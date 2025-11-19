@@ -21,11 +21,11 @@ import torch
 from nemo_rl.models.automodel.setup import (
     DistributedState,
     ModelAndOptimizerState,
-    ValidatedState,
     setup_distributed,
     setup_model_and_optimizer,
     validate_and_set_config,
 )
+from nemo_rl.models.automodel.types import RuntimeConfig
 
 
 @pytest.fixture
@@ -90,8 +90,8 @@ class TestValidateAndSetConfig:
             rank=0,
         )
 
-        # Verify result is a ValidatedState dataclass
-        assert isinstance(result, ValidatedState)
+        # Verify result is a RuntimeConfig dataclass
+        assert isinstance(result, RuntimeConfig)
         assert result.is_vlm is False
         assert result.dtype == torch.bfloat16
         assert result.cpu_offload is False
@@ -99,10 +99,6 @@ class TestValidateAndSetConfig:
         assert result.max_grad_norm == 1.0
         assert result.enable_seq_packing is False
         assert result.is_reward_model is False
-        assert result.tp_size == 1
-        assert result.cp_size == 1
-        assert result.ep_size == 1
-        assert result.sequence_parallel_enabled is False
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -529,8 +525,8 @@ class TestSetupDistributed:
         mock_manager.moe_mesh = None
         mock_manager_class.return_value = mock_manager
 
-        # Create validated state
-        validated_state = ValidatedState(
+        # Create runtime config
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -544,16 +540,13 @@ class TestSetupDistributed:
             is_reward_model=False,
             model_class=Mock,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=1,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         result = setup_distributed(
             config=mock_config,
-            validated_state=validated_state,
+            runtime_config=runtime_config,
         )
 
         # Verify result
@@ -563,6 +556,8 @@ class TestSetupDistributed:
         assert result.dp_size == 2
         assert result.tp_size == 1
         assert result.cp_size == 1
+        assert result.ep_size == 1
+        assert result.sequence_parallel_enabled is False
         assert result.device_mesh == mock_device_mesh
         assert result.manager == mock_manager
 
@@ -596,7 +591,7 @@ class TestSetupDistributed:
         mock_manager.cp_size = 1
         mock_manager_class.return_value = mock_manager
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.float32,
@@ -610,14 +605,11 @@ class TestSetupDistributed:
             is_reward_model=False,
             model_class=Mock,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=1,
-            ep_size=1,
-            dp_size=2,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
-        result = setup_distributed(mock_config, validated_state)
+        result = setup_distributed(mock_config, runtime_config)
 
         # Verify FSDP2Manager was called with CPU offload policy
         call_kwargs = mock_manager_class.call_args[1]
@@ -667,8 +659,8 @@ class TestSetupModelAndOptimizer:
         mock_worker.checkpointer.load_base_model = MagicMock()
         mock_worker.move_to_device = MagicMock(side_effect=lambda m, d: m)
 
-        # Create validated state
-        validated_state = ValidatedState(
+        # Create runtime config
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -682,11 +674,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=1,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         # Create distributed state
@@ -704,16 +693,18 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
+            dp_size=4,
             tp_size=1,
             cp_size=1,
-            manager=mock_manager,
+            ep_size=1,
+            sequence_parallel_enabled=False,
+            manager=MagicMock(),
         )
 
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
-            validated_state=validated_state,
+            runtime_config=runtime_config,
             distributed_state=distributed_state,
             worker_instance=mock_worker,
             init_optimizer=True,
@@ -755,7 +746,7 @@ class TestSetupModelAndOptimizer:
         mock_worker.checkpointer.load_base_model = MagicMock()
         mock_worker.move_to_device = MagicMock(side_effect=lambda m, d: m)
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -769,11 +760,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=1,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         mock_manager = MagicMock()
@@ -790,16 +778,18 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
+            dp_size=4,
             tp_size=1,
             cp_size=1,
-            manager=mock_manager,
+            ep_size=1,
+            sequence_parallel_enabled=False,
+            manager=MagicMock(),
         )
 
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
-            validated_state=validated_state,
+            runtime_config=runtime_config,
             distributed_state=distributed_state,
             worker_instance=mock_worker,
             init_optimizer=False,  # Don't initialize optimizer
@@ -836,7 +826,7 @@ class TestSetupModelAndOptimizer:
 
         mock_worker = MagicMock()
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -850,11 +840,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=2,  # cp_size > 1
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         distributed_state = DistributedState(
@@ -866,19 +853,21 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
+            dp_size=4,
             tp_size=1,
-            cp_size=2,
+            cp_size=2,  # cp_size > 1 to trigger the error
+            ep_size=1,
+            sequence_parallel_enabled=False,
             manager=MagicMock(),
         )
 
         with pytest.raises(
             ValueError, match="Context parallel is not supported for Gemma3ForCausalLM"
         ):
-            setup_model_and_optimizer(
+            result = setup_model_and_optimizer(
                 config=mock_config,
                 tokenizer=mock_tokenizer,
-                validated_state=validated_state,
+                runtime_config=runtime_config,
                 distributed_state=distributed_state,
                 worker_instance=mock_worker,
             )
@@ -927,7 +916,7 @@ class TestSetupModelAndOptimizer:
         mock_worker.checkpointer.load_base_model = MagicMock()
         mock_worker.move_to_device = MagicMock(side_effect=lambda m, d: m)
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -941,11 +930,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=1,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         mock_manager = MagicMock()
@@ -962,10 +948,12 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
+            dp_size=4,
             tp_size=1,
             cp_size=1,
-            manager=mock_manager,
+            ep_size=1,
+            sequence_parallel_enabled=False,
+            manager=MagicMock(),
         )
 
         # Configure with list scheduler
@@ -981,7 +969,7 @@ class TestSetupModelAndOptimizer:
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
-            validated_state=validated_state,
+            runtime_config=runtime_config,
             distributed_state=distributed_state,
             worker_instance=mock_worker,
             init_optimizer=True,
@@ -1011,7 +999,7 @@ class TestSetupModelAndOptimizer:
 
         mock_worker = MagicMock()
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=False,
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -1025,11 +1013,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=2,
-            cp_size=2,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=True,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         distributed_state = DistributedState(
@@ -1041,9 +1026,11 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
-            tp_size=2,
-            cp_size=2,
+            dp_size=4,
+            tp_size=2,  # tp_size > 1 to trigger the error
+            cp_size=2,  # cp_size > 1 to enter the validation block
+            ep_size=1,
+            sequence_parallel_enabled=True,  # Enable sequence parallel to trigger the error
             manager=MagicMock(),
         )
 
@@ -1051,10 +1038,10 @@ class TestSetupModelAndOptimizer:
             ValueError,
             match="context parallel can't be used together with sequence parallel",
         ):
-            setup_model_and_optimizer(
+            result = setup_model_and_optimizer(
                 config=mock_config,
                 tokenizer=mock_tokenizer,
-                validated_state=validated_state,
+                runtime_config=runtime_config,
                 distributed_state=distributed_state,
                 worker_instance=mock_worker,
             )
@@ -1076,7 +1063,7 @@ class TestSetupModelAndOptimizer:
 
         mock_worker = MagicMock()
 
-        validated_state = ValidatedState(
+        runtime_config = RuntimeConfig(
             is_vlm=True,  # VLM model
             is_generation_colocated=None,
             dtype=torch.bfloat16,
@@ -1090,11 +1077,8 @@ class TestSetupModelAndOptimizer:
             is_reward_model=False,
             model_class=mock_model_class,
             hf_config_overrides={},
-            tp_size=1,
-            cp_size=2,
-            ep_size=1,
-            dp_size=None,
-            sequence_parallel_enabled=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         distributed_state = DistributedState(
@@ -1106,19 +1090,21 @@ class TestSetupModelAndOptimizer:
             tp_mesh=MagicMock(),
             cp_mesh=MagicMock(),
             moe_mesh=None,
-            dp_size=1,
+            dp_size=4,
             tp_size=1,
-            cp_size=2,
+            cp_size=2,  # cp_size > 1 to trigger the VLM validation
+            ep_size=1,
+            sequence_parallel_enabled=False,
             manager=MagicMock(),
         )
 
         with pytest.raises(
             ValueError, match="Context parallel is yet not supported for VLM models"
         ):
-            setup_model_and_optimizer(
+            result = setup_model_and_optimizer(
                 config=mock_config,
                 tokenizer=mock_tokenizer,
-                validated_state=validated_state,
+                runtime_config=runtime_config,
                 distributed_state=distributed_state,
                 worker_instance=mock_worker,
             )

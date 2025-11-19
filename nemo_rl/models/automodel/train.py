@@ -28,10 +28,11 @@ from nemo_automodel.components.training.utils import (
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
+from nemo_rl.models.automodel.setup import DistributedState
+from nemo_rl.models.automodel.types import LossInputs, ProcessedInputs, RuntimeConfig
 
 
 def setup_train_loop(
@@ -96,50 +97,48 @@ def get_train_context(
 
 def forward_backward(
     model: nn.Module,
-    mb: BatchedDataDict[Any],
-    loss_fn: LossFunction,
-    global_valid_seqs: torch.Tensor,
-    global_valid_toks: torch.Tensor,
-    processed_inputs: dict[str, Any],
-    dtype: torch.dtype,
-    cp_size: int,
-    cp_mesh: Any,
-    device_mesh: Any,
-    enable_seq_packing: bool,
-    is_reward_model: bool,
-    allow_flash_attn_args: bool,
-    is_hf_model: bool,
-    is_moe_model: bool,
-    eval_mode: bool,
-    apply_temperature_fn,
+    processed_inputs: ProcessedInputs,
+    loss_inputs: LossInputs,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
+    eval_mode: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Forward and backward pass with clean grouped configuration.
+
+    Args:
+        model: Neural network model
+        processed_inputs: Processed microbatch inputs
+        loss_inputs: Loss computation inputs
+        runtime_config: Runtime configuration
+        distributed_state: Distributed training state
+        eval_mode: Whether in evaluation mode (skips backward pass)
+
+    Returns:
+        Tuple of (loss, loss_metrics)
+    """
     sequence_dim = 1
-    cp_buffers = processed_inputs["cp_buffers"]
+    cp_buffers = processed_inputs.cp_buffers
     with get_train_context(
-        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=is_hf_model
+        distributed_state.cp_size,
+        distributed_state.cp_mesh,
+        cp_buffers,
+        sequence_dim,
+        runtime_config.dtype,
+        autocast_enabled=runtime_config.is_hf_model,
     ):
         outputs = model_forward(
             model,
             processed_inputs,
-            is_reward_model,
-            allow_flash_attn_args,
-            is_hf_model,
-            is_moe_model,
+            runtime_config,
         )
 
         loss, loss_metrics = get_loss(
             outputs,
             model,
-            mb,
-            loss_fn,
-            global_valid_seqs,
-            global_valid_toks,
+            loss_inputs,
             processed_inputs,
-            cp_size,
-            cp_mesh,
-            device_mesh,
-            enable_seq_packing,
-            apply_temperature_fn,
+            runtime_config,
+            distributed_state,
         )
         # Backward pass
         if not eval_mode:
@@ -158,47 +157,59 @@ def forward_backward(
 def forward_with_processor(
     model: nn.Module,
     processor_fn: Any,
-    processed_inputs: dict[str, Any],
-    dtype: torch.dtype,
-    cp_size: int,
-    cp_mesh: Any,
-    device_mesh: Any,
-    is_reward_model: bool,
-    allow_flash_attn_args: bool,
-    is_hf_model: bool,
-    is_moe_model: bool,
-    apply_temperature_fn,
+    processed_inputs: ProcessedInputs,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
     processor_kwargs: Optional[dict[str, Any]] = None,
 ) -> Any:
+    """Forward pass with custom processor function.
+
+    Args:
+        model: Neural network model
+        processor_fn: Custom processor function to apply to outputs
+        processed_inputs: Processed microbatch inputs
+        runtime_config: Runtime configuration
+        distributed_state: Distributed training state
+        processor_kwargs: Optional kwargs for processor function (should include
+            apply_temperature_fn if needed by the processor)
+
+    Returns:
+        Result from processor function
+    """
     if processor_kwargs is None:
         processor_kwargs = {}
 
     sequence_dim = 1
-    cp_buffers = processed_inputs["cp_buffers"]
+    cp_buffers = processed_inputs.cp_buffers
 
     with get_train_context(
-        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=is_hf_model
+        distributed_state.cp_size,
+        distributed_state.cp_mesh,
+        cp_buffers,
+        sequence_dim,
+        runtime_config.dtype,
+        autocast_enabled=runtime_config.is_hf_model,
     ):
         outputs = model_forward(
             model,
             processed_inputs,
-            is_reward_model,
-            allow_flash_attn_args,
-            is_hf_model,
-            is_moe_model,
+            runtime_config,
         )
 
     with get_train_context(
-        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=False
+        distributed_state.cp_size,
+        distributed_state.cp_mesh,
+        cp_buffers,
+        sequence_dim,
+        runtime_config.dtype,
+        autocast_enabled=False,
     ):
         result = processor_fn(
             outputs=outputs,
             model=model,
             processed_inputs=processed_inputs,
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            device_mesh=device_mesh,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             **processor_kwargs,
         )
 
@@ -208,26 +219,35 @@ def forward_with_processor(
 def optimizer_step(
     optimizer: torch.optim.Optimizer,
     model: nn.Module,
-    max_grad_norm: Optional[float],
-    device_mesh: Any,
-    moe_mesh: Any,
-    dp_size: int,
-    cp_size: int,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
 ) -> Optional[torch.Tensor]:
+    """Optimizer step with gradient clipping.
+
+    Args:
+        optimizer: Optimizer instance
+        model: Neural network model
+        runtime_config: Runtime configuration (contains max_grad_norm)
+        distributed_state: Distributed training state
+
+    Returns:
+        Gradient norm tensor or None
+    """
     grad_norm = scale_grads_and_clip_grad_norm(
-        max_grad_norm,
+        runtime_config.max_grad_norm,
         [model],
         norm_type=2.0,
         pp_enabled=False,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
+        device_mesh=distributed_state.device_mesh,
+        moe_mesh=distributed_state.moe_mesh,
         ep_axis_name="ep"
-        if moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names
+        if distributed_state.moe_mesh is not None
+        and "ep" in distributed_state.moe_mesh.mesh_dim_names
         else None,
         pp_axis_name=None,
         foreach=True,
         num_label_tokens=1,
-        dp_group_size=dp_size * cp_size,
+        dp_group_size=distributed_state.dp_size * distributed_state.cp_size,
     )
     grad_norm = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
     grad_norm = (
@@ -266,17 +286,24 @@ def cleanup_after_training(
 
 def model_forward(
     model: nn.Module,
-    processed_inputs: dict[str, Any],
-    is_reward_model: bool,
-    allow_flash_attn_args: bool,
-    is_hf_model: bool,
-    is_moe_model: bool,
+    processed_inputs: ProcessedInputs,
+    runtime_config: RuntimeConfig,
 ) -> Any:
-    input_ids = processed_inputs["input_ids"]
-    attention_mask = processed_inputs["attention_mask"]
-    position_ids = processed_inputs["position_ids"]
-    flash_attn_kwargs = processed_inputs["flash_attn_kwargs"]
-    vlm_kwargs = processed_inputs["vlm_kwargs"]
+    """Model forward pass.
+
+    Args:
+        model: Neural network model
+        processed_inputs: Processed microbatch inputs
+        runtime_config: Runtime configuration
+
+    Returns:
+        Model outputs
+    """
+    input_ids = processed_inputs.input_ids
+    attention_mask = processed_inputs.attention_mask
+    position_ids = processed_inputs.position_ids
+    flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+    vlm_kwargs = processed_inputs.vlm_kwargs
 
     model_args = dict(
         input_ids=input_ids,
@@ -286,11 +313,11 @@ def model_forward(
         flash_attn_kwargs=flash_attn_kwargs,
         **vlm_kwargs,
     )
-    if is_moe_model and not is_hf_model:
+    if runtime_config.is_moe_model and not runtime_config.is_hf_model:
         padding_mask = ~attention_mask if attention_mask is not None else None
         model_args["padding_mask"] = padding_mask
 
-    if is_reward_model:
+    if runtime_config.is_reward_model:
         # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
         # Note that it should be empty anyway since sequence packing
         # is not supported for reward models.
@@ -300,7 +327,7 @@ def model_forward(
     if len(vlm_kwargs) > 0:
         del model_args["flash_attn_kwargs"]
 
-    if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
+    if not runtime_config.allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
     # Remove None attention_mask padding_mask if present
@@ -399,53 +426,60 @@ def _handle_context_parallel_sharding(
 def get_loss(
     outputs: Any,
     model: nn.Module,
-    mb: BatchedDataDict[Any],
-    loss_fn: LossFunction,
-    global_valid_seqs: torch.Tensor,
-    global_valid_toks: torch.Tensor,
-    processed_inputs: dict[str, Any],
-    cp_size: int,
-    cp_mesh: Any,
-    device_mesh: Any,
-    enable_seq_packing: bool,
-    apply_temperature_fn,
+    loss_inputs: LossInputs,
+    processed_inputs: ProcessedInputs,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute loss from model outputs.
+
+    Args:
+        outputs: Model outputs
+        model: Neural network model
+        loss_inputs: Loss computation inputs
+        processed_inputs: Processed microbatch inputs
+        runtime_config: Runtime configuration
+        distributed_state: Distributed training state
+
+    Returns:
+        Tuple of (loss, loss_metrics)
+    """
     sequence_dim = 1
-    flash_attn_kwargs = processed_inputs["flash_attn_kwargs"]
-    cp_buffers = processed_inputs["cp_buffers"]
-    seq_index = processed_inputs["seq_index"]
+    flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+    cp_buffers = processed_inputs.cp_buffers
+    seq_index = processed_inputs.seq_index
 
     with get_train_context_automodel(False, False, None)():
         # Process logits from model outputs
-        logits = _process_logits(outputs, model, apply_temperature_fn)
+        logits = _process_logits(outputs, model, loss_inputs.apply_temperature_fn)
         del outputs
 
         # Handle context parallel sharding if needed
-        if cp_size > 1:
+        if distributed_state.cp_size > 1:
             logits, _ = _handle_context_parallel_sharding(
                 logits,
                 seq_index,
-                cp_mesh,
-                device_mesh,
+                distributed_state.cp_mesh,
+                distributed_state.device_mesh,
                 sequence_dim,
-                mb=mb,
+                mb=loss_inputs.microbatch,
                 cp_buffers=cp_buffers,
             )
 
-        if enable_seq_packing:
+        if runtime_config.enable_seq_packing:
             loss_fn_ = SequencePackingLossWrapper(
-                loss_fn=loss_fn,
+                loss_fn=loss_inputs.loss_fn,
                 cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
             )
         else:
-            loss_fn_ = loss_fn
+            loss_fn_ = loss_inputs.loss_fn
 
         loss, loss_metrics = loss_fn_(
             logits,
-            mb,
-            global_valid_seqs,
-            global_valid_toks,
+            loss_inputs.microbatch,
+            loss_inputs.global_valid_seqs,
+            loss_inputs.global_valid_toks,
         )
         del logits
 
@@ -455,36 +489,50 @@ def get_loss(
 def get_logprobs(
     outputs: Any,
     model: nn.Module,
-    processed_inputs: dict[str, Any],
+    processed_inputs: ProcessedInputs,
     input_ids: torch.Tensor,
-    cp_size: int,
-    cp_mesh: Any,
-    device_mesh: Any,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
     apply_temperature_fn,
     logprob_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
+    """Extract log probabilities from model outputs.
+
+    Args:
+        outputs: Model outputs
+        model: Neural network model
+        processed_inputs: Processed microbatch inputs
+        input_ids: Input token IDs
+        runtime_config: Runtime configuration
+        distributed_state: Distributed training state
+        apply_temperature_fn: Temperature scaling function
+        logprob_chunk_size: Optional chunk size for logprob computation
+
+    Returns:
+        Token log probabilities tensor
+    """
     sequence_dim = 1
-    seq_index = processed_inputs["seq_index"]
-    seq_len = processed_inputs["seq_len"]
+    seq_index = processed_inputs.seq_index
+    seq_len = processed_inputs.seq_len
 
     # Process logits from model outputs
     logits = _process_logits(outputs, model, apply_temperature_fn)
     del outputs
 
-    if cp_size > 1:
+    if distributed_state.cp_size > 1:
         # Shard logits for CP (without modifying mb)
         logits, seq_index_tensor = _handle_context_parallel_sharding(
             logits,
             seq_index,
-            cp_mesh,
-            device_mesh,
+            distributed_state.cp_mesh,
+            distributed_state.device_mesh,
             sequence_dim,
         )
 
         # For logprob extraction, we need input_ids as DTensor
         input_ids_dtensor = DTensor.from_local(
             input_ids,
-            device_mesh=cp_mesh,
+            device_mesh=distributed_state.cp_mesh,
             placements=[Shard(sequence_dim)],
         )
 
@@ -547,40 +595,52 @@ def get_logprobs(
 def get_topk_logits(
     outputs: Any,
     model: nn.Module,
-    processed_inputs: dict[str, Any],
+    processed_inputs: ProcessedInputs,
     k: int,
-    cp_size: int,
-    cp_mesh: Any,
-    device_mesh: Any,
-    tp_mesh: Any,
+    runtime_config: RuntimeConfig,
+    distributed_state: DistributedState,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get top-k logits from model outputs.
+
+    Args:
+        outputs: Model outputs
+        model: Neural network model
+        processed_inputs: Processed microbatch inputs
+        k: Number of top logits to retrieve
+        runtime_config: Runtime configuration
+        distributed_state: Distributed training state
+        apply_temperature_fn: Temperature scaling function
+
+    Returns:
+        Tuple of (top_k_values, top_k_indices)
+    """
     from nemo_rl.distributed.model_utils import (
         allgather_cp_sharded_tensor,
         distributed_vocab_topk,
     )
 
     sequence_dim = 1
-    seq_index = processed_inputs["seq_index"]
+    seq_index = processed_inputs.seq_index
 
     # Process logits from model outputs
     logits = _process_logits(outputs, model, apply_temperature_fn)
     del outputs
 
-    if cp_size > 1:
+    if distributed_state.cp_size > 1:
         # Shard logits for CP (without modifying mb)
         logits, _ = _handle_context_parallel_sharding(
             logits,
             seq_index,
-            cp_mesh,
-            device_mesh,
+            distributed_state.cp_mesh,
+            distributed_state.device_mesh,
             sequence_dim,
         )
 
         # Deal with TP first
         local_logits = logits.to_local()  # [B, S_cp, V_tp]
 
-        tp_group = tp_mesh.get_group()
+        tp_group = distributed_state.tp_mesh.get_group()
         tp_rank = torch.distributed.get_rank(tp_group)
         V_local = int(local_logits.shape[-1])
         vocab_start_index = tp_rank * V_local
@@ -595,7 +655,7 @@ def get_topk_logits(
         )
         # [B, S_cp, k]
 
-        cp_group = cp_mesh.get_group()
+        cp_group = distributed_state.cp_mesh.get_group()
 
         vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
         idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
@@ -604,7 +664,7 @@ def get_topk_logits(
         # Compute top-k over full sequence length (do not drop last position)
         if isinstance(logits, DTensor):
             local_logits = logits.to_local()  # [B, S, V_local]
-            tp_group = tp_mesh.get_group()
+            tp_group = distributed_state.tp_mesh.get_group()
             tp_rank = torch.distributed.get_rank(tp_group)
             V_local = int(local_logits.shape[-1])
             vocab_start_index = tp_rank * V_local

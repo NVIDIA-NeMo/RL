@@ -27,30 +27,9 @@ from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedMod
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from transformers.utils import TRANSFORMERS_CACHE
 
+from nemo_rl.models.automodel.types import RuntimeConfig
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
-
-
-@dataclass
-class ValidatedState:
-    is_vlm: bool
-    is_generation_colocated: Optional[bool]
-    dtype: torch.dtype
-    cpu_offload: bool
-    offload_optimizer_for_logprob: bool
-    max_grad_norm: float
-    enable_seq_packing: bool
-    attn_impl: Optional[str]
-    model_config: AutoConfig
-    allow_flash_attn_args: bool
-    is_reward_model: bool
-    model_class: type
-    hf_config_overrides: dict[str, Any]
-    tp_size: int
-    cp_size: int
-    ep_size: int
-    dp_size: Optional[int]
-    sequence_parallel_enabled: bool
 
 
 @dataclass
@@ -66,6 +45,8 @@ class DistributedState:
     dp_size: int
     tp_size: int
     cp_size: int
+    ep_size: int
+    sequence_parallel_enabled: bool
     manager: FSDP2Manager
 
 
@@ -78,13 +59,15 @@ class ModelAndOptimizerState:
     reference_model_state_dict: Optional[dict[str, torch.Tensor]]
     is_hf_model: bool
     is_moe_model: bool
+    model_class: type
+    model_config: Any
 
 
 def validate_and_set_config(
     config: PolicyConfig,
     processor: Optional[AutoProcessor],
     rank: int,
-) -> ValidatedState:
+) -> RuntimeConfig:
     # Set basic configuration
     is_vlm = processor is not None
     is_generation_colocated = None
@@ -208,45 +191,50 @@ def validate_and_set_config(
             "See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
         )
 
-    return ValidatedState(
+    # Determine is_hf_model and is_moe_model here for RuntimeConfig
+    is_hf_model = (
+        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+    )
+    is_moe_model = False  # Will be determined later when model is created
+
+    return RuntimeConfig(
+        is_reward_model=is_reward_model,
         is_vlm=is_vlm,
-        is_generation_colocated=is_generation_colocated,
+        is_hf_model=is_hf_model,
+        is_moe_model=is_moe_model,
+        model_class=model_class,
+        model_config=model_config,
+        hf_config_overrides=hf_config_overrides,
+        allow_flash_attn_args=allow_flash_attn_args,
+        attn_impl=attn_impl,
         dtype=dtype,
+        enable_seq_packing=enable_seq_packing,
+        max_grad_norm=max_grad_norm,
         cpu_offload=cpu_offload,
         offload_optimizer_for_logprob=offload_optimizer_for_logprob,
-        max_grad_norm=max_grad_norm,
-        enable_seq_packing=enable_seq_packing,
-        attn_impl=attn_impl,
-        model_config=model_config,
-        allow_flash_attn_args=allow_flash_attn_args,
-        is_reward_model=is_reward_model,
-        model_class=model_class,
-        hf_config_overrides=hf_config_overrides,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        ep_size=ep_size,
-        dp_size=dp_size,
-        sequence_parallel_enabled=sequence_parallel_enabled,
+        is_generation_colocated=is_generation_colocated,
     )
 
 
 def setup_distributed(
     config: PolicyConfig,
-    validated_state: ValidatedState,
+    runtime_config: RuntimeConfig,
 ) -> DistributedState:
     # Initialize process group
     torch.distributed.init_process_group(backend="nccl")
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
-    # Extract validated config values
-    dtype = validated_state.dtype
-    cpu_offload = validated_state.cpu_offload
-    tp_size = validated_state.tp_size
-    cp_size = validated_state.cp_size
-    ep_size = validated_state.ep_size
-    dp_size = validated_state.dp_size
-    sequence_parallel_enabled = validated_state.sequence_parallel_enabled
+    # Extract runtime config values
+    dtype = runtime_config.dtype
+    cpu_offload = runtime_config.cpu_offload
+
+    # Extract parallelization config from config (not runtime_config)
+    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
+    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    dp_size = config["dtensor_cfg"].get("data_parallel_size", None)
+    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
     # Create FSDP2 manager
     manager = FSDP2Manager(
@@ -289,6 +277,8 @@ def setup_distributed(
         dp_size=manager.dp_size,
         tp_size=manager.tp_size,
         cp_size=manager.cp_size,
+        ep_size=ep_size,
+        sequence_parallel_enabled=sequence_parallel_enabled,
         manager=manager,
     )
 
@@ -296,7 +286,7 @@ def setup_distributed(
 def setup_model_and_optimizer(
     config: PolicyConfig,
     tokenizer: AutoTokenizer,
-    validated_state: ValidatedState,
+    runtime_config: RuntimeConfig,
     distributed_state: DistributedState,
     worker_instance: Any,
     init_optimizer: bool = True,
@@ -311,21 +301,22 @@ def setup_model_and_optimizer(
 
     from nemo_rl.models.policy.utils import import_class_from_path
 
-    # Extract configuration values
-    model_config = validated_state.model_config
-    model_class = validated_state.model_class
-    attn_impl = validated_state.attn_impl
-    hf_config_overrides = validated_state.hf_config_overrides
-    is_vlm = validated_state.is_vlm
-    tp_size = validated_state.tp_size
-    cp_size = validated_state.cp_size
-    sequence_parallel_enabled = validated_state.sequence_parallel_enabled
-    cpu_offload = validated_state.cpu_offload
+    # Extract configuration values from runtime_config
+    model_config = runtime_config.model_config
+    model_class = runtime_config.model_class
+    attn_impl = runtime_config.attn_impl
+    hf_config_overrides = runtime_config.hf_config_overrides
+    is_vlm = runtime_config.is_vlm
+    cpu_offload = runtime_config.cpu_offload
 
+    # Extract distributed configuration from distributed_state
     rank = distributed_state.rank
     device_mesh = distributed_state.device_mesh
     manager = distributed_state.manager
     moe_mesh = distributed_state.moe_mesh
+    tp_size = distributed_state.tp_size
+    cp_size = distributed_state.cp_size
+    sequence_parallel_enabled = distributed_state.sequence_parallel_enabled
 
     model_name = config["model_name"]
 
@@ -493,7 +484,7 @@ def setup_model_and_optimizer(
             optimizer, lr_lambda=lambda epoch: 1
         )
 
-    return ModelAndOptimizerState(
+    model_and_optimizer_state = ModelAndOptimizerState(
         model=model,
         model_state_dict_keys=model_state_dict_keys,
         optimizer=optimizer,
@@ -501,4 +492,8 @@ def setup_model_and_optimizer(
         reference_model_state_dict=reference_model_state_dict,
         is_hf_model=is_hf_model,
         is_moe_model=is_moe_model,
+        model_class=type(model),
+        model_config=model.config,
     )
+
+    return model_and_optimizer_state

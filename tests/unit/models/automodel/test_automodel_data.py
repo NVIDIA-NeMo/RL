@@ -24,6 +24,7 @@ from nemo_rl.models.automodel.data import (
     process_global_batch,
     process_microbatch,
 )
+from nemo_rl.models.automodel.types import ProcessedInputs
 
 
 @pytest.fixture
@@ -244,16 +245,17 @@ class TestProcessMicrobatch:
         )
 
         # Verify outputs
-        assert result["input_ids"].shape == (4, 64)
-        assert result["attention_mask"] is not None
-        assert result["attention_mask"].shape == (4, 64)
-        assert result["position_ids"] is not None
-        assert result["position_ids"].shape == (4, 64)
-        assert result["flash_attn_kwargs"] == {}
-        assert result["vlm_kwargs"] == {}
-        assert result["cp_buffers"] == []
-        assert result["seq_index"] is None
-        assert result["seq_len"] == 64
+        assert isinstance(result, ProcessedInputs)
+        assert result.input_ids.shape == (4, 64)
+        assert result.attention_mask is not None
+        assert result.attention_mask.shape == (4, 64)
+        assert result.position_ids is not None
+        assert result.position_ids.shape == (4, 64)
+        assert result.flash_attn_kwargs == {}
+        assert result.vlm_kwargs == {}
+        assert result.cp_buffers == []
+        assert result.seq_index is None
+        assert result.seq_len == 64
 
     @patch("nemo_rl.models.automodel.data.pack_sequences")
     @patch("nemo_rl.models.automodel.data.get_flash_attention_kwargs")
@@ -304,11 +306,12 @@ class TestProcessMicrobatch:
         )
 
         # Verify outputs
-        assert result["input_ids"].shape == (1, 204)
-        assert result["attention_mask"] is None
-        assert result["position_ids"] is not None
-        assert "cu_seqlens" in result["flash_attn_kwargs"]
-        assert result["vlm_kwargs"] == {}
+        assert isinstance(result, ProcessedInputs)
+        assert result.input_ids.shape == (1, 204)
+        assert result.attention_mask is None
+        assert result.position_ids is not None
+        assert "cu_seqlens" in result.flash_attn_kwargs
+        assert result.vlm_kwargs == {}
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
         # Create test microbatch with multimodal data
@@ -339,9 +342,10 @@ class TestProcessMicrobatch:
         )
 
         # Verify multimodal kwargs were extracted
-        assert "pixel_values" in result["vlm_kwargs"]
+        assert isinstance(result, ProcessedInputs)
+        assert "pixel_values" in result.vlm_kwargs
         # When multimodal inputs are present, position_ids should be None
-        assert result["position_ids"] is None
+        assert result.position_ids is None
 
     def test_with_context_parallel(self, mock_tokenizer):
         # Create test microbatch
@@ -367,11 +371,12 @@ class TestProcessMicrobatch:
         )
 
         # Verify context parallel buffers were created
-        assert len(result["cp_buffers"]) == 3  # input_ids, position_ids, seq_index
-        assert result["seq_index"] is not None
-        assert result["seq_index"].shape == (1, 128)
+        assert isinstance(result, ProcessedInputs)
+        assert len(result.cp_buffers) == 3  # input_ids, position_ids, seq_index
+        assert result.seq_index is not None
+        assert result.seq_index.shape == (1, 128)
         # Verify no multimodal inputs with CP
-        assert result["vlm_kwargs"] == {}
+        assert result.vlm_kwargs == {}
 
     def test_context_parallel_with_multimodal_raises_error(self, mock_tokenizer):
         # Create test microbatch with multimodal data
@@ -743,6 +748,7 @@ class TestIntegrationScenarios:
 
         # Verify pipeline results
         assert len(processed_mbs) == iterator_len
-        assert all(mb["input_ids"].shape[0] == 2 for mb in processed_mbs)
+        assert all(isinstance(mb, ProcessedInputs) for mb in processed_mbs)
+        assert all(mb.input_ids.shape[0] == 2 for mb in processed_mbs)
         assert global_batch_result["global_valid_seqs"] == 8
         assert global_batch_result["global_valid_toks"] == 512

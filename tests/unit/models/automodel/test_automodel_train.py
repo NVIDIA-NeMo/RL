@@ -21,6 +21,7 @@ from torch import nn
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.setup import DistributedState
 from nemo_rl.models.automodel.train import (
     _process_logits,
     cleanup_after_training,
@@ -33,6 +34,7 @@ from nemo_rl.models.automodel.train import (
     optimizer_step,
     setup_train_loop,
 )
+from nemo_rl.models.automodel.types import LossInputs, ProcessedInputs, RuntimeConfig
 
 
 @pytest.fixture
@@ -78,6 +80,49 @@ def mock_loss_fn():
 
     loss_fn.side_effect = side_effect
     return loss_fn
+
+
+@pytest.fixture
+def runtime_config():
+    """Create a RuntimeConfig instance for tests."""
+    return RuntimeConfig(
+        is_reward_model=False,
+        is_vlm=False,
+        is_hf_model=False,
+        is_moe_model=False,
+        model_class=MagicMock,
+        model_config=MagicMock(),
+        hf_config_overrides={},
+        allow_flash_attn_args=True,
+        attn_impl=None,
+        dtype=torch.float16,
+        enable_seq_packing=False,
+        max_grad_norm=1.0,
+        cpu_offload=False,
+        offload_optimizer_for_logprob=False,
+        is_generation_colocated=None,
+    )
+
+
+@pytest.fixture
+def distributed_state(mock_device_mesh, mock_dp_mesh, mock_cp_mesh):
+    """Create a DistributedState instance for tests."""
+    return DistributedState(
+        rank=0,
+        world_size=4,
+        device_mesh=mock_device_mesh,
+        dp_cp_mesh=mock_dp_mesh,
+        dp_mesh=mock_dp_mesh,
+        tp_mesh=MagicMock(),
+        cp_mesh=mock_cp_mesh,
+        moe_mesh=None,
+        dp_size=4,
+        tp_size=1,
+        cp_size=1,
+        ep_size=1,
+        sequence_parallel_enabled=False,
+        manager=MagicMock(),
+    )
 
 
 @pytest.fixture
@@ -245,7 +290,9 @@ class TestSetupTrainLoop:
 
 @pytest.mark.automodel
 class TestForwardBackward:
-    def test_basic_forward_backward_eval_mode(self, mock_model, mock_loss_fn):
+    def test_basic_forward_backward_eval_mode(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -255,16 +302,16 @@ class TestForwardBackward:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -272,24 +319,22 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify model was called
@@ -302,7 +347,9 @@ class TestForwardBackward:
         assert loss is not None
         assert isinstance(loss_metrics, dict)
 
-    def test_forward_backward_with_backward_pass(self, mock_model, mock_loss_fn):
+    def test_forward_backward_with_backward_pass(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -312,16 +359,16 @@ class TestForwardBackward:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -329,24 +376,22 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=False,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify model was called
@@ -360,7 +405,9 @@ class TestForwardBackward:
         # but we verify the loss is returned correctly
         assert loss is not None
 
-    def test_with_reward_model(self, mock_model, mock_loss_fn):
+    def test_with_reward_model(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -370,16 +417,16 @@ class TestForwardBackward:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -387,24 +434,31 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=True,
-            allow_flash_attn_args=False,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Modify runtime_config for reward model
+        runtime_config_reward = RuntimeConfig(
+            **{
+                **runtime_config.__dict__,
+                "is_reward_model": True,
+                "allow_flash_attn_args": False,
+            }
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config_reward,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify model was called
@@ -414,7 +468,9 @@ class TestForwardBackward:
         call_args = mock_model.call_args
         assert "flash_attn_kwargs" not in call_args[1]
 
-    def test_with_multimodal_inputs(self, mock_model, mock_loss_fn):
+    def test_with_multimodal_inputs(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -428,16 +484,16 @@ class TestForwardBackward:
             "pixel_values": torch.randn(4, 3, 224, 224).cuda(),
         }
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": None,  # Position IDs are None for multimodal
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": vlm_kwargs,
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=None,  # Position IDs are None for multimodal
+            flash_attn_kwargs={},
+            vlm_kwargs=vlm_kwargs,
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -445,24 +501,27 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Modify runtime_config for VLM
+        runtime_config_vlm = RuntimeConfig(
+            **{**runtime_config.__dict__, "is_vlm": True}
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config_vlm,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify model was called
@@ -514,7 +573,12 @@ class TestForwardBackward:
 
     @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_with_sequence_packing(
-        self, mock_seq_packing_wrapper, mock_model, mock_loss_fn
+        self,
+        mock_seq_packing_wrapper,
+        mock_model,
+        mock_loss_fn,
+        runtime_config,
+        distributed_state,
     ):
         # Create test microbatch
         mb = BatchedDataDict(
@@ -528,16 +592,16 @@ class TestForwardBackward:
         flash_attn_kwargs = MagicMock()
         flash_attn_kwargs.cu_seqlens_q = torch.tensor([0, 32, 80, 140, 204]).cuda()
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": None,
-            "position_ids": torch.arange(204).unsqueeze(0).cuda(),
-            "flash_attn_kwargs": flash_attn_kwargs,
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 204,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=None,
+            position_ids=torch.arange(204).unsqueeze(0).cuda(),
+            flash_attn_kwargs=flash_attn_kwargs,
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=204,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -553,24 +617,27 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=True,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Modify runtime_config for sequence packing
+        runtime_config_sp = RuntimeConfig(
+            **{**runtime_config.__dict__, "enable_seq_packing": True}
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config_sp,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify sequence packing wrapper was created
@@ -580,7 +647,9 @@ class TestForwardBackward:
         # Verify wrapped loss function was called
         wrapped_loss_fn.assert_called_once()
 
-    def test_with_temperature_scaling(self, mock_model, mock_loss_fn):
+    def test_with_temperature_scaling(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -590,16 +659,16 @@ class TestForwardBackward:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -608,30 +677,30 @@ class TestForwardBackward:
         temperature = 2.0
         apply_temperature_fn = MagicMock(side_effect=lambda x: x / temperature)
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify temperature function was called
         apply_temperature_fn.assert_called_once()
 
-    def test_model_output_as_tensor(self, mock_loss_fn):
+    def test_model_output_as_tensor(
+        self, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create a model that returns tensor directly
         mock_model = MagicMock(spec=nn.Module)
         mock_model.return_value = torch.randn(
@@ -647,16 +716,16 @@ class TestForwardBackward:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -664,24 +733,22 @@ class TestForwardBackward:
         # Mock temperature function
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
+            eval_mode=False,
         )
 
         # Verify loss function was called with tensor logits
@@ -693,7 +760,12 @@ class TestForwardBackward:
 class TestOptimizerStep:
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_basic_optimizer_step(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(1.5).cuda()
@@ -701,11 +773,8 @@ class TestOptimizerStep:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called
@@ -724,20 +793,21 @@ class TestOptimizerStep:
         mock_scale_grads,
         mock_optimizer,
         mock_model,
-        mock_device_mesh,
+        runtime_config,
+        distributed_state,
         mock_moe_mesh,
     ):
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(1.2).cuda()
 
+        distributed_state_with_moe = DistributedState(
+            **{**distributed_state.__dict__, "moe_mesh": mock_moe_mesh}
+        )
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=mock_moe_mesh,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state_with_moe,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called with moe_mesh
@@ -750,43 +820,59 @@ class TestOptimizerStep:
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_with_context_parallel(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(0.8).cuda()
 
+        # Modify distributed_state for context parallel
+        distributed_state_cp = DistributedState(
+            **{**distributed_state.__dict__, "cp_size": 2}
+        )
+
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=2,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state_cp,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called with correct dp_group_size
         mock_scale_grads.assert_called_once()
-        assert mock_scale_grads.call_args[1]["dp_group_size"] == 4  # dp_size * cp_size
+        assert (
+            mock_scale_grads.call_args[1]["dp_group_size"] == 8
+        )  # dp_size * cp_size (4 * 2)
 
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_with_no_max_grad_norm(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(5.0).cuda()
 
+        # Modify runtime_config with no max_grad_norm
+        runtime_config_no_clip = RuntimeConfig(
+            **{**runtime_config.__dict__, "max_grad_norm": None}
+        )
+
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=None,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config_no_clip,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called with None
@@ -798,7 +884,12 @@ class TestOptimizerStep:
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_infinite_grad_norm_handling(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock infinite gradient norm
         mock_scale_grads.return_value = torch.tensor(float("inf")).cuda()
@@ -806,11 +897,8 @@ class TestOptimizerStep:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called
@@ -826,7 +914,12 @@ class TestOptimizerStep:
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_nan_grad_norm_handling(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock NaN gradient norm
         mock_scale_grads.return_value = torch.tensor(float("nan")).cuda()
@@ -834,11 +927,8 @@ class TestOptimizerStep:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called
@@ -854,7 +944,12 @@ class TestOptimizerStep:
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_grad_norm_scalar_conversion(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock scalar gradient norm (not a tensor)
         mock_scale_grads.return_value = 1.5  # Plain Python float
@@ -862,11 +957,8 @@ class TestOptimizerStep:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called
@@ -883,7 +975,12 @@ class TestOptimizerStep:
 
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_grad_norm_already_tensor(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+        self,
+        mock_scale_grads,
+        mock_optimizer,
+        mock_model,
+        runtime_config,
+        distributed_state,
     ):
         # Mock tensor gradient norm (already a tensor)
         mock_scale_grads.return_value = torch.tensor(2.3).cuda()
@@ -891,11 +988,8 @@ class TestOptimizerStep:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=2,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify scale_grads_and_clip_grad_norm was called
@@ -1030,25 +1124,22 @@ class TestProcessLogits:
 
 @pytest.mark.automodel
 class TestModelForward:
-    def test_basic_model_forward(self, mock_model):
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+    def test_basic_model_forward(self, mock_model, runtime_config):
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
+            runtime_config=runtime_config,
         )
 
         # Verify model was called
@@ -1058,25 +1149,31 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" in call_kwargs
 
-    def test_model_forward_with_reward_model(self, mock_model):
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+    def test_model_forward_with_reward_model(self, mock_model, runtime_config):
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
+
+        # Modify runtime_config for reward model
+        runtime_config_reward = RuntimeConfig(
+            **{
+                **runtime_config.__dict__,
+                "is_reward_model": True,
+                "allow_flash_attn_args": False,
+            }
+        )
 
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=True,
-            allow_flash_attn_args=False,
-            is_hf_model=False,
-            is_moe_model=False,
+            runtime_config=runtime_config_reward,
         )
 
         # Verify model was called
@@ -1086,29 +1183,26 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" not in call_kwargs
 
-    def test_model_forward_with_multimodal(self, mock_model):
+    def test_model_forward_with_multimodal(self, mock_model, runtime_config):
         vlm_kwargs = {
             "pixel_values": torch.randn(4, 3, 224, 224).cuda(),
         }
 
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": None,  # None for multimodal
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": vlm_kwargs,
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=None,  # None for multimodal
+            flash_attn_kwargs={},
+            vlm_kwargs=vlm_kwargs,
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
+            runtime_config=runtime_config,
         )
 
         # Verify model was called
@@ -1119,26 +1213,27 @@ class TestModelForward:
         assert "pixel_values" in call_kwargs
         assert "flash_attn_kwargs" not in call_kwargs
 
-    def test_model_forward_with_moe_padding_mask(self, mock_model):
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+    def test_model_forward_with_moe_padding_mask(self, mock_model, runtime_config):
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         # Test with MoE model (not HF) - padding_mask should be set
+        runtime_config_moe = RuntimeConfig(
+            **{**runtime_config.__dict__, "is_moe_model": True}
+        )
+
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=True,
+            runtime_config=runtime_config_moe,
         )
 
         # Verify model was called
@@ -1148,26 +1243,29 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "padding_mask" in call_kwargs
 
-    def test_model_forward_with_hf_moe_no_padding_mask(self, mock_model):
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+    def test_model_forward_with_hf_moe_no_padding_mask(
+        self, mock_model, runtime_config
+    ):
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         # Test with HF MoE model - padding_mask should NOT be set
+        runtime_config_hf_moe = RuntimeConfig(
+            **{**runtime_config.__dict__, "is_hf_model": True, "is_moe_model": True}
+        )
+
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=True,
-            is_moe_model=True,
+            runtime_config=runtime_config_hf_moe,
         )
 
         # Verify model was called
@@ -1177,26 +1275,25 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "padding_mask" not in call_kwargs
 
-    def test_model_forward_with_non_moe_no_padding_mask(self, mock_model):
-        processed_inputs = {
-            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+    def test_model_forward_with_non_moe_no_padding_mask(
+        self, mock_model, runtime_config
+    ):
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)).cuda(),
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         # Test with non-MoE model - padding_mask should NOT be set
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
+            runtime_config=runtime_config,
         )
 
         # Verify model was called
@@ -1209,7 +1306,9 @@ class TestModelForward:
 
 @pytest.mark.automodel
 class TestForwardWithProcessor:
-    def test_with_get_loss_processor(self, mock_model, mock_loss_fn):
+    def test_with_get_loss_processor(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         """Test forward_with_processor with get_loss as the processor."""
         # Create test microbatch
         mb = BatchedDataDict(
@@ -1220,41 +1319,39 @@ class TestForwardWithProcessor:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
         apply_temperature_fn = lambda x: x
+
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
+            loss_fn=mock_loss_fn,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            apply_temperature_fn=apply_temperature_fn,
+        )
 
         # Call forward_with_processor with get_loss as processor
         loss, loss_metrics = forward_with_processor(
             model=mock_model,
             processor_fn=get_loss,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             processor_kwargs={
-                "mb": mb,
-                "loss_fn": mock_loss_fn,
-                "global_valid_seqs": global_valid_seqs,
-                "global_valid_toks": global_valid_toks,
-                "enable_seq_packing": False,
+                "loss_inputs": loss_inputs,
             },
         )
 
@@ -1268,7 +1365,9 @@ class TestForwardWithProcessor:
         assert loss is not None
         assert isinstance(loss_metrics, dict)
 
-    def test_with_get_logprobs_processor(self, mock_model):
+    def test_with_get_logprobs_processor(
+        self, mock_model, runtime_config, distributed_state
+    ):
         """Test forward_with_processor with get_logprobs as the processor."""
         # Create test microbatch
         mb = BatchedDataDict(
@@ -1281,16 +1380,16 @@ class TestForwardWithProcessor:
         input_ids = mb["input_ids"]
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
 
@@ -1299,17 +1398,11 @@ class TestForwardWithProcessor:
             model=mock_model,
             processor_fn=get_logprobs,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             processor_kwargs={
                 "input_ids": input_ids,
+                "apply_temperature_fn": apply_temperature_fn,
                 "logprob_chunk_size": None,
             },
         )
@@ -1323,7 +1416,9 @@ class TestForwardWithProcessor:
         # Verify first token has zero logprob (prepended)
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
-    def test_with_get_topk_logits_processor(self, mock_model):
+    def test_with_get_topk_logits_processor(
+        self, mock_model, runtime_config, distributed_state
+    ):
         """Test forward_with_processor with get_topk_logits as the processor."""
         # Create test microbatch
         mb = BatchedDataDict(
@@ -1334,16 +1429,16 @@ class TestForwardWithProcessor:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
         mock_tp_mesh = MagicMock()
@@ -1353,18 +1448,11 @@ class TestForwardWithProcessor:
             model=mock_model,
             processor_fn=get_topk_logits,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             processor_kwargs={
                 "k": 10,
-                "tp_mesh": mock_tp_mesh,
+                "apply_temperature_fn": apply_temperature_fn,
             },
         )
 
@@ -1375,7 +1463,7 @@ class TestForwardWithProcessor:
         assert vals.shape == (4, 64, 10)
         assert idx.shape == (4, 64, 10)
 
-    def test_with_custom_processor(self, mock_model):
+    def test_with_custom_processor(self, mock_model, runtime_config, distributed_state):
         """Test forward_with_processor with a custom processor function."""
 
         # Create a custom processor that just returns the logits shape
@@ -1383,11 +1471,10 @@ class TestForwardWithProcessor:
             outputs,
             model,
             processed_inputs,
-            cp_size,
-            cp_mesh,
-            device_mesh,
-            apply_temperature_fn,
+            runtime_config,
+            distributed_state,
         ):
+            apply_temperature_fn = lambda x: x
             logits = _process_logits(outputs, model, apply_temperature_fn)
             return logits.shape
 
@@ -1400,16 +1487,16 @@ class TestForwardWithProcessor:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
 
@@ -1418,15 +1505,8 @@ class TestForwardWithProcessor:
             model=mock_model,
             processor_fn=custom_processor,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             processor_kwargs={},
         )
 
@@ -1436,7 +1516,9 @@ class TestForwardWithProcessor:
         # Verify result is the logits shape
         assert result == torch.Size([4, 64, 1000])
 
-    def test_with_none_processor_kwargs(self, mock_model):
+    def test_with_none_processor_kwargs(
+        self, mock_model, runtime_config, distributed_state
+    ):
         """Test forward_with_processor with None processor_kwargs (default)."""
 
         # Create a simple processor that doesn't need extra kwargs
@@ -1444,10 +1526,8 @@ class TestForwardWithProcessor:
             outputs,
             model,
             processed_inputs,
-            cp_size,
-            cp_mesh,
-            device_mesh,
-            apply_temperature_fn,
+            runtime_config,
+            distributed_state,
         ):
             return "success"
 
@@ -1460,16 +1540,16 @@ class TestForwardWithProcessor:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
 
@@ -1478,15 +1558,8 @@ class TestForwardWithProcessor:
             model=mock_model,
             processor_fn=simple_processor,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             # processor_kwargs not provided (defaults to None)
         )
 
@@ -1496,7 +1569,9 @@ class TestForwardWithProcessor:
         # Verify result
         assert result == "success"
 
-    def test_with_temperature_scaling(self, mock_model, mock_loss_fn):
+    def test_with_temperature_scaling(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         """Test forward_with_processor with temperature scaling applied."""
         # Create test microbatch
         mb = BatchedDataDict(
@@ -1507,16 +1582,16 @@ class TestForwardWithProcessor:
         )
 
         # Create processed inputs
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -1525,26 +1600,24 @@ class TestForwardWithProcessor:
         temperature = 2.0
         apply_temperature_fn = MagicMock(side_effect=lambda x: x / temperature)
 
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
+            loss_fn=mock_loss_fn,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
         # Call forward_with_processor
         loss, loss_metrics = forward_with_processor(
             model=mock_model,
             processor_fn=get_loss,
             processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            is_reward_model=False,
-            allow_flash_attn_args=True,
-            is_hf_model=False,
-            is_moe_model=False,
-            apply_temperature_fn=apply_temperature_fn,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             processor_kwargs={
-                "mb": mb,
-                "loss_fn": mock_loss_fn,
-                "global_valid_seqs": global_valid_seqs,
-                "global_valid_toks": global_valid_toks,
-                "enable_seq_packing": False,
+                "loss_inputs": loss_inputs,
             },
         )
 
@@ -1554,7 +1627,9 @@ class TestForwardWithProcessor:
 
 @pytest.mark.automodel
 class TestGetLoss:
-    def test_basic_train_output_processing(self, mock_model, mock_loss_fn):
+    def test_basic_train_output_processing(
+        self, mock_model, mock_loss_fn, runtime_config, distributed_state
+    ):
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1567,34 +1642,37 @@ class TestGetLoss:
             }
         )
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = get_loss(
-            outputs=outputs,
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        loss, loss_metrics = get_loss(
+            outputs=outputs,
+            model=mock_model,
+            loss_inputs=loss_inputs,
+            processed_inputs=processed_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Verify loss function was called
@@ -1604,7 +1682,12 @@ class TestGetLoss:
 
     @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_train_output_with_sequence_packing(
-        self, mock_seq_packing_wrapper, mock_model, mock_loss_fn
+        self,
+        mock_seq_packing_wrapper,
+        mock_model,
+        mock_loss_fn,
+        runtime_config,
+        distributed_state,
     ):
         # Create mock outputs
         outputs = MagicMock()
@@ -1621,16 +1704,16 @@ class TestGetLoss:
         flash_attn_kwargs = MagicMock()
         flash_attn_kwargs.cu_seqlens_q = torch.tensor([0, 32, 80, 140, 204]).cuda()
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": None,
-            "position_ids": torch.arange(204).unsqueeze(0).cuda(),
-            "flash_attn_kwargs": flash_attn_kwargs,
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 204,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=None,
+            position_ids=torch.arange(204).unsqueeze(0).cuda(),
+            flash_attn_kwargs=flash_attn_kwargs,
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=204,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(512.0).cuda()
@@ -1644,19 +1727,27 @@ class TestGetLoss:
         )
         mock_seq_packing_wrapper.return_value = wrapped_loss_fn
 
-        loss, loss_metrics = get_loss(
-            outputs=outputs,
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            enable_seq_packing=True,
             apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Modify runtime_config for sequence packing
+        runtime_config_sp = RuntimeConfig(
+            **{**runtime_config.__dict__, "enable_seq_packing": True}
+        )
+
+        loss, loss_metrics = get_loss(
+            outputs=outputs,
+            model=mock_model,
+            loss_inputs=loss_inputs,
+            processed_inputs=processed_inputs,
+            runtime_config=runtime_config_sp,
+            distributed_state=distributed_state,
         )
 
         # Verify sequence packing wrapper was created
@@ -1666,7 +1757,9 @@ class TestGetLoss:
 
 @pytest.mark.automodel
 class TestGetLogprobs:
-    def test_basic_logprob_extraction(self, mock_model):
+    def test_basic_logprob_extraction(
+        self, mock_model, runtime_config, distributed_state
+    ):
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1681,16 +1774,16 @@ class TestGetLogprobs:
 
         input_ids = torch.randint(0, 1000, (4, 64)).cuda()
 
-        processed_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
 
@@ -1699,9 +1792,8 @@ class TestGetLogprobs:
             model=mock_model,
             processed_inputs=processed_inputs,
             input_ids=input_ids,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             apply_temperature_fn=apply_temperature_fn,
             logprob_chunk_size=None,
         )
@@ -1712,7 +1804,9 @@ class TestGetLogprobs:
         # Verify first token has zero logprob (prepended)
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
-    def test_logprob_extraction_with_chunking(self, mock_model):
+    def test_logprob_extraction_with_chunking(
+        self, mock_model, runtime_config, distributed_state
+    ):
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 128, 1000, device="cuda", requires_grad=True)
@@ -1727,16 +1821,16 @@ class TestGetLogprobs:
 
         input_ids = torch.randint(0, 1000, (4, 128)).cuda()
 
-        processed_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones(4, 128, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(128).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 128,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            attention_mask=torch.ones(4, 128, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(128).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=128,
+        )
 
         apply_temperature_fn = lambda x: x
 
@@ -1746,9 +1840,8 @@ class TestGetLogprobs:
             model=mock_model,
             processed_inputs=processed_inputs,
             input_ids=input_ids,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             apply_temperature_fn=apply_temperature_fn,
             logprob_chunk_size=64,
         )
@@ -1762,7 +1855,7 @@ class TestGetLogprobs:
 
 @pytest.mark.automodel
 class TestGetTopkLogits:
-    def test_basic_topk_extraction(self, mock_model):
+    def test_basic_topk_extraction(self, mock_model, runtime_config, distributed_state):
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1775,31 +1868,26 @@ class TestGetTopkLogits:
             }
         )
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 64,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 64, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(64).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=64,
+        )
 
         apply_temperature_fn = lambda x: x
-
-        # Create mock tp_mesh
-        mock_tp_mesh = MagicMock()
 
         vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
             processed_inputs=processed_inputs,
             k=10,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            tp_mesh=mock_tp_mesh,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1811,7 +1899,9 @@ class TestGetTopkLogits:
         assert torch.all(idx >= 0)
         assert torch.all(idx < 1000)
 
-    def test_topk_extraction_with_temperature(self, mock_model):
+    def test_topk_extraction_with_temperature(
+        self, mock_model, runtime_config, distributed_state
+    ):
         # Create mock outputs with known logits
         outputs = MagicMock()
         logits = torch.randn(2, 32, 500, device="cuda", requires_grad=True)
@@ -1825,32 +1915,27 @@ class TestGetTopkLogits:
             }
         )
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(2, 32, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(32).repeat(2, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 32,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(2, 32, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(32).repeat(2, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=32,
+        )
 
         temperature = 2.0
         apply_temperature_fn = lambda x: x / temperature
-
-        # Create mock tp_mesh
-        mock_tp_mesh = MagicMock()
 
         vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
             processed_inputs=processed_inputs,
             k=5,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            tp_mesh=mock_tp_mesh,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1858,7 +1943,9 @@ class TestGetTopkLogits:
         assert vals.shape == (2, 32, 5)
         assert idx.shape == (2, 32, 5)
 
-    def test_topk_extraction_different_k_values(self, mock_model):
+    def test_topk_extraction_different_k_values(
+        self, mock_model, runtime_config, distributed_state
+    ):
         outputs = MagicMock()
         outputs.logits = torch.randn(3, 48, 800, device="cuda", requires_grad=True)
 
@@ -1869,19 +1956,18 @@ class TestGetTopkLogits:
             }
         )
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(3, 48, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(48).repeat(3, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 48,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(3, 48, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(48).repeat(3, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=48,
+        )
 
         apply_temperature_fn = lambda x: x
-        mock_tp_mesh = MagicMock()
 
         # Test with k=20
         vals, idx = get_topk_logits(
@@ -1889,10 +1975,8 @@ class TestGetTopkLogits:
             model=mock_model,
             processed_inputs=processed_inputs,
             k=20,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=None,
-            tp_mesh=mock_tp_mesh,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1945,40 +2029,75 @@ class TestIntegrationScenarios:
             }
         )
 
-        processed_inputs = {
-            "input_ids": mb["input_ids"],
-            "attention_mask": torch.ones(4, 128, dtype=torch.bool).cuda(),
-            "position_ids": torch.arange(128).repeat(4, 1).cuda(),
-            "flash_attn_kwargs": {},
-            "vlm_kwargs": {},
-            "cp_buffers": [],
-            "seq_index": None,
-            "seq_len": 128,
-        }
+        processed_inputs = ProcessedInputs(
+            input_ids=mb["input_ids"],
+            attention_mask=torch.ones(4, 128, dtype=torch.bool).cuda(),
+            position_ids=torch.arange(128).repeat(4, 1).cuda(),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            seq_len=128,
+        )
 
         global_valid_seqs = torch.tensor(8.0).cuda()
         global_valid_toks = torch.tensor(1024.0).cuda()
 
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = forward_backward(
-            model=mock_model,
-            mb=mb,
+        # Create loss inputs
+        loss_inputs = LossInputs(
+            microbatch=mb,
             loss_fn=mock_loss_fn,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            processed_inputs=processed_inputs,
-            dtype=torch.float16,
-            cp_size=1,
-            cp_mesh=None,
-            device_mesh=mock_device_mesh,
-            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Create runtime config for training mode
+        runtime_config = RuntimeConfig(
             is_reward_model=False,
-            allow_flash_attn_args=True,
+            is_vlm=False,
             is_hf_model=False,
             is_moe_model=False,
+            model_class=MagicMock,
+            model_config=MagicMock(),
+            hf_config_overrides={},
+            allow_flash_attn_args=True,
+            attn_impl=None,
+            dtype=torch.float16,
+            enable_seq_packing=False,
+            max_grad_norm=1.0,
+            cpu_offload=False,
+            offload_optimizer_for_logprob=False,
+            is_generation_colocated=None,
+        )
+
+        # Create distributed state
+        distributed_state = DistributedState(
+            rank=0,
+            world_size=4,
+            device_mesh=mock_device_mesh,
+            dp_cp_mesh=mock_dp_mesh,
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=MagicMock(),
+            cp_mesh=MagicMock(),
+            moe_mesh=None,
+            dp_size=4,
+            tp_size=1,
+            cp_size=1,
+            ep_size=1,
+            sequence_parallel_enabled=False,
+            manager=MagicMock(),
+        )
+
+        loss, loss_metrics = forward_backward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            loss_inputs=loss_inputs,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
             eval_mode=False,
-            apply_temperature_fn=apply_temperature_fn,
         )
 
         # Step 3: Optimizer step
@@ -1987,11 +2106,8 @@ class TestIntegrationScenarios:
         grad_norm = optimizer_step(
             optimizer=mock_optimizer,
             model=mock_model,
-            max_grad_norm=1.0,
-            device_mesh=mock_device_mesh,
-            moe_mesh=None,
-            dp_size=dp_size,
-            cp_size=1,
+            runtime_config=runtime_config,
+            distributed_state=distributed_state,
         )
 
         # Step 4: Cleanup

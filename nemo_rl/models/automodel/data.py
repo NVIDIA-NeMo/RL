@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.types import ProcessedInputs
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -64,7 +65,7 @@ def process_microbatch(
     enable_seq_packing: bool,
     cfg: dict[str, Any],
     cp_size: int,
-) -> dict[str, Any]:
+) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
     Args:
@@ -75,14 +76,7 @@ def process_microbatch(
         cp_size: Context parallel size
 
     Returns:
-        Dictionary containing:
-            - input_ids: Processed input IDs
-            - attention_mask: Attention mask
-            - position_ids: Position IDs (or None)
-            - flash_attn_kwargs: Flash attention kwargs
-            - vlm_kwargs: Multimodal kwargs
-            - cp_buffers: Buffers for context parallel (if cp_size > 1)
-            - seq_index: Sequence indices (if cp_size > 1)
+        ProcessedInputs containing all tensors and metadata for forward pass
     """
     input_ids = mb.get("input_ids").cuda()
 
@@ -135,16 +129,16 @@ def process_microbatch(
         seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
         cp_buffers = [input_ids, position_ids, seq_index]
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-        "flash_attn_kwargs": flash_attn_kwargs,
-        "vlm_kwargs": vlm_kwargs,
-        "cp_buffers": cp_buffers,
-        "seq_index": seq_index,
-        "seq_len": seq_len,
-    }
+    return ProcessedInputs(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        flash_attn_kwargs=flash_attn_kwargs,
+        vlm_kwargs=vlm_kwargs,
+        cp_buffers=cp_buffers,
+        seq_index=seq_index,
+        seq_len=seq_len,
+    )
 
 
 def process_global_batch(

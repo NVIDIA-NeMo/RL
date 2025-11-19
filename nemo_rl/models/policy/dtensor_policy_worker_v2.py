@@ -68,6 +68,7 @@ from nemo_rl.models.automodel.train import (
     optimizer_step,
     setup_train_loop,
 )
+from nemo_rl.models.automodel.types import LossInputs
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -85,25 +86,6 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-
-
-def _copy_dataclass_fields(
-    target: Any, source: Any, fields: Optional[list[str]] = None
-) -> None:
-    """Copy fields from a dataclass to target object.
-
-    Args:
-        target: Target object to copy fields to
-        source: Source dataclass to copy fields from
-        fields: Optional list of field names to copy. If None, copies all fields.
-    """
-    from dataclasses import fields as get_fields
-
-    if fields is None:
-        fields = [f.name for f in get_fields(source)]
-
-    for field_name in fields:
-        setattr(target, field_name, getattr(source, field_name))
 
 
 def _maybe_adapt_tensor_to_hf(
@@ -166,74 +148,33 @@ class DTensorPolicyWorkerV2:
             rank=0,  # Temporary, will be updated after distributed init
         )
 
-        # Extract configuration values
-        _copy_dataclass_fields(
-            self,
-            validated_state,
-            [
-                "is_vlm",
-                "is_generation_colocated",
-                "dtype",
-                "cpu_offload",
-                "offload_optimizer_for_logprob",
-                "max_grad_norm",
-                "enable_seq_packing",
-                "allow_flash_attn_args",
-                "is_reward_model",
-            ],
-        )
+        # Extract runtime_config from validated_state
+        self.runtime_config = validated_state.runtime_config
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
+        print(
+            f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.runtime_config.is_vlm}"
+        )
 
         # Set up distributed environment
-        distributed_state = setup_distributed(
+        self.distributed_state = setup_distributed(
             config=config,
-            validated_state=validated_state,
-        )
-
-        # Extract distributed configuration
-        _copy_dataclass_fields(
-            self,
-            distributed_state,
-            [
-                "rank",
-                "device_mesh",
-                "dp_cp_mesh",
-                "dp_mesh",
-                "tp_mesh",
-                "cp_mesh",
-                "moe_mesh",
-                "dp_size",
-                "tp_size",
-                "cp_size",
-            ],
+            runtime_config=self.runtime_config,
         )
 
         # Set up model and optimizer
-        model_state = setup_model_and_optimizer(
+        self.model_and_optimizer = setup_model_and_optimizer(
             config=config,
             tokenizer=tokenizer,
-            validated_state=validated_state,
-            distributed_state=distributed_state,
+            runtime_config=self.runtime_config,
+            distributed_state=self.distributed_state,
             worker_instance=self,
             init_optimizer=init_optimizer,
             init_reference_model=init_reference_model,
         )
 
-        # Extract model configuration
-        _copy_dataclass_fields(
-            self,
-            model_state,
-            [
-                "model",
-                "model_state_dict_keys",
-                "optimizer",
-                "scheduler",
-                "is_hf_model",
-                "is_moe_model",
-                "reference_model_state_dict",
-            ],
-        )
+        # Direct accessors for frequently used fields
+        self.model = self.model_and_optimizer.model
+        self.optimizer = self.model_and_optimizer.optimizer
 
         # Load checkpoint if provided
         if weights_path:
@@ -255,7 +196,7 @@ class DTensorPolicyWorkerV2:
         from vllm.distributed.utils import StatelessProcessGroup
 
         pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
+            host=ip, port=port, rank=self.distributed_state.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
         self.model_update_group = PyNcclCommunicator(pg, device=device)
@@ -286,7 +227,9 @@ class DTensorPolicyWorkerV2:
             mbs = self.cfg["train_micro_batch_size"]
 
         # Setup training loop parameters
-        setup_params = setup_train_loop(data, gbs, self.dp_size, self.dp_mesh)
+        setup_params = setup_train_loop(
+            data, gbs, self.distributed_state.dp_size, self.distributed_state.dp_mesh
+        )
         local_gbs = setup_params["local_gbs"]
         num_global_batches = setup_params["num_global_batches"]
 
@@ -307,7 +250,7 @@ class DTensorPolicyWorkerV2:
             for gb_idx in range(num_global_batches):
                 # Process global batch and get normalization factors
                 gb_result = process_global_batch(
-                    data, gb_idx, local_gbs, loss_fn, self.dp_mesh
+                    data, gb_idx, local_gbs, loss_fn, self.distributed_state.dp_mesh
                 )
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
@@ -318,7 +261,11 @@ class DTensorPolicyWorkerV2:
 
                 # Get microbatch iterator
                 mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
-                    batch, self.cfg, self.enable_seq_packing, mbs, self.dp_mesh
+                    batch,
+                    self.cfg,
+                    self.runtime_config.enable_seq_packing,
+                    mbs,
+                    self.distributed_state.dp_mesh,
                 )
 
                 empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -336,35 +283,35 @@ class DTensorPolicyWorkerV2:
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
 
-                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    with torch.autocast(
+                        device_type="cuda", dtype=self.runtime_config.dtype
+                    ):
                         # Process microbatch inputs
                         processed_inputs = process_microbatch(
                             mb,
                             self.tokenizer,
-                            self.enable_seq_packing,
+                            self.runtime_config.enable_seq_packing,
                             self.cfg,
-                            self.cp_size,
+                            self.distributed_state.cp_size,
                         )
+
+                    # Create loss inputs
+                    loss_inputs = LossInputs(
+                        microbatch=mb,
+                        loss_fn=loss_fn,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        apply_temperature_fn=self._apply_temperature_scaling,
+                    )
 
                     # Forward and backward pass
                     loss, loss_metrics = forward_backward(
                         model=self.model,
-                        mb=mb,
-                        loss_fn=loss_fn,
-                        global_valid_seqs=global_valid_seqs,
-                        global_valid_toks=global_valid_toks,
                         processed_inputs=processed_inputs,
-                        dtype=self.dtype,
-                        cp_size=self.cp_size,
-                        cp_mesh=self.cp_mesh,
-                        device_mesh=self.device_mesh,
-                        enable_seq_packing=self.enable_seq_packing,
-                        is_reward_model=self.is_reward_model,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
-                        is_hf_model=self.is_hf_model,
-                        is_moe_model=self.is_moe_model,
+                        loss_inputs=loss_inputs,
+                        runtime_config=self.runtime_config,
+                        distributed_state=self.distributed_state,
                         eval_mode=eval_mode,
-                        apply_temperature_fn=self._apply_temperature_scaling,
                     )
 
                     # skip the update for dummy batches
@@ -387,25 +334,24 @@ class DTensorPolicyWorkerV2:
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
                     grad_norm = optimizer_step(
-                        self.optimizer,
-                        self.model,
-                        self.max_grad_norm,
-                        self.device_mesh,
-                        self.moe_mesh,
-                        self.dp_size,
-                        self.cp_size,
+                        optimizer=self.optimizer,
+                        model=self.model,
+                        runtime_config=self.runtime_config,
+                        distributed_state=self.distributed_state,
                     )
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
             # Cleanup after training batches
-            cleanup_after_training(self.optimizer, self.scheduler, eval_mode)
+            cleanup_after_training(
+                self.optimizer, self.model_and_optimizer.scheduler, eval_mode
+            )
 
             # Compute global loss across all ranks
             with torch.no_grad():
                 global_loss = torch.tensor(losses, device="cuda")
                 torch.distributed.all_reduce(
-                    global_loss, group=self.dp_mesh.get_group()
+                    global_loss, group=self.distributed_state.dp_mesh.get_group()
                 )
             # Aggregate metrics across all microbatches
             mb_metrics = defaultdict(list)
@@ -418,7 +364,7 @@ class DTensorPolicyWorkerV2:
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
                 "gpu_name": torch.cuda.get_device_name(),
-                "model_dtype": self.dtype,
+                "model_dtype": self.runtime_config.dtype,
                 "all_mb_metrics": dict(mb_metrics),
             }
 
@@ -467,9 +413,9 @@ class DTensorPolicyWorkerV2:
             mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
                 data,
                 self.cfg,
-                self.enable_seq_packing,
+                self.runtime_config.enable_seq_packing,
                 logprob_batch_size,
-                self.dp_mesh,
+                self.distributed_state.dp_mesh,
             )
 
             step = 0
@@ -481,20 +427,22 @@ class DTensorPolicyWorkerV2:
                 original_batch_size, original_seq_len = lp_batch.get("input_ids").shape
 
                 # Process microbatch inputs
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                with torch.autocast(
+                    device_type="cuda", dtype=self.runtime_config.dtype
+                ):
                     processed_inputs = process_microbatch(
                         lp_batch,
                         self.tokenizer,
-                        self.enable_seq_packing,
+                        self.runtime_config.enable_seq_packing,
                         self.cfg,
-                        self.cp_size,
+                        self.distributed_state.cp_size,
                     )
 
                 input_ids = processed_inputs["input_ids"]
 
                 # Create post_attention_mask for non-packed sequences (for masking later)
                 post_attention_mask = None
-                if not self.enable_seq_packing:
+                if not self.runtime_config.enable_seq_packing:
                     post_attention_mask = torch.zeros(
                         (original_batch_size, original_seq_len),
                         dtype=torch.bool,
@@ -508,17 +456,11 @@ class DTensorPolicyWorkerV2:
                     model=self.model,
                     processor_fn=get_logprobs,
                     processed_inputs=processed_inputs,
-                    dtype=self.dtype,
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    device_mesh=self.device_mesh,
-                    is_reward_model=self.is_reward_model,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    is_hf_model=self.is_hf_model,
-                    is_moe_model=self.is_moe_model,
-                    apply_temperature_fn=self._apply_temperature_scaling,
+                    runtime_config=self.runtime_config,
+                    distributed_state=self.distributed_state,
                     processor_kwargs={
                         "input_ids": input_ids,
+                        "apply_temperature_fn": self._apply_temperature_scaling,
                         "logprob_chunk_size": logprob_chunk_size,
                     },
                 )
@@ -527,7 +469,7 @@ class DTensorPolicyWorkerV2:
                 if batch_idx >= iterator_len:
                     continue
 
-                if not self.enable_seq_packing:
+                if not self.runtime_config.enable_seq_packing:
                     # Apply mask to zero out padding tokens logprobs
                     token_logprobs = token_logprobs * post_attention_mask
                 else:
@@ -584,7 +526,7 @@ class DTensorPolicyWorkerV2:
             if self.cfg["dynamic_batching"]["enabled"]:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            elif self.enable_seq_packing:
+            elif self.runtime_config.enable_seq_packing:
                 mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
                 iterator_len, max_seqlen = (
                     data.get_microbatch_iterator_for_packable_sequences_len()
@@ -610,7 +552,7 @@ class DTensorPolicyWorkerV2:
                 input_ids = generate_batch.get("input_ids").cuda()
                 input_lengths = generate_batch.get("input_lengths")
                 batch_size, seq_len = input_ids.shape
-                if self.enable_seq_packing:
+                if self.runtime_config.enable_seq_packing:
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
@@ -643,7 +585,7 @@ class DTensorPolicyWorkerV2:
                         device=input_ids.device,
                     )
                 context_parallel_ctx = None
-                if self.cp_size > 1:
+                if self.distributed_state.cp_size > 1:
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
                         1, 1
                     )
@@ -651,13 +593,15 @@ class DTensorPolicyWorkerV2:
 
                     # Create context parallel context
                     context_parallel_ctx = create_context_parallel_ctx(
-                        cp_mesh=self.cp_mesh,
+                        cp_mesh=self.distributed_state.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
                 with get_train_context(False, False, context_parallel_ctx)():
-                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    with torch.autocast(
+                        device_type="cuda", dtype=self.runtime_config.dtype
+                    ):
                         model_args = dict(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
@@ -727,9 +671,9 @@ class DTensorPolicyWorkerV2:
             mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
                 data,
                 self.cfg,
-                self.enable_seq_packing,
+                self.runtime_config.enable_seq_packing,
                 topk_batch_size,
-                self.dp_mesh,
+                self.distributed_state.dp_mesh,
             )
 
             for batch_idx, lp_batch in enumerate(
@@ -739,13 +683,15 @@ class DTensorPolicyWorkerV2:
                 original_batch_size, original_seq_len = lp_batch.get("input_ids").shape
 
                 # Process microbatch inputs
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                with torch.autocast(
+                    device_type="cuda", dtype=self.runtime_config.dtype
+                ):
                     processed_inputs = process_microbatch(
                         lp_batch,
                         self.tokenizer,
-                        self.enable_seq_packing,
+                        self.runtime_config.enable_seq_packing,
                         self.cfg,
-                        self.cp_size,
+                        self.distributed_state.cp_size,
                     )
 
                 # Model forward pass and top-k processing
@@ -753,18 +699,11 @@ class DTensorPolicyWorkerV2:
                     model=self.model,
                     processor_fn=get_topk_logits,
                     processed_inputs=processed_inputs,
-                    dtype=self.dtype,
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    device_mesh=self.device_mesh,
-                    is_reward_model=self.is_reward_model,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    is_hf_model=self.is_hf_model,
-                    is_moe_model=self.is_moe_model,
-                    apply_temperature_fn=self._apply_temperature_scaling,
+                    runtime_config=self.runtime_config,
+                    distributed_state=self.distributed_state,
                     processor_kwargs={
                         "k": k,
-                        "tp_mesh": self.tp_mesh,
+                        "apply_temperature_fn": self._apply_temperature_scaling,
                     },
                 )
 
@@ -773,7 +712,7 @@ class DTensorPolicyWorkerV2:
                     continue
 
                 # Handle sequence packing unpacking
-                if self.enable_seq_packing:
+                if self.runtime_config.enable_seq_packing:
                     # Unpack top-k results from packed format back to original batch format
                     # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
                     # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
@@ -859,7 +798,7 @@ class DTensorPolicyWorkerV2:
                 # Swap reference model state_dict to self.model
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
-                    val.copy_(self.reference_model_state_dict[k])
+                    val.copy_(self.model_and_optimizer.reference_model_state_dict[k])
 
                 # - self.model is the original reference_model, now on CUDA
                 # - curr_state_dict is the train model, now on CPU
@@ -948,12 +887,15 @@ class DTensorPolicyWorkerV2:
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
-            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+            # all tensor will be casted to self.runtime_config.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                state_dict_info[adapted_fqn] = (
+                    adapted_tensor.shape,
+                    self.runtime_config.dtype,
+                )
 
         return state_dict_info
 
@@ -970,7 +912,7 @@ class DTensorPolicyWorkerV2:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
+        if self.runtime_config.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -988,7 +930,9 @@ class DTensorPolicyWorkerV2:
                     # Convert to target dtype
                     yield (
                         adapted_fqn,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                        adapted_tensor.to(
+                            self.runtime_config.dtype, non_blocking=True
+                        ).contiguous(),
                     )
 
         # Use the shared implementation
@@ -996,7 +940,7 @@ class DTensorPolicyWorkerV2:
             params_generator=dtensor_params_generator(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
-            rank=self.rank,
+            rank=self.distributed_state.rank,
             worker_name=str(self),
         )
 
@@ -1004,7 +948,7 @@ class DTensorPolicyWorkerV2:
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
         # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
+        if self.runtime_config.cpu_offload:
             print(
                 "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
                 "using non-colocated generation since it will have an extra onload and offload at refit stage."
@@ -1024,7 +968,9 @@ class DTensorPolicyWorkerV2:
                     # Convert to target dtype
                     yield (
                         adapted_fqn,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                        adapted_tensor.to(
+                            self.runtime_config.dtype, non_blocking=True
+                        ).contiguous(),
                     )
 
         # param_iterator will return (name, tensor), we only need tensor
@@ -1039,13 +985,13 @@ class DTensorPolicyWorkerV2:
 
         # Manually move model to cpu for cpu offload case
         # cpu offload needs model on CPU before model forward
-        if self.cpu_offload:
+        if self.runtime_config.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda
-        if not self.cpu_offload:
+        if not self.runtime_config.cpu_offload:
             self.move_to_cuda(self.model)
         else:
             self.model = self.move_buffer_to_device(self.model, "cuda")
@@ -1054,7 +1000,10 @@ class DTensorPolicyWorkerV2:
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+        if (
+            self.optimizer is not None
+            and self.runtime_config.offload_optimizer_for_logprob
+        ):
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
@@ -1063,7 +1012,7 @@ class DTensorPolicyWorkerV2:
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
-        if not self.cpu_offload:
+        if not self.runtime_config.cpu_offload:
             self.move_to_cuda(self.model)
         else:
             # when cpu offload is enabled, the buffers do not get moved
@@ -1075,8 +1024,11 @@ class DTensorPolicyWorkerV2:
         # colocated generation will always offload optimizer to cuda before refit
         if (
             self.optimizer is not None
-            and not self.cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
+            and not self.runtime_config.cpu_offload
+            and (
+                self.runtime_config.offload_optimizer_for_logprob
+                or self.runtime_config.is_generation_colocated
+            )
         ):
             self.move_optimizer_to_device("cuda")
 
@@ -1192,7 +1144,7 @@ class DTensorPolicyWorkerV2:
                 optimizer=self.optimizer,
                 model=self.model,
                 weights_path=optimizer_path,
-                scheduler=self.scheduler,
+                scheduler=self.model_and_optimizer.scheduler,
             )
 
         # TODO: needed?
@@ -1242,7 +1194,7 @@ class DTensorPolicyWorkerV2:
                 optimizer=self.optimizer,
                 model=self.model,
                 weights_path=optimizer_path,
-                scheduler=self.scheduler,
+                scheduler=self.model_and_optimizer.scheduler,
             )
 
     def _ensure_checkpointer(
@@ -1258,8 +1210,8 @@ class DTensorPolicyWorkerV2:
             config_updates = {}
 
         # Compute dp/tp ranks
-        dp_rank = torch.distributed.get_rank(self.dp_mesh.get_group())
-        tp_rank = torch.distributed.get_rank(self.tp_mesh.get_group())
+        dp_rank = torch.distributed.get_rank(self.distributed_state.dp_mesh.get_group())
+        tp_rank = torch.distributed.get_rank(self.distributed_state.tp_mesh.get_group())
         pp_rank = 0
 
         if self.checkpointer is None:
@@ -1286,7 +1238,7 @@ class DTensorPolicyWorkerV2:
                 dp_rank=dp_rank,
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,
-                moe_mesh=self.moe_mesh,
+                moe_mesh=self.distributed_state.moe_mesh,
             )
         else:
             # Update mutable config fields on the existing instance
@@ -1300,7 +1252,9 @@ class DTensorPolicyWorkerV2:
                 setattr(cfg, k, v)
             # Ensure model_state_dict_keys is current
             if getattr(self, "model_state_dict_keys", None) is not None:
-                cfg.model_state_dict_keys = self.model_state_dict_keys
+                cfg.model_state_dict_keys = (
+                    self.model_and_optimizer.model_state_dict_keys
+                )
 
     def shutdown(self) -> None:
         """Shutdown the policy."""
