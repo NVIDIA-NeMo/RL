@@ -964,6 +964,7 @@ class Logger(LoggerInterface):
         x_series: list[float] = []
         y_series: list[list[float]] = []
         series_labels: list[str] = []
+        use_wandb_native_plot = False
 
         max_time_length = max(len(metric_values) for metric_values in metrics.values())
         x_series = [i * timeline_interval for i in range(max_time_length)]
@@ -987,7 +988,7 @@ class Logger(LoggerInterface):
             return
 
         wandb_logged = False
-        if self.wandb_logger is not None:
+        if self.wandb_logger is not None and use_wandb_native_plot:
             try:
                 plot = wandb.plot.line_series(
                     xs=x_series,
