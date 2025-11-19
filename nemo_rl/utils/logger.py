@@ -961,19 +961,22 @@ class Logger(LoggerInterface):
                 f"timeline_interval must be positive; received {timeline_interval}"
             )
 
-        x_series: list[list[float]] = []
+        x_series: list[float] = []
         y_series: list[list[float]] = []
         series_labels: list[str] = []
+
+        max_time_length = max(len(metric_values) for metric_values in metrics.values())
+        x_series = [i * timeline_interval for i in range(max_time_length)]
 
         for worker_id in sorted(metrics.keys()):
             metric_values = metrics[worker_id]
             if not metric_values:
                 continue
 
-            steps = [i * timeline_interval for i in range(len(metric_values))]
             values = [float(v) for v in metric_values]
+            if len(values) < max_time_length:
+                values = values + [float(0)] * (max_time_length - len(values))
 
-            x_series.append(steps)
             y_series.append(values)
             series_labels.append(f"worker_{worker_id}")
 
@@ -990,11 +993,11 @@ class Logger(LoggerInterface):
                     xs=x_series,
                     ys=y_series,
                     keys=series_labels,
-                    title=f"{name} per worker",
+                    title=f"{name} (per worker)",
                     xname="Time (s)",
                 )
                 self.wandb_logger.run.log(
-                    {f"{name}_per_worker_timeline": plot},
+                    {name: plot},
                     step=step,
                 )
                 wandb_logged = True
@@ -1013,8 +1016,8 @@ class Logger(LoggerInterface):
             return
 
         fig, ax = plt.subplots()
-        for label, xs, ys in zip(series_labels, x_series, y_series):
-            ax.plot(xs, ys, label=label)
+        for label, ys in zip(series_labels, y_series):
+            ax.plot(x_series, ys, label=label)
 
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(f"{name} (per worker)")

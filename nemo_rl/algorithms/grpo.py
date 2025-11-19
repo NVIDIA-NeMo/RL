@@ -1474,14 +1474,14 @@ def grpo_train(
                     logger.log_plot_per_worker_timeline_metrics(
                         vllm_logger_metrics["inflight_batch_sizes"],
                         step=total_steps + 1,
-                        name="Inflight Batch Sizes",
+                        name="performance/inflight_batch_sizes",
                         timeline_interval=vllm_metrics_logger_interval,
                     )
                 if "num_pending_samples" in vllm_logger_metrics:
                     logger.log_plot_per_worker_timeline_metrics(
                         vllm_logger_metrics["num_pending_samples"],
                         step=total_steps + 1,
-                        name="Num Pending Samples",
+                        name="performance/num_pending_samples",
                         timeline_interval=vllm_metrics_logger_interval,
                     )
 
@@ -2393,14 +2393,14 @@ def async_grpo_train(
                     logger.log_plot_per_worker_timeline_metrics(
                         vllm_logger_metrics["inflight_batch_sizes"],
                         step=step + 1,
-                        name="Inflight Batch Sizes",
+                        name="performance/inflight_batch_sizes",
                         timeline_interval=vllm_metrics_logger_interval,
                     )
                 if "num_pending_samples" in vllm_logger_metrics:
                     logger.log_plot_per_worker_timeline_metrics(
                         vllm_logger_metrics["num_pending_samples"],
                         step=step + 1,
-                        name="Num Pending Samples",
+                        name="performance/num_pending_samples",
                         timeline_interval=vllm_metrics_logger_interval,
                     )
 
