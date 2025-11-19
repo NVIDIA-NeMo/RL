@@ -1475,6 +1475,27 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                vllm_metrics_logger_interval = master_config["policy"]["generation"][
+                    "vllm_cfg"
+                ]["vllm_metrics_logger_interval"]
+                if "inflight_batch_sizes" in vllm_logger_metrics:
+                    logger.log_plot_per_worker_timeline_metrics(
+                        vllm_logger_metrics["inflight_batch_sizes"],
+                        step=total_steps + 1,
+                        name="performance/inflight_batch_sizes",
+                        timeline_interval=vllm_metrics_logger_interval,
+                    )
+                if "num_pending_samples" in vllm_logger_metrics:
+                    logger.log_plot_per_worker_timeline_metrics(
+                        vllm_logger_metrics["num_pending_samples"],
+                        step=total_steps + 1,
+                        name="performance/num_pending_samples",
+                        timeline_interval=vllm_metrics_logger_interval,
+                    )
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -2385,6 +2406,27 @@ def async_grpo_train(
             buffer_size_current = ray.get(replay_buffer.size.remote())
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
+
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                vllm_metrics_logger_interval = master_config["policy"]["generation"][
+                    "vllm_cfg"
+                ]["vllm_metrics_logger_interval"]
+                if "inflight_batch_sizes" in vllm_logger_metrics:
+                    logger.log_plot_per_worker_timeline_metrics(
+                        vllm_logger_metrics["inflight_batch_sizes"],
+                        step=step + 1,
+                        name="performance/inflight_batch_sizes",
+                        timeline_interval=vllm_metrics_logger_interval,
+                    )
+                if "num_pending_samples" in vllm_logger_metrics:
+                    logger.log_plot_per_worker_timeline_metrics(
+                        vllm_logger_metrics["num_pending_samples"],
+                        step=step + 1,
+                        name="performance/num_pending_samples",
+                        timeline_interval=vllm_metrics_logger_interval,
+                    )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
