@@ -37,7 +37,6 @@ def test_flops_counter(model_name, gbs, seqlen, expected_flops):
     flops_tracker = FLOPTracker.from_config(model_name, model_config)
     flops_tracker.track(gbs, seqlen)
 
-    # check within 5% relative difference
-    assert abs(flops_tracker.total_flops - expected_flops) / expected_flops <= 0.05, (
+    assert flops_tracker.total_flops == pytest.approx(expected_flops), (
         f"Expected {expected_flops} flops, got {flops_tracker.total_flops}"
     )
