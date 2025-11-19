@@ -41,7 +41,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv and python
-ARG UV_VERSION=0.9.1
+ARG UV_VERSION=0.9.7
 ARG PYTHON_VERSION=3.12
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
@@ -70,6 +70,9 @@ ARG BUILD_CUSTOM_VLLM
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
+
+# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./

@@ -827,3 +827,25 @@ class VllmGeneration(GenerationInterface):
         user calls shutdown().
         """
         self.shutdown()
+
+    def invalidate_kv_cache(self) -> bool:
+        """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
+
+        For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
+        Returns True if all workers report success.
+        """
+        try:
+            method_name = (
+                "reset_prefix_cache_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "reset_prefix_cache"
+            )
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            print(f"Error invalidating vLLM caches: {e}")
+            return False

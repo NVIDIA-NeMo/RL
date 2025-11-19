@@ -45,6 +45,8 @@ policy:
   max_total_sequence_length: 1024
   precision: "bfloat16"
 
+  offload_optimizer_for_logprob: false
+
   dtensor_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf

@@ -49,6 +49,7 @@ def create_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 1,
         "precision": "float32",
+        "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
@@ -671,6 +672,9 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
             "ratio_clip_max": 0.2,
             "ratio_clip_c": None,
             "reference_policy_kl_penalty": 0.1,
+            "reference_policy_kl_type": "k3",
+            "kl_input_clamp_value": 20.0,
+            "kl_output_clamp_value": 10.0,
             "disable_ppo_ratio": False,
             "use_on_policy_kl_approximation": False,
             "use_importance_sampling_correction": False,

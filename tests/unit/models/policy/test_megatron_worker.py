@@ -41,6 +41,9 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_max": 0.2,
     "ratio_clip_c": None,
     "reference_policy_kl_penalty": 0.1,
+    "reference_policy_kl_type": "k3",
+    "kl_input_clamp_value": 20.0,
+    "kl_output_clamp_value": 10.0,
     "disable_ppo_ratio": False,
     "use_on_policy_kl_approximation": False,
     "use_importance_sampling_correction": False,
@@ -73,6 +76,7 @@ def create_megatron_test_config(
         "logprob_batch_size": 2,
         "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,
