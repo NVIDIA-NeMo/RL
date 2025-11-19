@@ -37,9 +37,9 @@ time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
 
 # Research functional tests (self-discovery)
 for test_script in research/*/tests/functional/*.sh; do
-    project_dir=$(dirname $(dirname $test_script))
+    project_dir=$(echo $test_script | cut -d/ -f1-2)
     pushd $project_dir
-    time uv run --no-sync bash $test_script
+    time uv run --no-sync bash $(echo $test_script | cut -d/ -f3-)
     popd
 done
 
