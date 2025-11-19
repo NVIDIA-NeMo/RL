@@ -123,5 +123,5 @@ COPY --from=nemo-rl . /opt/nemo-rl
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 # NOTICES.txt file points to where the OSS source code is archived
-RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nemo/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
