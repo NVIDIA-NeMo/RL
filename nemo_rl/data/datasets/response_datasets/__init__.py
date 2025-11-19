@@ -27,6 +27,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3Dataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
@@ -48,6 +49,10 @@ def load_response_dataset(data_config, seed: int = 42):
             split=data_config["split"],
             output_key=data_config["output_key"],
             prompt_file=data_config["prompt_file"],
+            seed=seed,
+        )
+    elif dataset_name == "tulu3":
+        base_dataset = Tulu3Dataset(
             seed=seed,
         )
     elif dataset_name == "clevr_cogent":
