@@ -457,6 +457,7 @@ def print_performance_metrics(
         timeline_interval: float | None,
     ) -> None:
         dp_ranks = list(metric_dict.keys())
+        max_rows_to_print = 100
         max_timeline_length = 50
         marker = {0: "▃", 1: "▅", 2: "▆", 3: "▉"}
         zero_marker = "▁"
@@ -471,6 +472,8 @@ def print_performance_metrics(
             f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
         )
         for dp_idx, metric_values in metric_dict.items():
+            if dp_idx > max_rows_to_print:
+                break
             timeline = []
             length = len(metric_values)
             if timeline_interval is not None:
