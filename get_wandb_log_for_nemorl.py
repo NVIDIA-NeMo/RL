@@ -2,6 +2,7 @@
 import wandb
 import argparse
 import os
+import pandas as pd
 #import pprint
 
 def parse_args():
@@ -18,7 +19,7 @@ def main():
     assert os.environ.get("WANDB_API_KEY") is not None, "WANDB_API_KEY is not set"
 
     keys = [
-        "train/mean_total_tokens_per_sample",
+        # "train/mean_total_tokens_per_sample",
         "timing/train/total_step_time",
         "timing/train/exposed_generation",
         # "timing/train/generation",
@@ -47,15 +48,29 @@ def main():
     max_step = args.at_step + args.average_steps // 2 - 1 + (args.average_steps % 2)
     history = run.history().loc[min_step:max_step, keys]
 
+    # add MFU
+    history['performance/train_mfu'] = history['performance/train_fp_utilization'] * 100
     # get average of the history
     average_history = history.mean(axis=0)
+
+    
     history_at_step = history.loc[args.at_step]
-    print("Average history:")
-    #pprint.pprint(average_history)
-    print(average_history)
-    print("History at step:")
-    #pprint.pprint(history_at_step)
-    print(history_at_step)
+    # print("Average history:")
+    # #pprint.pprint(average_history)
+    # print(average_history)
+    # print("History at step:")
+    # #pprint.pprint(history_at_step)
+    # print(history_at_step)
+
+    # with pd.option_context('display.float_format', '{:.2f}'.format): 블록 내에서만 설정이 유지됩니다.
+    with pd.option_context('display.float_format', '{:.2f}'.format):
+        print("---")
+        print("Average history (Averaged across steps):")
+        print(average_history)
+        print("---")
+        print("History at step (Step {}):".format(args.at_step))
+        print(history_at_step)
+        print("---")
 
 if __name__ == "__main__":
     main()
