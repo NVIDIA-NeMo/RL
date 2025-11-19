@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -384,7 +384,7 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
 
 def print_performance_metrics(
     train_results: dict[str, float],
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
     timing_metrics: dict[str, float],
     master_config: dict,
 ) -> dict[str, float]:
@@ -510,27 +510,43 @@ def print_performance_metrics(
         vllm_logger_metrics = metrics["vllm_logger_metrics"]
         # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
+
+        assert "inflight_batch_sizes" in vllm_logger_metrics, (
+            "inflight_batch_sizes not found in vllm_logger_metrics"
+        )
+        assert "num_pending_samples" in vllm_logger_metrics, (
+            "num_pending_samples not found in vllm_logger_metrics"
+        )
+        assert isinstance(vllm_logger_metrics["inflight_batch_sizes"], dict), (
+            "inflight_batch_sizes must be a dictionary"
+        )
+        assert isinstance(vllm_logger_metrics["num_pending_samples"], dict), (
+            "num_pending_samples must be a dictionary"
+        )
+
         vllm_metrics_logger_interval = master_config["policy"]["generation"][
             "vllm_cfg"
         ]["vllm_metrics_logger_interval"]
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
-        visualize_per_worker_timeline(
-            vllm_logger_metrics["inflight_batch_sizes"],
-            "Inflight Batch Sizes",
-            vllm_metrics_logger_interval,
-        )
-        max_num_pending_samples = max(
-            (max(v) if v else 0)
-            for v in vllm_logger_metrics["num_pending_samples"].values()
-        )
-        # If there is at least one pending sample, visualize the timeline
-        if max_num_pending_samples > 0:
+        if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
             visualize_per_worker_timeline(
-                vllm_logger_metrics["num_pending_samples"],
-                "Num Pending Samples",
-                None,
+                vllm_logger_metrics["inflight_batch_sizes"],
+                "Inflight Batch Sizes",
+                vllm_metrics_logger_interval,
             )
+        if len(vllm_logger_metrics["num_pending_samples"].values()) > 0:
+            max_num_pending_samples = max(
+                (max(v) if v else 0)
+                for v in vllm_logger_metrics["num_pending_samples"].values()
+            )
+            # If there is at least one pending sample, visualize the timeline
+            if max_num_pending_samples > 0:
+                visualize_per_worker_timeline(
+                    vllm_logger_metrics["num_pending_samples"],
+                    "Num Pending Samples",
+                    None,
+                )
 
     # =====================================================
     # Throughputs
