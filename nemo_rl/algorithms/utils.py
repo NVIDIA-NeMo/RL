@@ -400,7 +400,7 @@ def print_performance_metrics(
         per_worker_load_ratio = [
             v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
         ]
-        max_rows_to_print = 100
+        max_rows_to_print = 1000
         bar_length = 20
         print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
@@ -457,11 +457,10 @@ def print_performance_metrics(
         timeline_interval: float | None,
     ) -> None:
         dp_ranks = list(metric_dict.keys())
-        max_rows_to_print = 100
+        max_rows_to_print = 1000
         max_timeline_length = 50
         marker = {0: "▃", 1: "▅", 2: "▆", 3: "▉"}
         zero_marker = "▁"
-        # marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
 
         max_value = max((max(v) if v else 0) for v in metric_dict.values())
         bin_width = (max_value + 1) / len(marker)
