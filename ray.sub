@@ -5,7 +5,6 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
-#SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -112,7 +111,10 @@ LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
 # Number of GPUs per worker node
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+#GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+GPUS_PER_NODE=4
+
 
 # Detect GRES support and set GRES_ARG
 GRES_ARG=$(maybe_gres_arg)
