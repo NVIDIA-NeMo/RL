@@ -10,10 +10,10 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g-async-1off
 policy:
   megatron_cfg:
-    tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 2
     expert_model_parallel_size: 8
-    sequence_parallel: true
+    sequence_parallel: false
   generation:
     colocated:
       enabled: false
@@ -22,7 +22,7 @@ policy:
         gpus_per_node: 8
     vllm_cfg:
       async_engine: true
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
       gpu_memory_utilization: 0.8
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n8g-2T2G-async-1off
