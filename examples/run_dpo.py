@@ -160,6 +160,11 @@ def dpo_preprocessor(
         "loss_multiplier": loss_multiplier,
         "idx": idx,
     }
+
+    if "reward" in chosen_completion and "reward" in rejected_completion:
+        output["reward_chosen"] = chosen_completion["reward"]
+        output["reward_rejected"] = rejected_completion["reward"]
+
     return output
 
 

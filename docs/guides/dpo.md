@@ -4,6 +4,11 @@
 to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the
 [DPO paper](https://arxiv.org/pdf/2305.18290).
 
+## Other Objectives
+
+- [Identity Preference Optimization (IPO)](https://arxiv.org/pdf/2310.12036)
+- [Reward-Aware Preference Optimization (RPO) with backward KL divergence](https://arxiv.org/pdf/2406.11704), [forward KL divergence, and squared distance](https://arxiv.org/pdf/2502.00203)
+
 ## Launch a DPO Run
 
 The script [examples/run_dpo.py](../../examples/run_dpo.py) can be used to launch a DPO experiment. This script can either be launched locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
@@ -40,11 +45,13 @@ Each DPO dataset class is expected to have the following attributes:
   "completions": [ // list of dicts — The list of completions
     {
       "rank": 0, // int — The rank of the completion (lower rank is preferred)
-      "completion": [] // list of dicts — The completion message(s)
+      "completion": [], // list of dicts — The completion message(s)
+      "reward": 10.0, // Optional, float - The ground truth reward of the completion (required for rpo)
     },
     {
       "rank": 1, // int — The rank of the completion (lower rank is preferred)
-      "completion": [] // list of dicts — The completion message(s)
+      "completion": [], // list of dicts — The completion message(s)
+      "reward": 0.0, // Optional, float - The ground truth reward of the completion (required for rpo)
     }
   ]
 }
@@ -76,7 +83,8 @@ DPO training supports only two completions (where the lowest rank is preferred a
                     "role": "assistant",
                     "content": "The capital of Germany is Berlin."
                 }
-            ]
+            ],
+            "reward": 10.0 // required for rpo
         },
         {
             "rank": 1,
@@ -85,7 +93,8 @@ DPO training supports only two completions (where the lowest rank is preferred a
                     "role": "assistant",
                     "content": "The capital of Germany is Munich."
                 }
-            ]
+            ],
+            "reward": 0.0 // required for rpo
         }
     ]
 }
@@ -132,6 +141,8 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 - `dpo.sft_loss_weight`: Weight for the auxiliary SFT loss
 - `dpo.preference_average_log_probs`: Whether to average log probabilities over tokens in the preference loss term
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
+- `dpo.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl)
+- `dpo.gt_reward_scale`: Reward scale for ground-truth rewards, only used in RPO
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
 

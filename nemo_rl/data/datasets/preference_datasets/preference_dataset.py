@@ -28,6 +28,7 @@ class PreferenceDataset:
             {
                 "rank": int, # The rank of the completion (lower rank is preferred)
                 "completion": list of dicts, # The completion message(s)
+                "reward": float, # Optional; The ground trutch reward for the completion (required for RPO)
             }
     }
 

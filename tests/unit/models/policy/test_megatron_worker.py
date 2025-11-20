@@ -1384,6 +1384,8 @@ def test_megatron_dpo_training(tiny_llama_model_path):
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 

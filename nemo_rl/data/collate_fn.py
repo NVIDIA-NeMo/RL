@@ -149,6 +149,7 @@ def preference_collate_fn(
     loss_multiplier = []
     idx = []
     task_names = []
+    rewards = []
     for datum_spec in data_batch:
         ## interleave chosen and rejected examples
         message_log.append(datum_spec["message_log_chosen"])
@@ -158,6 +159,13 @@ def preference_collate_fn(
         loss_multiplier.extend([datum_spec["loss_multiplier"]] * 2)
         idx.extend([datum_spec["idx"]] * 2)
         task_names.extend([datum_spec.get("task_name", None)] * 2)
+        if "reward_chosen" in datum_spec and "reward_rejected" in datum_spec:
+            rewards.append(datum_spec["reward_chosen"])
+            rewards.append(datum_spec["reward_rejected"])
+    if rewards:
+        assert len(rewards) == len(message_log), (
+            f"rewards length ({len(rewards)}) and message_log length ({len(message_log)}) mismatch"
+        )
     length_batch: torch.Tensor = torch.tensor(length)
     loss_multiplier_batch: torch.Tensor = torch.tensor(loss_multiplier)
 
@@ -193,5 +201,7 @@ def preference_collate_fn(
     )
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
+    if rewards:
+        data["rewards"] = torch.Tensor(rewards)
 
     return data

@@ -629,6 +629,8 @@ class DPOLossConfig(TypedDict):
     sft_loss_weight: float
     preference_average_log_probs: bool
     sft_average_log_probs: bool
+    preference_loss: str
+    gt_reward_scale: float
 
 
 class DPOLossDataDict(TypedDict):
@@ -638,14 +640,25 @@ class DPOLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    rewards: NotRequired[torch.Tensor]
 
 
-class DPOLossFn(PreferenceLoss):
+class DPOLossFn(LossFunction):
     """Direct Preference Optimization (DPO) loss function.
 
-    This loss function implements the DPO algorithm as described in:
+    This loss function implements:
+    - the DPO algorithm as described in:
     "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
     (https://arxiv.org/abs/2305.18290)
+    - the IPO algorithm as described in:
+    "A General Theoretical Paradigm to Understand Learning from Human Preferences"
+    (https://arxiv.org/abs/2310.12036)
+    - the RPO algorithm (with squared distance and forward/backward KL divergence) as described in:
+    "Nemotron-4 340B Technical Report"
+    (https://arxiv.org/abs/2406.11704)
+    "Reward-aware Preference Optimization: A Unified Mathematical Framework for Model Alignment"
+    (https://arxiv.org/abs/2502.00203)
+
 
     The loss combines two main components:
     1. Preference Loss: Optimizes the model to prefer chosen responses over rejected ones
@@ -660,15 +673,31 @@ class DPOLossFn(PreferenceLoss):
     - L_pref(θ) is the preference loss term
     - L_sft(θ) is the supervised fine-tuning loss term
 
-    The preference loss term is computed as:
-    L_pref(θ) = -E[log(σ(β * (r_chosen - r_rejected)))]
+    For DPO, the preference loss term is computed as:
+    L_pref(θ) = -E[log(σ(β * Δ_r))]
+
+    For IPO, the preference loss term is computed as:
+    L_pref(θ) = E[(Δ_r - (1/(2β))) ^ 2]
+
+    For RPO with squared distance, the preference loss term is computed as:
+    L_pref(θ) = E[(Δ_r - Δ_gtr) ^ 2]
+
+    For RPO with forward KL divergence, the preference loss term is computed as:
+    L_pref(θ) = E[σ(β * Δ_r) * log(σ(β * Δ_r)/σ(Δ_gtr)) + σ(-β * Δ_r) * log(σ(-β * Δ_r)/σ(Δ_gtr))]
+
+    For RPO with backward KL divergence, the preference loss term is computed as:
+    L_pref(θ) = E[σ(Δ_gtr) * log(σ(Δ_gtr)/σ(β * Δ_r)) + σ(-Δ_gtr) * log(σ(-Δ_gtr)/σ(-β * Δ_r))]
 
     where:
     - σ is the sigmoid function
     - β is the reference_policy_kl_penalty
     - r_chosen and r_rejected are the rewards for chosen and rejected responses
+    - Δ_r is the difference in rewards (r_chosen - r_rejected)
     - The rewards are computed as the sum of log probability differences between
       the current policy and reference policy
+    - gt_r_chosen and gt_r_rejected are the ground truth rewards for chosen and rejected responses
+    - η is the ground truth rewards scale
+    - Δ_gtr is the scaled difference in ground truth rewards (η * gt_r_chosen - η * gt_r_rejected)
 
     If preference_average_log_probs is True, the rewards are averaged over tokens:
     r = (1/n) * Σ_t (log π_θ(a_t|s_t) - log π_ref(a_t|s_t))
@@ -685,6 +714,8 @@ class DPOLossFn(PreferenceLoss):
             - sft_loss_weight (float): Weight for the SFT loss term (w_s)
             - preference_average_log_probs (bool): Whether to average log probs across tokens in preference loss
             - sft_average_log_probs (bool): Whether to average log probs across tokens in SFT loss
+            - preference_loss (str): Type of preference loss to use
+            - gt_reward_scale (float): Scale of the ground truth rewards (η)
 
     Returns:
         tuple[torch.Tensor, dict]: A tuple containing:
@@ -702,9 +733,15 @@ class DPOLossFn(PreferenceLoss):
         self.sft_loss_weight = cfg["sft_loss_weight"]
         self.preference_average_log_probs = cfg["preference_average_log_probs"]
         self.sft_average_log_probs = cfg["sft_average_log_probs"]
+        self.preference_loss = cfg["preference_loss"]
+        self.gt_reward_scale = cfg["gt_reward_scale"]
         self.sft_loss = NLLLoss()
 
         self.loss_type = LossType.SEQUENCE_LEVEL
+
+    def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
+        # tensor is of shape (2*micro_batch_size,)
+        return tensor[::2], tensor[1::2]
 
     def _dpo_loss(
         self,
@@ -758,8 +795,96 @@ class DPOLossFn(PreferenceLoss):
         if self.preference_average_log_probs:
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
-        return self._preference_loss(
-            rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty
+        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
+        rewards_delta = rewards_chosen - rewards_rejected
+
+        if self.preference_loss == "dpo":
+            per_sample_loss = (
+                -torch.nn.functional.logsigmoid(
+                    self.reference_policy_kl_penalty * rewards_delta
+                )
+                * sample_mask[::2]
+            )  ## zero out invalid samples
+        elif self.preference_loss == "ipo":
+            assert self.reference_policy_kl_penalty != 0, (
+                "IPO requires a non-zero reference_policy_kl_penalty"
+            )
+            per_sample_loss = (
+                torch.square(
+                    rewards_delta - 1.0 / (2.0 * self.reference_policy_kl_penalty)
+                )
+                * sample_mask[::2]
+            )
+        elif self.preference_loss in ["rpo_fwd_kl", "rpo_bwd_kl", "rpo_sq"]:
+            assert "rewards" in data, "RPO requires rewards"
+            gt_rewards_chosen, gt_rewards_rejected = self.split_output_tensor(
+                data["rewards"]
+            )
+            gt_rewards_delta = self.gt_reward_scale * (
+                gt_rewards_chosen - gt_rewards_rejected
+            )
+
+            if "kl" in self.preference_loss:
+                logbeta_hat_chosen = torch.nn.functional.logsigmoid(
+                    self.reference_policy_kl_penalty * rewards_delta
+                )
+                logbeta_hat_rejected = torch.nn.functional.logsigmoid(
+                    -self.reference_policy_kl_penalty * rewards_delta
+                )
+                logalpha_hat_chosen = torch.nn.functional.logsigmoid(gt_rewards_delta)
+                logalpha_hat_rejected = torch.nn.functional.logsigmoid(
+                    -gt_rewards_delta
+                )
+
+                if "fwd" in self.preference_loss:
+                    per_sample_loss = (
+                        torch.exp(logbeta_hat_chosen)
+                        * (logbeta_hat_chosen - logalpha_hat_chosen)
+                        + torch.exp(logbeta_hat_rejected)
+                        * (logbeta_hat_rejected - logalpha_hat_rejected)
+                    ) * sample_mask[::2]
+                elif "bwd" in self.preference_loss:
+                    per_sample_loss = (
+                        torch.exp(logalpha_hat_chosen)
+                        * (logalpha_hat_chosen - logbeta_hat_chosen)
+                        + torch.exp(logalpha_hat_rejected)
+                        * (logalpha_hat_rejected - logbeta_hat_rejected)
+                    ) * sample_mask[::2]
+            elif self.preference_loss == "rpo_sq":
+                per_sample_loss = (
+                    torch.square(
+                        self.reference_policy_kl_penalty * rewards_delta
+                        - gt_rewards_delta
+                    )
+                    * sample_mask[::2]
+                )
+        else:
+            raise NotImplementedError(
+                f"preference loss {self.preference_loss} is not implemented"
+            )
+
+        ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
+        return (
+            masked_mean(
+                per_sample_loss,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_chosen > rewards_rejected,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_chosen,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_rejected,
+                sample_mask[1::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
         )
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLoss)

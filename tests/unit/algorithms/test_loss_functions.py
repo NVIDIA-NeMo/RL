@@ -147,6 +147,8 @@ def test_dpo_loss():
             "sft_loss_weight": 0.0,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -169,6 +171,8 @@ def test_dpo_loss():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -208,6 +212,8 @@ def test_dpo_loss_varying_sequence_lengths():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
     dpo_loss_fn_avg = DPOLossFn(
@@ -217,6 +223,8 @@ def test_dpo_loss_varying_sequence_lengths():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": True,
             "sft_average_log_probs": True,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -338,6 +346,8 @@ def test_dpo_sft_matches_nll_loss():
             "sft_loss_weight": 1.0,  # Only use SFT loss
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
     dpo_loss, dpo_metrics = dpo_loss_fn(
@@ -361,6 +371,275 @@ def test_dpo_sft_matches_nll_loss():
         )
     )
     torch.testing.assert_close(scaled_dpo_loss, nll_loss)
+
+
+def test_ipo_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 1.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": True,
+            "sft_average_log_probs": False,
+            "preference_loss": "ipo",
+            "gt_reward_scale": 1.0,
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.25))
+
+    expected_rewards_delta = 2.232  # approx sqrt(3) + 0.5
+
+    target_lp = -expected_rewards_delta * torch.tile(torch.tensor([[0], [1]]), (1, 3))
+    next_token_logits = _create_exact_logits(
+        target_lp, data["input_ids"], batch_size * 2, 4, vocab_size, "cuda"
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Hand Calculation
+    expected_loss = (
+        expected_rewards_delta
+        - torch.tensor(1 / (2 * loss_fn.reference_policy_kl_penalty))
+    ) ** 2
+    # (2.23 - (1 / (2 * 1))^2 = (2.23 - 0.5)^2 = 1.73^2 = 3 (approx)
+    assert torch.isclose(expected_loss, torch.tensor(3.0), rtol=1e-3)
+
+    assert torch.isclose(loss.cpu(), expected_loss)
+
+
+def test_rpo_sq_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 1.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": True,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_sq",
+            "gt_reward_scale": 1.0,
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+    expected_rewards_delta = 2.232  # approx sqrt(3) + 0.5
+
+    target_lp = -expected_rewards_delta * torch.tile(torch.tensor([[0], [1]]), (1, 3))
+    next_token_logits = _create_exact_logits(
+        target_lp, data["input_ids"], batch_size * 2, 4, vocab_size, "cuda"
+    )
+
+    gt_rewards_delta = 0.5
+    data["rewards"] = gt_rewards_delta * torch.tensor([1, 0]).to("cuda")
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Hand Calculation
+    expected_loss = torch.tensor(expected_rewards_delta - gt_rewards_delta) ** 2
+    # (2.23 - 0.5)^2 = 1.73^2 = 3 (approx)
+    assert torch.isclose(expected_loss, torch.tensor(3.0), rtol=1e-3)
+
+    assert torch.isclose(loss.cpu(), expected_loss)
+
+
+def test_rpo_fwd_kl_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 1.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": True,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_fwd_kl",
+            "gt_reward_scale": 1.0,
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+    expected_rewards_delta = 1.38629  # σ(1.38629) = 0.8 (approx)
+
+    target_lp = -expected_rewards_delta * torch.tile(torch.tensor([[0], [1]]), (1, 3))
+    next_token_logits = _create_exact_logits(
+        target_lp, data["input_ids"], batch_size * 2, 4, vocab_size, "cuda"
+    )
+
+    gt_rewards_delta = 0.40547  # σ(.40547) = 0.6 (approx)
+    data["rewards"] = gt_rewards_delta * torch.tensor([1, 0]).to("cuda")
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Hand Calculation
+    sig_r = torch.sigmoid(torch.tensor(expected_rewards_delta))
+    assert torch.isclose(sig_r, torch.tensor(0.8))
+
+    sig_gtr = torch.sigmoid(torch.tensor(gt_rewards_delta))
+    assert torch.isclose(sig_gtr, torch.tensor(0.6))
+
+    # Note σ(-x) = 1 - σ(x)
+    expected_loss = sig_r * torch.log(sig_r / sig_gtr) + (1 - sig_r) * torch.log(
+        (1 - sig_r) / (1 - sig_gtr)
+    )
+    # = 0.8 * log(0.8 / 0.6) + (1 - 0.8) * log ((1 - 0.8) / (1 - 0.6))
+    # = 0.8 * log(0.8 / 0.6) + 0.2 * log (0.2 / 0.4)
+    # = 0.8 * 0.2878 + 0.2 * -0.6931 = 0.0916 (approx)
+    assert torch.isclose(expected_loss, torch.tensor(0.0916), rtol=1e-3)
+
+    assert torch.isclose(loss.cpu(), expected_loss)
+
+
+def test_rpo_bwd_kl_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 1.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": True,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_bwd_kl",
+            "gt_reward_scale": 1.0,
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+    expected_rewards_delta = 1.38629  # σ(1.38629) = 0.8 (approx)
+
+    target_lp = -expected_rewards_delta * torch.tile(torch.tensor([[0], [1]]), (1, 3))
+    next_token_logits = _create_exact_logits(
+        target_lp, data["input_ids"], batch_size * 2, 4, vocab_size, "cuda"
+    )
+
+    gt_rewards_delta = 0.40547  # σ(.40547) = 0.6 (approx)
+    data["rewards"] = gt_rewards_delta * torch.tensor([1, 0]).to("cuda")
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Hand Calculation
+    sig_r = torch.sigmoid(torch.tensor(expected_rewards_delta))
+    assert torch.isclose(sig_r, torch.tensor(0.8))
+
+    sig_gtr = torch.sigmoid(torch.tensor(gt_rewards_delta))
+    assert torch.isclose(sig_gtr, torch.tensor(0.6))
+
+    # Note σ(-x) = 1 - σ(x)
+    expected_loss = sig_gtr * torch.log(sig_gtr / sig_r) + (1 - sig_gtr) * torch.log(
+        (1 - sig_gtr) / (1 - sig_r)
+    )
+    # = 0.6 * log(0.6 / 0.8) + (1 - 0.6) * log ((1 - 0.6) / (1 - 0.8))
+    # = 0.6 * log(0.6 / 0.8) + 0.4 * log (0.4 / 0.2)
+    # = 0.6 * -0.2878 + 0.4 * 0.6931 = 0.1046 (approx)
+    assert torch.isclose(expected_loss, torch.tensor(0.1046), rtol=1e-3)
+
+    assert torch.isclose(loss.cpu(), expected_loss)
 
 
 def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="cuda"):
