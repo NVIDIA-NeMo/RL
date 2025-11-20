@@ -86,7 +86,6 @@ data:
   dataset_name: DAPOMath17K
 env:
   math:
-    enabled: true
     num_workers: 16
     math_verify_impl: "dapo_math_verify"
 

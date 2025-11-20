@@ -17,11 +17,13 @@ from typing import Any, Optional
 
 from datasets import Dataset, load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 def format_math(
-    data: dict[str, str | float | int], output_key: str = "expected_answer"
+    data: dict[str, str | float | int],
+    output_key: str = "expected_answer",
+    task_name: str = "OpenMathInstruct-2",
 ) -> dict[str, list[Any] | str]:
     return {
         "messages": [
@@ -34,6 +36,7 @@ def format_math(
                 "content": data[output_key],
             },
         ],
+        "task_name": task_name,
     }
 
 
@@ -59,33 +62,21 @@ def prepare_openinstructmath2_dataset(
     train_formatted = split_ds["train"].map(
         format_math,
         remove_columns=split_ds["train"].column_names,
-        fn_kwargs={"output_key": output_key},
+        fn_kwargs={"output_key": output_key, "task_name": task_name},
     )
     val_formatted = split_ds["test"].map(
         format_math,
         remove_columns=split_ds["test"].column_names,
-        fn_kwargs={"output_key": output_key},
+        fn_kwargs={"output_key": output_key, "task_name": task_name},
     )
-    # Safely set/override task_name without creating duplicate columns
-    if "task_name" in train_formatted.column_names:
-        train_formatted = train_formatted.map(lambda _: {"task_name": task_name})
-    else:
-        train_formatted = train_formatted.add_column(
-            "task_name", [task_name] * len(train_formatted)
-        )
-    if "task_name" in val_formatted.column_names:
-        val_formatted = val_formatted.map(lambda _: {"task_name": task_name})
-    else:
-        val_formatted = val_formatted.add_column(
-            "task_name", [task_name] * len(val_formatted)
-        )
+
     return {
         "train": train_formatted,
         "validation": val_formatted,
     }
 
 
-class OpenMathInstruct2Dataset:
+class OpenMathInstruct2Dataset(RawDataset):
     def __init__(
         self,
         split: str = "train_1M",
@@ -113,8 +104,4 @@ class OpenMathInstruct2Dataset:
             test_size=test_size,
             output_key=output_key,
             task_name=self.task_name,
-        )
-        self.task_spec = TaskDataSpec(
-            task_name=self.task_name,
-            prompt_file=prompt_file,
         )

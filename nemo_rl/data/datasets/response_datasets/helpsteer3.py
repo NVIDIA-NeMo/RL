@@ -16,11 +16,13 @@ from typing import Any
 from absl import logging
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 # Choose the chosen response as the response and the rejected response as the target
-def to_response_data_format(data: dict[str, Any]) -> dict:
+def to_response_data_format(
+    data: dict[str, Any], task_name: str = "HelpSteer3"
+) -> dict:
     response_1 = data["response1"]
     response_2 = data["response2"]
     overall_preference = data["overall_preference"]
@@ -45,20 +47,16 @@ def to_response_data_format(data: dict[str, Any]) -> dict:
     return {
         "context": context,
         "response": [{"role": "assistant", "content": chosen}],
+        "task_name": task_name,
     }
 
 
-class HelpSteer3Dataset:
+class HelpSteer3Dataset(RawDataset):
     """HelpSteer3 preference dataset for DPO training."""
 
     def __init__(self) -> None:
         ds = load_dataset("nvidia/HelpSteer3", "preference")
         self.task_name = "HelpSteer3"
-        self.formatted_ds = ds.map(to_response_data_format)
-        self.formatted_ds = self.formatted_ds.map(
-            lambda _: {"task_name": self.task_name}
-        )
-
-        self.task_spec = TaskDataSpec(
-            task_name=self.task_name,
+        self.formatted_ds = ds.map(
+            to_response_data_format, fn_kwargs={"task_name": self.task_name}
         )

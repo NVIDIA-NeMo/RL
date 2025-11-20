@@ -25,7 +25,6 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.environments.utils import ENV_REGISTRY
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -357,45 +356,6 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "helpsteer3_data_processor": helpsteer3_data_processor,
     },
 )
-
-
-# Task data processor is tied to the environment. In fact we can set it to related to dataset type.
-# For example, we can have a processor for response dataset, a processor for preference dataset, etc.
-def get_processors(env_name: str, env_configs: dict) -> TaskDataProcessFnCallable:
-    env_config = env_configs[env_name]
-    env_config_processor = env_config.get("processor")
-    env_default_processor = ENV_REGISTRY[env_name].get("default_processor")
-
-    if env_default_processor is None and env_config_processor is None:
-        raise ValueError(
-            f"Dataset processor not specified for env {env_name} and default processor is not specified"
-        )
-    elif env_default_processor is None and env_config_processor is not None:
-        env_processor = env_config_processor
-        print(
-            f"[INFO] No default processor specified for env {env_name}, using processor {env_config_processor}"
-        )
-    elif env_default_processor is not None and env_config_processor is None:
-        env_processor = env_default_processor
-        print(
-            f"[INFO] No processor specified for env {env_name}, using default processor {env_default_processor}"
-        )
-    else:
-        # If both are specified, use the processor specified in the env config.
-        env_processor = env_config_processor
-        print(
-            f"[INFO] Both default processor and processor specified for env {env_name}, using processor specified in env config {env_config_processor}"
-        )
-
-    assert env_processor is not None, (
-        f"Dataset processor not specified for env {env_name}"
-    )
-    if env_processor not in PROCESSOR_REGISTRY:
-        raise ValueError(f"Invalid env dataset processor: {env_processor}")
-
-    processor = PROCESSOR_REGISTRY[env_processor]
-    print(f"[INFO] Using dataset processor {env_processor} for env {env_name}")
-    return processor
 
 
 def register_processor(

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from importlib import import_module
 from typing import Any, Dict, NotRequired, TypedDict
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.path import import_class_from_path
 
 
 # Environment registry entry schema.
@@ -29,11 +29,9 @@ class EnvRegistryEntry(TypedDict, total=False):
 ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "math_default": {
         "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
-        "default_processor": "math_hf_data_processor",
     },
     "math": {
         "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
-        "default_processor": "math_hf_data_processor",
     },
     "code": {
         "actor_class_fqn": "nemo_rl.environments.code_environment.CodeEnvironment",
@@ -43,7 +41,6 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     },
     "code_jaccard": {
         "actor_class_fqn": "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment",
-        "default_processor": "helpsteer3_data_processor",
     },
 }
 
@@ -93,19 +90,6 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
 
     return chunks
-
-
-def import_class_from_path(class_fqn: str):
-    """Define a function to import a class from a string path for environment registration.
-
-    Note: Can not use nemo_rl.models.policy.utils.import_class_from_path because it depends on zmq.
-
-    Example:
-        'nemo_rl.environments.math_environment.MathEnvironment'
-    """
-    module_name, class_name = class_fqn.rsplit(".", 1)
-    module = import_module(module_name)
-    return getattr(module, class_name)
 
 
 def get_env(env_name: str, env_configs: dict) -> EnvironmentInterface:

@@ -1,11 +1,11 @@
 # GRPO Algorithm Configuration
 defaults: "grpo_math_1B.yaml"
 
+data:
+  env_name: "reward_model"
+
 env:
-  math:
-    enabled: false
   reward_model:  
-    enabled: true
     processor: "math_hf_data_processor"
     model_name: "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
     tokenizer:

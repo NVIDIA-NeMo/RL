@@ -32,6 +32,7 @@ from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
+# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
 def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
@@ -131,6 +132,19 @@ def load_response_dataset(data_config, seed: int = 42):
             "Please either use a built-in dataset "
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
+
+    base_dataset.set_task_spec(data_config)
+    # Skip sft datasets, the run_sft.py has not been refactored yet.
+    # TODO: refactor run_sft.py to use the new processor interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
+    if dataset_name not in [
+        "open_assistant",
+        "squad",
+        "openmathinstruct2",
+        "clevr_cogent",
+        "openai_format",
+        "tulu3_sft_mixture",
+    ]:
+        base_dataset.set_processor()
 
     return base_dataset
 

@@ -14,11 +14,11 @@
 
 from typing import Any, Optional
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class ResponseDataset:
+class ResponseDataset(RawDataset):
     """Dataset class for response data which can be loaded from a JSON file.
 
     This class handles loading of response data for SFT and RL training.
@@ -48,7 +48,7 @@ class ResponseDataset:
     ):
         self.input_key = input_key
         self.output_key = output_key
-
+        self.task_name = "ResponseDataset"
         # load from json file or huggingface
         train_ds = load_dataset_from_path(train_data_path, train_split)
         if val_data_path:
@@ -57,9 +57,13 @@ class ResponseDataset:
             val_ds = None
 
         # format the dataset
-        train_ds = train_ds.map(self.add_messages_key)
+        train_ds = train_ds.map(
+            self.add_messages_key, fn_kwargs={"task_name": self.task_name}
+        )
         if val_ds:
-            val_ds = val_ds.map(self.add_messages_key)
+            val_ds = val_ds.map(
+                self.add_messages_key, fn_kwargs={"task_name": self.task_name}
+            )
 
         # store the formatted dataset
         self.formatted_ds = {
@@ -67,14 +71,13 @@ class ResponseDataset:
             "validation": val_ds,
         }
 
-        self.task_spec = TaskDataSpec(task_name="ResponseDataset")
-
     def add_messages_key(
-        self, example: dict[str, Any]
-    ) -> dict[str, list[dict[str, Any]]]:
+        self, example: dict[str, Any], task_name: str = "ResponseDataset"
+    ) -> dict[str, str | list[dict[str, Any]]]:
         return {
             "messages": [
                 {"role": "user", "content": example[self.input_key]},
                 {"role": "assistant", "content": example[self.output_key]},
-            ]
+            ],
+            "task_name": task_name,
         }
