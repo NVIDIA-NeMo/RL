@@ -18,8 +18,6 @@ from typing import Any, Callable, Union
 
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
-
 
 class PreservingDataset:
     """A dataset wrapper that preserves original dict structure without None-filling.
@@ -195,10 +193,7 @@ class OpenAIFormatDataset:
             "train": formatted_train_dataset,
             "validation": formatted_val_dataset,
         }
-
-        self.task_spec = TaskDataSpec(
-            "json_dataset",
-        )
+        self.task_name = "json_dataset"
 
     def add_messages_key(
         self,

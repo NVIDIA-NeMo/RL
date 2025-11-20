@@ -22,6 +22,7 @@ from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDatas
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
+# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
 def load_preference_dataset(data_config):
     """Loads preference dataset."""
     dataset_name = data_config["dataset_name"]

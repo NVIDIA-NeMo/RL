@@ -16,10 +16,12 @@ from typing import Any
 
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-def format_tulu3_sft_mixture(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
+def format_tulu3_sft_mixture(
+    data: dict[str, Any], task_name: str = "tulu3_sft_mixture"
+) -> dict[str, str | dict[str, str]]:
     """Format for Tulu3 SFT data."""
     messages = data["messages"]
 
@@ -29,10 +31,11 @@ def format_tulu3_sft_mixture(data: dict[str, Any]) -> dict[str, str | dict[str, 
 
     return {
         "messages": messages,
+        "task_name": task_name,
     }
 
 
-class Tulu3SftMixtureDataset:
+class Tulu3SftMixtureDataset(RawDataset):
     """Tulu3 SFT mixture dataset."""
 
     def __init__(
@@ -75,33 +78,15 @@ class Tulu3SftMixtureDataset:
         train_formatted = split_ds["train"].map(
             format_tulu3_sft_mixture,
             remove_columns=split_ds["train"].column_names,
+            fn_kwargs={"task_name": self.task_name},
         )
         val_formatted = split_ds["test"].map(
             format_tulu3_sft_mixture,
             remove_columns=split_ds["test"].column_names,
+            fn_kwargs={"task_name": self.task_name},
         )
-
-        if "task_name" in train_formatted.column_names:
-            train_formatted = train_formatted.map(
-                lambda _: {"task_name": self.task_name}
-            )
-        else:
-            train_formatted = train_formatted.add_column(
-                "task_name", [self.task_name] * len(train_formatted)
-            )
-        if "task_name" in val_formatted.column_names:
-            val_formatted = val_formatted.map(lambda _: {"task_name": self.task_name})
-        else:
-            val_formatted = val_formatted.add_column(
-                "task_name", [self.task_name] * len(val_formatted)
-            )
 
         self.formatted_ds = {
             "train": train_formatted,
             "validation": val_formatted,
         }
-
-        self.task_spec = TaskDataSpec(
-            task_name="Tulu3SftMixture",
-            prompt_file=prompt_file,
-        )

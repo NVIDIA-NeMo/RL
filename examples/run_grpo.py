@@ -29,7 +29,7 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.data.processors import get_processors, math_hf_data_processor
+from nemo_rl.data.processors import math_hf_data_processor
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import get_env
@@ -71,14 +71,7 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up envs...")
-    enabled_envs = [
-        env_name
-        for env_name, env_config in env_configs.items()
-        if env_config["enabled"]
-    ]
-    assert len(enabled_envs) == 1, "Only support single environment for now"
-
-    env_name = enabled_envs[0]
+    env_name = data_config["env_name"]
     env = get_env(env_name=env_name, env_configs=env_configs)
 
     print("\n▶ Setting up data...")
@@ -96,13 +89,13 @@ def setup_data(
     data: Any = load_response_dataset(data_config, seed)
     task_spec = data.task_spec
     task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
-    task_processor = get_processors(env_name=env_name, env_configs=env_configs)
-    task_data_processors[task_name] = (task_spec, task_processor)
+    assert hasattr(data, "processor"), "Dataset must have a processor attribute"
+    task_data_processors[task_name] = (task_spec, data.processor)
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
-        task_spec,
+        default_task_spec,  # default task data spec to process any values not specified in the task-specific specs
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -112,7 +105,7 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
-            task_spec,
+            default_task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
