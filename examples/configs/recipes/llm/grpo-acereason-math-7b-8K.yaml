@@ -33,9 +33,9 @@ policy:
       enforce_eager: true
       load_format: dummy
       max_model_len: 8192
-      precision: float32
+      precision: bfloat16
       skip_tokenizer_init: true
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4
   logprob_batch_size: 2
   lr: 1.0e-06
   make_sequence_length_divisible_by: 4
@@ -46,7 +46,6 @@ policy:
     kwargs:
       lr: 1.0e-06
   pipeline_model_parallel_size: 1
-  precision: float32
   refit_buffer_size_gb: 4
   scheduler:
   - kwargs:
@@ -84,4 +83,3 @@ logger:
   monitor_gpus: false
 cluster:
   gpus_per_node: 8
-
