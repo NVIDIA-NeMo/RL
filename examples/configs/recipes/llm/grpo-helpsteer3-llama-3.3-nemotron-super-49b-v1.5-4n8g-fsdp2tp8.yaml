@@ -43,13 +43,11 @@ data:
   prompt_file: null
   dataset_name: HelpSteer3
   split: preference
+  env_name: "code_jaccard"
+  processor: helpsteer3_data_processor
 env:
-  math:
-    enabled: false
   code_jaccard:
-    enabled: true
     num_workers: 8
-    processor: helpsteer3_data_processor
 logger:
   wandb_enabled: true
   wandb:

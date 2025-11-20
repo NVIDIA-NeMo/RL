@@ -66,7 +66,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_rl.models.policy.utils import import_class_from_path
+from nemo_rl.utils.path import import_class_from_path
 
 
 class RotaryEmbedParallel(SequenceParallel):

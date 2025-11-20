@@ -12,7 +12,7 @@ We recommend launching the job using `uv`:
 uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
 ```
 
-If not specified, `config` will default to [examples/configs/grpo.yaml](../../examples/configs/grpo_math_1B.yaml).
+If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
 **Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
@@ -85,6 +85,37 @@ def my_data_processor(
 
 We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py).
 
+### Task–Dataset Mapping
+
+- task_name (unique task identifier):
+  - Determines which processor, env, prompts, and dataset to use for this task.
+  - Currently we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in config (i.e., config.data.dataset_name).
+- task_spec (TaskDataSpec):
+  - Specifies per-task system prompt and prompt (with defaults applied from a global spec when unspecified).
+- task_data_processors:
+  - Dict mapping: task_name -> (task_spec, processor_fn).
+  - Typical flow: provide a default mapping via defaultdict, then explicitly register the dataset-provided processor under the resolved task_name.
+
+Example (simplified):
+
+```python
+default_task_spec = TaskDataSpec(
+    task_name="math_default",
+    prompt_file=data_config["prompt_file"],
+    system_prompt_file=data_config["system_prompt_file"],
+)
+
+task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
+    lambda: (default_task_spec, math_hf_data_processor)
+)
+
+# Resolve task_name from dataset or spec
+task_spec = data.task_spec
+task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+assert hasattr(data, "processor"), "Dataset must have a processor attribute"
+task_data_processors[task_name] = (task_spec, data.processor)
+```
+
 #### Putting It All Together
 
 GRPO expects datasets to have the following form:
@@ -96,20 +127,50 @@ GRPO expects datasets to have the following form:
 Then, you can set the data up as follows:
 
 ```python
-base_dataset = load_dataset("json", data_files=data_config["dataset_name"])["train"]
-tokenizer = get_tokenizer(tokenizer_config)
 
-task_data_processors = defaultdict(lambda: (math_task_spec, math_data_processor))
-task_data_processors["math"] = (math_task_spec, math_data_processor)
+# 1) Select environment from data config
+env_name = data_config["env_name"]
+env = get_env(env_name=env_name, env_configs=env_configs)
 
-math_env = MathEnvironment.remote(env_configs["math"]) # ray remote actor
+# 2) Build default TaskDataSpec from config (prompts loaded from files if present)
+default_task_spec = TaskDataSpec(
+    task_name="math_default",
+    prompt_file=data_config["prompt_file"],
+    system_prompt_file=data_config["system_prompt_file"],
+)
 
+# 3) Define default processor mapping
+task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
+    lambda: (default_task_spec, math_hf_data_processor)
+)
+
+# 4) Load dataset via helper (built-ins or local/HF datasets)
+data = load_response_dataset(data_config, seed)
+
+# 5) Resolve task spec/name and ensure dataset provides a processor
+task_spec = data.task_spec
+task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+assert hasattr(data, "processor"), "Dataset must have a processor attribute"
+task_data_processors[task_name] = (task_spec, data.processor)
+
+# 6) Construct processed datasets (train and optional validation)
 dataset = AllTaskProcessedDataset(
-    base_dataset,
+    data.formatted_ds["train"],
     tokenizer,
-    math_task_spec,
+    default_task_spec,
     task_data_processors,
     max_seq_length=data_config["max_input_seq_length"],
+)
+val_dataset = (
+    AllTaskProcessedDataset(
+        data.formatted_ds["validation"],
+        tokenizer,
+        default_task_spec,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+    if data.formatted_ds["validation"]
+    else None
 )
 ```
 
@@ -120,6 +181,25 @@ Ensure you provide a mapping of tasks to their processors so the dataset knows w
 GRPO supports various types of environments for different tasks, including **[Math](../../nemo_rl/environments/math_environment.py)**, **[Code](../../nemo_rl/environments/code_environment.py)**, and **[Reward Model](../../nemo_rl/environments/reward_model_environment.py)** environments. Each environment provides a standardized interface for reward computation and evaluation, enabling consistent training across diverse domains.
 
 For more information about environments, see the [Environments Guide](environments.md).
+
+### Env–Task Mapping
+
+- env:
+  - The environment actor for reward/evaluation, constructed via `get_env(env_name=..., env_configs=...)`.
+  - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
+- task_to_env:
+  - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
+
+Example (simplified):
+
+```python
+env_name = data_config["env_name"]  # declared under config.data
+env = get_env(env_name=env_name, env_configs=env_configs)
+
+task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: env)
+task_to_env[task_name] = env
+val_task_to_env = task_to_env  # validation usually mirrors training mapping
+```
 
 ## Policy Model
 
@@ -141,7 +221,7 @@ RL generations typically produce highly variable sequence lengths, which result 
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss_functions.py) to calculate the loss for GRPO. Formally,
 
 $$
-L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})
+L(\theta) = E_{x \sim \pi_{\theta_{\¬text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})
 $$
 
 where:
