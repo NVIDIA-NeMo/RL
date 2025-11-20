@@ -350,6 +350,7 @@ def multichoice_qa_processor(
 PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     Dict[str, TaskDataProcessFnCallable],
     {
+        "default": math_hf_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "math_data_processor": math_data_processor,
