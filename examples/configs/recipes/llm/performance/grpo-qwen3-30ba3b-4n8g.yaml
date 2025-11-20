@@ -17,10 +17,10 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
-    sequence_parallel: true
+    sequence_parallel: false
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08
