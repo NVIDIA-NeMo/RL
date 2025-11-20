@@ -25,10 +25,11 @@ class RawDataset:
         raise NotImplementedError("__init__ is not implemented")
 
     def set_processor(self):
-        assert "processor" in self.data_config, (
-            "Processor not specified in data configs"
+        processor_name = (
+            self.data_config["processor"]
+            if "processor" in self.data_config
+            else "default"
         )
-        processor_name = self.data_config["processor"]
         assert processor_name in PROCESSOR_REGISTRY, (
             f"Processor {processor_name} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."
         )
@@ -36,14 +37,10 @@ class RawDataset:
 
     def set_task_spec(self, data_config: dict):
         self.data_config = data_config
-        assert "prompt_file" in self.data_config, (
-            "prompt_file not specified in data configs"
-        )
-        assert "system_prompt_file" in self.data_config, (
-            "system_prompt_file not specified in data configs"
-        )
+        system_prompt_file = self.data_config.get("system_prompt_file", None)
+        prompt_file = self.data_config.get("prompt_file", None)
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
-            prompt_file=self.data_config["prompt_file"],
-            system_prompt_file=self.data_config["system_prompt_file"],
+            prompt_file=prompt_file,
+            system_prompt_file=system_prompt_file,
         )
