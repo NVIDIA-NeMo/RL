@@ -1023,13 +1023,6 @@ class Logger(LoggerInterface):
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(f"{name} (per worker)")
         ax.set_title(name)
-        legend_cols = max(1, min(3, (len(series_labels) + 7) // 8))
-        ax.legend(
-            loc="upper right",
-            framealpha=0.8,
-            ncol=legend_cols,
-            fontsize="small",
-        )
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
 
