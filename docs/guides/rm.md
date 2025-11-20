@@ -2,6 +2,14 @@
 
 This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the DTensor backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
 
+## Objectives
+
+NeMo RL supports reward model training with preference loss as described in
+- [Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290)
+- [Identity Preference Optimization (IPO)](https://arxiv.org/pdf/2310.12036)
+- [Reward-Aware Preference Optimization (RPO) with backward KL divergence](https://arxiv.org/pdf/2406.11704), [forward KL divergence, and squared distance](https://arxiv.org/pdf/2502.00203)
+
+
 ## Launch a Training Job
 
 The script, [examples/run_rm.py](../../examples/run_rm.py), is used to train a Bradley-Terry reward model. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
@@ -29,11 +37,13 @@ Each RM dataset class is expected to have the following attributes:
   "completions": [ // list of dicts — The list of completions
     {
       "rank": 0, // int — The rank of the completion (lower rank is preferred)
-      "completion": [] // list of dicts — The completion message(s)
+      "completion": [], // list of dicts — The completion message(s)
+      "reward": 10.0, // Optional, float - The ground truth reward of the completion (required for rpo)
     },
     {
       "rank": 1, // int — The rank of the completion (lower rank is preferred)
-      "completion": [] // list of dicts — The completion message(s)
+      "completion": [], // list of dicts — The completion message(s)
+      "reward": 0.0, // Optional, float - The ground truth reward of the completion (required for rpo)
     }
   ]
 }
@@ -65,7 +75,8 @@ Currently, RM training supports only two completions (where the lowest rank is p
                     "role": "assistant",
                     "content": "The capital of Germany is Berlin."
                 }
-            ]
+            ],
+            "reward": 10.0 // required for rpo
         },
         {
             "rank": 1,
@@ -74,7 +85,8 @@ Currently, RM training supports only two completions (where the lowest rank is p
                     "role": "assistant",
                     "content": "The capital of Germany is Munich."
                 }
-            ]
+            ],
+            "reward": 0.0 // required for rpo
         }
     ]
 }
@@ -111,6 +123,14 @@ data:
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+
+## Reward Model Specific Training Parameters
+
+The reward model training implementation in NeMo RL supports key parameters that can be adjusted:
+
+- `dpo.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl)
+- `dpo.beta`: Scaling parameter (ex: `reference_policy_kl_penalty` in DPO)
+- `dpo.eta`: Reward scale for ground-truth rewards, only used in RPO
 
 ## Using Reward Models as Environments
 

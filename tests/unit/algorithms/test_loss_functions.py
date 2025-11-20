@@ -407,8 +407,7 @@ def test_ipo_loss():
 
     # Hand Calculation
     expected_loss = (
-        expected_rewards_delta
-        - torch.tensor(1 / (2 * loss_fn.reference_policy_kl_penalty))
+        expected_rewards_delta - torch.tensor(1 / (2 * loss_fn.preference_loss.beta))
     ) ** 2
     # (2.23 - (1 / (2 * 1))^2 = (2.23 - 0.5)^2 = 1.73^2 = 3 (approx)
     assert torch.isclose(expected_loss, torch.tensor(3.0), rtol=1e-3)
