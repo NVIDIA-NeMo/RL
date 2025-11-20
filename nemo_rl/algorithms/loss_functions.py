@@ -771,7 +771,7 @@ class DPOLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
         seq_index = data.get("seq_index", None)
