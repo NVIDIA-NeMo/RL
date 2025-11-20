@@ -16,7 +16,3 @@ dependencies = [
   "sphinxcontrib-mermaid",
   "swagger-plugin-for-sphinx",
 ]
-
-[tool.uv]
-# DO NOT create or modify the main project lockfile.
-no-lock = true
