@@ -12,6 +12,10 @@ rm:
   val_at_start: false
   seed: 42
 
+  preference_loss: dpo
+  beta: 1.
+  eta: 1.
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/rm"

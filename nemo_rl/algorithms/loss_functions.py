@@ -438,12 +438,19 @@ class NLLLoss(LossFunction):
         }
 
 
+class PreferenceLossConfig(TypedDict):
+    preference_loss: str
+    beta: float
+    eta: float
+
+
 class PreferenceLossDataDict(TypedDict):
     """Required keys for the preference loss function."""
 
     input_ids: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    rewards: NotRequired[torch.Tensor]
 
 
 class PreferenceLoss(LossFunction):
@@ -451,13 +458,48 @@ class PreferenceLoss(LossFunction):
 
     Optimizes the model to prefer chosen responses over rejected ones
 
-    The preference loss is computed as:
-    L_pref(θ) = -E[log(σ(β * (r_chosen - r_rejected)))]
+    This loss function implements the preference loss component of:
+    - the DPO algorithm as described in:
+    "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    (https://arxiv.org/abs/2305.18290)
+    - the IPO algorithm as described in:
+    "A General Theoretical Paradigm to Understand Learning from Human Preferences"
+    (https://arxiv.org/abs/2310.12036)
+    - the RPO algorithm (with squared distance and forward/backward KL divergence) as described in:
+    "Nemotron-4 340B Technical Report"
+    (https://arxiv.org/abs/2406.11704)
+    "Reward-aware Preference Optimization: A Unified Mathematical Framework for Model Alignment"
+    (https://arxiv.org/abs/2502.00203)
+
+    For DPO, the preference loss term is computed as:
+    L_pref(θ) = -E[log(σ(β * Δ_r))]
+
+    For IPO, the preference loss term is computed as:
+    L_pref(θ) = E[(Δ_r - (1/(2β))) ^ 2]
+
+    For RPO with squared distance, the preference loss term is computed as:
+    L_pref(θ) = E[(Δ_r - Δ_gtr) ^ 2]
+
+    For RPO with forward KL divergence, the preference loss term is computed as:
+    L_pref(θ) = E[σ(β * Δ_r) * log(σ(β * Δ_r)/σ(Δ_gtr)) + σ(-β * Δ_r) * log(σ(-β * Δ_r)/σ(Δ_gtr))]
+
+    For RPO with backward KL divergence, the preference loss term is computed as:
+    L_pref(θ) = E[σ(Δ_gtr) * log(σ(Δ_gtr)/σ(β * Δ_r)) + σ(-Δ_gtr) * log(σ(-Δ_gtr)/σ(-β * Δ_r))]
 
     where:
     - σ is the sigmoid function
     - β is a scaling factor (ex: `reference_policy_kl_penalty` in DPO)
     - r_chosen and r_rejected are the rewards for chosen and rejected responses
+    - Δ_r is the difference in rewards (r_chosen - r_rejected)
+    - gt_r_chosen and gt_r_rejected are the ground truth rewards for chosen and rejected responses
+    - η is the ground truth rewards scale
+    - Δ_gtr is the scaled difference in ground truth rewards (η * gt_r_chosen - η * gt_r_rejected)
+
+    Args:
+    cfg (PreferenceLossConfig): Configuration dictionary containing:
+        - preference_loss (str): Type of preference loss to use
+        - beta (float): Scaling factor (β)
+        - eta (float): Scale of the ground truth rewards (η)
 
     Returns:
         tuple[torch.Tensor, dict]: A tuple containing:
@@ -467,8 +509,11 @@ class PreferenceLoss(LossFunction):
                 - accuracy: Fraction of examples where chosen response has higher reward
     """
 
-    def __init__(self):
+    def __init__(self, cfg: PreferenceLossConfig):
         self.loss_type = LossType.SEQUENCE_LEVEL
+        self.preference_loss = cfg["preference_loss"]
+        self.beta = cfg["beta"]
+        self.eta = cfg["eta"]
 
     def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
         # tensor is of shape (2*micro_batch_size,)
@@ -477,16 +522,67 @@ class PreferenceLoss(LossFunction):
     def _preference_loss(
         self,
         rewards: Tensor,
+        data: Tensor,
         sample_mask: Tensor,
         global_valid_seqs: Tensor,
-        beta: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
         rewards_delta = rewards_chosen - rewards_rejected
 
-        per_sample_loss = (
-            -torch.nn.functional.logsigmoid(beta * rewards_delta) * sample_mask[::2]
-        )  ## zero out invalid samples
+        if self.preference_loss == "dpo":
+            per_sample_loss = (
+                -torch.nn.functional.logsigmoid(self.beta * rewards_delta)
+                * sample_mask[::2]
+            )  ## zero out invalid samples
+        elif self.preference_loss == "ipo":
+            assert self.beta != 0, (
+                "IPO requires a non-zero beta (reference_policy_kl_penalty for dpo)"
+            )
+            per_sample_loss = (
+                torch.square(rewards_delta - 1.0 / (2.0 * self.beta)) * sample_mask[::2]
+            )
+        elif self.preference_loss in ["rpo_fwd_kl", "rpo_bwd_kl", "rpo_sq"]:
+            assert "rewards" in data, "RPO requires rewards"
+            gt_rewards_chosen, gt_rewards_rejected = self.split_output_tensor(
+                data["rewards"]
+            )
+            gt_rewards_delta = self.eta * (gt_rewards_chosen - gt_rewards_rejected)
+
+            if "kl" in self.preference_loss:
+                logbeta_hat_chosen = torch.nn.functional.logsigmoid(
+                    self.beta * rewards_delta
+                )
+                logbeta_hat_rejected = torch.nn.functional.logsigmoid(
+                    -self.beta * rewards_delta
+                )
+                logalpha_hat_chosen = torch.nn.functional.logsigmoid(gt_rewards_delta)
+                logalpha_hat_rejected = torch.nn.functional.logsigmoid(
+                    -gt_rewards_delta
+                )
+
+                if "fwd" in self.preference_loss:
+                    per_sample_loss = (
+                        torch.exp(logbeta_hat_chosen)
+                        * (logbeta_hat_chosen - logalpha_hat_chosen)
+                        + torch.exp(logbeta_hat_rejected)
+                        * (logbeta_hat_rejected - logalpha_hat_rejected)
+                    ) * sample_mask[::2]
+                elif "bwd" in self.preference_loss:
+                    per_sample_loss = (
+                        torch.exp(logalpha_hat_chosen)
+                        * (logalpha_hat_chosen - logbeta_hat_chosen)
+                        + torch.exp(logalpha_hat_rejected)
+                        * (logalpha_hat_rejected - logbeta_hat_rejected)
+                    ) * sample_mask[::2]
+            elif self.preference_loss == "rpo_sq":
+                per_sample_loss = (
+                    torch.square(self.beta * rewards_delta - gt_rewards_delta)
+                    * sample_mask[::2]
+                )
+        else:
+            raise NotImplementedError(
+                f"preference loss {self.preference_loss} is not implemented"
+            )
 
         ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
         return (
@@ -528,7 +624,7 @@ class PreferenceLoss(LossFunction):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs)
+        ) = self._preference_loss(rewards, data, sample_mask, global_valid_seqs)
 
         ## divide by 2 because we're summing over (chosen, rejected) pairs
         num_valid_samples = sample_mask.sum() / 2
@@ -647,14 +743,19 @@ class DPOLossFn(LossFunction):
     """
 
     def __init__(self, cfg: DPOLossConfig):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
         self.preference_loss_weight = cfg["preference_loss_weight"]
         self.sft_loss_weight = cfg["sft_loss_weight"]
         self.preference_average_log_probs = cfg["preference_average_log_probs"]
         self.sft_average_log_probs = cfg["sft_average_log_probs"]
-        self.preference_loss = cfg["preference_loss"]
-        self.gt_reward_scale = cfg["gt_reward_scale"]
+
         self.sft_loss = NLLLoss()
+
+        self.preference_loss_config = {
+            "preference_loss": cfg["preference_loss"],
+            "beta": cfg["reference_policy_kl_penalty"],
+            "eta": cfg["gt_reward_scale"],
+        }
+        self.preference_loss = PreferenceLoss(self.preference_loss_config)
 
         self.loss_type = LossType.SEQUENCE_LEVEL
 
@@ -673,7 +774,6 @@ class DPOLossFn(LossFunction):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
-        sample_mask = data["sample_mask"]
         seq_index = data.get("seq_index", None)
 
         next_token_logits = next_token_logits.to(torch.float32)
@@ -714,97 +814,7 @@ class DPOLossFn(LossFunction):
         if self.preference_average_log_probs:
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
-        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
-        rewards_delta = rewards_chosen - rewards_rejected
-
-        if self.preference_loss == "dpo":
-            per_sample_loss = (
-                -torch.nn.functional.logsigmoid(
-                    self.reference_policy_kl_penalty * rewards_delta
-                )
-                * sample_mask[::2]
-            )  ## zero out invalid samples
-        elif self.preference_loss == "ipo":
-            assert self.reference_policy_kl_penalty != 0, (
-                "IPO requires a non-zero reference_policy_kl_penalty"
-            )
-            per_sample_loss = (
-                torch.square(
-                    rewards_delta - 1.0 / (2.0 * self.reference_policy_kl_penalty)
-                )
-                * sample_mask[::2]
-            )
-        elif self.preference_loss in ["rpo_fwd_kl", "rpo_bwd_kl", "rpo_sq"]:
-            assert "rewards" in data, "RPO requires rewards"
-            gt_rewards_chosen, gt_rewards_rejected = self.split_output_tensor(
-                data["rewards"]
-            )
-            gt_rewards_delta = self.gt_reward_scale * (
-                gt_rewards_chosen - gt_rewards_rejected
-            )
-
-            if "kl" in self.preference_loss:
-                logbeta_hat_chosen = torch.nn.functional.logsigmoid(
-                    self.reference_policy_kl_penalty * rewards_delta
-                )
-                logbeta_hat_rejected = torch.nn.functional.logsigmoid(
-                    -self.reference_policy_kl_penalty * rewards_delta
-                )
-                logalpha_hat_chosen = torch.nn.functional.logsigmoid(gt_rewards_delta)
-                logalpha_hat_rejected = torch.nn.functional.logsigmoid(
-                    -gt_rewards_delta
-                )
-
-                if "fwd" in self.preference_loss:
-                    per_sample_loss = (
-                        torch.exp(logbeta_hat_chosen)
-                        * (logbeta_hat_chosen - logalpha_hat_chosen)
-                        + torch.exp(logbeta_hat_rejected)
-                        * (logbeta_hat_rejected - logalpha_hat_rejected)
-                    ) * sample_mask[::2]
-                elif "bwd" in self.preference_loss:
-                    per_sample_loss = (
-                        torch.exp(logalpha_hat_chosen)
-                        * (logalpha_hat_chosen - logbeta_hat_chosen)
-                        + torch.exp(logalpha_hat_rejected)
-                        * (logalpha_hat_rejected - logbeta_hat_rejected)
-                    ) * sample_mask[::2]
-            elif self.preference_loss == "rpo_sq":
-                per_sample_loss = (
-                    torch.square(
-                        self.reference_policy_kl_penalty * rewards_delta
-                        - gt_rewards_delta
-                    )
-                    * sample_mask[::2]
-                )
-        else:
-            raise NotImplementedError(
-                f"preference loss {self.preference_loss} is not implemented"
-            )
-
-        ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
-        return (
-            masked_mean(
-                per_sample_loss,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_chosen > rewards_rejected,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_chosen,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_rejected,
-                sample_mask[1::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-        )
+        return self.preference_loss(rewards, data, global_valid_seqs, None)
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLoss)
     def __call__(  # type: ignore
@@ -840,12 +850,7 @@ class DPOLossFn(LossFunction):
                 global_normalization_factor=global_valid_seqs / 2,
             )
 
-        (
-            preference_loss,
-            accuracy,
-            rewards_chosen_mean,
-            rewards_rejected_mean,
-        ) = self._dpo_loss(
+        preference_loss, preference_loss_dict = self._dpo_loss(
             next_token_logits,
             data,
             global_valid_seqs,
@@ -859,17 +864,14 @@ class DPOLossFn(LossFunction):
             + self.preference_loss_weight * preference_loss
         )
 
-        ## divide by 2 because we're summing over (chosen, rejected) pairs
-        num_valid_samples = data["sample_mask"].sum() / 2
-
         return dpo_loss, {
             "loss": dpo_loss.item(),
             "sft_loss": sft_loss_chosen.item(),
-            "preference_loss": preference_loss.item(),
-            "accuracy": accuracy.item(),
-            "rewards_chosen_mean": rewards_chosen_mean.item(),
-            "rewards_rejected_mean": rewards_rejected_mean.item(),
-            "num_valid_samples": num_valid_samples.item(),
+            "preference_loss": preference_loss_dict["loss"],
+            "accuracy": preference_loss_dict["accuracy"],
+            "rewards_chosen_mean": preference_loss_dict["rewards_chosen_mean"],
+            "rewards_rejected_mean": preference_loss_dict["rewards_rejected_mean"],
+            "num_valid_samples": preference_loss_dict["num_valid_samples"],
         }
 
 

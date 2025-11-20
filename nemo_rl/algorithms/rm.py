@@ -222,7 +222,7 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLoss(rm_config)
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
