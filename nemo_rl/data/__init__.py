@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Any, Dict, Literal, NotRequired, TypedDict
 
 
 # TODO: split this typed dict up so it can be PreferenceDataConfig | ResponseDataConfig | etc
@@ -41,6 +41,11 @@ class DataConfig(TypedDict):
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # Specifies input sequence length for synthetic datasets.
+    # - int: fixed input length
+    # - Dict[str, Any]: generator config with 'mean' and 'std' keys for sampling from normal distribution
+    # Used by RandomDataset for benchmarking. Recommended default: not set (dataset-specific).
+    input_len_or_input_len_generator: NotRequired[Dict[str, Any] | int]
 
 
 # ===============================================================================
