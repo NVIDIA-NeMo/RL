@@ -245,7 +245,8 @@ class GenerationAlgorithm(ABC):
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     msg_list,
                     add_generation_prompt=True,
-                    tokenize=False
+                    tokenize=False,
+                    enable_thinking=True
                 )
                 formatted_prompts.append(formatted_prompt)
             prompts = formatted_prompts

@@ -592,6 +592,7 @@ SRUN_ARGS=(
     "--container-workdir=$PROJECT_DIR"
     "--container-mounts=$CONTAINER_MOUNTS"
     "--no-container-mount-home"
+    "--container-env=NVIDIA_VISIBLE_DEVICES"
     "--unbuffered"
 )
 
@@ -600,6 +601,7 @@ if [[ -n "$NODELIST" ]]; then
     print_status "Running on specific node: $NODELIST"
 fi
 
+export NVIDIA_VISIBLE_DEVICES=void
 srun "${SRUN_ARGS[@]}" bash -c "$COMMAND_BLOCK"
 
 print_status "Evaluation job completed"

@@ -47,6 +47,7 @@ SEQ_EVAL_THRESHOLD="${SEQ_EVAL_THRESHOLD:-}"
 SEQ_EVAL_TOKENS_TO_GENERATE="${SEQ_EVAL_TOKENS_TO_GENERATE:-}"
 SEQ_EVAL_STEPS="${SEQ_EVAL_STEPS:-}"
 SEQ_EVAL_BLOCK_LENGTH="${SEQ_EVAL_BLOCK_LENGTH:-}"
+SEQ_EVAL_TEMPERATURE="${SEQ_EVAL_TEMPERATURE:-}"
 SEQ_EVAL_EXTRA_ARGS="${SEQ_EVAL_EXTRA_ARGS:-}"
 
 # Additional flags that should be applied to every evaluation launch
@@ -145,6 +146,9 @@ if [[ -n "$SEQ_EVAL_STEPS" ]]; then
 fi
 if [[ -n "$SEQ_EVAL_BLOCK_LENGTH" ]]; then
   SEQ_EVAL_ARGS+=("--block-length" "$SEQ_EVAL_BLOCK_LENGTH")
+fi
+if [[ -n "$SEQ_EVAL_TEMPERATURE" ]]; then
+  SEQ_EVAL_ARGS+=("--temperature" "$SEQ_EVAL_TEMPERATURE")
 fi
 if [[ -n "$GLOBAL_EVAL_FLAGS" ]]; then
   read -r -a GLOBAL_FLAGS_ARRAY <<<"$GLOBAL_EVAL_FLAGS"
