@@ -17,7 +17,7 @@ import importlib
 import os
 import traceback
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import zmq
@@ -208,7 +208,7 @@ def import_class_from_path(name: str) -> Any:
     return cls_instance
 
 
-def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
+def get_gpu_info(model: List[torch.nn.Module]) -> dict[str, Any]:
     """Return information about the GPU being used by this worker."""
     import torch
 
@@ -239,7 +239,7 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
     # Get a parameter from the model to verify CUDA device placement
     # This confirms tensors are actually on the appropriate device
     param_info = {}
-    for module_name, module in model.named_modules():
+    for module_name, module in model[0].named_modules():
         for param_name, param in module.named_parameters(recurse=False):
             if param is not None and param.requires_grad:
                 full_name = f"{module_name}.{param_name}"

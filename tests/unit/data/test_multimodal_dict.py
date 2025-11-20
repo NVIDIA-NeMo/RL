@@ -185,6 +185,8 @@ def test_sequence_packing_with_packed_data():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     # Test sequence packing
