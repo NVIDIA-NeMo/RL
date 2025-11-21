@@ -16,10 +16,12 @@ from typing import Any, Dict, List, TypedDict
 
 import ray
 import torch
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.timer import Timer
 
 
 class PenguinConfig(TypedDict):
@@ -46,7 +48,9 @@ class Penguin(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = self.cfg["initial_global_config_dict"]
+        initial_global_config_dict = (
+            self.cfg.get("initial_global_config_dict") or dict()
+        )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -54,19 +58,24 @@ class Penguin(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = (
-            initial_global_config_dict.get("global_aiohttp_connector_limit_per_host")
-            or 1024
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_connector_limit_per_host", 16_384
         )
-        initial_global_config_dict["global_aiohttp_connector_limit"] = (
-            initial_global_config_dict["global_aiohttp_connector_limit_per_host"]
-            * len(self.cfg["base_urls"])
+        initial_global_config_dict.setdefault("global_aiohttp_connector_limit", 65_536)
+        print(
+            f"""Set global_aiohttp_connector_limit_per_host={initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} and global_aiohttp_connector_limit={initial_global_config_dict["global_aiohttp_connector_limit"]}.
+Depending on your data shape, you may want to change these values."""
         )
 
-        print(
-            f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]}.
-Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg["base_urls"])} * {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} = {initial_global_config_dict["global_aiohttp_connector_limit"]}."""
+        # Get Ray head node address if Ray is initialized
+        assert ray.is_initialized(), (
+            "Ray must be initialized before using Penguin environment"
         )
+        ray_context = ray.get_runtime_context()
+        assert ray_context.gcs_address, "Ray must have a GCS address"
+
+        initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
+        print(f"Ray head node address: {ray_context.gcs_address}")
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
@@ -94,17 +103,43 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
     def health_check(self) -> bool:
         return True
 
-    async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        penguin_results = await self.rch.run_examples(
+    async def run_rollouts(
+        self,
+        penguin_examples: list[dict],
+        tokenizer: PreTrainedTokenizerBase,
+        timer_prefix: str,
+    ) -> list[dict]:
+        timer = Timer()
+
+        penguin_result_iterator = self.rch.run_examples(
             examples=penguin_examples, head_server_config=self.head_server_config
         )
 
-        nemo_rl_results = list(
-            map(self._postprocess_penguin_to_nemo_rl_result, penguin_results)
-        )
-        return nemo_rl_results
+        timer.start("_run_rollouts_total")
+        nemo_rl_results = []
+        for task in penguin_result_iterator:
+            with timer.time(label=f"{timer_prefix}/await_results"):
+                penguin_result = await task
 
-    def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
+            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(
+                    penguin_result, tokenizer
+                )
+
+            nemo_rl_results.append(nemo_rl_result)
+
+        timer.stop("_run_rollouts_total")
+        timing_metrics = timer.get_timing_metrics("sum")
+        total_time = timing_metrics.pop("_run_rollouts_total")
+        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        )
+
+        return nemo_rl_results, timing_metrics
+
+    def _postprocess_penguin_to_nemo_rl_result(
+        self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase
+    ) -> dict:
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in penguin_result["response"]["output"]:
@@ -128,22 +163,33 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": output_item_dict["prompt_token_ids"][
-                        len(seen_token_ids) :
-                    ],
+                    "token_ids": torch.tensor(
+                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
+                    ),
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": output_item_dict["generation_token_ids"],
-                    "generation_logprobs": output_item_dict["generation_log_probs"],
+                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                    "generation_logprobs": torch.tensor(
+                        output_item_dict["generation_log_probs"]
+                    ),
                 }
             )
 
             seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+
+            # We pop to remove larger tensors from logging.
+            output_item_dict["prompt_str"] = tokenizer.decode(
+                output_item_dict.pop("prompt_token_ids")
+            )
+            output_item_dict["generation_str"] = tokenizer.decode(
+                output_item_dict.pop("generation_token_ids")
+            )
+            output_item_dict.pop("generation_log_probs")
 
         return {
             "message_log": nemo_rl_message_log,

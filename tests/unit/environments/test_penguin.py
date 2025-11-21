@@ -80,18 +80,18 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
 def penguin(penguin_vllm_generation):
     """Create a Penguin actor for testing."""
 
-    yaml_str = r"""multineedle_resources_server:
+    yaml_str = r"""example_multi_step_resources_server:
   resources_servers:
-    multineedle:
+    example_multi_step:
       entrypoint: app.py
       domain: instruction_following
-multineedle_simple_agent:
+example_multi_step_simple_agent:
   responses_api_agents:
     simple_agent:
       entrypoint: app.py
       resources_server:
         type: resources_servers
-        name: multineedle_resources_server
+        name: example_multi_step_resources_server
       model_server:
         type: responses_api_models
         name: openai_model
@@ -103,6 +103,7 @@ openai_model:
       api_key: ${policy_api_key}
       model: ${policy_model_name}
       return_token_id_information: true
+      uses_reasoning_parser: true
 """
 
     config = PenguinConfig(
@@ -141,7 +142,12 @@ def penguin_sanity_test_data():
     not PENGUIN_INSTALLED,
     reason="Skipping Penguin test since Penguin is not installed!",
 )
-def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation):
+def test_penguin_sanity(
+    penguin,
+    penguin_sanity_test_data,
+    penguin_vllm_generation,
+    penguin_tokenizer,  # noqa: F811
+):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
     # We need to match NeMo RL generation config params before sending to Penguin
@@ -153,10 +159,20 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
-    actual_result = ray.get(
-        penguin.run_rollouts.remote(penguin_sanity_test_data["input"])
+    actual_result, _ = ray.get(
+        penguin.run_rollouts.remote(
+            penguin_sanity_test_data["input"], penguin_tokenizer, ""
+        )
     )
     expected_result = penguin_sanity_test_data["expected_output"]
+
+    # These are tensors originally and we swap them back to a list for comparison below
+    for d in actual_result:
+        for message in d["input_message_log"]:
+            message["token_ids"] = message["token_ids"].tolist()
+        # Right now, we don't need to swap the token ids in the message log since they pointto the same underlying dictionary as above.
+        # for message in d["message_log"][:1]:
+        #     message["token_ids"] = message["token_ids"].tolist()
 
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
@@ -169,6 +185,10 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
                 message["token_ids"] = []
             if "generation_logprobs" in message:
                 message["generation_logprobs"] = []
+            if "prompt_str" in message:
+                message["prompt_str"] = "dummy prompt_str"
+            if "generation_str" in message:
+                message["generation_str"] = "dummy generation_str"
 
         return d
 

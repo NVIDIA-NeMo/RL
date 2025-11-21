@@ -35,6 +35,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "model_name": REWARD_MODEL_NAME,
     "tokenizer": {"name": REWARD_MODEL_NAME},
     "precision": "bfloat16",
+    "offload_optimizer_for_logprob": False,
     "batch_size": 32,
     "checkpoint_path": None,
     "max_model_len": MAX_MODEL_LEN,

@@ -1,0 +1,33 @@
+defaults: ./grpo-deepseek-v3-32n8g.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-64n8g-async-1off
+policy:
+  logprob_batch_size: 2
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 16
+    expert_model_parallel_size: 16
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 32
+        gpus_per_node: 8
+    vllm_cfg:
+      tensor_parallel_size: 32
+      gpu_memory_utilization: 0.8
+      async_engine: true
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n8g-async-32T32G-1off
+  wandb:
+    name: grpo-deepseek-v3-64n8g-async-32T32G-1off
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
