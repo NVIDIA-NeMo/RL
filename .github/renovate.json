@@ -30,8 +30,7 @@
     {
       "description": "Group all updates together into a single PR",
       "groupName": "all dependencies",
-      "additionalBranchPrefix": "all-deps-",
-      "schedule": ["at any time"]
+      "additionalBranchPrefix": "all-deps-"
     }
   ],
   "git-submodules": {
