@@ -180,7 +180,7 @@ class BlockWiseSoftTokenLLM:
                             logger.warning(
                                 f"Decoding Schedule Violation: Step {self.decoder.iter} requires decoding {num_to_decode} tokens, "
                                 f"but only {available_for_decoding} masks are available ({current_masks} total - {num_soft} soft tokens). "
-                                f"Auto-adjusting soft tokens for this step."
+                                f"Reduce soft_token_ratio or enable treat_soft_tokens_as_candidates."
                             )
                             # Adjust num_soft to make it work
                             num_soft = max(0, current_masks - num_to_decode)
@@ -357,13 +357,24 @@ class SoftTokenGeneration(DInferGeneration):
         if self.diffusion_llm is None:
             raise RuntimeError("Diffusion LLM not created")
             
-        # Extract soft token specific parameters from kwargs
-        soft_token_ratio = kwargs.get('soft_token_ratio', 0.2)
-        treat_soft_tokens_as_candidates = kwargs.get('treat_soft_tokens_as_candidates', False)
-        
-        # soft_temperature is now a direct argument, but also check kwargs for backward compatibility
-        if 'soft_temperature' in kwargs:
-            soft_temperature = kwargs['soft_temperature']
+        validated_args = self.validate_args(
+            steps=steps,
+            gen_length=gen_length,
+            block_length=block_length,
+            temperature=temperature,
+            remasking=remasking,
+            threshold=threshold,
+            factor=factor,
+            soft_token_ratio=kwargs.get('soft_token_ratio', 0.2),
+            treat_soft_tokens_as_candidates=kwargs.get('treat_soft_tokens_as_candidates', False),
+            soft_temperature=soft_temperature,
+            **kwargs
+        )
+            
+        # Extract soft token specific parameters from validated_args
+        soft_token_ratio = validated_args.get('soft_token_ratio', 0.2)
+        treat_soft_tokens_as_candidates = validated_args.get('treat_soft_tokens_as_candidates', False)
+        soft_temperature = validated_args.get('soft_temperature', soft_temperature)
             
         # Update early_stop if provided
         if early_stop is not None:
@@ -390,12 +401,14 @@ class SoftTokenGeneration(DInferGeneration):
         # unless we dynamically switch the decoder class, which is complex.
         # However, the user asked to "accept ThresholdDecoder as its decoder", so using ThresholdParallelDecoder 
         # as the primary one is correct.
+        
+        logger.debug(f"Using dInfer Soft Token generation with args: {validated_args}")
             
         with torch.no_grad():
             output_ids = self.diffusion_llm.generate(
                 prompt=prompt,
-                gen_length=gen_length,
-                block_length=block_length,
+                gen_length=validated_args['gen_length'],
+                block_length=validated_args['block_length'],
                 soft_token_ratio=soft_token_ratio,
                 treat_soft_tokens_as_candidates=treat_soft_tokens_as_candidates,
                 steps=steps,
