@@ -147,7 +147,8 @@ class BlockWiseSoftTokenLLM:
                          logits = self.model(inputs_embeds=use_input_embeds, past_key_values=past_key_values, use_cache=True,
                                           replace_position=replace_position).logits
                     else:
-                         logits = self.model(block, past_key_values=past_key_values, use_cache=True,
+                         # Use x slice instead of block to ensure we have the latest updates
+                         logits = self.model(x[block_loc.start:block_loc.end], past_key_values=past_key_values, use_cache=True,
                                           replace_position=replace_position).logits
                     return logits
 
@@ -160,6 +161,11 @@ class BlockWiseSoftTokenLLM:
                     # Pre-check: Ensure we can satisfy the soft token ratio without violating the decoding schedule
                     # if we choose to exclude soft tokens from candidacy.
                     current_masks = (x[block_loc.start:block_loc.end] == self.decoder.mask_id).sum().item()
+                    
+                    # Optimization: If no masks left, stop unrolling (matches blockwise behavior)
+                    if current_masks == 0:
+                        break
+
                     num_soft = int(current_masks * soft_token_ratio)
                     
                     # Determine num_to_decode for the current step
