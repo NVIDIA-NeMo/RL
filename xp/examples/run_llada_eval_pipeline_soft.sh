@@ -32,8 +32,8 @@ export SEQ_EVAL_OUTPUT_DIR="${SEQ_EVAL_OUTPUT_DIR:-${EVAL_OUTPUT_DIR}}"
 export SEQ_EVAL_GENERATION_ALGORITHM="${SEQ_EVAL_GENERATION_ALGORITHM:-dinfer_soft}"
 export SEQ_EVAL_TOKENS_TO_GENERATE="${SEQ_EVAL_TOKENS_TO_GENERATE:-512}"
 # Soft token typically uses fewer steps per block or smaller blocks
-export SEQ_EVAL_STEPS="${SEQ_EVAL_STEPS:-32}" 
-export SEQ_EVAL_BLOCK_LENGTH="${SEQ_EVAL_BLOCK_LENGTH:-64}"
+export SEQ_EVAL_STEPS="${SEQ_EVAL_STEPS:-8}"
+export SEQ_EVAL_BLOCK_LENGTH="${SEQ_EVAL_BLOCK_LENGTH:-8}"
 export SEQ_EVAL_TEMPERATURE="${SEQ_EVAL_TEMPERATURE:-0}"
 
 # Soft token specific parameters (passed via extra args)
