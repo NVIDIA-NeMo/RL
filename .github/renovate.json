@@ -57,6 +57,7 @@
   "requireConfig": "optional",
   "platformAutomerge": false,
   "rebaseWhen": "behind-base-branch",
-  "forkProcessing": "disabled"
+  "forkProcessing": "enabled",
+  "includeForks": true
 }
 
