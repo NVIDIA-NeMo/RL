@@ -1708,8 +1708,26 @@ class DTensorPolicyWorkerV2:
         return get_free_memory_bytes(device_idx)
 
     @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorkerV2."""
+        raise NotImplementedError(
+            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorkerV2"
+        )
+
+    @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
@@ -1743,7 +1761,9 @@ class DTensorPolicyWorkerV2:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
