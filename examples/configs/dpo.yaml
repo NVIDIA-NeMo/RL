@@ -22,7 +22,7 @@ dpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/dpo"
-  metric_name: "val_loss"
+  metric_name: "val:validation-default_loss"
   higher_is_better: false
   keep_top_k: 3
   save_period: 50
@@ -44,6 +44,8 @@ policy:
   #logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 1024
   precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
     env_vars:
@@ -113,6 +115,9 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    defer_fp32_logits: False
     
     optimizer:
       optimizer: "adam"
@@ -153,8 +158,8 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
-      average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -186,7 +191,7 @@ data:
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:

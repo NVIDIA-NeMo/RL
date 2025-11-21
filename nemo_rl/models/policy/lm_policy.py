@@ -96,6 +96,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
+
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                raise RuntimeError(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is required in Megatron backend. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
+                )
+
         else:
             if not dtensor_enable:
                 raise ValueError(
@@ -167,14 +174,33 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        self.worker_group = RayWorkerGroup(
-            cluster,
-            worker_builder,
-            name_prefix=name_prefix,
-            workers_per_node=workers_per_node,
-            sharding_annotations=self.sharding_annotations,
-            env_vars=env_vars or {},
-        )
+        if cluster._sorted_bundle_indices is not None:
+            # The cluster has initialized a unified placemenet group across nodes
+            # In this case, we need to create workers based on sorted bundle indices
+            group_size = cluster.num_gpus_per_node
+            tied_groups = [
+                (i // group_size, [bundle_idx])
+                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+            ]
+
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                bundle_indices_list=tied_groups,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
+
+        else:
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                workers_per_node=workers_per_node,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -563,7 +589,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         assert self.cfg["generation"] is not None, "Generation config is not set"
         result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures),
-            pad_value_dict={"output_ids": self.cfg["generation"]["pad_token_id"]},
+            pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
         )
 
         # Verify the output has all required fields
@@ -645,6 +671,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
         pass
@@ -714,10 +744,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             if (
                 checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format") == "safetensors"
+                and checkpointing_cfg.get("model_save_format", None) is not None
             ):
                 raise ValueError(
-                    "safetensors is only supported with DTensorPolicyWorkerV2 (_v2=true)."
+                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
                 )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
@@ -755,3 +785,36 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Print the node IP and GPU ID of the current worker."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "report_node_ip_and_gpu_id",
+            )
+        )
+        all_node_ips = sorted(set([result[0] for result in results]))
+        all_gpu_ids = sorted(set([result[1] for result in results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+
+        table = PrettyTable()
+        table.title = "Policy worker mapping to Nodes and GPUs"
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)

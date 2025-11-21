@@ -159,50 +159,9 @@ class BaseVllmGenerationWorker:
 
         # Monkey patch for vLLM to ensure RAY_ADDRESS is set in Ray actors.
         try:
-            import vllm.utils
             from vllm.logger import init_logger
-            from vllm.utils import cuda_is_initialized, is_in_ray_actor
 
             logger = init_logger("vllm_patch")
-
-            def _patched_maybe_force_spawn():
-                """Patched version of vllm.utils._maybe_force_spawn.
-
-                This patch changes an `elif is_in_ray_actor()` to an `if` statement.
-                This ensures that `os.environ["RAY_ADDRESS"]` is set when running
-                within a Ray actor, even if CUDA has already been initialized.
-                This is crucial for vLLM workers to connect back to the Ray cluster.
-                """
-                if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
-                    return
-
-                reason = None
-                if cuda_is_initialized():
-                    reason = "CUDA is initialized"
-
-                if is_in_ray_actor():
-                    # even if we choose to spawn, we need to pass the ray address
-                    # to the subprocess so that it knows how to connect to the ray cluster.
-                    # env vars are inherited by subprocesses, even if we use spawn.
-                    import ray
-
-                    os.environ["RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
-                    if reason is None:
-                        reason = "In a Ray actor and can only be spawned"
-
-                if reason is not None:
-                    logger.warning(
-                        "We must use the `spawn` multiprocessing start method. "
-                        "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
-                        "See https://docs.vllm.ai/en/latest/getting_started/"
-                        "troubleshooting.html#python-multiprocessing "
-                        "for more information. Reason: %s",
-                        reason,
-                    )
-                    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-            vllm.utils._maybe_force_spawn = _patched_maybe_force_spawn
-            logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
 
             def _patch_vllm_init_workers_ray():
                 """Patch the vLLM ray_distributed_executor.py file.
@@ -228,7 +187,7 @@ class BaseVllmGenerationWorker:
 
                     new_lines = [
                         f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
                     ]
 
                     need_replace = False
@@ -251,43 +210,6 @@ class BaseVllmGenerationWorker:
 
             _patch_vllm_init_workers_ray()
             logger.info("Successfully patched vllm _init_workers_ray.")
-
-            # Patch the vLLM sampler.py file to modify logprobs computation wrt temperature.
-            # This replaces raw_logprobs = self.compute_logprobs(logits) with custom temperature-applied logprobs.
-            # TODO(zhanda): This is only a temporary fix to address the issue of incorrect logprobs returned by vllm
-            # and should be removed or improved after vllm's new logprobs option is released. And currently, other
-            # sampling parameters like top_p, top_k, etc. are not supported.
-            # See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details.
-            def _patch_vllm_sampler():
-                try:
-                    import vllm.v1.sample.sampler as sampler_module
-
-                    file_to_patch = sampler_module.__file__
-
-                    with open(file_to_patch, "r") as f:
-                        content = f.read()
-
-                    old_line = "raw_logprobs = self.compute_logprobs(logits)"
-                    new_lines = "raw_logprobs = self.compute_logprobs(self.apply_temperature(logits.to(torch.float32), sampling_metadata.temperature) if sampling_metadata.temperature is not None else logits)"
-
-                    if new_lines in content:
-                        return
-
-                    if old_line not in content:
-                        return
-
-                    # Replace all instances of the old line with the new lines
-                    patched_content = content.replace(old_line, new_lines)
-
-                    # Write back the patched content
-                    with open(file_to_patch, "w") as f:
-                        f.write(patched_content)
-
-                except (ImportError, FileNotFoundError, PermissionError):
-                    # Allow failures gracefully
-                    pass
-
-            _patch_vllm_sampler()
 
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
@@ -375,14 +297,18 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
-        vllm_kwargs["hf_overrides"] = self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
+        if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
+            vllm_kwargs["hf_overrides"] = {}
+        vllm_kwargs["hf_overrides"].update(
+            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
+        )
 
         llm_kwargs = dict(
             model=self.model_name,
+            served_model_name=self.model_name,
             load_format=load_format,
-            # vllm==0.10.0 breaks skip_tokenizer_init=True.
-            # This will be reverted to `self.cfg["vllm_cfg"]["skip_tokenizer_init"]` once https://github.com/NVIDIA-NeMo/RL/issues/818 is resolved.
-            skip_tokenizer_init=False,
+            # Set in nemo_rl.models.generation.configure_generation_config
+            skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
@@ -396,7 +322,7 @@ class BaseVllmGenerationWorker:
             worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
-            logprobs_mode="raw_logprobs",
+            logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
 
@@ -536,7 +462,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
 
         # verify inputs have correct padding
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
@@ -570,7 +496,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             # Create a new tensor with the right size and fill with padding token
             full_output = torch.full(
-                (total_length,), self.cfg["pad_token_id"], dtype=input_ids.dtype
+                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype
             )
 
             # Copy original input (with padding) into the beginning

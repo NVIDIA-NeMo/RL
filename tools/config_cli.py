@@ -46,10 +46,12 @@ Example:
   tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
 
   # Minimize all llm the configs:
-  for algo in grpo dpo sft; do
+  for algo in grpo dpo sft distillation; do
     base_config=examples/configs/${algo}.yaml
     if [[ ${algo} == grpo ]]; then
       base_config=examples/configs/grpo_math_1B.yaml
+    elif [[ ${algo} == distillation ]]; then
+      base_config=examples/configs/distillation_math.yaml
     fi
     for recipe in examples/configs/recipes/llm/${algo}-*.yaml; do
       tools/config_cli.py minimize $base_config $recipe --in-place

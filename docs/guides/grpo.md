@@ -28,7 +28,7 @@ In this guide, we'll walk through how we handle:
 
 We support training with multiple RL "Environments" at the same time.
 
-An [Environment](../../nemo_rl/environments/interfaces.py) is an object that accepts a state/action history and returns an update state and rewards for the step. They run as Ray Remote Actors. Example [MathEnvironment](../../nemo_rl/environments/math_environment.py).
+An [Environment](../../nemo_rl/environments/interfaces.py) is an object that accepts a state/action history and returns an updated state and rewards for the step. They run as Ray Remote Actors. Example [MathEnvironment](../../nemo_rl/environments/math_environment.py).
 
 To support this, we need to know:
 
@@ -163,9 +163,8 @@ L(\theta) = E_t \Big[ \max \Big( \min \big(r_t(\theta) A_t, \text{clip}(r_t(\the
 $$
 
 where:
-- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is
-    usually set as 3 empirically
-- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has change
+- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set as 3 empirically
+- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed
 
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
@@ -257,6 +256,35 @@ $$
 $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepencies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If very spiky, it can indicate a bug in the inference framework or buggy weight refitting.
+
+### KL Divergence Error
+This feature is controlled by the following metrics:
+* `gen_kl_error`: $D_{\text{KL}}(P_{gen} || P_{policy})$
+  - the generation distribution as ground truth
+* `policy_kl_error`: $D_{\text{KL}}(P_{policy} || P_{gen})$
+  - the policy (training) distribution as ground truth
+* `js_divergence_error` or (Jensen–Shannon divergence): $(D_{\text{KL}}(P_{policy} || P_{m}) + D_{\text{KL}}(P_{gen} || P_{m})) / 2$, where $P_{m} = (P_{policy} + P_{gen}) / 2$
+  - uses the mean mixture distribution as reference
+
+According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is bigger for low-probability tokens as predicted by the generation inference engine (like vLLM).
+
+The three divergence metrics provide complementary perspectives on distribution mismatch. For example:
+
+We observed a case where vLLM assigned a disproportionately high probability to a single rare token, causing significant logprob error spikes (especially in MoE architectures):
+
+```text
+# extreme example
+1. Position 4559: 'au' (ID: 1786)
+   logp_gen     (from vLLM):      -5.xxx
+   logp_policy (from Mcore):      -15.xxx
+```
+Assuming other tokens have near-zero divergence, this single token's metrics with `kl_type=k3` are:
+
+* `gen_kl_error`: exp(-15 + 5) - (-15 + 5) - 1 ≈ 9 (moderate mismatch)
+* `policy_kl_error`: exp(-5 + 15) - (-5 + 15) - 1 ≈ 22,015 (severe mismatch dominating the metric)
+* `js_divergence_error`: ≈ 9, close to `gen_kl_error` since the mixture distribution (~-5.69) is dominated by the higher-probability value (logp_gen in this example)
+
+Ideally, all KL divergence metrics should be close to 0, with values below 1e-3 considered acceptable. Investigate any metric that shows spikes above this threshold.
 
 ### Sampling Importance Ratio
 This feature is controlled by the parameter `sampling_importance_ratio`. It adjusts the weighting of samples based on the ratio between the target policy and the behavior policy, helping to correct for distributional shift in off-policy learning. Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.

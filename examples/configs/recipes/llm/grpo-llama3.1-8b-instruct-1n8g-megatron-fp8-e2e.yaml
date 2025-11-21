@@ -19,7 +19,6 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
     converter_type: LlamaForCausalLM
     pipeline_model_parallel_size: 2
     activation_checkpointing: true
@@ -41,8 +40,6 @@ policy:
       NVTE_FP8_BLOCK_SCALING_FP32_SCALES: '1'
   generation:
     max_new_tokens: 4096
-    stop_token_ids:
-    - 128009
     vllm_cfg:
       precision: fp8
       gpu_memory_utilization: 0.5

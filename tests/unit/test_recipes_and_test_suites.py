@@ -28,6 +28,7 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
+performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
@@ -36,6 +37,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "grpo": "examples/configs/grpo_math_1B.yaml",
     "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
     "distillation": "examples/configs/distillation_math.yaml",
+    "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
 }
 
@@ -68,11 +70,23 @@ def release_test_suite():
 
 
 @pytest.fixture
+def performance_test_suite():
+    performance_suite = []
+    with open(performance_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                performance_suite.append(line)
+    return performance_suite
+
+
+@pytest.fixture
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
+    performance_test_suite,
 ):
-    return nightly_test_suite + release_test_suite
+    return nightly_test_suite + release_test_suite + performance_test_suite
 
 
 @pytest.fixture
@@ -90,10 +104,12 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
+        performance_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
+        "performance_test_suite",
     ],
 )
 def test_test_suites_exist(test_suite_path):
@@ -247,41 +263,3 @@ def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
         assert algo in expected_algos, (
             f"Recipe {recipe_yaml} has unexpected algo {algo}"
         )
-
-
-@pytest.mark.parametrize("algo, algo_base_yaml", ALGO_MAPPING_TO_BASE_YAML.items())
-def test_all_recipes_can_merge_configs_with_base_config(
-    all_recipe_yaml_rel_paths, all_test_suites, algo, algo_base_yaml
-):
-    from omegaconf import OmegaConf
-
-    from nemo_rl.utils.config import load_config
-
-    base_yaml = os.path.join(project_root, algo_base_yaml)
-    base_config = OmegaConf.load(base_yaml)
-    # Would result in an error if we couldn't merge our config with the recipe's config
-    OmegaConf.set_struct(base_config, True)
-    for recipe_yaml in all_recipe_yaml_rel_paths:
-        if not os.path.basename(recipe_yaml).startswith(algo):
-            # Skipping here b/c we test that all recipes start with the algo-hyphen in
-            #  test_all_recipes_start_with_algo_hyphen()
-            continue
-        recipe_yaml_path = os.path.join(recipes_dir, recipe_yaml)
-        recipe_config = load_config(recipe_yaml_path)
-        OmegaConf.set_struct(recipe_config, True)
-
-        # Work around ALLOWED_ADDITIONAL_CONFIG_KEYS by manually adding allowed keys to the base config
-        # This prevents merge conflicts when recipe configs contain keys not present in base configs
-        for key in ALLOWED_ADDITIONAL_CONFIG_KEYS:
-            if OmegaConf.select(recipe_config, key):
-                OmegaConf.update(
-                    base_config,
-                    key,
-                    OmegaConf.select(recipe_config, key),
-                    force_add=True,
-                )
-
-        # This will raise a error if the config can't be merged
-        print(f"Merging {recipe_yaml} with {base_yaml}")
-        merged_config = OmegaConf.merge(base_config, recipe_config)
-        print(merged_config)

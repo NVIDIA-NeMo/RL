@@ -40,9 +40,11 @@ class CheckpointingConfig(TypedDict):
     enabled (bool): Whether checkpointing is enabled.
     checkpoint_dir (PathLike): Directory where checkpoints will be saved.
     metric_name (str | None): Name of the metric to use for determining best checkpoints.
+        Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
+        the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
-    model_save_format (str): Format for saving model ("torch_save" or "safetensors").
+    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
     save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
@@ -57,7 +59,7 @@ class CheckpointingConfig(TypedDict):
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     # New nemo-automodel integration fields
-    model_save_format: NotRequired[str]  # Default: "safetensors"
+    model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[bool]  # Default: False
     model_cache_dir: NotRequired[str]  # Default: ""
     model_repo_id: NotRequired[str]  # Default: ""

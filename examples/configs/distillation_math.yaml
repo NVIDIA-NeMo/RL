@@ -20,7 +20,7 @@ loss_fn:
 checkpointing:
     enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
-    metric_name: "val_reward"
+    metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
     higher_is_better: true
     keep_top_k: 3
     save_period: 10
@@ -40,6 +40,8 @@ policy: &POLICY_BASE
     max_total_sequence_length: 8192
     precision: "bfloat16"
     logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
@@ -103,7 +105,7 @@ policy: &POLICY_BASE
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
         bias_activation_fusion: True
-        defer_fp32_logits: null
+        defer_fp32_logits: False
         
         optimizer:
             optimizer: "adam"
@@ -145,7 +147,6 @@ policy: &POLICY_BASE
             grad_reduce_in_fp32: false
             overlap_grad_reduce: true
             overlap_param_gather: true
-            average_in_collective: true
             use_custom_fsdp: false
             data_parallel_sharding_strategy: "optim_grads_params"
 

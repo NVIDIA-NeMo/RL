@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from typing import cast
 
 from transformers import PreTrainedTokenizerBase
@@ -26,7 +27,13 @@ def configure_generation_config(
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     # tokenizer setting
-    config["pad_token_id"] = tokenizer.pad_token_id
+    if "_pad_token_id" in config:
+        warnings.warn(
+            "'_pad_token_id' found in generation config and will be overridden with tokenizer.pad_token_id. "
+            "Note: '_pad_token_id' is intended for internal use and has no effect when set in user-provided configs.",
+            UserWarning,
+        )
+    config["_pad_token_id"] = tokenizer.pad_token_id
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
@@ -36,10 +43,12 @@ def configure_generation_config(
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 
-        # set skip_tokenizer_init
-        if is_eval or config["stop_strings"] is not None:
-            config["vllm_cfg"]["skip_tokenizer_init"] = False
-        else:
-            config["vllm_cfg"]["skip_tokenizer_init"] = True
+        # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
+        if "skip_tokenizer_init" not in config["vllm_cfg"]:
+            # set skip_tokenizer_init
+            if is_eval or config["stop_strings"] is not None:
+                config["vllm_cfg"]["skip_tokenizer_init"] = False
+            else:
+                config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     return config

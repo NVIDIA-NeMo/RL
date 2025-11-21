@@ -34,8 +34,6 @@ policy:
     - 13
   generation:
     max_new_tokens: 4096
-    stop_token_ids:
-    - 128009
     vllm_cfg:
       max_model_len: 4096
 data:
