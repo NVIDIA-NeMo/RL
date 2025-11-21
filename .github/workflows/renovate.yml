@@ -1,0 +1,86 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Renovate
+
+on:
+  schedule:
+    # Run daily at 5 PM UTC (9 AM PST / 10 AM PDT) to align with Renovate schedule
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: 'Renovate log level'
+        required: false
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+          - error
+      dry_run:
+        description: 'Dry run (no PRs created)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.9.1"
+          enable-cache: true
+          prune-cache: false
+
+      - name: Make scripts executable
+        run: |
+          chmod +x .github/scripts/sync_submodule_dependencies.py
+          chmod +x .github/scripts/renovate_post_update.sh
+
+      - name: Get token
+        id: get-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@v40.3.11
+        with:
+          configurationFile: .github/renovate.json
+          token: ${{ steps.get-token.outputs.token }}
+        env:
+          LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+          RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
+          # Git configuration
+          RENOVATE_GIT_AUTHOR: 'Renovate Bot <bot@renovateapp.com>'
+          # Platform configuration
+          RENOVATE_PLATFORM: 'github'
+          RENOVATE_REPOSITORIES: '${{ github.repository }}'
+

@@ -1,0 +1,95 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":dependencyDashboard"
+  ],
+  "schedule": [
+    "after 9am and before 5pm every weekday"
+  ],
+  "timezone": "America/Los_Angeles",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "semanticCommits": "disabled",
+  "commitMessagePrefix": "[Renovate]",
+  "branchPrefix": "renovate/",
+  "labels": ["dependencies", "CI:L2"],
+  "assignees": [],
+  "reviewers": [],
+  "allowedPostUpgradeCommands": [
+    "^\\.github/scripts/renovate_post_update\\.sh$"
+  ],
+  "postUpgradeTasks": {
+    "commands": [
+      ".github/scripts/renovate_post_update.sh"
+    ],
+    "fileFilters": [
+      "uv.lock",
+      "3rdparty/**/setup.py"
+    ],
+    "executionMode": "update"
+  },
+  "packageRules": [
+    {
+      "description": "Group all git submodules together",
+      "matchManagers": ["git-submodules"],
+      "groupName": "git submodules",
+      "commitMessageTopic": "git submodules",
+      "branchName": "renovate/submodules",
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "Group vllm with torch and ray for compatibility",
+      "matchPackageNames": ["vllm", "torch", "ray"],
+      "matchManagers": ["pep621"],
+      "groupName": "vllm and core dependencies",
+      "commitMessageTopic": "vllm and core dependencies",
+      "branchName": "renovate/vllm-core"
+    },
+    {
+      "description": "Group transformer-engine with flash-attn for xformers compatibility",
+      "matchPackageNames": ["transformer-engine", "flash-attn"],
+      "matchManagers": ["pep621"],
+      "groupName": "transformer-engine and flash-attn",
+      "commitMessageTopic": "transformer-engine and flash-attn",
+      "branchName": "renovate/te-flashattn",
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "Handle transformers separately as it needs compatibility checks",
+      "matchPackageNames": ["transformers"],
+      "matchManagers": ["pep621"],
+      "groupName": "transformers",
+      "commitMessageTopic": "transformers",
+      "branchName": "renovate/transformers"
+    },
+    {
+      "description": "Other Python dependencies",
+      "matchManagers": ["pep621"],
+      "excludePackageNames": ["vllm", "torch", "ray", "transformer-engine", "flash-attn", "transformers"],
+      "groupName": "Python dependencies",
+      "commitMessageTopic": "Python dependencies",
+      "branchName": "renovate/python-deps"
+    }
+  ],
+  "git-submodules": {
+    "enabled": true
+  },
+  "pep621": {
+    "enabled": true
+  },
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "CI:L2"]
+  },
+  "osvVulnerabilityAlerts": true,
+  "rangeStrategy": "bump",
+  "onboarding": false,
+  "requireConfig": "optional",
+  "platformAutomerge": false,
+  "rebaseWhen": "behind-base-branch"
+}
+
