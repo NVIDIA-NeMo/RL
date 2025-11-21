@@ -264,6 +264,7 @@ def setup_data(
     )
     task_data_processors[task_name] = (vlm_task_spec, hf_data_processor)
 
+    env_name = data_config["env_name"]
     vlm_env = VLMEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
@@ -271,7 +272,7 @@ def setup_data(
             ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
-    ).remote(env_configs[task_name])
+    ).remote(env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
