@@ -69,7 +69,7 @@ class _FixedParallelDecoder(ParallelDecoder):
         x[block_start:block_end][transfer_index] = x0[transfer_index]
 
 class BlockWiseSoftTokenLLM:
-    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2):
+    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2, treat_soft_tokens_as_candidates=False):
         self.model = model
         self.cache_factory = cache_factory
         self.decoder = decoder
@@ -80,12 +80,46 @@ class BlockWiseSoftTokenLLM:
         self.maximum_unroll = maximum_unroll
         self.expected_tpf = expected_tpf
         self.soft_token_ratio = soft_token_ratio
+        self.treat_soft_tokens_as_candidates = treat_soft_tokens_as_candidates
         self.input_embeddings = self.model.get_input_embeddings()
+
+    def validate_schedule(self, block_length):
+        """ Validates that the decoding schedule can be satisfied with the given soft token ratio.
+        """
+        if not hasattr(self.decoder, 'steps') or self.treat_soft_tokens_as_candidates:
+            return
+
+        steps = self.decoder.steps
+        current_masks = block_length
+        
+        # Calculate the schedule for a full block
+        base = current_masks // steps
+        remainder = current_masks % steps
+        
+        schedule = []
+        for i in range(steps):
+            count = base + (1 if i < remainder else 0)
+            schedule.append(count)
+            
+        # Simulate decoding
+        for step_idx, num_to_decode in enumerate(schedule):
+            num_soft = int(current_masks * self.soft_token_ratio)
+            available = current_masks - num_soft
+            
+            if available < num_to_decode:
+                raise ValueError(
+                    f"Decoding Schedule Violation: Step {step_idx} requires decoding {num_to_decode} tokens, "
+                    f"but only {available} masks are available ({current_masks} total - {num_soft} soft tokens). "
+                    f"Reduce soft_token_ratio or enable treat_soft_tokens_as_candidates."
+                )
+            current_masks -= num_to_decode
         
     @torch.no_grad()
     def generate(self, prompt, gen_length=128, block_length=128):
         ''' Generate tokens with diffusion iterations block by block using Soft Token Sampling.
         '''
+        self.validate_schedule(block_length)
+
         x = TokenArray(prompt, gen_length, self.decoder.mask_id, self.decoder.eos_id, self.model.device)
         it = self.iterator_factory.create(x, block_length)
 
@@ -96,6 +130,24 @@ class BlockWiseSoftTokenLLM:
             self.decoder.block_init(block, block_id)
 
             while (block == self.decoder.mask_id).sum() > 0:
+                
+                # Pre-check: Ensure we can satisfy the soft token ratio without violating the decoding schedule
+                # if we choose to exclude soft tokens from candidacy.
+                current_masks = (x[block_loc.start:block_loc.end] == self.decoder.mask_id).sum().item()
+                num_soft = int(current_masks * self.soft_token_ratio)
+                
+                # The decoder wants to transfer (decode) N tokens this step
+                num_to_decode = self.decoder.num_transfer_tokens[0, self.decoder.iter].item()
+                
+                if not self.treat_soft_tokens_as_candidates:
+                    # If soft tokens CANNOT be decoded, we must have enough pure masks left to satisfy decoder demand
+                    available_for_decoding = current_masks - num_soft
+                    if available_for_decoding < num_to_decode:
+                        raise ValueError(
+                            f"Decoding Schedule Violation: Step {self.decoder.iter} requires decoding {num_to_decode} tokens, "
+                            f"but only {available_for_decoding} masks are available ({current_masks} total - {num_soft} soft tokens). "
+                            f"Reduce soft_token_ratio or enable treat_soft_tokens_as_candidates."
+                        )
                 
                 # Helper to run model with correct context and embeddings
                 def run_model(use_input_embeds=None):
@@ -154,6 +206,7 @@ class BlockWiseSoftTokenLLM:
                 self.num_forwards += 1
                 
                 decoding_logits = logits1
+                soft_indices = None
                 
                 # 3. Soft Token Logic
                 # Identify masks in the current block
@@ -162,8 +215,6 @@ class BlockWiseSoftTokenLLM:
                 mask_indices = torch.nonzero(mask_mask).flatten() # Indices relative to block start
                 
                 if mask_indices.numel() > 0 and self.soft_token_ratio > 0:
-                    # Sample masks to turn into soft tokens
-                    num_soft = int(mask_indices.numel() * self.soft_token_ratio)
                     if num_soft > 0:
                         perm = torch.randperm(mask_indices.numel(), device=self.model.device)
                         soft_indices = mask_indices[perm[:num_soft]] # Indices relative to block start
@@ -192,7 +243,6 @@ class BlockWiseSoftTokenLLM:
                             global_offset = 0
                         
                         # Get base embeddings for the input context
-                        # We clone to avoid modifying the model's internal cache if any (unlikely here)
                         inputs_embeds = self.input_embeddings(target_ids).clone() # [1, len, d_model]
                         
                         # Replace masks with soft embeddings
@@ -204,7 +254,39 @@ class BlockWiseSoftTokenLLM:
                         decoding_logits = logits2
 
                 # 4. Decode using the latest logits
-                self.decoder.decode(decoding_logits, block_loc.start, block_loc.end, x)
+                # IMPORTANT: If treat_soft_tokens_as_candidates is False, we must mask out the logits
+                # for soft tokens so they are not selected by the decoder (which picks top-k confidence usually)
+                # However, FixedParallelDecoder usually relies on 'transfer_index' which is determined by confidence.
+                # We can force the logits of soft tokens to be very low confidence (high entropy) or -inf
+                # but FixedParallelDecoder logic for selection is 'get_transfer_index'.
+                
+                if not self.treat_soft_tokens_as_candidates and soft_indices is not None and soft_indices.numel() > 0:
+                    # We want to prevent these indices from being selected.
+                    # The decoder selects based on confidence. We can artificially lower the confidence 
+                    # of soft tokens to -inf (or uniform distribution) so they are last in line.
+                    # But we can't modify logits in-place if they are used for next step, so clone or careful modify.
+                    
+                    # Actually, simpler: mask them out in the 'mask_index' passed to get_transfer_index inside decode?
+                    # But we can't change the decoder code easily from here without subclassing.
+                    # Best approach: Modify the logits passed to decode() so that soft token positions look like garbage.
+                    
+                    # Set logits for soft tokens to a uniform distribution (max entropy -> min confidence)
+                    # or set them to -inf if we want to be sure.
+                    # But FixedParallelDecoder calculates confidence. 
+                    
+                    # Let's just zero out their logits to make them uniform -> low confidence
+                    # decoding_logits is [1, len, vocab]
+                    # We have soft_indices relative to block start.
+                    
+                    # Create a mask for soft tokens
+                    # Set their logits to 0 (uniform probability after softmax, low max-prob)
+                    decoding_logits_modified = decoding_logits.clone()
+                    decoding_logits_modified[0, soft_indices] = -1000.0 # Effectively zero probability for all tokens
+                    
+                    self.decoder.decode(decoding_logits_modified, block_loc.start, block_loc.end, x)
+                else:
+                    self.decoder.decode(decoding_logits, block_loc.start, block_loc.end, x)
+                    
                 iter_no += 1
 
             # Early stop at EOS
@@ -235,7 +317,8 @@ def main():
         "steps": 32,
         "block_length": 128,
         "cache_type": "dual",
-        "soft_token_ratio": 0.2
+        "soft_token_ratio": 0.2,
+        "treat_soft_tokens_as_candidates": False
     }
     
     # Setup components
@@ -297,7 +380,8 @@ def main():
         iterator_factory=iterator_factory,
         cache_factory=cache_factory,
         early_stop=True,
-        soft_token_ratio=generation_config["soft_token_ratio"]
+        soft_token_ratio=generation_config["soft_token_ratio"],
+        treat_soft_tokens_as_candidates=generation_config["treat_soft_tokens_as_candidates"]
     )
     
     start_time = time.time()
