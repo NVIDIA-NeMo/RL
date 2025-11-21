@@ -49,6 +49,45 @@ class BlockWiseSoftTokenLLM:
         self.soft_temperature = soft_temperature
         self.input_embeddings = self.model.get_input_embeddings()
 
+    def _compute_logits(self, x, block_loc, kv_cache, use_input_embeds=None):
+        """Helper to run model with correct context and embeddings."""
+        # Determine input context based on cache type
+        if kv_cache is None:
+            # Full context (no cache)
+            if use_input_embeds is not None:
+                logits = self.model(inputs_embeds=use_input_embeds).logits
+            else:
+                logits = self.model(x.data).logits
+            return logits[:, block_loc.start:block_loc.end]
+            
+        elif kv_cache.cache_type == 'prefix':
+            # Prefix Cache: past_key_values contains context up to block_start
+            past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+            
+            if use_input_embeds is not None:
+                # Input embeddings should correspond to x[block_loc.start:]
+                logits = self.model(inputs_embeds=use_input_embeds, past_key_values=past_key_values, use_cache=True,
+                                  replace_position=replace_position).logits
+            else:
+                logits = self.model(x[block_loc.start:], past_key_values=past_key_values, use_cache=True,
+                                  replace_position=replace_position).logits
+            
+            curr_len = block_loc.end - block_loc.start
+            return logits[:, :curr_len]
+
+        else:
+            # Dual/Sliding Cache: typically uses block context
+            past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+            
+            if use_input_embeds is not None:
+                 logits = self.model(inputs_embeds=use_input_embeds, past_key_values=past_key_values, use_cache=True,
+                                  replace_position=replace_position).logits
+            else:
+                 # Use x slice instead of block to ensure we have the latest updates
+                 logits = self.model(x[block_loc.start:block_loc.end], past_key_values=past_key_values, use_cache=True,
+                                  replace_position=replace_position).logits
+            return logits
+
     def validate_schedule(self, block_length, soft_token_ratio, treat_soft_tokens_as_candidates):
         """ Validates that the decoding schedule can be satisfied with the given soft token ratio.
         """
@@ -113,45 +152,6 @@ class BlockWiseSoftTokenLLM:
         for block_id, (block_loc, block) in enumerate(it):
             self.decoder.block_init(block, block_id)
             
-            # Helper to run model with correct context and embeddings
-            def run_model(use_input_embeds=None):
-                # Determine input context based on cache type
-                if kv_cache is None:
-                    # Full context (no cache)
-                    if use_input_embeds is not None:
-                        logits = self.model(inputs_embeds=use_input_embeds).logits
-                    else:
-                        logits = self.model(x.data).logits
-                    return logits[:, block_loc.start:block_loc.end]
-                    
-                elif kv_cache.cache_type == 'prefix':
-                    # Prefix Cache: past_key_values contains context up to block_start
-                    past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
-                    
-                    if use_input_embeds is not None:
-                        # Input embeddings should correspond to x[block_loc.start:]
-                        logits = self.model(inputs_embeds=use_input_embeds, past_key_values=past_key_values, use_cache=True,
-                                          replace_position=replace_position).logits
-                    else:
-                        logits = self.model(x[block_loc.start:], past_key_values=past_key_values, use_cache=True,
-                                          replace_position=replace_position).logits
-                    
-                    curr_len = block_loc.end - block_loc.start
-                    return logits[:, :curr_len]
-
-                else:
-                    # Dual/Sliding Cache: typically uses block context
-                    past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
-                    
-                    if use_input_embeds is not None:
-                         logits = self.model(inputs_embeds=use_input_embeds, past_key_values=past_key_values, use_cache=True,
-                                          replace_position=replace_position).logits
-                    else:
-                         # Use x slice instead of block to ensure we have the latest updates
-                         logits = self.model(x[block_loc.start:block_loc.end], past_key_values=past_key_values, use_cache=True,
-                                          replace_position=replace_position).logits
-                    return logits
-
             while (block == self.decoder.mask_id).sum() > 0:
                 
                 # Calculate unroll_k based on mask count and expected TPF
@@ -200,12 +200,11 @@ class BlockWiseSoftTokenLLM:
                         kv_cache.update(output.past_key_values)
                         self.cache_updates += 1
                         
-                        # Decode using these initial logits
+                        # Decode using these initial logits (Standard dInfer behavior)
                         self.decoder.decode(output.logits[:, block_loc.start:block_loc.end], block_loc.start, block_loc.end, x)
-                        # Removed continue to allow double decode (consistent with BlockWiseDiffusionLLM)
 
                     # 2. Pass 1: Standard Logits (with current masks)
-                    logits1 = run_model(use_input_embeds=None)
+                    logits1 = self._compute_logits(x, block_loc, kv_cache, use_input_embeds=None)
                     self.num_forwards += 1
                     
                     decoding_logits = logits1
@@ -257,7 +256,7 @@ class BlockWiseSoftTokenLLM:
                             inputs_embeds[0, global_offset + soft_indices] = soft_embeds
                             
                             # Pass 2: Get logits with Soft Tokens
-                            logits2 = run_model(use_input_embeds=inputs_embeds)
+                            logits2 = self._compute_logits(x, block_loc, kv_cache, use_input_embeds=inputs_embeds)
                             self.num_forwards += 1
                             decoding_logits = logits2
 
