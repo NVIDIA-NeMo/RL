@@ -29,6 +29,7 @@
   "packageRules": [
     {
       "description": "Group all updates together into a single PR",
+      "matchPackagePatterns": ["*"],
       "groupName": "all dependencies",
       "additionalBranchPrefix": "all-deps-"
     }
