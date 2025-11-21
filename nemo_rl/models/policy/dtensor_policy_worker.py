@@ -301,10 +301,6 @@ class DTensorPolicyWorker:
             print(
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
-        elif sequence_parallel_enabled and tp_size > 1:
-            raise RuntimeError(
-                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
-            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
