@@ -67,11 +67,12 @@ USAGE
 # Default configuration
 LOCAL_MODE=false
 JOB_NAME="llada-eval"
-TIME="2:00:00"
+TIME="4:00:00"
 CPUS_PER_TASK=32
 MEM="64G"
 PARTITION="cpu"
-CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/degert/data/enroot/nemo-rl:big-version-bump-from-githubci-18672942438.squashfs"
+#CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/degert/data/enroot/nemo-rl:big-version-bump-from-githubci-18672942438.squashfs"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/degert/data/enroot/nemo-rl:diffusion-sft-eval-20251120.sqsh"
 SERVER_ADDRESS=""
 SERVER_INFO_FILE=""
 USER_PROVIDED_SERVER_ADDRESS=""
@@ -455,19 +456,19 @@ else
 fi
 
 # Step 2: Prepare environment from uv.lock
-echo "[2/5] Syncing dependencies from uv.lock..."
-if command -v uv >/dev/null 2>&1; then
-    echo "[DEBUG] uv command is available, running sync..."
-    uv sync --locked --no-install-project --extra eval
-    if [ \$? -ne 0 ]; then
-        echo "Warning: uv sync failed, but continuing with container's existing environment..."
-    else
-        echo "Dependencies synced successfully."
-    fi
-else
-    echo "Warning: uv command not found. Using container's pre-installed environment."
-    echo "If you encounter missing dependencies, install uv in the container or use a container with uv pre-installed."
-fi
+#echo "[2/5] Syncing dependencies from uv.lock..."
+#if command -v uv >/dev/null 2>&1; then
+#    echo "[DEBUG] uv command is available, running sync..."
+#    uv sync --locked --no-install-project --extra eval
+#    if [ \$? -ne 0 ]; then
+#        echo "Warning: uv sync failed, but continuing with container's existing environment..."
+#    else
+#        echo "Dependencies synced successfully."
+#    fi
+#else
+#    echo "Warning: uv command not found. Using container's pre-installed environment."
+#    echo "If you encounter missing dependencies, install uv in the container or use a container with uv pre-installed."
+#fi
 
 # Step 2.5: Determine Python binary to use
 PYTHON_BIN="\$VENV_DIR/bin/python"

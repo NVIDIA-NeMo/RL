@@ -316,8 +316,8 @@ METADATA
         if [[ -L "$latest_link" ]] || [[ -e "$latest_link" ]]; then
             rm -f "$latest_link"
         fi
-        ln -s "$eval_job_name" "$latest_link"
-        print_status "Updated 'latest_eval' symlink -> $eval_job_name"
+        #ln -s "$eval_job_name" "$latest_link"
+        #print_status "Updated 'latest_eval' symlink -> $eval_job_name"
         
         # Mark as completed
         touch "$eval_job_dir/COMPLETED"

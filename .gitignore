@@ -35,6 +35,7 @@ hf_datasets_cache/
 /datasets/
 docker/*
 !docker/Dockerfile
+!docker/Dockerfile.diffusion_eval
 !docker/Dockerfile.ngc_pytorch
 !docker/README.md
 wandb/
