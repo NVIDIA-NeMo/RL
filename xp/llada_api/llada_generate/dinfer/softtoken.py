@@ -362,6 +362,10 @@ class SoftTokenGeneration(DInferGeneration):
         if self.diffusion_llm is None:
             raise RuntimeError("Diffusion LLM not created")
             
+        # Extract soft token params from kwargs to avoid duplicate arguments
+        soft_token_ratio = kwargs.pop('soft_token_ratio', 0.2)
+        treat_soft_tokens_as_candidates = kwargs.pop('treat_soft_tokens_as_candidates', False)
+        
         validated_args = self.validate_args(
             steps=steps,
             gen_length=gen_length,
@@ -370,8 +374,8 @@ class SoftTokenGeneration(DInferGeneration):
             remasking=remasking,
             threshold=threshold,
             factor=factor,
-            soft_token_ratio=kwargs.get('soft_token_ratio', 0.2),
-            treat_soft_tokens_as_candidates=kwargs.get('treat_soft_tokens_as_candidates', False),
+            soft_token_ratio=soft_token_ratio,
+            treat_soft_tokens_as_candidates=treat_soft_tokens_as_candidates,
             soft_temperature=soft_temperature,
             **kwargs
         )
