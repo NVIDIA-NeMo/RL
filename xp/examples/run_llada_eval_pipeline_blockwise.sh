@@ -1,0 +1,48 @@
+#!/bin/bash
+# Preset for LLaDA BlockWise (dInfer) evaluation
+#
+# Configuration:
+# - Server runs on 'interactive' partition (REQUIRED for GPU access)
+# - Eval runs on 'cpu' partition (for resource allocation)
+# - Uses --use-same-node to attempt co-location
+#
+# This will ONLY work if:
+# - The node allocated by 'interactive' partition is also accessible to 'cpu' partition
+# - OR the node has enough resources for both jobs
+
+set -euo pipefail
+
+# Use defaults if not already set (allows override from parent scripts)
+export EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-/lustre/fsw/portfolios/llmservice/users/$USER/llada-blockwise-eval}"
+
+# Run SERVER on interactive partition (REQUIRED for GPU access)
+export SERVER_PARTITION="${SERVER_PARTITION:-interactive}"
+export SERVER_INFO_FILE="${SERVER_INFO_FILE:-${EVAL_OUTPUT_DIR}/server_info.env}"
+export SERVER_GPUS="${SERVER_GPUS:-8}"
+export SERVER_BATCH_SIZE="${SERVER_BATCH_SIZE:-1}"
+export SERVER_BASE_MODEL="${SERVER_BASE_MODEL:-GSAI-ML/LLaDA-8B-Instruct}"
+export SERVER_DCP_PATH="${SERVER_DCP_PATH:-}"
+export SERVER_ENGINE="${SERVER_ENGINE:-dinfer}"
+export SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:---verbose}"
+
+# Run EVAL on cpu partition (attempt same node via --use-same-node)
+export SEQ_EVAL_PARTITION="${SEQ_EVAL_PARTITION:-cpu}"
+export SEQ_EVAL_BENCHMARK="${SEQ_EVAL_BENCHMARK:-gsm8k:1}"
+export SEQ_EVAL_OUTPUT_DIR="${SEQ_EVAL_OUTPUT_DIR:-${EVAL_OUTPUT_DIR}}"
+export SEQ_EVAL_GENERATION_ALGORITHM="${SEQ_EVAL_GENERATION_ALGORITHM:-dinfer_blockwise}"
+export SEQ_EVAL_THRESHOLD="${SEQ_EVAL_THRESHOLD:-0.9}"
+export SEQ_EVAL_TOKENS_TO_GENERATE="${SEQ_EVAL_TOKENS_TO_GENERATE:-512}"
+export SEQ_EVAL_STEPS="${SEQ_EVAL_STEPS:-32}"
+export SEQ_EVAL_BLOCK_LENGTH="${SEQ_EVAL_BLOCK_LENGTH:-64}"
+export SEQ_EVAL_TEMPERATURE="${SEQ_EVAL_TEMPERATURE:-0}"
+export SEQ_EVAL_EXTRA_ARGS="${SEQ_EVAL_EXTRA_ARGS:---model llada-8b-instruct}"
+export SEQ_EVAL_EXPNAME="${SEQ_EVAL_EXPNAME:-llada-blockwise}"
+
+# Enable same-node execution for guaranteed connectivity
+export SEQ_EVAL_USE_SAME_NODE="true"
+
+export PARALLEL_EVAL_JOBS_OVERRIDE=""
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/run_llada_eval_pipeline.sh"
+
