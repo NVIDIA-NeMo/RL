@@ -12,7 +12,7 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft_openmathinstruct2"
-  metric_name: "val_loss"
+  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
@@ -26,6 +26,8 @@ policy:
   train_micro_batch_size: 2
   max_total_sequence_length: 4096
   precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
     enabled: true

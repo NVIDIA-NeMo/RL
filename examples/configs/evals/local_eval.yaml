@@ -1,11 +1,17 @@
 # Evaluation Configuration from local files.
+# Other settings (e.g., eval metrics, vLLM, cluster, etc.) are inherited from examples/configs/evals/eval.yaml.
 defaults: "eval.yaml"
 
 generation:
   model_name: "Qwen/Qwen2.5-7B-Instruct"
+  vllm_cfg:
+    max_model_len: 2048
 
 data:
   prompt_file: "examples/prompts/cot.txt"
+  system_prompt_file: null
+  # You can also use custom datasets from a local dataset or HuggingFace.
+  # e.g., /path/to/local/dataset or hf_org/hf_dataset_name (HuggingFace)
   dataset_name: "https://openaipublic.blob.core.windows.net/simple-evals/math_500_test.csv"
   problem_key: "Question"
   solution_key: "Answer"

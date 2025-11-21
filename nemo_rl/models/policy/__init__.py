@@ -12,26 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class DTensorConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
 class DTensorConfig(TypedDict):
-    enabled: bool
-    env_vars: NotRequired[dict[str, str]]
+    enabled: Literal[True]
+    env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
-    cpu_offload: NotRequired[bool]
-    sequence_parallel: NotRequired[bool]
-    activation_checkpointing: NotRequired[bool]
-    tensor_parallel_size: NotRequired[int]
-    context_parallel_size: NotRequired[int]
-    custom_parallel_plan: NotRequired[str]
-    clear_cache_every_n_steps: NotRequired[int]
+    cpu_offload: bool
+    sequence_parallel: bool
+    activation_checkpointing: bool
+    tensor_parallel_size: int
+    context_parallel_size: int
+    custom_parallel_plan: str | None
+    clear_cache_every_n_steps: NotRequired[int | None]
+
+
+class SequencePackingConfigDisabled(TypedDict):
+    enabled: Literal[False]
 
 
 class SequencePackingConfig(TypedDict):
-    enabled: bool
+    enabled: Literal[True]
     train_mb_tokens: int
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
@@ -73,7 +81,7 @@ class MegatronSchedulerConfig(TypedDict):
     end_weight_decay: float
     weight_decay_incr_style: str
     lr_decay_style: str
-    lr_decay_iters: int
+    lr_decay_iters: NotRequired[int | None]
     lr_warmup_iters: int
     lr_warmup_init: float
 
@@ -82,35 +90,44 @@ class MegatronDDPConfig(TypedDict):
     grad_reduce_in_fp32: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
-    average_in_collective: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
 
 
+# Type exists to be lax if not specified
+class MegatronConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
 class MegatronConfig(TypedDict):
-    enabled: bool
-    env_vars: NotRequired[dict[str, str]]
+    enabled: Literal[True]
+    env_vars: NotRequired[dict[str, str] | None]
+    # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
+    # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
     activation_checkpointing: bool
-    converter_type: str
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
-    num_layers_in_first_pipeline_stage: int
-    num_layers_in_last_pipeline_stage: int
+    num_layers_in_first_pipeline_stage: int | None
+    num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
+    # If True, defer the casting of logits to float32 until the backward pass.
+    # If you are using logprob_chunk_size, you must set this to True.
     defer_fp32_logits: NotRequired[bool]
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
+    # Force overwrite of the initial checkpoint even if it exists (default: False)
+    force_overwrite_initial_ckpt: NotRequired[bool]
 
-    optimizer: NotRequired[MegatronOptimizerConfig]
-    scheduler: NotRequired[MegatronSchedulerConfig]
+    optimizer: MegatronOptimizerConfig
+    scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
 
 
@@ -118,7 +135,7 @@ class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
-    chat_template_kwargs: NotRequired[dict[str, Any]]
+    chat_template_kwargs: NotRequired[dict[str, Any] | None]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -129,10 +146,17 @@ class PytorchOptimizerConfig(TypedDict):
 class SinglePytorchSchedulerConfig(TypedDict):
     name: str
     kwargs: dict[str, Any]
-    milestones: NotRequired[list[int]]  # Used in SequentialLR configuration
+
+
+class SinglePytorchMilestonesConfig(TypedDict):
+    milestones: list[int]  # Used in SequentialLR configuration
 
 
 SchedulerMilestones = dict[str, list[int]]
+
+
+class DynamicBatchingConfigDisabled(TypedDict):
+    enabled: Literal[False]
 
 
 class DynamicBatchingConfig(TypedDict):
@@ -141,12 +165,10 @@ class DynamicBatchingConfig(TypedDict):
     # responses are sorted by sequence length and bucketed into microbatches with a total
     # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
     # training and logprob stages respectively.
-    enabled: bool
-
-    ## required if enabled is true
-    train_mb_tokens: NotRequired[int]
-    logprob_mb_tokens: NotRequired[int]
-    sequence_length_round: NotRequired[int]
+    enabled: Literal[True]
+    train_mb_tokens: int
+    logprob_mb_tokens: NotRequired[int]  # Only used for some algorithms
+    sequence_length_round: int
 
 
 class PolicyConfig(TypedDict):
@@ -155,21 +177,29 @@ class PolicyConfig(TypedDict):
     train_global_batch_size: int
     train_micro_batch_size: int
     logprob_batch_size: NotRequired[int]
-    logprob_chunk_size: NotRequired[int]
+    # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
+    # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
+    # If None, chunking is disabled and the full sequence is processed at once.
+    logprob_chunk_size: NotRequired[int | None]
     generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
-    dtensor_cfg: DTensorConfig
-    megatron_cfg: NotRequired[MegatronConfig]
+    dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
-    dynamic_batching: DynamicBatchingConfig
-    sequence_packing: NotRequired[SequencePackingConfig]
+    dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
+    sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    max_grad_norm: NotRequired[Union[float, int]]
+    # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
+    max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]
-    optimizer: NotRequired[PytorchOptimizerConfig]
-    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones]
+    optimizer: NotRequired[PytorchOptimizerConfig | None]
+    scheduler: NotRequired[
+        list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
+        | SchedulerMilestones
+        | None
+    ]

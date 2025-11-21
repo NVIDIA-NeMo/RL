@@ -1,4 +1,4 @@
-# Nemo RL: A Scalable and Efficient Post-Training Library
+# NeMo RL: A Scalable and Efficient Post-Training Library
 
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
 
@@ -8,7 +8,7 @@
   DAPO extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
 * [9/30/2025][Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
 * [9/27/2025] [FP8 Quantization in NeMo RL](https://github.com/NVIDIA-NeMo/RL/discussions/1216)
-* [9/25/2025] On-policy Distillation (Qwen3-style)
+* [9/25/2025] On-policy Distillation 
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 
 <details>
@@ -28,7 +28,9 @@
 
 ## Overview
 
-**Nemo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+**NeMo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+
+![NeMo RL Architecture Diagram](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/main/docs/assets/RL_diagram.png)
 
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
@@ -69,12 +71,12 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Megatron Bridge Integration** - Integrate Megatron Bridge to enable training features from Megatron Core.
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
 - 🔜 **New Models** - gpt-oss.
-- 🔜 **Expand Algorithms** - DAPO, GSPO, On-policy Distillation.
+- 🔜 **Expand Algorithms** - DAPO, GSPO.
 - 🔜 **GB200** - Add container support for GB200.
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Learning Algorithms** - GRPO/GSPO, SFT, and DPO.
+- ✅ **Learning Algorithms** - GRPO/GSPO, SFT, DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
 - ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
@@ -129,9 +131,8 @@ For more examples and setup details, continue to the [Prerequisites](#prerequisi
     <tr>
       <td colspan="2" style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Clone and create the environment</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
-git submodule update --init --recursive
 uv venv</code></pre>
         <em>Note:</em> If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
       </td>
@@ -200,19 +201,6 @@ uv venv
 > [!NOTE]
 > Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
 > This ensures that the version of python used is always what we prescribe.
-
-If working outside a container, it can help to build [flash-attn](https://github.com/Dao-AILab/flash-attention) and warm the uv cache before your first run.
-```sh
-bash tools/build-flash-attn-in-uv-cache.sh
-```
-> [!NOTE]
-> On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache directory, making subsequent installs much quicker.
-
-> [!TIP]
-> The NeMo RL Dockerfile will warm the uv cache with flash-attn.
-> See https://docs.nvidia.com/nemo/rl/latest/docker.html for instructions if you are looking for the NeMo RL container.
-
-If successful, you should see `✅ flash-attn successfully added to uv cache`.
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 > [!NOTE]

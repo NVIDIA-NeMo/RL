@@ -1,0 +1,22 @@
+# uv.docs.toml
+[project]
+name = "nemo-rl-docs-env"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+  "sphinx",
+  "sphinx-autobuild",
+  "sphinx-autodoc2",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "myst_parser",
+  "nvidia-sphinx-theme",
+  "gitpython>=3.1.45",
+  "python-dotenv",
+  "sphinxcontrib-mermaid",
+  "swagger-plugin-for-sphinx",
+]
+
+[tool.uv]
+# DO NOT create or modify the main project lockfile.
+no-lock = true

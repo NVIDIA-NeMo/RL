@@ -4,7 +4,7 @@ grpo:
   num_generations_per_prompt: 32
   max_num_steps: 20
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
+  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long
 policy:
   model_name: Qwen/Qwen2.5-32B
   tokenizer:
@@ -13,7 +13,6 @@ policy:
   logprob_batch_size: 2
   max_total_sequence_length: 16384
   dtensor_cfg:
-    sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 8
   dynamic_batching:
@@ -38,20 +37,18 @@ policy:
     - 13
   generation:
     max_new_tokens: 16384
-    stop_token_ids:
-    - 151643
     vllm_cfg:
       tensor_parallel_size: 4
       max_model_len: 16384
 data:
   max_input_seq_length: 16384
 logger:
-  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
+  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
+    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long
 cluster:
   gpus_per_node: 8
   num_nodes: 32

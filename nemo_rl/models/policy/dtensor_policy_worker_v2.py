@@ -150,6 +150,7 @@ class DTensorPolicyWorkerV2:
         model_name = self.cfg["model_name"]
 
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
+        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         if self.cfg["precision"] == "float32":
@@ -281,6 +282,10 @@ class DTensorPolicyWorkerV2:
             print(
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
+        elif sequence_parallel_enabled and tp_size > 1:
+            raise RuntimeError(
+                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
+            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
@@ -303,12 +308,19 @@ class DTensorPolicyWorkerV2:
         dp_replicate_size = 1
         dp_shard_size = dp_size
 
+        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
+        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
+        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
+        prev_local_rank = os.environ["LOCAL_RANK"]
+        os.environ["LOCAL_RANK"] = "0"
+
         # Create device mesh with HSDP structure for FSDP2 compatibility
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda",
             (dp_replicate_size, dp_shard_size, cp_size, tp_size),
             mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
         )
+        os.environ["LOCAL_RANK"] = prev_local_rank
 
         # Create flattened submeshes for different use cases
         # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
@@ -656,6 +668,9 @@ class DTensorPolicyWorkerV2:
                         )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
+                            assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
+                                "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
+                            )
 
                     context_parallel_ctx = None
                     if self.cp_size > 1:
@@ -1666,8 +1681,12 @@ class DTensorPolicyWorkerV2:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
@@ -1757,13 +1776,21 @@ class DTensorPolicyWorkerV2:
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
+        # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
         else:
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.eval()
-        self.offload_before_refit()
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
@@ -1777,15 +1804,13 @@ class DTensorPolicyWorkerV2:
 
         self.model.train()
         # Move optimizer state to CUDA if it exists
+        # colocated generation will always offload optimizer to cuda before refit
         if (
-            hasattr(self, "optimizer")
-            and self.optimizer is not None
+            self.optimizer is not None
             and not self.cpu_offload
+            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, (DTensor, torch.Tensor)):
-                        state[k] = v.to("cuda")
+            self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
 
@@ -1794,11 +1819,8 @@ class DTensorPolicyWorkerV2:
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, (DTensor, torch.Tensor)):
-                        state[k] = v.to("cpu")
+        if self.optimizer is not None:
+            self.move_optimizer_to_device("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1818,6 +1840,12 @@ class DTensorPolicyWorkerV2:
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+
+    def move_optimizer_to_device(self, device: str | torch.device) -> None:
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, (DTensor, torch.Tensor)):
+                    state[k] = v.to(device)
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
@@ -1913,3 +1941,9 @@ class DTensorPolicyWorkerV2:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Report the node IP and GPU ID of the current worker."""
+        ip = ray._private.services.get_node_ip_address()
+        gpu_id = ray.get_gpu_ids()[0]
+        return (ip, gpu_id)

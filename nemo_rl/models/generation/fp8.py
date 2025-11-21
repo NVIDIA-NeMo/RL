@@ -302,18 +302,8 @@ def load_weights(weights, model_runner):
         param_scale = torch.squeeze(param_scale, dim=-1)
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
-    # Monkey patch the param class to their subclass, as certain models
-    # will check the param type to call the proper weightloader
-    for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
-            param.orig_type = param.__class__
-            param.__class__ = param.subclass_type
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
-    # Undo the type change above to the original type
-    for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
-            param.__class__ = param.orig_type
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -324,12 +314,25 @@ def cast_tensor_to_fp8_blockwise(
 
     block_size1 = weight_block_size[1]
     block_size0 = weight_block_size[0]
-    assert data_hp.shape[1] % block_size1 == 0, (
-        f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    )
-    assert data_hp.shape[0] % block_size0 == 0, (
-        f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
-    )
+    shape_before_padding = data_hp.shape
+    # pad data_hp to make its shape a multiple of weight_block_size with the last element of data_hp
+    if data_hp.shape[1] % block_size1 != 0 or data_hp.shape[0] % block_size0 != 0:
+        pad1 = (
+            0
+            if data_hp.shape[1] % block_size1 == 0
+            else block_size1 - data_hp.shape[1] % block_size1
+        )
+        pad0 = (
+            0
+            if data_hp.shape[0] % block_size0 == 0
+            else block_size0 - data_hp.shape[0] % block_size0
+        )
+        print(
+            f"Padding data_hp from {data_hp.shape} to {(data_hp.shape[0] + pad0, data_hp.shape[1] + pad1)}"
+        )
+        data_hp = torch.nn.functional.pad(
+            data_hp, (0, pad1, 0, pad0), mode="constant", value=data_hp[-1, -1]
+        )
 
     # FP8
     max_dtype = torch.finfo(torch.float8_e4m3fn).max
@@ -385,57 +388,35 @@ def cast_tensor_to_fp8_blockwise(
         .reshape(original_shape)
     )
 
+    # remove the padding
+    if data_hp.shape != shape_before_padding:
+        fp_data = fp_data[: shape_before_padding[0], : shape_before_padding[1]]
+
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
 
 
 def process_weights_after_loading(self, layer) -> None:
-    from torch.nn import Parameter
-    from vllm.model_executor.parameter import (
-        BlockQuantScaleParameter,
-        ModelWeightParameter,
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        maybe_post_process_fp8_weight_block,
+        process_fp8_weight_block_strategy,
     )
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
-    def _create_param_from_subclass_attributes(custom_param):
-        param = Parameter(custom_param.data, requires_grad=False)
-        base_param_dir = dir(torch.nn.Parameter)
-        custom_param_dir = dir(custom_param)
-        # Find the attributes that are unique to the custom parameter
-        custom_attributes = [
-            attr
-            for attr in custom_param_dir
-            if attr not in base_param_dir and not attr.startswith("__")
-        ]
-        # Set the custom attributes into the base parameter object
-        for attr in custom_attributes:
-            setattr(param, attr, getattr(custom_param, attr))
+    weight_scale = layer.weight_scale_inv
+    weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
+    layer.weight.data = weight.data
+    if hasattr(layer, "weight_scale"):
+        # Not the first time to call this function, just need to update the data
+        layer.weight_scale.data = weight_scale.data
+    else:
+        # The first time to call this function, create a new parameter and update the tp status
+        layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
+        layer.update_param_tp_status()
 
-        param.subclass_type = type(custom_param)
-        return param
-
-    weight = layer.weight.data
-    weight_scale_inv = layer.weight_scale_inv.data
-    weight = self._maybe_pad_weight(weight)
-
-    layer.weight = _create_param_from_subclass_attributes(
-        ModelWeightParameter(
-            data=weight,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight.weight_loader,
-        )
-    )
-    layer.weight_scale_inv = _create_param_from_subclass_attributes(
-        BlockQuantScaleParameter(
-            data=weight_scale_inv,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight_scale_inv.weight_loader,
-        )
-    )
+    maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
 
 
 @triton.jit

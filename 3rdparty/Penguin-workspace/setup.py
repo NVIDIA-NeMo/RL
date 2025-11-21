@@ -25,7 +25,7 @@ src_dir = Path("Penguin")
 
 
 CACHED_DEPENDENCIES = [
-    "openai<=1.97.1",
+    "openai<=2.6.1",
     "tqdm",
     "pydantic",
     "pydantic_core",
@@ -40,6 +40,7 @@ CACHED_DEPENDENCIES = [
     "tdigest>=0.5.2.2",
     "aiohttp",
     "yappi",
+    "ray[default]",
 ]
 
 if src_dir.exists():

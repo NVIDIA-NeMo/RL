@@ -15,7 +15,7 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft"
-  metric_name: "val_loss" ## set to null to save most recent k checkpoints
+  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
@@ -33,8 +33,11 @@ policy:
   max_total_sequence_length: 1024
   precision: "bfloat16"
 
+  offload_optimizer_for_logprob: false
+
   dtensor_cfg:
     enabled: true
+    env_vars: {}
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -73,6 +76,7 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 1
@@ -93,6 +97,7 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
+    defer_fp32_logits: False
 
     optimizer:
       optimizer: "adam"
@@ -134,7 +139,6 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
-      average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
       use_custom_fsdp: false
 

@@ -94,6 +94,7 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_new_tokens": 16,
     "do_sample": False,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -148,6 +149,7 @@ def get_basic_megatron_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -209,7 +211,6 @@ def get_basic_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
@@ -438,7 +439,7 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
 
     # Extract in correct order
     outputs = [item for _, item in collected_indexed_outputs]
-    pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    pad_token_id = vllm_policy.cfg.get("_pad_token_id", tokenizer.pad_token_id)
     outputs = BatchedDataDict.from_batches(
         outputs,
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
@@ -1112,6 +1113,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert len(base_urls) == cluster.num_gpus_per_node
 
     body = dict(
+        model=generation_config["model_name"],
         messages=[
             {"role": "user", "content": "count to 5"},
         ],
@@ -1160,6 +1162,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 },
                 "finish_reason": "length",
                 "stop_reason": None,
+                "token_ids": None,
             }
         ],
         "service_tier": None,
@@ -1171,6 +1174,7 @@ def test_vllm_http_server(cluster, tokenizer):
             "prompt_tokens_details": None,
         },
         "prompt_logprobs": None,
+        "prompt_token_ids": None,
         "kv_transfer_params": None,
     }
 

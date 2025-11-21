@@ -42,6 +42,7 @@ simple_policy_config = {
     "logprob_batch_size": 1,
     "max_total_sequence_length": 1024,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {

@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
     get_tokenizer,
     maybe_pad_last_batch,
     print_performance_metrics,
@@ -393,3 +394,202 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
 
     out = capsys.readouterr().out
     assert "Throughputs (per GPU)" in out
+
+
+# ============================================================================
+# Tests for calculate_baseline_and_std_per_prompt function
+# ============================================================================
+
+
+def test_calculate_baseline_and_std_per_prompt_basic():
+    """Test basic functionality of calculate_baseline_and_std_per_prompt."""
+    # Create rewards for 2 prompts, each with 3 generations
+    rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    valid_mask = torch.ones(6)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    expected_baseline = torch.tensor([2.5, 2.0, 1.5, 5.5, 5.0, 4.5])
+    expected_std = torch.tensor(
+        [0.707107, 1.414214, 0.707107, 0.707107, 1.414214, 0.707107]
+    )
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_single_generation_per_prompt():
+    """Test calculate_baseline_and_std_per_prompt when num_valid < 2 (single generation per prompt)."""
+    # Case where each prompt has only 1 generation (num_valid = 1 < 2)
+    rewards = torch.tensor([2.5, 4.0])
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    valid_mask = torch.ones(2)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    # When num_valid <= 1 (single generation per prompt), baseline equals reward
+    expected_baseline = torch.tensor([2.5, 4.0])
+    expected_std = torch.tensor([0.0, 0.0])
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_identical_rewards():
+    """Test calculate_baseline_and_std_per_prompt when all rewards for a prompt are identical."""
+    # All generations for both prompts have the same reward
+    rewards = torch.tensor([3.0, 3.0, 3.0, 7.0, 7.0, 7.0])
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    valid_mask = torch.ones(6)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    expected_baseline = torch.tensor([3.0, 3.0, 3.0, 7.0, 7.0, 7.0])
+    expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
+    """Test calculate_baseline_and_std_per_prompt with different number of generations per prompt."""
+    # Prompt 0 has 2 generations, Prompt 1 has 3 generations
+    rewards = torch.tensor([1.0, 2.0, 4.0, 5.0, 6.0])
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    valid_mask = torch.ones(5)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    expected_baseline = torch.tensor([2.0, 1.0, 5.5, 5.0, 4.5])
+    expected_std = torch.tensor([0.0, 0.0, 0.707107, 1.414214, 0.707107])
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_empty_input():
+    """Test calculate_baseline_and_std_per_prompt with empty tensors."""
+    rewards = torch.tensor([])
+    prompts = torch.empty(0, 3, dtype=torch.long)
+    valid_mask = torch.tensor([])
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    assert baseline.shape == torch.Size([0])
+    assert std.shape == torch.Size([0])
+    assert torch.equal(baseline, torch.tensor([]))
+    assert torch.equal(std, torch.tensor([]))
+
+
+def test_calculate_baseline_and_std_per_prompt_nan_handling():
+    """Test calculate_baseline_and_std_per_prompt handles valid_mask correctly with masked samples."""
+    # Test that valid_mask properly excludes samples from baseline calculation
+    # Note: The function doesn't handle actual NaN values; it uses valid_mask to exclude samples
+    rewards = torch.tensor([1.0, 999.0, 3.0, 4.0, 5.0, 6.0])  # 999.0 should be ignored
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0 (invalid sample)
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    # Mark the second sample as invalid
+    valid_mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    expected_baseline = torch.tensor([3.0, 4.0, 1.0, 5.5, 5.0, 4.5])
+    expected_std = torch.tensor([0.0, 0.0, 0.0, 0.707107, 1.414214, 0.707107])
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
+    """Test calculate_baseline_and_std_per_prompt works with CUDA tensors if available."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    rewards = torch.tensor([1.0, 2.0, 3.0, 4.0]).cuda()
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    ).cuda()
+    valid_mask = torch.ones(4).cuda()
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    # Verify results are on CUDA and have expected values
+    assert baseline.device.type == "cuda"
+    assert std.device.type == "cuda"
+
+    expected_baseline = torch.tensor([2.0, 1.0, 4.0, 3.0]).cuda()
+    expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0]).cuda()
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    assert torch.allclose(std, expected_std, rtol=1e-5)
+
+
+def test_calculate_baseline_and_std_per_prompt_numerical_precision():
+    """Test calculate_baseline_and_std_per_prompt with edge case numerical values."""
+    # Use very small and very large values
+    rewards = torch.tensor([1e-8, 2e-8, 3e-8, 1e8, 2e8, 3e8])
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+    valid_mask = torch.ones(6)
+
+    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+
+    expected_baseline = torch.tensor([2.5e-8, 2e-8, 1.5e-8, 2.5e8, 2e8, 1.5e8])
+
+    assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
+    # Std values should be finite and not NaN
+    assert torch.isfinite(std).all()
+    assert not torch.isnan(std).any()

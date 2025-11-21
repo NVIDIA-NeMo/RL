@@ -178,7 +178,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
-            BaseModelPath(name=model_config.model, model_path=model_config.model)
+            BaseModelPath(
+                name=model_config.served_model_name, model_path=model_config.model
+            ),
+            BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
         openai_serving_models = OpenAIServingModels(
@@ -216,7 +219,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 documents=None,
                 chat_template_kwargs=None,
                 tool_parser=None,
-                truncate_prompt_tokens=None,
                 add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
@@ -240,7 +242,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents,
                     chat_template_kwargs,
                     tool_parser,
-                    truncate_prompt_tokens,
                     add_special_tokens,
                 )
 
@@ -254,14 +255,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         last_assistant_message_idx = i
                         break
 
-                # If there's no assistant message, we don't have any issues.
                 if last_assistant_message_idx is None:
-                    return res
+                    # If there's no assistant message, we just use the entire thing.
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
+                else:
+                    # Include the last assistant message itself.
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
 
-                # Include the last assistant message itself.
-                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
-                    : last_assistant_message_idx + 1
-                ]
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
                     request,
@@ -275,7 +281,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents=documents,
                     chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                     add_special_tokens=add_special_tokens,
                 )
                 actual_corresponding_token_ids = corresponding_res[2][0][
@@ -289,7 +294,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
@@ -353,7 +358,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
@@ -379,38 +384,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingTokenization(
             NeMoRLOpenAIServingMixin, OpenAIServingTokenization
         ):
-            async def create_tokenize(self, request, raw_request):
-                """Override to handle required_prefix_token_ids for tokenization."""
-                # Call parent's create_tokenize first
-                result = await super().create_tokenize(request, raw_request)
-
-                # If there's an error or no required_prefix_token_ids, return as-is
-                if isinstance(result, ErrorResponse):
-                    return result
-
-                # Only process chat requests (not completion requests)
-                if not hasattr(request, "messages"):
-                    return result
-
-                # Get the template-tokenized tokens from the result
-                template_token_ids = result.tokens
-
-                # Get the tokenizer from the engine client
-                tokenizer = await self.engine_client.get_tokenizer()
-
-                # Apply _replace_prefix_tokens to fix up the tokenization
-                final_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=request.required_prefix_token_ids,
-                    template_token_ids=template_token_ids,
-                )
-
-                # Update the result with the corrected tokens
-                result.tokens = final_token_ids
-                result.count = len(final_token_ids)
-
-                return result
+            pass
 
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             engine_client,
@@ -431,7 +405,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
@@ -454,6 +428,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
         import threading
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord, getLogger
 
         import uvicorn
         from fastapi import FastAPI
@@ -480,6 +456,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             port=free_port,
         )
         server = uvicorn.Server(config=config)
+
+        print(
+            "Adding a uvicorn logging filter so that the logs aren't spammed with 200 OK messages. This is to help errors pop up better and filter out noise."
+        )
+
+        class No200Filter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+                return not msg.strip().endswith("200")
+
+        uvicorn_logger = getLogger("uvicorn.access")
+        uvicorn_logger.addFilter(No200Filter())
 
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
@@ -528,7 +516,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if len(data["input_ids"]) == 0:
             return
 
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         input_ids_batch = data["input_ids"]
         input_lengths_batch = data["input_lengths"]
@@ -636,7 +624,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Create output_ids tensor for this single item
             output_ids_single_item = torch.full(
                 (final_output_tensor_len,),
-                self.cfg["pad_token_id"],
+                self.cfg["_pad_token_id"],
                 dtype=original_input_ids_single_row.dtype,
                 device=original_input_ids_single_row.device,
             )

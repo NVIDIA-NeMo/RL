@@ -1,0 +1,34 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 30
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-1n8g-megatron
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 8
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      max_model_len: 512
+  sequence_packing:
+    enabled: false
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-nano-v2-12b-1n8g-megatron
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nano-v2-12b-1n8g-megatron
+cluster:
+  gpus_per_node: 8

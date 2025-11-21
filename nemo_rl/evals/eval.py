@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.data import MathDataConfig
+from nemo_rl.data import EvalDataConfigType
 from nemo_rl.data.collate_fn import eval_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
@@ -49,12 +49,17 @@ class EvalConfig(TypedDict):
     save_path: str | None
 
 
+# TODO: this should updated, but is left to avoid breaking changes
+class _PassThroughMathConfig(TypedDict):
+    math: MathEnvConfig
+
+
 class MasterConfig(TypedDict):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
-    data: MathDataConfig
-    env: MathEnvConfig
+    data: EvalDataConfigType
+    env: _PassThroughMathConfig
     cluster: ClusterConfig
 
 
