@@ -15,6 +15,7 @@ from .base import DInferGeneration
 from ._imports import (
     DINFER_AVAILABLE,
     ParallelDecoder,
+    ThresholdParallelDecoder,
     get_num_transfer_tokens,
     get_transfer_index,
     TokenArray,
@@ -50,6 +51,7 @@ class BlockWiseSoftTokenLLM:
     def validate_schedule(self, block_length, soft_token_ratio, treat_soft_tokens_as_candidates):
         """ Validates that the decoding schedule can be satisfied with the given soft token ratio.
         """
+        # Only validate for FixedParallelDecoder which has steps
         if not hasattr(self.decoder, 'steps') or treat_soft_tokens_as_candidates:
             return
 
@@ -81,7 +83,7 @@ class BlockWiseSoftTokenLLM:
             current_masks -= num_to_decode
         
     @torch.no_grad()
-    def generate(self, prompt, gen_length=128, block_length=128, soft_token_ratio=None, treat_soft_tokens_as_candidates=None, steps=None):
+    def generate(self, prompt, gen_length=128, block_length=128, soft_token_ratio=None, treat_soft_tokens_as_candidates=None, steps=None, threshold=None):
         ''' Generate tokens with diffusion iterations block by block using Soft Token Sampling.
         '''
         # Use instance defaults if not provided
@@ -90,9 +92,12 @@ class BlockWiseSoftTokenLLM:
         if treat_soft_tokens_as_candidates is None:
             treat_soft_tokens_as_candidates = self.treat_soft_tokens_as_candidates
             
-        # Update decoder steps if provided
+        # Update decoder parameters
         if steps is not None and hasattr(self.decoder, 'steps'):
             self.decoder.steps = steps
+            
+        if threshold is not None and hasattr(self.decoder, 'threshold'):
+            self.decoder.threshold = threshold
             
         self.validate_schedule(block_length, soft_token_ratio, treat_soft_tokens_as_candidates)
 
@@ -112,24 +117,31 @@ class BlockWiseSoftTokenLLM:
                 current_masks = (x[block_loc.start:block_loc.end] == self.decoder.mask_id).sum().item()
                 num_soft = int(current_masks * soft_token_ratio)
                 
-                # The decoder wants to transfer (decode) N tokens this step
-                if self.decoder.iter < self.decoder.num_transfer_tokens.shape[1]:
-                    num_to_decode = self.decoder.num_transfer_tokens[0, self.decoder.iter].item()
+                # Determine num_to_decode for the current step
+                num_to_decode = 0
+                if hasattr(self.decoder, 'num_transfer_tokens'):
+                    # Fixed schedule
+                    if self.decoder.iter < self.decoder.num_transfer_tokens.shape[1]:
+                        num_to_decode = self.decoder.num_transfer_tokens[0, self.decoder.iter].item()
                 else:
-                    num_to_decode = 0 # Should not happen usually
+                    # Dynamic schedule (Threshold decoder) - estimation not straightforward here without logits
+                    # We assume ThresholdDecoder manages its own termination, but we still need to be careful
+                    # about soft token availability if treat_soft_tokens_as_candidates is False.
+                    # Since we don't know N in advance for Threshold, we can't easily pre-validate per step.
+                    pass
                 
-                if not treat_soft_tokens_as_candidates:
+                if not treat_soft_tokens_as_candidates and num_to_decode > 0:
                     # If soft tokens CANNOT be decoded, we must have enough pure masks left to satisfy decoder demand
                     available_for_decoding = current_masks - num_soft
                     if available_for_decoding < num_to_decode:
                         # Log warning instead of crashing
-                         logger.warning(
+                        logger.warning(
                             f"Decoding Schedule Violation: Step {self.decoder.iter} requires decoding {num_to_decode} tokens, "
                             f"but only {available_for_decoding} masks are available ({current_masks} total - {num_soft} soft tokens). "
                             f"Auto-adjusting soft tokens for this step."
                         )
-                         # Adjust num_soft to make it work
-                         num_soft = max(0, current_masks - num_to_decode)
+                        # Adjust num_soft to make it work
+                        num_soft = max(0, current_masks - num_to_decode)
 
                 # Helper to run model with correct context and embeddings
                 def run_model(use_input_embeds=None):
@@ -259,7 +271,7 @@ class BlockWiseSoftTokenLLM:
 
 class SoftTokenGeneration(DInferGeneration):
     """
-    dInfer Soft Token generation with FixedParallelDecoder and dual cache.
+    dInfer Soft Token generation with FixedParallelDecoder or ThresholdParallelDecoder.
     """
     
     def __init__(self):
@@ -271,31 +283,46 @@ class SoftTokenGeneration(DInferGeneration):
     def create_diffusion_llm(self):
         """
         Create dInfer BlockWiseSoftTokenLLM.
+        Uses ThresholdParallelDecoder by default (dynamic steps) but can switch to FixedParallelDecoder (fixed steps)
         """
         if not DINFER_AVAILABLE:
             raise RuntimeError("dInfer is not available")
         
-        # Use default steps of 64 if not specified (will be updated in generate)
-        decoder = FixedParallelDecoder(
+        # Default to ThresholdParallelDecoder if no steps provided or steps is large
+        # However, the user can override this via request parameters
+        
+        # For initialization, we'll use a default decoder.
+        # Ideally, we should be able to swap decoders per request, but the architecture wraps the model in 
+        # BlockWiseSoftTokenLLM which holds ONE decoder.
+        # A workaround is to initialize with ThresholdParallelDecoder as default, or handle it in generate.
+        
+        # Let's use ThresholdParallelDecoder as the base, as it's more flexible.
+        # BUT BlockWiseSoftTokenLLM was designed with FixedParallelDecoder in mind (validate_schedule uses steps).
+        # Let's stick to FixedParallelDecoder for now as default for 'softtoken' to match original experiment,
+        # but allow switching or updating threshold if available.
+        
+        # Actually, 'softtoken' implies we want to use soft tokens. The decoding strategy (fixed vs threshold) is separate.
+        # Let's initialize with ThresholdParallelDecoder as it is generally better (faster).
+        
+        decoder = ThresholdParallelDecoder(
             temperature=0,
-            steps=64,
+            threshold=0.9,
             mask_id=MASK_ID,
             eos_id=EOS_ID
         )
         
         # Create the Soft Token LLM
-        # Default ratio 0.2, treating soft tokens as candidates=False
         diffusion_llm = BlockWiseSoftTokenLLM(
             model=self.model,
             decoder=decoder,
-            iterator_factory=BlockIteratorFactory(True), # True for random order? notebook uses True
+            iterator_factory=BlockIteratorFactory(True),
             cache_factory=KVCacheFactory('dual'),
             early_stop=True,
             soft_token_ratio=0.2,
             treat_soft_tokens_as_candidates=False
         )
         
-        logger.info("Created BlockWiseSoftTokenLLM with FixedParallelDecoder")
+        logger.info("Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder")
         
         return diffusion_llm
     
@@ -308,7 +335,7 @@ class SoftTokenGeneration(DInferGeneration):
         block_length: int,
         temperature: float = 0,
         remasking: bool = True,
-        threshold: float = 0.95,
+        threshold: float = 0.9,
         factor: float = 1.0,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
@@ -322,9 +349,27 @@ class SoftTokenGeneration(DInferGeneration):
         soft_token_ratio = kwargs.get('soft_token_ratio', 0.2)
         treat_soft_tokens_as_candidates = kwargs.get('treat_soft_tokens_as_candidates', False)
         
-        # Update decoder temperature if needed
+        # Determine which decoder to use based on 'steps' vs 'threshold' presence?
+        # Or just update the existing decoder if compatible.
+        
+        # If 'steps' is provided and small (e.g. < 100), user might want FixedParallelDecoder.
+        # If 'threshold' is provided, user wants ThresholdParallelDecoder.
+        
+        # For now, we'll stick with the initialized decoder (ThresholdParallelDecoder) 
+        # and just update its parameters.
+        
+        # Update decoder temperature
         if hasattr(self.diffusion_llm.decoder, 'temperature'):
             self.diffusion_llm.decoder.temperature = temperature
+            
+        # Update decoder threshold if applicable
+        if hasattr(self.diffusion_llm.decoder, 'threshold'):
+            self.diffusion_llm.decoder.threshold = threshold
+            
+        # NOTE: If we initialized with ThresholdParallelDecoder, 'steps' parameter is effectively ignored by the decoder logic
+        # unless we dynamically switch the decoder class, which is complex.
+        # However, the user asked to "accept ThresholdDecoder as its decoder", so using ThresholdParallelDecoder 
+        # as the primary one is correct.
             
         with torch.no_grad():
             output_ids = self.diffusion_llm.generate(
@@ -333,7 +378,8 @@ class SoftTokenGeneration(DInferGeneration):
                 block_length=block_length,
                 soft_token_ratio=soft_token_ratio,
                 treat_soft_tokens_as_candidates=treat_soft_tokens_as_candidates,
-                steps=steps
+                steps=steps,
+                threshold=threshold
             )
             
         return output_ids, self.diffusion_llm.num_forwards
@@ -343,6 +389,7 @@ class SoftTokenGeneration(DInferGeneration):
         return (
             DINFER_AVAILABLE and 
             ParallelDecoder is not None and
+            ThresholdParallelDecoder is not None and
             TokenArray is not None
         )
 
@@ -354,6 +401,6 @@ class SoftTokenGeneration(DInferGeneration):
             'block_length': 128,
             'temperature': 0,
             'soft_token_ratio': 0.2,
-            'treat_soft_tokens_as_candidates': False
+            'treat_soft_tokens_as_candidates': False,
+            'threshold': 0.9
         }
-
