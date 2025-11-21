@@ -29,7 +29,7 @@ env:
       max_integer: 15
 
 logger:
-  wandb_enabled: True 
+  wandb_enabled: True
   wandb:
     project: "grpo-simulated-adk"
     name: "llama-8b-__NOW__"
