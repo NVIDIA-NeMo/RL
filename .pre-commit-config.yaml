@@ -16,6 +16,12 @@ repos:
       args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
 
+  - repo: https://github.com/ComPWA/mirrors-taplo
+    rev: v0.9.3
+    hooks:
+    - id: taplo-format
+      name: Format TOML files with taplo
+
   - repo: local
     hooks:
       - id: no-underscore-md

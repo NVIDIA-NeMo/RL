@@ -38,7 +38,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
-ARG UV_VERSION=0.9.1
+ARG UV_VERSION=0.9.7
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
@@ -96,6 +96,8 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 
 RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
+# Remove torch requirements from extra-build-dependencies for build with NGC PyTorch base image
+sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyproject.toml
 
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 # The venv is symlinked to avoid bloating the layer size
@@ -115,6 +117,8 @@ FROM hermetic AS release
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
+ARG RC_DATE=00.00
+ARG TARGETARCH
 ENV UV_NO_SYNC=1
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
@@ -134,3 +138,6 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+# NOTICES.txt file points to where the OSS source code is archived
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt

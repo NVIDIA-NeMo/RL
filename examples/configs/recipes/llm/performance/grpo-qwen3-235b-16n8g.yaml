@@ -1,0 +1,59 @@
+defaults: ../../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+  max_num_steps: 500
+  val_batch_size: 5
+  max_val_samples: 16
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-16n8g
+policy:
+  model_name: Qwen/Qwen3-235B-A22B
+  tokenizer:
+    name: Qwen/Qwen3-235B-A22B
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    pipeline_model_parallel_size: 8
+    context_parallel_size: 2
+    expert_model_parallel_size: 16
+    activation_checkpointing: true
+    num_layers_in_first_pipeline_stage: 11
+    num_layers_in_last_pipeline_stage: 11
+    moe_permute_fusion: true
+    defer_fp32_logits: true
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+    fp8_cfg:
+      enabled: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 16
+      async_engine: true
+logger:
+  log_dir: logs/grpo-qwen3-235b-16n8g
+  wandb_enabled: true
+  tensorboard_enabled: false # to avoid a bug
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-235b-16n8g
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

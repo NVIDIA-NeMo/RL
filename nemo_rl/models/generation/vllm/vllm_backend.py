@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import traceback
 from typing import Any
 
 import torch
@@ -77,8 +78,12 @@ class VllmInternalWorkerExtension:
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
             )
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
@@ -161,7 +166,8 @@ class VllmInternalWorkerExtension:
             return True
         except Exception as e:
             print(
-                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}"
+                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
+                f"{traceback.format_exc()}"
             )
             return False
 

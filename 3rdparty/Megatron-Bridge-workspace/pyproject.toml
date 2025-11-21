@@ -1,8 +1,5 @@
 [build-system]
-requires = [
-    "setuptools>=61.0",
-    "wheel",
-]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,4 +8,3 @@ dynamic = ["dependencies", "version"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 description = "Standalone packaging for the Megatron Bridge sub-module."
 requires-python = ">=3.10"
-

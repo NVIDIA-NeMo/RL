@@ -35,6 +35,8 @@ policy:
   precision: "bfloat16"
   activation_checkpointing_enabled: false
 
+  offload_optimizer_for_logprob: false
+
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported

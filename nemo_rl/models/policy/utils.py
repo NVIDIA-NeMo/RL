@@ -15,10 +15,12 @@
 import gc
 import importlib
 import os
+import traceback
 from enum import Enum
 from typing import Any, Dict, Optional
 
 import torch
+import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from transformers import (
     AutoConfig,
@@ -479,6 +481,21 @@ def stream_weights_via_ipc_zmq_impl(
             print(
                 f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
             )
+
+    except zmq.Again:
+        timeout_ms = zmq_socket.getsockopt(zmq.RCVTIMEO)
+        raise TimeoutError(
+            f"{worker_name} (rank {rank}): ZMQ communication timeout after {timeout_ms}ms in policy worker side. "
+            f"The generation worker may be dead or unresponsive. "
+            f"This typically indicates the generation worker has crashed or is not responding to weight streaming."
+        ) from None
+    except zmq.ZMQError as e:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): ZMQ error during weight streaming: {e} (errno: {e.errno}). "
+            f"Error details: {e.strerror}. "
+            f"This may indicate network issues or the peer process has terminated unexpectedly.\n"
+            f"{traceback.format_exc()}"
+        ) from e
 
     finally:
         # Clean up buffers in finally block to ensure cleanup even on exceptions

@@ -42,6 +42,7 @@ def import_model_from_hf_name(
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
     orig_pipeline_model_parallel_size = model_provider.pipeline_model_parallel_size
+    orig_context_parallel_size = model_provider.context_parallel_size
     orig_expert_model_parallel_size = model_provider.expert_model_parallel_size
     orig_expert_tensor_parallel_size = model_provider.expert_tensor_parallel_size
     orig_num_layers_in_first_pipeline_stage = (
@@ -59,6 +60,7 @@ def import_model_from_hf_name(
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
         ]
+        model_provider.context_parallel_size = megatron_config["context_parallel_size"]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"
         ]
@@ -72,6 +74,7 @@ def import_model_from_hf_name(
             "num_layers_in_last_pipeline_stage"
         ]
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
+        model_provider.sequence_parallel = megatron_config["sequence_parallel"]
     model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
@@ -82,6 +85,7 @@ def import_model_from_hf_name(
     config = megatron_model[0].config
     config.tensor_model_parallel_size = orig_tensor_model_parallel_size
     config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
+    config.context_parallel_size = orig_context_parallel_size
     config.expert_model_parallel_size = orig_expert_model_parallel_size
     config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
@@ -122,6 +126,11 @@ def export_model_from_megatron(
 
     # Export performs on CPU with proper distributed context
     with temporary_distributed_context(backend="gloo"):
+        # Need to set model parallel cuda manual seed for mamba mixer
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(0)
+
         # Load the Megatron model
         megatron_model = bridge.load_megatron_model(
             input_path, skip_temp_dist_context=True

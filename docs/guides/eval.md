@@ -64,8 +64,12 @@ uv run python examples/run_eval.py --config path/to/custom_config.yaml
 # Run evaluation script on one of the supported benchmarks (e.g., GPQA)
 uv run python examples/run_eval.py --config examples/configs/evals/gpqa_eval.yaml
 
-# Run evaluation script with a local dataset that is prefetched as a csv file.
-uv run python examples/run_eval.py --config examples/configs/evals/local_eval.yaml
+# Run evaluation script with a local dataset where the problem and solution keys are "Question" and "Answer" respectively.
+uv run python examples/run_eval.py \
+    --config examples/configs/evals/local_eval.yaml \
+    data.dataset_name=/path/to/local/dataset \
+    data.problem_key=Question \
+    data.solution_key=Answer
 
 # Override specific config values via command line
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
