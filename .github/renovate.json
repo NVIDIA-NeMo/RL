@@ -13,7 +13,10 @@
   "semanticCommits": "disabled",
   "commitMessagePrefix": "[Renovate]",
   "branchPrefix": "renovate/",
-  "labels": ["dependencies", "CI:L2"],
+  "labels": [
+    "dependencies",
+    "CI:L2"
+  ],
   "assignees": [],
   "reviewers": [],
   "allowedCommands": [
@@ -32,10 +35,15 @@
   "packageRules": [
     {
       "description": "Group all updates together into a single PR",
-      "matchManagers": ["git-submodules", "pep621"],
+      "matchManagers": [
+        "git-submodules",
+        "pep621"
+      ],
       "groupName": "all dependencies",
       "additionalBranchPrefix": "all-deps-",
-      "schedule": ["at any time"]
+      "schedule": [
+        "at any time"
+      ]
     }
   ],
   "git-submodules": {
@@ -49,7 +57,10 @@
   },
   "vulnerabilityAlerts": {
     "enabled": true,
-    "labels": ["security", "CI:L2"]
+    "labels": [
+      "security",
+      "CI:L2"
+    ]
   },
   "osvVulnerabilityAlerts": true,
   "rangeStrategy": "bump",
@@ -57,7 +68,5 @@
   "requireConfig": "optional",
   "platformAutomerge": false,
   "rebaseWhen": "behind-base-branch",
-  "forkProcessing": "enabled",
-  "includeForks": true
+  "forkProcessing": "enabled"
 }
-
