@@ -85,4 +85,8 @@ jobs:
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
           # Explicitly set which repository to process
           RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # Global-only configuration options
+          RENOVATE_ONBOARDING: 'false'
+          RENOVATE_REQUIRE_CONFIG: 'optional'
+          RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\.github/scripts/renovate_post_update\\.sh$"]'
 
