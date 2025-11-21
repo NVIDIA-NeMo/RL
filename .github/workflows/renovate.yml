@@ -65,9 +65,10 @@ jobs:
 
       # Option 1: Use GitHub App token (recommended for better rate limits)
       # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
+      # If these secrets aren't set, this step will be skipped and PAT will be used
       - name: Get GitHub App token
         id: get-app-token
-        if: secrets.RENOVATE_APP_ID != ''
+        continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.RENOVATE_APP_ID }}
