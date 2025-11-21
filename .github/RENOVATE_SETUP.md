@@ -17,20 +17,52 @@ Renovate automatically:
 
 ## Setup Requirements
 
-### 1. GitHub App Installation (Recommended)
+You need to set up authentication for Renovate. Choose one of the following options:
 
-The workflow is configured to use a GitHub App for authentication, which provides better rate limits and security.
+### Option 1: Personal Access Token (PAT) - Quick Start
 
-**Steps:**
-1. Create a Renovate GitHub App or use an existing one
-2. Install the app on your repository
-3. Add these secrets to your repository:
-   - `RENOVATE_APP_ID`: The app ID
+**This is the easiest way to get started:**
+
+1. Create a GitHub Personal Access Token (PAT):
+   - Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
+   - Click "Generate new token (classic)"
+   - Give it a descriptive name (e.g., "Renovate Bot")
+   - Select scopes:
+     - ✅ `repo` (Full control of private repositories)
+     - ✅ `workflow` (Update GitHub Action workflows - required for github-actions manager)
+   - Click "Generate token" and copy it
+
+2. Add the token as a repository secret:
+   - Go to your repository → Settings → Secrets and variables → Actions
+   - Click "New repository secret"
+   - Name: `RENOVATE_TOKEN`
+   - Value: Paste your PAT
+   - Click "Add secret"
+
+3. You're done! The workflow will use the PAT automatically.
+
+### Option 2: GitHub App (Recommended for Organizations)
+
+**Better for rate limits and security, but requires more setup:**
+
+1. Create a GitHub App:
+   - Go to Organization Settings → Developer settings → GitHub Apps → New GitHub App
+   - Or use an existing Renovate GitHub App
+   
+2. Configure the app with these permissions:
+   - Repository permissions:
+     - Contents: Read & Write
+     - Pull requests: Read & Write
+     - Workflows: Read & Write (if using github-actions manager)
+     - Metadata: Read-only
+   
+3. Install the app on your repository
+
+4. Add these secrets to your repository:
+   - `RENOVATE_APP_ID`: The app ID (found on the app's settings page)
    - `RENOVATE_APP_PRIVATE_KEY`: The app's private key (PEM format)
 
-**Alternative:** If you prefer to use a Personal Access Token (PAT):
-- Modify `.github/workflows/renovate.yml` to use a PAT instead of the GitHub App token
-- Replace the `get-token` step with a direct token reference
+5. The workflow will automatically detect and use the GitHub App token
 
 ### 2. Grant Workflow Permissions
 

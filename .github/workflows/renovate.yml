@@ -63,8 +63,11 @@ jobs:
           chmod +x .github/scripts/sync_submodule_dependencies.py
           chmod +x .github/scripts/renovate_post_update.sh
 
-      - name: Get token
-        id: get-token
+      # Option 1: Use GitHub App token (recommended for better rate limits)
+      # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
+      - name: Get GitHub App token
+        id: get-app-token
+        if: secrets.RENOVATE_APP_ID != ''
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.RENOVATE_APP_ID }}
@@ -74,7 +77,8 @@ jobs:
         uses: renovatebot/github-action@v44.0.3
         with:
           configurationFile: .github/renovate.json
-          token: ${{ steps.get-token.outputs.token }}
+          # Use GitHub App token if available, otherwise fall back to PAT
+          token: ${{ steps.get-app-token.outputs.token || secrets.RENOVATE_TOKEN }}
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
