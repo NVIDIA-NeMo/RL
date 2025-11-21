@@ -12,10 +12,11 @@ dinfer/
 ├── base.py             # DInferGeneration base class
 ├── blockwise.py        # BlockWise with threshold decoder (recommended)
 ├── hierarchy.py        # BlockWise with hierarchical decoder
-└── credit.py           # BlockWise with credit threshold decoder
+├── credit.py           # BlockWise with credit threshold decoder
+└── softtoken.py        # BlockWise with soft token sampling (experimental)
 ```
 
-**Hierarchy**: `GenerationAlgorithm` → `DInferGeneration` → `{BlockWise, Hierarchy, Credit}Generation`
+**Hierarchy**: `GenerationAlgorithm` → `DInferGeneration` → `{BlockWise, Hierarchy, Credit, SoftToken}Generation`
 
 ## Available Algorithms
 
@@ -24,6 +25,7 @@ dinfer/
 | `dinfer_blockwise` | Threshold | Dual | General purpose (recommended) |
 | `dinfer_hierarchy` | Hierarchical | Dual | Enhanced parallel decoding |
 | `dinfer_credit` | Credit Threshold | Dual | Credit-based parallel strategy |
+| `dinfer_soft` | Fixed (Step-based) | Dual | Experimental soft token sampling |
 
 ## Key Features
 

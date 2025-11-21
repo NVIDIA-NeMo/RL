@@ -163,7 +163,7 @@ def create_parser():
     parser.add_argument(
         "--generation-algorithm",
         default="dual_cache",
-        choices=["basic", "prefix_cache", "dual_cache", "nemotron", "dinfer_blockwise", "dinfer_hierarchy", "dinfer_credit"],
+        choices=["basic", "prefix_cache", "dual_cache", "nemotron", "dinfer_blockwise", "dinfer_hierarchy", "dinfer_credit", "dinfer_soft"],
         help="Generation algorithm: LLaDA (basic=no cache, prefix_cache=prefix caching, dual_cache=dual caching) or Nemotron (nemotron=native generation)"
     )
     parser.add_argument(
@@ -177,6 +177,19 @@ def create_parser():
         type=float,
         default=None,
         help="Factor for LLaDA dynamic parallel decoding strategy (e.g., 2.0) - not used by Nemotron"
+    )
+    
+    # Soft Token parameters
+    parser.add_argument(
+        "--soft-token-ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of soft tokens for dInfer Soft Token generation"
+    )
+    parser.add_argument(
+        "--treat-soft-tokens-as-candidates",
+        action="store_true",
+        help="Whether to treat soft tokens as candidates for decoding (dInfer Soft Token only)"
     )
     
     # Execution settings
@@ -253,6 +266,8 @@ def main():
         "generation_algorithm": getattr(args, 'generation_algorithm', 'dual_cache'),
         "threshold": args.threshold,
         "factor": args.factor,
+        "soft_token_ratio": args.soft_token_ratio,
+        "treat_soft_tokens_as_candidates": args.treat_soft_tokens_as_candidates,
     }
     
     # Set default experiment name if not provided
@@ -335,6 +350,11 @@ def main():
         if config['factor'] is not None:
             generation_args.append(f"++inference.extra_body.factor={config['factor']}")
         
+        # Add Soft Token parameters
+        if config['generation_algorithm'] == "dinfer_soft":
+            generation_args.append(f"++inference.extra_body.soft_token_ratio={config['soft_token_ratio']}")
+            generation_args.append(f"++inference.extra_body.treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
+        
         model_type_display = "Nemotron" if config['generation_algorithm'] == "nemotron" else "LLaDA"
         print(f"\n🔧 {model_type_display} generation parameters (via extra_body):")
         print(f"  steps={config['steps']}")
@@ -348,6 +368,10 @@ def main():
                 print("  ⚠️  Note: cfg_scale and remasking are not used by Nemotron")
             if config['factor'] is not None:
                 print("  ⚠️  Note: factor is not used by Nemotron (LLaDA-specific)")
+        elif config['generation_algorithm'] == "dinfer_soft":
+            print(f"  generation_algorithm={config['generation_algorithm']} (dInfer Soft Token)")
+            print(f"  soft_token_ratio={config['soft_token_ratio']}")
+            print(f"  treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
         else:
             print(f"  cfg_scale={config['cfg_scale']}")
             print(f"  remasking={config['remasking']}")

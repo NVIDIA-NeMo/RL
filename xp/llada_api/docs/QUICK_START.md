@@ -213,6 +213,9 @@ curl http://localhost:8000/stats | jq
 # dInfer (10x+ faster) - auto-selected for LLaDA
 --engine dinfer --algorithm dinfer_hierarchy
 
+# Experimental: Soft Token Sampling
+--engine dinfer --algorithm dinfer_soft
+
 # Fast-dLLM (alternative)
 --engine fast-dllm --algorithm dual_cache
 ```

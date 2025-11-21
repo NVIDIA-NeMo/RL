@@ -214,6 +214,7 @@ tail -f /tmp/llada_worker_0.log
     - `dinfer_blockwise` - Threshold-based parallel decoding (recommended)
     - `dinfer_hierarchy` - Hierarchical parallel decoding
     - `dinfer_credit` - Credit-based parallel decoding with EMA fusion
+    - `dinfer_soft` - Soft token sampling (experimental)
   - Fast-dLLM algorithms:
     - `basic`, `prefix_cache`, `dual_cache`
 

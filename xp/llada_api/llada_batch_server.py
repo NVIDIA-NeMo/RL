@@ -482,7 +482,7 @@ class BatchProcessor:
                     batch_messages.append(messages_list)
                     
                     # Store configuration for each request
-                    batch_configs.append({
+                    config_dict = {
                         'steps': request.steps,
                         'gen_length': request.max_completion_tokens or 128,
                         'block_length': request.block_length,
@@ -490,7 +490,15 @@ class BatchProcessor:
                         'remasking': request.remasking,
                         'threshold': request.threshold,
                         'factor': request.factor
-                    })
+                    }
+                    
+                    # Capture any extra fields from the request (e.g., soft_token_ratio)
+                    # This handles fields passed via extra_body in NeMo-Skills
+                    extra_fields = {k: v for k, v in request.__dict__.items() 
+                                  if k not in request.model_fields and k not in config_dict}
+                    config_dict.update(extra_fields)
+                    
+                    batch_configs.append(config_dict)
                 except Exception as e:
                     logger.error(f"Failed to prepare request {batch_req.request_id}: {e}")
                     return [HTTPException(status_code=400, detail=f"Failed to prepare request: {e}") for _ in batch_requests]
@@ -568,7 +576,11 @@ class BatchProcessor:
                     temperature=config['temperature'],
                     remasking=config['remasking'],
                     threshold=config['threshold'],
-                    factor=config['factor']
+                    factor=config['factor'],
+                    **{k: v for k, v in config.items() if k not in [
+                        'steps', 'gen_length', 'block_length', 'temperature', 
+                        'remasking', 'threshold', 'factor'
+                    ]}
                 )
                 
                 logger.info(f"✅ Batch generation completed with {nfe} forward passes")

@@ -21,6 +21,10 @@ DINFER_PATH = os.path.join(
 # Initialize availability flags
 DINFER_AVAILABLE = False
 LLaDAModelLM = None
+ParallelDecoder = None
+get_num_transfer_tokens = None
+get_transfer_index = None
+TokenArray = None
 BlockWiseDiffusionLLM = None
 VicinityCacheDiffusionLLM = None
 IterSmoothDiffusionLLM = None
@@ -40,6 +44,12 @@ if os.path.exists(DINFER_PATH):
     
     try:
         from dinfer.model import LLaDAModelLM as _LLaDAModelLM
+        from dinfer.decoding.parallel_strategy import (
+            ParallelDecoder as _ParallelDecoder,
+            get_num_transfer_tokens as _get_num_transfer_tokens,
+            get_transfer_index as _get_transfer_index,
+        )
+        from dinfer.decoding.utils import TokenArray as _TokenArray
         from dinfer import (
             BlockWiseDiffusionLLM as _BlockWiseDiffusionLLM,
             VicinityCacheDiffusionLLM as _VicinityCacheDiffusionLLM,
@@ -56,6 +66,10 @@ if os.path.exists(DINFER_PATH):
         )
         
         LLaDAModelLM = _LLaDAModelLM
+        ParallelDecoder = _ParallelDecoder
+        get_num_transfer_tokens = _get_num_transfer_tokens
+        get_transfer_index = _get_transfer_index
+        TokenArray = _TokenArray
         BlockWiseDiffusionLLM = _BlockWiseDiffusionLLM
         VicinityCacheDiffusionLLM = _VicinityCacheDiffusionLLM
         IterSmoothDiffusionLLM = _IterSmoothDiffusionLLM
@@ -88,6 +102,10 @@ EOS_ID = 126081
 __all__ = [
     'DINFER_AVAILABLE',
     'LLaDAModelLM',
+    'ParallelDecoder',
+    'get_num_transfer_tokens',
+    'get_transfer_index',
+    'TokenArray',
     'BlockWiseDiffusionLLM',
     'VicinityCacheDiffusionLLM',
     'IterSmoothDiffusionLLM',

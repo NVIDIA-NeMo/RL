@@ -16,6 +16,7 @@ from .base import DInferGeneration
 from .blockwise import BlockWiseGeneration
 from .hierarchy import HierarchyGeneration
 from .credit import CreditGeneration
+from .softtoken import SoftTokenGeneration
 
 __all__ = [
     'DINFER_AVAILABLE',
@@ -23,5 +24,6 @@ __all__ = [
     'BlockWiseGeneration',
     'HierarchyGeneration',
     'CreditGeneration',
+    'SoftTokenGeneration',
 ]
 

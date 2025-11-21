@@ -35,7 +35,7 @@ GPUS_PER_NODE=1
 CPUS_PER_TASK=16
 MEM="128G"
 PARTITION="interactive"
-CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/degert/data/enroot/nemo-rl:big-version-bump-from-githubci-18672942438.squashfs"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/mfathi/containers/nemo_rl_base.sqsh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -86,7 +86,7 @@ show_usage() {
     echo "                          (default: auto-detected - dinfer for LLaDA, nemotron for Nemotron)"
     echo "  --algorithm ALGO        Specific algorithm within engine (optional, uses engine default)"
     echo "                          fast-dllm: basic, prefix_cache, dual_cache"
-    echo "                          dinfer: dinfer_blockwise, dinfer_hierarchy, dinfer_credit"
+    echo "                          dinfer: dinfer_blockwise, dinfer_hierarchy, dinfer_credit, dinfer_soft"
     echo "                          nemotron: nemotron"
     echo ""
     echo "Batch Processing Options (ignored with --streaming):"

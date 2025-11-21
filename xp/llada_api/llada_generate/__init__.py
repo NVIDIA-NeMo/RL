@@ -214,6 +214,13 @@ def _register_builtin_algorithms():
     except Exception as e:
         logger.warning(f"Failed to register dInfer Credit generation: {e}")
 
+    try:
+        from .dinfer import SoftTokenGeneration
+        register_algorithm(SoftTokenGeneration(), aliases=['softtoken', 'dinfer_softtoken'])
+        logger.debug("Registered dInfer SoftToken generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register dInfer SoftToken generation: {e}")
+
 
 # Register built-in algorithms on import
 _register_builtin_algorithms()
