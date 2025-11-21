@@ -26,12 +26,6 @@ get_num_transfer_tokens = None
 get_transfer_index = None
 TokenArray = None
 BlockWiseDiffusionLLM = None
-VicinityCacheDiffusionLLM = None
-IterSmoothDiffusionLLM = None
-IterSmoothWithVicinityCacheDiffusionLLM = None
-BlockWiseDiffusionLLMWithSP = None
-BlockDiffusionLLMAttnmask = None
-BlockDiffusionLLM = None
 ThresholdParallelDecoder = None
 CreditThresholdParallelDecoder = None
 HierarchyDecoder = None
@@ -52,12 +46,6 @@ if os.path.exists(DINFER_PATH):
         from dinfer.decoding.utils import TokenArray as _TokenArray
         from dinfer import (
             BlockWiseDiffusionLLM as _BlockWiseDiffusionLLM,
-            VicinityCacheDiffusionLLM as _VicinityCacheDiffusionLLM,
-            IterSmoothDiffusionLLM as _IterSmoothDiffusionLLM,
-            IterSmoothWithVicinityCacheDiffusionLLM as _IterSmoothWithVicinityCacheDiffusionLLM,
-            BlockWiseDiffusionLLMWithSP as _BlockWiseDiffusionLLMWithSP,
-            BlockDiffusionLLMAttnmask as _BlockDiffusionLLMAttnmask,
-            BlockDiffusionLLM as _BlockDiffusionLLM,
             ThresholdParallelDecoder as _ThresholdParallelDecoder,
             CreditThresholdParallelDecoder as _CreditThresholdParallelDecoder,
             HierarchyDecoder as _HierarchyDecoder,
@@ -71,12 +59,6 @@ if os.path.exists(DINFER_PATH):
         get_transfer_index = _get_transfer_index
         TokenArray = _TokenArray
         BlockWiseDiffusionLLM = _BlockWiseDiffusionLLM
-        VicinityCacheDiffusionLLM = _VicinityCacheDiffusionLLM
-        IterSmoothDiffusionLLM = _IterSmoothDiffusionLLM
-        IterSmoothWithVicinityCacheDiffusionLLM = _IterSmoothWithVicinityCacheDiffusionLLM
-        BlockWiseDiffusionLLMWithSP = _BlockWiseDiffusionLLMWithSP
-        BlockDiffusionLLMAttnmask = _BlockDiffusionLLMAttnmask
-        BlockDiffusionLLM = _BlockDiffusionLLM
         ThresholdParallelDecoder = _ThresholdParallelDecoder
         CreditThresholdParallelDecoder = _CreditThresholdParallelDecoder
         HierarchyDecoder = _HierarchyDecoder
@@ -107,12 +89,6 @@ __all__ = [
     'get_transfer_index',
     'TokenArray',
     'BlockWiseDiffusionLLM',
-    'VicinityCacheDiffusionLLM',
-    'IterSmoothDiffusionLLM',
-    'IterSmoothWithVicinityCacheDiffusionLLM',
-    'BlockWiseDiffusionLLMWithSP',
-    'BlockDiffusionLLMAttnmask',
-    'BlockDiffusionLLM',
     'ThresholdParallelDecoder',
     'CreditThresholdParallelDecoder',
     'HierarchyDecoder',
