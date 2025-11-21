@@ -191,6 +191,12 @@ def create_parser():
         action="store_true",
         help="Whether to treat soft tokens as candidates for decoding (dInfer Soft Token only)"
     )
+    parser.add_argument(
+        "--soft-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for soft token probability distribution (dInfer Soft Token only)"
+    )
     
     # Execution settings
     parser.add_argument(
@@ -268,6 +274,7 @@ def main():
         "factor": args.factor,
         "soft_token_ratio": args.soft_token_ratio,
         "treat_soft_tokens_as_candidates": args.treat_soft_tokens_as_candidates,
+        "soft_temperature": args.soft_temperature,
     }
     
     # Set default experiment name if not provided
@@ -354,6 +361,7 @@ def main():
         if config['generation_algorithm'] == "dinfer_soft":
             generation_args.append(f"++inference.extra_body.soft_token_ratio={config['soft_token_ratio']}")
             generation_args.append(f"++inference.extra_body.treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
+            generation_args.append(f"++inference.extra_body.soft_temperature={config['soft_temperature']}")
         
         model_type_display = "Nemotron" if config['generation_algorithm'] == "nemotron" else "LLaDA"
         print(f"\n🔧 {model_type_display} generation parameters (via extra_body):")
@@ -372,6 +380,7 @@ def main():
             print(f"  generation_algorithm={config['generation_algorithm']} (dInfer Soft Token)")
             print(f"  soft_token_ratio={config['soft_token_ratio']}")
             print(f"  treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
+            print(f"  soft_temperature={config['soft_temperature']}")
         else:
             print(f"  cfg_scale={config['cfg_scale']}")
             print(f"  remasking={config['remasking']}")

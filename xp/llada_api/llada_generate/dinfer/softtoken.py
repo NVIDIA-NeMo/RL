@@ -34,7 +34,7 @@ class BlockWiseSoftTokenLLM:
     Block-wise diffusion LLM with Soft Token Sampling.
     Adapted from BlockWiseSoftTokenLLM in soft_token_experiment.py.
     """
-    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2, treat_soft_tokens_as_candidates=False):
+    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2, treat_soft_tokens_as_candidates=False, soft_temperature=1.0):
         self.model = model
         self.cache_factory = cache_factory
         self.decoder = decoder
@@ -46,6 +46,7 @@ class BlockWiseSoftTokenLLM:
         self.expected_tpf = expected_tpf
         self.soft_token_ratio = soft_token_ratio
         self.treat_soft_tokens_as_candidates = treat_soft_tokens_as_candidates
+        self.soft_temperature = soft_temperature
         self.input_embeddings = self.model.get_input_embeddings()
 
     def validate_schedule(self, block_length, soft_token_ratio, treat_soft_tokens_as_candidates):
@@ -83,7 +84,7 @@ class BlockWiseSoftTokenLLM:
             current_masks -= num_to_decode
         
     @torch.no_grad()
-    def generate(self, prompt, gen_length=128, block_length=128, soft_token_ratio=None, treat_soft_tokens_as_candidates=None, steps=None, threshold=None):
+    def generate(self, prompt, gen_length=128, block_length=128, soft_token_ratio=None, treat_soft_tokens_as_candidates=None, steps=None, threshold=None, soft_temperature=None):
         ''' Generate tokens with diffusion iterations block by block using Soft Token Sampling.
         '''
         # Use instance defaults if not provided
@@ -91,6 +92,8 @@ class BlockWiseSoftTokenLLM:
             soft_token_ratio = self.soft_token_ratio
         if treat_soft_tokens_as_candidates is None:
             treat_soft_tokens_as_candidates = self.treat_soft_tokens_as_candidates
+        if soft_temperature is None:
+            soft_temperature = self.soft_temperature
             
         # Update decoder parameters
         if steps is not None and hasattr(self.decoder, 'steps'):
@@ -216,6 +219,11 @@ class BlockWiseSoftTokenLLM:
                         # Extract logits for these positions
                         # logits1 shape: [1, block_len, vocab]
                         selected_logits = logits1[0, soft_indices]
+                        
+                        # Apply soft temperature
+                        if soft_temperature > 0:
+                            selected_logits = selected_logits / soft_temperature
+                            
                         probs = torch.softmax(selected_logits, dim=-1)
                         
                         # Compute Soft Embeddings: Weighted average of token embeddings
@@ -319,7 +327,8 @@ class SoftTokenGeneration(DInferGeneration):
             cache_factory=KVCacheFactory('dual'),
             early_stop=True,
             soft_token_ratio=0.2,
-            treat_soft_tokens_as_candidates=False
+            treat_soft_tokens_as_candidates=False,
+            soft_temperature=1.0
         )
         
         logger.info("Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder")
@@ -337,6 +346,7 @@ class SoftTokenGeneration(DInferGeneration):
         remasking: bool = True,
         threshold: float = 0.9,
         factor: float = 1.0,
+        soft_temperature: float = 1.0,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
         """
@@ -348,6 +358,10 @@ class SoftTokenGeneration(DInferGeneration):
         # Extract soft token specific parameters from kwargs
         soft_token_ratio = kwargs.get('soft_token_ratio', 0.2)
         treat_soft_tokens_as_candidates = kwargs.get('treat_soft_tokens_as_candidates', False)
+        
+        # soft_temperature is now a direct argument, but also check kwargs for backward compatibility
+        if 'soft_temperature' in kwargs:
+            soft_temperature = kwargs['soft_temperature']
         
         # Determine which decoder to use based on 'steps' vs 'threshold' presence?
         # Or just update the existing decoder if compatible.
@@ -379,7 +393,8 @@ class SoftTokenGeneration(DInferGeneration):
                 soft_token_ratio=soft_token_ratio,
                 treat_soft_tokens_as_candidates=treat_soft_tokens_as_candidates,
                 steps=steps,
-                threshold=threshold
+                threshold=threshold,
+                soft_temperature=soft_temperature
             )
             
         return output_ids, self.diffusion_llm.num_forwards
@@ -402,5 +417,6 @@ class SoftTokenGeneration(DInferGeneration):
             'temperature': 0,
             'soft_token_ratio': 0.2,
             'treat_soft_tokens_as_candidates': False,
-            'threshold': 0.9
+            'threshold': 0.9,
+            'soft_temperature': 1.0
         }
