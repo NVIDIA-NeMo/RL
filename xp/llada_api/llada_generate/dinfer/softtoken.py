@@ -324,7 +324,7 @@ class SoftTokenGeneration(DInferGeneration):
         diffusion_llm = BlockWiseSoftTokenLLM(
             model=self.model,
             decoder=decoder,
-            iterator_factory=BlockIteratorFactory(True),
+            iterator_factory=BlockIteratorFactory(),
             cache_factory=KVCacheFactory('dual'),
             early_stop=self.early_stop,
             soft_token_ratio=0.2,
