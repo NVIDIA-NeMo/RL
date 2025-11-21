@@ -18,6 +18,7 @@ from ._imports import (
     MASK_ID,
     EOS_ID
 )
+from ._utils import FixedParallelDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +53,12 @@ class BlockWiseGeneration(DInferGeneration):
         if not DINFER_AVAILABLE:
             raise RuntimeError("dInfer is not available")
         
-        # Create decoder with threshold-based parallel decoding (updated API)
-        decoder = ThresholdParallelDecoder(
-            temperature=1.0,
-            threshold=0.9,
-            remasking='low_confidence',
+        # Use default steps of 64 if not specified (will be updated in generate)
+        decoder = FixedParallelDecoder(
+            temperature=0,
+            steps=64,
             mask_id=MASK_ID,
-            eos_id=EOS_ID,
-            use_float64=False
+            eos_id=EOS_ID
         )
         
         # Create the BlockWise diffusion LLM
