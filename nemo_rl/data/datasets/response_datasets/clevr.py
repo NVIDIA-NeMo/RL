@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from datasets import load_dataset
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import pil_to_base64
 
 
@@ -95,7 +96,7 @@ def prepare_clevr_cogent_dataset(
     }
 
 
-class CLEVRCoGenTDataset:
+class CLEVRCoGenTDataset(RawDataset):
     def __init__(
         self,
         split: str = "trainA",
