@@ -71,16 +71,11 @@ jobs:
           private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
 
       - name: Run Renovate
-        uses: renovatebot/github-action@v40.3.11
+        uses: renovatebot/github-action@v44.0.3
         with:
           configurationFile: .github/renovate.json
           token: ${{ steps.get-token.outputs.token }}
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
-          # Git configuration
-          RENOVATE_GIT_AUTHOR: 'Renovate Bot <bot@renovateapp.com>'
-          # Platform configuration
-          RENOVATE_PLATFORM: 'github'
-          RENOVATE_REPOSITORIES: '${{ github.repository }}'
 
