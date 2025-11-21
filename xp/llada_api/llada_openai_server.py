@@ -94,7 +94,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = Field(default="llada-8b-instruct")
     messages: List[ChatMessage] = Field(..., description="List of messages")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)  # Fast-dLLM default
-    max_completion_tokens: Optional[int] = Field(default=128, gt=0)  # Fast-dLLM default
+    max_tokens: Optional[int] = Field(default=128, gt=0)  # Fast-dLLM default
     stream: bool = Field(default=False)
     # Standard OpenAI parameters
     top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Top-p (nucleus) sampling")
@@ -259,7 +259,7 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     logger.info(f"Generation request received:")
     logger.info(f"  Model: {request.model}")
     logger.info(f"  Temperature: {request.temperature}")
-    logger.info(f"  Max tokens: {request.max_completion_tokens}")
+    logger.info(f"  Max tokens: {request.max_tokens}")
     logger.info(f"  Top-p: {request.top_p} (NOTE: Not used in LLaDA diffusion generation)")
     logger.info(f"  Top-k: {request.top_k} (NOTE: Not used in LLaDA diffusion generation)")
     logger.info(f"  LLaDA steps: {request.steps}")
@@ -340,7 +340,7 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     
     # Generate using the algorithm
     try:
-        gen_length = request.max_completion_tokens or 128
+        gen_length = request.max_tokens or 128
         
         # Ensure block_length compatibility for LLaDA algorithms
         block_length = min(request.block_length, gen_length)

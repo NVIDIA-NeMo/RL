@@ -436,8 +436,8 @@ class SoftTokenGeneration(DInferGeneration):
         """Get the required arguments."""
         return {
             'steps': 64,
-            'gen_length': 128,
-            'block_length': 128,
+            'gen_length': 256,
+            'block_length': 64,
             'temperature': 0,
             'soft_token_ratio': 0.2,
             'treat_soft_tokens_as_candidates': False,

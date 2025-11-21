@@ -484,7 +484,7 @@ class BatchProcessor:
                     # Store configuration for each request
                     config_dict = {
                         'steps': request.steps,
-                        'gen_length': request.max_completion_tokens or 128,
+                        'gen_length': request.max_tokens or 128,
                         'block_length': request.block_length,
                         'temperature': request.temperature,
                         'remasking': request.remasking,
