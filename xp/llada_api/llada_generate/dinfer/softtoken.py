@@ -287,7 +287,8 @@ class SoftTokenGeneration(DInferGeneration):
             name="dinfer_soft",
             description="dInfer Soft Token generation (experimental)"
         )
-    
+        self.early_stop = True  # Default value
+        
     def create_diffusion_llm(self):
         """
         Create dInfer BlockWiseSoftTokenLLM.
@@ -325,13 +326,13 @@ class SoftTokenGeneration(DInferGeneration):
             decoder=decoder,
             iterator_factory=BlockIteratorFactory(True),
             cache_factory=KVCacheFactory('dual'),
-            early_stop=True,
+            early_stop=self.early_stop,
             soft_token_ratio=0.2,
             treat_soft_tokens_as_candidates=False,
             soft_temperature=1.0
         )
         
-        logger.info("Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder")
+        logger.info(f"Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder (early_stop={self.early_stop})")
         
         return diffusion_llm
     
@@ -347,6 +348,7 @@ class SoftTokenGeneration(DInferGeneration):
         threshold: float = 0.9,
         factor: float = 1.0,
         soft_temperature: float = 1.0,
+        early_stop: Optional[bool] = None,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
         """
@@ -362,6 +364,10 @@ class SoftTokenGeneration(DInferGeneration):
         # soft_temperature is now a direct argument, but also check kwargs for backward compatibility
         if 'soft_temperature' in kwargs:
             soft_temperature = kwargs['soft_temperature']
+            
+        # Update early_stop if provided
+        if early_stop is not None:
+            self.diffusion_llm.early_stop = early_stop
         
         # Determine which decoder to use based on 'steps' vs 'threshold' presence?
         # Or just update the existing decoder if compatible.
@@ -418,5 +424,6 @@ class SoftTokenGeneration(DInferGeneration):
             'soft_token_ratio': 0.2,
             'treat_soft_tokens_as_candidates': False,
             'threshold': 0.9,
-            'soft_temperature': 1.0
+            'soft_temperature': 1.0,
+            'early_stop': True
         }

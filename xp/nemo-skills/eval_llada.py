@@ -198,6 +198,13 @@ def create_parser():
         help="Temperature for soft token probability distribution (dInfer Soft Token only)"
     )
     
+    # dInfer specific settings
+    parser.add_argument(
+        "--no-early-stop",
+        action="store_true",
+        help="Disable early stopping for dInfer generation (default: early stopping enabled)"
+    )
+    
     # Execution settings
     parser.add_argument(
         "--dry-run",
@@ -275,6 +282,7 @@ def main():
         "soft_token_ratio": args.soft_token_ratio,
         "treat_soft_tokens_as_candidates": args.treat_soft_tokens_as_candidates,
         "soft_temperature": args.soft_temperature,
+        "early_stop": not args.no_early_stop,
     }
     
     # Set default experiment name if not provided
@@ -356,6 +364,9 @@ def main():
             generation_args.append(f"++inference.extra_body.threshold={config['threshold']}")
         if config['factor'] is not None:
             generation_args.append(f"++inference.extra_body.factor={config['factor']}")
+            
+        # Add dInfer early stopping parameter
+        generation_args.append(f"++inference.extra_body.early_stop={config['early_stop']}")
         
         # Add Soft Token parameters
         if config['generation_algorithm'] == "dinfer_soft":
@@ -389,6 +400,8 @@ def main():
                 print(f"  threshold={config['threshold']} (Fast-dLLM parallel decoding)")
             if config['factor'] is not None:
                 print(f"  factor={config['factor']} (Fast-dLLM dynamic decoding)")
+        
+        print(f"  early_stop={config['early_stop']}")
         
         print("   (Passed via NeMo-Skills extra_body to OpenAI API)")
         
