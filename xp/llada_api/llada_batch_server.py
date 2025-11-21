@@ -494,7 +494,9 @@ class BatchProcessor:
                     
                     # Capture any extra fields from the request (e.g., soft_token_ratio)
                     # This handles fields passed via extra_body in NeMo-Skills
-                    extra_fields = {k: v for k, v in request.__dict__.items() 
+                    # Use model_dump() to ensure we get extra fields in Pydantic v2
+                    request_values = request.model_dump()
+                    extra_fields = {k: v for k, v in request_values.items() 
                                   if k not in request.model_fields and k not in config_dict}
                     config_dict.update(extra_fields)
                     

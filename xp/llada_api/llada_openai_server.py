@@ -271,7 +271,8 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     logger.info(f"  Fast-dLLM factor: {request.factor}")
     
     # Log any extra parameters received via NeMo-Skills extra_body
-    extra_fields = {k: v for k, v in request.__dict__.items() if k not in request.model_fields}
+    request_values = request.model_dump()
+    extra_fields = {k: v for k, v in request_values.items() if k not in request.model_fields}
     if extra_fields:
         logger.info(f"  Extra parameters received: {extra_fields}")
     
@@ -358,7 +359,8 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
             temperature=request.temperature,
             remasking=request.remasking,
             threshold=request.threshold,
-            factor=request.factor
+            factor=request.factor,
+            **extra_fields
         )
         
         logger.info(f"Generation completed with {nfe} forward passes")
