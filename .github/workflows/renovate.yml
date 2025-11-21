@@ -83,4 +83,6 @@ jobs:
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
+          # Explicitly set which repository to process
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
 
