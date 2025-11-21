@@ -8,8 +8,8 @@
     "after 9am and before 5pm every weekday"
   ],
   "timezone": "America/Los_Angeles",
-  "prConcurrentLimit": 5,
-  "prHourlyLimit": 2,
+  "prConcurrentLimit": 1,
+  "prHourlyLimit": 1,
   "semanticCommits": "disabled",
   "commitMessagePrefix": "[Renovate]",
   "branchPrefix": "renovate/",
@@ -31,45 +31,11 @@
   },
   "packageRules": [
     {
-      "description": "Group all git submodules together",
-      "matchManagers": ["git-submodules"],
-      "groupName": "git submodules",
-      "commitMessageTopic": "git submodules",
-      "additionalBranchPrefix": "submodules-",
+      "description": "Group all updates together into a single PR",
+      "matchManagers": ["git-submodules", "pep621"],
+      "groupName": "all dependencies",
+      "additionalBranchPrefix": "all-deps-",
       "schedule": ["at any time"]
-    },
-    {
-      "description": "Group vllm with torch and ray for compatibility",
-      "matchPackageNames": ["vllm", "torch", "ray"],
-      "matchManagers": ["pep621"],
-      "groupName": "vllm and core dependencies",
-      "commitMessageTopic": "vllm and core dependencies",
-      "additionalBranchPrefix": "vllm-core-"
-    },
-    {
-      "description": "Group transformer-engine with flash-attn for xformers compatibility",
-      "matchPackageNames": ["transformer-engine", "flash-attn"],
-      "matchManagers": ["pep621"],
-      "groupName": "transformer-engine and flash-attn",
-      "commitMessageTopic": "transformer-engine and flash-attn",
-      "additionalBranchPrefix": "te-flashattn-",
-      "schedule": ["at any time"]
-    },
-    {
-      "description": "Handle transformers separately as it needs compatibility checks",
-      "matchPackageNames": ["transformers"],
-      "matchManagers": ["pep621"],
-      "groupName": "transformers",
-      "commitMessageTopic": "transformers",
-      "additionalBranchPrefix": "transformers-"
-    },
-    {
-      "description": "Other Python dependencies",
-      "matchManagers": ["pep621"],
-      "excludePackageNames": ["vllm", "torch", "ray", "transformer-engine", "flash-attn", "transformers"],
-      "groupName": "Python dependencies",
-      "commitMessageTopic": "Python dependencies",
-      "additionalBranchPrefix": "python-deps-"
     }
   ],
   "git-submodules": {
@@ -90,6 +56,7 @@
   "onboarding": false,
   "requireConfig": "optional",
   "platformAutomerge": false,
-  "rebaseWhen": "behind-base-branch"
+  "rebaseWhen": "behind-base-branch",
+  "forkProcessing": "disabled"
 }
 
