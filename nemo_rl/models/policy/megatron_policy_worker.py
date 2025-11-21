@@ -269,7 +269,7 @@ def setup_megatron_model(
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
-                    if hasattr(layer.mlp, "router"):
+                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
         mixed_precision_wrapper = CustomFloat16Module
@@ -468,6 +468,11 @@ class MegatronPolicyWorker:
             "float16": torch.float16,
         }
         self.dtype = dtype_map[self.cfg["precision"]]
+
+        self.optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_cpu_offload"
+        ]
+        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
 
         # Reward models are not yet supported with Megatron.
         if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
@@ -1266,12 +1271,17 @@ class MegatronPolicyWorker:
             if len(multimodal_data) > 0:
                 position_ids = None
 
+            additional_kwargs = {}
+            # Mamba models currently do not support packed_seq_params
+            if packed_seq_params is not None:
+                additional_kwargs["packed_seq_params"] = packed_seq_params
+
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
                 **multimodal_data,
+                **additional_kwargs,
             )
 
             # Apply temperature scaling to logits for training
@@ -1545,11 +1555,15 @@ class MegatronPolicyWorker:
             if len(multimodal_data) > 0:
                 position_ids = None
 
+            additional_kwargs = {}
+            if packed_seq_params is not None:
+                additional_kwargs["packed_seq_params"] = packed_seq_params
+
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
+                **additional_kwargs,
                 **multimodal_data,
             )
 
@@ -1886,8 +1900,12 @@ class MegatronPolicyWorker:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
@@ -2011,7 +2029,24 @@ class MegatronPolicyWorker:
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
-        self.offload_before_refit()
+
+        # offload grads to cpu
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )  # get rid of grad buffers
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+            and self.offload_optimizer_for_logprob
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
@@ -2021,19 +2056,14 @@ class MegatronPolicyWorker:
         self.model.train()
 
         # Move optimizer state to CUDA if it exists
+        # colocated generation will always offload optimizer to cuda before refit
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
-            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+            and not self.optimizer_cpu_offload
+            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
-            if isinstance(self.optimizer, ChainedOptimizer):
-                optimizer_state = self.optimizer.state
-            else:
-                optimizer_state = self.optimizer._get_state()
-            for _, state in optimizer_state.items():
-                for k, v in state.items():
-                    if torch.is_tensor(v) and not v.is_cuda:
-                        state[k] = v.to("cuda")
+            self.move_optimizer("cuda")
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
@@ -2055,20 +2085,9 @@ class MegatronPolicyWorker:
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
-            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+            and not self.optimizer_cpu_offload
         ):
-            # Iterate through the state dictionaries for each parameter group
-            if isinstance(self.optimizer, ChainedOptimizer):
-                optimizer_state = self.optimizer.state
-            else:
-                optimizer_state = self.optimizer._get_state()
-            for _, state in optimizer_state.items():
-                # Iterate through the state items (e.g., momentum, variance) for a parameter
-                for k, v in state.items():
-                    # Check if the item is a tensor and on the GPU
-                    if torch.is_tensor(v) and v.is_cuda:
-                        # Move the tensor to CPU and update the state dictionary
-                        state[k] = v.to("cpu")
+            self.move_optimizer("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -2147,6 +2166,29 @@ class MegatronPolicyWorker:
                         new_state_dict[name] = item
                     model.load_state_dict(new_state_dict)
         return model
+
+    def move_optimizer(self, device: str):
+        # Iterate through the state dictionaries for each parameter group
+        if isinstance(self.optimizer, ChainedOptimizer):
+            optimizer_state = self.optimizer.state
+        else:
+            optimizer_state = self.optimizer._get_state()
+        for _, state in optimizer_state.items():
+            # Iterate through the state items (e.g., momentum, variance) for a parameter
+            for k, v in state.items():
+                # Check if the item is a tensor
+                if torch.is_tensor(v):
+                    # Move the tensor to device and update the state dictionary
+                    if device == "cpu":
+                        if v.is_cuda:
+                            state[k] = v.to("cpu")
+                    elif device == "cuda":
+                        if not v.is_cuda:
+                            state[k] = v.to("cuda")
+                    else:
+                        raise ValueError(
+                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                        )
 
     def save_checkpoint(
         self,

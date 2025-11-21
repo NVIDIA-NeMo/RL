@@ -65,6 +65,7 @@ class MLflowConfig(TypedDict):
     experiment_name: str
     run_name: str
     tracking_uri: NotRequired[str]
+    artifact_location: NotRequired[str | None]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -130,6 +131,11 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
+            # Penguin will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
+            # This logic catches non-compatible objects being logged.
+            if not isinstance(value, (int, float, bool, str)):
+                continue
+
             if prefix:
                 name = f"{prefix}/{name}"
 
@@ -719,31 +725,30 @@ class MLflowLogger(LoggerInterface):
 
         Args:
             cfg: MLflow configuration
-            log_dir: Optional log directory
+            log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        if cfg["tracking_uri"]:
-            mlflow.set_tracking_uri(cfg["tracking_uri"])
+        tracking_uri = cfg.get("tracking_uri")
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
 
-        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        experiment_name = cfg["experiment_name"]
+        experiment = mlflow.get_experiment_by_name(experiment_name)
         if experiment is None:
-            if log_dir:
-                mlflow.create_experiment(
-                    name=cfg["experiment_name"],
-                    artifact_location=log_dir,
-                )
-            else:
-                mlflow.create_experiment(cfg["experiment_name"])
+            mlflow.create_experiment(
+                name=experiment_name,
+                **{"artifact_location": cfg.get("artifact_location", log_dir)}
+                if "artifact_location" in cfg or log_dir
+                else {},
+            )
         else:
-            mlflow.set_experiment(cfg["experiment_name"])
+            mlflow.set_experiment(experiment_name)
 
         # Start run
-        run_kwargs: dict[str, str] = {}
-        run_kwargs["run_name"] = cfg["run_name"]
-
+        run_name = cfg["run_name"]
+        run_kwargs = {"run_name": run_name}
         self.run = mlflow.start_run(**run_kwargs)
         print(
-            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
-            f"run {cfg['run_name']}"
+            f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}"
         )
 
     def log_metrics(
@@ -842,8 +847,10 @@ class Logger(LoggerInterface):
             self.loggers.append(tensorboard_logger)
 
         if cfg["mlflow_enabled"]:
-            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
-            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_log_dir = self.base_log_dir
+            if mlflow_log_dir:
+                mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
+                os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 

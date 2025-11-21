@@ -67,6 +67,7 @@ def create_dtensor_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 1,
         "precision": "float32",
+        "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
@@ -122,6 +123,7 @@ def create_megatron_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 1,
         "precision": "float32",
+        "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
