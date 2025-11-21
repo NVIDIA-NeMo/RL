@@ -17,6 +17,8 @@ from typing import Any
 
 from datasets import load_dataset
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
+
 
 def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     return {
@@ -37,7 +39,7 @@ def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     }
 
 
-class SquadDataset:
+class SquadDataset(RawDataset):
     def __init__(self) -> None:
         original_ds = load_dataset("rajpurkar/squad")
         self.task_name = "SQuAD"
