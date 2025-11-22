@@ -23,7 +23,7 @@ on:
       log_level:
         description: 'Renovate log level'
         required: false
-        default: 'debug'
+        default: 'info'
         type: choice
         options:
           - debug
