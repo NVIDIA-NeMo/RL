@@ -75,9 +75,6 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
-)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
@@ -1764,6 +1761,12 @@ class MegatronPolicyWorker:
         """
         no_grad = torch.no_grad()
         no_grad.__enter__()
+
+        if self.should_disable_forward_pre_hook:
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
+
         self.model.config.flash_decode = True
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
@@ -1792,9 +1795,11 @@ class MegatronPolicyWorker:
         )
 
         from megatron.core.inference.contexts import StaticInferenceContext
+        from megatron.core.inference.inference_request import InferenceRequest
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
+        from megatron.core.inference.sampling_params import SamplingParams
 
         inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
 
@@ -1810,21 +1815,57 @@ class MegatronPolicyWorker:
             max_batch_size=self.cfg["generation_batch_size"],
         )
 
-        # detokenize the prompts
-        # detokenized_prompts = [
-        # self.tokenizer.decode(prompt)
-        # for prompt in data.get("input_ids")
-        # ]
-        # apply chat template
-        out = run_mcore_engine(
-            engine=inference_engine,
-            # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data["input_ids"],
-            prompt_lengths_tensor=data["input_lengths"],
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
-            - data["input_ids"].size(1),
+        input_ids = data["input_ids"]
+        tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - input_ids.size(
+            1
         )
-        # print(out)
+
+        prompt_tokens_tensor = input_ids
+        prompt_lengths_tensor = data["input_lengths"]
+
+        # Handle None values for top_k - convert to integer as required by Megatron
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        # Use temperature 0.0 for greedy, 1.0 otherwise
+        temperature = 0.0 if greedy else 1.0
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
+        )
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_k=top_k_val,
+            top_p=top_p_val,
+            return_segments=False,
+            return_log_probs=True,
+            num_tokens_to_generate=tokens_to_generate,
+            top_n_logprobs=0,
+            return_prompt_top_n_logprobs=False,
+        )
+        requests = []
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            tokenized_prompt = p[:prompt_len].cpu().numpy().tolist()
+            detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
+            req = InferenceRequest(
+                prompt=detokenized_prompt,
+                prompt_tokens=tokenized_prompt,
+                sampling_params=sampling_params,
+                request_id=inference_engine.get_new_request_id(),
+            )
+            requests.append(req)
+
+        result = inference_engine.generate(inference_requests=requests)
+
+        out = {
+            "text": [x.prompt + x.generated_text for x in result],
+            "tokens": [x.prompt_tokens + x.generated_tokens.tolist() for x in result],
+            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
