@@ -832,7 +832,7 @@ class Logger(LoggerInterface):
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
 
-        if cfg["swanlab_enabled"]:
+        if cfg.get("swanlab_enabled", False):
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
             os.makedirs(swanlab_log_dir, exist_ok=True)
             self.swanlab_logger = SwanlabLogger(cfg["swanlab"], log_dir=swanlab_log_dir)
@@ -864,7 +864,7 @@ class Logger(LoggerInterface):
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
-            if cfg["swanlab_enabled"] and self.swanlab_logger:
+            if cfg.get("swanlab_enabled", False) and self.swanlab_logger:
                 self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
