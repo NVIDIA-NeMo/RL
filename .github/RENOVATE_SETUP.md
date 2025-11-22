@@ -6,14 +6,14 @@ This repository uses [Renovate](https://docs.renovatebot.com/) to automatically 
 
 Renovate automatically:
 1. **Updates git submodules** by tracking the configured branches
-2. **Updates Python dependencies** in `pyproject.toml`, with special handling for:
-   - `vllm` grouped with `torch` and `ray` for compatibility
-   - `transformer-engine` grouped with `flash-attn` for xformers compatibility
-   - `transformers` handled separately due to specific constraints
-   - Other Python dependencies grouped together
+2. **Updates a small allowlist of Python dependencies** in `pyproject.toml`:
+   - `vllm`, `torch`, and `ray` for the core training stack
+   - `transformer-engine` and `flash-attn` for xformers compatibility
+   - `transformers` so we can track upstream releases
+   - _Everything else is frozen unless explicitly requested._
 3. **Syncs `3rdparty/*/setup.py` files** with their corresponding submodule dependencies
 4. **Regenerates `uv.lock`** after dependency updates
-5. **Creates PRs** that automatically trigger the full CI pipeline (`cicd-main.yml`)
+5. **Creates a single PR** that automatically triggers the full CI pipeline (`cicd-main.yml`)
 
 ## Setup Requirements
 
@@ -111,17 +111,13 @@ You can manually trigger Renovate at any time:
    - **Log level**: Set to `debug` for verbose output
    - **Dry run**: Enable to preview changes without creating PRs
 
-## Update Groups
+## Update Strategy
 
-Renovate creates separate PRs for different types of updates:
+Renovate now produces **one consolidated PR at a time**:
 
-| Branch | Contents | Schedule |
-|--------|----------|----------|
-| `renovate/submodules` | All git submodules | Any time |
-| `renovate/vllm-core` | vllm + torch + ray | Daily |
-| `renovate/te-flashattn` | transformer-engine + flash-attn | Any time |
-| `renovate/transformers` | transformers only | Daily |
-| `renovate/python-deps` | Other Python packages | Daily |
+| Branch prefix | Contents | Notes |
+|---------------|----------|-------|
+| `renovate/allowlist-…` | Git submodules, Docker/GitHub Action updates, and the allowlisted Python packages above | Runs on the configured weekday schedule; no other dependencies are touched until explicitly re-enabled. |
 
 ## CI Integration
 
