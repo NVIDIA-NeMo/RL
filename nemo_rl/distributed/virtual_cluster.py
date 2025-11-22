@@ -58,6 +58,8 @@ class PY_EXECUTABLES:
     # Use Penguin dependencies
     PENGUIN = "uv run --locked --extra penguin"
 
+    ADK = "uv run --locked --extra adk"
+
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:
