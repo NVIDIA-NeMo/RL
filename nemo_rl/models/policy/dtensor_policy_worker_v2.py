@@ -27,9 +27,6 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
-from nemo_automodel.components._transformers.utils import (
-    sliding_window_overwrite,
-)
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
@@ -181,9 +178,6 @@ class DTensorPolicyWorkerV2:
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             torch_dtype=torch.float32,
             trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
