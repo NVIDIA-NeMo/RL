@@ -45,8 +45,26 @@ def main():
     
     # Connect to Ray if multi-node
     if args.multi_node:
-        ray.init(address="auto", ignore_reinit_error=True)
-        print("Connected to Ray cluster.")
+        import sys
+        
+        # Capture relevant environment variables to propagate to workers
+        env_vars = {
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "PATH": os.environ.get("PATH", ""),
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+            # "VLLM_WORKER_MULTIPROC_METHOD": "spawn", # Try ensuring env is right first
+        }
+        
+        ray.init(
+            address="auto", 
+            ignore_reinit_error=True,
+            runtime_env={
+                "py_executable": sys.executable,
+                "env_vars": env_vars
+            }
+        )
+        print(f"Connected to Ray cluster using python: {sys.executable}")
+        print(f"Ray available resources: {ray.available_resources()}")
 
     # Configuration
     MODEL_NAME = args.model
@@ -119,7 +137,7 @@ def main():
         max_model_len=args.max_model_len,
         trust_remote_code=args.trust_remote_code,
         dtype="bfloat16",
-        disable_log_stats=True, # Match NeMo-RL worker config
+        # disable_log_stats=True, # Match NeMo-RL worker config
     )
     
     # 6. Run Generation
