@@ -66,17 +66,11 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.engines import (
-    StaticInferenceEngine,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
-)
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
 )
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -1764,7 +1758,12 @@ class MegatronPolicyWorker:
         """
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model.config.flash_decode = True
+
+        if self.should_disable_forward_pre_hook:
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
+
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1791,40 +1790,120 @@ class MegatronPolicyWorker:
             inference_max_requests=self.cfg["generation_batch_size"],
         )
 
-        from megatron.core.inference.contexts import StaticInferenceContext
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
+        from megatron.core.inference.sampling_params import SamplingParams
 
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
-
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, inference_context
+        inference_max_batch_size = inference_wrapper_config.inference_max_requests
+        max_batch_size = inference_max_batch_size
+        buffer_size_gb = 10
+        buffer_guaranteed_fraction = 0.1
+        num_cuda_graphs = 1
+        model_config = self.model.config
+        model_config.cuda_graph_impl = "local"
+        dynamic_context = DynamicInferenceContext(
+            params_dtype=inference_wrapper_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=None,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
         )
+        inference_wrapped_model = GPTInferenceWrapper(
+            self.model, inference_wrapper_config, dynamic_context
+        )
+        inference_wrapped_model.prep_model_for_inference()
+
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        inference_engine = StaticInferenceEngine(
-            text_generation_controller=text_generation_controller,
-            max_batch_size=self.cfg["generation_batch_size"],
+
+        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+        dynamic_engine = DynamicInferenceEngine(
+            controller=text_generation_controller,
+            random_seed=1234,
+            context=dynamic_context,
+            enable_cuda_graph=True,
+            termination_id=self.megatron_tokenizer.eod,
         )
 
-        # detokenize the prompts
-        # detokenized_prompts = [
-        # self.tokenizer.decode(prompt)
-        # for prompt in data.get("input_ids")
-        # ]
-        # apply chat template
-        out = run_mcore_engine(
-            engine=inference_engine,
-            # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data["input_ids"],
-            prompt_lengths_tensor=data["input_lengths"],
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
+        tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - data[
+            "input_ids"
+        ].size(1)
+
+        # Handle None values for top_k - convert to integer as required by Megatron
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        # Use temperature 0.0 for greedy, 1.0 otherwise
+        temperature = 0.0 if greedy else 1.0
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
+        )
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_k=top_k_val,
+            top_p=top_p_val,
+            return_segments=False,
+            return_log_probs=True,
+            num_tokens_to_generate=tokens_to_generate,
+            top_n_logprobs=0,
+            return_prompt_top_n_logprobs=False,
+        )
+        sampling_params = SamplingParams(
+            temperature=1.0,
+            top_k=0,
+            top_p=0.0,
+            return_segments=True,
+            return_log_probs=True,
+            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"]
             - data["input_ids"].size(1),
         )
-        # print(out)
+
+        input_ids = data["input_ids"]
+        prompt_tokens_tensor = input_ids
+        prompt_lengths_tensor = data["input_lengths"]
+        request_id = 0
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            tokenized_prompt = p[:prompt_len]  # .cuda()
+            detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
+            dynamic_engine.add_request(
+                request_id,
+                detokenized_prompt,
+                num_tokens_to_generate=tokens_to_generate,
+            )
+            request_id += 1
+
+        result = []
+        while dynamic_engine.has_unfinished_requests():
+            result_step = dynamic_engine.step_modern(sampling_params, verbose=False)
+            if result_step["finished_requests"] is not None:
+                result.extend(result_step["finished_requests"])
+
+        # Sort results by request_id to maintain original batch order
+        result.sort(key=lambda x: x.request_id)
+
+        out = {
+            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
+            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
