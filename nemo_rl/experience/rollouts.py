@@ -379,6 +379,11 @@ def run_multi_turn_rollout(
         if len(active_indices) == 0:
             break
 
+        if max_rollout_turns > 1:
+            print(
+                f"▶ ▶ ▶ Running rollout turn {turn + 1} / {max_rollout_turns} with {len(active_indices)} active samples..."
+            )
+
         active_samples_per_turn.append(len(active_indices))
 
         # Convert LLMMessageLogType to FlatMessagesType for generation
@@ -404,6 +409,7 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+
         # add the multimodal data to the generation input data
         multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
         generation_input_data.update(multimodal_data)
@@ -444,11 +450,30 @@ def run_multi_turn_rollout(
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
-            # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
+            # Tokenize the raw content from the environment into chat format if needed
+            env_role = env_output.observations[i]["role"].lower()
+            if env_role in {"user", "assistant", "system"}:
+                formatted_obs = tokenizer.apply_chat_template(
+                    [{"role": env_role, "content": env_obs_content.strip()}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                tokenized_obs = tokenizer(
+                    formatted_obs, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
+                # remove the bos token if added after `apply_chat_template`
+                if (
+                    len(formatted_obs) > 0
+                    and hasattr(tokenizer, "bos_token_id")
+                    and formatted_obs[0] == tokenizer.bos_token_id
+                ):
+                    formatted_obs = formatted_obs[1:]
+            else:
+                formatted_obs = env_obs_content.strip()
+                tokenized_obs = tokenizer(
+                    formatted_obs, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
+
             # tokenizer returns torch.float32 when env_obs_content is empty
             tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
@@ -471,7 +496,7 @@ def run_multi_turn_rollout(
 
             tokenized_env_obs_message = {
                 "role": env_output.observations[i]["role"],
-                "content": env_obs_content,
+                "content": formatted_obs,
                 "token_ids": tokenized_obs,
             }
             current_batch["message_log"][global_idx].append(tokenized_env_obs_message)
@@ -713,9 +738,28 @@ async def run_sample_multi_turn_rollout(
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
         # Tokenize environment response
-        tokenized_obs = tokenizer(
-            env_obs_content, return_tensors="pt", add_special_tokens=False
-        ).input_ids[0]
+        env_role = env_output.observations[0]["role"].lower()
+        if env_role in {"user", "assistant", "system"}:
+            formatted_obs = tokenizer.apply_chat_template(
+                [{"role": env_role, "content": env_obs_content.strip()}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            tokenized_obs = tokenizer(
+                formatted_obs, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
+            # remove the bos token if added after `apply_chat_template`
+            if (
+                len(formatted_obs) > 0
+                and hasattr(tokenizer, "bos_token_id")
+                and formatted_obs[0] == tokenizer.bos_token_id
+            ):
+                formatted_obs = formatted_obs[1:]
+        else:
+            formatted_obs = env_obs_content.strip()
+            tokenized_obs = tokenizer(
+                formatted_obs, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
@@ -729,7 +773,7 @@ async def run_sample_multi_turn_rollout(
 
         env_message = {
             "role": env_output.observations[0]["role"],
-            "content": env_obs_content,
+            "content": formatted_obs,
             "token_ids": tokenized_obs,
         }
         current_message_log.append(env_message)
