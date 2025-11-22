@@ -32,7 +32,7 @@ The environment is a simulated user that:
 - Optionally evaluates the agent's final guess using an LLM-based grader (included for extensibility, though not essential for this task).
 
 ### Example Usage
-    uv run python examples/run_grpo_unique_numbers_w_adk.py
+    uv run --extra adk --extra automodel python examples/run_grpo_unique_numbers_w_adk.py
 
 ### Requirements
 - A working ADK environment with access to a compatible LLM endpoint.
