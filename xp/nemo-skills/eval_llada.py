@@ -194,7 +194,7 @@ def create_parser():
     parser.add_argument(
         "--soft-temperature",
         type=float,
-        default=1.0,
+        default=0.2,
         help="Temperature for soft token probability distribution (dInfer Soft Token only)"
     )
     

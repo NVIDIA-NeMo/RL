@@ -278,6 +278,13 @@ class BlockWiseSoftTokenLLM:
                 x[block_loc.end:] = self.decoder.eos_id
                 break
 
+        # DEBUG: Check for EOS tokens to explain short output
+        eos_count = (x.data == self.decoder.eos_id).sum().item()
+        if eos_count > 0:
+            total_len = x.total_length
+            logger.warning(f"SoftTokenLLM Generated {eos_count} EOS tokens out of {total_len} total positions. "
+                  f"This will shorten the output by {eos_count} tokens.")
+
         logger.debug(f'SoftTokenLLM - Total diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 
@@ -334,7 +341,7 @@ class SoftTokenGeneration(DInferGeneration):
             early_stop=self.early_stop,
             soft_token_ratio=0.2,
             treat_soft_tokens_as_candidates=False,
-            soft_temperature=1.0
+            soft_temperature=0.2
         )
         
         logger.info(f"Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder (early_stop={self.early_stop})")
@@ -446,6 +453,6 @@ class SoftTokenGeneration(DInferGeneration):
             'soft_token_ratio': 0.2,
             'treat_soft_tokens_as_candidates': False,
             'threshold': 0.9,
-            'soft_temperature': 1.0,
+            'soft_temperature': 0.2,
             'early_stop': True
         }
