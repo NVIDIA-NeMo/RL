@@ -77,7 +77,11 @@
     "enabled": true
   },
   "pep621": {
-    "enabled": true
+    "enabled": true,
+    "fileMatch": ["(^|/)pyproject\\.toml$"]
+  },
+  "uv": {
+    "enabled": false
   },
   "lockFileMaintenance": {
     "enabled": false
