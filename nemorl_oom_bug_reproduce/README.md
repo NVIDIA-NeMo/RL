@@ -40,8 +40,11 @@ dependencies = [
 ### 4. Install dependencies
 
 ```bash
-uv sync --all-extras
-```
+# DEPRECATED - No longer needed
+# uv sync --all-extras
+``` 
+
+No need to install manually as ether0 has its own uv environment.
 
 ---
 
@@ -50,11 +53,20 @@ uv sync --all-extras
 From inside the copied `/path/to/nemo-rl/oom_bug_reproduce` directory:
 
 ```bash
-bash run.sh configs/config_qwen3_235B_instruct.yaml 16 qwen3_235B_instruct_results
+# DEPRECATED - No longer needed as we need container to handle env setup
+# bash run.sh configs/config_qwen3_235B_instruct.yaml 16 qwen3_235B_instruct_results
+
+# small scale
+COMMAND="bash nemorl_oom_bug_reproduce/local_run_small_scale.sh" NNODES=2 bash user_run_slurm.sh
+
+# large scale
+COMMAND="bash nemorl_oom_bug_reproduce/local_run_large_scale.sh" NNODES=16 LONG_RUN=true bash user_run_slurm.sh
 ```
 
 Note: you will need to change the slurm partition name inside run.sh !
 
 ### 7. Expected behavior
 
-CPU ram will slowly increase. For us, after ~10-12 full steps, it raises an OOM error
+> CPU ram will slowly increase. For us, after ~10-12 full steps, it raises an OOM error  
+
+Tried but not able to reproduce.
