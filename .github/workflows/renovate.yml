@@ -117,6 +117,10 @@ jobs:
           configurationFile: .github/renovate.json
           # Use GitHub App token if available, otherwise fall back to PAT
           token: ${{ steps.get-app-token.outputs.token || secrets.RENOVATE_TOKEN }}
+          # Run as root to avoid "dubious ownership" errors with pre-cloned repo
+          docker-user: root
+          # Pass GIT_CONFIG_GLOBAL env var to container (not in default regex)
+          env-regex: '^(?:RENOVATE_\w+|LOG_LEVEL|GITHUB_COM_TOKEN|NODE_OPTIONS|(?:HTTPS?|NO)_PROXY|(?:https?|no)_proxy|GIT_CONFIG_GLOBAL)$'
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
