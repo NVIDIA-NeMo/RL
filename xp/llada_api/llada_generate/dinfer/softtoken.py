@@ -324,13 +324,20 @@ class SoftTokenGeneration(DInferGeneration):
         
         # Actually, 'softtoken' implies we want to use soft tokens. The decoding strategy (fixed vs threshold) is separate.
         # Let's initialize with ThresholdParallelDecoder as it is generally better (faster).
-        
-        decoder = ThresholdParallelDecoder(
+
+        decoder = FixedParallelDecoder(
             temperature=0,
-            threshold=0.9,
+            steps=64,
             mask_id=MASK_ID,
             eos_id=EOS_ID
         )
+        
+        # decoder = ThresholdParallelDecoder(
+        #     temperature=0,
+        #     threshold=0.9,
+        #     mask_id=MASK_ID,
+        #     eos_id=EOS_ID
+        # )
         
         # Create the Soft Token LLM
         diffusion_llm = BlockWiseSoftTokenLLM(

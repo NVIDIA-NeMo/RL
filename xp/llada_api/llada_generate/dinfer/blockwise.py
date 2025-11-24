@@ -55,19 +55,19 @@ class BlockWiseGeneration(DInferGeneration):
             raise RuntimeError("dInfer is not available")
         
         # Use default steps of 64 if not specified (will be updated in generate)
-        # decoder = FixedParallelDecoder(
-        #     temperature=0,
-        #     steps=64,
-        #     mask_id=MASK_ID,
-        #     eos_id=EOS_ID
-        # )
-
-        decoder = ThresholdParallelDecoder(
+        decoder = FixedParallelDecoder(
             temperature=0,
-            threshold=0.9,
+            steps=64,
             mask_id=MASK_ID,
             eos_id=EOS_ID
         )
+
+        # decoder = ThresholdParallelDecoder(
+        #     temperature=0,
+        #     threshold=0.9,
+        #     mask_id=MASK_ID,
+        #     eos_id=EOS_ID
+        # )
         
         # Create the BlockWise diffusion LLM
         diffusion_llm = BlockWiseDiffusionLLM(
