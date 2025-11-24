@@ -856,6 +856,10 @@ def run_async_multi_turn_rollout(
         for final_state, sample_metrics in sample_results:
             final_sample_states.append(final_state)
             all_sample_metrics.append(sample_metrics)
+        
+        # Clean up task references to prevent memory leaks
+        del sample_tasks
+        del sample_results
 
         # Reconstruct batch from sample results
         batch_size = len(final_sample_states)
@@ -930,9 +934,21 @@ def run_async_multi_turn_rollout(
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
+        # Explicit cleanup of large intermediate data structures
+        del sample_initial_states
+        del final_sample_states
+        del all_sample_metrics
+
         return final_batch, rollout_metrics
 
-    return asyncio.run(_async_rollout_implementation())
+    # Run the async function and clean up afterward
+    result = asyncio.run(_async_rollout_implementation())
+    
+    # Force garbage collection to free memory from async tasks
+    import gc
+    gc.collect()
+    
+    return result
 
 
 @dataclass

@@ -717,6 +717,26 @@ class AsyncTrajectoryCollector:
                         f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
                     )
 
+            # CRITICAL: Explicitly delete large data objects to prevent memory leaks
+            # Thread-local variables can persist in memory even after thread completion
+            # This ensures generation data is freed immediately
+            try:
+                del repeated_batch
+            except NameError:
+                pass
+            try:
+                del final_batch_cpu
+            except NameError:
+                pass
+            try:
+                del trajectory_group
+            except NameError:
+                pass
+            
+            # Force garbage collection to free memory immediately
+            import gc
+            gc.collect()
+
             # Detach thread record when finished
             with self._threads_lock:
                 current = _threading.current_thread()
