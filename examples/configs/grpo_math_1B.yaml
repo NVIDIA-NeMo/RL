@@ -32,9 +32,16 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    in_flight_weight_updates: false # Set to true to enable in-flight weight updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
+  # Can be set to k1, k2, k3
+  # For more details, see http://joschu.net/blog/kl-approx.html
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
   ratio_clip_max: 0.2
   ratio_clip_c: null
@@ -71,6 +78,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
   logprob_chunk_size: null
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
   dtensor_cfg:
     _v2: true
@@ -147,7 +155,6 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
-      average_in_collective: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 

@@ -15,13 +15,14 @@
 import gc
 import importlib
 import os
+import traceback
 from enum import Enum
 from typing import Any, Dict, Optional
 
 import torch
+import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForTextToWaveform,
@@ -272,35 +273,6 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
-def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
-    """Returns configuration overrides to handle sliding window settings based on model rules.
-
-    Args:
-        model_name: The HuggingFace model name or path to load configuration from
-
-    Returns:
-        dict: Dictionary with overwrite values, or empty dict if no overwrites needed
-    """
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    overwrite_dict = {}
-
-    # Override sliding_window setting to address a HF mismatch relevant to use_sliding_window
-    # TODO(@zhiyul): remove this once the bug is fixed https://github.com/huggingface/transformers/issues/38002
-    if (
-        hasattr(hf_config, "use_sliding_window")
-        and hf_config.use_sliding_window == False
-    ):
-        assert hasattr(hf_config, "sliding_window")
-        overwrite_dict = {
-            "sliding_window": None,
-        }
-        print(
-            f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}"
-        )
-
-    return overwrite_dict
-
-
 def configure_dynamo_cache() -> None:
     """Disable dynamo autotune_local_cache.
 
@@ -479,6 +451,21 @@ def stream_weights_via_ipc_zmq_impl(
             print(
                 f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
             )
+
+    except zmq.Again:
+        timeout_ms = zmq_socket.getsockopt(zmq.RCVTIMEO)
+        raise TimeoutError(
+            f"{worker_name} (rank {rank}): ZMQ communication timeout after {timeout_ms}ms in policy worker side. "
+            f"The generation worker may be dead or unresponsive. "
+            f"This typically indicates the generation worker has crashed or is not responding to weight streaming."
+        ) from None
+    except zmq.ZMQError as e:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): ZMQ error during weight streaming: {e} (errno: {e.errno}). "
+            f"Error details: {e.strerror}. "
+            f"This may indicate network issues or the peer process has terminated unexpectedly.\n"
+            f"{traceback.format_exc()}"
+        ) from e
 
     finally:
         # Clean up buffers in finally block to ensure cleanup even on exceptions
