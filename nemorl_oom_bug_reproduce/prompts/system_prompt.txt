@@ -1,0 +1,1 @@
+You are an expert in chemistry. Think deeply and solve the below problem. Your final answer must be a SMILES string, enclosed in <answer>...</answer> tags, with no other formatting. 
