@@ -58,7 +58,8 @@
       "matchManagers": [
         "pip_setup",
         "poetry",
-        "pixi"
+        "pixi",
+        "uv"
       ],
       "enabled": false
     },
@@ -79,9 +80,6 @@
   "pep621": {
     "enabled": true,
     "fileMatch": ["(^|/)pyproject\\.toml$"]
-  },
-  "uv": {
-    "enabled": false
   },
   "lockFileMaintenance": {
     "enabled": false
