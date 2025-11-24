@@ -62,6 +62,7 @@ jobs:
         run: |
           chmod +x .github/scripts/sync_submodule_dependencies.py
           chmod +x .github/scripts/renovate_post_update.sh
+          chmod +x .github/scripts/renovate_cmd.sh
 
       - name: Pre-clone repository with full submodule history
         env:
@@ -87,18 +88,15 @@ jobs:
           echo "Submodule status:"
           git submodule status --recursive
           
-          # Create global gitconfig for Renovate container to mark this as a safe directory
-          # This is needed because the repo was created by the runner user but Renovate
-          # runs as a different user inside its Docker container
-          cat > /tmp/.gitconfig << 'EOF'
-          [safe]
-              directory = *
-          EOF
+          # Copy the renovate command wrapper to /tmp so it's accessible in the container
+          # This wrapper sets git safe.directory before running renovate
+          # Use GITHUB_WORKSPACE since we've cd'd into the pre-cloned directory
+          cp "${GITHUB_WORKSPACE}/.github/scripts/renovate_cmd.sh" /tmp/renovate_cmd.sh
+          chmod +x /tmp/renovate_cmd.sh
           
           # Fix permissions for Renovate container (runs as uid 1000)
           # Make everything world-writable so the container user can access it
           chmod -R 777 /tmp/renovate
-          chmod 644 /tmp/.gitconfig
 
       # Option 1: Use GitHub App token (recommended for better rate limits)
       # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
@@ -117,10 +115,9 @@ jobs:
           configurationFile: .github/renovate.json
           # Use GitHub App token if available, otherwise fall back to PAT
           token: ${{ steps.get-app-token.outputs.token || secrets.RENOVATE_TOKEN }}
-          # Run as root to avoid "dubious ownership" errors with pre-cloned repo
-          docker-user: root
-          # Pass GIT_CONFIG_GLOBAL env var to container (not in default regex)
-          env-regex: '^(?:RENOVATE_\w+|LOG_LEVEL|GITHUB_COM_TOKEN|NODE_OPTIONS|(?:HTTPS?|NO)_PROXY|(?:https?|no)_proxy|GIT_CONFIG_GLOBAL)$'
+          # Use custom command that sets git safe.directory before running renovate
+          # This avoids "dubious ownership" errors with the pre-cloned repo
+          docker-cmd-file: /tmp/renovate_cmd.sh
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
@@ -130,6 +127,4 @@ jobs:
           RENOVATE_ONBOARDING: 'false'
           RENOVATE_REQUIRE_CONFIG: 'optional'
           RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\.github/scripts/renovate_post_update\\.sh$"]'
-          # Use our custom gitconfig that marks the pre-cloned repo as safe
-          GIT_CONFIG_GLOBAL: /tmp/.gitconfig
 
