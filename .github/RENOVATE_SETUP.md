@@ -13,7 +13,7 @@ Renovate automatically:
    - _Everything else is frozen unless explicitly requested._
 3. **Syncs `3rdparty/*/setup.py` files** with their corresponding submodule dependencies
 4. **Regenerates `uv.lock`** after dependency updates
-5. **Clones git submodules during Renovate's own checkout** so workspace members such as `Automodel` exist before `uv lock` runs.
+5. **Pre-clones git submodules with full history** so Renovate can checkout new commits (works around `shallow=true` in `.gitmodules`)
 6. **Creates a single PR** that automatically triggers the full CI pipeline (`cicd-main.yml`)
 
 ## Setup Requirements

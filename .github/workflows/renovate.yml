@@ -63,6 +63,33 @@ jobs:
           chmod +x .github/scripts/sync_submodule_dependencies.py
           chmod +x .github/scripts/renovate_post_update.sh
 
+      - name: Pre-clone repository with full submodule history
+        env:
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+        run: |
+          # Pre-clone the repo to where Renovate expects it, with unshallowed submodules
+          # Renovate will reuse this clone instead of cloning fresh
+          CLONE_DIR="/tmp/renovate/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}"
+          mkdir -p "$(dirname "$CLONE_DIR")"
+          
+          echo "Cloning to $CLONE_DIR with full submodule history..."
+          git clone --recurse-submodules \
+            "https://x-access-token:${RENOVATE_TOKEN}@github.com/${{ github.repository }}.git" \
+            "$CLONE_DIR"
+          
+          cd "$CLONE_DIR"
+          
+          # Unshallow all submodules (they were cloned shallow due to .gitmodules setting)
+          echo "Unshallowing submodules..."
+          git submodule foreach --recursive 'git fetch --unshallow origin 2>/dev/null || echo "Already unshallow or no remote"'
+          
+          echo ""
+          echo "Submodule status:"
+          git submodule status --recursive
+          
+          # Fix permissions for Renovate container (runs as uid 1000)
+          chmod -R a+rwX /tmp/renovate
+
       # Option 1: Use GitHub App token (recommended for better rate limits)
       # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
       # If these secrets aren't set, this step will be skipped and PAT will be used
