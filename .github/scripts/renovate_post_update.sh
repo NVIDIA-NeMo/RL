@@ -36,8 +36,16 @@ echo ""
 
 # Step 2: Run uv lock to regenerate lock file
 echo "Step 2: Running uv lock..."
+
+# Install uv if not available (needed when running inside Renovate's Docker container)
 if ! command -v uv &> /dev/null; then
-    echo "ERROR: uv is not installed or not in PATH"
+    echo "uv not found, installing..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+if ! command -v uv &> /dev/null; then
+    echo "ERROR: uv is not installed or not in PATH after installation attempt"
     exit 1
 fi
 
