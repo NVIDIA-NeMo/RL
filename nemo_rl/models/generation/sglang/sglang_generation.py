@@ -89,12 +89,16 @@ class SGLangGeneration(GenerationInterface):
         
         self.dp_size = num_servers
         self.gpus_per_server = gpus_per_server
-        
-        # Create sharding annotations with only data_parallel dimension
-        # Each server is independent, so we only need DP sharding
+
+        # Create sharding annotations
+        # Even though SGLang manages TP internally, we include it in the layout to support
+        # RayWorkerGroup's worker management (which creates one worker per GPU bundle).
+        # The TP dimension becomes a "free axis" in run_all_workers_sharded_data, ensuring
+        # only the primary workers (TP rank 0) are called.
+        total_workers = num_servers * gpus_per_server
         self.sharding_annotations = NamedSharding(
-            layout=np.arange(num_servers).reshape(num_servers),
-            names=["data_parallel"],
+            layout=np.arange(total_workers).reshape(num_servers, gpus_per_server),
+            names=["data_parallel", "tensor_parallel"],
         )
         
         # Initialize placement groups

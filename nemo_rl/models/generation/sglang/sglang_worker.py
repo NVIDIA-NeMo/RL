@@ -98,9 +98,15 @@ class SGLangGenerationWorker:
             
             init_kwargs["seed"] = seed
 
-        # For SGLang, Ray manages GPU assignment via CUDA_VISIBLE_DEVICES
-        # We set num_gpus to 0 and let Ray handle it
-        if local_bundle_indices is not None and len(local_bundle_indices) > 1:
+        # Check if this worker is part of a parallel group (multiple GPUs per server).
+        # A worker with local rank =0 owns the server(local_bundle_indices is not None )
+        # otherwise it is a placeholder for Ray's resource management (local_bundle_indices is None).
+        is_part_of_parallel_workers = (
+            local_bundle_indices is not None and len(local_bundle_indices) > 1
+        ) or local_bundle_indices is None
+
+        if is_part_of_parallel_workers:
+            # For parallel workers, we manage GPU assignment manually via CUDA_VISIBLE_DEVICES
             resources["num_gpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
@@ -126,17 +132,27 @@ class SGLangGenerationWorker:
         """
         self.cfg = config
         self.is_model_owner = bundle_indices is not None
-        
+
+        # Only the primary worker (local_rank=0) in each server group starts the SGLang server
+        # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
             return
 
+        # Set CUDA_VISIBLE_DEVICES to allow SGLang server to see the correct GPUs
+        # bundle_indices contains the node-local GPU indices (e.g., [0,1,2,3] or [4,5,6,7])
+        # Since we set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1, Ray won't override this
+        gpu_ids = ",".join(str(idx) for idx in bundle_indices)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+
         # Determine tp_size from bundle_indices length
-        # Ray sets CUDA_VISIBLE_DEVICES so each server sees logical GPUs 0, 1, 2, ..., tp_size-1
-        tp_size = len(bundle_indices) if bundle_indices else 1
-        
+        tp_size = len(bundle_indices)
+
+        print(
+            f"[SGLang Server] Node {os.environ.get('NODE_RANK', '?')}: "
+            f"Setting CUDA_VISIBLE_DEVICES={gpu_ids} (tp_size={tp_size})"
+        )
+
         # Build SGLang server arguments
-        # Ray automatically sets CUDA_VISIBLE_DEVICES, so base_gpu_id should be 0
-        # and gpu_id_step should be 1
         kwargs = {
             "model_path": self.cfg.get("model_path", ""),
             "trust_remote_code": True,
