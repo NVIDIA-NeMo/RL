@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 import threading
+import time
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -153,6 +155,94 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 self._setup_vllm_server()
             )
 
+        # vLLM Metrics Logger
+        # Metrics logger only enabled for per-actor, model-owner only
+        self._vllm_metrics_lock = threading.Lock()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._start_vllm_metrics_logger()
+
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM logger metrics.
+
+        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Runs only on the model-owner actor.
+        """
+        from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
+
+        assert self.cfg["vllm_cfg"].get("async_engine", False), (
+            "vLLM metrics logger is only supported with async engine enabled"
+        )
+        # Run only on the model-owner actor
+        if not getattr(self, "is_model_owner", False):
+            return
+
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
+
+        # Lazy import inside thread target to avoid import overhead if disabled
+        stop_event = threading.Event()
+        self._vllm_metrics_logger_stop_event = stop_event
+
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+
+        def _logger_loop():
+            # Delay a little to let engine settle
+            time.sleep(min(2.0, interval_s))
+            while True:
+                try:
+                    for m in get_metrics_snapshot():
+                        if isinstance(m, Gauge):
+                            # Log the vllm inflight batch sizes
+                            if m.name == "vllm:num_requests_running":
+                                with self._vllm_metrics_lock:
+                                    self.inflight_batch_sizes.append(int(m.value))
+                            # Log the vllm pending number of requests in the queue
+                            elif m.name == "vllm:num_requests_waiting":
+                                with self._vllm_metrics_lock:
+                                    self.num_pending_samples.append(int(m.value))
+                except Exception:
+                    print(
+                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        flush=True,
+                    )
+                    pass
+                time.sleep(interval_s)
+
+        t = threading.Thread(
+            target=_logger_loop, name="vllm-metrics-logger", daemon=True
+        )
+        t.start()
+        self._vllm_metrics_logger_thread = t
+        print(
+            "📋[vLLM Metric Logger] vLLM metrics logger thread started",
+            flush=True,
+        )
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            metric = {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+            }
+        return metric
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+
+        with self._vllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
@@ -170,6 +260,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             JSONResponse,
             StreamingResponse,
         )
+
         from vllm.entrypoints.openai.api_server import (  # pyright: ignore[reportMissingImports]
             BaseModelPath,
             OpenAIServingChat,

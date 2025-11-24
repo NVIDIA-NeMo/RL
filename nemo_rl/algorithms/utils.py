@@ -451,6 +451,16 @@ def print_performance_metrics(
         x_new = np.linspace(0, 1, new_size)
         return np.interp(x_new, x_old, data)
 
+    def get_min_idle_time(
+        metric_dict: dict[int, list[int]], timeline_interval: float
+    ) -> float:
+        min_idle_time = float("inf")
+        for _, metric_values in metric_dict.items():
+            count_zeros = lambda x: sum(v == 0 for v in x)
+            idle_time = count_zeros(metric_values) * timeline_interval
+            min_idle_time = min(min_idle_time, idle_time)
+        return min_idle_time
+
     def visualize_per_worker_timeline(
         metric_dict: dict[int, list[int]],
         metric_name: str,
@@ -467,6 +477,10 @@ def print_performance_metrics(
 
         print(f"  - {metric_name}:")
         print(f"    - Max value: {max_value}")
+        if timeline_interval is not None:
+            print(
+                f"    - Min idle time: {get_min_idle_time(metric_dict, timeline_interval)} s"
+            )
         print(
             f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
         )
