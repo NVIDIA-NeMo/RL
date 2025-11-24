@@ -291,9 +291,10 @@ def hf_data_processor(
     # pdb.set_trace()
 
     # add this for backward compatibility
-    user_message["token_ids"] = adjust_image_tokens(
-        message["input_ids"], message["num_patches"], 131073, 131074
-    )[0]
+    user_message["token_ids"] = message["input_ids"][0]
+    # user_message["token_ids"] = adjust_image_tokens(
+    #     message["input_ids"], message["num_patches"], 131073, 131074
+    # )[0]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = get_multimodal_keys_from_processor(processor)
     for key in multimodal_keys:
