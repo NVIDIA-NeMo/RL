@@ -249,19 +249,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
         from typing import List, Optional, Union
 
-        from fastapi import Request  # pyright: ignore[reportMissingImports]
-        from fastapi.responses import (  # pyright: ignore[reportMissingImports]
-            JSONResponse,
-            StreamingResponse,
-        )
-
-        from vllm.entrypoints.openai.api_server import (  # pyright: ignore[reportMissingImports]
+        from fastapi import Request
+        from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.openai.api_server import (
             BaseModelPath,
             OpenAIServingChat,
             OpenAIServingModels,
