@@ -89,6 +89,17 @@ jobs:
           
           # Fix permissions for Renovate container (runs as uid 1000)
           chmod -R a+rwX /tmp/renovate
+          
+          # Create global gitconfig for Renovate container to mark this as a safe directory
+          # This is needed because the repo was created by the runner user but Renovate
+          # runs as a different user inside its Docker container
+          mkdir -p /tmp/renovate/cache
+          cat > /tmp/renovate/cache/.gitconfig << EOF
+          [safe]
+              directory = /tmp/renovate/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}
+              directory = *
+          EOF
+          chmod a+r /tmp/renovate/cache/.gitconfig
 
       # Option 1: Use GitHub App token (recommended for better rate limits)
       # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
@@ -116,4 +127,6 @@ jobs:
           RENOVATE_ONBOARDING: 'false'
           RENOVATE_REQUIRE_CONFIG: 'optional'
           RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\.github/scripts/renovate_post_update\\.sh$"]'
+          # Use our custom gitconfig that marks the pre-cloned repo as safe
+          GIT_CONFIG_GLOBAL: /tmp/renovate/cache/.gitconfig
 
