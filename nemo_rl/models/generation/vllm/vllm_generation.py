@@ -823,6 +823,8 @@ class VllmGeneration(GenerationInterface):
         """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return {}
 
         futures: list[ray.ObjectRef] = []
         dp_indices: list[int] = []
@@ -857,6 +859,8 @@ class VllmGeneration(GenerationInterface):
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
             return
         futures = self.worker_group.run_all_workers_single_data(
             "clear_vllm_logger_metrics",
