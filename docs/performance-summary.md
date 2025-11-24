@@ -28,10 +28,6 @@ Since reinforcement learning consists of training, generation and transition bet
 - **Tokens/sec/GPU**: [insert formula here]
 - **Training MFU**: Model floating-point operations per second per GPU
 
-```{contents}
-:local:
-:depth: 2
-```
 
 ## Performance Summary for Large Language Models
 
@@ -47,14 +43,19 @@ The performance data includes:
 
 ## Nemo RL v0.4
 
-### GRPO Performance on-policy. Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
+### GRPO, On-policy. Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
 
 #### System: DGX-H100. Precision: Training BF16, Generation BF16.
 
-| Model | Training Backend|T-Max Sequence Length | G-Average Seq len| #-GPUs | G-GBS |T-GBS|G-TP|G-PP|G-DP|T-TP|T-CP| T-EP| T-PP|T-VPP|T-DP | Tokens / sec / GPU | Total Step time(s) |
-|-------|--------|-----|-----|-----------------|------|----|----|----|----|----|----|-----------------------|-------------------------|------|----|-----|-|
-| LLAMA3.1_8B_instruct |Megatron|4096 | 1056 | 16|2048|512| 1 | 1 | 1 | 1 | 1|1|2|n/a | 8| 1496| 99 |
-| LLAMA3.1_8B_instruct |PyTorch|4096 | 1056 | 16|2048|512| 1 | 1 | 16| 1 | 1|1|1|n/a | 16| 1482| 114.9 |
+| Model | Training Backend|T-Max Sequence Length | G-Average Seq len| #-GPUs | G-GBS |T-GBS|Generation [TP,PP,DP]|Training [TP,CP,EP,PP,VPP,DP] | Tokens / sec / GPU | Total Step time(s) |
+|-------|--------|-----|-----|-----------------|------|----|----|----|-|-|
+| LLAMA3.1_8B|Megatron|4,096 | 1,056 | 16|2,048|512| [1,1,1] | [1,1,1,1,1,2,n/a,8]| 1,496| 99 |
+| LLAMA3.1_8B|PyTorch|4,096 | 1,056 | 16|2,048|512| [1,1,16]|[ 1,1,1,1,n/a,16]| 1,482| 115|
+| LLAMA3.1_70B_instruct |Megatron|4,096 | 675| 32|512|512| [8,1,4]|[ 4,1,1,8,n/a,1]| 124| 106|
+| DeepSeek V3 |Megatron|1,536 |760|256|512|512| [64,1,4]|[1,1,16,16,n/a,1]| 10.4| 168|
+| Qwen3-235B |Megatron|8,192|5,660|128|512|512| [16,1,8]|[2,2,16,8,n/a,1]| 48.4| 476|
+| Qwen3-30B3A |Megatron|4,096|3,156|32|2,048|512| [2,1,8]|[1,1,8,1,n/a,4]| 1,129| 170|
+| Qwen3-32B |Megatron|4,096|3,226|32|2,048|512| [4,1,8]|[4,1,1,4,n/a,2]| 532| 400|
 
-will add more rows
+
 - Is MOE token drop or dropless? [Guyue to confirm]
