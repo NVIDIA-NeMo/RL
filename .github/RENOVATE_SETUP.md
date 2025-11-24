@@ -13,7 +13,8 @@ Renovate automatically:
    - _Everything else is frozen unless explicitly requested._
 3. **Syncs `3rdparty/*/setup.py` files** with their corresponding submodule dependencies
 4. **Regenerates `uv.lock`** after dependency updates
-5. **Creates a single PR** that automatically triggers the full CI pipeline (`cicd-main.yml`)
+5. **Clones git submodules during Renovate's own checkout** so workspace members such as `Automodel` exist before `uv lock` runs.
+6. **Creates a single PR** that automatically triggers the full CI pipeline (`cicd-main.yml`)
 
 ## Setup Requirements
 
@@ -117,7 +118,12 @@ Renovate now produces **one consolidated PR at a time**:
 
 | Branch prefix | Contents | Notes |
 |---------------|----------|-------|
-| `renovate/allowlist-…` | Git submodules, Docker/GitHub Action updates, and the allowlisted Python packages above | Runs on the configured weekday schedule; no other dependencies are touched until explicitly re-enabled. |
+| `renovate/allowlist-…` | Git submodules, Docker/GitHub Action updates, and the allowlisted Python packages above | Runs on the configured weekday schedule; no other dependencies are touched until explicitly re-enabled. Renovate's built-in vulnerability PRs are disabled so everything funnels through this branch. |
+
+## Debug vs. Production Settings
+
+- `prHourlyLimit` is currently `0` **only while debugging** so Renovate can recreate PRs immediately. Set it back to `1` once we're satisfied with the configuration to avoid noisy PR bursts.
+- `prConcurrentLimit` stays at `1` to preserve the "one PR at a time" contract; raise it temporarily if you ever need parallel testing.
 
 ## CI Integration
 
