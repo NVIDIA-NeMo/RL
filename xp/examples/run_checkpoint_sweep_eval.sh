@@ -202,12 +202,12 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 # Confirm before proceeding
-read -p "Proceed with evaluation? [y/N] " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    print_warning "Cancelled by user"
-    exit 0
-fi
+#read -p "Proceed with evaluation? [y/N] " -n 1 -r
+#echo
+#if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#    print_warning "Cancelled by user"
+#    exit 0
+#fi
 
 # Process each checkpoint
 TOTAL=${#CHECKPOINT_DIRS[@]}
@@ -234,6 +234,7 @@ for checkpoint_dir in "${CHECKPOINT_DIRS[@]}"; do
     # Extract hyperparameters from preset (generation algorithm, benchmark, etc.)
     # For naming, we'll use a simplified approach
     eval_job_name="eval_${timestamp}"
+    #eval_job_name="eval_ckpt_sweep"
     eval_job_dir="$checkpoint_dir/$eval_job_name"
     
     print_status "Creating eval job directory: $eval_job_dir"

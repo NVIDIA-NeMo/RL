@@ -67,7 +67,7 @@ USAGE
 # Default configuration
 LOCAL_MODE=false
 JOB_NAME="llada-eval"
-TIME="4:00:00"
+TIME="24:00:00"
 CPUS_PER_TASK=32
 MEM="64G"
 PARTITION="cpu"

@@ -212,6 +212,9 @@ class OpenAIFormatDataset:
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
         assert messages[-1]["role"] == "assistant"
+        for m in messages:
+            if "content" in m and not isinstance(m["content"], str):
+                m["content"] = str(m["content"])
 
         # Preserve tools if they exist in the data
         result = {"messages": messages}
