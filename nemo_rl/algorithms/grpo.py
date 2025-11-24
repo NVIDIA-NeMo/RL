@@ -656,18 +656,26 @@ def normalize_advantages_with_epsilon(
     std: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
-    """Normalize advantages by standard deviation with epsilon to avoid division by zero.
+    """Normalize advantages by standard deviation, skipping samples with zero std.
+
+    When std is exactly zero (from leave-one-out baseline with identical rewards),
+    normalization is skipped for those samples to prevent numerical instability.
+    This makes normalize_rewards compatible with use_leave_one_out_baseline.
 
     Args:
         advantages: Tensor of shape (batch_size, 1) containing advantage values
         std: Tensor of shape (batch_size,) containing standard deviation values
-        epsilon: Small value to avoid division by zero, defaults to 1e-6
+        epsilon: Small value to avoid division by very small std, defaults to 1e-6
 
     Returns:
         Normalized advantages tensor of same shape as input advantages
     """
-    # Use epsilon to avoid division by zero instead of masking
-    return advantages / (std.unsqueeze(-1) + epsilon)
+    # Only normalize where std > 0 to avoid division by near-zero
+    non_zero_std_mask = std > 0
+    advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
+        std.unsqueeze(-1)[non_zero_std_mask] + epsilon
+    )
+    return advantages
 
 
 def dynamic_sampling(

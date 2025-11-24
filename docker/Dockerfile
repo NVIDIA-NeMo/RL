@@ -76,7 +76,9 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN <<"EOF" bash -exu
@@ -108,6 +110,8 @@ FROM hermetic AS release
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
+ARG RC_DATE=00.00
+ARG TARGETARCH
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
@@ -123,4 +127,6 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-
+# NOTICES.txt file points to where the OSS source code is archived
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
