@@ -48,6 +48,50 @@ def read_dependencies_from_pyproject(pyproject_path: Path) -> List[str]:
     return [str(dep).strip() for dep in data["project"]["dependencies"]]
 
 
+def find_list_end(content: str, start_pos: int) -> int:
+    """
+    Find the position of the closing bracket for a Python list.
+    
+    Args:
+        content: The file content
+        start_pos: Position right after the opening '['
+        
+    Returns:
+        Position of the matching closing ']'
+    """
+    bracket_count = 1
+    i = start_pos
+    in_string = False
+    string_char = None
+    
+    while i < len(content) and bracket_count > 0:
+        char = content[i]
+        
+        # Handle string literals (skip brackets inside strings)
+        if not in_string:
+            if char in '"\'':
+                in_string = True
+                string_char = char
+            elif char == '[':
+                bracket_count += 1
+            elif char == ']':
+                bracket_count -= 1
+        else:
+            # Check for escape sequences
+            if char == '\\' and i + 1 < len(content):
+                i += 1  # Skip the escaped character
+            elif char == string_char:
+                in_string = False
+                string_char = None
+        
+        i += 1
+    
+    if bracket_count != 0:
+        raise ValueError("Unmatched brackets in file")
+    
+    return i - 1  # Position of the closing ']'
+
+
 def update_cached_dependencies(setup_py_path: Path, new_dependencies: List[str]) -> bool:
     """
     Update CACHED_DEPENDENCIES list in a setup.py file.
@@ -59,13 +103,17 @@ def update_cached_dependencies(setup_py_path: Path, new_dependencies: List[str])
     
     content = setup_py_path.read_text()
     
-    # Find CACHED_DEPENDENCIES list using regex
-    # Pattern matches: CACHED_DEPENDENCIES = [ ... ]
-    pattern = r'(CACHED_DEPENDENCIES\s*=\s*\[)(.*?)(\])'
-    match = re.search(pattern, content, re.DOTALL)
+    # Find the start of CACHED_DEPENDENCIES list
+    pattern = r'CACHED_DEPENDENCIES\s*=\s*\['
+    match = re.search(pattern, content)
     
     if not match:
         raise ValueError(f"CACHED_DEPENDENCIES not found in {setup_py_path}")
+    
+    # Find the actual end of the list using bracket counting
+    # This handles nested brackets like those in "megatron-core[dev,mlm]"
+    list_start = match.end()  # Position right after the '['
+    list_end = find_list_end(content, list_start)  # Position of the closing ']'
     
     # Build new dependencies list with proper formatting
     indent = "    "
@@ -75,8 +123,8 @@ def update_cached_dependencies(setup_py_path: Path, new_dependencies: List[str])
     
     new_deps_str = "\n" + "\n".join(formatted_deps) + "\n"
     
-    # Replace the content between brackets
-    new_content = content[:match.start(2)] + new_deps_str + content[match.end(2):]
+    # Replace the content between brackets (keeping the brackets themselves)
+    new_content = content[:list_start] + new_deps_str + content[list_end:]
     
     # Check if content changed
     if new_content == content:
