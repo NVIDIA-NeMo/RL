@@ -48,6 +48,7 @@ dependencies = [
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "ether0 @ git+https://github.com/Future-House/ether0.git",
 ]
 
 [project.optional-dependencies]
@@ -99,6 +100,9 @@ mcore = [
   "flash-attn==2.8.1",
 ]
 penguin = ["penguin"]
+ether0 = [
+  "ether0 @ git+https://github.com/Future-House/ether0.git",
+]
 
 [dependency-groups]
 

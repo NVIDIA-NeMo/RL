@@ -106,7 +106,7 @@ class Ether1Environment(EnvironmentInterface[Ether1EnvironmentMetadata]):
         worker_cls = HFVerifyWorker
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
-                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+                runtime_env={"py_executable": PY_EXECUTABLES.ETHER0}
             ).remote()
             for _ in range(self.num_workers)
         ]

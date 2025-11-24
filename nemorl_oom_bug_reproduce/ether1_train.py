@@ -76,9 +76,10 @@ def setup_data(
     task_data_processors["ether1"] = (task_spec, ether1_data_processor)
 
     # setup math environment
+    # Use uv-managed Python environment which has ether0 and all dependencies from pyproject.toml
     ether1_env = Ether1Environment.options(
         runtime_env={
-            "py_executable": PY_EXECUTABLES.SYSTEM,
+            "py_executable": PY_EXECUTABLES.ETHER0,  # Use uv run environment with ether0 extra
             "env_vars": dict(os.environ),  # Pass all current environment variables
         }
     ).remote(env_configs["ether1"])
@@ -170,6 +171,7 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
+        memory_profiler,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     # Check if async mode is enabled
@@ -215,6 +217,7 @@ def main() -> None:
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
+            memory_profiler=memory_profiler,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
         )
     else:
@@ -234,6 +237,7 @@ def main() -> None:
             checkpointer,
             grpo_state,
             master_config,
+            memory_profiler,
         )
 
 
