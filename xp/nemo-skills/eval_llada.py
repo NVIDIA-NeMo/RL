@@ -132,6 +132,11 @@ def create_parser():
         default=512,
         help="Maximum number of tokens to generate"
     )
+    parser.add_argument(
+        "--examples-type",
+        default=None,
+        help="Few-shot examples type (e.g., gsm8k_standard_few_shot) from nemo_skills.prompt.few_shot_examples"
+    )
     
     # Diffusion model parameters
     parser.add_argument(
@@ -268,6 +273,7 @@ def main():
         "max_samples": args.max_samples,
         "quick_test": args.quick_test,
         "keep_thinking": args.keep_thinking,
+        "examples_type": args.examples_type,
         
         # LLaDA-specific settings
         "steps": args.steps,
@@ -423,6 +429,11 @@ def main():
             generation_args.append("++remove_thinking=False")
             print("\n⚠️  Keep-thinking mode enabled: <think> tags will NOT be removed from generations")
             print("   This helps when model outputs are truncated and missing </think> tags")
+            
+        # Add examples_type parameter if specified
+        if config["examples_type"]:
+            generation_args.append(f"++examples_type={config['examples_type']}")
+            print(f"\n📚 Few-shot examples enabled: {config['examples_type']}")
         
         #print("#### generation_args: ", str(wrap_arguments(" ".join(generation_args))), flush=True)
         #exit(2)
