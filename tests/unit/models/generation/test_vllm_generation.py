@@ -2383,6 +2383,24 @@ def test_vllm_guided_decoding(cluster, tokenizer):
             "Output should match the regex pattern"
         )
 
+        # Validate log probabilities for regex guided tokens (should be logprob=0, probability=1)
+        assert "logprobs" in regex_outputs, "logprobs not found in regex guided generation output"
+        assert "generation_lengths" in regex_outputs, "generation_lengths not found in regex guided generation output"
+        
+        logprobs = regex_outputs["logprobs"]
+        generation_lengths = regex_outputs["generation_lengths"]
+        input_lengths = input_data["input_lengths"]
+        
+        # For regex \d{3}-\d{3}-\d{4}, hyphens at positions 3,7 and end token should have logprob ≈ 0
+        input_len = input_lengths[0].item()
+        generated_logprobs = logprobs[0, input_len:input_len + generation_lengths[0].item()]
+        
+        # Check hyphen positions (3, 7) and last token have logprob ≈ 0
+        constrained_indices = [3, 7, -1]  # hyphens and end token
+        assert all(abs(generated_logprobs[i].item()) < 1e-3 for i in constrained_indices), (
+            f"Regex constrained tokens should have logprob ≈ 0"
+        )
+
         # Test 2: Choice guided decoding
         print("Testing choice guided decoding...")
         choices = ["yes", "no", "maybe"]
@@ -2411,6 +2429,7 @@ def test_vllm_guided_decoding(cluster, tokenizer):
         )
         output_only = choice_generated_texts[0].split(prompt2)[1]
         assert output_only in choices, "Output should be one of the choices"
+
 
     finally:
         vllm_policy.shutdown()
