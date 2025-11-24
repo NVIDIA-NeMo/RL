@@ -6,6 +6,8 @@ repos:
       types_or: [python, pyi] # Only include Python files.
     - id: trailing-whitespace
       types_or: [python, pyi] # Only include Python files.
+    - id: pretty-format-json
+      args: ["--autofix", "--no-sort-keys", "--indent", "2"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: "v0.9.9" # Use the appropriate version

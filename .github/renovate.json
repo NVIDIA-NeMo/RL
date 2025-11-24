@@ -14,7 +14,10 @@
   "semanticCommits": "disabled",
   "commitMessagePrefix": "[Renovate]",
   "branchPrefix": "renovate/",
-  "labels": ["dependencies", "CI:L2"],
+  "labels": [
+    "dependencies",
+    "CI:L2"
+  ],
   "assignees": [],
   "reviewers": [],
   "postUpgradeTasks": {
@@ -30,12 +33,16 @@
   "packageRules": [
     {
       "description": "Disable Python dependency updates unless explicitly allowlisted",
-      "matchManagers": ["pep621"],
+      "matchManagers": [
+        "pep621"
+      ],
       "enabled": false
     },
     {
       "description": "Allowlisted training stack dependencies (from initial requirements)",
-      "matchManagers": ["pep621"],
+      "matchManagers": [
+        "pep621"
+      ],
       "matchPackageNames": [
         "vllm",
         "torch",
@@ -48,12 +55,18 @@
     },
     {
       "description": "Disable alternate Python managers that duplicate pep621 coverage",
-      "matchManagers": ["pip_setup", "poetry", "pixi"],
+      "matchManagers": [
+        "pip_setup",
+        "poetry",
+        "pixi"
+      ],
       "enabled": false
     },
     {
       "description": "Group every allowed update into a single PR",
-      "matchPackagePatterns": ["*"],
+      "matchPackagePatterns": [
+        "*"
+      ],
       "groupName": "allowlisted dependency updates",
       "additionalBranchPrefix": "allowlist-",
       "separateMajorMinor": false,
@@ -70,7 +83,7 @@
     "enabled": false
   },
   "vulnerabilityAlerts": {
-      "enabled": false
+    "enabled": false
   },
   "osvVulnerabilityAlerts": false,
   "rangeStrategy": "bump",
