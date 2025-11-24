@@ -46,6 +46,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies.
     BASE = "uv run --locked"
 
+    # Use NeMo-RL direct dependencies and ether0.
+    ETHER0 = "uv run --locked --extra ether0"
+
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
 

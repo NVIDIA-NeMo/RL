@@ -70,6 +70,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.memory_profiler import MemoryProfiler, profile_memory
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -165,6 +166,17 @@ class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
+class MemoryProfilingConfig(TypedDict):
+    """Configuration for CPU RAM memory profiling.
+    
+    When enabled, tracks process memory usage and identifies top memory-consuming
+    variables throughout the training pipeline.
+    """
+    enabled: bool
+    track_top_n_variables: NotRequired[int]  # default: 10
+    include_system_objects: NotRequired[bool]  # default: False
+
+
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -174,6 +186,7 @@ class MasterConfig(TypedDict):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    memory_profiling: NotRequired[MemoryProfilingConfig]
 
 
 # ===============================================================================
@@ -198,6 +211,7 @@ def setup(
     CheckpointManager,
     GRPOSaveState,
     MasterConfig,
+    MemoryProfiler,
 ]:
     """Main entry point for running GRPO algorithm.
 
@@ -229,6 +243,18 @@ def setup(
     # ==========================
     logger = Logger(logger_config)
     logger.log_hyperparams(master_config)
+
+    # ==========================
+    #    Memory Profiling
+    # ==========================
+    memory_profiling_config = master_config.get("memory_profiling", {"enabled": False})
+    memory_profiler = MemoryProfiler(
+        enabled=memory_profiling_config.get("enabled", False),
+        track_top_n_variables=memory_profiling_config.get("track_top_n_variables", 10),
+        include_system_objects=memory_profiling_config.get("include_system_objects", False),
+    )
+    if memory_profiler.enabled:
+        print("  ✓ Memory profiling enabled", flush=True)
 
     # ==========================
     #      Checkpointing
@@ -625,6 +651,7 @@ def setup(
         checkpointer,
         grpo_save_state,
         master_config,
+        memory_profiler,
     )
 
 
@@ -962,6 +989,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    memory_profiler: MemoryProfiler,
     processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
@@ -1041,7 +1069,7 @@ def grpo_train(
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with timer.time("data_processing"), memory_profiler.profile("data_processing"):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -1072,7 +1100,7 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
-                with timer.time("generation"):
+                with timer.time("generation"), memory_profiler.profile("generation"):
                     # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                     if _should_use_penguin(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1134,7 +1162,7 @@ def grpo_train(
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
-                with timer.time("reward_calculation"):
+                with timer.time("reward_calculation"), memory_profiler.profile("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
@@ -1258,7 +1286,7 @@ def grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
+                with timer.time("policy_training"), memory_profiler.profile("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_num_steps) or (
@@ -1444,6 +1472,9 @@ def grpo_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
+            memory_metrics: dict[str, float] = memory_profiler.get_metrics(
+                reduction_op="sum"
+            )
             # track example with high token mult prob error above 1.05
             if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
@@ -1504,17 +1535,25 @@ def grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            # Print memory metrics if available
+            if memory_metrics:
+                print("\n🔬 Memory Metrics:")
+                for k, v in sorted(memory_metrics.items()):
+                    print(f"  • {k}: {v:.2f} MB", flush=True)
+
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(memory_metrics, total_steps + 1, prefix="memory/train")
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
 
             timer.reset()
+            memory_profiler.reset()
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
@@ -1689,6 +1728,7 @@ def async_grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    memory_profiler: MemoryProfiler,
     max_trajectory_age_steps: int = 1,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
@@ -2027,7 +2067,7 @@ def async_grpo_train(
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
                 print("▶ Processing rewards...")
-                with timer.time("reward_calculation"):
+                with timer.time("reward_calculation"), memory_profiler.profile("reward_calculation"):
                     prompt_only_message_logs = []
                     for message_log in repeated_batch["message_log"]:
                         prompt_only_log = []
@@ -2079,7 +2119,7 @@ def async_grpo_train(
                         )
 
                 # Prepare training data (same as sync version)
-                with timer.time("data_processing"):
+                with timer.time("data_processing"), memory_profiler.profile("data_processing"):
                     # Add loss mask and advantages to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2141,7 +2181,7 @@ def async_grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...")
-                with timer.time("policy_training"):
+                with timer.time("policy_training"), memory_profiler.profile("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
@@ -2337,6 +2377,9 @@ def async_grpo_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )
+            memory_metrics: dict[str, float] = memory_profiler.get_metrics(
+                reduction_op="sum"
+            )
 
             # Add buffer stats
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -2371,11 +2414,19 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            # Print memory metrics if available
+            if memory_metrics:
+                print("\n🔬 Memory Metrics:")
+                for k, v in sorted(memory_metrics.items()):
+                    print(f"  • {k}: {v:.2f} MB")
+
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            logger.log_metrics(memory_metrics, step + 1, prefix="memory/train")
 
             timer.reset()
+            memory_profiler.reset()
             step += 1
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)

@@ -60,6 +60,28 @@ checkpointing:
   model_save_format: "safetensors"
   save_consolidated: false
 
+memory_profiling:
+  # Enable/disable CPU memory profiling
+  enabled: true
+  
+  # Number of top memory-consuming variables to track (reduced for performance)
+  track_top_n_variables: 5
+  
+  # Include Python system objects in tracking (keep false for performance)
+  include_system_objects: false
+  
+  # Optional: How often to log total memory usage in background (seconds)
+  # log_period_seconds: 30.0
+  
+  # Optional: Log variable breakdown when exiting a tracked block
+  # log_variable_breakdown_on_exit: true
+  
+  # Optional: Log variable breakdown on manual snapshot
+  # log_variable_breakdown_on_snapshot: true
+  
+  # Optional: Log variable breakdown when calculating diff
+  # log_variable_breakdown_on_diff: true
+
 policy:
   model_name: "Qwen/Qwen3-235B-A22B-Instruct-2507"
   tokenizer:
