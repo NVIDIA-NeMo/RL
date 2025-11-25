@@ -73,8 +73,8 @@
       "matchPackagePatterns": [
         "*"
       ],
-      "groupName": "allowlisted dependency updates",
-      "additionalBranchPrefix": "allowlist-",
+      "groupName": "dependency updates",
+      "additionalBranchPrefix": "deps-",
       "separateMajorMinor": false,
       "separateMultipleMajor": false
     }
