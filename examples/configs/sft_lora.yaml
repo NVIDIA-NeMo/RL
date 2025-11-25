@@ -22,7 +22,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "/models/Qwen3-0.6B"
+  model_name: "Qwen/Qwen3-0.6B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # chat_template can be a Jinja template string or path to a .jinja file
@@ -32,6 +32,8 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
   precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
     enabled: true
@@ -209,5 +211,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
+  gpus_per_node: 8
   num_nodes: 1
