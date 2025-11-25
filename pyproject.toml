@@ -18,7 +18,7 @@ license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
   "ninja",                                                                                                            # for flash-attn parallel build
-  "torch==2.8.0",
+  "torch",  # version dictated by vllm
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.49.2",
@@ -105,7 +105,7 @@ penguin = ["penguin"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.8.0",
+  "torch",  # version dictated by vllm
   # Build requirement for TE
   "setuptools",
   "packaging",
