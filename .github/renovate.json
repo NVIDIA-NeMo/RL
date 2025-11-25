@@ -43,15 +43,24 @@
       "matchPackageNames": [
         "vllm",
         "transformer-engine",
-        "flash-attn",
-        "transformers"
+        "flash-attn"
       ],
       "enabled": true
     },
     {
-      "description": "Disable Python version updates in .python-version",
+      "description": "Disable Python version updates (pyenv, github-actions python)",
       "matchManagers": [
         "pyenv"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Disable Python runtime version updates in GitHub Actions",
+      "matchPackageNames": [
+        "python"
+      ],
+      "matchManagers": [
+        "github-actions"
       ],
       "enabled": false
     },
