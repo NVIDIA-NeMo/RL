@@ -260,13 +260,45 @@ class SGLangGenerationWorker:
         pass
 
     def sleep(self):
+        # TODO
         pass
 
     def wake_up(self, **kwargs):
+        # TODO
         pass
 
     def shutdown(self) -> bool:
-        pass
+        """Shutdown the SGLang server process.
+        
+        Returns:
+            bool: True if shutdown was successful, False otherwise
+        """
+        if not self.is_model_owner:
+            return True
+        
+        if not hasattr(self, "server_process") or self.server_process is None:
+            return True
+        
+        try:
+            print(
+                f"[SGLang Worker] Rank {self.global_rank} Shutting down server at {self.base_url}..."
+            )
+            
+            if self.server_process.is_alive():
+                kill_process_tree(self.server_process.pid)
+            
+            # Wait for the process to terminate
+            self.server_process.join(timeout=5.0)
+            
+            if self.server_process.is_alive():
+                return False
+            return True
+            
+        except Exception as e:
+            print(
+                f"[SGLang Worker] Rank {self.global_rank} Error during shutdown: {e}"
+            )
+            return False
 
     def _make_request(self, endpoint: str, payload: Optional[dict] = None):
         """Make a POST request to the specified endpoint with the given payload.
