@@ -170,7 +170,7 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 :hidden:
 
 about/overview
-about/performance
+about/performance-summary
 about/features
 about/backends
 about/quick-start
