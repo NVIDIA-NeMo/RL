@@ -208,6 +208,55 @@ class SGLangGenerationWorker:
     ):
         pass
 
+    def _generate_single_sample(
+        self,
+        input_ids: list[int],
+        sampling_params: dict[str, Any],
+        stop_string: Optional[str] = None,
+    ) -> tuple[list[int], list[float]]:
+        """Generate a single sample using SGLang API.
+        
+        Args:
+            input_ids: List of input token IDs (without padding)
+            sampling_params: Dictionary of sampling parameters (temperature, top_p, max_new_tokens, etc.)
+            stop_string: Optional stop string for this sample
+            
+        Returns:
+            Tuple of (generated_tokens, logprobs):
+                - generated_tokens: List of generated token IDs
+                - logprobs: List of log probabilities for generated tokens
+        """
+        # Prepare payload for SGLang API
+        # Note: stop should be in sampling_params, not in payload top level
+        if stop_string is not None:
+            # stop can be a string or list of strings
+            sampling_params = sampling_params.copy()  # Don't modify the original
+            sampling_params["stop"] = stop_string
+        
+        payload = {
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "input_ids": input_ids,
+        }
+        
+        print(f"[SGLang Worker] Rank {self.global_rank} payload: {payload}")
+        # Call SGLang generate endpoint
+        response = self._make_request("generate", payload)
+        
+        # Extract generated tokens and logprobs
+        meta_info = response.get("meta_info", {})
+        output_token_logprobs = meta_info.get("output_token_logprobs", [])
+        
+        if output_token_logprobs:
+            new_tokens = [item[1] for item in output_token_logprobs]
+            new_logprobs = [item[0] for item in output_token_logprobs]
+        else:
+            # Fallback: empty if token logprobs not available
+            new_tokens = []
+            new_logprobs = []
+        
+        return new_tokens, new_logprobs
+
     def _launch_server_process(self, server_args: ServerArgs) -> multiprocessing.Process:
         """Launch the SGLang server process and wait for it to be ready."""
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
@@ -217,7 +266,6 @@ class SGLangGenerationWorker:
         # Use the base_url we stored earlier
         headers = {
             "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {server_args.api_key}",
         }
 
         with requests.Session() as session:
@@ -234,6 +282,8 @@ class SGLangGenerationWorker:
                     raise Exception(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
 
                 time.sleep(2)
+        # response = session.get(f"{self.base_url}/get_model_info", headers=headers)
+        # print(f"[SGLang Worker] Rank {self.global_rank} model_info: {response.json()}")
         return p
 
     
@@ -256,10 +306,120 @@ class SGLangGenerationWorker:
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
+        # Handle empty input case
+        if len(data["input_ids"]) == 0:
+            return BatchedDataDict[GenerationOutputSpec](
+                {
+                    "output_ids": torch.zeros((0, 0), dtype=torch.long),
+                    "logprobs": torch.zeros((0, 0), dtype=torch.float),
+                    "generation_lengths": torch.zeros(0, dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                }
+            )
+        
+        input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
-        print(f"[SGLang Generation Worker] Rank {self.global_rank} Input lengths: {input_lengths}")
-
-        pass
+        stop_strings = data.get("stop_strings", [None] * len(input_lengths))
+        batch_size = len(input_lengths)
+        pad_token_id = self.cfg.get("_pad_token_id", 0)
+        
+        # Verify inputs have correct padding
+        verify_right_padding(data, pad_value=pad_token_id)
+        
+        # Original input length with padding
+        padded_input_length = input_ids.size(1)
+        
+        print(f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}")
+        
+        # Get generation parameters from config
+        max_new_tokens = self.cfg.get("max_new_tokens", 512)
+        temperature = 0.0 if greedy else self.cfg.get("temperature", 1.0)
+        top_p = self.cfg.get("top_p", 1.0)
+        top_k = self.cfg.get("top_k", None)
+        
+        sampling_params = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_new_tokens": max_new_tokens,
+        }
+        if top_k is not None:
+            sampling_params["top_k"] = top_k
+        
+        # TEST: Only process the first sample TODO
+        if batch_size == 0:
+            raise ValueError("Empty batch received")
+        
+        i = 0
+        input_len = input_lengths[i].item()
+        valid_input_ids = input_ids[i, :input_len].tolist()
+        
+        print(f"[SGLang Worker] Rank {self.global_rank} Processing sample {i}, input_len: {input_len}")
+        
+        new_tokens, new_logprobs = self._generate_single_sample(
+            input_ids=valid_input_ids,
+            sampling_params=sampling_params,
+            stop_string=stop_strings[i],
+        )
+        
+        print(f"[SGLang Worker] Rank {self.global_rank} Generated {len(new_tokens)} tokens")
+        
+        generation_length = len(new_tokens)
+        
+        # Calculate total length: padded_input_length + max_generated_length
+        # For now, since we only process one sample, max_length = generation_length
+        max_length = generation_length
+        total_length = padded_input_length + max_length
+        
+        # Create output tensor
+        full_output = torch.full(
+            (total_length,), pad_token_id, dtype=input_ids.dtype
+        )
+        
+        # Copy original input (with padding) into the beginning
+        full_output[:input_len] = input_ids[i][:input_len]
+        
+        # Add generated tokens after the original input
+        if new_tokens:
+            full_output[input_len : input_len + len(new_tokens)] = (
+                torch.tensor(new_tokens, dtype=input_ids.dtype)
+            )
+        
+        full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+        if new_logprobs:
+            for idx, logprob in enumerate(new_logprobs):
+                position = input_len + idx
+                full_logprobs[position] = logprob
+        
+        unpadded_length = input_len + generation_length
+        
+        # For other samples, create dummy outputs (same shape as first sample)
+        output_ids_list = [full_output]
+        logprobs_list = [full_logprobs]
+        generation_lengths_list = [generation_length]
+        unpadded_sequence_lengths_list = [unpadded_length]
+        
+        for j in range(1, batch_size):
+            dummy_output = torch.full((total_length,), pad_token_id, dtype=input_ids.dtype)
+            dummy_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            output_ids_list.append(dummy_output)
+            logprobs_list.append(dummy_logprobs)
+            generation_lengths_list.append(0)
+            unpadded_sequence_lengths_list.append(input_lengths[j].item())
+        
+        # Stack into tensors
+        output_ids = torch.stack(output_ids_list)
+        logprobs = torch.stack(logprobs_list)
+        generation_lengths = torch.tensor(generation_lengths_list, dtype=torch.long)
+        unpadded_sequence_lengths = torch.tensor(unpadded_sequence_lengths_list, dtype=torch.long)
+        
+        return BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": output_ids,
+                "generation_lengths": generation_lengths,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths,
+                "logprobs": logprobs,
+            }
+        )
 
     def sleep(self):
         # TODO
@@ -316,7 +476,6 @@ class SGLangGenerationWorker:
         url = f"{self.base_url}/{endpoint}"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {self.server_args.api_key}",
         }
         response = requests.post(url, json=payload or {}, headers=headers)
         response.raise_for_status()
