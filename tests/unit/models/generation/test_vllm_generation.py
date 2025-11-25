@@ -240,10 +240,10 @@ def cluster():
 def moe_cluster():
     """Create a virtual cluster for testing MoE models."""
     virtual_cluster = RayVirtualCluster(
-        bundle_ct_per_node_list=[8],  # 1 node with 8 GPU bundle
+        bundle_ct_per_node_list=[2],  # 1 node with 8 GPU bundle
         use_gpus=True,
         max_colocated_worker_groups=2,
-        num_gpus_per_node=8,
+        num_gpus_per_node=2,
         name="vllm-test-moe-cluster",
     )
     yield virtual_cluster
