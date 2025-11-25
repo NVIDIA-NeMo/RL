@@ -30,11 +30,6 @@ on:
           - info
           - warn
           - error
-      dry_run:
-        description: 'Dry run (no PRs created)'
-        required: false
-        default: false
-        type: boolean
       update_docker:
         description: 'Include Docker base image updates (normally disabled)'
         required: false
@@ -151,7 +146,6 @@ jobs:
           env-regex: '^(?:RENOVATE_\w+|LOG_LEVEL|GITHUB_COM_TOKEN|NODE_OPTIONS|(?:HTTPS?|NO)_PROXY|(?:https?|no)_proxy|NRL_AUTO_SYNC_DEPS)$'
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
-          RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
           # Explicitly set which repository to process
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           # Global-only configuration options
