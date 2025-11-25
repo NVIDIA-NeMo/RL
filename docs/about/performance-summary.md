@@ -9,9 +9,6 @@ This page provides performance benchmarks for LLMs and VLMs using NeMo RL across
 
 - **GBS**: Global Batch Size
 - **MBS**: Micro Batch Size
-- **FSDP**: Fully Sharded Data Parallel
-  - FSDP = 1: use FSDP
-  - FSDP = 0: use DDP (Distributed Data Parallel)
 - **TP**: Tensor Parallel Size
 - **PP**: Pipeline Parallel Size
 - **CP**: Context Parallel Size
