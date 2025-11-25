@@ -937,7 +937,7 @@ class Logger(LoggerInterface):
 
     def log_plot_per_worker_timeline_metrics(
         self,
-        metrics: dict[str, list[Any]],
+        metrics: dict[int, list[Any]],
         step: int,
         name: str,
         timeline_interval: float,
