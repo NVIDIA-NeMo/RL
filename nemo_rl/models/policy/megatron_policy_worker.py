@@ -1747,14 +1747,14 @@ class MegatronPolicyWorker:
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+        # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
         no_grad.__enter__()
-
+        self.model.config.flash_decode = False
         if self.should_disable_forward_pre_hook:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1792,13 +1792,13 @@ class MegatronPolicyWorker:
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        inference_max_batch_size = inference_wrapper_config.inference_max_requests
-        max_batch_size = inference_max_batch_size
-        buffer_size_gb = 10
+        buffer_size_gb = 20
         buffer_guaranteed_fraction = 0.1
-        num_cuda_graphs = 1
+        num_cuda_graphs = 16
+        max_tokens = 16384
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
+
         dynamic_context = DynamicInferenceContext(
             params_dtype=inference_wrapper_config.params_dtype,
             num_layers=model_config.num_layers,
@@ -1811,6 +1811,7 @@ class MegatronPolicyWorker:
             max_requests_override=None,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
+            max_tokens_override=max_tokens,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
@@ -1831,54 +1832,35 @@ class MegatronPolicyWorker:
             termination_id=self.megatron_tokenizer.eod,
         )
 
-        tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - data[
-            "input_ids"
-        ].size(1)
-
         # Handle None values for top_k - convert to integer as required by Megatron
         top_k_cfg = self.cfg["generation"]["top_k"]
         top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
-
-        # Use temperature 0.0 for greedy, 1.0 otherwise
-        temperature = 0.0 if greedy else 1.0
 
         top_p_cfg = self.cfg["generation"]["top_p"]
         top_p_val = (
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
         sampling_params = SamplingParams(
-            temperature=temperature,
+            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
             top_p=top_p_val,
             return_segments=False,
-            return_log_probs=True,
-            num_tokens_to_generate=tokens_to_generate,
             top_n_logprobs=0,
+            return_log_probs=True,
             return_prompt_top_n_logprobs=False,
         )
-        sampling_params = SamplingParams(
-            temperature=1.0,
-            top_k=0,
-            top_p=0.0,
-            return_segments=True,
-            return_log_probs=True,
-            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"]
-            - data["input_ids"].size(1),
-        )
-
         input_ids = data["input_ids"]
-        prompt_tokens_tensor = input_ids
+        prompt_tokens_tensor = input_ids.cuda()
         prompt_lengths_tensor = data["input_lengths"]
         request_id = 0
+
         for p, prompt_len in zip(
             prompt_tokens_tensor, prompt_lengths_tensor, strict=True
         ):
-            tokenized_prompt = p[:prompt_len]  # .cuda()
-            detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
             dynamic_engine.add_request(
                 request_id,
-                detokenized_prompt,
-                num_tokens_to_generate=tokens_to_generate,
+                p[:prompt_len],
+                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
             )
             request_id += 1
 
@@ -1899,8 +1881,10 @@ class MegatronPolicyWorker:
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_seq_len = max([len(tokens) for tokens in out["tokens"]])
+        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        padded_input_length = input_ids.size(1)
 
+        max_seq_len = padded_input_length + max_gen_seq_len
         # Create padded tensors for tokens and logprobs
         output_ids_padded = torch.full(
             (batch_size, max_seq_len),
@@ -1916,12 +1900,19 @@ class MegatronPolicyWorker:
         )
 
         # Fill in the padded tensors with actual values
+        generation_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
+        unpadded_sequence_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
         for i in range(batch_size):
             seq_len = len(out["tokens"][i])
             output_ids_padded[i, :seq_len] = torch.tensor(
                 out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
             )
-
+            generation_lengths[i] = seq_len - input_lengths[i].item()
+            unpadded_sequence_lengths[i] = seq_len
             logprob_len = len(out["logprobs"][i])
             logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
                 out["logprobs"][i],
@@ -1932,16 +1923,13 @@ class MegatronPolicyWorker:
         out_dict = {
             "output_ids": output_ids_padded,
             "logprobs": logprobs_padded,
-            "generation_lengths": torch.tensor(
-                [len(o) - input_lengths[i] for i, o in enumerate(out["logprobs"])]
-            ),
-            "unpadded_sequence_lengths": torch.tensor(
-                [len(o) for o in out["logprobs"]]
-            ),
+            "generation_lengths": generation_lengths,
+            "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
 
         self.model.config.flash_decode = False
         no_grad.__exit__(None, None, None)
+
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
     def zero_out_weights(self):
