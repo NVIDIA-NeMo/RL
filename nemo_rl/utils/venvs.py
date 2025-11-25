@@ -95,7 +95,7 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync"], env=env, check=True)
+    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
@@ -187,18 +187,3 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.util.remove_placement_group(pg)
     # Return mapping from node IP to venv python path
     return paths[0]
-
-
-# Need to set PYTHONPATH to include transformers downloaded modules.
-# Assuming the cache directory is the same cross venvs.
-def patch_transformers_module_dir(env_vars: dict[str, str]):
-    from transformers.utils.hub import TRANSFORMERS_CACHE
-
-    module_dir = os.path.join(TRANSFORMERS_CACHE, "..", "modules")
-    assert module_dir is not None, "TRANSFORMERS_CACHE should exist."
-    if "PYTHONPATH" not in env_vars:
-        env_vars["PYTHONPATH"] = module_dir
-    else:
-        env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
-
-    return env_vars
