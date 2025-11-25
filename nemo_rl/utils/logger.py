@@ -963,64 +963,28 @@ class Logger(LoggerInterface):
                 f"timeline_interval must be positive; received {timeline_interval}"
             )
 
-        x_series: list[float] = []
+        x_series: list[list[float]] = []
         y_series: list[list[float]] = []
         series_labels: list[str] = []
-        use_wandb_native_plot = False
 
-        max_time_length = max(len(metric_values) for metric_values in metrics.values())
-        x_series = [i * timeline_interval for i in range(max_time_length)]
+        if not metrics[0]:
+            print(
+                f"Skipping {name} per-worker timeline logging because all series were empty."
+            )
+            return
 
         for worker_id in sorted(metrics.keys()):
             metric_values = metrics[worker_id]
             if not metric_values:
                 continue
 
-            values = [float(v) for v in metric_values]
-            if len(values) < max_time_length:
-                values = values + [float(0)] * (max_time_length - len(values))
-
-            y_series.append(values)
+            x_series.append([i * timeline_interval for i in range(len(metric_values))])
+            y_series.append([float(v) for v in metric_values])
             series_labels.append(f"worker_{worker_id}")
 
-        if not x_series:
-            print(
-                f"Skipping {name} per-worker timeline logging because all series were empty."
-            )
-            return
-
-        wandb_logged = False
-        if self.wandb_logger is not None and use_wandb_native_plot:
-            try:
-                plot = wandb.plot.line_series(
-                    xs=x_series,
-                    ys=y_series,
-                    keys=series_labels,
-                    title=f"{name} (per worker)",
-                    xname="Time (s)",
-                )
-                self.wandb_logger.run.log(
-                    {name: plot},
-                    step=step,
-                )
-                wandb_logged = True
-            except Exception as exc:
-                print(
-                    f"Warning: Failed to log {name} per-worker timeline to wandb: {exc}"
-                )
-
-        # Fallback/static plot for loggers that expect matplotlib figures.
-        loggers_requiring_fig = [
-            logger
-            for logger in self.loggers
-            if not (isinstance(logger, WandbLogger) and wandb_logged)
-        ]
-        if not loggers_requiring_fig:
-            return
-
         fig, ax = plt.subplots()
-        for label, ys in zip(series_labels, y_series):
-            ax.plot(x_series, ys, label=label)
+        for label, xs, ys in zip(series_labels, x_series, y_series):
+            ax.plot(xs, ys, label=label)
 
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(f"{name} (per worker)")
@@ -1028,8 +992,8 @@ class Logger(LoggerInterface):
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
 
-        for logger in loggers_requiring_fig:
-            logger.log_plot(fig, step, f"{name}_per_worker_timeline")
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{name}")
         plt.close(fig)
 
     def log_plot_token_mult_prob_error(

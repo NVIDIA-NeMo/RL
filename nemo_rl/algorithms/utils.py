@@ -767,7 +767,6 @@ def log_vllm_metrics_to_wandb(
         "kv_cache_usage_perc",
         "num_preemptions",
         "generation_tokens",
-        "request_success",
     ]
 
     for vllm_metric in vllm_metrics_to_plot:

@@ -193,7 +193,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.kv_cache_usage_perc: list[float] = []
         self.num_preemptions: list[int] = []
         self.generation_tokens: list[int] = []
-        self.request_success: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -219,9 +218,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                                 # Log the vllm generation tokens
                                 elif m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
-                                # Log the vllm request success
-                                elif m.name == "vllm:request_success":
-                                    self.request_success.append(int(m.value))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -251,7 +247,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "num_preemptions": copy.deepcopy(self.num_preemptions),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
-                "request_success": copy.deepcopy(self.request_success),
             }
         return metric
 
@@ -265,7 +260,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.kv_cache_usage_perc = []
             self.num_preemptions = []
             self.generation_tokens = []
-            self.request_success = []
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
