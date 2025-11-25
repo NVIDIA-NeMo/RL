@@ -463,6 +463,9 @@ class MegatronPolicyWorker:
         }
         self.dtype = dtype_map[self.cfg["precision"]]
 
+        # Initialize generation step counter for seed calculation
+        self.generation_step = 0
+
         self.optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
             "optimizer_cpu_offload"
         ]
@@ -1827,9 +1830,25 @@ class MegatronPolicyWorker:
         )
 
         text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+
+        # Calculate seed based on step, node, and rank to ensure reproducibility across workers
+        # Similar to vllm_worker.py seed calculation but with added step information
+        # Formula: seed = (node_idx * 1024 * 10000) + (step * 1024) + local_rank
+        # This allows for:
+        # - Multiple nodes (node_idx multiplier is large enough)
+        # - Up to 10000 steps per node before potential overlap
+        # - Up to 1024 local ranks (GPUs per node)
+        local_rank = torch.cuda.current_device()  # Local GPU index on the node
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        seed = (node_idx * 1024 * 10000) + (self.generation_step * 1024) + local_rank
+
+        # Increment generation step counter for next call
+        self.generation_step += 1
+
         dynamic_engine = DynamicInferenceEngine(
             controller=text_generation_controller,
-            random_seed=1234,
+            random_seed=seed,
             context=dynamic_context,
             enable_cuda_graph=True,
             termination_id=self.megatron_tokenizer.eod,
