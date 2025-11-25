@@ -4,9 +4,6 @@
     "config:best-practices",
     ":dependencyDashboard"
   ],
-  "schedule": [
-    "after 9am and before 5pm every weekday"
-  ],
   "timezone": "America/Los_Angeles",
   "cloneSubmodules": true,
   "prConcurrentLimit": 1,
