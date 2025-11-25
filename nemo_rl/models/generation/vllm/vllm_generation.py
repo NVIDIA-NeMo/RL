@@ -838,9 +838,13 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[int]]] = {
+        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
+            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
+            "num_preemptions": {},  # dp_idx -> list[int]
+            "generation_tokens": {},  # dp_idx -> list[int]
+            "request_success": {},  # dp_idx -> list[int]
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -854,6 +858,18 @@ class VllmGeneration(GenerationInterface):
             num_pending_samples = stats.get("num_pending_samples")
             if num_pending_samples:
                 vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
+            if kv_cache_usage_perc:
+                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
+            num_preemptions = stats.get("num_preemptions")
+            if num_preemptions:
+                vllm_logger_metrics["num_preemptions"][dp_idx] = num_preemptions
+            generation_tokens = stats.get("generation_tokens")
+            if generation_tokens:
+                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            request_success = stats.get("request_success")
+            if request_success:
+                vllm_logger_metrics["request_success"][dp_idx] = request_success
 
         return vllm_logger_metrics
 
