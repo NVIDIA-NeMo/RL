@@ -49,26 +49,13 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
-# Check if all workspace members have pyproject.toml
-echo "Checking workspace members..."
-MISSING_PYPROJECT=false
-for workspace_dir in 3rdparty/*-workspace/; do
-    if [ -d "$workspace_dir" ] && [ ! -f "${workspace_dir}pyproject.toml" ]; then
-        echo "WARNING: Workspace member ${workspace_dir} is missing pyproject.toml"
-        MISSING_PYPROJECT=true
-    fi
-done
-
-if [ "$MISSING_PYPROJECT" = true ]; then
-    echo "WARNING: Some workspace members are missing pyproject.toml files"
-    echo "Skipping uv lock to avoid errors"
-    echo "Please ensure all workspace members have a pyproject.toml file"
-else
-    uv lock
-    if [ $? -ne 0 ]; then
-        echo "ERROR: uv lock failed"
-        exit 1
-    fi
+# Run uv lock to regenerate the lock file
+# Note: Workspace members are defined in pyproject.toml [tool.uv.workspace].members
+# Some members point to submodule paths (e.g., Automodel-workspace/Automodel), not the parent dir
+uv lock
+if [ $? -ne 0 ]; then
+    echo "ERROR: uv lock failed"
+    exit 1
 fi
 echo ""
 
