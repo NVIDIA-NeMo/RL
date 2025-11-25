@@ -30,9 +30,6 @@ from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
 )
-from nemo_automodel.components._transformers.utils import (
-    sliding_window_overwrite,
-)
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
@@ -259,7 +256,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         if self.lora_enabled:
             # Always use float32 since FSDP requires all parameters to be in the same dtype.
             # autocast should cast the weights to the correct dtype during the forward pass.
-            cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": torch.float32}
+            cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
             self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
 
         if self.rank == 0:
@@ -2078,6 +2075,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "peft_config",
             }
         }
+        if self.lora_enabled:
+            checkpoint_kwargs["is_peft"] = True
+            checkpoint_kwargs["peft_config"] = self.peft_config
 
         save_checkpoint(
             model=self.model,
