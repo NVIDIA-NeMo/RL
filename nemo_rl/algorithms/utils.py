@@ -765,7 +765,6 @@ def log_vllm_metrics_to_wandb(
         "inflight_batch_sizes",
         "num_pending_samples",
         "kv_cache_usage_perc",
-        "num_preemptions",
         "generation_tokens",
     ]
 

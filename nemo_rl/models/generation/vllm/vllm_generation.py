@@ -842,7 +842,6 @@ class VllmGeneration(GenerationInterface):
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
-            "num_preemptions": {},  # dp_idx -> list[int]
             "generation_tokens": {},  # dp_idx -> list[int]
         }
 
@@ -860,9 +859,6 @@ class VllmGeneration(GenerationInterface):
             kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
             if kv_cache_usage_perc:
                 vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
-            num_preemptions = stats.get("num_preemptions")
-            if num_preemptions:
-                vllm_logger_metrics["num_preemptions"][dp_idx] = num_preemptions
             generation_tokens = stats.get("generation_tokens")
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens

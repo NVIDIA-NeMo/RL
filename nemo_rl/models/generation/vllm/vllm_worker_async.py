@@ -191,7 +191,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
-        self.num_preemptions: list[int] = []
         self.generation_tokens: list[int] = []
 
         def _logger_loop():
@@ -212,11 +211,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                                 elif m.name == "vllm:kv_cache_usage_perc":
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
-                                # Log the vllm number of preemptions
-                                if m.name == "vllm:num_preemptions":
-                                    self.num_preemptions.append(int(m.value))
-                                # Log the vllm generation tokens
-                                elif m.name == "vllm:generation_tokens":
+                                if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
                 except Exception:
                     print(
@@ -245,7 +240,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
-                "num_preemptions": copy.deepcopy(self.num_preemptions),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
             }
         return metric
@@ -258,7 +252,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
-            self.num_preemptions = []
             self.generation_tokens = []
 
     async def post_init_async(self):
