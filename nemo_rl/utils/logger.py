@@ -967,7 +967,7 @@ class Logger(LoggerInterface):
         y_series: list[list[float]] = []
         series_labels: list[str] = []
 
-        if not metrics[0]:
+        if not any(metrics.values()):
             print(
                 f"Skipping {name} per-worker timeline logging because all series were empty."
             )
