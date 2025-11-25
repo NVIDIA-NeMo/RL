@@ -45,13 +45,18 @@
       ],
       "matchPackageNames": [
         "vllm",
-        "torch",
-        "ray",
         "transformer-engine",
         "flash-attn",
         "transformers"
       ],
       "enabled": true
+    },
+    {
+      "description": "Disable Python version updates in .python-version",
+      "matchManagers": [
+        "pyenv"
+      ],
+      "enabled": false
     },
     {
       "description": "Disable alternate Python managers that duplicate pep621 coverage",
