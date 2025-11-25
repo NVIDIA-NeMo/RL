@@ -3,7 +3,7 @@
 Collect and analyze benchmark results from multiple runs.
 
 Usage:
-    python collect_results.py                    # Collect all *-logs/results.json
+    python collect_results.py                    # Collect all results from vllm_standalone_perf_exp/
     python collect_results.py 1234567 1234568   # Collect specific job IDs
     python collect_results.py --output results.csv
 """
@@ -113,7 +113,7 @@ def save_csv(results, output_path):
 def main():
     parser = argparse.ArgumentParser(description="Collect benchmark results")
     parser.add_argument("job_ids", nargs="*", help="Job IDs to collect (default: all)")
-    parser.add_argument("--base-dir", default=".", help="Base directory")
+    parser.add_argument("--base-dir", default="vllm_standalone_perf_exp", help="Base directory (default: vllm_standalone_perf_exp)")
     parser.add_argument("--output", "-o", help="Output CSV file")
     parser.add_argument("--json", help="Output JSON file")
     

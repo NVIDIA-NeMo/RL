@@ -4,8 +4,8 @@
 #SBATCH -p batch
 #SBATCH -t 02:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o %j-logs/slurm-%j.out
-#SBATCH -e %j-logs/slurm-%j.err
+#SBATCH -o vllm_standalone_perf_exp/%j-logs/slurm-%j.out
+#SBATCH -e vllm_standalone_perf_exp/%j-logs/slurm-%j.err
 
 set -ex
 
@@ -43,8 +43,9 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
 CONTAINER_NAME=vllm-offline-bench
 JOB_CACHE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache
 
-# Log directory: $SLURM_JOB_ID-logs/ (similar to ray.sub style)
-LOGS_DIR=${LOGS_DIR:-$BASE_DIR/${SLURM_JOB_ID}-logs}
+# Log directory: vllm_standalone_perf_exp/$SLURM_JOB_ID-logs/
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-$BASE_DIR/vllm_standalone_perf_exp}
+LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/${SLURM_JOB_ID}-logs}
 
 # venv for custom installations (persisted across jobs)
 VLLM_VENV_DIR=${VLLM_VENV_DIR:-$BASE_DIR/vllm-benchmark-venv}
@@ -63,6 +64,7 @@ VLLM_GIT_BRANCH=${VLLM_GIT_BRANCH:-main}
 # Setup
 # ============================================================
 
+mkdir -p $EXPERIMENT_DIR
 mkdir -p $LOGS_DIR
 mkdir -p $JOB_CACHE_DIR
 
@@ -173,13 +175,12 @@ export RAY_ADDRESS=$head_ip:6379
 echo "Head node: $head_node ($head_ip)"
 
 # ============================================================
-# vLLM Environment Variables (from Duncan's script)
+# vLLM Environment Variables 
 # ============================================================
 export VLLM_USE_V1=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
-export PYTHONPATH=/usr/local/lib/python3.12/dist-packages:$PYTHONPATH
 
 # ============================================================
 # Start Ray workers on non-head nodes

@@ -83,8 +83,10 @@ echo "Job IDs: ${JOB_IDS[*]}"
 echo ""
 echo "Monitor with: squeue -u $USER"
 echo ""
-echo "Results will be in:"
+echo "Results will be in: vllm_standalone_perf_exp/"
 for JOB_ID in "${JOB_IDS[@]}"; do
-    echo "  - ${JOB_ID}-logs/results.json"
+    echo "  - vllm_standalone_perf_exp/${JOB_ID}-logs/results.json"
 done
+echo ""
+echo "Collect results with: python collect_results.py"
 

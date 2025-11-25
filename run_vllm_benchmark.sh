@@ -23,7 +23,7 @@ GPUS_PER_NODE=4
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-32B-Instruct}
 
 # Parallelism
-TP_SIZE=${TP_SIZE:-4}
+TP_SIZE=${TP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
 
 # DP (Data Parallelism) is automatically calculated:
@@ -136,7 +136,7 @@ case "${1:-help}" in
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: \$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: vllm_standalone_perf_exp/\$SLURM_JOB_ID-logs/"
         echo "  - slurm-*.out    (main output)"
         echo "  - slurm-*.err    (errors)"
         echo "  - results.json   (benchmark results)"
@@ -176,7 +176,7 @@ case "${1:-help}" in
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: \$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: vllm_standalone_perf_exp/\$SLURM_JOB_ID-logs/"
         ;;
     
     build)
