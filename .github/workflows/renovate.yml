@@ -35,6 +35,16 @@ on:
         required: false
         default: false
         type: boolean
+      update_docker:
+        description: 'Include Docker base image updates (normally disabled)'
+        required: false
+        default: false
+        type: boolean
+      force_run:
+        description: 'Force run ignoring schedule restrictions (always create PRs)'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   renovate:
@@ -63,6 +73,25 @@ jobs:
           chmod +x .github/scripts/sync_submodule_dependencies.py
           chmod +x .github/scripts/renovate_post_update.sh
           chmod +x .github/scripts/renovate_cmd.sh
+
+      - name: Configure Renovate options
+        id: config
+        run: |
+          # Enable Docker updates if requested (modify config temporarily)
+          if [ "${{ inputs.update_docker }}" = "true" ]; then
+            echo "Enabling Docker base image updates..."
+            # Remove the dockerfile disable rule by commenting it out
+            sed -i 's/"description": "Disable Docker base image updates/"description": "TEMP_ENABLED: Docker base image updates/' .github/renovate.json
+            sed -i '/"matchManagers": \["dockerfile"\]/,/"enabled": false/s/"enabled": false/"enabled": true/' .github/renovate.json
+          fi
+          
+          # Build RENOVATE_FORCE JSON if force_run is enabled
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "Force run enabled - ignoring schedule restrictions"
+            echo 'force_json={"schedule":[]}' >> $GITHUB_OUTPUT
+          else
+            echo 'force_json=' >> $GITHUB_OUTPUT
+          fi
 
       - name: Pre-clone repository with full submodule history
         env:
@@ -132,4 +161,6 @@ jobs:
           # Enable auto-sync of CACHED_DEPENDENCIES in 3rdparty setup.py files
           # This allows submodule updates to proceed without manual intervention
           NRL_AUTO_SYNC_DEPS: '1'
+          # Force run ignoring schedule (when triggered manually with force_run=true)
+          RENOVATE_FORCE: ${{ steps.config.outputs.force_json }}
 
