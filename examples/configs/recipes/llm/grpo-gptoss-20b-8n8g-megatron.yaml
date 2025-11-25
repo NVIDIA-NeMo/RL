@@ -1,0 +1,25 @@
+defaults: ../../grpo_math_70B_megatron.yaml
+grpo:
+  max_num_steps: 500
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-gptoss-20b-8n8g-megatron
+  save_period: 100
+policy:
+  model_name: openai/gpt-oss-20b
+  tokenizer:
+    name: openai/gpt-oss-20b
+  megatron_cfg:
+    expert_model_parallel_size: 8
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    moe_router_dtype: "fp64"
+    moe_permute_fusion: true
+  sequence_packing:
+    enabled: false ## sequence packing is not supported w/ GPT-OSS + megatron backend
+  dynamic_batching:
+    enabled: true
+cluster:
+  num_nodes: 8
