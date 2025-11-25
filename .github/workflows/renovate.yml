@@ -80,9 +80,9 @@ jobs:
           # Enable Docker updates if requested (modify config temporarily)
           if [ "${{ inputs.update_docker }}" = "true" ]; then
             echo "Enabling Docker base image updates..."
-            # Remove the dockerfile disable rule by commenting it out
-            sed -i 's/"description": "Disable Docker base image updates/"description": "TEMP_ENABLED: Docker base image updates/' .github/renovate.json
-            sed -i '/"matchManagers": \["dockerfile"\]/,/"enabled": false/s/"enabled": false/"enabled": true/' .github/renovate.json
+            jq '(.packageRules[] | select(.matchManagers == ["dockerfile"])).enabled = true' \
+              .github/renovate.json > .github/renovate.json.tmp && \
+              mv .github/renovate.json.tmp .github/renovate.json
           fi
           
           # Build RENOVATE_FORCE JSON if force_run is enabled
