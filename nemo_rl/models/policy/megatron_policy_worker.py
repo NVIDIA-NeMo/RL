@@ -1792,10 +1792,13 @@ class MegatronPolicyWorker:
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        buffer_size_gb = 20
-        buffer_guaranteed_fraction = 0.1
-        num_cuda_graphs = 16
-        max_tokens = 16384
+        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
+        buffer_guaranteed_fraction = mcore_generation_config[
+            "buffer_guaranteed_fraction"
+        ]
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        max_tokens = mcore_generation_config["max_tokens"]
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
 
