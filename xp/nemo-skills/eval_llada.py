@@ -205,8 +205,8 @@ def create_parser():
     parser.add_argument(
         "--intensity",
         type=float,
-        default=1.0,
-        help="Intensity of soft token embeddings mixing with mask token embedding (1.0 = pure soft token, 0.0 = pure mask token)"
+        default=None,
+        help="Intensity of soft token embeddings mixing with mask token embedding (1.0 = pure soft token, 0.0 = pure mask token, None = auto-compute based on entropy)"
     )
     
     # dInfer specific settings
@@ -386,7 +386,9 @@ def main():
             generation_args.append(f"++inference.extra_body.soft_token_ratio={config['soft_token_ratio']}")
             generation_args.append(f"++inference.extra_body.treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
             generation_args.append(f"++inference.extra_body.soft_temperature={config['soft_temperature']}")
-            generation_args.append(f"++inference.extra_body.intensity={config['intensity']}")
+            # Only pass intensity if explicitly set (None means auto-compute based on entropy)
+            if config['intensity'] is not None:
+                generation_args.append(f"++inference.extra_body.intensity={config['intensity']}")
         
         model_type_display = "Nemotron" if config['generation_algorithm'] == "nemotron" else "LLaDA"
         print(f"\n🔧 {model_type_display} generation parameters (via extra_body):")
@@ -406,7 +408,8 @@ def main():
             print(f"  soft_token_ratio={config['soft_token_ratio']}")
             print(f"  treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
             print(f"  soft_temperature={config['soft_temperature']}")
-            print(f"  intensity={config['intensity']}")
+            intensity_display = "auto (entropy-based)" if config['intensity'] is None else config['intensity']
+            print(f"  intensity={intensity_display}")
         else:
             print(f"  cfg_scale={config['cfg_scale']}")
             print(f"  remasking={config['remasking']}")

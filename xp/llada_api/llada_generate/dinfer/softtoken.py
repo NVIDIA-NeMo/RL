@@ -34,7 +34,7 @@ class BlockWiseSoftTokenLLM:
     Block-wise diffusion LLM with Soft Token Sampling.
     Adapted from BlockWiseSoftTokenLLM in soft_token_experiment.py.
     """
-    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2, treat_soft_tokens_as_candidates=False, soft_temperature=1.0, intensity=1.0):
+    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, soft_token_ratio=0.2, treat_soft_tokens_as_candidates=False, soft_temperature=1.0, intensity=None):
         self.model = model
         self.cache_factory = cache_factory
         self.decoder = decoder
@@ -238,10 +238,28 @@ class BlockWiseSoftTokenLLM:
                             # [num_soft, vocab] @ [vocab, d_model] -> [num_soft, d_model]
                             soft_embeds = torch.matmul(probs, self.input_embeddings.weight)
                             
-                            # Apply intensity if < 1.0
-                            if intensity < 1.0:
+                            # Apply intensity: auto-compute from entropy if None, or use fixed value if < 1.0
+                            if intensity is None:
+                                # Auto-compute per-token intensity based on entropy of logits
+                                # Entropy ranges from 0 (one-hot/certain) to log(vocab_size) (uniform/uncertain)
+                                # Intensity should be 1.0 for one-hot (low entropy), 0.0 for uniform (high entropy)
+                                probs_for_entropy = probs  # [num_soft, vocab]
+                                # Add small epsilon to avoid log(0)
+                                log_probs = torch.log(probs_for_entropy + 1e-10)
+                                entropy = -torch.sum(probs_for_entropy * log_probs, dim=-1)  # [num_soft]
+                                vocab_size = probs_for_entropy.shape[-1]
+                                max_entropy = torch.log(torch.tensor(vocab_size, dtype=torch.float, device=self.model.device))
+                                normalized_entropy = entropy / max_entropy  # [num_soft], ranges 0-1
+                                per_token_intensity = 1.0 - normalized_entropy  # [num_soft]: 1 for certain, 0 for uncertain
+                                
                                 mask_token_tensor = torch.tensor(self.decoder.mask_id, device=self.model.device)
-                                mask_embed = self.input_embeddings(mask_token_tensor) # [d_model]
+                                mask_embed = self.input_embeddings(mask_token_tensor)  # [d_model]
+                                # Apply per-token intensity: soft_embeds is [num_soft, d_model]
+                                # per_token_intensity is [num_soft], broadcast via unsqueeze
+                                soft_embeds = mask_embed * (1.0 - per_token_intensity).unsqueeze(-1) + soft_embeds * per_token_intensity.unsqueeze(-1)
+                            elif intensity < 1.0:
+                                mask_token_tensor = torch.tensor(self.decoder.mask_id, device=self.model.device)
+                                mask_embed = self.input_embeddings(mask_token_tensor)  # [d_model]
                                 soft_embeds = mask_embed * (1.0 - intensity) + soft_embeds * intensity
 
                             # Prepare Input Embeddings
@@ -358,7 +376,7 @@ class SoftTokenGeneration(DInferGeneration):
             soft_token_ratio=0.2,
             treat_soft_tokens_as_candidates=False,
             soft_temperature=0.2,
-            intensity=1.0
+            intensity=None  # Auto-compute intensity based on entropy
         )
         
         logger.info(f"Created BlockWiseSoftTokenLLM with ThresholdParallelDecoder (early_stop={self.early_stop})")
@@ -389,7 +407,7 @@ class SoftTokenGeneration(DInferGeneration):
         # Extract soft token params from kwargs to avoid duplicate arguments
         soft_token_ratio = kwargs.pop('soft_token_ratio', 0.2)
         treat_soft_tokens_as_candidates = kwargs.pop('treat_soft_tokens_as_candidates', False)
-        intensity = kwargs.pop('intensity', 1.0)
+        intensity = kwargs.pop('intensity', None)  # None = auto-compute based on entropy
         
         validated_args = self.validate_args(
             steps=steps,
@@ -476,5 +494,5 @@ class SoftTokenGeneration(DInferGeneration):
             'threshold': 0.9,
             'soft_temperature': 0.2,
             'early_stop': True,
-            'intensity': 1.0
+            'intensity': None  # None = auto-compute intensity based on entropy
         }
