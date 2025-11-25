@@ -76,7 +76,6 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
-    sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -218,9 +217,6 @@ class DTensorPolicyWorker:
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             torch_dtype=torch.float32,
             trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,

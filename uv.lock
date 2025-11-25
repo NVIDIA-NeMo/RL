@@ -23,6 +23,7 @@ members = [
     "nemo-automodel",
     "nemo-rl",
     "penguin",
+    "template-project",
 ]
 overrides = [
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
@@ -1079,7 +1080,8 @@ dependencies = [
     { name = "setuptools" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
 ]
 
 [[package]]
@@ -2331,7 +2333,8 @@ version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux') or sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/31/23/be0b4dcac42d77f99406c906567cde22a7a3d71b3f3ffdfda2ac6153ec36/liger_kernel-0.6.2.tar.gz", hash = "sha256:5c5bcffffa769bc26ae838f5a4954170dd5cacde036abb1b383039f39fa5fd69", size = 3679495, upload-time = "2025-08-22T00:15:28.456Z" }
 wheels = [
@@ -3212,7 +3215,7 @@ dependencies = [
     { name = "num2words" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nvshmem-cu12" },
+    { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "pillow" },
@@ -3232,8 +3235,7 @@ dependencies = [
     { name = "torchvision", version = "0.23.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.23.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "transformers" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "wandb" },
 ]
 
@@ -3288,10 +3290,14 @@ docs = [
     { name = "gitpython" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
+    { name = "python-dotenv" },
     { name = "sphinx" },
     { name = "sphinx-autobuild" },
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
+    { name = "sphinx-design" },
+    { name = "sphinxcontrib-mermaid" },
+    { name = "swagger-plugin-for-sphinx" },
 ]
 test = [
     { name = "pytest" },
@@ -3330,7 +3336,7 @@ requires-dist = [
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nvshmem-cu12" },
+    { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "penguin", marker = "extra == 'penguin'", editable = "3rdparty/Penguin-workspace" },
@@ -3351,8 +3357,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
     { name = "transformers", specifier = ">=4.55.4" },
-    { name = "triton", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "triton", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
+    { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.0" },
@@ -3382,10 +3387,14 @@ docs = [
     { name = "gitpython", specifier = ">=3.1.45" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
+    { name = "python-dotenv" },
     { name = "sphinx" },
     { name = "sphinx-autobuild" },
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
+    { name = "sphinx-design" },
+    { name = "sphinxcontrib-mermaid" },
+    { name = "swagger-plugin-for-sphinx" },
 ]
 test = [
     { name = "pytest", specifier = ">=7.0.0" },
@@ -5891,6 +5900,18 @@ wheels = [
 ]
 
 [[package]]
+name = "sphinx-design"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "sphinx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2b/69/b34e0cb5336f09c6866d53b4a19d76c227cdec1bbc7ac4de63ca7d58c9c7/sphinx_design-0.6.1.tar.gz", hash = "sha256:b44eea3719386d04d765c1a8257caca2b3e6f8421d7b3a5e742c0fd45f84e632", size = 2193689, upload-time = "2024-08-02T13:48:44.277Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c6/43/65c0acbd8cc6f50195a3a1fc195c404988b15c67090e73c7a41a9f57d6bd/sphinx_design-0.6.1-py3-none-any.whl", hash = "sha256:b11f37db1a802a183d61b159d9a202314d4d2fe29c163437001324fe2f19549c", size = 2215338, upload-time = "2024-08-02T13:48:42.106Z" },
+]
+
+[[package]]
 name = "sphinxcontrib-applehelp"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5924,6 +5945,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b2/e8/9ed3830aeed71f17c026a07a5097edcf44b692850ef215b161b8ad875729/sphinxcontrib-jsmath-1.0.1.tar.gz", hash = "sha256:a9925e4a4587247ed2191a22df5f6970656cb8ca2bd6284309578f2153e0c4b8", size = 5787, upload-time = "2019-01-21T16:10:16.347Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/42/4c8646762ee83602e3fb3fbe774c2fac12f317deb0b5dbeeedd2d3ba4b77/sphinxcontrib_jsmath-1.0.1-py2.py3-none-any.whl", hash = "sha256:2ec2eaebfb78f3f2078e73666b1415417a116cc848b72e5172e596c871103178", size = 5071, upload-time = "2019-01-21T16:10:14.333Z" },
+]
+
+[[package]]
+name = "sphinxcontrib-mermaid"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "sphinx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/97/69/bf039237ad260073e8c02f820b3e00dc34f3a2de20aff7861e6b19d2f8c5/sphinxcontrib_mermaid-1.0.0.tar.gz", hash = "sha256:2e8ab67d3e1e2816663f9347d026a8dee4a858acdd4ad32dd1c808893db88146", size = 15153, upload-time = "2024-10-12T16:33:03.863Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/c8/784b9ac6ea08aa594c1a4becbd0dbe77186785362e31fd633b8c6ae0197a/sphinxcontrib_mermaid-1.0.0-py3-none-any.whl", hash = "sha256:60b72710ea02087f212028feb09711225fbc2e343a10d34822fe787510e1caa3", size = 9597, upload-time = "2024-10-12T16:33:02.303Z" },
 ]
 
 [[package]]
@@ -5996,6 +6030,21 @@ wheels = [
 ]
 
 [[package]]
+name = "swagger-plugin-for-sphinx"
+version = "6.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docutils" },
+    { name = "jinja2" },
+    { name = "sphinx" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5b/b3/84bc7d8af6b50e6c365f1593fe4a01245f4bfb2178040261c6429db0b46b/swagger_plugin_for_sphinx-6.0.0.tar.gz", hash = "sha256:70366c610648cede5ef482922c9c97c86c99746b9edf33e4ec13fab23d820251", size = 16026, upload-time = "2025-10-16T06:26:09.95Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/f0/1098f6628bbe04b086ce59692d09b116ec751286eb7d33e88c5bf0c2e210/swagger_plugin_for_sphinx-6.0.0-py3-none-any.whl", hash = "sha256:35dc646d759a44ce78aefde2fe34f54e7b8c3439d0a52541a6a8b9924a711832", size = 11253, upload-time = "2025-10-16T06:26:08.504Z" },
+]
+
+[[package]]
 name = "swankit"
 version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -6058,6 +6107,31 @@ sdist = { url = "https://files.pythonhosted.org/packages/dd/34/7e2f78d1ed0af7d00
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/72/f420480118cbdd18eb761b9936f0a927957130659a638449575b4a4f0aa7/tdigest-0.5.2.2-py2.py3-none-any.whl", hash = "sha256:e32ff6ab62e4defdb93b816c831080d94dfa1efb68a9fa1e7976c237fa9375cb", size = 9445, upload-time = "2019-05-07T18:57:37.493Z" },
     { url = "https://files.pythonhosted.org/packages/b4/94/fd3853b98f39d10206b08f2737d2ec2dc6f46a42dc7b7e05f4f0162d13ee/tdigest-0.5.2.2-py3-none-any.whl", hash = "sha256:dd25f8d6e6be002192bba9e4b8c16491d36c10b389f50637818603d1f67c6fb2", size = 9440, upload-time = "2019-05-07T18:57:38.942Z" },
+]
+
+[[package]]
+name = "template-project"
+version = "0.1.0"
+source = { editable = "research/template_project" }
+dependencies = [
+    { name = "nemo-rl" },
+]
+
+[package.dev-dependencies]
+test = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-timeout" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "nemo-rl", editable = "." }]
+
+[package.metadata.requires-dev]
+test = [
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest-cov" },
+    { name = "pytest-timeout" },
 ]
 
 [[package]]
@@ -6532,17 +6606,11 @@ source = { registry = "https://download.pytorch.org/whl/cu129" }
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform == 'win32'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/triton-3.4.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" },
@@ -6558,11 +6626,15 @@ name = "triton"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and sys_platform == 'darwin'",
+    "python_full_version >= '3.13' and sys_platform == 'win32'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
 ]
 
 [[package]]

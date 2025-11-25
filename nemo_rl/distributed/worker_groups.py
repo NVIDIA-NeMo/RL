@@ -13,6 +13,7 @@
 # limitations under the License.
 import importlib
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -20,6 +21,7 @@ from typing import Any, Optional, Union
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tqdm import tqdm
 
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -383,7 +385,8 @@ class RayWorkerGroup:
             ):
                 if worker_count > pg.bundle_count:
                     raise ValueError(
-                        f"Placement group {i} has {pg.bundle_count} bundles, but {worker_count} workers were requested"
+                        f"Placement group {i} has {pg.bundle_count} bundles, "
+                        f"but {worker_count} workers were requested"
                     )
 
                 for bundle_idx in range(worker_count):
@@ -561,12 +564,39 @@ class RayWorkerGroup:
 
                 global_rank += 1
 
+        # Wait for all workers to initialize with timing and progress bar
+        num_workers = len(worker_futures)
+        worker_refs = [future for future, _ in worker_futures]
+
+        start_time = time.perf_counter()
+
+        # Use ray.wait() to track individual worker completion times
+        remaining_refs = worker_refs.copy()
+
+        with tqdm(
+            total=num_workers,
+            desc=f"Initializing {self.name_prefix} workers",
+            unit="worker",
+            disable=False,
+        ) as pbar:
+            while remaining_refs:
+                # Wait for at least one worker to complete
+                ready_refs, remaining_refs = ray.wait(
+                    remaining_refs, num_returns=1, timeout=None
+                )
+
+                # Update progress bar for each ready worker
+                for _ in ready_refs:
+                    pbar.update(1)
+
+        # Get all worker results
+        workers = ray.get(worker_refs)
+        total_init_time = time.perf_counter() - start_time
+
         print(
-            f"Waiting for {len(worker_futures)} workers to finish initializing...",
+            f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s",
             flush=True,
         )
-        worker_refs = [future for future, _ in worker_futures]
-        workers = ray.get(worker_refs)
 
         for idx, (worker, (_, initializer)) in enumerate(zip(workers, worker_futures)):
             worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = initializer
