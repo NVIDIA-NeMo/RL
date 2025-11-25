@@ -39,6 +39,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    log_vllm_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
@@ -1467,23 +1468,14 @@ def grpo_train(
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
-                vllm_metrics_logger_interval = master_config["policy"]["generation"][
-                    "vllm_cfg"
-                ]["vllm_metrics_logger_interval"]
-                if "inflight_batch_sizes" in vllm_logger_metrics:
-                    logger.log_plot_per_worker_timeline_metrics(
-                        vllm_logger_metrics["inflight_batch_sizes"],
-                        step=total_steps + 1,
-                        name="performance/inflight_batch_sizes",
-                        timeline_interval=vllm_metrics_logger_interval,
-                    )
-                if "num_pending_samples" in vllm_logger_metrics:
-                    logger.log_plot_per_worker_timeline_metrics(
-                        vllm_logger_metrics["num_pending_samples"],
-                        step=total_steps + 1,
-                        name="performance/num_pending_samples",
-                        timeline_interval=vllm_metrics_logger_interval,
-                    )
+                log_vllm_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    total_steps + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
 
             print("\n📊 Training Results:")
 
@@ -2386,23 +2378,14 @@ def async_grpo_train(
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
-                vllm_metrics_logger_interval = master_config["policy"]["generation"][
-                    "vllm_cfg"
-                ]["vllm_metrics_logger_interval"]
-                if "inflight_batch_sizes" in vllm_logger_metrics:
-                    logger.log_plot_per_worker_timeline_metrics(
-                        vllm_logger_metrics["inflight_batch_sizes"],
-                        step=step + 1,
-                        name="performance/inflight_batch_sizes",
-                        timeline_interval=vllm_metrics_logger_interval,
-                    )
-                if "num_pending_samples" in vllm_logger_metrics:
-                    logger.log_plot_per_worker_timeline_metrics(
-                        vllm_logger_metrics["num_pending_samples"],
-                        step=step + 1,
-                        name="performance/num_pending_samples",
-                        timeline_interval=vllm_metrics_logger_interval,
-                    )
+                log_vllm_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    step + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
