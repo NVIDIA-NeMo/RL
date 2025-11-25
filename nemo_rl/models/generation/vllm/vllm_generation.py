@@ -819,6 +819,55 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            future = self.worker_group.run_single_worker_single_data(
+                "get_vllm_logger_metrics",
+                worker_idx=worker_idx,
+            )
+            futures.append(future)
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        vllm_logger_metrics: dict[str, dict[int, list[int]]] = {
+            "inflight_batch_sizes": {},  # dp_idx -> list[int]
+            "num_pending_samples": {},  # dp_idx -> list[int]
+        }
+
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight_batch_sizes = stats.get("inflight_batch_sizes")
+            if inflight_batch_sizes:
+                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
+                    inflight_batch_sizes
+                )
+            num_pending_samples = stats.get("num_pending_samples")
+            if num_pending_samples:
+                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+
+        return vllm_logger_metrics
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_vllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
