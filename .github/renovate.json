@@ -78,6 +78,13 @@
       "enabled": false
     },
     {
+      "description": "Disable Docker base image updates by default (enable manually when needed)",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "enabled": false
+    },
+    {
       "description": "Group every allowed update into a single PR",
       "matchPackagePatterns": [
         "*"
