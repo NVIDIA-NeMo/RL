@@ -96,7 +96,7 @@
   "rangeStrategy": "bump",
   "platformAutomerge": false,
   "rebaseWhen": "behind-base-branch",
-  "recreateClosed": true,
+  "recreateWhen": "always",
   "forkProcessing": "enabled",
   "includeForks": true
 }
