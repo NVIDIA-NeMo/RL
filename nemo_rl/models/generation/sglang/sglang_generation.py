@@ -204,6 +204,15 @@ class SGLangGeneration(GenerationInterface):
         
         return bundle_indices_list
 
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication.
+    
+        
+        TODO:       if weight updates via NCCL are needed in the future.
+        """
+        return []
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -252,6 +261,15 @@ class SGLangGeneration(GenerationInterface):
             )
 
         return combined
+
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        pass
+
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        return []
+
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+        return []
    
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""

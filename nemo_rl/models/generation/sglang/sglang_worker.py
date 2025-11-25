@@ -25,6 +25,7 @@ import torch
 import multiprocessing
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -35,17 +36,9 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
-try:
-    from sglang.srt.entrypoints.http_server import launch_server
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import kill_process_tree
-except ImportError:
-    # SGLang may not be installed, but we still want the code to be importable
-    launch_server = None
-    ServerArgs = None
-    kill_process_tree = None
-
-
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 
 
 @ray.remote(
@@ -132,7 +125,10 @@ class SGLangGenerationWorker:
         """
         self.cfg = config
         self.is_model_owner = bundle_indices is not None
-
+        
+        # This is the global worker rank across all workers
+        self.global_rank = int(os.environ.get("RANK", "0"))
+        
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -152,6 +148,10 @@ class SGLangGenerationWorker:
             f"Setting CUDA_VISIBLE_DEVICES={gpu_ids} (tp_size={tp_size})"
         )
 
+        # Get current node IP and a free port for the server
+        node_ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
+        
         # Build SGLang server arguments
         kwargs = {
             "model_path": self.cfg.get("model_path", ""),
@@ -169,6 +169,10 @@ class SGLangGenerationWorker:
             "ep_size": self.cfg.get("ep_size", 1),
             # Always skip warmup to prevent warmup timeout
             "skip_server_warmup": True,
+            # Server network settings - listen on all interfaces, use the free port we found
+            "host": "0.0.0.0",
+            "port": free_port,
+            "torchao_config": "",
         }
         
         # Add other config fields if they exist
@@ -181,6 +185,12 @@ class SGLangGenerationWorker:
                 kwargs[key] = self.cfg[key]
 
         server_args = ServerArgs(**kwargs)
+        # Save server_args and base_url for use in generate() and _make_request()
+        self.server_args = server_args
+        self.base_url = f"http://{node_ip}:{free_port}"
+        
+        print(f"[SGLang Server] Rank {self.global_rank} Starting on {self.base_url}")
+        
         self.server_process = self._launch_server_process(server_args)
 
 
@@ -201,11 +211,8 @@ class SGLangGenerationWorker:
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
         p.start()
 
-        if server_args.node_rank != 0:
-            return
-
-        base_url = server_args.url()
-
+        # Wait for server to be ready by checking health endpoint
+        # Use the base_url we stored earlier
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {server_args.api_key}",
@@ -214,14 +221,15 @@ class SGLangGenerationWorker:
         with requests.Session() as session:
             while True:
                 try:
-                    response = session.get(f"{base_url}/health_generate", headers=headers)
+                    response = session.get(f"{self.base_url}/health_generate", headers=headers)
                     if response.status_code == 200:
+                        print(f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}")
                         break
                 except requests.RequestException:
                     pass
 
                 if not p.is_alive():
-                    raise Exception("Server process terminated unexpectedly.")
+                    raise Exception(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
 
                 time.sleep(2)
         return p
@@ -246,6 +254,9 @@ class SGLangGenerationWorker:
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
+        input_lengths = data["input_lengths"]
+        print(f"[SGLang Generation Worker] Rank {self.global_rank} Input lengths: {input_lengths}")
+
         pass
 
     def sleep(self):
@@ -267,10 +278,12 @@ class SGLangGenerationWorker:
         Returns:
             The JSON response from the server
         """
-        if self.node_rank != 0:
-            return
-
-        url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        # Use the stored base_url instead of constructing from server_args
+        url = f"{self.base_url}/{endpoint}"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {self.server_args.api_key}",
+        }
+        response = requests.post(url, json=payload or {}, headers=headers)
         response.raise_for_status()
         return response.json()

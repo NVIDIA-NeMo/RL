@@ -62,6 +62,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -482,6 +483,13 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
+    def init_sglang():
+        """Initialize SGLang generation workers."""
+        t0 = time.perf_counter()
+        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg.finish_generation()
+        return pg, time.perf_counter() - t0
+
     # Handle backend-specific setup
     if backend == "megatron":
         # Megatron backend: policy_generation is None, only initialize policy
@@ -565,6 +573,57 @@ def setup(
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+    elif backend == "sglang":
+        # Set model_name and model_path
+        generation_config["model_name"] = policy_config["model_name"]
+        if "model_path" not in generation_config or not generation_config.get("model_path"):
+            generation_config["model_path"] = policy_config["model_name"]
+        
+        # Determine if parallel initialization is possible (non-colocated mode)
+        use_parallel_init = not colocated_inference
+
+        if use_parallel_init:
+            # Parallel initialization: SGLang and Policy can initialize simultaneously
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated mode)",
+                flush=True,
+            )
+
+            # Execute both initializations in parallel
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                sglang_future = executor.submit(init_sglang)
+                policy_future = executor.submit(init_policy)
+                policy_generation, sglang_time = sglang_future.result()
+                policy, policy_time = policy_future.result()
+            parallel_wall_time = time.perf_counter() - parallel_start_time
+
+            # Store timing metrics
+            worker_init_timing_metrics["sglang_init_time_s"] = sglang_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        else:
+            # Sequential initialization: colocated mode (GPU memory requires SGLang first)
+            print(
+                "  ⚙️  Using sequential worker initialization (colocated mode)",
+                flush=True,
+            )
+
+            # Initialize SGLang first (clean GPU memory), then policy
+            policy_generation, sglang_time = init_sglang()
+            worker_init_timing_metrics["sglang_init_time_s"] = sglang_time
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+
+        print(
+            f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 
