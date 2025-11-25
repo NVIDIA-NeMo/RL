@@ -81,11 +81,24 @@ if os.path.exists(bridge_src_dir):
             )
             for dep in sorted(extra_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
-        print(
-            "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+
+        # Check for auto-sync mode (used by Renovate to allow submodule updates)
+        # Set NRL_AUTO_SYNC_DEPS=1 to auto-sync instead of erroring
+        auto_sync = os.environ.get("NRL_AUTO_SYNC_DEPS", "").lower() in ("1", "true", "yes")
+
+        if auto_sync:
+            CACHED_DEPENDENCIES.clear()
+            CACHED_DEPENDENCIES.extend(deps_list)
+            print(
+                "[megatron-bridge][setup] Auto-synced CACHED_DEPENDENCIES from submodule (NRL_AUTO_SYNC_DEPS=1)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     else:
         print(
             "[megatron-bridge][setup] Dependency sets are consistent with the submodule pyproject.",

@@ -118,6 +118,8 @@ jobs:
           # Use custom command that sets git safe.directory before running renovate
           # This avoids "dubious ownership" errors with the pre-cloned repo
           docker-cmd-file: /tmp/renovate_cmd.sh
+          # Pass NRL_AUTO_SYNC_DEPS to container (extends default env-regex)
+          env-regex: '^(?:RENOVATE_\w+|LOG_LEVEL|GITHUB_COM_TOKEN|NODE_OPTIONS|(?:HTTPS?|NO)_PROXY|(?:https?|no)_proxy|NRL_AUTO_SYNC_DEPS)$'
         env:
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
           RENOVATE_DRY_RUN: ${{ inputs.dry_run || false }}
@@ -127,4 +129,7 @@ jobs:
           RENOVATE_ONBOARDING: 'false'
           RENOVATE_REQUIRE_CONFIG: 'optional'
           RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\.github/scripts/renovate_post_update\\.sh$"]'
+          # Enable auto-sync of CACHED_DEPENDENCIES in 3rdparty setup.py files
+          # This allows submodule updates to proceed without manual intervention
+          NRL_AUTO_SYNC_DEPS: '1'
 
