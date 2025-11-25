@@ -5,6 +5,10 @@
 # Mark all directories as safe (required for pre-cloned repos with different ownership)
 git config --global --add safe.directory '*'
 
+# Enable auto-sync of CACHED_DEPENDENCIES in 3rdparty setup.py files
+# This allows submodule updates to proceed - the setup.py will use submodule deps directly
+export NRL_AUTO_SYNC_DEPS=1
+
 # Run the actual renovate command
 exec renovate "$@"
 
