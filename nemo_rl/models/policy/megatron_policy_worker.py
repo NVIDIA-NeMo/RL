@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
-import math
 import os
 import time
 import warnings
@@ -85,7 +84,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -114,6 +112,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.megatron.common import (
+    _get_pack_sequence_parameters_for_megatron,
     _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
@@ -1022,6 +1021,7 @@ class MegatronPolicyWorker:
                 seqlen_key = None
                 pad_factor = 1
                 pad_full_seq_to = None
+                pad_packed_seq_to_multiple_of = 1
                 if self.cfg["dynamic_batching"]["enabled"]:
                     data_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     data_iterator_len = (
@@ -1037,16 +1037,14 @@ class MegatronPolicyWorker:
                     mbs = 1
                     pack_seqs = True
                     seqlen_key = "input_lengths"
-                    tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
-                    cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                    pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
-                    if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                        # if fp8 is enabled, ensure the sequence is padded to multiples of 16
-                        pad_factor = math.lcm(16, pad_factor)
-                    if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
-                        _, pad_full_seq_to = (
-                            batch.get_microbatch_iterator_for_packable_sequences_len()
-                        )
+                    (
+                        pad_factor,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                    ) = _get_pack_sequence_parameters_for_megatron(
+                        self.cfg["megatron_cfg"],
+                        seq_dim_size,
+                    )
                 else:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
@@ -1068,6 +1066,7 @@ class MegatronPolicyWorker:
                             pack_sequences=pack_seqs,
                             seq_length_key=seqlen_key,
                             pad_individual_seqs_to_multiple_of=pad_factor,
+                            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                             pad_full_seq_to=pad_full_seq_to,
                         ),
                         data_iterator=data_iterator,
@@ -1217,37 +1216,28 @@ class MegatronPolicyWorker:
         self.model.eval()
 
         pp_seq_dim_size = input_seq_dim_size
-        pp_rank = get_pipeline_model_parallel_rank()
         pp_grp = get_pipeline_model_parallel_group()
-        pp_size = get_pipeline_model_parallel_world_size()
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-        # if pp_size > 1, we need to pad the full sequence to the max sequence length to maintain a static PP buffer
-        if (
-            self.cfg["sequence_packing"]["enabled"]
-            and self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            _, pad_full_seq_to = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
+        if self.cfg["sequence_packing"]["enabled"]:
+            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
+            (
+                pad_factor,
+                pad_packed_seq_to_multiple_of,
+                pad_full_seq_to,
+            ) = _get_pack_sequence_parameters_for_megatron(
+                self.cfg["megatron_cfg"],
+                seq_dim_size,
             )
-            pp_seq_dim_size = pad_full_seq_to
-        else:
-            pad_full_seq_to = None
+            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pad_full_seq_to
+            nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
             if self.cfg["sequence_packing"]["enabled"]:
                 original_seq_length = data_dict["input_ids"].shape[1]
-                tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
-                pp_size = self.cfg["megatron_cfg"]["pipeline_model_parallel_size"]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
-                pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
-                if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                    # if fp8 is enabled, ensure the sequence is padded to multiples of 16
-                    pad_factor = math.lcm(16, pad_factor)
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -1258,6 +1248,7 @@ class MegatronPolicyWorker:
                     data_dict["input_ids"].clone(),
                     data_dict["input_lengths"],
                     pad_individual_seqs_to_multiple_of=pad_factor,
+                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                     pad_packed_seq_to=pad_full_seq_to,
                     cp_rank=cp_rank,
                     cp_size=cp_size,
@@ -1505,33 +1496,29 @@ class MegatronPolicyWorker:
         pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
-        # If using sequence packing with PP>1, pad full sequence to static PP buffer length
-        pad_full_seq_to = None
-        if (
-            self.cfg["sequence_packing"]["enabled"]
-            and self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            _, pad_full_seq_to = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
+        if self.cfg["sequence_packing"]["enabled"]:
+            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
+            (
+                pad_factor,
+                pad_packed_seq_to_multiple_of,
+                pad_full_seq_to,
+            ) = _get_pack_sequence_parameters_for_megatron(
+                self.cfg["megatron_cfg"],
+                seq_dim_size,
             )
-            pp_seq_dim_size = pad_full_seq_to
+            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pad_full_seq_to
+            nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
 
             pack = self.cfg["sequence_packing"]["enabled"]
             if pack:
                 original_seq_length = data_dict["input_ids"].shape[1]
-                tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
-                pp_size = self.cfg["megatron_cfg"]["pipeline_model_parallel_size"]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
-                pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
-                if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                    pad_factor = math.lcm(16, pad_factor)
 
                 (
                     input_ids_unpacked,
@@ -1543,6 +1530,7 @@ class MegatronPolicyWorker:
                     data_dict["input_ids"].clone(),
                     data_dict["input_lengths"],
                     pad_individual_seqs_to_multiple_of=pad_factor,
+                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                     pad_packed_seq_to=pad_full_seq_to,
                     cp_rank=cp_rank,
                     cp_size=cp_size,
