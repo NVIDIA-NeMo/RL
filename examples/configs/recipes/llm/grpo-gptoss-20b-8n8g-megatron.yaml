@@ -14,15 +14,18 @@ policy:
   megatron_cfg:
     enabled: true
     expert_model_parallel_size: 8
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 4
     sequence_parallel: true
     moe_permute_fusion: true
   dtensor_cfg:
     enabled: false
   dynamic_batching:
-    enabled: true
+    enabled: false
   sequence_packing:
     enabled: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
 cluster:
   num_nodes: 8
-  num_gpus_per_node: 8
+  gpus_per_node: 8
