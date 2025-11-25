@@ -23,6 +23,6 @@ policy:
     enabled: true
   sequence_packing:
     enabled: false
-  cluster:
-    num_nodes: 8
-    num_gpus_per_node: 8
+cluster:
+  num_nodes: 8
+  num_gpus_per_node: 8
