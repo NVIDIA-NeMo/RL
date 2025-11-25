@@ -16,7 +16,7 @@ This page provides performance benchmarks for LLMs and VLMs using NeMo RL across
 - **EP**: Expert Parallel Size
 - **T-**: Training related
 - **G-**: Generation related
-- **Training backend**: NeMo RL have two training backends: Megatron and PyTorch DTensor
+- **Training backend**: NeMo RL have two training backends: Megatron and PyTorch DTensor. This performance summary currently only shows number from Megatron backend.
 
 ## Performance Metrics
 
