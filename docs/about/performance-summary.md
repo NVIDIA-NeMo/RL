@@ -14,7 +14,6 @@ This page provides performance benchmarks for LLMs and VLMs using NeMo RL across
 - **CP**: Context Parallel Size
 - **VP**: Virtual Pipeline Parallel Size
 - **EP**: Expert Parallel Size
-- **GA**: Number of Gradient Accumulations
 - **T-**: Training related
 - **G-**: Generation related
 - **Training backend**: NeMo RL have two training backends: Megatron and PyTorch DTensor
