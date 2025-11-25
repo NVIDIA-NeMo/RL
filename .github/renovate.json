@@ -6,6 +6,9 @@
   ],
   "timezone": "America/Los_Angeles",
   "cloneSubmodules": true,
+  "customEnvVariables": {
+    "NRL_AUTO_SYNC_DEPS": "1"
+  },
   "prConcurrentLimit": 1,
   "prHourlyLimit": 0,
   "semanticCommits": "disabled",
