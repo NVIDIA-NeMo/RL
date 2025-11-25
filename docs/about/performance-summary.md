@@ -57,4 +57,4 @@ The performance data includes:
 | Qwen3-32B |On policy|4,096|3,206|32|2,048|512| [4,1]|[4,1,1,4,n/a]| 540| 393|
 | Qwen3-32B |1-step Off|4,096|3,207|64|2,048|512| [4,1]|[4,1,1,4,n/a]| 494| 215|
 
-Note: All Mixture-of-expert (MOE) model training uses token drop-less. 
+Note: All Mixture-of-expert (MoE) model training uses token drop-less. 
