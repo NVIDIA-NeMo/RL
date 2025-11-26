@@ -26,6 +26,7 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
+import copy
 from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
@@ -284,7 +285,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self.print0(f"  {dtype_str}: {len(names)} parameters")
 
             if self.peft_config is not None:
-                apply_lora_to_linear_modules(model, self.peft_config)
+                apply_lora_to_linear_modules(model, copy.deepcopy(self.peft_config))
 
                 # Debug: Check dtypes after LoRA application on rank 0
                 self.print0("DEBUG: Checking parameter dtypes after LoRA on rank 0")
@@ -341,7 +342,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             if self.lora_enabled:
                 self.print0("Before LoRA:")
                 self.print0(self.model)
-                apply_lora_to_linear_modules(self.model, self.peft_config)
+                apply_lora_to_linear_modules(self.model, copy.deepcopy(self.peft_config))
                 self.print0("After LoRA:")
                 self.print0(self.model)
                 # print all frozen parameters
