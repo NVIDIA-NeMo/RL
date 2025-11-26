@@ -1114,16 +1114,27 @@ def grpo_train(
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
                             policy.prepare_for_lp_inference()
+                            # Align with training data processing to ensure parallel training compatibility
+                            calib_flat, calib_input_lengths = (
+                                batched_message_log_to_flat_message(
+                                    repeated_batch["message_log"],
+                                    pad_value_dict={
+                                        "token_ids": tokenizer.pad_token_id
+                                    },
+                                    make_sequence_length_divisible_by=master_config[
+                                        "policy"
+                                    ]["make_sequence_length_divisible_by"],
+                                )
+                            )
                             # Create calibration data from flattened messages
                             calibration_data = BatchedDataDict[ClippedPGLossDataDict](
                                 {
-                                    "input_ids": batched_flat["token_ids"],
-                                    "input_lengths": input_lengths,
+                                    "input_ids": calib_flat["token_ids"],
+                                    "input_lengths": calib_input_lengths,
                                 }
                             )
-                            # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                             calibration_data.update(
-                                batched_flat.get_multimodal_dict(as_tensors=False)
+                                calib_flat.get_multimodal_dict(as_tensors=False)
                             )
                             calibration_data.to("cpu")
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
