@@ -114,6 +114,11 @@ class SGLangGeneration(GenerationInterface):
         worker_builder = RayWorkerBuilder(worker_cls, config)
         
         env_vars = {}
+        global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if global_cvd:
+            # Explicitly pass CUDA_VISIBLE_DEVICES to workers via env_vars
+            # This ensures all workers see the same global value, even though
+            env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
         
         # Allocate bundles for each server
         # Each server gets consecutive bundles

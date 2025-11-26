@@ -99,7 +99,9 @@ class SGLangGenerationWorker:
         ) or local_bundle_indices is None
 
         if is_part_of_parallel_workers:
-            # For parallel workers, we manage GPU assignment manually via CUDA_VISIBLE_DEVICES
+            # For parallel workers, we manage GPU assignment via base_gpu_id
+            # All workers see the same global CUDA_VISIBLE_DEVICES, but use different
+            # logical GPU ranges via base_gpu_id
             resources["num_gpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
@@ -136,18 +138,19 @@ class SGLangGenerationWorker:
         if not self.is_model_owner:
             return
 
-        # Set CUDA_VISIBLE_DEVICES to allow SGLang server to see the correct GPUs
-        # bundle_indices contains the node-local GPU indices (e.g., [0,1,2,3] or [4,5,6,7])
-        # Since we set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1, Ray won't override this
-        gpu_ids = ",".join(str(idx) for idx in bundle_indices)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
-
         # Determine tp_size from bundle_indices length
         tp_size = len(bundle_indices)
-
+        
+        base_gpu_id = bundle_indices[0] if bundle_indices else 0
+        
+        # Get the global CUDA_VISIBLE_DEVICES (all engines see the same global value)
+        global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        
+        
         print(
-            f"[SGLang Server] Node {os.environ.get('NODE_RANK', '?')}: "
-            f"Setting CUDA_VISIBLE_DEVICES={gpu_ids} (tp_size={tp_size})"
+            f"[SGLang Server] Rank {self.global_rank}: "
+            f"base_gpu_id={base_gpu_id}, tp_size={tp_size}, "
+            f"bundle_indices={bundle_indices}, global_cvd={global_cvd}"
         )
 
         # Get current node IP and a free port for the server
@@ -161,9 +164,8 @@ class SGLangGenerationWorker:
             "random_seed": seed if seed is not None else self.cfg.get("random_seed", 1),
             # Memory settings
             "enable_memory_saver": self.cfg.get("enable_memory_saver", False),
-            # GPU settings - Ray handles CUDA_VISIBLE_DEVICES, so we use logical GPU 0
             "gpu_id_step": 1,
-            "base_gpu_id": 0,  # Always 0 because Ray sets CUDA_VISIBLE_DEVICES
+            "base_gpu_id": base_gpu_id,
             # Parallel settings
             "tp_size": tp_size,
             "dp_size": self.cfg.get("dp_size", 1),
@@ -191,7 +193,7 @@ class SGLangGenerationWorker:
         self.server_args = server_args
         self.base_url = f"http://{node_ip}:{free_port}"
         
-        print(f"[SGLang Server] Rank {self.global_rank} Starting on {self.base_url}")
+        print(f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}")
         
         self.server_process = self._launch_server_process(server_args)
 
