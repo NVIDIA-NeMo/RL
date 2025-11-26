@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import cast
 
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
     RowwiseParallel,
-    SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -36,24 +34,6 @@ def get_custom_parallel_plan():
         "model.layers.*.mlp.down_proj": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
-
-    base_model_sp_plan = {
-        "model.embed_tokens": RowwiseParallel(
-            input_layouts=Replicate(), output_layouts=Shard(1)
-        ),
-        "model.norm": SequenceParallel(),
-        "model.layers.*.input_layernorm": SequenceParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-        "model.layers.*.post_attention_layernorm": SequenceParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-        "lm_head": ColwiseParallel(
-            input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False
-        ),
-    }
-
-    if False:
-        # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return base_model_tp_plan
 
