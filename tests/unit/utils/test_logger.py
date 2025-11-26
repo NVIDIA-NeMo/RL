@@ -548,6 +548,101 @@ class TestMLflowLogger:
         # Check that end_run was called
         mock_mlflow.end_run.assert_called_once()
 
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_init_with_none_log_dir(self, mock_mlflow):
+        """Test initialization with None log_dir uses server default artifact location."""
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": "http://localhost:5000",
+        }
+        mock_mlflow.get_experiment_by_name.return_value = None
+
+        MLflowLogger(cfg, log_dir=None)
+
+        # Verify create_experiment was called without artifact_location
+        mock_mlflow.create_experiment.assert_called_once_with(name="test-experiment")
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_init_with_custom_log_dir(self, mock_mlflow):
+        """Test initialization with custom log_dir sets artifact_location."""
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": "http://localhost:5000",
+        }
+        mock_mlflow.get_experiment_by_name.return_value = None
+
+        MLflowLogger(cfg, log_dir="/custom/path")
+
+        # Verify create_experiment was called with artifact_location
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name="test-experiment", artifact_location="/custom/path"
+        )
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_init_with_artifact_location_in_config(self, mock_mlflow):
+        """Test initialization with artifact_location in config takes precedence over log_dir."""
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": "http://localhost:5000",
+            "artifact_location": "/config/artifact/path",
+        }
+        mock_mlflow.get_experiment_by_name.return_value = None
+
+        MLflowLogger(cfg, log_dir="/fallback/path")
+
+        # Verify create_experiment was called with artifact_location from config
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
+        )
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_init_with_artifact_location_none_in_config(self, mock_mlflow):
+        """Test initialization with artifact_location=None in config uses server default."""
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": "http://localhost:5000",
+            "artifact_location": None,
+        }
+        mock_mlflow.get_experiment_by_name.return_value = None
+
+        MLflowLogger(cfg, log_dir="/fallback/path")
+
+        # Verify create_experiment was called without artifact_location
+        # (None is explicitly set, so we don't pass it to MLflow)
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
+        )
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_init_without_artifact_location_uses_log_dir(self, mock_mlflow):
+        """Test initialization without artifact_location in config uses log_dir."""
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": "http://localhost:5000",
+        }
+        mock_mlflow.get_experiment_by_name.return_value = None
+
+        log_dir = "/fallback/path"
+        MLflowLogger(cfg, log_dir=log_dir)
+
+        # Verify create_experiment was called with log_dir as artifact_location
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name=cfg["experiment_name"], artifact_location=log_dir
+        )
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+
 
 class TestRayGpuMonitorLogger:
     """Test the RayGpuMonitorLogger class."""
