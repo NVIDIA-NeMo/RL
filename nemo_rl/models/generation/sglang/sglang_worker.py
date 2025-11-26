@@ -20,6 +20,7 @@ from typing import Any, Optional, cast
 import requests
 import asyncio
 import aiohttp
+import threading
 
 import time
 import ray
@@ -41,6 +42,52 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+
+
+class AsyncLoopThread:
+    """A background event loop thread for running async operations in Ray actors.
+    
+    This class creates a dedicated thread with its own event loop, allowing
+    synchronous Ray actor methods to execute async coroutines without blocking
+    the main actor thread. This is necessary because run_coroutine_threadsafe
+    requires the event loop to be in a different thread.
+    """
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._start_loop, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise RuntimeError("Event loop thread failed to start within 5 seconds")
+    
+    def _start_loop(self):
+        """Run the event loop in the background thread."""
+        asyncio.set_event_loop(self.loop)
+        self._ready.set()
+        self.loop.run_forever()
+    
+    def run(self, coro):
+        """Schedule a coroutine onto the loop and block until it's done.
+        
+        Args:
+            coro: The coroutine to execute
+            
+        Returns:
+            The result of the coroutine
+        """
+        if not self.loop.is_running():
+            raise RuntimeError("Event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        result = future.result()
+        return result
+    
+    def shutdown(self):
+        """Shutdown the event loop and wait for the thread to finish."""
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(timeout=2.0)
+        if self.loop.is_running():
+            self.loop.close()
 
 
 @ray.remote(
@@ -135,6 +182,10 @@ class SGLangGenerationWorker:
         # This is the global worker rank across all workers
         self.global_rank = int(os.environ.get("RANK", "0"))
         
+        # Create a dedicated event loop thread for async operations
+        # there will be issues if we use the event loop in the main thread
+        self.async_loop_thread = AsyncLoopThread()
+        
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -197,6 +248,9 @@ class SGLangGenerationWorker:
         
         print(f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}")
         
+        self.session = None
+        self.connector = None
+        
         self.server_process = self._launch_server_process(server_args)
 
 
@@ -211,6 +265,15 @@ class SGLangGenerationWorker:
         max_new_tokens: Optional[int] = None,
     ):
         pass
+
+    async def _ensure_session(self):
+        if self.session is None:
+            # Create connector with connection pool limit
+            self.connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
+            # Create session with timeout
+            timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+            self.session = aiohttp.ClientSession(connector=self.connector, timeout=timeout)
+        return self.session
 
     async def _generate_single_sample(
         self,
@@ -243,16 +306,20 @@ class SGLangGenerationWorker:
             "input_ids": input_ids,
         }
         
-        # Use aiohttp for async request
         url = f"{self.base_url}/generate"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
         
-        async with aiohttp.ClientSession() as session:
+        session = await self._ensure_session()
+        
+        try:
             async with session.post(url, json=payload, headers=headers) as response:
                 response.raise_for_status()
                 result = await response.json()
+        except Exception as e:
+            print(f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}")
+            raise
         
         # Extract generated tokens and logprobs
         meta_info = result.get("meta_info", {})
@@ -268,16 +335,27 @@ class SGLangGenerationWorker:
         
         return new_tokens, new_logprobs
 
-    async def _generate_async(self, tasks: list) -> list:
-        """Execute all async generation tasks concurrently.
+    async def _generate_async(self, tasks):
         
-        Args:
-            tasks: List of async coroutines for generating samples
-            
-        Returns:
-            List of (tokens, logprobs) tuples for all samples
-        """
-        return await asyncio.gather(*tasks)
+        async def wrap(idx, coro):
+            try:
+                result = await coro
+                return idx, result
+            except Exception as e:
+                raise
+
+        wrapped = [wrap(i, t) for i, t in enumerate(tasks)]
+        results = [None] * len(tasks)
+        count = 0
+
+        for fut in asyncio.as_completed(wrapped):
+            idx, value = await fut
+            results[idx] = value
+            count += 1
+            if count % 50 == 0 or count == len(tasks):
+                print(f"[SGLang Worker] Rank {self.global_rank} Completed {count}/{len(tasks)} tasks")
+
+        return results
 
     def _launch_server_process(self, server_args: ServerArgs) -> multiprocessing.Process:
         """Launch the SGLang server process and wait for it to be ready."""
@@ -384,16 +462,14 @@ class SGLangGenerationWorker:
                 )
             )
         
-        # Execute all requests concurrently
+        # Execute all requests concurrently using the dedicated event loop thread
         try:
-            loop = asyncio.get_running_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._generate_async(tasks),
-                loop
-            )
-            all_results = future.result()
-        except RuntimeError:
-            all_results = asyncio.run(self._generate_async(tasks))
+            all_results = self.async_loop_thread.run(self._generate_async(tasks))
+        except Exception as e:
+            raise
+        
+        total_generated_tokens = sum(len(tokens) for tokens, _ in all_results)
+        avg_generation_length = total_generated_tokens / batch_size if batch_size > 0 else 0
         
         # Process results
         output_ids_list = []
@@ -444,7 +520,7 @@ class SGLangGenerationWorker:
         logprobs = torch.stack(logprobs_list)
         generation_lengths = torch.tensor(generation_lengths_list, dtype=torch.long)
         unpadded_sequence_lengths = torch.tensor(unpadded_sequence_lengths_list, dtype=torch.long)
-        
+        print(f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)")
         return BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": output_ids,
@@ -463,18 +539,37 @@ class SGLangGenerationWorker:
         pass
 
     def shutdown(self) -> bool:
-        """Shutdown the SGLang server process.
+        """Shutdown the SGLang server process and cleanup async resources.
         
         Returns:
             bool: True if shutdown was successful, False otherwise
         """
+        if hasattr(self, "async_loop_thread"):
+            try:
+                self.async_loop_thread.shutdown()
+                print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+            except Exception as e:
+                print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
+        
         if not self.is_model_owner:
             return True
         
-        if not hasattr(self, "server_process") or self.server_process is None:
-            return True
-        
         try:
+            if hasattr(self, "session") and self.session is not None:
+                try:
+                    async def close_session():
+                        await self.session.close()
+                        if self.connector is not None:
+                            await self.connector.close()
+                    
+                    self.async_loop_thread.run(close_session())
+                    print(f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed.")
+                except Exception as e:
+                    print(f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}")
+            
+            if not hasattr(self, "server_process") or self.server_process is None:
+                return True
+            
             print(
                 f"[SGLang Worker] Rank {self.global_rank} Shutting down server at {self.base_url}..."
             )
