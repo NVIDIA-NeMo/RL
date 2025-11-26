@@ -705,3 +705,276 @@ def test_pack_sequences_with_context_parallel(pack_sequences_setup):
                     print(f"  {test_name}: {status}")
                     if not test_result["success"]:
                         print(f"    Error: {test_result['error']}")
+
+
+def test_get_pack_sequence_parameters_for_megatron():
+    """Test _get_pack_sequence_parameters_for_megatron function with various configurations."""
+    from nemo_rl.models.megatron.common import (
+        _get_pack_sequence_parameters_for_megatron,
+    )
+
+    # Test 1: Basic configuration - no parallelism, no FP8
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+    }
+    max_seq_len = 1024
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 2: Context parallelism only
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 4,
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 4 * 2  # cp_size * 2
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 3: Tensor parallelism with sequence parallelism
+    megatron_cfg = {
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 2  # tp_size when SP is enabled
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 4: Tensor parallelism without sequence parallelism
+    megatron_cfg = {
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 5: Pipeline parallelism
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 4,
+        "context_parallel_size": 1,
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to == max_seq_len, f"Expected pad_to={max_seq_len}, got {pad_to}"
+
+    # Test 6: Combined CP and TP with SP
+    megatron_cfg = {
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 4,
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 7: FP8 enabled with default recipe
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "fp8_cfg": {"enabled": True},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 16, (
+        f"Expected pad_packed=16, got {pad_packed}"
+    )  # Default FP8 divisor
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 8: FP8 enabled with blockwise recipe
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 128, (
+        f"Expected pad_packed=128, got {pad_packed}"
+    )  # Blockwise FP8 divisor
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 9: FP8 with CP and TP+SP
+    megatron_cfg = {
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 4,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
+    expected_packed = 128 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == expected_packed, (
+        f"Expected pad_packed={expected_packed}, got {pad_packed}"
+    )
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 10: All parallelism types with FP8 and PP
+    megatron_cfg = {
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 4,
+        "context_parallel_size": 2,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "other"},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 2 * 2 * 2  # cp_size * 2 * tp_size
+    expected_packed = 16 * 2 * 2 * 2  # divisor * cp_size * 2 * tp_size
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == expected_packed, (
+        f"Expected pad_packed={expected_packed}, got {pad_packed}"
+    )
+    assert pad_to == max_seq_len, f"Expected pad_to={max_seq_len}, got {pad_to}"
+
+    # Test 11: FP8 disabled explicitly
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "fp8_cfg": {"enabled": False},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 12: Missing fp8_cfg (should default to disabled)
+    megatron_cfg = {
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        # No fp8_cfg key
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+    assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 13: Edge case - very large parallelism values
+    megatron_cfg = {
+        "tensor_model_parallel_size": 8,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 8,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+    }
+
+    pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+        megatron_cfg, max_seq_len
+    )
+
+    expected_individual = 8 * 2 * 8  # cp_size * 2 * tp_size = 128
+    expected_packed = 128 * 8 * 2 * 8  # divisor * cp_size * 2 * tp_size = 16384
+    assert pad_individual == expected_individual, (
+        f"Expected pad_individual={expected_individual}, got {pad_individual}"
+    )
+    assert pad_packed == expected_packed, (
+        f"Expected pad_packed={expected_packed}, got {pad_packed}"
+    )
+    assert pad_to is None, f"Expected pad_to=None, got {pad_to}"
+
+    # Test 14: Edge case - different max_seq_len values with PP
+    for test_seq_len in [512, 2048, 4096]:
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 2,
+            "context_parallel_size": 1,
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, test_seq_len
+        )
+
+        assert pad_individual == 1, f"Expected pad_individual=1, got {pad_individual}"
+        assert pad_packed == 1, f"Expected pad_packed=1, got {pad_packed}"
+        assert pad_to == test_seq_len, f"Expected pad_to={test_seq_len}, got {pad_to}"
+
+    print("All _get_pack_sequence_parameters_for_megatron tests passed!")
