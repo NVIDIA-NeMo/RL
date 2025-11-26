@@ -761,18 +761,11 @@ def log_vllm_metrics_to_wandb(
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
-    vllm_metrics_to_plot = [
-        "inflight_batch_sizes",
-        "num_pending_samples",
-        "kv_cache_usage_perc",
-        "generation_tokens",
-    ]
-
-    for vllm_metric in vllm_metrics_to_plot:
-        if vllm_metric in vllm_logger_metrics:
-            logger.log_plot_per_worker_timeline_metrics(
-                vllm_logger_metrics[vllm_metric],
-                step=step,
-                name=f"vllm_metrics/{vllm_metric}",
-                timeline_interval=timeline_interval,
-            )
+    for vllm_metric in vllm_logger_metrics.keys():
+        logger.log_plot_per_worker_timeline_metrics(
+            vllm_logger_metrics[vllm_metric],
+            step=step,
+            prefix="vllm_metrics",
+            name=vllm_metric,
+            timeline_interval=timeline_interval,
+        )
