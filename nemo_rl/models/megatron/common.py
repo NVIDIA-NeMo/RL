@@ -58,6 +58,7 @@ def _pack_sequences_for_megatron(
         pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
         pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
         pad_packed_seq_to: Pad packed sequences to this value (before CP)
+            - The three parameters above can be calculated using _get_pack_sequence_parameters_for_megatron, we do not recommend users to set these parameters manually.
         cp_size: Context parallelism size
 
     Returns:

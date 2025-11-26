@@ -1217,6 +1217,9 @@ class MegatronPolicyWorker:
 
         pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
+        pad_factor = 1
+        pad_packed_seq_to_multiple_of = 1
+        pad_full_seq_to = None
         if self.cfg["sequence_packing"]["enabled"]:
             _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
             (
@@ -1496,6 +1499,9 @@ class MegatronPolicyWorker:
         pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
+        pad_factor = 1
+        pad_packed_seq_to_multiple_of = 1
+        pad_full_seq_to = None
         if self.cfg["sequence_packing"]["enabled"]:
             _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
             (
