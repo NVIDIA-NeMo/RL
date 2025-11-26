@@ -18,6 +18,8 @@ import os
 import sys
 from typing import Any, Optional, cast
 import requests
+import asyncio
+import aiohttp
 
 import time
 import ray
@@ -210,13 +212,13 @@ class SGLangGenerationWorker:
     ):
         pass
 
-    def _generate_single_sample(
+    async def _generate_single_sample(
         self,
         input_ids: list[int],
         sampling_params: dict[str, Any],
         stop_string: Optional[str] = None,
     ) -> tuple[list[int], list[float]]:
-        """Generate a single sample using SGLang API.
+        """Generate a single sample using SGLang API (async function).
         
         Args:
             input_ids: List of input token IDs (without padding)
@@ -241,12 +243,19 @@ class SGLangGenerationWorker:
             "input_ids": input_ids,
         }
         
-        print(f"[SGLang Worker] Rank {self.global_rank} payload: {payload}")
-        # Call SGLang generate endpoint
-        response = self._make_request("generate", payload)
+        # Use aiohttp for async request
+        url = f"{self.base_url}/generate"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                result = await response.json()
         
         # Extract generated tokens and logprobs
-        meta_info = response.get("meta_info", {})
+        meta_info = result.get("meta_info", {})
         output_token_logprobs = meta_info.get("output_token_logprobs", [])
         
         if output_token_logprobs:
@@ -258,6 +267,17 @@ class SGLangGenerationWorker:
             new_logprobs = []
         
         return new_tokens, new_logprobs
+
+    async def _generate_async(self, tasks: list) -> list:
+        """Execute all async generation tasks concurrently.
+        
+        Args:
+            tasks: List of async coroutines for generating samples
+            
+        Returns:
+            List of (tokens, logprobs) tuples for all samples
+        """
+        return await asyncio.gather(*tasks)
 
     def _launch_server_process(self, server_args: ServerArgs) -> multiprocessing.Process:
         """Launch the SGLang server process and wait for it to be ready."""
@@ -347,66 +367,77 @@ class SGLangGenerationWorker:
         if top_k is not None:
             sampling_params["top_k"] = top_k
         
-        # TEST: Only process the first sample TODO
         if batch_size == 0:
             raise ValueError("Empty batch received")
         
-        i = 0
-        input_len = input_lengths[i].item()
-        valid_input_ids = input_ids[i, :input_len].tolist()
-        
-        print(f"[SGLang Worker] Rank {self.global_rank} Processing sample {i}, input_len: {input_len}")
-        
-        new_tokens, new_logprobs = self._generate_single_sample(
-            input_ids=valid_input_ids,
-            sampling_params=sampling_params,
-            stop_string=stop_strings[i],
-        )
-        
-        print(f"[SGLang Worker] Rank {self.global_rank} Generated {len(new_tokens)} tokens")
-        
-        generation_length = len(new_tokens)
-        
-        # Calculate total length: padded_input_length + max_generated_length
-        # For now, since we only process one sample, max_length = generation_length
-        max_length = generation_length
-        total_length = padded_input_length + max_length
-        
-        # Create output tensor
-        full_output = torch.full(
-            (total_length,), pad_token_id, dtype=input_ids.dtype
-        )
-        
-        # Copy original input (with padding) into the beginning
-        full_output[:input_len] = input_ids[i][:input_len]
-        
-        # Add generated tokens after the original input
-        if new_tokens:
-            full_output[input_len : input_len + len(new_tokens)] = (
-                torch.tensor(new_tokens, dtype=input_ids.dtype)
+        # Create async tasks for all samples
+        tasks = []
+        for i in range(batch_size):
+            input_len = input_lengths[i].item()
+            valid_input_ids = input_ids[i, :input_len].tolist()
+            
+            tasks.append(
+                self._generate_single_sample(
+                    input_ids=valid_input_ids,
+                    sampling_params=sampling_params,
+                    stop_string=stop_strings[i],
+                )
             )
         
-        full_logprobs = torch.zeros(total_length, dtype=torch.float32)
-        if new_logprobs:
-            for idx, logprob in enumerate(new_logprobs):
-                position = input_len + idx
-                full_logprobs[position] = logprob
+        # Execute all requests concurrently
+        try:
+            loop = asyncio.get_running_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self._generate_async(tasks),
+                loop
+            )
+            all_results = future.result()
+        except RuntimeError:
+            all_results = asyncio.run(self._generate_async(tasks))
         
-        unpadded_length = input_len + generation_length
+        # Process results
+        output_ids_list = []
+        logprobs_list = []
+        generation_lengths_list = []
+        unpadded_sequence_lengths_list = []
+        max_length = 0
         
-        # For other samples, create dummy outputs (same shape as first sample)
-        output_ids_list = [full_output]
-        logprobs_list = [full_logprobs]
-        generation_lengths_list = [generation_length]
-        unpadded_sequence_lengths_list = [unpadded_length]
+        # First pass: calculate max_length
+        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+            input_len = input_lengths[i].item()
+            generation_length = len(new_tokens)
+            unpadded_length = input_len + generation_length
+            max_length = max(max_length, unpadded_length)
         
-        for j in range(1, batch_size):
-            dummy_output = torch.full((total_length,), pad_token_id, dtype=input_ids.dtype)
-            dummy_logprobs = torch.zeros(total_length, dtype=torch.float32)
-            output_ids_list.append(dummy_output)
-            logprobs_list.append(dummy_logprobs)
-            generation_lengths_list.append(0)
-            unpadded_sequence_lengths_list.append(input_lengths[j].item())
+        total_length = padded_input_length + max_length
+        
+        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+            input_len = input_lengths[i].item()
+            generation_length = len(new_tokens)
+            unpadded_length = input_len + generation_length
+            
+            full_output = torch.full(
+                (total_length,), pad_token_id, dtype=input_ids.dtype
+            )
+            full_output[:input_len] = input_ids[i][:input_len]
+            
+            # Add generated tokens after the original input
+            if new_tokens:
+                full_output[input_len : input_len + len(new_tokens)] = (
+                    torch.tensor(new_tokens, dtype=input_ids.dtype)
+                )
+            
+            # Construct logprobs: zeros for input tokens, actual logprobs for generated tokens
+            full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            if new_logprobs:
+                for idx, logprob in enumerate(new_logprobs):
+                    position = input_len + idx
+                    full_logprobs[position] = logprob
+            
+            output_ids_list.append(full_output)
+            logprobs_list.append(full_logprobs)
+            generation_lengths_list.append(generation_length)
+            unpadded_sequence_lengths_list.append(unpadded_length)
         
         # Stack into tensors
         output_ids = torch.stack(output_ids_list)
