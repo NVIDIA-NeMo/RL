@@ -153,18 +153,57 @@ class KvRouter:
 
     async def periodic_update_indexer(self):
         async def update_tree(worker_id: int):
+            logger.info(f"Starting KV event listener for worker {worker_id}")
+            events_received_count = 0
+            events_applied_count = 0
+            events_failed_count = 0
+            
             try:
                 while True:
                     try:
+                        logger.debug(f"Polling for KV events from worker {worker_id}...")
                         kv_events: list[str] = await self.kv_listeners[
                             worker_id
                         ].get_events()
-                        for event in kv_events:
-                            event = json.loads(event)
-                            self.radix_tree.apply_event(
-                                worker_id, json.dumps(event).encode("utf-8")
+                        
+                        if kv_events:
+                            logger.info(
+                                f"Received {len(kv_events)} KV event(s) from worker {worker_id}"
                             )
+                            events_received_count += len(kv_events)
+                        
+                        for idx, event in enumerate(kv_events):
+                            try:
+                                event_dict = json.loads(event)
+                                event_type = event_dict.get("type", "unknown")
+                                logger.debug(
+                                    f"Worker {worker_id} event {idx+1}/{len(kv_events)}: "
+                                    f"type={event_type}"
+                                )
+                                
+                                self.radix_tree.apply_event(
+                                    worker_id, json.dumps(event_dict).encode("utf-8")
+                                )
+                                events_applied_count += 1
+                                logger.debug(
+                                    f"Successfully applied {event_type} event from worker {worker_id}"
+                                )
+                                
+                            except Exception as apply_error:
+                                events_failed_count += 1
+                                # Events can arrive out of order or reference parent blocks
+                                # that don't exist yet. Log at debug level and continue.
+                                error_msg = str(apply_error)
+                                if "Failed to find parent block" in error_msg:
+                                    logger.debug(
+                                        f"Skipping out-of-order event for worker {worker_id}: {error_msg}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Error applying KV event for worker {worker_id}: {error_msg}"
+                                    )
                     except zmq.Again:
+                        logger.debug(f"No KV events available for worker {worker_id} (timeout)")
                         pass
                     except Exception as e:
                         logger.warning(
@@ -173,11 +212,14 @@ class KvRouter:
 
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                logger.debug(
-                    "Indexer update task cancelled for worker %s", worker_id
+                logger.info(
+                    f"Indexer update task cancelled for worker {worker_id} "
+                    f"(received: {events_received_count}, applied: {events_applied_count}, "
+                    f"failed: {events_failed_count})"
                 )
                 raise
 
+        logger.info(f"Starting periodic_update_indexer for {self.num_workers} workers")
         worker_tasks: list[asyncio.Task] = []
         for worker_id in range(self.num_workers):
             worker_tasks.append(asyncio.create_task(update_tree(worker_id)))
@@ -187,13 +229,16 @@ class KvRouter:
             if worker_tasks:
                 await asyncio.gather(*worker_tasks)
         except asyncio.CancelledError:
+            logger.info("periodic_update_indexer cancelled")
             raise
         finally:
+            logger.info("Cleaning up indexer tasks...")
             for task in worker_tasks:
                 task.cancel()
             if worker_tasks:
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
             self.indexer_tasks = []
+            logger.info("Indexer tasks cleanup completed")
 
     async def get_best_worker(self, local_hashes: list[int], num_tokens: int) -> int:
         try:

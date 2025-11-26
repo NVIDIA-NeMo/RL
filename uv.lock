@@ -101,7 +101,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/ac/dc/4ffda8a22b6af3f41
 
 [[package]]
 name = "ai-dynamo"
-version = "0.5.1"
+version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ai-dynamo-runtime" },
@@ -110,25 +110,27 @@ dependencies = [
     { name = "fastapi" },
     { name = "filelock" },
     { name = "kubernetes" },
+    { name = "prometheus-client" },
     { name = "pytest" },
     { name = "setuptools" },
     { name = "typer" },
     { name = "types-psutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/97/e4c8b3154fd465419e9dd4e9bd8ea86ea4424408744bebba52c7792a86c6/ai_dynamo-0.5.1-py3-none-any.whl", hash = "sha256:ddf9359983771b06d57adc9a653a198b5306561b7d4af8cf3ad41bebee4005b1", size = 121942, upload-time = "2025-10-14T01:31:49.433Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/b7/62fb0edaeae0943731d0e1d3e1455b0a8a94ef448aa5bd8ffe33288ab464/ai_dynamo-0.6.1-py3-none-any.whl", hash = "sha256:92ac7088e834c12e3dcbbc214538b2ce39d34d48c814b79271f8705242ac9a97", size = 176585, upload-time = "2025-11-06T21:49:35.485Z" },
 ]
 
 [[package]]
 name = "ai-dynamo-runtime"
-version = "0.5.1"
+version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "uvloop" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/71/b884e4dd0fd1b95eaab957a5595230810959699327772cd14f04163b7e22/ai_dynamo_runtime-0.5.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:1386158c071c6c8017338fad2df8b02725fac0fe6131c85c76ddcf99fcb2ef3d", size = 19936732, upload-time = "2025-10-14T01:32:37.006Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/0c/076268db6ff2c87663a0d70f7ce7a6a1c566ac1383981d9c82437de2ff98/ai_dynamo_runtime-0.6.1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8178fc0bd56732aa7390855d5b056d143093b2278fdc3c2577b4c47180ef0b49", size = 24668701, upload-time = "2025-11-06T21:53:27.305Z" },
+    { url = "https://files.pythonhosted.org/packages/99/fc/cd7172407aeb07fc83fa94eb51281280847e5ec7fb3c6aedb1a02cf4e7ea/ai_dynamo_runtime-0.6.1-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5382ff345c02759e73e1a56f271680e7fae5eabf26d159b87942ae15fd4d9ae0", size = 24656122, upload-time = "2025-11-06T21:52:32.931Z" },
 ]
 
 [[package]]
@@ -1484,6 +1486,26 @@ dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e8/6d/7066d160bdffa2f9da29a8c3957f266b17a03ca0b3bdc8fdae86d9881fe7/flash_attn-2.8.1.tar.gz", hash = "sha256:0ff003899fcb244f357905b04f622d5c9736887126dd6675f8f4bc52954e3923", size = 8166563, upload-time = "2025-07-10T05:16:39.729Z" }
+
+[[package]]
+name = "flashinfer-python"
+version = "0.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "numpy" },
+    { name = "nvidia-cudnn-frontend" },
+    { name = "packaging" },
+    { name = "pynvml" },
+    { name = "requests" },
+    { name = "tabulate" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/71/dd3001b8be8174d90561764a5f3be4ca219517bde2841189ea6973a3873f/flashinfer_python-0.3.1.tar.gz", hash = "sha256:992017d193dfbbc62e67401a6d5416629bf90b640872d14b7863de45e9371446", size = 3817118, upload-time = "2025-09-05T06:21:45.229Z" }
 
 [[package]]
 name = "flask"
@@ -3309,6 +3331,12 @@ automodel = [
     { name = "nemo-automodel" },
     { name = "vllm" },
 ]
+dynamo = [
+    { name = "ai-dynamo" },
+    { name = "nixl" },
+    { name = "uvloop" },
+    { name = "vllm", extra = ["flashinfer"] },
+]
 mcore = [
     { name = "flash-attn" },
     { name = "megatron-bridge" },
@@ -3369,6 +3397,7 @@ test = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "ai-dynamo" },
+    { name = "ai-dynamo", marker = "extra == 'dynamo'", specifier = "==0.6.1" },
     { name = "blobfile" },
     { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
     { name = "causal-conv1d", marker = "extra == 'vllm'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
@@ -3391,6 +3420,7 @@ requires-dist = [
     { name = "mlflow", specifier = ">=3.5.0,<3.6.0" },
     { name = "nemo-automodel", marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "ninja" },
+    { name = "nixl", marker = "extra == 'dynamo'", specifier = "<=0.7.0" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
@@ -3418,12 +3448,14 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.55.4" },
     { name = "triton", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "triton", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
+    { name = "uvloop", marker = "extra == 'dynamo'" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.0" },
+    { name = "vllm", extras = ["flashinfer"], marker = "extra == 'dynamo'", specifier = "==0.11.0" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore", "penguin"]
+provides-extras = ["automodel", "vllm", "mcore", "penguin", "dynamo"]
 
 [package.metadata.requires-dev]
 build = [
@@ -3493,6 +3525,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/95/97/51359c77527d45943fe7a94d00a3843b81162e6c4244b3579fe8fc54cb9c/ninja-1.13.0-py3-none-win32.whl", hash = "sha256:8cfbb80b4a53456ae8a39f90ae3d7a2129f45ea164f43fadfa15dc38c4aef1c9", size = 267201, upload-time = "2025-08-11T15:10:15.158Z" },
     { url = "https://files.pythonhosted.org/packages/29/45/c0adfbfb0b5895aa18cec400c535b4f7ff3e52536e0403602fc1a23f7de9/ninja-1.13.0-py3-none-win_amd64.whl", hash = "sha256:fb8ee8719f8af47fed145cced4a85f0755dd55d45b2bddaf7431fa89803c5f3e", size = 309975, upload-time = "2025-08-11T15:10:16.697Z" },
     { url = "https://files.pythonhosted.org/packages/df/93/a7b983643d1253bb223234b5b226e69de6cda02b76cdca7770f684b795f5/ninja-1.13.0-py3-none-win_arm64.whl", hash = "sha256:3c0b40b1f0bba764644385319028650087b4c1b18cdfa6f45cb39a3669b81aa9", size = 290806, upload-time = "2025-08-11T15:10:18.018Z" },
+]
+
+[[package]]
+name = "nixl"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/24/3c08a12967ad9809dd01a4a6fed16fb3ef8e1ddfb011f0da26f8f5eeea74/nixl-0.7.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:86d96e8f5637cf2de861273be4d305a0a3b8ab32317d96f8262108c0249d16f1", size = 22674274, upload-time = "2025-10-24T19:18:54.481Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/b4/3fba8da135f99e63807e4b57d9c9a098c1c02730bb057ec299bb74648790/nixl-0.7.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:9a825f38057c352d1a2ca77fea423d9f2e8c751892aedfa590723ce9c739ffcd", size = 23615784, upload-time = "2025-10-24T19:21:08.638Z" },
 ]
 
 [[package]]
@@ -3637,6 +3683,19 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/51/e123d997aa098c61d029f76663dedbfb9bc8dcf8c60cbd6adbe42f76d049/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:949452be657fa16687d0930933f032835951ef0892b37d2d53824d1a84dc97a8", size = 706758467, upload-time = "2025-06-06T21:54:08.597Z" },
+]
+
+[[package]]
+name = "nvidia-cudnn-frontend"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/39/79b606e805abd67ab4fa72f752a5413a496159f10d94fbdb1d67bb5ae86c/nvidia_cudnn_frontend-1.16.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dd6fdd71c0896ff2ca1809d914cbd17f2904d55863f8881f47946e1d634c7a88", size = 1839271, upload-time = "2025-11-07T01:29:53.06Z" },
+    { url = "https://files.pythonhosted.org/packages/09/21/a0e0d50ba8d7b639fe635500fee0d9c0319561b1ae72176d7024ec04b439/nvidia_cudnn_frontend-1.16.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:16efb069d4bda4d3b99134f59f376cfd4d09558298bd96af778fdc7f2851e696", size = 1954062, upload-time = "2025-11-07T01:32:18.556Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/d6/30ae67bb9c010e9459d1211c56d73373eb4e3dd9f57f4c3c1fe0966efcb1/nvidia_cudnn_frontend-1.16.0-cp312-cp312-win_amd64.whl", hash = "sha256:7b7860db03767c158accbe0b4e9c9553506513cc970ff08ed28c7761681ac466", size = 1368435, upload-time = "2025-11-07T01:26:28.022Z" },
+    { url = "https://files.pythonhosted.org/packages/32/2c/b4376afef0a6342c56e82e3465c1f8f5c719f588293a50dd04019a22ae6e/nvidia_cudnn_frontend-1.16.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b6bcb3a2fbff80538958e21e2227520f082a961164865aaeedaac527f61084f9", size = 1839805, upload-time = "2025-11-07T01:30:31.056Z" },
+    { url = "https://files.pythonhosted.org/packages/71/13/836b90354036154ab82db3861210e5736983fe1fc44bb39c146ad93b333b/nvidia_cudnn_frontend-1.16.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cbdad88b2bec5dde837f8fa7632022334cddb4756f923b5421c06a712cb59d31", size = 1953953, upload-time = "2025-11-07T01:33:03.781Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/30/3025f34f2c86ceef85134dc1f323f8cf2a26d3ffddc5ada48528c80bfae1/nvidia_cudnn_frontend-1.16.0-cp313-cp313-win_amd64.whl", hash = "sha256:138de2bc4697fabb2eb2f0f601a7e31f8fe97874908e26e33d737276f335473c", size = 1368359, upload-time = "2025-11-07T01:26:51.561Z" },
 ]
 
 [[package]]
@@ -4378,11 +4437,11 @@ wheels = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.22.1"
+version = "0.23.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5e/cf/40dde0a2be27cc1eb41e333d1a674a74ce8b8b0457269cc640fd42b07cf7/prometheus_client-0.22.1.tar.gz", hash = "sha256:190f1331e783cf21eb60bca559354e0a4d4378facecf78f5428c39b675d20d28", size = 69746, upload-time = "2025-06-02T14:29:01.152Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/53/3edb5d68ecf6b38fcbcc1ad28391117d2a322d9a1a3eff04bfdb184d8c3b/prometheus_client-0.23.1.tar.gz", hash = "sha256:6ae8f9081eaaaf153a2e959d2e6c4f4fb57b12ef76c8c7980202f1e57b48b2ce", size = 80481, upload-time = "2025-09-18T20:47:25.043Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/ae/ec06af4fe3ee72d16973474f122541746196aaa16cea6f66d18b963c6177/prometheus_client-0.22.1-py3-none-any.whl", hash = "sha256:cca895342e308174341b2cbf99a56bef291fbc0ef7b9e5412a0f26d653ba7094", size = 58694, upload-time = "2025-06-02T14:29:00.068Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/db/14bafcb4af2139e046d03fd00dea7873e48eafe18b7d2797e73d6681f210/prometheus_client-0.23.1-py3-none-any.whl", hash = "sha256:dd1913e6e76b59cfe44e7a4b83e01afc9873c1bdfd2ed8739f1e76aeca115f99", size = 61145, upload-time = "2025-09-18T20:47:23.875Z" },
 ]
 
 [[package]]
@@ -6134,6 +6193,15 @@ wheels = [
 ]
 
 [[package]]
+name = "tabulate"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/fe/802052aecb21e3797b8f7902564ab6ea0d60ff8ca23952079064155d1ae1/tabulate-0.9.0.tar.gz", hash = "sha256:0095b12bf5966de529c0feb1fa08671671b3368eec77d7ef7ab114be2c068b3c", size = 81090, upload-time = "2022-10-06T17:21:48.54Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/44/4a5f08c96eb108af5cb50b41f76142f0afa346dfa99d5296fe7202a11854/tabulate-0.9.0-py3-none-any.whl", hash = "sha256:024ca478df22e9340661486f85298cff5f6dcdba14f3813e8830015b9ed1948f", size = 35252, upload-time = "2022-10-06T17:21:44.262Z" },
+]
+
+[[package]]
 name = "tdigest"
 version = "0.5.2.2"
 source = { registry = "https://pypi.org/simple" }
@@ -6880,6 +6948,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/82/5a/36d2351206f4d8d87
 wheels = [
     { url = "https://files.pythonhosted.org/packages/47/33/d19e0763c34392ec956534536fa837c060495bfff31ed83452135ea7608d/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl", hash = "sha256:3861c75ff2b12e24f6d179ff5c084d791b42ded8675d76c8706697c79f68cd62", size = 438217982, upload-time = "2025-10-04T01:39:32.382Z" },
     { url = "https://files.pythonhosted.org/packages/d7/bf/973444bb959fc7acbbeb3d226bd4d135dcd49b6af174b29aab1b50e2d710/vllm-0.11.0-cp38-abi3-manylinux2014_aarch64.whl", hash = "sha256:52369c9ee949944354bdc7afc88ded2d1ed02b098bf90db06cf80098a19787b7", size = 401003969, upload-time = "2025-10-04T01:39:50.251Z" },
+]
+
+[package.optional-dependencies]
+flashinfer = [
+    { name = "flashinfer-python" },
 ]
 
 [[package]]

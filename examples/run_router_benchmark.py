@@ -118,18 +118,29 @@ def create_temp_benchmark_dataset(max_samples: int, max_seq_length: int, seed: i
         raise ValueError("max_samples must be positive")
 
     logger.info(
-        "Creating synthetic dataset: %s samples, max sequence length %s",
+        "Creating synthetic dataset with repetitive samples: %s samples, max sequence length %s",
         max_samples,
         max_seq_length,
     )
 
+    # Create a small number of unique patterns that will be repeated
+    num_unique_patterns = min(10, max_samples)  # Use 10 unique patterns or fewer
     rng = np.random.default_rng(seed)
-    input_ids = rng.integers(1, 1000, size=(max_samples, max_seq_length), dtype=np.int64)
+    
+    # Generate unique patterns
+    unique_input_ids = rng.integers(1, 1000, size=(num_unique_patterns, max_seq_length), dtype=np.int64)
+    
+    # Repeat patterns to fill max_samples
+    input_ids = np.tile(unique_input_ids, (max_samples // num_unique_patterns + 1, 1))[:max_samples]
+    
+    # Create repetitive lengths that cycle through a small set of values
     base_length = min(max_seq_length, 150)
     input_lengths = np.array(
         [max(1, min(max_seq_length, base_length - (i % 3))) for i in range(max_samples)],
         dtype=np.int64,
     )
+
+    logger.info(f"Created {max_samples} samples from {num_unique_patterns} unique patterns")
 
     return {
         "input_ids": input_ids,
