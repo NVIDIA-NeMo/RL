@@ -463,9 +463,6 @@ class MegatronPolicyWorker:
         }
         self.dtype = dtype_map[self.cfg["precision"]]
 
-        # Initialize generation step counter for seed calculation
-        self.generation_step = 0
-
         self.optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
             "optimizer_cpu_offload"
         ]
@@ -1864,10 +1861,7 @@ class MegatronPolicyWorker:
         local_rank = torch.cuda.current_device()  # Local GPU index on the node
         num_gpus_per_node = torch.cuda.device_count()
         node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        seed = (node_idx * 1024 * 10000) + (self.generation_step * 1024) + local_rank
-
-        # Increment generation step counter for next call
-        self.generation_step += 1
+        seed = (node_idx * 1024) + local_rank
 
         dynamic_engine = DynamicInferenceEngine(
             controller=text_generation_controller,
