@@ -396,9 +396,36 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
+def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
+    assert layer.weight_block_size is not None
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import (
+        is_deep_gemm_e8m0_used,
+        should_use_deepgemm_for_fp8_linear,
+    )
+
+    # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
+    # requantize the weight and input to the specific scale
+    # at the same time.
+    should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
+        layer.orig_dtype, layer.weight
+    )
+    if should_use_deepgemm:
+        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=layer.weight.data,
+            ws=layer.weight_scale.data,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
+        )
+        layer.weight.data.copy_(dg_weight)
+        layer.weight_scale.data.copy_(dg_weight_scale)
+
+
 def process_weights_after_loading(self, layer) -> None:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        maybe_post_process_fp8_weight_block,
         process_fp8_weight_block_strategy,
     )
 
@@ -416,7 +443,7 @@ def process_weights_after_loading(self, layer) -> None:
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
         layer.update_param_tp_status()
 
-    maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+    maybe_post_process_fp8_weight_block(layer)
 
 
 @triton.jit
