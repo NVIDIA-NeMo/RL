@@ -28,7 +28,23 @@ from pydantic import BaseModel
 
 from dynamo._core import RadixTree, ZmqKvEventListener
 
+# Configure logger to write to file
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create file handler
+file_handler = logging.FileHandler("standalone_router.log", mode="a")
+file_handler.setLevel(logging.DEBUG)
+
+# Create formatter
+formatter = logging.Formatter(
+    "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+file_handler.setFormatter(formatter)
+
+# Add handler to logger
+logger.addHandler(file_handler)
 
 
 class RouterRequest(BaseModel):
@@ -101,13 +117,22 @@ class KvRouter:
         
         logger.info("Router initialized")
 
-    async def start_background_tasks(self):
-        """Start background tasks for load and indexer updates"""
+    async def start_background_tasks(self, enable_kv_indexer: bool = True):
+        """Start background tasks for load and indexer updates
+        
+        Args:
+            enable_kv_indexer: If False, skip KV event tracking (useful for round-robin routing)
+        """
         logger.info("Starting router background tasks...")
         self.background_tasks.append(asyncio.create_task(self.periodic_update_load()))
-        self.background_tasks.append(
-            asyncio.create_task(self.periodic_update_indexer())
-        )
+        
+        if enable_kv_indexer:
+            self.background_tasks.append(
+                asyncio.create_task(self.periodic_update_indexer())
+            )
+            logger.info("KV indexer enabled (for KV-aware routing)")
+        else:
+            logger.info("KV indexer disabled (round-robin mode - no KV tracking needed)")
 
     async def periodic_update_load(self):
         async def update_load(worker_id: int):
@@ -159,6 +184,7 @@ class KvRouter:
             events_failed_count = 0
             
             try:
+                logger.info(f"[periodic_update_indexer] Starting indexer update task for worker {worker_id}")
                 while True:
                     try:
                         logger.debug(f"Polling for KV events from worker {worker_id}...")
@@ -176,6 +202,16 @@ class KvRouter:
                             try:
                                 event_dict = json.loads(event)
                                 event_type = event_dict.get("type", "unknown")
+                                
+                                # Debug: Log hash info for add_block events
+                                if event_type == "add_block" and idx < 2:  # Only log first 2 events
+                                    block_hash = event_dict.get("hash", "N/A")
+                                    parent_hash = event_dict.get("parent_hash", "N/A")
+                                    logger.info(
+                                        f"[KV Event DEBUG] Worker {worker_id} add_block: "
+                                        f"hash={block_hash}, parent_hash={parent_hash}"
+                                    )
+                                
                                 logger.debug(
                                     f"Worker {worker_id} event {idx+1}/{len(kv_events)}: "
                                     f"type={event_type}"
@@ -206,9 +242,17 @@ class KvRouter:
                         logger.debug(f"No KV events available for worker {worker_id} (timeout)")
                         pass
                     except Exception as e:
-                        logger.warning(
-                            f"Error receiving KV events for worker {worker_id}: {e}"
-                        )
+                        # Downgrade "Failed to find parent block" to DEBUG level
+                        # This is expected in round-robin routing or with diverse prompts
+                        error_msg = str(e)
+                        if "Failed to find parent block" in error_msg:
+                            logger.debug(
+                                f"KV event for worker {worker_id}: {e} (expected in round-robin mode)"
+                            )
+                        else:
+                            logger.warning(
+                                f"Error receiving KV events for worker {worker_id}: {e}"
+                            )
 
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
@@ -246,7 +290,15 @@ class KvRouter:
                 raise ValueError("num_tokens must be positive")
 
             # local_hashes can be empty
+            logger.debug(
+                f"[get_best_worker] num_tokens={num_tokens}, "
+                f"num_hashes={len(local_hashes)}, "
+                f"first_3_hashes={local_hashes[:3] if local_hashes else []}"
+            )
             raw_scores = self.radix_tree.find_matches(local_hashes).scores
+            logger.debug(
+                f"[get_best_worker] raw_scores from RadixTree: {raw_scores}"
+            )
 
             overlap_scores = {
                 worker_id: raw_scores.get(worker_id, 0) * self.block_size / num_tokens
@@ -320,6 +372,13 @@ class KvRouter:
                 listener.close()
             except Exception as e:
                 logger.error(f"Error closing load listener: {e}")
+        
+        # Close KV event listeners
+        for listener in self.kv_listeners:
+            try:
+                listener.close()
+            except Exception as e:
+                logger.error(f"Error closing KV listener: {e}")
 
         # Terminate ZMQ context
         try:

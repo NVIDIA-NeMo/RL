@@ -757,14 +757,19 @@ class VllmGeneration(GenerationInterface):
         ):
             yield result
     
-    async def start_router(self) -> bool:
-        """Start the router background tasks if router is enabled."""
+    async def start_router(self, enable_kv_indexer: bool = True) -> bool:
+        """Start the router background tasks if router is enabled.
+        
+        Args:
+            enable_kv_indexer: If False, skip KV event tracking (useful for round-robin routing)
+        """
         if not self.router_enabled or self.router is None:
             return True
 
         try:
-            print("[INFO] Starting KvRouter background tasks...")
-            await self.router.start_background_tasks()
+            mode_str = "KV-aware" if enable_kv_indexer else "round-robin"
+            print(f"[INFO] Starting KvRouter background tasks ({mode_str} mode)...")
+            await self.router.start_background_tasks(enable_kv_indexer=enable_kv_indexer)
             print("[INFO] KvRouter started successfully")
             return True
         except Exception as e:
@@ -845,8 +850,8 @@ class VllmGeneration(GenerationInterface):
         """Shut down all vLLM workers, router, and clean up resources."""
         success = True
         
-        # Shutdown router first if enabled
-        if self.router_enabled and self.router is not None:
+        # Shutdown router first if enabled (use hasattr for safety in case of partial initialization)
+        if hasattr(self, 'router_enabled') and self.router_enabled and hasattr(self, 'router') and self.router is not None:
             try:
                 # Router shutdown is async, so we need to run it in an event loop
                 import asyncio
@@ -865,14 +870,15 @@ class VllmGeneration(GenerationInterface):
                 print(f"Error shutting down router: {e}")
                 success = False
         
-        # Shutdown workers
-        try:
-            # Use the worker group's shutdown method with the worker's cleanup method
-            worker_success = self.worker_group.shutdown(cleanup_method="shutdown")
-            success = success and worker_success
-        except Exception as e:
-            print(f"Error during policy shutdown: {e}")
-            success = False
+        # Shutdown workers (use hasattr for safety in case of partial initialization)
+        if hasattr(self, 'worker_group') and self.worker_group is not None:
+            try:
+                # Use the worker group's shutdown method with the worker's cleanup method
+                worker_success = self.worker_group.shutdown(cleanup_method="shutdown")
+                success = success and worker_success
+            except Exception as e:
+                print(f"Error during policy shutdown: {e}")
+                success = False
             
         return success
 
