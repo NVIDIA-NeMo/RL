@@ -237,6 +237,7 @@ class SGLangGenerationWorker:
             "dtype", "kv_cache_dtype", "context_length", "max_running_requests",
             "chunked_prefill_size", "max_prefill_tokens", "schedule_policy",
             "schedule_conservativeness", "cpu_offload_gb", "log_level",
+            "mem_fraction_static",
         ]:
             if key in self.cfg:
                 kwargs[key] = self.cfg[key]
@@ -382,8 +383,6 @@ class SGLangGenerationWorker:
                     raise Exception(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
 
                 time.sleep(2)
-        # response = session.get(f"{self.base_url}/get_model_info", headers=headers)
-        # print(f"[SGLang Worker] Rank {self.global_rank} model_info: {response.json()}")
         return p
 
     
