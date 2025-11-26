@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
+import numpy as np
 import ray
 import requests
 import swanlab
@@ -939,6 +940,7 @@ class Logger(LoggerInterface):
         self,
         metrics: dict[int, list[Any]],
         step: int,
+        prefix: str,
         name: str,
         timeline_interval: float,
     ) -> None:
@@ -963,6 +965,7 @@ class Logger(LoggerInterface):
                 f"timeline_interval must be positive; received {timeline_interval}"
             )
 
+        # Plot the per-worker timeline metrics
         x_series: list[list[float]] = []
         y_series: list[list[float]] = []
         series_labels: list[str] = []
@@ -993,7 +996,25 @@ class Logger(LoggerInterface):
         fig.tight_layout()
 
         for logger in self.loggers:
-            logger.log_plot(fig, step, f"{name}")
+            logger.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        plt.close(fig)
+
+        # Plot the average of the metrics
+        min_length = min(len(v) for v in metrics.values())
+        x_series = [i * timeline_interval for i in range(min_length)]
+        truncated_y_serise = [v[:min_length] for v in y_series]
+
+        avg_y_serise = np.mean(truncated_y_serise, axis=0)
+
+        fig, ax = plt.subplots()
+        ax.plot(x_series, avg_y_serise, label="average")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (average)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/average_{name}")
         plt.close(fig)
 
     def log_plot_token_mult_prob_error(
