@@ -514,7 +514,7 @@ def setup(
                 "Async rollouts is not supported with kv cache fp8 enabled."
             )
             assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
+                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
             )
 
         ## make vllm hf overrides match the training policy
