@@ -1723,6 +1723,11 @@ class DTensorPolicyWorkerV2:
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1759,6 +1764,11 @@ class DTensorPolicyWorkerV2:
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
