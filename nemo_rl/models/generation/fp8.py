@@ -396,6 +396,9 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
+# Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
+# Patches this method to not create new torch.nn.Parameter for layer weights
+# to maintain weight loaders.
 def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     assert layer.weight_block_size is not None
 
@@ -420,6 +423,8 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
         )
+        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
+        # Instead of creating new torch.nn.Parameter, we update the data in place.
         layer.weight.data.copy_(dg_weight)
         layer.weight_scale.data.copy_(dg_weight_scale)
 
