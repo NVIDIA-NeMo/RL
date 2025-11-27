@@ -1,0 +1,59 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: -1
+loss_fn:
+  reference_policy_kl_penalty: 0.04
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo_megatron
+  save_period: 10000
+policy:
+  model_name: moonshotai/Moonlight-16B-A3B-Instruct
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    algorithm: modified_ffd
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    moe_router_dtype: fp32
+    expert_model_parallel_size: 4
+    pipeline_model_parallel_size: 4
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    apply_rope_fusion: false
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    optimizer:
+      lr: 1.0e-06
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_warmup_iters: 50
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: '1'
+  generation:
+    vllm_cfg:
+      precision: fp8
+      use_deep_gemm: true
+      gpu_memory_utilization: 0.5
+      expert_parallel_size: 4
+      quantization_ignored_layer_kws: [
+        a_proj,
+        b_proj
+      ]
+logger:
+  monitor_gpus: false
+  wandb:
+    name: grpo-moonlight-16B-A3B-Instruct
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
