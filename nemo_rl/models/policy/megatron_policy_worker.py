@@ -24,67 +24,6 @@ from typing import Any, Iterator, Optional, TypeVar
 import ray
 import torch
 import zmq
-
-def _apply_transformer_engine_patch():
-    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files."""
-    try:
-        import transformer_engine
-
-        te_path = os.path.dirname(transformer_engine.__file__)
-        perm_file = os.path.join(te_path, "pytorch", "triton", "permutation.py")
-
-        if not os.path.exists(perm_file):
-            return
-
-        with open(perm_file, "r") as f:
-            content = f.read()
-
-        if "get_int_dtype = triton.constexpr_function(get_int_dtype)" not in content:
-            print(f"Applying Triton fix to {perm_file}...")
-
-            # 1. Replace the usage
-            old_usage = "idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
-            new_usage = "idtype = get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
-
-            # 2. Insert the definition before the first @triton.jit
-            jit_anchor = "@triton.jit"
-
-            new_definition = (
-                "\n\n"
-                "get_int_dtype = core.get_int_dtype\n"
-                "get_int_dtype = triton.constexpr_function(get_int_dtype)\n"
-            )
-
-            new_content = None
-            if old_usage in content:
-                temp_content = content.replace(old_usage, new_usage)
-
-                if jit_anchor in temp_content:
-                    new_content = temp_content.replace(
-                        jit_anchor, new_definition + jit_anchor, 1
-                    )
-
-            if new_content:
-                try:
-                    with open(perm_file, "w") as f:
-                        f.write(new_content)
-                    print("Successfully patched transformer_engine.")
-                except OSError as e:
-                    print(
-                        f"Could not write patch to transformer_engine (permission denied?): {e}"
-                    )
-            else:
-                print("Could not find patch locations in permutation.py")
-
-    except (ImportError, FileNotFoundError, AttributeError):
-        pass
-    except Exception as e:
-        print(f"Error checking/patching transformer_engine: {e}")
-
-
-_apply_transformer_engine_patch()
-
-
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.training import fault_tolerance
