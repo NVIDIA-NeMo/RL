@@ -1075,7 +1075,9 @@ def grpo_train(
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
-                    if policy_generation is not None:
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "clear_vllm_logger_metrics"
+                    ):
                         policy_generation.clear_vllm_logger_metrics()
                     # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                     if _should_use_penguin(master_config):
@@ -1916,7 +1918,9 @@ def async_grpo_train(
     print("✅ All setup complete, starting buffer wait...")
 
     # Clear vLLM logger metrics after at start of training
-    if policy_generation is not None:
+    if policy_generation is not None and hasattr(
+        policy_generation, "clear_vllm_logger_metrics"
+    ):
         policy_generation.clear_vllm_logger_metrics()
 
     # Wait for initial buffer fill
@@ -2182,7 +2186,9 @@ def async_grpo_train(
                         trajectory_collector.resume_after_refit.remote()
 
                 # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
-                if policy_generation is not None:
+                if policy_generation is not None and hasattr(
+                    policy_generation, "clear_vllm_logger_metrics"
+                ):
                     policy_generation.clear_vllm_logger_metrics()
 
                 # Validation
