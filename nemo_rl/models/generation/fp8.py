@@ -107,112 +107,6 @@ def monkey_patch_vllm_ray_executor(fp8_config):
         fp8_patches_applied = True
 
 
-def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-    """Modified version of BaseKVCacheMethod.process_weights_after_loading.
-
-    Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
-    for dynamic updates during refit.
-    """
-    import torch
-    from vllm.logger import init_logger
-    from vllm.platforms import current_platform
-
-    logger = init_logger(__name__)
-
-    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
-    # regardless whether the kv-scale is available in the checkpoint.
-    if layer.kv_cache_dtype != "auto":
-        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
-            # We prefer to use separate k_scale and v_scale if present
-            k_scale = layer.k_scale.to("cpu").tolist()
-            v_scale = layer.v_scale.to("cpu").tolist()
-            if current_platform.is_fp8_fnuz():
-                k_scale *= 2
-                v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-            # If no scales were loaded (both scales are invalid negative
-            # values), use the default value of 1.0
-            k_scale = 1.0
-            v_scale = 1.0
-        else:
-            # If we find a single kv_scale in the checkpoint, we remap
-            # kv_scale to k_scale during weight loading, and duplicate
-            # k_scale to v_scale here
-            assert layer.k_scale > 0.0
-            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
-            k_scale = scale_to_duplicate.to("cpu").tolist()
-            v_scale = scale_to_duplicate.to("cpu").tolist()
-            if current_platform.is_fp8_fnuz():
-                k_scale *= 2
-                v_scale *= 2
-
-        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
-            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
-
-        if layer.q_scale < 0.0:
-            logger.warning_once(
-                "Checkpoint does not provide a q scaling factor. "
-                "Setting it to k_scale. This only matters for "
-                "the flash-attn backend."
-            )
-            layer._q_scale.copy_(k_scale)
-            layer._q_scale_float = k_scale
-
-        # These are used in the final Attention.forward()
-        layer._k_scale.copy_(k_scale)
-        layer._v_scale.copy_(v_scale)
-        layer._k_scale_float = k_scale
-        layer._v_scale_float = v_scale
-        if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
-            logger.warning_once(
-                "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
-                "may cause accuracy issues. Please make sure k/v_scale "
-                "scaling factors are available in the fp8 checkpoint."
-            )
-
-    if layer.q_scale > 0.0:
-        q_scale = layer.q_scale
-        if current_platform.is_fp8_fnuz():
-            q_scale *= 2
-    else:
-        q_scale = 1.0
-    if layer.prob_scale > 0.0:
-        prob_scale = layer.prob_scale
-        if current_platform.is_fp8_fnuz():
-            prob_scale *= 2
-    else:
-        prob_scale = 1.0
-
-    is_singleton_float = (
-        lambda x: isinstance(x, float)
-        or isinstance(x, torch.Tensor)
-        and x.numel() == 1
-        and x.is_floating_point()
-    )
-    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
-        raise ValueError(
-            "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
-        )
-
-    # These are used in the final Attention.forward()
-    layer._q_scale.copy_(q_scale)
-    layer._q_scale_float = (
-        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
-    )
-
-    layer._prob_scale.copy_(prob_scale)
-    if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
-        logger.warning_once(
-            f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
-            f"{prob_scale} with fp8 attention. This may cause accuracy "
-            "issues. Please make sure q/prob scaling factors are "
-            "available in the fp8 checkpoint."
-        )
-
-    # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
-    # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
-
-
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
     """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
 
@@ -316,6 +210,9 @@ def apply_fp8_patches(self, fp8_config):
         func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher1 = patch(func1_path, process_weights_after_loading)
         fp8_state.vllm_patches.append(patcher1)
+        func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+        patcher2 = patch(func2_path, process_weights_after_loading_moe)
+        fp8_state.vllm_patches.append(patcher2)
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -332,32 +229,8 @@ def apply_fp8_patches(self, fp8_config):
     if global_fp8_config.kv_cache_dtype == "fp8":
         # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
+        patcher5 = patch(func5_path, process_weights_after_loading_kv)
         fp8_state.vllm_patches.append(patcher5)
-    # This patch is used to support torch.compile with vllm parameter subclasses, such as
-    # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
-    # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
-    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
-    # which this patch can be removed.
-    func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
-    patcher1 = patch(func1_path, process_weights_after_loading)
-    fp8_state.vllm_patches.append(patcher1)
-    func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
-    patcher2 = patch(func2_path, process_weights_after_loading_moe)
-    fp8_state.vllm_patches.append(patcher2)
-    func3_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-    patcher3 = patch(func3_path, process_weights_after_loading_kv)
-    fp8_state.vllm_patches.append(patcher3)
-    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
-    # SNR compared to plain fp32 scaling factors. This feature is still under active research.
-    if global_fp8_config.use_activation_pow2_scale:
-        func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
-        func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
-        func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
-        patcher2 = patch(func2_path, per_token_group_quant_fp8)
-        patcher3 = patch(func3_path, _per_token_group_quant_fp8)
-        patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-        fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -763,6 +636,11 @@ def process_weights_after_loading_moe(self, layer) -> None:
 
 
 def process_weights_after_loading_kv(self, layer) -> None:
+    """Modified version of BaseKVCacheMethod.process_weights_after_loading.
+
+    Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
+    for dynamic updates during refit.
+    """
     # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
     # regardless whether the kv-scale is available in the checkpoint.
     # No need to process kv scales after loading if we are going to
@@ -839,6 +717,9 @@ def process_weights_after_loading_kv(self, layer) -> None:
     )
 
     layer._prob_scale.copy_(prob_scale)
+
+    # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
+    # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
 
 
 @triton.jit
