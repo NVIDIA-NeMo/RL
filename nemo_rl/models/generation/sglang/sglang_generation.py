@@ -275,6 +275,56 @@ class SGLangGeneration(GenerationInterface):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         return []
+
+    def get_sglang_server_urls(self) -> list[str]:
+        """Get base URLs of all SGLang servers.
+        
+        Returns:
+            List of base URLs (e.g., ["http://localhost:30000", "http://localhost:30001"])
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        
+        # Get base URLs from all workers (only primary workers, TP rank 0)
+        # Use run_rank_0_only_axes to only get URLs from primary workers
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_base_url",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        urls = ray.get(futures)
+        # Filter out None values and return unique URLs
+        return list(set(url for url in urls if url is not None))
+
+    def get_sglang_url_to_gpu_uuids(self) -> dict[str, list[str]]:
+        """Get mapping from SGLang server URL to list of GPU UUIDs it uses.
+        
+        Returns:
+            Dict mapping server URL to list of GPU UUIDs
+            e.g., {"http://localhost:30000": ["GPU-aaa", "GPU-bbb"], ...}
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        
+        # Get base URLs and GPU UUIDs from all primary workers (TP rank 0)
+        futures_url = self.worker_group.run_all_workers_single_data(
+            "get_base_url",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        futures_uuids = self.worker_group.run_all_workers_single_data(
+            "get_gpu_uuids",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        
+        urls = ray.get(futures_url)
+        uuids_list = ray.get(futures_uuids)
+        
+        # Create mapping
+        url_to_uuids = {}
+        for url, uuids in zip(urls, uuids_list):
+            if url is not None and uuids is not None:
+                url_to_uuids[url] = uuids
+        
+        return url_to_uuids
    
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
