@@ -12,16 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import gc
 import importlib
 import os
+import pickle
 import traceback
 from enum import Enum
 from typing import Any, Dict, Optional
 
+import requests
 import torch
+import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -488,3 +495,241 @@ def rebuild_cuda_tensor_from_ipc(
     list_args = list(args)
     list_args[6] = device_id
     return func(*list_args)
+
+
+def stream_weights_via_http_impl(
+    params_generator,
+    sglang_url_to_gpu_uuids: dict[str, list[str]],
+    rank: int,
+    worker_name: str,
+    current_device_uuid: str,
+) -> None:
+    """Stream weights to SGLang servers via HTTP API (update_weights_from_tensor).
+    
+    Flow: Each rank creates IPC handler → gather handlers in rank order → send list → SGLang matches by tp_rank index
+    
+    Key points:
+    - Each rank creates handler on its own GPU
+    - Handlers are gathered in rank order: [rank0_handler, rank1_handler, ...]
+    - List index = rank = GPU ID
+    - SGLang automatically matches: handler = serialized_handlers[tp_rank]
+    
+    Args:
+        params_generator: Generator yielding (name, tensor) pairs
+        sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        rank: Worker rank for logging
+        worker_name: Name of the worker for logging
+        current_device_uuid: UUID of the current training worker's GPU
+    """
+    monkey_patch_torch_reductions()
+    
+    target_urls = [
+        url for url, uuids in sglang_url_to_gpu_uuids.items()
+        if current_device_uuid in uuids
+    ]
+    
+    if not target_urls:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): No matching SGLang server found for GPU UUID {current_device_uuid}. "
+            f"Available servers: {list(sglang_url_to_gpu_uuids.keys())}"
+        )
+    
+    if len(target_urls) > 1:
+        print(
+            f"[WARNING] {worker_name} (rank {rank}): GPU UUID {current_device_uuid} matches multiple SGLang servers: {target_urls}. "
+            f"Using the first one: {target_urls[0]}"
+        )
+        target_urls = [target_urls[0]]
+    
+    base_url = target_urls[0]
+    url = f"{base_url}/update_weights_from_tensor"
+    sglang_gpu_uuids = sglang_url_to_gpu_uuids[base_url]
+    
+    ipc_gather_group, ipc_gather_src = _setup_ipc_gather_group(
+        rank, current_device_uuid, sglang_gpu_uuids, sglang_url_to_gpu_uuids
+    )
+    
+    tensor_count = 0
+    
+    try:
+        for name, tensor in params_generator:
+            torch.cuda.current_stream().synchronize()
+            tensor = tensor.contiguous().cuda()
+            
+            serialized_handler = MultiprocessingSerializer.serialize(
+                tensor,
+                output_str=True
+            )
+            
+            gathered_handlers = _gather_ipc_handlers(
+                serialized_handler, ipc_gather_group, ipc_gather_src, rank
+            )
+            
+            if rank == ipc_gather_src:
+                _send_tensor_to_sglang(
+                    url, name, gathered_handlers, tensor.shape, str(tensor.dtype)
+                )
+                tensor_count += 1
+            
+            del tensor, serialized_handler
+            if rank == ipc_gather_src:
+                del gathered_handlers
+            torch.cuda.empty_cache()
+        
+        if rank == ipc_gather_src:
+            completion_payload = {"complete": True}
+            try:
+                response = requests.post(url, json=completion_payload, timeout=120)
+                response.raise_for_status()
+            except Exception as e:
+                raise RuntimeError(
+                    f"{worker_name} (rank {rank}): Failed to send completion to {url}: {e}"
+                ) from e
+        
+        if rank == 0:
+            print(
+                f"[sglang refit] {worker_name}: Sent {tensor_count} tensors to SGLang server: {base_url}",
+                flush=True
+            )
+    
+    except Exception as e:
+        print(
+            f"{worker_name} (rank {rank}): Error during HTTP weight streaming: {e}.\n"
+            f"{traceback.format_exc()}"
+        )
+        raise
+    
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _setup_ipc_gather_group(
+    rank: int,
+    current_device_uuid: str,
+    sglang_gpu_uuids: list[str],
+    sglang_url_to_gpu_uuids: dict[str, list[str]],
+) -> tuple[Optional[dist.ProcessGroup], Optional[int]]:
+    """Setup Gloo group for gathering IPC handlers from ranks in the same SGLang server.
+    
+    Returns:
+        Tuple of (gather_group, gather_src_rank) or (None, None) if not needed
+    """
+    if not dist.is_initialized():
+        return None, None
+    
+    world_size = dist.get_world_size()
+    my_rank = dist.get_rank()
+    
+    all_ranks_uuids = [None] * world_size
+    dist.all_gather_object(all_ranks_uuids, current_device_uuid)
+    
+    matching_ranks = [
+        r for r, uuid in enumerate(all_ranks_uuids)
+        if uuid in sglang_gpu_uuids
+    ]
+    
+    if len(matching_ranks) == 0:
+        return None, None
+    
+    matching_ranks = sorted(matching_ranks)
+    gather_src = matching_ranks[0]
+    
+    if my_rank in matching_ranks:
+        gather_group = dist.new_group(ranks=matching_ranks, backend="gloo")
+        return gather_group, gather_src
+    else:
+        return None, None
+
+
+def _gather_ipc_handlers(
+    serialized_handler: str,
+    gather_group: Optional[dist.ProcessGroup],
+    gather_src: Optional[int],
+    rank: int,
+) -> Optional[list[str]]:
+    """Gather IPC handlers from all ranks in the group to gather_src rank.
+    
+    Key: dist.gather_object automatically arranges by rank order
+    Result: gathered_handlers[0] = rank0_handler, gathered_handlers[1] = rank1_handler
+    Index = rank = GPU ID, automatically matched by SGLang tp_rank
+    
+    Returns:
+        List of serialized handlers in rank order (only on gather_src rank), None otherwise
+    """
+    if gather_group is None or gather_src is None:
+        return None
+    
+    if not dist.is_initialized():
+        return None
+    
+    world_size = dist.get_world_size(gather_group)
+    
+    if rank == gather_src:
+        gathered_handlers = [None] * world_size
+    else:
+        gathered_handlers = None
+    
+    dist.gather_object(
+        obj=serialized_handler,
+        object_gather_list=gathered_handlers,
+        dst=gather_src,
+        group=gather_group,
+    )
+    
+    return gathered_handlers
+
+
+def _send_tensor_to_sglang(
+    url: str,
+    tensor_name: str,
+    gathered_handlers: list[str],
+    shape: torch.Size,
+    dtype: str,
+) -> None:
+    """Send gathered IPC handlers to SGLang server via HTTP.
+    
+    Key: gathered_handlers are in rank order [rank0, rank1, ...]
+    SGLang will automatically match: handler = serialized_handlers[tp_rank]
+    
+    Args:
+        url: SGLang server URL
+        tensor_name: Name of the tensor
+        gathered_handlers: List of serialized IPC handlers in rank order
+        shape: Tensor shape
+        dtype: Tensor dtype
+    """
+    encoded_handlers = [
+        base64.b64encode(handler.encode('utf-8')).decode('utf-8')
+        for handler in gathered_handlers
+    ]
+    
+    payload = {
+        "tensor_name": tensor_name,
+        "shape": list(shape),
+        "dtype": dtype,
+        "serialized_handlers": encoded_handlers,
+    }
+    
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+        )
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"Failed to send tensor '{tensor_name}' to {url}: {e}"
+        try:
+            error_detail = response.text
+            error_msg += f"\nResponse status: {response.status_code}"
+            error_msg += f"\nResponse body: {error_detail[:500]}"
+        except:
+            pass
+        print(f"[sglang refit] {error_msg}", flush=True)
+        raise RuntimeError(error_msg) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to send tensor '{tensor_name}' to {url}: {e}"
+        ) from e
