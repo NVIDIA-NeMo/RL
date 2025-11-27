@@ -23,6 +23,9 @@ tests/test_suites/llm/dapo-qwen2.5-7b.sh
 # Deepseek-V3 on DAPO dataset
 tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron.sh
 
+# GPT-OSS
+tests/test_suites/llm/grpo-gptoss-20b-8n8g-megatron.sh
+
 #######
 # SFT #
 #######
