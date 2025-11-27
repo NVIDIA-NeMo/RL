@@ -112,22 +112,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             return f"{self.__class__.__qualname__}"
 
-    def print0(self, msg):
-        if self.rank == 0:
-            print(f"{msg}")
-
-    def print_frozen_params_info(self, model: nn.Module):
-        total_frozen_params = 0
-        num_frozen_layers = 0
-        total_params = 0
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                total_frozen_params += param.numel()
-                num_frozen_layers += 1
-            total_params += param.numel()
-        self.print0(
-            f"Total frozen parameters: {total_frozen_params:,} / {total_params:,} ({num_frozen_layers} layers, {total_frozen_params / total_params * 100:.2f}%)"
-        )
 
     def __init__(
         self,
@@ -205,10 +189,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             **hf_config_overrides,
         )
 
-        self.print0(
-            f"DEBUG: Model config torch_dtype={model_config.torch_dtype}, self.dtype={self.dtype}, precision={self.cfg['precision']}"
-        )
-
         self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
             model_config
         )
@@ -271,54 +251,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 torch_dtype=str(model_config.torch_dtype),
             )
 
-            # Debug: Check dtypes after from_pretrained on rank 0
-            self.print0("DEBUG: Checking parameter dtypes after from_pretrained")
-            param_dtypes_after_load = {}
-            for name, param in model.named_parameters():
-                dtype_str = str(param.dtype)
-                if dtype_str not in param_dtypes_after_load:
-                    param_dtypes_after_load[dtype_str] = []
-                param_dtypes_after_load[dtype_str].append(name)
-
-            self.print0("Parameter dtype distribution after from_pretrained:")
-            for dtype_str, names in param_dtypes_after_load.items():
-                self.print0(f"  {dtype_str}: {len(names)} parameters")
-
             if self.peft_config is not None:
                 apply_lora_to_linear_modules(model, copy.deepcopy(self.peft_config))
-
-                # Debug: Check dtypes after LoRA application on rank 0
-                self.print0("DEBUG: Checking parameter dtypes after LoRA on rank 0")
-                param_dtypes_after_lora = {}
-                for name, param in model.named_parameters():
-                    dtype_str = str(param.dtype)
-                    if dtype_str not in param_dtypes_after_lora:
-                        param_dtypes_after_lora[dtype_str] = []
-                    param_dtypes_after_lora[dtype_str].append(name)
-
-                self.print0("Parameter dtype distribution after LoRA:")
-                for dtype_str, names in param_dtypes_after_lora.items():
-                    self.print0(f"  {dtype_str}: {len(names)} parameters")
-                    if len(names) <= 10:
-                        for name in names:
-                            self.print0(f"    - {name}")
 
             full_state_dict = model.state_dict()
             # Store the original model state dict keys before any parallelization
             model_state_dict_keys = list(full_state_dict.keys())
-
-            # Debug: Check dtypes in state dict before broadcast
-            self.print0("DEBUG: Checking state dict dtypes before broadcast")
-            state_dict_dtypes = {}
-            for name, tensor in full_state_dict.items():
-                dtype_str = str(tensor.dtype)
-                if dtype_str not in state_dict_dtypes:
-                    state_dict_dtypes[dtype_str] = []
-                state_dict_dtypes[dtype_str].append(name)
-
-            self.print0("State dict dtype distribution:")
-            for dtype_str, names in state_dict_dtypes.items():
-                self.print0(f"  {dtype_str}: {len(names)} tensors")
 
             del model
 
@@ -340,34 +278,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 torch_dtype=str(model_config.torch_dtype),
             )
             if self.lora_enabled:
-                self.print0("Before LoRA:")
-                self.print0(self.model)
                 apply_lora_to_linear_modules(self.model, copy.deepcopy(self.peft_config))
-                self.print0("After LoRA:")
-                self.print0(self.model)
-                # print all frozen parameters
-                self.print_frozen_params_info(self.model)
 
-                # Debug: Check dtypes of all parameters after LoRA
-                self.print0(
-                    "DEBUG: Checking parameter dtypes after LoRA application (before FSDP)"
-                )
-                param_dtypes = {}
-                for name, param in self.model.named_parameters():
-                    dtype_str = str(param.dtype)
-                    if dtype_str not in param_dtypes:
-                        param_dtypes[dtype_str] = []
-                    param_dtypes[dtype_str].append(name)
 
-                self.print0("Parameter dtype distribution:")
-                for dtype_str, names in param_dtypes.items():
-                    self.print0(f"  {dtype_str}: {len(names)} parameters")
-                    if len(names) <= 10:
-                        for name in names:
-                            self.print0(f"    - {name}")
-                    else:
-                        self.print0(f"    - First 5: {names[:5]}")
-                        self.print0(f"    - Last 5: {names[-5:]}")
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -453,33 +366,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
         # ------------------------------------------------
-
-        # Debug: Check dtypes before FSDP parallelization
-        self.print0("DEBUG: Checking parameter dtypes before FSDP parallelization")
-        param_dtypes_pre_fsdp = {}
-        for name, param in self.model.named_parameters():
-            dtype_str = str(param.dtype)
-            if dtype_str not in param_dtypes_pre_fsdp:
-                param_dtypes_pre_fsdp[dtype_str] = []
-            param_dtypes_pre_fsdp[dtype_str].append(name)
-
-        self.print0("Parameter dtype distribution before FSDP:")
-        for dtype_str, names in param_dtypes_pre_fsdp.items():
-            self.print0(f"  {dtype_str}: {len(names)} parameters")
-
-        if len(param_dtypes_pre_fsdp) > 1:
-            self.print0(
-                "WARNING: Multiple dtypes detected before FSDP! This will cause FSDP error."
-            )
-            self.print0(
-                f"MixedPrecisionPolicy config: param_dtype={self.dtype}, reduce_dtype=float32, output_dtype=float32"
-            )
-            self.print0("Detailed dtype breakdown:")
-            for dtype_str, names in param_dtypes_pre_fsdp.items():
-                self.print0(f"  {dtype_str} parameters (showing first 10):")
-                for name in names[:10]:
-                    self.print0(f"    - {name}")
-
         self.model = fsdp2_strategy_parallelize(
             self.model,
             device_mesh=self.device_mesh,
@@ -639,9 +525,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             mbs = self.cfg["train_micro_batch_size"]
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
-        self.print0(
-            f"local_gbs:{local_gbs} mbs:{mbs}, dp_size:{self.dp_size}, ds size:{data.size}"
-        )
+
         torch.distributed.all_reduce(
             total_dataset_size,
             op=torch.distributed.ReduceOp.SUM,
@@ -846,37 +730,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 and "flash_attn_kwargs" in model_args
                             ):
                                 del model_args["flash_attn_kwargs"]
-
-                            # Debug: Check model parameter dtypes before forward pass (only on first iteration)
-                            if (
-                                self.peft_config is not None
-                                and not self._debug_lora_info_printed_during_train
-                                and gb_idx == 0
-                                and mb_idx == 0
-                                and self.rank == 0
-                            ):
-                                self.print0(
-                                    "DEBUG: Checking parameter dtypes before first forward pass"
-                                )
-                                param_dtypes_before_forward = {}
-                                for name, param in self.model.named_parameters():
-                                    dtype_str = str(param.dtype)
-                                    if dtype_str not in param_dtypes_before_forward:
-                                        param_dtypes_before_forward[dtype_str] = []
-                                    param_dtypes_before_forward[dtype_str].append(name)
-
-                                self.print0(
-                                    "Parameter dtype distribution before forward:"
-                                )
-                                for (
-                                    dtype_str,
-                                    names,
-                                ) in param_dtypes_before_forward.items():
-                                    self.print0(
-                                        f"  {dtype_str}: {len(names)} parameters (first 5: {names[:5]})"
-                                    )
-                                self.print_frozen_params_info(self.model)
-                                self._debug_lora_info_printed_during_train = True
 
                             outputs = self.model(**model_args)
 

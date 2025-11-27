@@ -552,7 +552,7 @@ def get_formatted_message_log(
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
         # Debug: Print each message turn separately (only once for the first sample)
-        if hasattr(get_formatted_message_log, "_debug_printed"):
+        if not hasattr(get_formatted_message_log, "_debug_printed"):
             if i == 0:
                 # Print header only at the start of first message
                 print("\n" + "=" * 80)
