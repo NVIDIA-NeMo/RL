@@ -1010,7 +1010,6 @@ def refit_policy_generation(
             if isinstance(policy_generation, SGLangGeneration):
                 # Get SGLang server URL to GPU UUIDs mapping
                 sglang_url_to_gpu_uuids = policy_generation.get_sglang_url_to_gpu_uuids()
-                
                 futures_train = policy.stream_weights_via_http(
                     sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
                 )

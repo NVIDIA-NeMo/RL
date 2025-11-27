@@ -27,8 +27,6 @@ import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from sglang.srt.utils import MultiprocessingSerializer
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -521,6 +519,12 @@ def stream_weights_via_http_impl(
         worker_name: Name of the worker for logging
         current_device_uuid: UUID of the current training worker's GPU
     """
+    from sglang.srt.utils import MultiprocessingSerializer
+    try:
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+    except ImportError:
+        from sglang.srt.patch_torch import monkey_patch_torch_reductions
+    
     monkey_patch_torch_reductions()
     
     target_urls = [
@@ -552,12 +556,16 @@ def stream_weights_via_http_impl(
     tensor_count = 0
     
     try:
-        for name, tensor in params_generator:
+        tensor_list = list(params_generator)
+        total_tensors = len(tensor_list)
+        
+        for idx, (name, tensor) in enumerate(tensor_list):
             torch.cuda.current_stream().synchronize()
             tensor = tensor.contiguous().cuda()
             
+            named_tensors = [(name, tensor)]
             serialized_handler = MultiprocessingSerializer.serialize(
-                tensor,
+                named_tensors,
                 output_str=True
             )
             
@@ -566,8 +574,10 @@ def stream_weights_via_http_impl(
             )
             
             if rank == ipc_gather_src:
+                is_last = (idx == total_tensors - 1)
                 _send_tensor_to_sglang(
-                    url, name, gathered_handlers, tensor.shape, str(tensor.dtype)
+                    url, name, gathered_handlers, tensor.shape, str(tensor.dtype),
+                    flush_cache=is_last
                 )
                 tensor_count += 1
             
@@ -575,16 +585,6 @@ def stream_weights_via_http_impl(
             if rank == ipc_gather_src:
                 del gathered_handlers
             torch.cuda.empty_cache()
-        
-        if rank == ipc_gather_src:
-            completion_payload = {"complete": True}
-            try:
-                response = requests.post(url, json=completion_payload, timeout=120)
-                response.raise_for_status()
-            except Exception as e:
-                raise RuntimeError(
-                    f"{worker_name} (rank {rank}): Failed to send completion to {url}: {e}"
-                ) from e
         
         if rank == 0:
             print(
@@ -686,6 +686,7 @@ def _send_tensor_to_sglang(
     gathered_handlers: list[str],
     shape: torch.Size,
     dtype: str,
+    flush_cache: bool = False,
 ) -> None:
     """Send gathered IPC handlers to SGLang server via HTTP.
     
@@ -698,17 +699,11 @@ def _send_tensor_to_sglang(
         gathered_handlers: List of serialized IPC handlers in rank order
         shape: Tensor shape
         dtype: Tensor dtype
+        flush_cache: Whether to flush cache after this tensor (for last tensor)
     """
-    encoded_handlers = [
-        base64.b64encode(handler.encode('utf-8')).decode('utf-8')
-        for handler in gathered_handlers
-    ]
-    
     payload = {
-        "tensor_name": tensor_name,
-        "shape": list(shape),
-        "dtype": dtype,
-        "serialized_handlers": encoded_handlers,
+        "serialized_named_tensors": gathered_handlers,
+        "flush_cache": flush_cache,
     }
     
     try:
