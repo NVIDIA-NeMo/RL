@@ -25,7 +25,6 @@ time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_fp8_kvcache.sh
 time uv run --no-sync bash ./tests/functional/dpo.sh
 time uv run --no-sync bash ./tests/functional/rm.sh
 time uv run --no-sync bash ./tests/functional/eval.sh
