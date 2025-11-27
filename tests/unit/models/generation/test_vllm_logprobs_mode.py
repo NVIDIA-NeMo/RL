@@ -255,7 +255,7 @@ def test_apply_top_k_top_p_matches_vllm_upstream(top_k, top_p, test_name):
     print(f"Testing: {test_name}")
 
     # Our implementation: expects [batch, seq, vocab], takes scalar k/p
-    our_result = apply_top_k_top_p(logits_3d.clone(), top_k=top_k, top_p=top_p)
+    our_result, _ = apply_top_k_top_p(logits_3d.clone(), top_k=top_k, top_p=top_p)
 
     # vLLM upstream: expects [batch, vocab], takes tensor k/p with shape [batch]
     # Process each sequence position separately (vLLM doesn't batch over seq_len)

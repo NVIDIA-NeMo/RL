@@ -16,6 +16,7 @@ import gc
 import importlib
 import os
 import traceback
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -81,68 +82,39 @@ class IPCProtocol(Enum):
     ACK = "ack"
 
 
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
-) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
+def need_top_k_filtering(top_k: int | None) -> bool:
+    """Check if top-k filtering is needed."""
+    return top_k is not None and top_k != -1
 
-    Simplified version of VLLM's implementation for scalar parameters.
 
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
+def need_top_p_filtering(top_p: float | None) -> bool:
+    """Check if top-p filtering is needed."""
+    return top_p is not None and top_p != 1.0
 
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
-        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
 
-    Returns:
-        Filtered logits with sampling parameters applied
+@dataclass
+class TrainingSamplingParams:
+    """Training-specific sampling parameters to match generation parameters.
+
+    Used to ensure consistency between training and inference by applying the same sampling strategy during
+    logprob computation. Not directly using vLLM's SamplingParams class to avoid dependency on vLLM in this env.
+
+    Attributes:
+        top_k: Top-k filtering parameter (None or -1 to disable)
+        top_p: Top-p filtering parameter (1.0 to disable)
+        temperature: Temperature for scaling logits (default: 1.0)
     """
-    if top_p is None or top_p == 1.0:
-        if top_k is None or top_k == -1:
-            return logits
-        # Avoid sorting vocab for top-k only case
-        return apply_top_k_only(logits, top_k)
 
-    # Apply top-p (requires sorting)
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
-
-    if top_k is not None and top_k != -1:
-        # Apply top-k first
-        top_k_index = logits_sort.size(-1) - top_k
-        # Get all the top_k values - need to broadcast the index across all dimensions
-        index_tensor = torch.full(
-            logits_sort.shape[:-1],
-            top_k_index,
-            device=logits_sort.device,
-            dtype=torch.long,
-        )
-        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
-        top_k_mask = logits_sort < top_k_threshold
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    # Apply top-p
-    probs_sort = logits_sort.softmax(dim=-1)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    top_p_mask = probs_sum <= 1 - top_p
-    # at least one
-    top_p_mask[..., -1] = False
-    logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    return logits
+    top_k: int | None = None
+    top_p: float = 1.0
+    temperature: float = 1.0
 
 
-def apply_top_k_only(
+@torch.no_grad()
+def _apply_top_k_only_fn(
     logits: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
+    top_k: int | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply top-k mask to the logits.
 
     Simplified version of VLLM's implementation for scalar parameters.
@@ -158,23 +130,155 @@ def apply_top_k_only(
         top_k: Top-k sampling parameter.
 
     Returns:
-        Filtered logits with top-k applied
+        filtered_logits: Filtered logits tensor of shape [batch_size, seq_len, vocab_size].
+        keep_mask: Mask tensor of shape [batch_size, seq_len, vocab_size], where 1 (True) indicates tokens to be
+            kept, 0 (False) indicates tokens to be masked. None if top-k filtering is not needed.
     """
-    if top_k >= logits.shape[-1] or top_k == -1:
-        return logits
+    if not need_top_k_filtering(top_k):
+        return logits, None
 
     # Get top-k values and create mask
+    assert top_k is not None  # Type narrowing
     top_k_values, _ = torch.topk(logits, top_k, dim=-1)
     threshold = top_k_values[..., -1:].expand_as(logits)
-    mask = logits >= threshold
+    keep_mask = logits >= threshold
 
     # Apply mask: keep top-k values, set others to -inf
     logits = torch.where(
-        mask,
+        keep_mask,
         logits,
         torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
     )
-    return logits
+    return logits, keep_mask
+
+
+@torch.no_grad()
+def _apply_top_k_top_p_fn(
+    logits: torch.Tensor,
+    top_k: int | None,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply top-k and top-p masks to the logits (internal function).
+
+    Simplified version of VLLM's implementation for scalar parameters.
+
+    Based on VLLM's implementation:
+    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
+    SPDX-License-Identifier: Apache-2.0
+    Copyright contributors to the vLLM project
+
+    Args:
+        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
+        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
+        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
+
+    Returns:
+        filtered_logits: Filtered logits tensor of shape [batch_size, seq_len, vocab_size].
+        keep_mask: Mask tensor of shape [batch_size, seq_len, vocab_size], where 1 (True) indicates
+            tokens to be kept, 0 (False) indicates tokens to be masked.
+    """
+    if not need_top_p_filtering(top_p):
+        if not need_top_k_filtering(top_k):
+            return logits, None
+        # Avoid sorting vocab for top-k only case
+        filtered_logits, top_k_keep_mask = _apply_top_k_only_fn(logits, top_k)
+        return filtered_logits, top_k_keep_mask
+
+    # Apply top-p (requires sorting)
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    top_k_keep_mask = None
+
+    if need_top_k_filtering(top_k):
+        assert top_k is not None  # Type narrowing
+        # Apply top-k first
+        top_k_index = logits_sort.size(-1) - top_k
+        # Get all the top_k values - need to broadcast the index across all dimensions
+        index_tensor = torch.full(
+            logits_sort.shape[:-1],
+            top_k_index,
+            device=logits_sort.device,
+            dtype=torch.long,
+        )
+        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
+        top_k_keep_mask = logits_sort >= top_k_threshold
+        logits_sort.masked_fill_(~top_k_keep_mask, -float("inf"))
+
+    # Apply top-p
+    probs_sort = logits_sort.softmax(dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    top_p_keep_mask = probs_sum > 1 - top_p
+    # at least one
+    top_p_keep_mask[..., -1] = True
+    logits_sort.masked_fill_(~top_p_keep_mask, -float("inf"))
+
+    # Re-sort the probabilities
+    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+    if top_k_keep_mask is not None:
+        keep_mask = torch.logical_and(top_k_keep_mask, top_p_keep_mask)
+    else:
+        keep_mask = top_p_keep_mask
+
+    return logits, keep_mask
+
+
+class ApplyTopKTopP(torch.autograd.Function):
+    """Autograd function for top-k and top-p filtering with proper gradient handling."""
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]  Always ignore torch.autograd.Function.forward's type since it's always more specific than the base class
+        ctx,
+        logits: torch.Tensor,
+        top_k: Optional[int],
+        top_p: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply top-k/top-p filtering and save masks for backward."""
+        filtered_logits, keep_mask = _apply_top_k_top_p_fn(logits, top_k, top_p)
+
+        # Save masks for backward pass
+        ctx.save_for_backward(keep_mask)
+
+        return filtered_logits, keep_mask
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: torch.Tensor):
+        """Backward pass: mask out gradients for filtered tokens."""
+        grad_filtered_logits = grad_outputs[0]
+        (keep_mask,) = ctx.saved_tensors
+
+        # Apply masks to gradients - masked out tokens should not receive gradients
+        if keep_mask is not None:
+            grad_filtered_logits = grad_filtered_logits.masked_fill(~keep_mask, 0.0)
+
+        return grad_filtered_logits, None, None
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    top_k: int | None,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply top-k and top-p masks to the logits with proper gradient handling.
+
+    Simplified version of VLLM's implementation for scalar parameters.
+
+    Based on VLLM's implementation:
+    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
+    SPDX-License-Identifier: Apache-2.0
+    Copyright contributors to the vLLM project
+
+    Args:
+        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
+        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
+        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
+
+    Returns:
+        filtered_logits: Filtered logits tensor of shape [batch_size, seq_len, vocab_size].
+        keep_mask: Mask tensor of shape [batch_size, seq_len, vocab_size], where 1 (True) indicates tokens to be
+            kept, 0 (False) indicates tokens to be masked.
+    """
+    if not need_top_k_filtering(top_k) and not need_top_p_filtering(top_p):
+        return logits, None
+    return ApplyTopKTopP.apply(logits, top_k, top_p)
 
 
 def resolve_model_class(model_name: str) -> Any:

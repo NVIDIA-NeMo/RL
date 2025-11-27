@@ -24,9 +24,15 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    apply_top_k_top_p,
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
+)
+from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
+    need_top_k_filtering,
+    need_top_p_filtering,
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -150,6 +156,7 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
@@ -240,17 +247,27 @@ class ClippedPGLossFn(LossFunction):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                sampling_params=sampling_params,
             )
             # slice off to the correct length to remove potential CP padding
             curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                sampling_params=sampling_params,
             )
         else:
             next_token_logits_wo_last = next_token_logits[
                 :, :-1
             ]  # Remove last position's logits
+            # Apply top-k and top-p filtering
+            next_token_logits_wo_last, _ = apply_top_k_top_p(
+                next_token_logits_wo_last,
+                top_k=sampling_params.top_k if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else None,
+            )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits_wo_last, dim=-1
             )
@@ -258,6 +275,11 @@ class ClippedPGLossFn(LossFunction):
             curr_logprobs = next_token_logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
+
+        # Apply masking to avoid NaN in KL/Ratios when logprobs are -inf at masked positions
+        # This happens when top-k/p filtering removes the padding token
+        # This avoids -inf * 0 = NaN when doing calculations similar to the masked_mean
+        curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -456,6 +478,7 @@ class NLLLoss(LossFunction):
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
@@ -479,15 +502,25 @@ class NLLLoss(LossFunction):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                sampling_params=sampling_params,
             )
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                sampling_params=sampling_params,
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            # Apply top-k and top-p filtering
+            next_token_logits, _ = apply_top_k_top_p(
+                next_token_logits,
+                top_k=sampling_params.top_k if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else None,
+            )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )
@@ -495,6 +528,9 @@ class NLLLoss(LossFunction):
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
+
+        # Apply masking to avoid NaN when logprobs are -inf at masked positions
+        token_logprobs = torch.where(mask.bool(), token_logprobs, 0.0)
 
         if dpo_loss:
             ## shape: [batch_size]
@@ -714,6 +750,7 @@ class DPOLossFn(PreferenceLoss):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
@@ -733,15 +770,25 @@ class DPOLossFn(PreferenceLoss):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                sampling_params=sampling_params,
             )
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                sampling_params=sampling_params,
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            # Apply top-k and top-p filtering
+            next_token_logits, _ = apply_top_k_top_p(
+                next_token_logits,
+                top_k=sampling_params.top_k if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else None,
+            )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )
@@ -749,6 +796,9 @@ class DPOLossFn(PreferenceLoss):
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
+
+        # Apply masking to avoid NaN when logprobs are -inf at masked positions
+        token_logprobs = torch.where(token_mask.bool(), token_logprobs, 0.0)
 
         ref_logprobs = data["reference_policy_logprobs"][:, :-1]
 
@@ -772,6 +822,7 @@ class DPOLossFn(PreferenceLoss):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         sft_loss_chosen = torch.tensor(0.0)
         if self.sft_loss_weight > 0:
@@ -788,6 +839,7 @@ class DPOLossFn(PreferenceLoss):
                 context_parallel_group=context_parallel_group,
                 dpo_loss=True,
                 dpo_average_log_probs=self.sft_average_log_probs,
+                sampling_params=sampling_params,
             )
             sft_loss_chosen, sft_loss_rejected = self.split_output_tensor(sft_loss)
             sft_loss_chosen = masked_mean(
@@ -808,6 +860,7 @@ class DPOLossFn(PreferenceLoss):
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
         )
 
         dpo_loss = (
@@ -849,6 +902,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -899,6 +953,7 @@ class SequencePackingLossWrapper:
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                sampling_params=sampling_params,
             )
             loss_accum += loss
             for k, v in metrics.items():
@@ -948,8 +1003,18 @@ class DistillationLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
+        # The generation sampling params top-k and top-p are supported yet for distillation loss
+        if sampling_params is not None and (
+            need_top_k_filtering(sampling_params.top_k)
+            or need_top_p_filtering(sampling_params.top_p)
+        ):
+            raise ValueError(
+                "Generation sampling params top-k and top-p are supported yet for distillation loss"
+            )
+
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]

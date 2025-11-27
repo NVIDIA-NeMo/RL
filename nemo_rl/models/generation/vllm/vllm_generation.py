@@ -40,8 +40,8 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
 # See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
-TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
-TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
+TOP_K_THRESHOLD = 1  # Allow top_k >= 8000 (effectively no filtering)
+TOP_P_THRESHOLD = 0.1  # Allow top_p >= 0.99 (close to 1.0)
 
 
 class VllmGeneration(GenerationInterface):
