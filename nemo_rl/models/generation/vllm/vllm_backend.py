@@ -143,6 +143,13 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.model_executor.model_loader.utils import (
+                        process_weights_after_loading,
+                    )
+
+                    process_weights_after_loading(
+                        self.model_runner.model, self.model_config, self.device
+                    )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 

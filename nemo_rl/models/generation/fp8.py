@@ -20,6 +20,7 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -333,6 +334,30 @@ def apply_fp8_patches(self, fp8_config):
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
         patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
         fp8_state.vllm_patches.append(patcher5)
+    # This patch is used to support torch.compile with vllm parameter subclasses, such as
+    # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
+    # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
+    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
+    # which this patch can be removed.
+    func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
+    patcher1 = patch(func1_path, process_weights_after_loading)
+    fp8_state.vllm_patches.append(patcher1)
+    func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+    patcher2 = patch(func2_path, process_weights_after_loading_moe)
+    fp8_state.vllm_patches.append(patcher2)
+    func3_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+    patcher3 = patch(func3_path, process_weights_after_loading_kv)
+    fp8_state.vllm_patches.append(patcher3)
+    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
+    # SNR compared to plain fp32 scaling factors. This feature is still under active research.
+    if global_fp8_config.use_activation_pow2_scale:
+        func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
+        func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
+        func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
+        patcher2 = patch(func2_path, per_token_group_quant_fp8)
+        patcher3 = patch(func3_path, _per_token_group_quant_fp8)
+        patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
+        fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -342,11 +367,6 @@ def apply_fp8_patches(self, fp8_config):
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     config = AutoConfig.from_pretrained(model_name)
-    if hasattr(config, "num_experts"):
-        assert config.num_experts == 0, (
-            "FP8 generation for MoE models is currently not supported"
-        )
-
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -409,6 +429,24 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
+    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
+    if len(quantization_ignored_layer_kws):
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [
+            f"model.{name}".removesuffix(".weight")
+            for name, _ in model.named_parameters()
+        ]
+        ignored_layers = [
+            n
+            for n in param_names
+            if any(p in n for p in quantization_ignored_layer_kws)
+        ]
+        if "ignored_layers" not in fp8_block_quant_kwargs:
+            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
+        else:
+            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
+        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     # kv_cache_dtype can be "auto" or "fp8"
@@ -484,6 +522,8 @@ def _get_module_from_param_name(model, name: str):
     try:
         # Traverse the model hierarchy
         for part in module_path:
+            if isinstance(current_module, FusedMoE):
+                return current_module
             if isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
             else:
@@ -503,6 +543,11 @@ def _is_fp8_weight(name, model):
             if (
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
+                or (
+                    isinstance(module, FusedMoE)
+                    and module.w13_weight.dtype == torch.float8_e4m3fn
+                    and module.w2_weight.dtype == torch.float8_e4m3fn
+                )
             ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
@@ -619,6 +664,11 @@ def cast_tensor_to_fp8_blockwise(
 
 
 def process_weights_after_loading(self, layer) -> None:
+    """This function is used to process the weights after loading for a Linear layer.
+
+    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
+    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    """
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         maybe_post_process_fp8_weight_block,
         process_fp8_weight_block_strategy,
@@ -639,6 +689,156 @@ def process_weights_after_loading(self, layer) -> None:
         layer.update_param_tp_status()
 
     maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+
+
+def process_weights_after_loading_moe(self, layer) -> None:
+    """This function is used to process the weights after loading for a FusedMoE layer.
+
+    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
+    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    """
+    # Lazy import to avoid importing triton too early.
+    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+        is_rocm_aiter_moe_enabled,
+    )
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        expert_weight_is_col_major,
+        requant_weight_ue8m0_inplace,
+    )
+    from vllm.utils.deep_gemm import (
+        get_col_major_tma_aligned_tensor,
+        is_deep_gemm_e8m0_used,
+    )
+
+    self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
+
+    assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
+    assert self.quant_config.activation_scheme == "dynamic"
+
+    if self.flashinfer_moe_backend is not None:
+        layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+        layer.w13_weight_scale_inv.data = swap_w13_to_w31(
+            layer.w13_weight_scale_inv.data
+        )
+
+    # DeepGemm scales need to be transposed and aligned. We try to do
+    # it ahead of time for performance reasons.
+    if self.allow_deep_gemm and not is_deep_gemm_e8m0_used():
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
+    if is_deep_gemm_e8m0_used():
+        assert layer.weight_block_size is not None
+        # Re-quantise the expert weights so their scales are UE8M0.
+        block_sz = tuple(layer.weight_block_size)
+        requant_weight_ue8m0_inplace(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            block_sz,
+        )
+        requant_weight_ue8m0_inplace(
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            block_sz,
+        )
+
+        # Ensure column-major TMA alignment expected by DeepGEMM.
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
+
+def process_weights_after_loading_kv(self, layer) -> None:
+    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    # No need to process kv scales after loading if we are going to
+    # calculate them on the fly.
+    from vllm.platforms import current_platform
+
+    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            # We prefer to use separate k_scale and v_scale if present
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            # If no scales were loaded (both scales are invalid negative
+            # values), use the default value of 1.0
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            # If we find a single kv_scale in the checkpoint, we remap
+            # kv_scale to k_scale during weight loading, and duplicate
+            # k_scale to v_scale here
+            assert layer.k_scale > 0.0
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        if layer.q_scale < 0.0:
+            layer._q_scale.copy_(k_scale)
+            layer._q_scale_float = k_scale
+
+        # These are used in the final Attention.forward()
+        layer._k_scale.copy_(k_scale)
+        layer._v_scale.copy_(v_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+
+    if layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    is_singleton_float = (
+        lambda x: isinstance(x, float)
+        or isinstance(x, torch.Tensor)
+        and x.numel() == 1
+        and x.is_floating_point()
+    )
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError(
+            "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
+        )
+
+    # These are used in the final Attention.forward()
+    layer._q_scale.copy_(q_scale)
+    layer._q_scale_float = (
+        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
+    )
+
+    layer._prob_scale.copy_(prob_scale)
 
 
 @triton.jit
