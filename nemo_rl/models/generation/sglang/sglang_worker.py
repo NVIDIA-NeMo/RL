@@ -186,6 +186,9 @@ class SGLangGenerationWorker:
         # there will be issues if we use the event loop in the main thread
         self.async_loop_thread = AsyncLoopThread()
         
+        # Maximum concurrent requests per server to avoid overloading
+        # Default to 8 concurrent requests per server
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 16)
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -256,7 +259,33 @@ class SGLangGenerationWorker:
 
 
     def _merge_stop_strings(self, batch_stop_strings):
-        pass
+        """Merge stop strings from config and batch.
+        
+        Args:
+            batch_stop_strings: List of stop strings from batch (one per sample)
+            
+        Returns:
+            List of merged stop strings (one per sample)
+        """
+        stop_set: set[str] = set()
+        
+        # Add stop strings from config
+        if self.cfg.get("stop_strings"):
+            stop_set.update(self.cfg["stop_strings"])
+        
+        # Merge stop strings from batch
+        merged_stop_strings = []
+        for sample_ss in batch_stop_strings:
+            sample_stop_set = stop_set.copy()
+            if sample_ss:
+                if isinstance(sample_ss, str):
+                    sample_stop_set.add(sample_ss)
+                elif isinstance(sample_ss, list):
+                    sample_stop_set.update(sample_ss)
+            
+            merged_stop_strings.append(list(sample_stop_set) if sample_stop_set else None)
+        
+        return merged_stop_strings
 
     def _build_sampling_params(
         self,
@@ -264,8 +293,60 @@ class SGLangGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
-    ):
-        pass
+        input_len: Optional[int] = None,
+        context_length: Optional[int] = None,
+        sample_index: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build sampling parameters dictionary for SGLang API.
+        
+        Args:
+            greedy: Whether to use greedy decoding (temperature=0.0)
+            stop_strings: Merged stop strings (not used here, handled per sample)
+            max_new_tokens: Override max_new_tokens from config if provided
+            input_len: Input length for this sample (used for context_length adjustment)
+            context_length: Maximum context length (if provided, adjusts max_new_tokens)
+            sample_index: Sample index (used for warning messages, 0-indexed)
+            
+        Returns:
+            Dictionary of sampling parameters compatible with SGLang API
+        """
+        top_k_cfg = self.cfg.get("top_k")
+        top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
+        temperature = 0.0 if greedy else self.cfg.get("temperature", 1.0)
+        
+        base_max_tokens = (
+            max_new_tokens if max_new_tokens is not None else self.cfg.get("max_new_tokens", 512)
+        )
+        
+        # TODO: check if this is needed
+        final_max_tokens = base_max_tokens
+        if context_length is not None and input_len is not None:
+            max_allowed_new_tokens = max(0, context_length - input_len - 1)
+            if base_max_tokens > max_allowed_new_tokens:
+                final_max_tokens = max_allowed_new_tokens
+                if sample_index == 0:
+                    print(
+                        f"[SGLang Worker] Rank {self.global_rank} Warning: "
+                        f"Sample {sample_index} input length ({input_len}) + max_new_tokens ({base_max_tokens}) "
+                        f"would exceed context_length ({context_length}). "
+                        f"Reducing max_new_tokens to {final_max_tokens} for this sample."
+                    )
+        
+        # Build sampling params dict
+        sampling_params = {
+            "temperature": temperature,
+            "top_p": self.cfg.get("top_p", 1.0),
+            "max_new_tokens": final_max_tokens,
+        }
+        
+        if top_k_val != -1:
+            sampling_params["top_k"] = top_k_val
+        
+        stop_token_ids = self.cfg.get("stop_token_ids")
+        if stop_token_ids is not None:
+            sampling_params["stop_token_ids"] = stop_token_ids
+        
+        return sampling_params
 
     async def _ensure_session(self):
         if self.session is None:
@@ -418,7 +499,8 @@ class SGLangGenerationWorker:
         
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
-        stop_strings = data.get("stop_strings", [None] * len(input_lengths))
+        batch_stop_strings = data.get("stop_strings", [None] * len(input_lengths))
+        stop_strings = self._merge_stop_strings(batch_stop_strings)
         batch_size = len(input_lengths)
         pad_token_id = self.cfg.get("_pad_token_id", 0)
         
@@ -430,33 +512,36 @@ class SGLangGenerationWorker:
         
         print(f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}")
         
-        # Get generation parameters from config
-        max_new_tokens = self.cfg.get("max_new_tokens", 512)
-        temperature = 0.0 if greedy else self.cfg.get("temperature", 1.0)
-        top_p = self.cfg.get("top_p", 1.0)
-        top_k = self.cfg.get("top_k", None)
-        
-        sampling_params = {
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_new_tokens": max_new_tokens,
-        }
-        if top_k is not None:
-            sampling_params["top_k"] = top_k
-        
         if batch_size == 0:
             raise ValueError("Empty batch received")
+        
+        context_length = self.cfg.get("context_length", None)
         
         # Create async tasks for all samples
         tasks = []
         for i in range(batch_size):
             input_len = input_lengths[i].item()
+            
+            # Truncate input if it exceeds context_length
+            if context_length is not None and input_len >= context_length:
+                input_len = context_length - 1
+            
             valid_input_ids = input_ids[i, :input_len].tolist()
+            
+            # Build sampling params for this sample (with context_length adjustment)
+            sample_sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+                max_new_tokens=None,
+                input_len=input_len,
+                context_length=context_length,
+                sample_index=i,
+            )
             
             tasks.append(
                 self._generate_single_sample(
                     input_ids=valid_input_ids,
-                    sampling_params=sampling_params,
+                    sampling_params=sample_sampling_params,
                     stop_string=stop_strings[i],
                 )
             )
