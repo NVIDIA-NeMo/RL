@@ -530,6 +530,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
         }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
