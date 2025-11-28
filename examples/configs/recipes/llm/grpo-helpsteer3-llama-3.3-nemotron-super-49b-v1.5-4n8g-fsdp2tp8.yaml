@@ -1,0 +1,67 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  max_num_steps: 10
+checkpointing:
+  checkpoint_dir: results/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+  metric_name: val:reward
+policy:
+  # This is the model name is unusable because the model did bot update on huggingface yet.
+  # ISSUE: https://github.com/NVIDIA-NeMo/RL/issues/1571
+  model_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 
+  max_total_sequence_length: 32768
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  dtensor_cfg:
+    activation_checkpointing: true
+    context_parallel_size: 4
+    cpu_offload: true
+    tensor_parallel_size: 8
+    custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 13
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 13
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+data:
+  # Training with HelpSteer3 will lead to high logprob error.
+  # ISSUE: https://github.com/NVIDIA-NeMo/RL/issues/1570
+  prompt_file: null
+  dataset_name: HelpSteer3
+  split: preference
+  env_name: "code_jaccard"
+  processor: helpsteer3_data_processor
+env:
+  code_jaccard:
+    num_workers: 8
+logger:
+  wandb_enabled: true
+  wandb:
+    project: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp${policy.dtensor_cfg.tensor_parallel_size}
+  tensorboard:
+    log_dir: tb_logs-grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+  mlflow:
+    experiment_name: grpo-helpsteer3
+    run_name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

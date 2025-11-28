@@ -11,7 +11,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
+import os
+from typing import Any, Dict, NotRequired, TypedDict
+
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.path import import_class_from_path
+
+
+# Environment registry entry schema.
+class EnvRegistryEntry(TypedDict, total=False):
+    actor_class_fqn: str
+    default_processor: NotRequired[str]
+
+
+# Environment registry. Key is the env name, value is a dictionary with the actor class FQN and optional default processor.
+ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
+    "math_default": {
+        "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
+    },
+    "math": {
+        "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
+    },
+    "code": {
+        "actor_class_fqn": "nemo_rl.environments.code_environment.CodeEnvironment",
+    },
+    "reward_model": {
+        "actor_class_fqn": "nemo_rl.environments.reward_model_environment.RewardModelEnvironment",
+    },
+    "code_jaccard": {
+        "actor_class_fqn": "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment",
+    },
+}
 
 
 def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[Any]]:
@@ -59,3 +90,24 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
 
     return chunks
+
+
+def get_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
+    if env_name not in ENV_REGISTRY:
+        raise ValueError(f"Invalid env name: {env_name}")
+    actor_class_fqn = ENV_REGISTRY[env_name]["actor_class_fqn"]
+    actor_class = import_class_from_path(actor_class_fqn)
+    env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(actor_class_fqn),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        }
+    ).remote(env_configs[env_name])
+    return env
+
+
+def register_env(env_name: str, actor_class_fqn: str) -> None:
+    if env_name in ENV_REGISTRY:
+        raise ValueError(f"Env name {env_name} already registered")
+
+    ENV_REGISTRY[env_name] = {"actor_class_fqn": actor_class_fqn}

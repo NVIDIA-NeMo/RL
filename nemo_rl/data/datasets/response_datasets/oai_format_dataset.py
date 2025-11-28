@@ -18,7 +18,7 @@ from typing import Any, Callable, Union
 
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class PreservingDataset:
@@ -84,7 +84,7 @@ class PreservingDataset:
         return PreservingDataset(mapped_data)
 
 
-class OpenAIFormatDataset:
+class OpenAIFormatDataset(RawDataset):
     """This class is used to load an SFT dataset in the OpenAI format.
 
     The dataset should be in the following format:
@@ -133,7 +133,7 @@ class OpenAIFormatDataset:
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
-
+        self.task_name = "json_dataset"
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
             train_original_dataset = load_dataset("json", data_files=train_ds_path)[
@@ -195,10 +195,7 @@ class OpenAIFormatDataset:
             "train": formatted_train_dataset,
             "validation": formatted_val_dataset,
         }
-
-        self.task_spec = TaskDataSpec(
-            "json_dataset",
-        )
+        self.task_name = "json_dataset"
 
     def add_messages_key(
         self,

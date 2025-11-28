@@ -44,6 +44,48 @@ code_env = CodeEnvironment.remote(env_config)
 
 We’re tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
 
+## Code Jaccard Environment
+
+The Code Jaccard Environment evaluates code (or text) responses by measuring Jaccard-based similarity against ground-truth answers. This is a lightweight, text-similarity reward useful when an execution sandbox is unnecessary or unavailable.
+
+### How it works
+- Extracts the assistant’s response text from each conversation.
+- Computes a Jaccard similarity score between the response and ground truth:
+  - Tokenizes both texts (whitespace), computes intersection/union, then applies a length ratio penalty.
+  - Scores are in [0, 1]. Observations label responses as “aligned/misaligned” using a 0.5 threshold.
+- Returns:
+  - observations: environment feedback strings
+  - rewards: tensor of similarity scores
+  - terminateds: all ones (single-step episodes)
+  - answers: optional, the response text when requested
+
+### Usage
+```python
+from nemo_rl.environments.code_jaccard_environment import CodeJaccardEnvironment
+
+env_config = {
+    "num_workers": 2,
+    # Optional default stop strings (unused in scoring but available for consistency)
+    "stop_strings": None,
+}
+
+code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
+```
+
+### Configuration
+- `num_workers` (int): Number of parallel verification workers.
+- `stop_strings` (list[str] | None): Optional default stop strings (propagated downstream; not required for scoring).
+
+### Sample GRPO config
+```yaml
+env:
+  code_jaccard:
+    num_workers: 2
+    stop_strings: null
+data:
+  env_name: code_jaccard
+```
+
 ## Reward Model Environment
 
 The Reward Model Environment uses pre-trained reward models to score conversation quality. 

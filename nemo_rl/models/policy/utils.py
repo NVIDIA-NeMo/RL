@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import gc
-import importlib
 import os
 import traceback
 from enum import Enum
@@ -191,20 +190,6 @@ def is_vllm_v1_engine_enabled() -> bool:
         bool: True if V1 engine is enabled, False otherwise (defaults to True if not set)
     """
     return os.environ.get("NRL_VLLM_USE_V1", "1") == "1"
-
-
-def import_class_from_path(name: str) -> Any:
-    """Import a class from a string path (e.g. 'torch.optim.AdamW').
-
-    Args:
-        full_path: Full path to class including module path and class name
-
-    Returns:
-        The imported class object
-    """
-    module_name, cls_name = name.rsplit(".", 1)
-    cls_instance = getattr(importlib.import_module(module_name), cls_name)
-    return cls_instance
 
 
 def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:

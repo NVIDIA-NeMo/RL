@@ -228,6 +228,7 @@ data:
   prompt_file: "examples/prompts/clevr_cogent_cot.txt"
   system_prompt_file: null
   dataset_name: "clevr-cogent"
+  env_name: "clevr-cogent"
   split: "trainA"
   shuffle: true
   num_workers: 1
