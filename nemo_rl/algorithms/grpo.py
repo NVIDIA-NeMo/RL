@@ -979,11 +979,8 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    print("[sglang refit] Starting refit process...", flush=True)
     if colocated_inference:
-        print("[sglang refit] Offloading optimizer before refit...", flush=True)
         policy.offload_before_refit()
-        print("[sglang refit] Preparing generation interface for weights...", flush=True)
         policy_generation.prepare_for_generation(tags=["weights"])
 
     # Create a context manager that does nothing when timer is None
@@ -1008,8 +1005,9 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                # Get SGLang server URL to GPU UUIDs mapping
                 sglang_url_to_gpu_uuids = policy_generation.get_sglang_url_to_gpu_uuids()
+                # Stream weights via HTTP
+                flush_success = policy_generation.invalidate_kv_cache()                
                 futures_train = policy.stream_weights_via_http(
                     sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
                 )
@@ -1018,7 +1016,6 @@ def refit_policy_generation(
                 update_success = True
             else:
                 # Original ZMQ IPC path for vLLM
-                print("[sglang refit] Using ZMQ IPC path for vLLM", flush=True)
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes
                 )
@@ -1044,14 +1041,11 @@ def refit_policy_generation(
                 f"This often indicates an issue with {error_tag} or "
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
-            print(f"[sglang refit] {error_message}", flush=True)
             raise RuntimeError(error_message)
 
     if colocated_inference:
-        print("[sglang refit] Offloading after refit and preparing for generation...", flush=True)
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
-        print("[sglang refit] Refit process completed successfully", flush=True)
 
 
 # ===============================================================================
@@ -1218,7 +1212,6 @@ def grpo_train(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
-                        print("[sglang refit] Policy generation refit completed, stale flag cleared", flush=True)
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation

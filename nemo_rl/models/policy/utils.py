@@ -524,6 +524,7 @@ def stream_weights_via_http_impl(
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
     except ImportError:
         from sglang.srt.patch_torch import monkey_patch_torch_reductions
+    print(f"[sglang refit details] entering stream_weights_via_http_impl")
     
     monkey_patch_torch_reductions()
     
@@ -559,6 +560,13 @@ def stream_weights_via_http_impl(
         tensor_list = list(params_generator)
         total_tensors = len(tensor_list)
         
+        if rank == ipc_gather_src:
+            print(
+                f"[sglang refit details] {worker_name}: Starting weight update - "
+                f"Total parameters to update: {total_tensors}",
+                flush=True
+            )
+        
         for idx, (name, tensor) in enumerate(tensor_list):
             torch.cuda.current_stream().synchronize()
             tensor = tensor.contiguous().cuda()
@@ -574,10 +582,9 @@ def stream_weights_via_http_impl(
             )
             
             if rank == ipc_gather_src:
-                is_last = (idx == total_tensors - 1)
                 _send_tensor_to_sglang(
                     url, name, gathered_handlers, tensor.shape, str(tensor.dtype),
-                    flush_cache=is_last
+                    flush_cache=False
                 )
                 tensor_count += 1
             
@@ -586,11 +593,18 @@ def stream_weights_via_http_impl(
                 del gathered_handlers
             torch.cuda.empty_cache()
         
-        if rank == 0:
+        if rank == ipc_gather_src:
             print(
-                f"[sglang refit] {worker_name}: Sent {tensor_count} tensors to SGLang server: {base_url}",
+                f"[sglang refit details] {worker_name}: Weight update completed - "
+                f"Successfully updated {tensor_count}/{total_tensors} parameters to SGLang server: {base_url}",
                 flush=True
             )
+            if tensor_count != total_tensors:
+                print(
+                    f"[sglang refit details] {worker_name}: WARNING - Expected {total_tensors} tensors, "
+                    f"but only sent {tensor_count}",
+                    flush=True
+                )
     
     except Exception as e:
         print(
