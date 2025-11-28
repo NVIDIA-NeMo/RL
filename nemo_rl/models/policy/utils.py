@@ -549,10 +549,10 @@ def stream_weights_via_http_impl(
     url = f"{base_url}/update_weights_from_tensor"
     sglang_gpu_uuids = sglang_url_to_gpu_uuids[base_url]
     
-    ipc_gather_group, ipc_gather_src = _setup_ipc_gather_group(
+    ipc_gather_group, ipc_gather_src, matching_ranks = _setup_ipc_gather_group(
         rank, current_device_uuid, sglang_gpu_uuids, sglang_url_to_gpu_uuids
     )
-    
+    print(f"[sglang refit] {worker_name} (rank {rank}): ipc_gather_group={ipc_gather_group}, ipc_gather_src={ipc_gather_src}, matching_ranks={matching_ranks}")
     tensor_count = 0
     
     try:
@@ -570,7 +570,7 @@ def stream_weights_via_http_impl(
             )
             
             gathered_handlers = _gather_ipc_handlers(
-                serialized_handler, ipc_gather_group, ipc_gather_src, rank
+                serialized_handler, ipc_gather_group, ipc_gather_src, rank, matching_ranks
             )
             
             if rank == ipc_gather_src:
@@ -609,14 +609,17 @@ def _setup_ipc_gather_group(
     current_device_uuid: str,
     sglang_gpu_uuids: list[str],
     sglang_url_to_gpu_uuids: dict[str, list[str]],
-) -> tuple[Optional[dist.ProcessGroup], Optional[int]]:
-    """Setup Gloo group for gathering IPC handlers from ranks in the same SGLang server.
+) -> tuple[Optional[dist.ProcessGroup], Optional[int], Optional[list[int]]]:
+    """Setup gather configuration for IPC handlers.
     
     Returns:
-        Tuple of (gather_group, gather_src_rank) or (None, None) if not needed
+        Tuple of (gather_group, gather_src_rank, matching_ranks)
+        - gather_group: None (use default FSDP group)
+        - gather_src_rank: The rank that will collect and send to SGLang server
+        - matching_ranks: List of ranks that belong to the same SGLang server
     """
     if not dist.is_initialized():
-        return None, None
+        return None, None, None
     
     world_size = dist.get_world_size()
     my_rank = dist.get_rank()
@@ -630,16 +633,12 @@ def _setup_ipc_gather_group(
     ]
     
     if len(matching_ranks) == 0:
-        return None, None
+        return None, None, None
     
     matching_ranks = sorted(matching_ranks)
     gather_src = matching_ranks[0]
     
-    if my_rank in matching_ranks:
-        gather_group = dist.new_group(ranks=matching_ranks, backend="gloo")
-        return gather_group, gather_src
-    else:
-        return None, None
+    return None, gather_src, matching_ranks
 
 
 def _gather_ipc_handlers(
@@ -647,37 +646,37 @@ def _gather_ipc_handlers(
     gather_group: Optional[dist.ProcessGroup],
     gather_src: Optional[int],
     rank: int,
+    matching_ranks: Optional[list[int]] = None,
 ) -> Optional[list[str]]:
-    """Gather IPC handlers from all ranks in the group to gather_src rank.
+    """Gather IPC handlers from all ranks in the default FSDP group, then filter by server.
     
-    Key: dist.gather_object automatically arranges by rank order
-    Result: gathered_handlers[0] = rank0_handler, gathered_handlers[1] = rank1_handler
-    Index = rank = GPU ID, automatically matched by SGLang tp_rank
+    Args:
+        serialized_handler: Serialized IPC handler from this rank
+        gather_group: Process group (None means use default FSDP group)
+        gather_src: Rank that will collect and filter handlers
+        rank: Current rank
+        matching_ranks: List of ranks that belong to the same SGLang server
     
     Returns:
         List of serialized handlers in rank order (only on gather_src rank), None otherwise
+        The list contains handlers from matching_ranks only, in rank order
     """
-    if gather_group is None or gather_src is None:
+    if gather_src is None:
         return None
     
     if not dist.is_initialized():
         return None
     
-    world_size = dist.get_world_size(gather_group)
+    world_size = dist.get_world_size()
     
-    if rank == gather_src:
-        gathered_handlers = [None] * world_size
+    all_handlers = [None] * world_size
+    dist.all_gather_object(all_handlers, serialized_handler)
+    
+    if rank == gather_src and matching_ranks is not None:
+        filtered_handlers = [all_handlers[r] for r in matching_ranks]
+        return filtered_handlers
     else:
-        gathered_handlers = None
-    
-    dist.gather_object(
-        obj=serialized_handler,
-        object_gather_list=gathered_handlers,
-        dst=gather_src,
-        group=gather_group,
-    )
-    
-    return gathered_handlers
+        return None
 
 
 def _send_tensor_to_sglang(
