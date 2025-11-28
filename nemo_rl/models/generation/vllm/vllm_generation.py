@@ -253,16 +253,22 @@ class VllmGeneration(GenerationInterface):
             self.block_size = router_cfg.get("block_size", 64)
             base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
             base_metrics_port = router_cfg.get("base_metrics_port", 5657)
+            
+            # Get worker addresses for distributed setup
+            worker_addresses = self._get_worker_addresses()
 
             print(
                 f"[INFO] Initializing KvRouter with {self.dp_size} workers, "
                 f"block_size={self.block_size}, mode={self.router_mode}"
             )
+            if len(set(worker_addresses)) > 1:
+                print(f"[INFO] Distributed setup detected: workers on {len(set(worker_addresses))} different nodes")
             self.router = KvRouter(
                 block_size=self.block_size,
                 num_workers=self.dp_size,
                 base_kv_events_port=base_kv_events_port,
                 base_metrics_port=base_metrics_port,
+                worker_addresses=worker_addresses,
             )
 
     def _get_tied_worker_bundle_indices(
@@ -409,6 +415,39 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+    
+    def _get_worker_addresses(self) -> list[str]:
+        """Get IP addresses for each worker for distributed router setup.
+        
+        For distributed Ray clusters, returns the actual node IP where each worker is running.
+        For single-node setups, returns localhost for all workers.
+        
+        Returns:
+            List of IP addresses, one per DP group (router needs one address per DP worker)
+        """
+        import ray
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        worker_addresses = []
+        
+        # Get the DP leader workers (one per DP group)
+        dp_leader_indices = self.worker_group.dp_leader_worker_indices
+        
+        for idx in dp_leader_indices:
+            worker_ref = self.worker_group.workers[idx]
+            try:
+                # Ask worker to report its own IP address from AVAILABLE_ADDR_LIST env var
+                # This is more reliable than querying Ray's internal state
+                addr = ray.get(worker_ref.get_node_ip.remote())
+                worker_addresses.append(addr)
+                logger.info(f"Worker {idx} reported address: {addr}")
+            except Exception as e:
+                logger.warning(f"Error getting address for worker {idx}: {e}, using localhost")
+                worker_addresses.append("localhost")
+        
+        logger.info(f"Worker addresses for router: {worker_addresses}")
+        return worker_addresses
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting

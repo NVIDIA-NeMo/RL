@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import logging
 import threading
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
@@ -176,6 +177,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             llm_kwargs["block_size"] = block_size
 
             stat_logger = [LoggerFactory(port=metrics_port)]
+            
+            # Apply patch to ensure KV events are published
+            from nemo_rl.models.generation.vllm.vllm_v1_kv_events_patch import patch_vllm_v1_kv_events
+            patch_vllm_v1_kv_events()
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args, stat_loggers=stat_logger)
@@ -874,6 +879,25 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             list_of_worker_results = result_or_coro
 
         return cast(list[str], list_of_worker_results)
+    
+    def get_node_ip(self) -> str:
+        """Get the IP address of the node this worker is running on.
+        
+        Returns the first IP from AVAILABLE_ADDR_LIST environment variable,
+        which is set by RayWorkerGroup during worker initialization.
+        """
+        import os
+        import ast
+        
+        # AVAILABLE_ADDR_LIST is set by RayWorkerGroup
+        addr_list_str = os.environ.get("AVAILABLE_ADDR_LIST", "['localhost']")
+        try:
+            addr_list = ast.literal_eval(addr_list_str)
+            if addr_list and len(addr_list) > 0:
+                return addr_list[0]
+        except Exception:
+            pass
+        return "localhost"
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""

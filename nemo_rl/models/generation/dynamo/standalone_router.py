@@ -77,6 +77,7 @@ class KvRouter:
         num_workers: int = 4,
         base_kv_events_port: int = 5557,
         base_metrics_port: int = 5657,
+        worker_addresses: Optional[list[str]] = None,
     ):
         self.num_workers = num_workers
         self.block_size = block_size
@@ -87,17 +88,30 @@ class KvRouter:
         self.waitings = [0] * num_workers
         
         self.round_robin_counter = 0
+        
+        # Use localhost for all workers if addresses not provided (single-node setup)
+        if worker_addresses is None:
+            self.worker_addresses = ["localhost"] * num_workers
+            logger.info("No worker addresses provided, using localhost for all workers (single-node mode)")
+        else:
+            if len(worker_addresses) != num_workers:
+                raise ValueError(
+                    f"Number of worker addresses ({len(worker_addresses)}) must match "
+                    f"number of workers ({num_workers})"
+                )
+            self.worker_addresses = worker_addresses
+            logger.info(f"Using distributed mode with worker addresses: {worker_addresses}")
 
         self.context = zmq.Context()
         self.load_listeners = [
             setup_zmq_subscriber(
-                self.context, f"tcp://localhost:{base_metrics_port + worker_id}"
+                self.context, f"tcp://{self.worker_addresses[worker_id]}:{base_metrics_port + worker_id}"
             )
             for worker_id in range(num_workers)
         ]
         self.kv_listeners = [
             ZmqKvEventListener(
-                f"tcp://localhost:{base_kv_events_port + worker_id}", "", block_size
+                f"tcp://{self.worker_addresses[worker_id]}:{base_kv_events_port + worker_id}", "", block_size
             )
             for worker_id in range(num_workers)
         ]
@@ -201,15 +215,33 @@ class KvRouter:
                         for idx, event in enumerate(kv_events):
                             try:
                                 event_dict = json.loads(event)
-                                event_type = event_dict.get("type", "unknown")
                                 
-                                # Debug: Log hash info for add_block events
-                                if event_type == "add_block" and idx < 2:  # Only log first 2 events
-                                    block_hash = event_dict.get("hash", "N/A")
-                                    parent_hash = event_dict.get("parent_hash", "N/A")
+                                # Dynamo ZmqKvEventListener format: {"event_id": ..., "data": {...}, "dp_rank": ...}
+                                # RadixTree expects this EXACT format - do NOT transform it!
+                                
+                                # Determine event type for logging only
+                                event_type = "unknown"
+                                if "data" in event_dict:
+                                    data = event_dict["data"]
+                                    if isinstance(data, dict):
+                                        if "stored" in data:
+                                            event_type = "block_stored"
+                                        elif "removed" in data:
+                                            event_type = "block_removed"
+                                    elif data == "cleared":
+                                        event_type = "all_blocks_cleared"
+                                
+                                # Debug: Log event info for first few events
+                                if idx == 0 and events_received_count <= 10:
+                                    block_hashes = "N/A"
+                                    if event_type == "block_stored" and isinstance(event_dict.get("data"), dict):
+                                        stored = event_dict["data"].get("stored", {})
+                                        blocks = stored.get("blocks", [])
+                                        block_hashes = [b.get("block_hash") for b in blocks]
+                                    
                                     logger.info(
-                                        f"[KV Event DEBUG] Worker {worker_id} add_block: "
-                                        f"hash={block_hash}, parent_hash={parent_hash}"
+                                        f"[KV Event] Worker {worker_id}: type={event_type}, "
+                                        f"block_hashes={block_hashes}"
                                     )
                                 
                                 logger.debug(
@@ -217,8 +249,9 @@ class KvRouter:
                                     f"type={event_type}"
                                 )
                                 
+                                # Pass the ORIGINAL event format to RadixTree
                                 self.radix_tree.apply_event(
-                                    worker_id, json.dumps(event_dict).encode("utf-8")
+                                    worker_id, event.encode("utf-8") if isinstance(event, str) else json.dumps(event_dict).encode("utf-8")
                                 )
                                 events_applied_count += 1
                                 logger.debug(
@@ -300,8 +333,18 @@ class KvRouter:
                 f"[get_best_worker] raw_scores from RadixTree: {raw_scores}"
             )
 
+            # RadixTree returns scores with tuple keys (worker_id, lora_id)
+            # Convert to simple worker_id -> score mapping (sum across all lora_ids)
+            worker_scores = {}
+            for (worker_id, lora_id), score in raw_scores.items():
+                worker_scores[worker_id] = worker_scores.get(worker_id, 0) + score
+            
+            logger.debug(
+                f"[get_best_worker] worker_scores (aggregated): {worker_scores}"
+            )
+
             overlap_scores = {
-                worker_id: raw_scores.get(worker_id, 0) * self.block_size / num_tokens
+                worker_id: worker_scores.get(worker_id, 0) * self.block_size / num_tokens
                 for worker_id in range(self.num_workers)
             }
 
