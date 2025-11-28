@@ -1,0 +1,18 @@
+defaults: ../../sft_nemotron_super_49b_base.yaml
+
+# SFT Algorithm Configuration for Nemotron Super 49B
+sft:
+  max_num_epochs: 3
+
+policy:
+  train_micro_batch_size: 8
+
+logger:
+  wandb:
+    project: "sft-nemotron-joyang"
+    name: "sft-${data.dataset_name}-nemotron-super-49b-joyang"
+  tensorboard:
+    log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "openmathinstruct-nemorl-1M_train"
