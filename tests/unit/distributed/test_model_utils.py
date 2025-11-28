@@ -1055,7 +1055,7 @@ class SamplingParamsTestActor:
                         if not torch.isinf(filtered_logits[b, s, idx]):
                             continue
 
-                        assert False, f"Index {idx} in top-p should not be -inf"
+                        raise AssertionError(f"Index {idx} in top-p should not be -inf")
 
         # Test 3: No filtering case
         if top_k is None and top_p >= 1.0:
@@ -1070,16 +1070,27 @@ class SamplingParamsTestActor:
             probs.sum(dim=-1), torch.ones(batch_size, seq_len, device="cuda"), atol=1e-5
         ), "Probabilities don't sum to 1"
 
-        # Test 5: Backward pass
+        # Test 5: Verify keep_mask alignment with filtered logits
+        # This test would have caught the sorting bug!
+        if keep_mask is not None:
+            # The keep_mask should exactly match positions where logits are NOT -inf
+            non_inf_mask = ~torch.isinf(filtered_logits.detach())
+
+            assert torch.equal(keep_mask, non_inf_mask), (
+                f"keep_mask doesn't match non-inf positions in filtered_logits! "
+                f"This indicates keep_mask is in wrong order (e.g., sorted instead of original). "
+                f"Mismatch count: {(keep_mask != non_inf_mask).sum().item()} out of {keep_mask.numel()}"
+            )
+
+        # Test 6: Backward pass
         # Generate random output gradients (same shape as filtered_logits)
         torch.manual_seed(44)
         output_grad = torch.randn_like(filtered_logits)
 
-        # Compute expected gradients: unmasked tokens get gradients, masked tokens get 0
-        if keep_mask is not None:
-            expected_grad = output_grad * keep_mask
-        else:
-            expected_grad = output_grad
+        # Compute expected gradients independently based on filtered_logits
+        # (not based on keep_mask, which could be buggy)
+        non_inf_mask = ~torch.isinf(filtered_logits.detach())
+        expected_grad = output_grad * non_inf_mask.float()
 
         # Compute actual gradients
         filtered_logits.backward(output_grad)

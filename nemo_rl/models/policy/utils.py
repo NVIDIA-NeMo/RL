@@ -211,12 +211,15 @@ def _apply_top_k_top_p_fn(
     top_p_keep_mask[..., -1] = True
     logits_sort.masked_fill_(~top_p_keep_mask, -float("inf"))
 
-    # Re-sort the probabilities
+    # Scatter the logits back to the original order
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
     if top_k_keep_mask is not None:
         keep_mask = torch.logical_and(top_k_keep_mask, top_p_keep_mask)
     else:
         keep_mask = top_p_keep_mask
+
+    # Scatter the keep_mask back to the original order to match logits
+    keep_mask = keep_mask.scatter(dim=-1, index=logits_idx, src=keep_mask)
 
     return logits, keep_mask
 

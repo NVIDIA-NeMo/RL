@@ -266,7 +266,7 @@ class ClippedPGLossFn(LossFunction):
             next_token_logits_wo_last, _ = apply_top_k_top_p(
                 next_token_logits_wo_last,
                 top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
             )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits_wo_last, dim=-1
@@ -519,7 +519,7 @@ class NLLLoss(LossFunction):
             next_token_logits, _ = apply_top_k_top_p(
                 next_token_logits,
                 top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
             )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
@@ -787,7 +787,7 @@ class DPOLossFn(PreferenceLoss):
             next_token_logits, _ = apply_top_k_top_p(
                 next_token_logits,
                 top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else None,
+                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
             )
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
@@ -1006,13 +1006,13 @@ class DistillationLossFn(LossFunction):
         sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
-        # The generation sampling params top-k and top-p are supported yet for distillation loss
+        # The generation sampling params top-k and top-p are not supported yet for distillation loss
         if sampling_params is not None and (
             need_top_k_filtering(sampling_params.top_k)
             or need_top_p_filtering(sampling_params.top_p)
         ):
             raise ValueError(
-                "Generation sampling params top-k and top-p are supported yet for distillation loss"
+                "Generation sampling params top-k and top-p are not supported yet for distillation loss"
             )
 
         # Basic shapes
