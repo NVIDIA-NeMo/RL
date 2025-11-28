@@ -71,6 +71,8 @@ policy:
 
     pipeline_dtype: bfloat16
     pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    pipeline_model_parallel_layout: null
     scheduler:
       end_weight_decay: 0.01
       lr_decay_iters: 1000
