@@ -353,22 +353,27 @@ class SGLangGeneration(GenerationInterface):
         self.shutdown()
 
     def invalidate_kv_cache(self) -> bool:
-        """Invalidate KV cache after weight updates.
+        """Invalidate KV cache before weight updates (Megatron-style).
         
-        For SGLang, this might need to call a different method or might not be needed
-        if the server handles it automatically.
+        This flushes the cache before weight updates to clear stale cache.
+        Only primary workers (TP rank 0, model owners) will flush their cache.
+        
+        Returns:
+            bool: True if all caches were flushed successfully, False otherwise
         """
         try:
-            # For SGLang, we can call a method on each worker if it exists
-            futures = []
-            for worker in self.worker_group.workers:
-                if hasattr(worker, "invalidate_kv_cache"):
-                    futures.append(worker.invalidate_kv_cache.remote())
-            
-            if futures:
-                results = ray.get(futures)
-                return all(result for result in results if result is not None)
-            return True
+            futures = self.worker_group.run_all_workers_single_data(
+                "invalidate_kv_cache",
+                run_rank_0_only_axes=["tensor_parallel"],
+            )
+            results = ray.get(futures)
+            results = [r for r in results if r is not None]
+            success = all(result for result in results) if results else True
+            if success:
+                print("[sglang refit] All SGLang server caches flushed successfully", flush=True)
+            else:
+                print("[sglang refit] WARNING - Some SGLang server caches failed to flush", flush=True)
+            return success
         except Exception as e:
-            print(f"Error invalidating SGLang caches: {e}")
+            print(f"[sglang refit] Error flushing SGLang caches: {e}", flush=True)
             return False

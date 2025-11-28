@@ -1713,8 +1713,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         current_device_uuid = self.report_device_id()
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
+            """
+            state_dict_items = sorted(self.model.state_dict().items(), key=lambda x: x[0])
+            for name, tensor in state_dict_items:
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -1726,7 +1728,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     # Convert to target dtype
                     yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
         # Use the HTTP implementation
         stream_weights_via_http_impl(
             params_generator=dtensor_params_generator(),
