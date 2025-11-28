@@ -208,6 +208,12 @@ def create_parser():
         default=None,
         help="Intensity of soft token embeddings mixing with mask token embedding (1.0 = pure soft token, 0.0 = pure mask token, None = auto-compute based on entropy)"
     )
+    parser.add_argument(
+        "--soft-rounds",
+        type=int,
+        default=1,
+        help="Number of soft token inference rounds (0 = standard blockwise, 1 = single round, >1 = multi-round with non-overlapping soft tokens)"
+    )
     
     # dInfer specific settings
     parser.add_argument(
@@ -295,6 +301,7 @@ def main():
         "treat_soft_tokens_as_candidates": args.treat_soft_tokens_as_candidates,
         "soft_temperature": args.soft_temperature,
         "intensity": args.intensity,
+        "soft_rounds": args.soft_rounds,
         "early_stop": not args.no_early_stop,
     }
     
@@ -386,6 +393,7 @@ def main():
             generation_args.append(f"++inference.extra_body.soft_token_ratio={config['soft_token_ratio']}")
             generation_args.append(f"++inference.extra_body.treat_soft_tokens_as_candidates={config['treat_soft_tokens_as_candidates']}")
             generation_args.append(f"++inference.extra_body.soft_temperature={config['soft_temperature']}")
+            generation_args.append(f"++inference.extra_body.soft_rounds={config['soft_rounds']}")
             # Only pass intensity if explicitly set (None means auto-compute based on entropy)
             if config['intensity'] is not None:
                 generation_args.append(f"++inference.extra_body.intensity={config['intensity']}")
@@ -410,6 +418,8 @@ def main():
             print(f"  soft_temperature={config['soft_temperature']}")
             intensity_display = "auto (entropy-based)" if config['intensity'] is None else config['intensity']
             print(f"  intensity={intensity_display}")
+            soft_rounds_desc = {0: "standard blockwise", 1: "single round"}.get(config['soft_rounds'], f"{config['soft_rounds']} rounds")
+            print(f"  soft_rounds={config['soft_rounds']} ({soft_rounds_desc})")
         else:
             print(f"  cfg_scale={config['cfg_scale']}")
             print(f"  remasking={config['remasking']}")
