@@ -71,10 +71,14 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
     configure_dynamo_cache,
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
+    need_top_k_filtering,
+    need_top_p_filtering,
     resolve_model_class,
 )
 from nemo_rl.utils.native_checkpoint import (
@@ -208,6 +212,16 @@ class DTensorPolicyWorker:
                 f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
+
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            generation_cfg = self.cfg["generation"]
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg.get("top_k", None),
+                top_p=generation_cfg.get("top_p", 1.0),
+                temperature=generation_cfg.get("temperature", 1.0),
+            )
+        else:
+            self.sampling_params = None
 
         hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
 
@@ -480,8 +494,21 @@ class DTensorPolicyWorker:
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            logits.div_(self.cfg["generation"]["temperature"])
+        if self.sampling_params is not None and self.sampling_params.temperature != 1.0:
+            logits.div_(self.sampling_params.temperature)
+        return logits
+
+    def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
+        if self.sampling_params is not None and (
+            need_top_k_filtering(self.sampling_params.top_k)
+            or need_top_p_filtering(self.sampling_params.top_p)
+        ):
+            logits, _ = apply_top_k_top_p(
+                logits,
+                top_k=self.sampling_params.top_k,
+                top_p=self.sampling_params.top_p,
+            )
         return logits
 
     @staticmethod
@@ -815,6 +842,7 @@ class DTensorPolicyWorker:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            sampling_params=self.sampling_params,
                         )
                         del logits
 
@@ -1103,6 +1131,7 @@ class DTensorPolicyWorker:
                             input_ids_dtensor,
                             seq_index_tensor,
                             chunk_size=logprob_chunk_size,
+                            sampling_params=self.sampling_params,  # top-k and top-p filtering
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
@@ -1112,6 +1141,7 @@ class DTensorPolicyWorker:
                                 logits,
                                 input_ids,
                                 chunk_size=logprob_chunk_size,
+                                sampling_params=self.sampling_params,  # top-k and top-p filtering
                             )
                         else:
                             if logprob_chunk_size is not None:
@@ -1129,6 +1159,10 @@ class DTensorPolicyWorker:
                                     chunk_logits = logits[
                                         :, chunk_start:chunk_end, :
                                     ].to(torch.float32)
+                                    # Apply top-k and top-p filtering
+                                    chunk_logits = self._apply_top_k_top_p_filtering(
+                                        chunk_logits
+                                    )
                                     log_probs = torch.nn.functional.log_softmax(
                                         chunk_logits, dim=-1
                                     )
@@ -1136,7 +1170,9 @@ class DTensorPolicyWorker:
                                 log_probs = torch.cat(chunked_log_probs, dim=1)
                                 del chunked_log_probs
                             else:
+                                # Apply top-k and top-p filtering
                                 logits = logits.to(torch.float32)
+                                logits = self._apply_top_k_top_p_filtering(logits)
                                 log_probs = torch.nn.functional.log_softmax(
                                     logits, dim=-1
                                 )
