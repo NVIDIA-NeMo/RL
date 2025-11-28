@@ -186,9 +186,11 @@ class SGLangGenerationWorker:
         # there will be issues if we use the event loop in the main thread
         self.async_loop_thread = AsyncLoopThread()
         
-        # Maximum concurrent requests per server to avoid overloading
-        # Default to 8 concurrent requests per server
-        self.max_concurrent_requests = config.get("max_concurrent_requests", 16)
+        # 
+        # temp: Maximum concurrent requests per server
+        # we may remove this limit in the future
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 999999)
+
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -240,7 +242,7 @@ class SGLangGenerationWorker:
             "dtype", "kv_cache_dtype", "context_length", "max_running_requests",
             "chunked_prefill_size", "max_prefill_tokens", "schedule_policy",
             "schedule_conservativeness", "cpu_offload_gb", "log_level",
-            "mem_fraction_static",
+            "mem_fraction_static", "allow_auto_truncate",
         ]:
             if key in self.cfg:
                 kwargs[key] = self.cfg[key]
@@ -418,13 +420,20 @@ class SGLangGenerationWorker:
         return new_tokens, new_logprobs
 
     async def _generate_async(self, tasks):
+        """Execute generation tasks with concurrency control.
+        
+        TEMP: Uses a semaphore to limit the number of concurrent requests per server, preventing server overload.
+        A router based solution is preffered in the future.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         
         async def wrap(idx, coro):
-            try:
-                result = await coro
-                return idx, result
-            except Exception as e:
-                raise
+            async with semaphore:
+                try:
+                    result = await coro
+                    return idx, result
+                except Exception as e:
+                    raise
 
         wrapped = [wrap(i, t) for i, t in enumerate(tasks)]
         results = [None] * len(tasks)
