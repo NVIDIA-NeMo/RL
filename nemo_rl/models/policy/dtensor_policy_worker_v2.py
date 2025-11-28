@@ -27,6 +27,11 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
+import copy
+from nemo_automodel.components._peft.lora import (
+    PeftConfig,
+    apply_lora_to_linear_modules,
+)
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
@@ -107,6 +112,7 @@ class DTensorPolicyWorkerV2:
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+
 
     def __init__(
         self,
@@ -223,6 +229,18 @@ class DTensorPolicyWorkerV2:
 
         full_state_dict = None
         model_state_dict_keys = None
+
+        # lora config
+        lora_cfg = self.cfg["dtensor_cfg"].get("lora", None)
+        self.peft_config = None
+        self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
+        self._debug_lora_info_printed_during_train = False
+        if self.lora_enabled:
+            # Always use float32 since FSDP requires all parameters to be in the same dtype.
+            # autocast should cast the weights to the correct dtype during the forward pass.
+            cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
+            self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
+
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
@@ -234,9 +252,13 @@ class DTensorPolicyWorkerV2:
                 torch_dtype=str(model_config.torch_dtype),
             )
 
+            if self.peft_config is not None:
+                apply_lora_to_linear_modules(model, copy.deepcopy(self.peft_config))
+
             full_state_dict = model.state_dict()
             # Store the original model state dict keys before any parallelization
             model_state_dict_keys = list(full_state_dict.keys())
+
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
@@ -256,6 +278,10 @@ class DTensorPolicyWorkerV2:
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
+            if self.lora_enabled:
+                apply_lora_to_linear_modules(self.model, copy.deepcopy(self.peft_config))
+
+
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -510,6 +536,7 @@ class DTensorPolicyWorkerV2:
             mbs = self.cfg["train_micro_batch_size"]
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
+
         torch.distributed.all_reduce(
             total_dataset_size,
             op=torch.distributed.ReduceOp.SUM,
@@ -1684,15 +1711,51 @@ class DTensorPolicyWorkerV2:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
+    def _is_lora_weight(self, name: str) -> bool:
+        """Check if a weight is a LoRA weight based on its name.
+
+        LoRA weights typically contain 'lora_A' or 'lora_B' in their names.
+        """
+        return "lora_A" in name or "lora_B" in name
+
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        """Prepare state dict metadata for weight refitting and IPC streaming."""
-        state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
-            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-            state_dict_info[name] = (tensor.shape, self.dtype)
+        """Prepare state dict metadata for weight refitting and IPC streaming.
 
-        return state_dict_info
+        Returns:
+            dict containing:
+                - 'weights': dict mapping weight names to (shape, dtype) tuples
+                - 'lora_enabled': bool indicating if LoRA is enabled
+                - 'lora_config': optional PeftConfig if LoRA is enabled
+                - 'lora_weights': list of LoRA weight names (when LoRA is enabled)
+        """
+        state_dict_info = {}
+        lora_weight_names = []
+
+        # Determine which weights to include based on LoRA status
+        if self.lora_enabled:
+            # Only include LoRA weights when LoRA is enabled
+            for name, tensor in self.model.state_dict().items():
+                if self._is_lora_weight(name):
+                    # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+                    state_dict_info[name] = (tensor.shape, self.dtype)
+                    lora_weight_names.append(name)
+        else:
+            # Include all weights when LoRA is not enabled
+            for name, tensor in self.model.state_dict().items():
+                # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+                state_dict_info[name] = (tensor.shape, self.dtype)
+
+        refit_info = {
+            "weights": state_dict_info,
+            "lora_enabled": self.lora_enabled,
+            "lora_config": self.peft_config.to_dict()
+            if self.lora_enabled and self.peft_config
+            else None,
+            "lora_weights": lora_weight_names if self.lora_enabled else None,
+        }
+
+        return refit_info
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
@@ -1704,7 +1767,11 @@ class DTensorPolicyWorkerV2:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream model weights to peer process via ZMQ IPC socket."""
+        """Stream model weights to peer process via ZMQ IPC socket.
+
+        When LoRA is enabled, only LoRA weights are streamed.
+        When LoRA is disabled, all weights are streamed.
+        """
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1713,8 +1780,15 @@ class DTensorPolicyWorkerV2:
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
+
+            Only yields LoRA weights when LoRA is enabled, otherwise yields all weights.
+            """
             for name, tensor in self.model.state_dict().items():
+                # Skip non-LoRA weights if LoRA is enabled
+                if self.lora_enabled and not self._is_lora_weight(name):
+                    continue
+
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -1738,7 +1812,11 @@ class DTensorPolicyWorkerV2:
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        When LoRA is enabled, only LoRA weights are broadcasted.
+        When LoRA is disabled, all weights are broadcasted.
+        """
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
@@ -1756,8 +1834,17 @@ class DTensorPolicyWorkerV2:
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
 
+        # Filter state dict to only include LoRA weights if LoRA is enabled
+        def _filtered_state_dict_iterator():
+            """Iterator that yields only LoRA weights when LoRA is enabled."""
+            for name, tensor in self.model.state_dict().items():
+                # Skip non-LoRA weights if LoRA is enabled
+                if self.lora_enabled and not self._is_lora_weight(name):
+                    continue
+                yield (name, tensor)
+
         packed_broadcast_producer(
-            iterator=iter(self.model.state_dict().items()),
+            iterator=_filtered_state_dict_iterator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
@@ -1894,6 +1981,9 @@ class DTensorPolicyWorkerV2:
                 "peft_config",
             }
         }
+        if self.lora_enabled:
+            checkpoint_kwargs["is_peft"] = True
+            checkpoint_kwargs["peft_config"] = self.peft_config
 
         save_checkpoint(
             model=self.model,
