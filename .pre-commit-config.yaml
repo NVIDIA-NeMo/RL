@@ -40,18 +40,18 @@ repos:
         exclude: '^\.github/'
         types: [file]
 
-  # - repo: local
-  #   hooks:
-  #     - id: pyrefly-typecheck
-  #       name: pyrefly check
-  #       entry: uv run --group dev pyrefly check
-  #       types_or: [python, pyi]
-  #       language: system
-  #       pass_filenames: false # Pyrefly reads config & project roots itself.
-  #       args: []
-  #       require_serial: true
-  #       additional_dependencies: []
-  #       minimum_pre_commit_version: "2.9.2"
+  - repo: local
+    hooks:
+      - id: pyrefly-typecheck
+        name: pyrefly check
+        entry: uv run --group dev pyrefly check
+        types_or: [python, pyi]
+        language: system
+        pass_filenames: false # Pyrefly reads config & project roots itself.
+        args: []
+        require_serial: true
+        additional_dependencies: []
+        minimum_pre_commit_version: "2.9.2"
 
   # This pre-commit hook ensures that the config file is minimized and reflects exactly what you
   # intend to merge. Without it, you might run experiments with one config, but when merging upstream,

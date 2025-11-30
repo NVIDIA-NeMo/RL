@@ -593,7 +593,6 @@ def sft_train(
                         f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
                     )
                     metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
-                print(f"  • Grad norm: {float(metrics['grad_norm']):.4f}")
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

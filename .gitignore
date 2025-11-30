@@ -46,6 +46,3 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
-
-# temp
-slurm/

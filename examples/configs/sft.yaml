@@ -36,6 +36,7 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
+    _v2: true
     enabled: true
     env_vars: {}
     cpu_offload: False
@@ -44,6 +45,18 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    lora:
+      enabled: false
+      target_modules: [] # match all linear modules takes precendence
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      lora_dtype: ${policy.precision}
+      use_triton: true
 
   dynamic_batching:
     enabled: false

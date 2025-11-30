@@ -14,6 +14,7 @@
 
 import gc
 import itertools
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -26,7 +27,6 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
-import copy
 from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
@@ -98,6 +98,15 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _patched_init_lora_weights(self, init_method: str):
+    if init_method == "xavier":
+        nn.init.xavier_normal_(self.lora_A.weight.data)
+        print("Initialized LoRA weights with patched xavier initialization")
+    else:
+        nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
+    self.lora_B.weight.data.zero_()
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
@@ -111,7 +120,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
-
 
     def __init__(
         self,
@@ -233,7 +241,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         lora_cfg = self.cfg["dtensor_cfg"].get("lora", None)
         self.peft_config = None
         self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
-        self._debug_lora_info_printed_during_train = False
+        # patch the init_lora_weights method to use the xavier initialization
+        # _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
         if self.lora_enabled:
             # Always use float32 since FSDP requires all parameters to be in the same dtype.
             # autocast should cast the weights to the correct dtype during the forward pass.
@@ -252,12 +261,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
             if self.peft_config is not None:
-                apply_lora_to_linear_modules(model, copy.deepcopy(self.peft_config))
+                apply_lora_to_linear_modules(model, self.peft_config)
 
             full_state_dict = model.state_dict()
             # Store the original model state dict keys before any parallelization
             model_state_dict_keys = list(full_state_dict.keys())
-
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
@@ -278,9 +286,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 torch_dtype=str(model_config.torch_dtype),
             )
             if self.lora_enabled:
-                apply_lora_to_linear_modules(self.model, copy.deepcopy(self.peft_config))
-
-
+                apply_lora_to_linear_modules(self.model, self.peft_config)
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -525,7 +531,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             mbs = self.cfg["train_micro_batch_size"]
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
-
         torch.distributed.all_reduce(
             total_dataset_size,
             op=torch.distributed.ReduceOp.SUM,

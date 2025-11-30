@@ -21,11 +21,11 @@ policy:
     tensor_parallel_size: 1
     _v2: true
     lora:
-      enabled: false
+      enabled: true
       target_modules: [] # match all linear modules takes precendence
       exclude_modules: []
       match_all_linear: true
-      dim: 32
+      dim: 128
       alpha: 32
       dropout: 0.0
       dropout_position: "post"
