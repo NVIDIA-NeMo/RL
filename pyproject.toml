@@ -79,6 +79,26 @@ vllm = [
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
   "causal-conv1d",
 ]
+sglang = [
+  "sglang>=0.4.1",
+  "pybase64",
+  "orjson",
+  "uvloop",
+  "requests",
+  "openai",
+  "partial-json-parser",
+  "sentencepiece",
+  "sgl-kernel==0.3.17.post1",
+  "compressed-tensors",
+  "msgspec",
+  "python-multipart",
+  "torchao",
+  "xgrammar",
+  "interegular",
+  "openai-harmony",
+  "torch-memory-saver",
+  "einops",
+]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
