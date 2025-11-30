@@ -609,7 +609,7 @@ class SGLangGenerationWorker:
             unpadded_length = input_len + generation_length
             max_length = max(max_length, unpadded_length)
         
-        total_length = padded_input_length + max_length
+        total_length = max(max_length, padded_input_length)
         
         for i, (new_tokens, new_logprobs) in enumerate(all_results):
             input_len = input_lengths[i].item()
