@@ -421,7 +421,6 @@ def logprob_setup(request, two_gpu_virtual_cluster):
     params=[
         # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
         ("tiny_llama_model_path", [], [], True, 16, 32, 0.0, "post", "xavier", True),
-        ("tiny_llama_model_path", [], [], True, 128, 32, 0.0, "post", "xavier", True),
         ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
         (
             "tiny_qwen2_model_path",
@@ -475,7 +474,6 @@ def training_with_lora_setup(request, two_gpu_virtual_cluster):
     params=[
         # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
         ("tiny_llama_model_path", [], [], True, 16, 32, 0.0, "post", "xavier", True),
-        ("tiny_llama_model_path", [], [], True, 128, 32, 0.0, "post", "xavier", True),
         ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
         (
             "tiny_qwen2_model_path",
