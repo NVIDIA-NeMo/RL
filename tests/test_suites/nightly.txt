@@ -66,8 +66,6 @@ tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 # dynamic batching
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch.sh
-# Lora
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-dtensor-lora.sh
 
 # Functional 32b test
 tests/test_suites/llm/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3.sh

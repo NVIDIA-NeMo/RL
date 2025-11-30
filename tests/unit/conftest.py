@@ -516,8 +516,7 @@ def tiny_llama_model_path():
         num_key_value_heads=None,
     )
     model = LlamaForCausalLM(config=config)
-    tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
-    # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
     shutil.rmtree(model_path, ignore_errors=True)
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
@@ -547,8 +546,7 @@ def tiny_llama_tied_model_path():
         num_key_value_heads=None,
     )
     model = LlamaForCausalLM(config=config)
-    tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
-    # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
     shutil.rmtree(model_path, ignore_errors=True)
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)

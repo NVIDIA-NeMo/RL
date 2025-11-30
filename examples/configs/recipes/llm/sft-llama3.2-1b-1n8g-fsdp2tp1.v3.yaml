@@ -6,18 +6,8 @@ checkpointing:
   save_period: 100
 policy:
   dtensor_cfg:
-    _v2: true
     lora:
-      enabled: false
-      target_modules: [] # match all linear modules takes precendence
-      exclude_modules: []
-      match_all_linear: true
       dim: 32
-      alpha: 32
-      dropout: 0.0
-      dropout_position: "post"
-      lora_A_init: "xavier"
-      use_triton: true
   tokenizer:
     name: meta-llama/Llama-3.2-1B
   make_sequence_length_divisible_by: 1
