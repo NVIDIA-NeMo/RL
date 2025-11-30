@@ -1130,7 +1130,14 @@ def grpo_train(
                     policy_generation.finish_generation()
                     # Collect vLLM logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -2170,7 +2177,14 @@ def async_grpo_train(
 
                     # Collect vLLM logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
