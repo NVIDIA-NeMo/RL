@@ -20,7 +20,6 @@ from typing import Any, Optional, cast
 import requests
 import asyncio
 import aiohttp
-import threading
 
 import time
 import ray
@@ -36,58 +35,13 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.utils import AsyncLoopThread
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-
-
-class AsyncLoopThread:
-    """A background event loop thread for running async operations in Ray actors.
-    
-    This class creates a dedicated thread with its own event loop, allowing
-    synchronous Ray actor methods to execute async coroutines without blocking
-    the main actor thread. This is necessary because run_coroutine_threadsafe
-    requires the event loop to be in a different thread.
-    """
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        self._ready = threading.Event()
-        self._thread = threading.Thread(target=self._start_loop, daemon=True)
-        self._thread.start()
-        if not self._ready.wait(timeout=5.0):
-            raise RuntimeError("Event loop thread failed to start within 5 seconds")
-    
-    def _start_loop(self):
-        """Run the event loop in the background thread."""
-        asyncio.set_event_loop(self.loop)
-        self._ready.set()
-        self.loop.run_forever()
-    
-    def run(self, coro):
-        """Schedule a coroutine onto the loop and block until it's done.
-        
-        Args:
-            coro: The coroutine to execute
-            
-        Returns:
-            The result of the coroutine
-        """
-        if not self.loop.is_running():
-            raise RuntimeError("Event loop is not running")
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        result = future.result()
-        return result
-    
-    def shutdown(self):
-        """Shutdown the event loop and wait for the thread to finish."""
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        self._thread.join(timeout=2.0)
-        if self.loop.is_running():
-            self.loop.close()
 
 
 @ray.remote(
@@ -178,19 +132,16 @@ class SGLangGenerationWorker:
         """
         self.cfg = config
         self.is_model_owner = bundle_indices is not None
-        
-        # This is the global worker rank across all workers
         self.global_rank = int(os.environ.get("RANK", "0"))
         
         # Create a dedicated event loop thread for async operations
         # there will be issues if we use the event loop in the main thread
         self.async_loop_thread = AsyncLoopThread()
         
-        # 
         # temp: Maximum concurrent requests per server
         # we may remove this limit in the future
         self.max_concurrent_requests = config.get("max_concurrent_requests", 999999)
-
+        
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -258,6 +209,85 @@ class SGLangGenerationWorker:
         self.connector = None
         
         self.server_process = self._launch_server_process(server_args)
+
+    def get_base_url(self) -> str:
+        """Get the base URL of this SGLang server."""
+        return self.base_url
+
+    def invalidate_kv_cache(self) -> bool:
+        """Invalidate KV cache before weight updates (Megatron-style).
+        
+        This flushes the cache before weight updates to clear stale cache.
+        Uses retry logic to handle cases where there are pending requests.
+        
+        Returns:
+            bool: True if flush was successful, False otherwise
+        """
+        if not self.is_model_owner:
+            return True
+        
+        url = f"{self.base_url}/flush_cache"
+        max_attempts = 60
+        connection_retry_limit = 5
+        
+        # flush_cache will not return status_code 200 when there are pending requests
+        for attempt in range(max_attempts):
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    if attempt > 0:
+                        print(
+                            f"[SGLang Worker] Rank {self.global_rank} Cache flushed successfully "
+                            f"(attempt {attempt + 1})",
+                            flush=True
+                        )
+                    return True
+            except requests.exceptions.ConnectionError:
+                # Server might not be ready yet - only retry for first few attempts
+                if attempt >= connection_retry_limit:
+                    print(
+                        f"[SGLang Worker] Rank {self.global_rank} Connection failed after "
+                        f"{connection_retry_limit} attempts",
+                        flush=True
+                    )
+                    return False
+            except Exception as e:
+                # For other errors, log and retry (except on last attempt)
+                if attempt == max_attempts - 1:
+                    print(
+                        f"[SGLang Worker] Rank {self.global_rank} Failed to flush cache after "
+                        f"{max_attempts} attempts: {e}",
+                        flush=True
+                    )
+                    return False
+            
+            time.sleep(1)
+        
+        # All attempts exhausted without success
+        print(
+            f"[SGLang Worker] Rank {self.global_rank} Timeout: Cache flush failed after "
+            f"{max_attempts} attempts. Server may have pending requests.",
+            flush=True
+        )
+        return False
+
+    def get_gpu_uuids(self) -> list[str]:
+        """Get list of GPU UUIDs used by this SGLang server.
+        
+        Returns:
+            List of GPU UUIDs (e.g., ["GPU-xxxxx", "GPU-yyyyy"])
+        """
+        from nemo_rl.utils.nvml import get_device_uuid
+        
+        # Get all GPU UUIDs used by this server
+        # SGLang server uses GPUs starting from base_gpu_id with tp_size GPUs
+        gpu_uuids = []
+        for i in range(self.server_args.tp_size):
+            gpu_id = self.server_args.base_gpu_id + i
+            uuid = get_device_uuid(gpu_id)
+            gpu_uuids.append(uuid)
+        
+        return gpu_uuids
 
 
     def _merge_stop_strings(self, batch_stop_strings):
@@ -379,6 +409,7 @@ class SGLangGenerationWorker:
         """
         # Prepare payload for SGLang API
         # Note: stop should be in sampling_params, not in payload top level
+        # TODO: double check this
         if stop_string is not None:
             # stop can be a string or list of strings
             sampling_params = sampling_params.copy()  # Don't modify the original
