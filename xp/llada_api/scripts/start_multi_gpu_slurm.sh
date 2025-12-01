@@ -770,5 +770,6 @@ srun --job-name="$JOB_NAME" \
      --container-image="$CONTAINER_IMAGE" \
      --container-workdir="$PROJECT_DIR" \
      --container-mounts="$CONTAINER_MOUNTS" \
+     --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"benchmarking","description":"DiffusionLLM benchmarking script which has periods of low GPU activity due to evaluation metrics calculating during runtime"}}' \
      bash -c "$COMMAND_BLOCK"
 
