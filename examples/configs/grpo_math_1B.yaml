@@ -231,6 +231,8 @@ policy:
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
