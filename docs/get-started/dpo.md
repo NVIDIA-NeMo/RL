@@ -13,11 +13,41 @@ content_type: "tutorial"
 
 **Direct Preference Optimization (DPO)** aligns models to human preferences without needing a separate reward model. It learns directly from "A is better than B" data.
 
+:::{card}
+
+**Goal**: Align a model to preferences using chosen/rejected pairs.
+
+^^^
+
+**In this tutorial, you will**:
+
+1. Run DPO with the default configuration
+2. Customize KL penalty and loss weights
+3. Understand the required data format
+
+:::
+
+:::{button-ref} sft
+:color: secondary
+:outline:
+:ref-type: doc
+
+← Previous: SFT Quickstart
+:::
+
+:::{tip}
+**Going deeper**: For comprehensive coverage of **reference models**, **loss functions**, and **training stability**, refer to the [DPO Guide](../guides/dpo.md).
+:::
+
+---
+
 ## Prerequisites
 
 Ensure you have completed the [Quickstart Installation](index.md). You should have:
 *   NeMo RL installed via `uv`
 *   Environment variables set (`HF_HOME`, etc.)
+
+---
 
 ## Running DPO
 
@@ -43,6 +73,8 @@ uv run python examples/run_dpo.py \
   loss_fn.sft_loss_weight=0.1
 ```
 
+---
+
 ## Data Format
 DPO requires triplets:
 *   **Prompt**: The input.
@@ -57,6 +89,15 @@ DPO requires triplets:
 }
 ```
 
+---
+
 ## Next Steps
-*   **Deep Dive**: See the [DPO Guide](../guides/dpo.md).
-*   **Compare**: Try [Reward Modeling](../guides/rm.md) as an alternative approach.
+
+Now that you've aligned your model with preferences, you're ready for advanced reinforcement learning.
+
+:::{button-ref} grpo
+:color: primary
+:ref-type: doc
+
+Next: GRPO Quickstart →
+:::

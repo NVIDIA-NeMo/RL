@@ -8,9 +8,24 @@ content_type: "tutorial"
 ---
 
 (gs-overview)=
+
 # Quickstart Guide
 
-Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes. You will install the library, set up your environment, and run a sample training job on your local machine.
+Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes.
+
+:::{card}
+
+**Goal**: Install NeMo RL and run your first local training job.
+
+^^^
+
+**In this tutorial, you will**:
+
+1. Install `uv` and system prerequisites
+2. Clone the repository and initialize the environment
+3. Run a sample GRPO training job to verify installation
+
+:::
 
 ## Prerequisites
 
@@ -81,7 +96,7 @@ Let's verify your installation by running a **Group Relative Policy Optimization
 
 ## 3. Choose Your Path
 
-Now that you have a working setup, choose the workflow that matches your goal:
+Now that you have a working setup, choose the workflow that matches your goal.
 
 ::::{grid} 1 1 1 3
 :gutter: 2
@@ -105,6 +120,13 @@ Dive deeper into RL with GRPO, configuring rewards and complex reasoning tasks.
 :::
 
 ::::
+
+:::{button-ref} sft
+:color: primary
+:ref-type: doc
+
+Next: SFT Quickstart →
+:::
 
 ## Advanced Setup
 

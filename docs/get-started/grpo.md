@@ -13,11 +13,41 @@ content_type: "tutorial"
 
 **Group Relative Policy Optimization (GRPO)** is a reinforcement learning algorithm that eliminates the need for a critic model by using group-based baselines. This makes it highly efficient for reasoning tasks.
 
+:::{card}
+
+**Goal**: Optimize a policy using group-relative rewards for reasoning tasks.
+
+^^^
+
+**In this tutorial, you will**:
+
+1. Run GRPO on a math benchmark
+2. Scale to multi-GPU training
+3. Understand group-based advantage estimation
+
+:::
+
+:::{button-ref} dpo
+:color: secondary
+:outline:
+:ref-type: doc
+
+← Previous: DPO Quickstart
+:::
+
+:::{tip}
+**Going deeper**: For comprehensive coverage of **group sampling**, **KL divergence**, and **advanced configuration**, refer to the [GRPO Guide](../guides/grpo.md).
+:::
+
+---
+
 ## Prerequisites
 
 Ensure you have completed the [Quickstart Installation](index.md). You should have:
 *   NeMo RL installed via `uv`
 *   Environment variables set (`HF_HOME`, etc.)
+
+---
 
 ## Running GRPO
 
@@ -53,6 +83,8 @@ uv run python examples/run_grpo_math.py \
   grpo.num_generations_per_prompt=16
 ```
 
+---
+
 ## Understanding the Output
 
 GRPO training produces specific metrics:
@@ -67,7 +99,16 @@ Logs are saved to `results/grpo_math_1B/experiment_0/`.
 2.  **Score**: Evaluate all $G$ completions with the reward function (e.g., correctness).
 3.  **Update**: Optimize the policy to increase the likelihood of high-scoring completions relative to the group average.
 
+---
+
 ## Next Steps
-*   **Deep Dive**: See the [GRPO Guide](../guides/grpo.md) for algorithm details.
-*   **Custom Rewards**: Learn to build [Custom Environments](../guides/environments.md).
-*   **Reproduction**: Try the [DeepScaleR Tutorial](../guides/grpo-deepscaler.md).
+
+You have completed the quickstart tutorials! You are now ready to build your own RL pipelines.
+
+:::{card} What's Next?
+
+*   **Create Custom Environments**: Learn to define your own rewards in the [Environments Guide](../guides/environments.md).
+*   **Reproduce State-of-the-Art**: Try the [DeepScaleR Tutorial](../guides/grpo-deepscaler.md).
+*   **Deploy to Cluster**: Scale your training with the [Cluster Setup Guide](cluster.md).
+
+:::

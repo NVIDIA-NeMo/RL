@@ -13,11 +13,42 @@ content_type: "tutorial"
 
 **Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models. It trains the model to follow instructions using a dataset of prompt-response pairs.
 
+:::{card}
+
+**Goal**: Train a model to follow instructions using a supervised dataset.
+
+^^^
+
+**In this tutorial, you will**:
+
+1. Run SFT with the default configuration
+2. Scale up with the Megatron Core backend
+3. Customize model and training parameters
+4. Understand the SFT training process
+
+:::
+
+:::{button-ref} index
+:color: secondary
+:outline:
+:ref-type: doc
+
+← Previous: Quickstart Guide
+:::
+
+:::{tip}
+**Going deeper**: For comprehensive coverage of **custom datasets**, **packing strategies**, and **advanced hyperparameters**, refer to the [SFT Guide](../guides/sft.md).
+:::
+
+---
+
 ## Prerequisites
 
 Ensure you have completed the [Quickstart Installation](index.md). You should have:
 *   NeMo RL installed via `uv`
 *   Environment variables set (`HF_HOME`, etc.)
+
+---
 
 ## Running SFT
 
@@ -51,12 +82,23 @@ uv run python examples/run_sft.py \
   sft.learning_rate=2e-5
 ```
 
+---
+
 ## How it Works
 SFT is standard language modeling on specific data:
 1.  **Input**: Instruction + Desired Response.
 2.  **Loss**: Cross-entropy loss on the response tokens.
 3.  **Goal**: Maximize probability of the desired response given the instruction.
 
+---
+
 ## Next Steps
-*   **Deep Dive**: See the [SFT Guide](../guides/sft.md).
-*   **Prepare for RL**: Use your SFT checkpoint as the starting point for [GRPO](grpo.md) or [DPO](dpo.md).
+
+You've fine-tuned your model! Now you can align it to preferences or optimize it with reinforcement learning.
+
+:::{button-ref} dpo
+:color: primary
+:ref-type: doc
+
+Next: DPO Quickstart →
+:::
