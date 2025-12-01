@@ -30,6 +30,8 @@ import numpy as np
 import torch
 import yaml
 
+from nemo_rl.utils.config import load_config
+
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
@@ -49,6 +51,8 @@ class CheckpointingConfig(TypedDict):
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
+    peft_config: PEFT config.
+    _model_name (Optional[str]): Name of the model to use for checkpointing. Defaults to the policy model name. Used for validation.
     """
 
     enabled: bool
@@ -65,6 +69,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    _model_name: NotRequired[str]
 
 
 class CheckpointManager:
@@ -105,6 +110,9 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
+
+        # This is only used for validation
+        self._model_name = config.get("_model_name", None)
 
     def init_tmp_checkpoint(
         self,
@@ -254,6 +262,7 @@ class CheckpointManager:
         """Get the path to the latest checkpoint.
 
         Returns the path to the checkpoint with the highest step number.
+        If config.yaml is found in the checkpoint directory, the current policy model name is compared with the model name in the checkpoint to ensure the correct checkpoint is being loaded.
 
         Returns:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
@@ -267,6 +276,14 @@ class CheckpointManager:
         step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
         if len(step_dirs) == 0:
             return None
+        # Load the config.yaml from this ckpt dir
+        config_path = os.path.join(step_dirs[-1], "config.yaml")
+        if os.path.exists(config_path):
+            ckpt_config = load_config(config_path)
+            if ckpt_config["policy"]["model_name"] != self._model_name:
+                raise ValueError(
+                    f"Model name in checkpoint {ckpt_config['policy']['model_name']} does not match policy model name {self._model_name}. Please verify if the correct checkpoint is being loaded."
+                )
         return str(step_dirs[-1])
 
     def load_training_info(
