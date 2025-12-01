@@ -11,21 +11,19 @@ content_type: "tutorial"
 
 # Get Started with SFT
 
-**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models. It trains the model to follow instructions using a dataset of prompt-response pairs.
+**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models. In this tutorial, you will learn the end-to-end workflow of fine-tuning a model to follow instructions.
 
 :::{card}
-
-**Goal**: Train a model to follow instructions using a supervised dataset.
+**Goal**: Train a basic model (Llama-3.2-1B) on a sample dataset using your local machine.
 
 ^^^
 
-**In this tutorial, you will**:
+**Steps**:
 
-1. Run SFT with the default configuration
-2. Scale up with the Megatron Core backend
-3. Customize model and training parameters
-4. Understand the SFT training process
-
+1. **Prepare Data**: Understand the input format.
+2. **Configure**: Set hyperparameters in the YAML configuration.
+3. **Train**: Run the `run_sft.py` script.
+4. **Verify**: Check logs and model artifacts.
 :::
 
 :::{button-ref} index
@@ -36,81 +34,130 @@ content_type: "tutorial"
 ← Previous: Quickstart Guide
 :::
 
-:::{tip}
-**Going deeper**: For comprehensive coverage of **custom datasets**, **packing strategies**, and **advanced hyperparameters**, refer to the [SFT Guide](../guides/sft.md).
-:::
-
 ---
 
 ## Prerequisites
 
 Ensure you have completed the [Quickstart Installation](index.md). You should have:
-*   NeMo RL installed via `uv`
-*   Environment variables set (`HF_HOME`, etc.)
+
+* NeMo RL installed via `uv`
+* Environment variables set (`HF_HOME`, etc.)
 
 ---
 
-## Running SFT
+## Step 1: Prepare Your Data
 
-### 1. Basic Command
-Run the default SFT example:
+SFT requires a dataset of "Instruction" and "Response" pairs. The goal is to teach the model to generate the target response given the instruction.
 
-```bash
-uv run python examples/run_sft.py
+By default, the example script uses the **SQuAD** dataset, but you can use your own data.
+
+### The Data Format
+
+NeMo RL supports standard JSONL files where each line is a training example.
+
+```json
+{"input": "What is the capital of France?", "output": "The capital of France is Paris."}
+{"input": "Write a python function to add two numbers.", "output": "def add(a, b):\n    return a + b"}
 ```
 
-This uses the default configuration in `examples/configs/sft.yaml`.
+You can specify your data in the configuration file (see Step 2).
 
-### 2. Using Megatron Core Backend
-For large-scale training:
+---
+
+## Step 2: Configure the Job
+
+NeMo RL uses **Hydra** for configuration, allowing you to manage parameters in structured YAML files. The default configuration is at `examples/configs/sft.yaml`.
+
+Key parameters you might want to change:
+
+* **`policy.model_name`**: The base model to start from (e.g., `meta-llama/Llama-3.2-1B`).
+* **`data.train_data_path`**: Path to your training `.jsonl` file.
+* **`sft.max_num_epochs`**: How many times to iterate over the dataset.
+* **`sft.learning_rate`**: The step size for the optimizer.
+
+:::{tip}
+You don't need to edit the YAML file directly. You can override any parameter from the command line (shown in Step 3).
+:::
+
+---
+
+## Step 3: Run the Training
+
+We will use the `examples/run_sft.py` script to start the training. This script handles loading the model, processing the data, and running the training loop.
+
+Run the following command to start a small experiment:
+
+```bash
+uv run python examples/run_sft.py \
+  sft.max_num_epochs=1 \
+  sft.max_num_steps=100 \
+  policy.model_name="meta-llama/Llama-3.2-1B"
+```
+
+**What's happening?**
+
+* `uv run`: Ensures the script runs in the managed environment.
+* `sft.max_num_epochs=1`: Overrides the configuration to run for just 1 epoch.
+* `sft.max_num_steps=100`: Limits the run to 100 steps (good for a quick test).
+
+---
+
+## Step 4: Monitor and Verify
+
+Once the script starts, it will print logs to your console. Watch for these key indicators:
+
+1. **Data Loading**: Look for "Training and validation datasets loaded".
+2. **Loss**: You should see the loss value printed periodically. Ideally, this number should decrease over time.
+
+### Output Artifacts
+
+By default, NeMo RL saves results to the `results/sft` directory (defined in `checkpointing.checkpoint_dir`).
+
+* **Checkpoints**: Saved model weights (e.g., `results/sft/checkpoints/`).
+* **Logs**: Training metrics (e.g., `logs/`).
+
+To verify your training was successful, check that a checkpoint file exists in the results directory.
+
+---
+
+## Scaling Up
+
+Once you are comfortable with the basic workflow, you can scale up to larger models and multi-GPU training.
+
+### Using Megatron Core
+
+For high-performance training on large models, switch to a Megatron-compatible configuration:
 
 ```bash
 uv run python examples/run_sft.py \
   --config examples/configs/sft_openmathinstruct2_megatron.yaml
 ```
 
-### 3. Common Customizations
+### Multi-Node Training
 
-```bash
-# Change Model
-uv run python examples/run_sft.py \
-  policy.model_name="meta-llama/Llama-3.2-1B-Instruct"
-
-# Adjust Hyperparameters
-uv run python examples/run_sft.py \
-  sft.max_num_epochs=3 \
-  sft.learning_rate=2e-5
-```
-
----
-
-## How it Works
-SFT is standard language modeling on specific data:
-1.  **Input**: Instruction + Desired Response.
-2.  **Loss**: Cross-entropy loss on the response tokens.
-3.  **Goal**: Maximize probability of the desired response given the instruction.
+To run on a cluster (Slurm or Kubernetes), refer to the [Cluster Setup](cluster.md) guide.
 
 ---
 
 ## Next Steps
 
-You've successfully fine-tuned a model! Now, choose how you want to deploy or scale your training.
+Now that you've fine-tuned a model, you can move on to Reinforcement Learning from Human Feedback (RLHF).
 
 ::::{grid} 1 2 2 2
 :gutter: 2
 
-:::{grid-item-card} {octicon}`desktop-download;1.5em;sd-mr-1` Local Deployment
-:link: local-workstation
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Run DPO
+:link: dpo
 :link-type: doc
 
-Manage GPUs and run concurrent experiments on your workstation.
+Direct Preference Optimization (DPO) aligns your model using preference data.
 :::
 
-:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Setup
-:link: cluster
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` SFT Guide
+:link: ../guides/sft
 :link-type: doc
 
-Scale your training to multi-node Slurm or Kubernetes clusters.
+Deep dive into SFT parameters, packing strategies, and custom datasets.
 :::
 
 ::::
