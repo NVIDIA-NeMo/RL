@@ -52,7 +52,7 @@ You don't need to manually configure Ray. NeMo RL provides a helper script, `ray
 
 ## Step 2: Submit a Job
 
-The submission process is identical for SFT, DPO, and GRPO. You simply swap the Python script in the `COMMAND` variable.
+The submission process is identical for SFT, DPO, Reward Model (RM), and GRPO. You swap the Python script in the `COMMAND` variable.
 
 ### Command Cheatsheet
 
@@ -62,6 +62,7 @@ Copy the command for your training type:
 | :--- | :--- |
 | **SFT** | `uv run examples/run_sft.py` |
 | **DPO** | `uv run examples/run_dpo.py` |
+| **Reward Model** | `uv run examples/run_rm.py` |
 | **GRPO** | `uv run examples/run_grpo_math.py` |
 
 ::::{tab-set}
@@ -97,6 +98,7 @@ You are now inside the container on the head node. Run your command (see Cheatsh
 ```bash
 uv run examples/run_sft.py
 ```
+
 :::
 
 :::{tab-item} Batch Mode (Production)
@@ -135,6 +137,7 @@ Once your job is running, you have two main ways to see what's happening.
 The `ray.sub` script creates a log directory named after your Job ID (e.g., `1980204-logs/`).
 
 * **`ray-driver.log`**: The stdout/stderr of your Python script. Check this for training progress (loss values).
+* **`ray-worker-*.log`**: Logs for individual worker nodes (useful for debugging specific node failures).
 * **`dashboard.log`**: Debug info for the Ray dashboard.
 
 ```bash
