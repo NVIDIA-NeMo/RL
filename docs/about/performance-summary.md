@@ -59,5 +59,5 @@ The performance data includes:
 
 Note:
 
-* All Mixture-of-expert (MOE) model training uses token drop-less. 
+* All Mixture-of-expert (MoE) model training uses token drop-less. 
 * The following metrics are extracted from the average of 5 steps: G-Average Seq len, Tokens/sec/gpu, Total Step time(s). Because of the averaging, the numbers in table does not completely match the equation stated in Performance Metrics above but the difference is small.
