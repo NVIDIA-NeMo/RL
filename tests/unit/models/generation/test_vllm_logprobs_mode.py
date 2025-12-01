@@ -167,7 +167,7 @@ def test_processed_logprobs_matches_manual_computation():
         scaled_logits_batched = scaled_logits.unsqueeze(0).unsqueeze(
             0
         )  # [1, 1, vocab_size]
-        filtered_logits_batched = apply_top_k_top_p(
+        filtered_logits_batched, _ = apply_top_k_top_p(
             scaled_logits_batched, top_k=top_k, top_p=top_p
         )
         filtered_logits = filtered_logits_batched.squeeze(0).squeeze(0)  # [vocab_size]
