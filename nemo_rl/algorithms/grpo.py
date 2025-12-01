@@ -2124,7 +2124,6 @@ def async_grpo_train(
             trajectory_collector.resume.remote()
 
     print("✅ All setup complete, starting buffer wait...")
-
     # Clear vLLM logger metrics after at start of training
     if policy_generation is not None and hasattr(
         policy_generation, "clear_vllm_logger_metrics"
