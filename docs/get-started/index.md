@@ -32,7 +32,7 @@ Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes.
 * **OS**: Linux (Ubuntu 22.04/20.04 recommended)
 * **Hardware**: NVIDIA GPU (Volta/Compute Capability 7.0+ required)
 * **Software**: 
-  * Python 3.10+
+  * Python 3.12+
   * CUDA 12+
   * Git
 
@@ -94,6 +94,72 @@ Let's verify your installation by running a **Group Relative Policy Optimization
    * It will download a small model (`Qwen/Qwen2.5-1.5B-Instruct` or similar) and dataset.
    * You should see training logs indicating "Training started" and loss metrics streaming.
 
+### Local Development Tips
+
+Use these tips to manage your local resources and troubleshoot.
+
+:::{dropdown} 💡 How to Control GPU Usage & Run Concurrent Jobs
+
+**Controlling GPU Usage**
+
+By default, Ray detects and uses all available GPUs. To restrict a job to specific GPUs, use `CUDA_VISIBLE_DEVICES`:
+
+```bash
+# Only use GPU 0 and 3
+CUDA_VISIBLE_DEVICES=0,3 uv run examples/run_grpo_math.py
+```
+
+**Running Concurrent Jobs**
+
+You can run multiple independent training jobs on the same machine by isolating them to different GPUs. Each job spins up its own isolated Ray instance.
+
+**Terminal 1 (Job A)**:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run examples/run_grpo_math.py
+```
+
+**Terminal 2 (Job B)**:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 uv run examples/run_sft.py
+```
+
+:::
+
+:::{dropdown} 🔍 Monitoring & Logs
+
+**Ray Dashboard**
+
+When a job starts, Ray provides a dashboard URL (usually `http://127.0.0.1:8265`) in the logs. Open this URL in your browser to view actor status, logs, and resource utilization.
+
+**Weights & Biases**
+
+If you set `WANDB_API_KEY`, metrics stream to W&B. This is the recommended way to track training curves (loss, reward, KL divergence).
+:::
+
+:::{dropdown} ℹ️ How NeMo RL manages the local cluster
+
+When you execute a training script (for example, `uv run ...`), NeMo RL:
+
+1. Checks for an existing Ray cluster.
+2. If none is found, it automatically starts a local Ray instance using your available resources.
+3. It shuts down the cluster when the script finishes (unless connected to a persistent Ray server).
+
+You generally do **not** need to start Ray manually.
+:::
+
+:::{dropdown} 🛠️ Troubleshooting
+
+* **"Resources not available"**: If a job hangs, check if another Ray instance is holding the GPUs. You may need to manually stop stray Ray processes:
+
+  ```bash
+  ray stop
+  ```
+
+* **OOM Errors**: If you run out of memory, try reducing the batch size or model size in the configuration YAML.
+:::
+
 ## 3. Choose Your Path
 
 Now that you have a working setup, choose the workflow that matches your goal.
@@ -121,14 +187,6 @@ Dive deeper into RL with GRPO, configuring rewards and complex reasoning tasks.
 
 ::::
 
-:::{button-ref} sft
-:color: primary
-:ref-type: doc
-
-Next: SFT Quickstart →
-:::
-
 ## Advanced Setup
 
-*   **Local Management**: Learn how to control GPUs and run concurrent jobs in the [Local Deployment Guide](local-workstation.md).
-*   **Cluster Setup**: Ready to scale? Set up multi-node training on [Slurm or Kubernetes](cluster.md).
+* **Cluster Setup**: Ready to scale? Set up multi-node training on [Slurm or Kubernetes](cluster.md).
