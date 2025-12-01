@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -99,11 +99,12 @@ def calculate_baseline_and_std_per_prompt(
 
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
+    std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
     else:
-        reward_device = torch.device(reward_device)
+        reward_device = torch.device(f"cuda:{device_ordinal}")
 
     for i in range(len(unique_prompts)):
         is_matching_prompt = (prompts == unique_prompts[i]).all(1)
@@ -142,8 +143,15 @@ def calculate_baseline_and_std_per_prompt(
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = prompt_baseline_square
+            std[prompt_idx] = (
+                (
+                    (prompt_baseline_square - prompt_baseline.square())
+                    * (num_valid / (num_valid - 1))
+                )
+                .sqrt()
+                .nan_to_num(0)
+            )
 
-    std = (sq_baseline - baseline.square()).sqrt().nan_to_num(0)
     return baseline, std
 
 
@@ -376,7 +384,7 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
 
 def print_performance_metrics(
     train_results: dict[str, float],
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
     timing_metrics: dict[str, float],
     master_config: dict,
 ) -> dict[str, float]:
@@ -392,13 +400,14 @@ def print_performance_metrics(
         per_worker_load_ratio = [
             v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
         ]
-        max_rows_to_print = 100
+        max_rows_to_print = 1000
+        bar_length = 20
         print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
-                f"{'■' * int(per_worker_load_ratio[i] * 10)}"
-                f"{'□' * (10 - int(per_worker_load_ratio[i] * 10))}"
+                f"{'■' * int(per_worker_load_ratio[i] * bar_length)}"
+                f"{'□' * (bar_length - int(per_worker_load_ratio[i] * bar_length))}"
                 f" Count: {per_worker_token_counts_list[i] / 1000:.1f}K"
             )
         estimated_idle_ratio = 1 - sum(per_worker_load_ratio) / len(
@@ -432,6 +441,125 @@ def print_performance_metrics(
         print(
             f"  • Mean Total Tokens per Sample: {metrics['mean_total_tokens_per_sample']:.2f}"
         )
+
+    # =====================================================
+    # vLLM Logger Metrics (inflight batch sizes, num pending samples, etc.)
+    # =====================================================
+    def resize_timeline(data, new_size):
+        old_size = len(data)
+        x_old = np.linspace(0, 1, old_size)
+        x_new = np.linspace(0, 1, new_size)
+        return np.interp(x_new, x_old, data)
+
+    def get_min_idle_time(
+        metric_dict: dict[int, list[int]], timeline_interval: float
+    ) -> float:
+        min_idle_time = float("inf")
+        for _, metric_values in metric_dict.items():
+            count_zeros = lambda x: sum(v == 0 for v in x)
+            idle_time = count_zeros(metric_values) * timeline_interval
+            min_idle_time = min(min_idle_time, idle_time)
+        return min_idle_time
+
+    def visualize_per_worker_timeline(
+        metric_dict: dict[int, list[int]],
+        metric_name: str,
+        timeline_interval: float | None,
+    ) -> None:
+        dp_ranks = list(metric_dict.keys())
+        max_rows_to_print = 1000
+        max_timeline_length = 50
+        marker = {0: "▃", 1: "▅", 2: "▆", 3: "▉"}
+        zero_marker = "▁"
+
+        max_value = max((max(v) if v else 0) for v in metric_dict.values())
+        bin_width = (max_value + 1) / len(marker)
+
+        print(f"  - {metric_name}:")
+        print(f"    - Max value: {max_value}")
+        if timeline_interval is not None:
+            print(
+                f"    - Min idle time: {get_min_idle_time(metric_dict, timeline_interval)} s"
+            )
+        print(
+            f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
+        )
+        for dp_idx, metric_values in metric_dict.items():
+            if dp_idx > max_rows_to_print:
+                break
+            timeline = []
+            length = len(metric_values)
+            if timeline_interval is not None:
+                count_zeros = lambda x: sum(v == 0 for v in x)
+                idle = count_zeros(metric_values) * timeline_interval
+                active = length * timeline_interval - idle
+            if length > max_timeline_length:
+                resized_metric_values = resize_timeline(
+                    metric_values, max_timeline_length
+                )
+            else:
+                resized_metric_values = metric_values
+
+            for i, value in enumerate(resized_metric_values):
+                m = (
+                    zero_marker
+                    if value == 0
+                    else marker[min(int(value // bin_width), len(marker) - 1)]
+                )
+                timeline.append(m)
+            if timeline_interval is not None:
+                print(
+                    f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
+                )
+            else:
+                print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
+
+    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
+        "vllm_cfg", {}
+    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
+        "generation"
+    ].get("vllm_cfg", {}).get("async_engine", False)
+    if is_vllm_metrics_logger_enabled:
+        vllm_logger_metrics = metrics["vllm_logger_metrics"]
+        # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
+        # metric_name: "inflight_batch_sizes" or "num_pending_samples"
+
+        assert "inflight_batch_sizes" in vllm_logger_metrics, (
+            "inflight_batch_sizes not found in vllm_logger_metrics"
+        )
+        assert "num_pending_samples" in vllm_logger_metrics, (
+            "num_pending_samples not found in vllm_logger_metrics"
+        )
+        assert isinstance(vllm_logger_metrics["inflight_batch_sizes"], dict), (
+            "inflight_batch_sizes must be a dictionary"
+        )
+        assert isinstance(vllm_logger_metrics["num_pending_samples"], dict), (
+            "num_pending_samples must be a dictionary"
+        )
+
+        vllm_metrics_logger_interval = master_config["policy"]["generation"][
+            "vllm_cfg"
+        ]["vllm_metrics_logger_interval"]
+        print("  • vLLM Logger Metrics:")
+        # Visualize the inflight batch sizes timeline
+        if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
+            visualize_per_worker_timeline(
+                vllm_logger_metrics["inflight_batch_sizes"],
+                "Inflight Batch Sizes",
+                vllm_metrics_logger_interval,
+            )
+        if len(vllm_logger_metrics["num_pending_samples"].values()) > 0:
+            max_num_pending_samples = max(
+                (max(v) if v else 0)
+                for v in vllm_logger_metrics["num_pending_samples"].values()
+            )
+            # If there is at least one pending sample, visualize the timeline
+            if max_num_pending_samples > 0:
+                visualize_per_worker_timeline(
+                    vllm_logger_metrics["num_pending_samples"],
+                    "Num Pending Samples",
+                    None,
+                )
 
     # =====================================================
     # Throughputs

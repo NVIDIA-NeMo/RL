@@ -20,6 +20,7 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -118,6 +119,12 @@ def apply_fp8_patches(self, fp8_config):
     func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     patcher1 = patch(func1_path, process_weights_after_loading)
     fp8_state.vllm_patches.append(patcher1)
+    func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+    patcher2 = patch(func2_path, process_weights_after_loading_moe)
+    fp8_state.vllm_patches.append(patcher2)
+    func3_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+    patcher3 = patch(func3_path, process_weights_after_loading_kv)
+    fp8_state.vllm_patches.append(patcher3)
     # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
     # SNR compared to plain fp32 scaling factors. This feature is still under active research.
     if global_fp8_config.use_activation_pow2_scale:
@@ -137,11 +144,6 @@ def apply_fp8_patches(self, fp8_config):
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     config = AutoConfig.from_pretrained(model_name)
-    if hasattr(config, "num_experts"):
-        assert config.num_experts == 0, (
-            "FP8 generation for MoE models is currently not supported"
-        )
-
     global global_fp8_config
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
@@ -191,6 +193,24 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
+    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
+    if len(quantization_ignored_layer_kws):
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [
+            f"model.{name}".removesuffix(".weight")
+            for name, _ in model.named_parameters()
+        ]
+        ignored_layers = [
+            n
+            for n in param_names
+            if any(p in n for p in quantization_ignored_layer_kws)
+        ]
+        if "ignored_layers" not in fp8_block_quant_kwargs:
+            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
+        else:
+            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
+        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
 
     vllm_kwargs = {
         "quantization": "fp8",
@@ -262,6 +282,8 @@ def _get_module_from_param_name(model, name: str):
     try:
         # Traverse the model hierarchy
         for part in module_path:
+            if isinstance(current_module, FusedMoE):
+                return current_module
             if isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
             else:
@@ -281,6 +303,11 @@ def _is_fp8_weight(name, model):
             if (
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
+                or (
+                    isinstance(module, FusedMoE)
+                    and module.w13_weight.dtype == torch.float8_e4m3fn
+                    and module.w2_weight.dtype == torch.float8_e4m3fn
+                )
             ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
@@ -302,18 +329,8 @@ def load_weights(weights, model_runner):
         param_scale = torch.squeeze(param_scale, dim=-1)
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
-    # Monkey patch the param class to their subclass, as certain models
-    # will check the param type to call the proper weightloader
-    for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
-            param.orig_type = param.__class__
-            param.__class__ = param.subclass_type
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
-    # Undo the type change above to the original type
-    for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
-            param.__class__ = param.orig_type
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -324,12 +341,25 @@ def cast_tensor_to_fp8_blockwise(
 
     block_size1 = weight_block_size[1]
     block_size0 = weight_block_size[0]
-    assert data_hp.shape[1] % block_size1 == 0, (
-        f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    )
-    assert data_hp.shape[0] % block_size0 == 0, (
-        f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
-    )
+    shape_before_padding = data_hp.shape
+    # pad data_hp to make its shape a multiple of weight_block_size with the last element of data_hp
+    if data_hp.shape[1] % block_size1 != 0 or data_hp.shape[0] % block_size0 != 0:
+        pad1 = (
+            0
+            if data_hp.shape[1] % block_size1 == 0
+            else block_size1 - data_hp.shape[1] % block_size1
+        )
+        pad0 = (
+            0
+            if data_hp.shape[0] % block_size0 == 0
+            else block_size0 - data_hp.shape[0] % block_size0
+        )
+        print(
+            f"Padding data_hp from {data_hp.shape} to {(data_hp.shape[0] + pad0, data_hp.shape[1] + pad1)}"
+        )
+        data_hp = torch.nn.functional.pad(
+            data_hp, (0, pad1, 0, pad0), mode="constant", value=data_hp[-1, -1]
+        )
 
     # FP8
     max_dtype = torch.finfo(torch.float8_e4m3fn).max
@@ -385,57 +415,190 @@ def cast_tensor_to_fp8_blockwise(
         .reshape(original_shape)
     )
 
+    # remove the padding
+    if data_hp.shape != shape_before_padding:
+        fp_data = fp_data[: shape_before_padding[0], : shape_before_padding[1]]
+
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
 
 
 def process_weights_after_loading(self, layer) -> None:
-    from torch.nn import Parameter
-    from vllm.model_executor.parameter import (
-        BlockQuantScaleParameter,
-        ModelWeightParameter,
+    """This function is used to process the weights after loading for a Linear layer.
+
+    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
+    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    """
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        maybe_post_process_fp8_weight_block,
+        process_fp8_weight_block_strategy,
     )
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
-    def _create_param_from_subclass_attributes(custom_param):
-        param = Parameter(custom_param.data, requires_grad=False)
-        base_param_dir = dir(torch.nn.Parameter)
-        custom_param_dir = dir(custom_param)
-        # Find the attributes that are unique to the custom parameter
-        custom_attributes = [
-            attr
-            for attr in custom_param_dir
-            if attr not in base_param_dir and not attr.startswith("__")
-        ]
-        # Set the custom attributes into the base parameter object
-        for attr in custom_attributes:
-            setattr(param, attr, getattr(custom_param, attr))
+    weight_scale = layer.weight_scale_inv
+    weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
+    layer.weight.data = weight.data
+    if hasattr(layer, "weight_scale"):
+        # Not the first time to call this function, just need to update the data
+        layer.weight_scale.data = weight_scale.data
+    else:
+        # The first time to call this function, create a new parameter and update the tp status
+        layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
+        layer.update_param_tp_status()
 
-        param.subclass_type = type(custom_param)
-        return param
+    maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
 
-    weight = layer.weight.data
-    weight_scale_inv = layer.weight_scale_inv.data
-    weight = self._maybe_pad_weight(weight)
 
-    layer.weight = _create_param_from_subclass_attributes(
-        ModelWeightParameter(
-            data=weight,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight.weight_loader,
-        )
+def process_weights_after_loading_moe(self, layer) -> None:
+    """This function is used to process the weights after loading for a FusedMoE layer.
+
+    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
+    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    """
+    # Lazy import to avoid importing triton too early.
+    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+        is_rocm_aiter_moe_enabled,
     )
-    layer.weight_scale_inv = _create_param_from_subclass_attributes(
-        BlockQuantScaleParameter(
-            data=weight_scale_inv,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight_scale_inv.weight_loader,
-        )
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
     )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        expert_weight_is_col_major,
+        requant_weight_ue8m0_inplace,
+    )
+    from vllm.utils.deep_gemm import (
+        get_col_major_tma_aligned_tensor,
+        is_deep_gemm_e8m0_used,
+    )
+
+    self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
+
+    assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
+    assert self.quant_config.activation_scheme == "dynamic"
+
+    if self.flashinfer_moe_backend is not None:
+        layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+        layer.w13_weight_scale_inv.data = swap_w13_to_w31(
+            layer.w13_weight_scale_inv.data
+        )
+
+    # DeepGemm scales need to be transposed and aligned. We try to do
+    # it ahead of time for performance reasons.
+    if self.allow_deep_gemm and not is_deep_gemm_e8m0_used():
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
+    if is_deep_gemm_e8m0_used():
+        assert layer.weight_block_size is not None
+        # Re-quantise the expert weights so their scales are UE8M0.
+        block_sz = tuple(layer.weight_block_size)
+        requant_weight_ue8m0_inplace(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            block_sz,
+        )
+        requant_weight_ue8m0_inplace(
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            block_sz,
+        )
+
+        # Ensure column-major TMA alignment expected by DeepGEMM.
+        if expert_weight_is_col_major(layer.w13_weight_scale_inv):
+            layer.w13_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w13_weight_scale_inv
+            )
+        if expert_weight_is_col_major(layer.w2_weight_scale_inv):
+            layer.w2_weight_scale_inv = get_col_major_tma_aligned_tensor(
+                layer.w2_weight_scale_inv
+            )
+
+
+def process_weights_after_loading_kv(self, layer) -> None:
+    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    # No need to process kv scales after loading if we are going to
+    # calculate them on the fly.
+    from vllm.platforms import current_platform
+
+    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            # We prefer to use separate k_scale and v_scale if present
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            # If no scales were loaded (both scales are invalid negative
+            # values), use the default value of 1.0
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            # If we find a single kv_scale in the checkpoint, we remap
+            # kv_scale to k_scale during weight loading, and duplicate
+            # k_scale to v_scale here
+            assert layer.k_scale > 0.0
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        if layer.q_scale < 0.0:
+            layer._q_scale.copy_(k_scale)
+            layer._q_scale_float = k_scale
+
+        # These are used in the final Attention.forward()
+        layer._k_scale.copy_(k_scale)
+        layer._v_scale.copy_(v_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+
+    if layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    is_singleton_float = (
+        lambda x: isinstance(x, float)
+        or isinstance(x, torch.Tensor)
+        and x.numel() == 1
+        and x.is_floating_point()
+    )
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError(
+            "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
+        )
+
+    # These are used in the final Attention.forward()
+    layer._q_scale.copy_(q_scale)
+    layer._q_scale_float = (
+        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
+    )
+
+    layer._prob_scale.copy_(prob_scale)
 
 
 @triton.jit

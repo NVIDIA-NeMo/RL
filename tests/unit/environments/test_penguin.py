@@ -80,18 +80,18 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
 def penguin(penguin_vllm_generation):
     """Create a Penguin actor for testing."""
 
-    yaml_str = r"""multineedle_resources_server:
+    yaml_str = r"""example_multi_step_resources_server:
   resources_servers:
-    multineedle:
+    example_multi_step:
       entrypoint: app.py
       domain: instruction_following
-multineedle_simple_agent:
+example_multi_step_simple_agent:
   responses_api_agents:
     simple_agent:
       entrypoint: app.py
       resources_server:
         type: resources_servers
-        name: multineedle_resources_server
+        name: example_multi_step_resources_server
       model_server:
         type: responses_api_models
         name: openai_model
