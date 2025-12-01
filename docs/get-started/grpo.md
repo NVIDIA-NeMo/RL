@@ -101,9 +101,9 @@ uv run python examples/run_grpo_math.py \
 
 GRPO training logs specific metrics that tell you if "Reasoning" is emerging:
 
-1.  **`reward_mean`**: The average accuracy of the group. This should steadily increase.
-2.  **`kl_policy`**: How far the model has drifted from the original behavior.
-3.  **`advantage`**: The relative score of an output compared to its group peers.
+1.  **`reward`**: The average accuracy of the group (mean reward). This should steadily increase.
+2.  **`policy_kl_error`**: How far the model has drifted from the original behavior (KL divergence).
+3.  **`advantages/mean`**: The average relative score of an output compared to its group peers.
 
 ### Output Artifacts
 
@@ -115,6 +115,7 @@ Results are saved to `results/grpo`:
 ## Scaling Up
 
 ### Multi-GPU Training
+
 GRPO involves heavy generation (inference) and training. For larger models (7B+), you almost certainly need multiple GPUs.
 
 Use the Megatron backend for efficient scaling:
@@ -126,29 +127,5 @@ uv run python examples/run_grpo_math.py \
 ```
 
 ### Async Training
+
 For maximum throughput, you can decouple generation and training. See the [GRPO Guide](../guides/grpo.md) for advanced `async_grpo` configurations.
-
----
-
-## Next Steps
-
-You've now explored the three main pillars of NeMo RL: SFT, DPO, and GRPO.
-
-::::{grid} 1 2 2 2
-:gutter: 2
-
-:::{grid-item-card} {octicon}`repo;1.5em;sd-mr-1` Custom Rewards
-:link: ../guides/grpo
-:link-type: doc
-
-Learn how to write your own reward functions for coding or chemistry tasks.
-:::
-
-:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Guide
-:link: cluster
-:link-type: doc
-
-Ready for production? Deploy your training jobs to a Slurm cluster.
-:::
-
-::::
