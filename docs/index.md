@@ -196,7 +196,6 @@ about/backends.md
 about/installation.md
 about/algorithms/index.md
 about/evaluation.md
-about/clusters.md
 about/tips-and-tricks.md
 ::::
 
@@ -205,12 +204,11 @@ about/tips-and-tricks.md
 :caption: Get Started
 :maxdepth: 2
 
-get-started/index.md
-Local Deployment <get-started/local-workstation.md>
+Quickstart <get-started/index.md>
+SFT <get-started/sft.md>
+DPO <get-started/dpo.md>
+GRPO <get-started/grpo.md>
 Cluster Setup <get-started/cluster.md>
-GRPO Quickstart <get-started/grpo.md>
-SFT Quickstart <get-started/sft.md>
-DPO Quickstart <get-started/dpo.md>
 ::::
 
 ::::{toctree}
@@ -246,10 +244,8 @@ model-quirks.md
 :caption: Setup & Deployment
 :maxdepth: 2
 
-get-started/local-workstation.md
 get-started/cluster.md
 docker.md
-about/clusters.md
 ::::
 
 ::::{toctree}
@@ -283,4 +279,4 @@ guides/use-custom-vllm.md
 :maxdepth: 2
 
 apidocs/index.rst
-:::
+::::
