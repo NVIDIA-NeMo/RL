@@ -94,11 +94,23 @@ SFT is standard language modeling on specific data:
 
 ## Next Steps
 
-You've fine-tuned your model! Now you can align it to preferences or optimize it with reinforcement learning.
+You've successfully fine-tuned a model! Now, choose how you want to deploy or scale your training.
 
-:::{button-ref} dpo
-:color: primary
-:ref-type: doc
+::::{grid} 1 2 2 2
+:gutter: 2
 
-Next: DPO Quickstart →
+:::{grid-item-card} {octicon}`desktop-download;1.5em;sd-mr-1` Local Deployment
+:link: local-workstation
+:link-type: doc
+
+Manage GPUs and run concurrent experiments on your workstation.
 :::
+
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Setup
+:link: cluster
+:link-type: doc
+
+Scale your training to multi-node Slurm or Kubernetes clusters.
+:::
+
+::::

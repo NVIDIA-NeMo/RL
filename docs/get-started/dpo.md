@@ -27,12 +27,12 @@ content_type: "tutorial"
 
 :::
 
-:::{button-ref} sft
+:::{button-ref} index
 :color: secondary
 :outline:
 :ref-type: doc
 
-← Previous: SFT Quickstart
+← Previous: Quickstart Guide
 :::
 
 :::{tip}
@@ -93,11 +93,23 @@ DPO requires triplets:
 
 ## Next Steps
 
-Now that you've aligned your model with preferences, you're ready for advanced reinforcement learning.
+You've successfully aligned a model! Now, choose how you want to deploy or scale your training.
 
-:::{button-ref} grpo
-:color: primary
-:ref-type: doc
+::::{grid} 1 2 2 2
+:gutter: 2
 
-Next: GRPO Quickstart →
+:::{grid-item-card} {octicon}`desktop-download;1.5em;sd-mr-1` Local Deployment
+:link: local-workstation
+:link-type: doc
+
+Manage GPUs and run concurrent experiments on your workstation.
 :::
+
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Setup
+:link: cluster
+:link-type: doc
+
+Scale your training to multi-node Slurm or Kubernetes clusters.
+:::
+
+::::

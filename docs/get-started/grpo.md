@@ -27,12 +27,12 @@ content_type: "tutorial"
 
 :::
 
-:::{button-ref} dpo
+:::{button-ref} index
 :color: secondary
 :outline:
 :ref-type: doc
 
-← Previous: DPO Quickstart
+← Previous: Quickstart Guide
 :::
 
 :::{tip}
@@ -103,12 +103,23 @@ Logs are saved to `results/grpo_math_1B/experiment_0/`.
 
 ## Next Steps
 
-You have completed the quickstart tutorials! You are now ready to build your own RL pipelines.
+You've successfully run GRPO! Now, choose how you want to deploy or scale your training.
 
-:::{card} What's Next?
+::::{grid} 1 2 2 2
+:gutter: 2
 
-*   **Create Custom Environments**: Learn to define your own rewards in the [Environments Guide](../guides/environments.md).
-*   **Reproduce State-of-the-Art**: Try the [DeepScaleR Tutorial](../guides/grpo-deepscaler.md).
-*   **Deploy to Cluster**: Scale your training with the [Cluster Setup Guide](cluster.md).
+:::{grid-item-card} {octicon}`desktop-download;1.5em;sd-mr-1` Local Deployment
+:link: local-workstation
+:link-type: doc
 
+Manage GPUs and run concurrent experiments on your workstation.
 :::
+
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Setup
+:link: cluster
+:link-type: doc
+
+Scale your training to multi-node Slurm or Kubernetes clusters.
+:::
+
+::::
