@@ -21,9 +21,12 @@ git submodule update --init --recursive
 
 ## Install System Dependencies
 
-### cuDNN (For Megatron Backend)
+Use these tabs to find the specific system dependencies for your backend or setup.
 
-If you are using the Megatron backend on bare metal (outside of a container), you may need to install the cuDNN headers. Here is how you check and install them:
+::::{tab-set}
+
+:::{tab-item} Megatron Backend (Bare Metal)
+If you are using the Megatron backend on bare metal (outside of a container), you may need to install the cuDNN headers.
 
 ```sh
 # Check if you have libcudnn installed
@@ -38,15 +41,18 @@ sudo apt install cudnn  # Will install cuDNN meta packages which points to the l
 # sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
 # sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
 ```
+:::
 
-### libibverbs (For vLLM Dependencies)
-
-If you encounter problems when installing vllm's dependency `deepspeed` on bare-metal (outside of a container), you may need to install `libibverbs-dev`:
+:::{tab-item} vLLM / DeepSpeed
+If you encounter problems when installing vllm's dependency `deepspeed` on bare-metal (outside of a container), you may need to install `libibverbs-dev`.
 
 ```sh
 sudo apt-get update
 sudo apt-get install libibverbs-dev
 ```
+:::
+
+::::
 
 ## Install UV Package Manager
 
