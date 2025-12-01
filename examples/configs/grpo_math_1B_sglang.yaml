@@ -7,7 +7,7 @@ grpo:
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 2
+  val_period: 10
   val_at_start: false
   overlong_filtering: false
   max_val_samples: 256
@@ -222,7 +222,7 @@ policy:
     allow_auto_truncate: true
     enable_memory_saver: false
     max_running_requests: null
-    mem_fraction_static: 0.5
+    mem_fraction_static: 0.7
     skip_server_warmup: true  # Skip server warmup to prevent timeout
     colocated:
       # true: generation shares training GPUs
@@ -264,7 +264,7 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
-  wandb_enabled: false
+  wandb_enabled: true
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   swanlab_enabled: false # Disable SwanLab logging
