@@ -58,6 +58,11 @@ We use `uv` for fast, reliable package management.
    # git submodule update --init --recursive
    ```
 
+   :::{warning}
+   If you previously ran without checking out submodules, you may need to rebuild virtual environments:
+   `NRL_FORCE_REBUILD_VENVS=true uv sync`
+   :::
+
 3. **Initialize Environment**:
    Create the virtual environment.
 
@@ -85,9 +90,22 @@ Let's verify your installation by running a **Group Relative Policy Optimization
 2. **Run the Training Script**:
    Use `uv run` to execute the script. This automatically handles dependencies.
 
+   ::::{tab-set}
+
+   :::{tab-item} Native PyTorch (DTensor)
    ```bash
    uv run python examples/run_grpo_math.py
    ```
+   :::
+
+   :::{tab-item} Megatron Core
+   ```bash
+   uv run examples/run_grpo_math.py \
+     --config examples/configs/grpo_math_1B_megatron.yaml
+   ```
+   :::
+
+   ::::
 
    **What to expect**:
    * NeMo RL will automatically start a local Ray cluster on your machine.
