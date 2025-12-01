@@ -38,6 +38,10 @@ Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes.
 
 ## 1. Installation
 
+:::{seealso}
+For detailed system requirements, bare-metal setup (non-container), and troubleshooting, refer to the [Comprehensive Installation Guide](installation.md).
+:::
+
 We use `uv` for fast, reliable package management.
 
 1. **Install `uv`** (if not installed):

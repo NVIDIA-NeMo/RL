@@ -5,7 +5,7 @@ Use this quick start to get going with either the native PyTorch DTensor or Mega
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
 
-For more examples and setup details, continue to the [Prerequisites](installation.md) section.
+For more examples and setup details, continue to the [Prerequisites](../get-started/installation.md) section.
 
 ## Quick Start Options
 

@@ -193,7 +193,6 @@ Home <self>
 about/overview.md
 about/features.md
 about/backends.md
-about/installation.md
 about/algorithms/index.md
 about/evaluation.md
 about/tips-and-tricks.md
@@ -205,6 +204,7 @@ about/tips-and-tricks.md
 :maxdepth: 2
 
 Quickstart <get-started/index.md>
+Installation <get-started/installation.md>
 SFT <get-started/sft.md>
 DPO <get-started/dpo.md>
 GRPO <get-started/grpo.md>
