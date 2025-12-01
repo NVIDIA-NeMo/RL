@@ -83,16 +83,31 @@ You don't need to edit the YAML file directly. You can override any parameter fr
 
 ## Step 3: Run the Training
 
-We will use the `examples/run_sft.py` script to start the training. This script handles loading the model, processing the data, and running the training loop.
+We will use the `examples/run_sft.py` script to start the training.
 
-Run the following command to start a small experiment:
+::::{tab-set}
 
+:::{tab-item} Native PyTorch (DTensor)
 ```bash
 uv run python examples/run_sft.py \
   sft.max_num_epochs=1 \
   sft.max_num_steps=100 \
   policy.model_name="meta-llama/Llama-3.2-1B"
 ```
+:::
+
+:::{tab-item} Megatron Core
+```bash
+uv run python examples/run_sft.py \
+  sft.max_num_epochs=1 \
+  sft.max_num_steps=100 \
+  policy.model_name="meta-llama/Llama-3.2-1B" \
+  policy.megatron_cfg.enabled=true \
+  policy.dtensor_cfg.enabled=false
+```
+:::
+
+::::
 
 **What's happening?**
 

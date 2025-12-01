@@ -83,11 +83,26 @@ Key parameters for GRPO:
 
 Run the `examples/run_grpo_math.py` script. This example uses a deterministic "Math Verifier" to reward correct answers.
 
+::::{tab-set}
+
+:::{tab-item} Native PyTorch (DTensor)
 ```bash
 uv run python examples/run_grpo_math.py \
   grpo.max_num_steps=100 \
   grpo.num_generations_per_prompt=4
 ```
+:::
+
+:::{tab-item} Megatron Core
+```bash
+uv run python examples/run_grpo_math.py \
+  --config examples/configs/grpo_math_1B_megatron.yaml \
+  grpo.max_num_steps=100 \
+  grpo.num_generations_per_prompt=4
+```
+:::
+
+::::
 
 **What's happening?**
 

@@ -87,8 +87,11 @@ For a local test, stick to small models like `meta-llama/Llama-3.2-1B-Instruct` 
 
 ## Step 3: Run the Training
 
-Run the `examples/run_dpo.py` script. You can override the model and data path directly from the CLI.
+Run the `examples/run_dpo.py` script.
 
+::::{tab-set}
+
+:::{tab-item} Native PyTorch (DTensor)
 ```bash
 uv run python examples/run_dpo.py \
   dpo.max_num_epochs=1 \
@@ -97,6 +100,22 @@ uv run python examples/run_dpo.py \
   data.dataset_name=BinaryPreferenceDataset \
   data.train_data_path=path/to/your/data.jsonl
 ```
+:::
+
+:::{tab-item} Megatron Core
+```bash
+uv run python examples/run_dpo.py \
+  dpo.max_num_epochs=1 \
+  dpo.reference_policy_kl_penalty=0.1 \
+  policy.train_global_batch_size=32 \
+  data.dataset_name=BinaryPreferenceDataset \
+  data.train_data_path=path/to/your/data.jsonl \
+  policy.megatron_cfg.enabled=true \
+  policy.dtensor_cfg.enabled=false
+```
+:::
+
+::::
 
 **What's happening?**
 
