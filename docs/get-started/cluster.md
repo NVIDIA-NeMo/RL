@@ -52,7 +52,17 @@ You don't need to manually configure Ray. NeMo RL provides a helper script, `ray
 
 ## Step 2: Submit a Job
 
-The submission process is identical for SFT, DPO, and GRPO. You define the resources in Slurm flags and the task in the `COMMAND` variable.
+The submission process is identical for SFT, DPO, and GRPO. You simply swap the Python script in the `COMMAND` variable.
+
+### Command Cheatsheet
+
+Copy the command for your training type:
+
+| Type | Command |
+| :--- | :--- |
+| **SFT** | `uv run examples/run_sft.py` |
+| **DPO** | `uv run examples/run_dpo.py` |
+| **GRPO** | `uv run examples/run_grpo_math.py` |
 
 ::::{tab-set}
 
@@ -82,10 +92,10 @@ bash <JOB_ID>-attach.sh
 ```
 
 **3. Run Your Training**
-You are now inside the container on the head node. Run your script as usual:
+You are now inside the container on the head node. Run your command (see Cheatsheet above):
 
 ```bash
-uv run examples/run_grpo_math.py
+uv run examples/run_sft.py
 ```
 :::
 
@@ -93,11 +103,11 @@ uv run examples/run_grpo_math.py
 Batch mode is "fire and forget." You specify the command upfront, and the cluster shuts down automatically when it finishes.
 
 **1. Submit the Job**
-Include the `COMMAND` variable in your submission.
+Include the `COMMAND` variable in your submission. Replace the command below with the one from the Cheatsheet.
 
 ```bash
 # Run from the root of NeMo RL repo
-COMMAND="uv run examples/run_grpo_math.py" \
+COMMAND="uv run examples/run_sft.py" \
 CONTAINER=nvcr.io/nvidia/nemo:latest \
 MOUNTS="$PWD:$PWD" \
 sbatch \
