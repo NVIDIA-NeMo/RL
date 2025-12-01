@@ -24,6 +24,7 @@ from typing import (
 
 import numpy as np
 import ray
+import torch
 from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
@@ -624,6 +625,15 @@ class VllmGeneration(GenerationInterface):
 
             if msg_type == "sample":
                 # Yield individual sample result immediately
+                if os.getenv("NRL_VLLM_SEND_SHAPES_ONLY", "false") == "true":
+                    item[1]["output_ids"] = torch.randint(
+                        0, 1000, item[1]["output_ids"]
+                    )
+                    item[1]["logprobs"] = torch.randn(item[1]["logprobs"])
+                    print(
+                        f"🌀🌀[LONGSEQ-DEBUG][generate_async] reconstruct item! (original_idx: {item[0]})"
+                    )
+
                 yield item
             elif msg_type == "error":
                 # Cancel the task and propagate error

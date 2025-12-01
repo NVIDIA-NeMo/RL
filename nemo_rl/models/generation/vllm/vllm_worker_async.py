@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
@@ -793,15 +794,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 dtype=torch.long,
                 device=original_input_ids_single_row.device,
             )
-
-            result_batch = BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": output_ids_single_item_batched,
-                    "logprobs": logprobs_single_item,
-                    "generation_lengths": generation_lengths_tensor,
-                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                }
-            )
+            if os.getenv("NRL_VLLM_SEND_SHAPES_ONLY", "false") == "true":
+                result_batch = BatchedDataDict[GenerationOutputSpec](
+                    {
+                        "output_ids": output_ids_single_item_batched.shape,
+                        "logprobs": logprobs_single_item.shape,
+                        "generation_lengths": generation_lengths_tensor.cpu(),
+                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor.cpu(),
+                    }
+                )
+            else:
+                result_batch = BatchedDataDict[GenerationOutputSpec](
+                    {
+                        "output_ids": output_ids_single_item_batched.cpu(),
+                        "logprobs": logprobs_single_item.cpu(),
+                        "generation_lengths": generation_lengths_tensor.cpu(),
+                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor.cpu(),
+                    }
+                )
 
             return (sample_idx, result_batch)
 
