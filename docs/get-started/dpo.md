@@ -74,9 +74,10 @@ The default configuration is at `examples/configs/dpo.yaml`.
 Key parameters to tune:
 
 * **`policy.model_name`**: Your starting model (e.g., the SFT checkpoint you created).
+* **`data.dataset_name`**: Set to `BinaryPreferenceDataset` to use the custom JSONL format described above.
 * **`data.train_data_path`**: Path to your preference `.jsonl` file.
-* **`loss_fn.reference_policy_kl_penalty`**: Controls how much the model stays close to the original behavior (preventing "reward hacking").
-* **`loss_fn.preference_loss_weight`**: The strength of the preference signal.
+* **`dpo.reference_policy_kl_penalty`**: Controls how much the model stays close to the original behavior (preventing "reward hacking").
+* **`dpo.preference_loss_weight`**: The strength of the preference signal.
 
 :::{tip}
 For a local test, stick to small models like `meta-llama/Llama-3.2-1B-Instruct` to avoid OOM errors.
@@ -91,8 +92,10 @@ Run the `examples/run_dpo.py` script. You can override the model and data path d
 ```bash
 uv run python examples/run_dpo.py \
   dpo.max_num_epochs=1 \
-  loss_fn.reference_policy_kl_penalty=0.1 \
-  policy.train_global_batch_size=32
+  dpo.reference_policy_kl_penalty=0.1 \
+  policy.train_global_batch_size=32 \
+  data.dataset_name=BinaryPreferenceDataset \
+  data.train_data_path=path/to/your/data.jsonl
 ```
 
 **What's happening?**
@@ -120,38 +123,15 @@ Results are saved to `results/dpo`:
 ## Scaling Up
 
 ### Custom Loss Functions
+
 NeMo RL supports variations of preference loss. You can change weights to balance SFT loss (maintaining instruction following) and Preference loss:
 
 ```bash
 uv run python examples/run_dpo.py \
-  loss_fn.preference_loss_weight=1.0 \
-  loss_fn.sft_loss_weight=0.1
+  dpo.preference_loss_weight=1.0 \
+  dpo.sft_loss_weight=0.1
 ```
 
 ### Multi-Node Training
-For large-scale alignment, use the Megatron backend configuration found in `examples/configs/` (e.g., `dpo_megatron.yaml` if available or adapt the SFT one).
 
----
-
-## Next Steps
-
-You have now completed the standard alignment pipeline (SFT → DPO)!
-
-::::{grid} 1 2 2 2
-:gutter: 2
-
-:::{grid-item-card} {octicon}`beaker;1.5em;sd-mr-1` GRPO Guide
-:link: grpo
-:link-type: doc
-
-Explore Group Relative Policy Optimization for reasoning tasks.
-:::
-
-:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` DPO Guide
-:link: ../guides/dpo
-:link-type: doc
-
-Deep dive into DPO theory, reference models, and stability tips.
-:::
-
-::::
+For large-scale alignment, enable the Megatron backend in `examples/configs/dpo.yaml` by setting `policy.megatron_cfg.enabled=true` and configuring the distributed parameters, or use a specific Megatron-compatible configuration file if available.
