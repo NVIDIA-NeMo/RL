@@ -22,7 +22,10 @@ This page provides performance benchmarks for LLMs and VLMs using NeMo RL across
 
 Since reinforcement learning consists of training, generation and transition between the two, performance measurement also reflects this. Specifically, we track the following metrics:
 - **Step time**: Time for each step, which includes training, generation, policy logprobs, and refit time.
-- **Tokens/sec/GPU**: Total number of tokens used in training in a batch, divided by the step time, divided by the total number of GPUs.
+- **Tokens/sec/GPU**: The rate at the tokens are processed by a stage (such as training, generation, or refitting) on a single GPU:
+$$
+\text{Tokens/sec/GPU} = \frac{\text{Total Tokens Processed}}{\text{Time for Stage} \times \text{Number of GPUs}}
+$$
 - **Training MFU**: Model floating-point operations per second per GPU
 
 
