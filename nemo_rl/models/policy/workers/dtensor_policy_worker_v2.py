@@ -85,6 +85,7 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
+from nemo_rl.models.policy.workers.base_policy_worker import BasePolicyWorker
 from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -97,7 +98,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2:
+class DTensorPolicyWorkerV2(BasePolicyWorker):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -473,9 +474,6 @@ class DTensorPolicyWorkerV2:
         device = torch.cuda.current_device()
         self.model_update_group = PyNcclCommunicator(pg, device=device)
 
-    def is_alive(self) -> bool:
-        return True
-
     def check_model_allow_flash_attn_args(self, model_config) -> bool:
         # Some models doesn't support flash_attn_kwargs
         # Check nemotron nas.
@@ -486,13 +484,6 @@ class DTensorPolicyWorkerV2:
             return False
 
         return True
-
-    def reset_peak_memory_stats(self) -> None:
-        torch.cuda.reset_peak_memory_stats()
-
-    def get_gpu_info(self) -> dict[str, Any]:
-        """Return information about the GPU being used by this worker."""
-        return get_gpu_info(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1615,24 +1606,6 @@ class DTensorPolicyWorkerV2:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_reference_policy_logprobs")
-    def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """Get the logprobs from the reference policy for a batch of data.
-
-        Returns:
-          a BatchedDataDict with key "reference_logprobs" and shape [batch_size, sequence_length].
-          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
-          The logprob of input token i is specified at position i in the output logprobs tensor.
-        """
-        with self.use_reference_model():
-            reference_logprobs = self.get_logprobs(data, micro_batch_size)
-
-        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
-        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
-        return return_data
-
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
         noise_std = 0.01  # Standard deviation for the noise
@@ -1653,37 +1626,6 @@ class DTensorPolicyWorkerV2:
         """
         return self.model.config
 
-    def report_device_id(self) -> str:
-        """Report the UUID of the current CUDA device using NVML.
-
-        Returns:
-            str: UUID of the device in the format "GPU-xxxxx"
-        """
-        from nemo_rl.utils.nvml import get_device_uuid
-
-        # Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        # Get device UUID using NVML
-        return get_device_uuid(device_idx)
-
-    def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
-
-    def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
-        if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
-
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
@@ -1693,13 +1635,6 @@ class DTensorPolicyWorkerV2:
             state_dict_info[name] = (tensor.shape, self.dtype)
 
         return state_dict_info
-
-    def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
-        from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        device_idx = torch.cuda.current_device()
-        return get_free_memory_bytes(device_idx)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
@@ -1920,24 +1855,3 @@ class DTensorPolicyWorkerV2:
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
-
-    def shutdown(self) -> None:
-        """Shutdown the policy."""
-        # Clean up extension resources like ZMQ sockets
-        if hasattr(self, "zmq_socket"):
-            self.zmq_socket.close()
-            self.zmq_context.term()
-
-    def start_gpu_profiling(self) -> None:
-        """Start GPU profiling."""
-        torch.cuda.profiler.start()
-
-    def stop_gpu_profiling(self) -> None:
-        """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
-
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
-        """Report the node IP and GPU ID of the current worker."""
-        ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
-        return (ip, gpu_id)
