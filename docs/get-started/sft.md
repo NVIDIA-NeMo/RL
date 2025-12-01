@@ -73,7 +73,7 @@ Key parameters you might want to change:
 * **`policy.model_name`**: The base model to start from (e.g., `meta-llama/Llama-3.2-1B`).
 * **`data.train_data_path`**: Path to your training `.jsonl` file.
 * **`sft.max_num_epochs`**: How many times to iterate over the dataset.
-* **`sft.learning_rate`**: The step size for the optimizer.
+* **`policy.optimizer.kwargs.lr`**: The step size for the optimizer.
 
 :::{tip}
 You don't need to edit the YAML file directly. You can override any parameter from the command line (shown in Step 3).
@@ -136,28 +136,3 @@ uv run python examples/run_sft.py \
 ### Multi-Node Training
 
 To run on a cluster (Slurm or Kubernetes), refer to the [Cluster Setup](cluster.md) guide.
-
----
-
-## Next Steps
-
-Now that you've fine-tuned a model, you can move on to Reinforcement Learning from Human Feedback (RLHF).
-
-::::{grid} 1 2 2 2
-:gutter: 2
-
-:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Run DPO
-:link: dpo
-:link-type: doc
-
-Direct Preference Optimization (DPO) aligns your model using preference data.
-:::
-
-:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` SFT Guide
-:link: ../guides/sft
-:link-type: doc
-
-Deep dive into SFT parameters, packing strategies, and custom datasets.
-:::
-
-::::
