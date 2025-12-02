@@ -16,8 +16,6 @@ from typing import Any, Dict
 import pytest
 import torch
 
-from nemo_rl.models.megatron.common import get_moe_metrics
-
 
 def _make_fake_tracker(values: Dict[str, torch.Tensor]) -> dict[str, Any]:
     tracker: dict[str, Any] = {}
@@ -31,6 +29,7 @@ def test_get_moe_metrics_empty_tracker(monkeypatch):
     """If no aux losses are tracked, get_moe_metrics should return an empty dict."""
 
     from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
 
     # Patch the imported functions in nemo_rl.models.megatron.common
     monkeypatch.setattr(
@@ -66,6 +65,7 @@ def test_get_moe_metrics_aggregation_and_per_layer_logging(monkeypatch):
     """Validate aggregation logic and optional per-layer logging."""
 
     from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
 
     # Fake tracker contents: two aux losses, each with per-layer values.
     load_balancing = torch.tensor([1.0, 3.0])
