@@ -64,12 +64,11 @@ class SGLangGeneration(GenerationInterface):
         # Store config
         self.cfg = config
         
-        # Get number of GPUs per server from config
-        # For SGLang, this is typically the tensor parallel size
-        # TODO: Add proper config field, hardcoded to 4 for now
         gpus_per_server = self.cfg.get("gpus_per_server", None)
         if gpus_per_server is None:
-            gpus_per_server = 4
+            raise ValueError(
+                "gpus_per_server must be set in SGLangConfig. "
+            )
         
         # Calculate number of servers based on available resources
         total_gpus = cluster.world_size()
