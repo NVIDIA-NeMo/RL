@@ -39,7 +39,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
-    log_vllm_metrics_to_wandb,
+    log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
@@ -1479,7 +1479,7 @@ def grpo_train(
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
-                log_vllm_metrics_to_wandb(
+                log_generation_metrics_to_wandb(
                     vllm_logger_metrics,
                     total_steps + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][
@@ -2402,7 +2402,7 @@ def async_grpo_train(
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
-                log_vllm_metrics_to_wandb(
+                log_generation_metrics_to_wandb(
                     vllm_logger_metrics,
                     step + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][

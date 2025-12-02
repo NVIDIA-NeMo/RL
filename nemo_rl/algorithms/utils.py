@@ -747,7 +747,7 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def log_vllm_metrics_to_wandb(
+def log_generation_metrics_to_wandb(
     vllm_logger_metrics: dict[str, dict[int, list[Any]]],
     step: int,
     timeline_interval: float,
