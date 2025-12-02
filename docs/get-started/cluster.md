@@ -13,7 +13,7 @@ content_type: "tutorial"
 
 Scaling from a single GPU to a multi-node cluster allows you to train larger models (70B+) and process data much faster.
 
-NeMo RL uses **Ray** to manage distributed computing. This guide shows you how to deploy a transient Ray cluster on top of a standard workload manager like **Slurm**.
+NeMo RL uses **Ray** to manage distributed computing.
 
 :::{card}
 **Goal**: Submit a multi-node training job (e.g., GRPO) to a Slurm cluster.
@@ -37,7 +37,7 @@ NeMo RL uses **Ray** to manage distributed computing. This guide shows you how t
 
 ---
 
-## Step 1: Understand the Architecture
+## 1. Understand the Architecture
 
 When you submit a job, two layers of orchestration happen:
 
@@ -50,7 +50,7 @@ You don't need to manually configure Ray. NeMo RL provides a helper script, `ray
 
 ---
 
-## Step 2: Submit a Job
+## 2. Submit a Job
 
 The submission process is identical for SFT, DPO, Reward Model (RM), and GRPO. You swap the Python script in the `COMMAND` variable.
 
@@ -128,7 +128,7 @@ Slurm will write the output to a log file (e.g., `12345-logs/ray-driver.log`).
 
 ---
 
-## Step 3: Verify Your Cluster
+## 3. Verify Your Cluster
 
 Once your job is running, you have two main ways to see what's happening.
 

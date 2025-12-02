@@ -43,7 +43,7 @@ content_type: "tutorial"
 
 ---
 
-## Step 1: Prepare Your Data
+## 1. Prepare Your Data
 
 GRPO is unique because it primarily needs **Prompts** (questions) and a way to verify the answer (Ground Truth).
 
@@ -66,7 +66,7 @@ You don't need a pre-built preference dataset like DPO; the algorithm generates 
 
 ---
 
-## Step 2: Configure the Job
+## 2. Configure the Job
 
 The configuration is located at `examples/configs/grpo_math_1B.yaml`.
 
@@ -79,7 +79,7 @@ Key parameters for GRPO:
 
 ---
 
-## Step 3: Run the Training
+## 3. Run the Training
 
 Run the `examples/run_grpo_math.py` script. This example uses a deterministic "Math Verifier" to reward correct answers.
 
@@ -112,7 +112,7 @@ uv run python examples/run_grpo_math.py \
 
 ---
 
-## Step 4: Monitor and Verify
+## 4. Monitor and Verify
 
 GRPO training logs specific metrics that tell you if "Reasoning" is emerging:
 

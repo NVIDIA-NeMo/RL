@@ -9,7 +9,7 @@ content_type: "tutorial"
 
 # Installation and Prerequisites
 
-This detailed guide walks you through the complete installation process for NeMo RL. Use this guide if you are setting up on a bare-metal system, need specific backend dependencies (like Megatron or vLLM), or are troubleshooting your environment.
+Use this guide if you are setting up on a bare-metal system, need specific backend dependencies (like Megatron or vLLM), or are troubleshooting your environment.
 
 :::{card}
 **Goal**: Fully configure your system, install NeMo RL dependencies, and prepare the virtual environment.
@@ -34,7 +34,7 @@ This detailed guide walks you through the complete installation process for NeMo
 
 ---
 
-## Step 1: Install System Dependencies
+## 1. Install System Dependencies
 
 Before installing the Python package, ensure your operating system has the required libraries for your chosen backend.
 
@@ -85,7 +85,7 @@ sudo apt-get install libibverbs-dev
 
 ---
 
-## Step 2: Clone the Repository
+## 2. Clone the Repository
 
 NeMo RL relies on several third-party libraries included as git submodules. You must clone the repository recursively.
 
@@ -112,7 +112,7 @@ git config submodule.recurse true
 
 ---
 
-## Step 3: Install UV Package Manager
+## 3. Install UV Package Manager
 
 We use `uv` for fast, reliable, and isolated Python package management.
 
@@ -129,7 +129,7 @@ We use `uv` for fast, reliable, and isolated Python package management.
 
 ---
 
-## Step 4: Create Virtual Environment
+## 4. Create Virtual Environment
 
 Initialize the project-specific virtual environment. NeMo RL uses a `.python-version` file to pin the supported Python version automatically.
 
@@ -150,7 +150,7 @@ Initialize the project-specific virtual environment. NeMo RL uses a `.python-ver
 
 ---
 
-## Step 5: Using UV to Run Commands
+## 5. Using UV to Run Commands
 
 In NeMo RL, we recommend using `uv run` to execute scripts rather than manually activating the virtual environment. This ensures you are always using the locked dependencies and correct environment variables.
 

@@ -11,7 +11,7 @@ content_type: "tutorial"
 
 # Quickstart Guide
 
-Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes.
+Welcome to NeMo RL!
 
 :::{card}
 
@@ -19,7 +19,7 @@ Welcome to NeMo RL! This guide gets you up and running in less than 15 minutes.
 
 ^^^
 
-**In this tutorial, you will**:
+**Steps**:
 
 1. Install `uv` and system prerequisites
 2. Clone the repository and initialize the environment

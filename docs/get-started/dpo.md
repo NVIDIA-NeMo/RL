@@ -45,7 +45,7 @@ Before running DPO, you typically need:
 
 ---
 
-## Step 1: Prepare Your Data
+## 1. Prepare Your Data
 
 DPO requires a dataset of "Preference Triplets". Each example contains a prompt and two potential responses: one "chosen" (preferred) and one "rejected".
 
@@ -67,7 +67,7 @@ NeMo RL expects a JSONL file with the following structure:
 
 ---
 
-## Step 2: Configure the Job
+## 2. Configure the Job
 
 The default configuration is at `examples/configs/dpo.yaml`.
 
@@ -85,7 +85,7 @@ For a local test, stick to small models like `meta-llama/Llama-3.2-1B-Instruct` 
 
 ---
 
-## Step 3: Run the Training
+## 3. Run the Training
 
 Run the `examples/run_dpo.py` script.
 
@@ -125,7 +125,7 @@ uv run python examples/run_dpo.py \
 
 ---
 
-## Step 4: Monitor and Verify
+## 4. Monitor and Verify
 
 Watch the logs for these metrics:
 

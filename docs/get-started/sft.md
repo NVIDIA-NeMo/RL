@@ -11,7 +11,7 @@ content_type: "tutorial"
 
 # Get Started with SFT
 
-**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models. In this tutorial, you will learn the end-to-end workflow of fine-tuning a model to follow instructions.
+**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models.
 
 :::{card}
 **Goal**: Train a basic model (Llama-3.2-1B) on a sample dataset using your local machine.
@@ -45,7 +45,7 @@ Ensure you have completed the [Quickstart Installation](index.md). You should ha
 
 ---
 
-## Step 1: Prepare Your Data
+## 1. Prepare Your Data
 
 SFT requires a dataset of "Instruction" and "Response" pairs. The goal is to teach the model to generate the target response given the instruction.
 
@@ -64,7 +64,7 @@ You can specify your data in the configuration file (see Step 2).
 
 ---
 
-## Step 2: Configure the Job
+## 2. Configure the Job
 
 NeMo RL uses **Hydra** for configuration, allowing you to manage parameters in structured YAML files. The default configuration is at `examples/configs/sft.yaml`.
 
@@ -81,7 +81,7 @@ You don't need to edit the YAML file directly. You can override any parameter fr
 
 ---
 
-## Step 3: Run the Training
+## 3. Run the Training
 
 We will use the `examples/run_sft.py` script to start the training.
 
@@ -117,7 +117,7 @@ uv run python examples/run_sft.py \
 
 ---
 
-## Step 4: Monitor and Verify
+## 4. Monitor and Verify
 
 Once the script starts, it will print logs to your console. Watch for these key indicators:
 
