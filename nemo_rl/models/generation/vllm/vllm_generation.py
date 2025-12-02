@@ -898,3 +898,13 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Check if KV cache scales should be synchronized during refit.
+
+        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        """
+        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
+            "kv_cache_dtype"
+        ].startswith("fp8")
