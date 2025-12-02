@@ -236,6 +236,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether the generation backend requires KV cache scales synchronization."""
+        return False
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         raise NotImplementedError
