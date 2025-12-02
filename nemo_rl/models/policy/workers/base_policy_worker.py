@@ -2,11 +2,14 @@ import ray
 import torch
 import zmq
 from abc import ABC, abstractmethod
-from typing import Any, Optiona l
+from typing import Any, Optional
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.models.policy.interfaces import (
+    LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
+)
 
 
 class BasePolicyWorker(ABC):
