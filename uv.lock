@@ -23,6 +23,7 @@ members = [
     "nemo-automodel",
     "nemo-rl",
     "penguin",
+    "template-project",
 ]
 overrides = [
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
@@ -6106,6 +6107,31 @@ sdist = { url = "https://files.pythonhosted.org/packages/dd/34/7e2f78d1ed0af7d00
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/72/f420480118cbdd18eb761b9936f0a927957130659a638449575b4a4f0aa7/tdigest-0.5.2.2-py2.py3-none-any.whl", hash = "sha256:e32ff6ab62e4defdb93b816c831080d94dfa1efb68a9fa1e7976c237fa9375cb", size = 9445, upload-time = "2019-05-07T18:57:37.493Z" },
     { url = "https://files.pythonhosted.org/packages/b4/94/fd3853b98f39d10206b08f2737d2ec2dc6f46a42dc7b7e05f4f0162d13ee/tdigest-0.5.2.2-py3-none-any.whl", hash = "sha256:dd25f8d6e6be002192bba9e4b8c16491d36c10b389f50637818603d1f67c6fb2", size = 9440, upload-time = "2019-05-07T18:57:38.942Z" },
+]
+
+[[package]]
+name = "template-project"
+version = "0.1.0"
+source = { editable = "research/template_project" }
+dependencies = [
+    { name = "nemo-rl" },
+]
+
+[package.dev-dependencies]
+test = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-timeout" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "nemo-rl", editable = "." }]
+
+[package.metadata.requires-dev]
+test = [
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest-cov" },
+    { name = "pytest-timeout" },
 ]
 
 [[package]]
