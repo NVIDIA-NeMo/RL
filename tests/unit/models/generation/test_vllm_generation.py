@@ -180,6 +180,8 @@ def get_basic_megatron_test_config(
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "track_moe_metrics": False,
+            "moe_per_layer_logging": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",

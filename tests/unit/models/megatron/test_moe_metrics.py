@@ -26,6 +26,7 @@ def _make_fake_tracker(values: Dict[str, torch.Tensor]) -> dict[str, Any]:
     return tracker
 
 
+@pytest.mark.mcore
 def test_get_moe_metrics_empty_tracker(monkeypatch):
     """If no aux losses are tracked, get_moe_metrics should return an empty dict."""
 
@@ -60,6 +61,7 @@ def test_get_moe_metrics_empty_tracker(monkeypatch):
     assert cleared["called"], "clear_aux_losses_tracker should be called"
 
 
+@pytest.mark.mcore
 def test_get_moe_metrics_aggregation_and_per_layer_logging(monkeypatch):
     """Validate aggregation logic and optional per-layer logging."""
 

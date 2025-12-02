@@ -91,6 +91,8 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
+    track_moe_metrics: False
+    moe_per_layer_logging: False
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
