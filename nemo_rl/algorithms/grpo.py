@@ -889,27 +889,6 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
     return should_use_penguin
 
 
-# Function to check if KV cache scales should be calculated and synchronized during refit
-def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
-    """Check if KV cache scales should be synchronized during refit.
-
-    Returns True if kv_cache_dtype is fp8 (which requires precision=fp8).
-    KV scales are always computed and synced statically during training
-    when using FP8 KV cache.
-    """
-    generation_config = master_config["policy"]["generation"]
-    if generation_config is None:
-        return False
-
-    if generation_config["backend"] != "vllm":
-        return False
-
-    vllm_cfg = cast(VllmConfig, generation_config)["vllm_cfg"]
-
-    # Sync scales when using FP8 KV cache
-    return vllm_cfg["kv_cache_dtype"].startswith("fp8")
-
-
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1014,8 +993,6 @@ def grpo_train(
     )
     timeout.start_iterations()
 
-    # Check if we need to sync KV cache scales (infer from config)
-    sync_kv_scales = _should_sync_kv_scales(master_config)
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     NEED_REFIT = True
@@ -1025,6 +1002,10 @@ def grpo_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
+
+    # Check if we need to sync KV cache scales
+    # When fallback to policy as the policy_generation, we use getattr to check.
+    sync_kv_scales = getattr(policy_generation, "requires_kv_scale_sync", False)
 
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
