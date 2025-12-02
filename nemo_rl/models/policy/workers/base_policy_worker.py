@@ -7,7 +7,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
-class BasePolicyWorker:
+class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(

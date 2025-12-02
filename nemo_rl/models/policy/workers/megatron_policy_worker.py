@@ -123,7 +123,7 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
-from nemo_rl.models.policy.workers.base_policy_worker import BasePolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -422,7 +422,7 @@ def destroy_parallel_state():
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
-class MegatronPolicyWorker(ColocatablePolicyInterface, BasePolicyWorker):
+class MegatronPolicyWorker(ColocatablePolicyInterface, AbstractPolicyWorker):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 

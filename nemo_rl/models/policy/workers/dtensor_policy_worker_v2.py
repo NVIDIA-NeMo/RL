@@ -86,7 +86,7 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.models.policy.workers.base_policy_worker import BasePolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -99,7 +99,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(ColocatablePolicyInterface, BasePolicyWorker):
+class DTensorPolicyWorkerV2(ColocatablePolicyInterface, AbstractPolicyWorker):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
