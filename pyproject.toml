@@ -45,7 +45,7 @@ dependencies = [
   "torchvision>=0.22.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.5.0,<3.6.0",
-  "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
+  "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
 ]
@@ -57,7 +57,7 @@ automodel = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.11.2/vllm-0.11.2+cu130-cp38-abi3-manylinux1_x86_64.whl", # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+  "vllm==0.11.2",      # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
   "flash-attn==2.8.1",
   "mamba-ssm",
   "causal-conv1d",
@@ -69,7 +69,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.11.2/vllm-0.11.2+cu130-cp38-abi3-manylinux1_x86_64.whl", # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+  "vllm==0.11.2",
   "num2words>=0.5.14",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
   "flash-attn==2.8.1",
@@ -88,11 +88,11 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch,core_cu13]==2.9.0",
+  "transformer-engine[pytorch]==2.8.0",
   "megatron-core",
   "megatron-bridge",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.11.2/vllm-0.11.2+cu130-cp38-abi3-manylinux1_x86_64.whl", # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+  "vllm==0.11.2",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -153,19 +153,19 @@ penguin = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
-  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 triton = [
-  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.4" }
-mamba-ssm = { git = "https://github.com/yfw/mamba", branch = "general_stride_fix" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
 
 [tool.uv.workspace]
 members = [
@@ -187,8 +187,8 @@ url = "https://pypi.org/simple"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv]
@@ -212,12 +212,9 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # The TE override is needed because automodel/mbridge we are on is still on 2.5.0
-# The transformer-engine-cu12 override is needed because
-# automodel/mbridge are still using cuda 12.
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13]==2.9.0",
-  "transformer-engine-cu12; sys_platform == 'never'",
+  "transformer-engine[pytorch]==2.8.0",
   "opencv-python-headless>=4.11.0",
 ]
 
@@ -240,13 +237,13 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
-version = "1.5.4"
+version = "1.5.0.post8"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "v2.2.6.post3"
+version = "2.2.4"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]

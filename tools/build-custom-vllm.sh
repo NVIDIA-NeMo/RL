@@ -66,7 +66,7 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu130
+uv pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu129
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."
