@@ -20,7 +20,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar
+from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -118,6 +118,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
     _pack_sequences_for_megatron,
     broadcast_tensor,
@@ -2021,10 +2022,17 @@ class MegatronPolicyWorker:
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
-            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            use_fp8_kv_cache = (
+                "vllm_cfg" in generation_cfg
+                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+            )
 
         if not use_fp8_kv_cache:
             return

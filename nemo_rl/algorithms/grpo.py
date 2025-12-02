@@ -500,10 +500,10 @@ def setup(
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"].get("kv_cache_dtype") == "fp8":
+        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                "kv_cache_dtype='fp8' requires precision='fp8'. "
+                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
             # FP8 KV cache compatibility checks
@@ -900,15 +900,13 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
     if generation_config is None:
         return False
 
-    backend = generation_config.get("backend", "")
-    if backend != "vllm":
+    if generation_config["backend"] != "vllm":
         return False
 
-    vllm_cfg = generation_config.get("vllm_cfg", {})
-    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    vllm_cfg = cast(VllmConfig, generation_config)["vllm_cfg"]
 
-    # Sync scales when using FP8 KV cache (always static in this design)
-    return kv_cache_dtype == "fp8"
+    # Sync scales when using FP8 KV cache
+    return vllm_cfg["kv_cache_dtype"].startswith("fp8")
 
 
 def refit_policy_generation(

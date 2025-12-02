@@ -243,12 +243,18 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
-    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+
+    # Validate configuration: kv_cache_dtype
+    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+        raise ValueError(
+            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+        )
 
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
-    if kv_cache_dtype == "fp8" and not use_fp8_weights:
+    if kv_cache_dtype.startswith("fp8") and not use_fp8_weights:
         raise ValueError(
-            "kv_cache_dtype='fp8' requires precision='fp8'. "
+            f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
             "FP8 KV cache can only be used together with FP8 model weights."
         )
 
@@ -322,7 +328,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
-    # kv_cache_dtype can be "auto" or "fp8"
     vllm_kwargs = {
         "quantization": "fp8",
         "kv_cache_dtype": kv_cache_dtype,
