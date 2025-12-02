@@ -173,6 +173,7 @@ policy: &POLICY_BASE
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
+            kv_cache_dtype: "auto"
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
