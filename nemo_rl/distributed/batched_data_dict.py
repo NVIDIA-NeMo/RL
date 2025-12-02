@@ -54,6 +54,8 @@ class SequencePackingArgs(TypedDict):
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
+    min_bin_count: Optional[int]
+    bin_count_multiple: Optional[int]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -430,8 +432,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
                 collect_metrics=False,  # TODO(ahmadki): make configurable
-                min_bin_count=shards,
-                bin_count_multiple=shards,
+                min_bin_count=sequence_packing_args["min_bin_count"] or shards,
+                bin_count_multiple=sequence_packing_args["bin_count_multiple"]
+                or shards,
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]

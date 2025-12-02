@@ -283,6 +283,8 @@ def test_sequence_packing_basic():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     # Shard the batch with sequence packing
@@ -346,6 +348,8 @@ def test_sequence_packing_uniform_lengths():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
@@ -406,6 +410,8 @@ def test_sequence_packing_long_sequences():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
@@ -450,6 +456,8 @@ def test_sequence_packing_with_dynamic_batching_conflict():
         input_key="input_ids",
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     dynamic_batching_args: DynamicBatchingArgs = {
@@ -660,6 +668,8 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=pad_to_multiple_of,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     # Test with multiple shards and explicit batch_size to create chunks
