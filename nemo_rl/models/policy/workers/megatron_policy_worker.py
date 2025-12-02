@@ -75,8 +75,6 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -92,11 +90,13 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.megatron.common import (
-    broadcast_tensor
-)
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.data import get_mb_iterator, check_sequence_dim
+from nemo_rl.models.megatron.pipeline_parallel import (
+    broadcast_loss_metrics_from_last_stage,
+    broadcast_object_across_pp_ranks,
+    broadcast_tensors_from_last_stage,
+)
 from nemo_rl.models.megatron.train import (
     forward_maybe_backward,
     loss_processor,
@@ -146,57 +146,6 @@ from megatron.core.parallel_state import get_context_parallel_world_size
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def broadcast_object_across_pp_ranks(obj):
-    """Broadcast an object across pipeline parallel ranks.
-
-    This utility function handles broadcasting an object from the rank that owns it
-    to all other pipeline parallel ranks. If only one rank has the object (non-None),
-    it will be broadcast to all other ranks.
-
-    Args:
-        obj: The object to broadcast. Can be None on ranks that don't own it.
-
-    Returns:
-        The object on all ranks (either the original or the broadcast copy).
-
-    Raises:
-        ValueError: If the object doesn't exist on any pipeline parallel rank.
-    """
-    pp_size = get_pipeline_model_parallel_world_size()
-    pp_group = get_pipeline_model_parallel_group()
-
-    if pp_size == 1:
-        return obj
-
-    # ------------------------------------------------------------------
-    # 1. Gather presence flags from all PP ranks to find the source rank
-    # ------------------------------------------------------------------
-    has_obj = obj is not None
-    obj_flags = [None] * pp_size
-    torch.distributed.all_gather_object(obj_flags, has_obj, group=pp_group)
-
-    # ------------------------------------------------------------------
-    # 2. Identify the owning rank (the only rank with True flag)
-    # ------------------------------------------------------------------
-    src_rank = None  # Rank *inside* the PP group
-    for rank, flag in enumerate(obj_flags):
-        if flag:
-            src_rank = rank
-            break
-
-    if src_rank is None:
-        raise ValueError("Object must exist on at least one PP rank")
-
-    # ------------------------------------------------------------------
-    # 3. Broadcast the object from the source rank to all ranks
-    # ------------------------------------------------------------------
-    # Use broadcast_object_list which is more robust than all_gather_object
-    obj_list = [obj]
-    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
-    global_src = pp_ranks[src_rank]
-    torch.distributed.broadcast_object_list(obj_list, src=global_src, group=pp_group)
-
-    return obj_list[0]
 
 
 @ray.remote(
@@ -497,20 +446,13 @@ class MegatronPolicyWorker(BasePolicyWorker):
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
-
-                    torch.distributed.broadcast_object_list(
-                        [gb_loss_metrics],
-                        src=get_pipeline_model_parallel_last_rank(),
-                        group=get_pipeline_model_parallel_group(),
-                    )
                 else:
-                    loss_metrics = [None]  # type: ignore
-                    torch.distributed.broadcast_object_list(
-                        loss_metrics,
-                        src=get_pipeline_model_parallel_last_rank(),
-                        group=get_pipeline_model_parallel_group(),
-                    )
-                    gb_loss_metrics = loss_metrics[0]
+                    gb_loss_metrics = None
+                    mb_losses = None
+
+                # Broadcast loss metrics from last stage to all stages
+                gb_loss_metrics = broadcast_loss_metrics_from_last_stage(gb_loss_metrics)
+                if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
@@ -612,12 +554,10 @@ class MegatronPolicyWorker(BasePolicyWorker):
                 all_log_probs_padded.append(lp)
 
             logprobs = torch.cat(all_log_probs_padded, dim=0)
-            # broadcast logprobs to first pp rank
-            broadcast_tensor(logprobs, torch.distributed.get_rank(), pp_grp)
+            tensors = {"logprobs": logprobs}
         else:
-            logprobs = broadcast_tensor(
-                None, get_pipeline_model_parallel_last_rank(), pp_grp
-            )
+            tensors = None
+        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
@@ -701,8 +641,6 @@ class MegatronPolicyWorker(BasePolicyWorker):
 
         self.model.eval()
 
-        pp_grp = get_pipeline_model_parallel_group()
-
         (
             mb_iterator,
             data_iterator_len,
@@ -748,17 +686,20 @@ class MegatronPolicyWorker(BasePolicyWorker):
 
             topk_logits = torch.cat(logits_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
-
-            topk_logits = broadcast_tensor(
-                topk_logits, torch.distributed.get_rank(), pp_grp
-            )
-            topk_indices = broadcast_tensor(
-                topk_indices, torch.distributed.get_rank(), pp_grp
-            )
+            tensors_to_broadcast = {
+                "topk_logits": topk_logits,
+                "topk_indices": topk_indices,
+            }
         else:
-            last_pp_rank = get_pipeline_model_parallel_last_rank()
-            topk_logits = broadcast_tensor(None, last_pp_rank, pp_grp)
-            topk_indices = broadcast_tensor(None, last_pp_rank, pp_grp)
+            tensors_to_broadcast = {
+                "topk_logits": None,
+                "topk_indices": None,
+            }
+
+        # Broadcast tensors from last stage to all stages
+        broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
+        topk_logits = broadcasted["topk_logits"]
+        topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict.from_batches(
