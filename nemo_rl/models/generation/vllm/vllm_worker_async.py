@@ -25,6 +25,20 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
+# Register the Nemotron JSON tool parser with vLLM if available.
+# This ensures that using `tool_parser: nemotron_json` in the NeMo RL
+# config will succeed without requiring users to manually import the
+# plugin in their own code.
+try:  # pragma: no cover - optional runtime dependency
+    from nemo_rl.models.generation.vllm import (  # noqa: F401
+        nemotron_toolcall_parser_no_streaming,
+    )
+except Exception:
+    # If the module is missing for some reason, vLLM will simply not
+    # have the `nemotron_json` parser registered and will raise a
+    # clear error when it is requested.
+    pass
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -106,9 +120,13 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # We take everything starting with the EOS token ID.
+    # We take everything starting with the EOS token ID in the shared prefix
+    # between template_prefix_token_ids and template_token_ids.
     template_cut_start = -1
-    for pos in reversed(range(len(template_prefix_token_ids))):
+    # Guard against pathological cases where template_prefix_token_ids may be
+    # longer than template_token_ids by only iterating over the common length.
+    max_pos = min(len(template_prefix_token_ids), len(template_token_ids))
+    for pos in reversed(range(max_pos)):
         if template_token_ids[pos] == eos_token_id:
             template_cut_start = pos
             break
