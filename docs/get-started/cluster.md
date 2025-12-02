@@ -75,10 +75,12 @@ Ask for the resources you need (e.g., 1 node, 8 GPUs).
 
 ```bash
 # Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+
 CONTAINER=nvcr.io/nvidia/nemo:latest \
 MOUNTS="$PWD:$PWD" \
 sbatch \
-    --nodes=1 \
+    --nodes=${NUM_ACTOR_NODES} \
     --gpus-per-node=8 \
     --time=04:00:00 \
     --job-name=nemo-rl-interactive \
@@ -109,11 +111,13 @@ Include the `COMMAND` variable in your submission. Replace the command below wit
 
 ```bash
 # Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+
 COMMAND="uv run examples/run_sft.py" \
 CONTAINER=nvcr.io/nvidia/nemo:latest \
 MOUNTS="$PWD:$PWD" \
 sbatch \
-    --nodes=4 \
+    --nodes=${NUM_ACTOR_NODES} \
     --gpus-per-node=8 \
     --time=24:00:00 \
     --job-name=nemo-rl-prod \
@@ -173,4 +177,27 @@ You can pass these variables to `sbatch` to configure the environment:
 
 :::{tip}
 Export secrets like `HF_TOKEN` in your shell profile (`~/.bashrc`) so you don't have to type them every time.
+:::
+
+:::{dropdown} Advanced Environment Configuration
+The following variables allow for deeper customization of the Ray cluster. Most users will not need to change these defaults.
+
+| Variable (and default) | Explanation |
+| :--- | :--- |
+| `UV_CACHE_DIR_OVERRIDE` | Override the UV cache directory to a shared filesystem location. Essential for persisting package caches across jobs. |
+| `CPUS_PER_WORKER=128` | CPUs each Ray worker node claims. Default is `16 * GPUS_PER_NODE`. |
+| `GPUS_PER_NODE=8` | Number of GPUs each Ray worker node claims. |
+| `BASE_LOG_DIR=$SLURM_SUBMIT_DIR` | Base directory for storing Ray logs. |
+| `NODE_MANAGER_PORT=53001` | Port for the Ray node manager on worker nodes. |
+| `OBJECT_MANAGER_PORT=53003` | Port for the Ray object manager on worker nodes. |
+| `RUNTIME_ENV_AGENT_PORT=53005` | Port for the Ray runtime environment agent on worker nodes. |
+| `DASHBOARD_AGENT_GRPC_PORT=53007` | gRPC port for the Ray dashboard agent on worker nodes. |
+| `METRICS_EXPORT_PORT=53009` | Port for exporting metrics from worker nodes. |
+| `PORT=6379` | Main port for the Ray head node. |
+| `RAY_CLIENT_SERVER_PORT=10001` | Port for the Ray client server on the head node. |
+| `DASHBOARD_GRPC_PORT=52367` | gRPC port for the Ray dashboard on the head node. |
+| `DASHBOARD_PORT=8265` | Port for the Ray dashboard UI on the head node. |
+| `DASHBOARD_AGENT_LISTEN_PORT=52365` | Listening port for the dashboard agent on the head node. |
+| `MIN_WORKER_PORT=54001` | Minimum port in the range for Ray worker processes. |
+| `MAX_WORKER_PORT=54257` | Maximum port in the range for Ray worker processes. |
 :::
