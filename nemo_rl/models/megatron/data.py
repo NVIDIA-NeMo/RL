@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -9,8 +9,160 @@ from megatron.core.parallel_state import (
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+
+
+def get_microbatch_iterator(
+    data: BatchedDataDict[Any],
+    cfg: dict[str, Any],
+    mbs: int,
+) -> tuple[Iterator, int, int, int, int, int, int]:
+    _, seq_dim_size = check_sequence_dim(data)
+    if cfg["dynamic_batching"]["enabled"]:
+        mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+        data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+        micro_batch_size = mbs
+        ## TODO: handle other args
+    elif cfg["sequence_packing"]["enabled"]:
+        mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+        data_iterator_len, _ = (
+            data.get_microbatch_iterator_for_packable_sequences_len()
+        )
+        (
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = _get_pack_sequence_parameters_for_megatron(
+            cfg["megatron_cfg"],
+            seq_dim_size,
+        )
+        micro_batch_size = 1
+    else:
+        mb_iterator = data.make_microbatch_iterator(mbs)
+        data_iterator_len = data.size // mbs
+        micro_batch_size = mbs
+        pad_factor = 1
+        pad_packed_seq_to_multiple_of = 1
+        pad_full_seq_to = None
+    return (
+        mb_iterator,
+        data_iterator_len,
+        micro_batch_size,
+        pad_factor,
+        pad_packed_seq_to_multiple_of,
+        pad_full_seq_to,
+        seq_dim_size,
+    )
+
+def process_microbatch(
+    data_dict: BatchedDataDict[Any],
+    seq_length_key: Optional[str] = None,
+    pad_individual_seqs_to_multiple_of: int = 1,
+    pad_full_seq_to: Optional[int] = None,
+    pack_sequences: bool = False,
+):
+    #with straggler_timer(bdata=True):
+    input_ids = data_dict["input_ids"]
+    attention_mask = None
+    position_ids = None
+    packed_seq_params = None
+
+    original_batch_size = input_ids.shape[0]
+    original_seq_length = input_ids.shape[1]
+    seq_lengths = None  # Will be set if using packed sequences
+    cu_seqlens = None
+    cu_seqlens_padded = None
+
+    if pack_sequences:
+        # For packed sequences with padded input, we need sequence lengths
+        assert seq_length_key is not None, (
+            "seq_length_key must be provided for packed sequences"
+        )
+        assert seq_length_key in data_dict, (
+            f"{seq_length_key} not found in data_dict"
+        )
+
+        # Get sequence lengths and context parallel size
+        seq_lengths = data_dict[seq_length_key]
+
+        # Pack sequences
+        (
+            input_ids,
+            input_ids_cp_sharded,
+            packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _pack_sequences_for_megatron(
+            input_ids,
+            seq_lengths,
+            pad_individual_seqs_to_multiple_of,
+            pad_full_seq_to or 1,
+            cp_rank=get_context_parallel_rank(),
+            cp_size=get_context_parallel_world_size(),
+        )
+    
+        # For packed sequences, position_ids and attention_mask are typically None
+        # The PackedSeqParams handles all necessary sequence information
+        position_ids = None
+        attention_mask = None
+    else:
+        input_ids_cp_sharded = input_ids
+        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+            data=input_ids,
+            eod_token=0,  # used for loss_mask, which we don't use
+            pad_token=0,  # used for loss_mask, which we don't use
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            pad_mask_loss=False,
+        )
+    return (
+        input_ids,
+        input_ids_cp_sharded,
+        attention_mask,
+        position_ids,
+        packed_seq_params,
+        cu_seqlens,
+        cu_seqlens_padded,
+    )
+
+def process_global_batch(
+    data: BatchedDataDict[Any],
+    batch_idx: int,
+    batch_size: int,
+    loss_fn: LossFunction,
+    dp_group: torch.distributed.ProcessGroup,
+) -> dict[str, Any]:
+    batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
+
+    assert "sample_mask" in batch, "sample_mask must be present in the data!"
+
+    # Get the normalization factor for the loss
+    local_valid_seqs = torch.sum(batch["sample_mask"])
+
+    if "token_mask" not in batch:
+        local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
+    else:
+        local_valid_toks = torch.sum(
+            batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
+        )
+
+    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    torch.distributed.all_reduce(to_reduce, group=dp_group)
+    global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+
+    if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
+        assert "token_mask" in batch, (
+            "token_mask must be present in the data when using token-level loss"
+        )
+
+    return (
+        batch,
+        global_valid_seqs,
+        global_valid_toks,
+    )
 
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
@@ -316,81 +468,6 @@ def _unpack_sequences_from_megatron(
 
     return unpacked_output
 
-def preprocess_one_batch(
-    data_iterator,
-    seq_length_key: Optional[str] = None,
-    pad_individual_seqs_to_multiple_of: int = 1,
-    pad_full_seq_to: Optional[int] = None,
-    pack_sequences: bool = False,
-
-):
-    #with straggler_timer(bdata=True):
-    data_dict = next(data_iterator).to("cuda")
-    input_ids = data_dict["input_ids"]
-    attention_mask = None
-    position_ids = None
-    packed_seq_params = None
-
-    original_batch_size = input_ids.shape[0]
-    original_seq_length = input_ids.shape[1]
-    seq_lengths = None  # Will be set if using packed sequences
-    cu_seqlens = None
-    cu_seqlens_padded = None
-
-    if pack_sequences:
-        # For packed sequences with padded input, we need sequence lengths
-        assert seq_length_key is not None, (
-            "seq_length_key must be provided for packed sequences"
-        )
-        assert seq_length_key in data_dict, (
-            f"{seq_length_key} not found in data_dict"
-        )
-
-        # Get sequence lengths and context parallel size
-        seq_lengths = data_dict[seq_length_key]
-
-        # Pack sequences
-        (
-            input_ids,
-            input_ids_cp_sharded,
-            packed_seq_params,
-            cu_seqlens,
-            cu_seqlens_padded,
-        ) = _pack_sequences_for_megatron(
-            input_ids,
-            seq_lengths,
-            pad_individual_seqs_to_multiple_of,
-            pad_full_seq_to or 1,
-            cp_rank=get_context_parallel_rank(),
-            cp_size=get_context_parallel_world_size(),
-        )
-    
-        # For packed sequences, position_ids and attention_mask are typically None
-        # The PackedSeqParams handles all necessary sequence information
-        position_ids = None
-        attention_mask = None
-    else:
-        input_ids_cp_sharded = input_ids
-        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-            data=input_ids,
-            eod_token=0,  # used for loss_mask, which we don't use
-            pad_token=0,  # used for loss_mask, which we don't use
-            reset_position_ids=False,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
-            pad_mask_loss=False,
-        )
-    return (
-        data_dict,
-        input_ids,
-        input_ids_cp_sharded,
-        packed_seq_params,
-        cu_seqlens,
-        cu_seqlens_padded,
-        position_ids,
-        attention_mask,
-    )
-
 def check_sequence_dim(data: BatchedDataDict[Any]):
     # dim 1 is always assumed to be the sequence dim, sanity check this here
     sequence_dim = 1
@@ -401,41 +478,3 @@ def check_sequence_dim(data: BatchedDataDict[Any]):
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
             )
     return sequence_dim, seq_dim_size
-
-def get_mb_iterator(cfg: dict, data: BatchedDataDict[Any], mbs: int):
-    _, seq_dim_size = check_sequence_dim(data)
-    if cfg["dynamic_batching"]["enabled"]:
-        mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-        data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-        micro_batch_size = mbs
-        ## TODO: handle other args
-    elif cfg["sequence_packing"]["enabled"]:
-        mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-        data_iterator_len, _ = (
-            data.get_microbatch_iterator_for_packable_sequences_len()
-        )
-        (
-            pad_factor,
-            pad_packed_seq_to_multiple_of,
-            pad_full_seq_to,
-        ) = _get_pack_sequence_parameters_for_megatron(
-            cfg["megatron_cfg"],
-            seq_dim_size,
-        )
-        micro_batch_size = 1
-    else:
-        mb_iterator = data.make_microbatch_iterator(mbs)
-        data_iterator_len = data.size // mbs
-        micro_batch_size = mbs
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
-    return (
-        mb_iterator,
-        data_iterator_len,
-        micro_batch_size,
-        pad_factor,
-        pad_packed_seq_to_multiple_of,
-        pad_full_seq_to,
-        seq_dim_size,
-    )

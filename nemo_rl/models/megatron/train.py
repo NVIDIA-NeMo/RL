@@ -21,7 +21,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
-from nemo_rl.models.megatron.data import preprocess_one_batch
+from nemo_rl.models.megatron.data import process_microbatch
 
 def forward_step(
     model,
@@ -71,17 +71,17 @@ def forward_with_processor(
     processor_fn: Optional[Callable[Any, Callable]] = None,
 ):
     pack_sequences = cfg["sequence_packing"]["enabled"]
+    data_dict = next(data_iterator).to("cuda")
     (
-        data_dict,
         input_ids,
         input_ids_cp_sharded,
+        attention_mask,
+        position_ids,
         packed_seq_params,
         cu_seqlens,
         cu_seqlens_padded,
-        position_ids,
-        attention_mask,
-    ) = preprocess_one_batch(
-        data_iterator,
+    ) = process_microbatch(
+        data_dict,
         seq_length_key,
         pad_individual_seqs_to_multiple_of,
         pad_full_seq_to,
@@ -99,7 +99,7 @@ def forward_with_processor(
     )
 
     ## calling processor_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
-    #### NOTE: the processor_fn passed in here should take in the following kwargs!
+    #### NOTE: the processor_fn passed in here should accept the following kwargs!
     processor_fn_wrapped = processor_fn(
         data_dict=data_dict,
         input_ids=input_ids,

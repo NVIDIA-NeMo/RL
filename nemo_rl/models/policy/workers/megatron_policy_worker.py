@@ -82,7 +82,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import (
@@ -91,7 +91,10 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.megatron.data import get_mb_iterator, check_sequence_dim
+from nemo_rl.models.megatron.data import (
+    get_microbatch_iterator,
+    process_global_batch,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_object_across_pp_ranks,
@@ -121,7 +124,6 @@ from nemo_rl.models.megatron.setup import (
     handle_model_import,
     setup_environment_and_config,
     setup_megatron_model,
-    setup_megatron_model_and_components,
     setup_model_config,
     setup_reference_model_state,
     validate_model_paths,
@@ -139,13 +141,7 @@ except ImportError:
     HAVE_FSDP2 = False
 
 
-from megatron.core.packed_seq_params import PackedSeqParams
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
-from megatron.core.parallel_state import get_context_parallel_world_size
-
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
 
 
 @ray.remote(
@@ -233,7 +229,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             self.scheduler,
             self.checkpointing_context,
             param_sync_func,
-        ) = setup_megatron_model_and_components(config, self.megatron_cfg, init_optimizer)
+        ) = setup_megatron_model(config, self.megatron_cfg, init_optimizer)
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -321,37 +317,17 @@ class MegatronPolicyWorker(BasePolicyWorker):
             all_mb_metrics = []
             losses = []
             for gb_idx in range(num_global_batches):
-                global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-
-                assert "sample_mask" in global_batch, (
-                    "sample_mask must be present in the data!"
+                ( 
+                    batch,
+                    global_valid_seqs,
+                    global_valid_toks,
+                ) = process_global_batch(
+                    data,
+                    gb_idx,
+                    local_gbs,
+                    loss_fn,
+                    dp_group=parallel_state.get_data_parallel_group(),
                 )
-                ## get the normalization factor for the loss
-                local_valid_seqs = torch.sum(global_batch["sample_mask"])
-
-                if not "token_mask" in global_batch:
-                    local_valid_toks = (
-                        local_valid_seqs * global_batch["input_ids"].shape[1]
-                    )
-                else:
-                    local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
-                    )
-
-                to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-                torch.distributed.all_reduce(
-                    to_reduce, group=parallel_state.get_data_parallel_group()
-                )
-                global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
-
-                if (
-                    hasattr(loss_fn, "loss_type")
-                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
-                ):
-                    assert "token_mask" in global_batch, (
-                        "token_mask must be present in the data when using token-level loss"
-                    )
                 
                 loss_processor_wrapped = partial(
                     loss_processor,
@@ -370,7 +346,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     pad_packed_seq_to_multiple_of,
                     pad_full_seq_to,
                     seq_dim_size,
-                ) = get_mb_iterator(self.cfg, batch, mbs)
+                ) = get_microbatch_iterator(batch, self.cfg, mbs)
                 
                 seqlen_key = "input_lengths" if self.cfg["sequence_packing"]["enabled"] else None
 
@@ -525,7 +501,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             pad_packed_seq_to_multiple_of,
             pad_full_seq_to,
             input_seq_dim_size,
-        ) = get_mb_iterator(self.cfg, data, logprob_batch_size)
+        ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
         
         pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
@@ -649,7 +625,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             pad_packed_seq_to_multiple_of,
             pad_full_seq_to,
             input_seq_dim_size,
-        ) = get_mb_iterator(self.cfg, data, logprob_batch_size)
+        ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
         
         pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 

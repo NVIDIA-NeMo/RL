@@ -530,28 +530,28 @@ def _create_megatron_config(
 
 def setup_megatron_model(
     policy_cfg: PolicyConfig,
-    cfg: ConfigContainer,
+    megatron_cfg: ConfigContainer,
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
 ):
     state = GlobalState()
-    state.cfg = cfg
+    state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
-    cfg.dist.external_gpu_device_mapping = True
+    megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
-        cfg=cfg,
+        cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
     )
 
-    if cfg.ft and cfg.ft.enable_ft_package:
-        fault_tolerance.setup(cfg, state)
-        fault_tolerance.maybe_setup_simulated_fault(cfg.ft)
+    if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
+        fault_tolerance.setup(megatron_cfg, state)
+        fault_tolerance.maybe_setup_simulated_fault(megatron_cfg.ft)
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options(cfg.model, cfg.train.micro_batch_size)
+    set_jit_fusion_options(megatron_cfg.model, megatron_cfg.train.micro_batch_size)
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -570,17 +570,17 @@ def setup_megatron_model(
     torch.distributed.barrier()
 
     # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = init_checkpointing_context(cfg.checkpoint)
+    checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
     # Tokenizer
     build_tokenizer(
-        cfg.tokenizer,
-        make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
-        // cfg.model.tensor_model_parallel_size,
-        tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
+        megatron_cfg.tokenizer,
+        make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
+        // megatron_cfg.model.tensor_model_parallel_size,
+        tensor_model_parallel_size=megatron_cfg.model.tensor_model_parallel_size,
         trust_remote_code=True,
     )
-    assert cfg.model.vocab_size, "vocab size must be specified in model config"
+    assert megatron_cfg.model.vocab_size, "vocab size must be specified in model config"
 
     torch.distributed.barrier()
 
@@ -611,20 +611,20 @@ def setup_megatron_model(
 
     # Model, optimizer, and learning rate.
     model = get_model(
-        cfg.model,
-        cfg.ddp,
-        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        megatron_cfg.model,
+        megatron_cfg.ddp,
+        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
-            optimizer_config=cfg.optimizer,
-            scheduler_config=cfg.scheduler,
+            optimizer_config=megatron_cfg.optimizer,
+            scheduler_config=megatron_cfg.scheduler,
             model=model,
-            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
+            use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
         )
     else:
         optimizer = None
@@ -635,11 +635,11 @@ def setup_megatron_model(
 
     # Load checkpoint if applicable
     if (
-        cfg.checkpoint.load is not None
-        or cfg.checkpoint.pretrained_checkpoint is not None
+        megatron_cfg.checkpoint.load is not None
+        or megatron_cfg.checkpoint.pretrained_checkpoint is not None
     ) and (
-        checkpoint_exists(cfg.checkpoint.load)
-        or checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
+        checkpoint_exists(megatron_cfg.checkpoint.load)
+        or checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
     ):
         load_checkpoint(
             state,
@@ -647,13 +647,27 @@ def setup_megatron_model(
             optimizer,
             scheduler,
             checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
+            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
 
-    return state, model, optimizer, scheduler, checkpointing_context
+    # Set the param sync function for the model
+    param_sync_func = None
+    if (
+        megatron_cfg.ddp.overlap_param_gather
+        and megatron_cfg.ddp.align_param_gather
+    ):
+        param_sync_func = [
+            model_chunk.start_param_sync for model_chunk in model
+        ]
+        if len(model) == 1:
+            param_sync_func = param_sync_func[0]
 
+    # Get the first model from the list
+    model = model[0]
+
+    return state, model, optimizer, scheduler, checkpointing_context, param_sync_func
 
 def handle_model_import(config: PolicyConfig, hf_model_name: str, pretrained_path: str, pt_checkpoint_exists: bool) -> None:
     """Handle HF model import if checkpoint doesn't exist."""
@@ -672,45 +686,6 @@ def handle_model_import(config: PolicyConfig, hf_model_name: str, pretrained_pat
             print("Reinitializing model parallel after loading model state.")
             parallel_state.destroy_model_parallel()
 
-
-def setup_megatron_model_and_components(
-    config: PolicyConfig, 
-    megatron_cfg: ConfigContainer, 
-    init_optimizer: bool
-) -> tuple:
-    """Setup the main Megatron model and optimizer.
-    
-    Returns:
-        Tuple of (mcore_state, model, optimizer, scheduler, checkpointing_context, param_sync_func)
-    """
-    (
-        mcore_state,
-        models,
-        optimizer,
-        scheduler,
-        checkpointing_context,
-    ) = setup_megatron_model(
-        policy_cfg=config, 
-        cfg=megatron_cfg, 
-        load_optimizer=init_optimizer
-    )
-
-    # Set the param sync function for the model
-    param_sync_func = None
-    if (
-        megatron_cfg.ddp.overlap_param_gather
-        and megatron_cfg.ddp.align_param_gather
-    ):
-        param_sync_func = [
-            model_chunk.start_param_sync for model_chunk in models
-        ]
-        if len(models) == 1:
-            param_sync_func = param_sync_func[0]
-
-    # Get the first model from the list
-    model = models[0]
-
-    return mcore_state, model, optimizer, scheduler, checkpointing_context, param_sync_func
 
 
 def setup_reference_model_state(
