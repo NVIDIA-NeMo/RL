@@ -595,7 +595,8 @@ def setup(
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
-    policy_generation.prepare_refit_info(state_dict_info)
+    if policy_generation is not None:
+        policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
 
@@ -1155,7 +1156,10 @@ def grpo_train(
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
-                    policy_generation.clear_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "clear_vllm_logger_metrics"
+                    ):
+                        policy_generation.clear_vllm_logger_metrics()
                     # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                     if _should_use_penguin(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1207,7 +1211,14 @@ def grpo_train(
                     policy_generation.finish_generation()
                     # Collect vLLM logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -2011,7 +2022,10 @@ def async_grpo_train(
     print("✅ All setup complete, starting buffer wait...")
 
     # Clear vLLM logger metrics after at start of training
-    policy_generation.clear_vllm_logger_metrics()
+    if policy_generation is not None and hasattr(
+        policy_generation, "clear_vllm_logger_metrics"
+    ):
+        policy_generation.clear_vllm_logger_metrics()
 
     # Wait for initial buffer fill
     print(
@@ -2260,7 +2274,14 @@ def async_grpo_train(
 
                     # Collect vLLM logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -2276,7 +2297,10 @@ def async_grpo_train(
                         trajectory_collector.resume_after_refit.remote()
 
                 # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
-                policy_generation.clear_vllm_logger_metrics()
+                if policy_generation is not None and hasattr(
+                    policy_generation, "clear_vllm_logger_metrics"
+                ):
+                    policy_generation.clear_vllm_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None
