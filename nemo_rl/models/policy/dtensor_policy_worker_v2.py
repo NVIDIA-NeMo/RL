@@ -18,14 +18,19 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional, cast
+from typing import Any, Generator, Optional
 
 import ray
 import torch
 import zmq
-from accelerate import init_empty_weights
-from nemo_automodel import (
-    NeMoAutoModelForSequenceClassification,
+from nemo_automodel.components.checkpoint._backports.filesystem import (
+    SerializationFormat,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
+    CheckpointingConfig as AutomodelCheckpointingConfig,
 )
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
@@ -35,30 +40,16 @@ from nemo_automodel.components.distributed.grad_utils import (
     clip_grad_by_total_norm_,
     get_grad_norm,
 )
-from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
-)
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
 from torch import nn
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    set_model_state_dict,
-)
-from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
-    MixedPrecisionPolicy,
-    OffloadPolicy,
-)
 from torch.distributed.tensor import DTensor, Shard
 from transformers import (
-    AutoConfig,
     AutoProcessor,
     AutoTokenizer,
 )
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
@@ -67,6 +58,11 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
+)
+from nemo_rl.models.automodel.setup import (
+    setup_distributed,
+    setup_model_and_optimizer,
+    validate_and_set_config,
 )
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -79,15 +75,8 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    configure_dynamo_cache,
     get_gpu_info,
     get_runtime_env_for_policy_worker,
-    import_class_from_path,
-    resolve_model_class,
-)
-from nemo_rl.utils.automodel_checkpoint import (
-    load_checkpoint,
-    save_checkpoint,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -120,341 +109,91 @@ class DTensorPolicyWorkerV2:
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
+        # Store tokenizer and processor
         self.tokenizer = tokenizer
         self.processor = processor
-        self.is_vlm = processor is not None
+        is_vlm = processor is not None
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
-
-        self.is_generation_colocated = None
-        if "generation" in config and config["generation"] is not None:
-            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
-
-        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-        if not self.is_generation_colocated:
-            os.environ["NCCL_CUMEM_ENABLE"] = "1"
-
-        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
-        # with different order of node_bundles
-        configure_dynamo_cache()
-
+        # Store configuration
         self.cfg = config
-        # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
-        torch.distributed.init_process_group(backend="nccl")
-        self.rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        model_name = self.cfg["model_name"]
 
-        self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
-        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
-        self.max_grad_norm = self.cfg["max_grad_norm"]
+        # Initialize checkpointer references
+        self.checkpointer = None
+        self.checkpoint_config = None
 
-        if self.cfg["precision"] == "float32":
-            self.dtype = torch.float32
-        elif self.cfg["precision"] == "bfloat16":
-            self.dtype = torch.bfloat16
-        elif self.cfg["precision"] == "float16":
-            self.dtype = torch.float16
-        else:
-            raise ValueError(f"Unknown precision: {self.cfg['precision']}")
-
-        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
-        if self.enable_seq_packing:
-            assert not self.is_vlm, (
-                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
-            )
-            print(
-                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
-            )
-            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
-
-        hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
-
-        model_config = AutoConfig.from_pretrained(
-            model_name,
-            # Always load the model in float32 to keep master weights in float32.
-            # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            torch_dtype=torch.float32,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2"
-            if self.enable_seq_packing
-            else None,
-            **hf_config_overrides,
+        # Validate configuration and set derived values
+        self.runtime_config = validate_and_set_config(
+            config=config,
+            processor=processor,
+            rank=0,  # Temporary, will be updated after distributed init
         )
 
-        self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
-            model_config
+        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={is_vlm}")
+
+        # Set up distributed environment (returns FSDP2Manager)
+        self.distributed_manager = setup_distributed(
+            config=config,
+            runtime_config=self.runtime_config,
         )
 
-        self._is_reward_model = (
-            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
-        )
-        if self._is_reward_model:
-            # Ensure sequence packing is disabled.
-            if self.enable_seq_packing:
-                raise NotImplementedError(
-                    "Sequence packing is not supported for reward models"
-                )
-            # Load model as a Reward Model.
-            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
-            if rm_type == "bradley_terry":
-                model_class = NeMoAutoModelForSequenceClassification
-                if model_config.num_labels != 1:
-                    # For Bradley-Terry reward models, the linear head has a single output.
-                    # In the transformers library, the default setting for model_config.num_labels is 2
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
-                    # Since num_labels is used as the out_features for the linear head
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
-                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
-                    # from the model checkpoint and are instead initialized using model_config.initializer_range
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
-                    print(
-                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
-                        "for the linear head of Bradley-Terry reward models."
-                    )
-                    model_config.num_labels = 1
-            else:
-                raise ValueError(f"Unknown reward model type: {rm_type}")
-        else:
-            # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
-
-        full_state_dict = None
-        model_state_dict_keys = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = model_class.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-                use_liger_kernel=False,
-                torch_dtype=str(model_config.torch_dtype),
-            )
-
-            full_state_dict = model.state_dict()
-            # Store the original model state dict keys before any parallelization
-            model_state_dict_keys = list(full_state_dict.keys())
-            del model
-
-        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
-        # All ranks initialize model on meta device, so FSDP can shard it.
-        # The actual weights will be broadcast from rank 0.
-
-        with init_empty_weights():
-            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
-            # so we need to set it to None if sequence packing is disabled
-            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-            self.model = model_class.from_config(
-                model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
-                use_liger_kernel=False,
-                trust_remote_code=True,
-                torch_dtype=str(model_config.torch_dtype),
-            )
-
-        if self.model.config.pad_token_id is None:
-            self.model.config.pad_token_id = tokenizer.pad_token_id
-
-        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
-        if cp_size > 1 and self.enable_seq_packing:
-            raise ValueError(
-                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-            )
-        dp_size = world_size // tp_size // cp_size
-        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
-        assert world_size == dp_size * tp_size * cp_size, (
-            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
+        # Set up model and optimizer
+        self.model_and_optimizer_state = setup_model_and_optimizer(
+            config=config,
+            tokenizer=tokenizer,
+            runtime_config=self.runtime_config,
+            distributed_manager=self.distributed_manager,
+            worker_instance=self,
+            is_vlm=is_vlm,
+            init_optimizer=init_optimizer,
+            init_reference_model=init_reference_model,
         )
 
-        if sequence_parallel_enabled and tp_size == 1:
-            print(
-                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
-            )
-        elif sequence_parallel_enabled and tp_size > 1:
-            raise RuntimeError(
-                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
-            )
+        # Set up backward compatibility aliases
+        self._set_attributes()
 
-        if cp_size > 1:
-            assert not isinstance(self.model, Gemma3ForCausalLM), (
-                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. "
-                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-            )
-
-            assert not (tp_size > 1 and sequence_parallel_enabled), (
-                "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
-                "Please either set cp_size = 1 or disable sequence parallel. "
-                "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
-            )
-
-            assert not self.is_vlm, (
-                "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
-            )
-
-        # For FSDP2 compatibility, we need to support HSDP structure
-        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
-        dp_replicate_size = 1
-        dp_shard_size = dp_size
-
-        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
-        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
-        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
-        prev_local_rank = os.environ["LOCAL_RANK"]
-        os.environ["LOCAL_RANK"] = "0"
-
-        # Create device mesh with HSDP structure for FSDP2 compatibility
-        device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (dp_replicate_size, dp_shard_size, cp_size, tp_size),
-            mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
-        )
-        os.environ["LOCAL_RANK"] = prev_local_rank
-
-        # Create flattened submeshes for different use cases
-        # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
-        device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
-
-        # Flatten dp_shard + cp for FSDP2 sharding
-        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
-
-        # Flatten dp_replicate + dp_shard + cp for gradient operations
-        device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
-
-        # Store mesh references for backward compatibility
-        self.dp_cp_mesh = device_mesh["dp_cp"]
-        self.dp_mesh = device_mesh["dp"]
-        self.tp_mesh = device_mesh["tp"]
-        self.cp_mesh = device_mesh["cp"]
-
-        self.dp_size = dp_size
-        self.tp_size = tp_size
-        self.cp_size = cp_size
-        self.device_mesh = device_mesh
-
-        # ------------------------------------------------
-        # 3) Move to GPU + Composable FSDP
-        #    (Initialize device mesh, shard submodules, then shard entire model)
-        # ------------------------------------------------
-        self.model = fsdp2_strategy_parallelize(
-            self.model,
-            device_mesh=self.device_mesh,
-            mp_policy=MixedPrecisionPolicy(
-                param_dtype=self.dtype,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            ),
-            offload_policy=CPUOffloadPolicy(pin_memory=False)
-            if self.cpu_offload
-            else OffloadPolicy(),
-            sequence_parallel=sequence_parallel_enabled,
-            activation_checkpointing=self.cfg["dtensor_cfg"][
-                "activation_checkpointing"
-            ],
-            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
-            dp_replicate_mesh_name="dp_replicate",
-            dp_shard_cp_mesh_name="dp_shard_cp",
-            tp_mesh_name="tp",
-        )
-
-        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
-        # This will broadcast the state dict from rank 0 to all other ranks
-        # and load it into the FSDP model.
-        set_model_state_dict(
-            self.model,
-            model_state_dict=full_state_dict,
-            options=StateDictOptions(
-                full_state_dict=True,
-                broadcast_from_rank0=True,
-            ),
-        )
-
-        # Broadcast model state dict keys to all ranks and store as instance variable
-        keys_to_broadcast = [model_state_dict_keys]
-        torch.distributed.broadcast_object_list(keys_to_broadcast, src=0)
-        self.model_state_dict_keys = keys_to_broadcast[0]
-
-        # Handle tied word embeddings after loading the state dict
-        # We need to actually tie the parameters at the model level
-        is_tied_lm_head = hasattr(self.model, "lm_head") and getattr(
-            getattr(self.model, "config", {}), "tie_word_embeddings", False
-        )
-        if is_tied_lm_head:
-            embed_tokens_weight = None
-            for name, param in self.model.named_parameters():
-                if "embed_tokens" in name and name.endswith(".weight"):
-                    embed_tokens_weight = param
-                    break
-
-            if embed_tokens_weight is not None:
-                self.model.lm_head.weight = embed_tokens_weight
-
-        # Manually broadcast buffers
-        for _, buf in self.model.named_buffers():
-            torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
-
-        if self.cpu_offload:
-            self.model = self.move_to_device(self.model, "cpu")
-
-        if init_reference_model:
-            self.reference_model_state_dict = get_cpu_state_dict(
-                self.model.state_dict().items(), pin_memory=True
-            )
-
-        if init_optimizer:
-            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
-            self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
-            )
-        else:
-            self.optimizer = None
-
-        if "scheduler" in self.cfg and self.optimizer is not None:
-            if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = import_class_from_path(
-                    cast(str, self.cfg["scheduler"]["name"])
-                )
-                self.scheduler = scheduler_cls(
-                    self.optimizer, **self.cfg["scheduler"]["kwargs"]
-                )
-            else:
-                schedulers = []
-                for scheduler_cfg in self.cfg["scheduler"]:
-                    if "name" in scheduler_cfg:
-                        schedulers.append(
-                            import_class_from_path(scheduler_cfg["name"])(
-                                self.optimizer, **scheduler_cfg["kwargs"]
-                            )
-                        )
-                    else:
-                        assert "milestones" in scheduler_cfg, (
-                            "unknown scheduler config: ",
-                            scheduler_cfg,
-                        )
-                        milestones: list[int] = scheduler_cfg["milestones"]
-
-                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-                    self.optimizer, schedulers, milestones
-                )
-
-        elif self.optimizer is not None:
-            ## default to a passthrough LR schedule
-            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer, lr_lambda=lambda epoch: 1
-            )
-
-        # restore
+        # Load checkpoint if provided
         if weights_path:
             self.load_checkpoint(weights_path, optimizer_path)
         else:
             print(
-                "No weights path provided. Starting from scratch (default policy init)"
+                "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
             )
+
+    def _set_attributes(self) -> None:
+        # Aliases from model_and_optimizer_state
+        self.model = self.model_and_optimizer_state.model
+        self.optimizer = self.model_and_optimizer_state.optimizer
+        self.scheduler = self.model_and_optimizer_state.scheduler
+        self.reference_model_state_dict = (
+            self.model_and_optimizer_state.reference_model_state_dict
+        )
+        self.model_state_dict_keys = (
+            self.model_and_optimizer_state.model_state_dict_keys
+        )
+        self.is_vlm = self.model_and_optimizer_state.is_vlm
+        self._is_reward_model = self.model_and_optimizer_state.is_reward_model
+
+        # Aliases from manager (FSDP2Manager)
+        self.rank = torch.distributed.get_rank()
+        self.device_mesh = self.distributed_manager.device_mesh
+        self.dp_cp_mesh = self.device_mesh["dp_cp"]
+        self.dp_mesh = self.device_mesh["dp"]
+        self.tp_mesh = self.device_mesh["tp"]
+        self.cp_mesh = self.device_mesh["cp"]
+        self.dp_size = self.distributed_manager.dp_size
+        self.tp_size = self.distributed_manager.tp_size
+        self.cp_size = self.distributed_manager.cp_size
+
+        # Aliases from runtime_config
+        self.dtype = self.runtime_config.dtype
+        self.cpu_offload = self.runtime_config.cpu_offload
+        self.offload_optimizer_for_logprob = (
+            self.runtime_config.offload_optimizer_for_logprob
+        )
+        self.max_grad_norm = self.runtime_config.max_grad_norm
+        self.enable_seq_packing = self.runtime_config.enable_seq_packing
+        self.allow_flash_attn_args = self.runtime_config.allow_flash_attn_args
+        self.is_generation_colocated = self.runtime_config.is_generation_colocated
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
@@ -1892,34 +1631,142 @@ class DTensorPolicyWorkerV2:
                 "save_consolidated",
                 "is_peft",
                 "peft_config",
+                "model_cache_dir",
+                "model_repo_id",
+                "is_async",
+                "dequantize_base_checkpoint",
             }
         }
 
-        save_checkpoint(
+        checkpoint_root = _infer_checkpoint_root(weights_path)
+
+        # Ensure a persistent Checkpointer exists and is configured
+        self._ensure_checkpointer(
+            config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root
+        )
+
+        self.checkpointer.save_model(
             model=self.model,
             weights_path=weights_path,
-            optimizer=self.optimizer if optimizer_path else None,
-            scheduler=self.scheduler if optimizer_path else None,
-            optimizer_path=optimizer_path,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            model_state_dict_keys=self.model_state_dict_keys,
-            **checkpoint_kwargs,
+            peft_config=checkpoint_kwargs.get("peft_config"),
+            tokenizer=self.tokenizer if tokenizer_path is None else None,
         )
+
+        if optimizer_path and self.optimizer is not None:
+            self.checkpointer.save_optimizer(
+                optimizer=self.optimizer,
+                model=self.model,
+                weights_path=optimizer_path,
+                scheduler=self.model_and_optimizer_state.scheduler,
+            )
+
+        if tokenizer_path and self.tokenizer is not None:
+            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+            self.tokenizer.save_pretrained(tokenizer_path)
 
     def load_checkpoint(
         self,
         weights_path: str,
         optimizer_path: Optional[str] = None,
     ) -> None:
-        """Load a checkpoint into the model."""
-        load_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer if optimizer_path else None,
-            scheduler=self.scheduler if optimizer_path else None,
-            optimizer_path=optimizer_path,
+        """Load a checkpoint into the model using Automodel Checkpointer."""
+        print(f"Loading weights from {weights_path}")
+
+        model_save_format, is_peft = detect_checkpoint_format(weights_path)
+
+        weights_dir = os.path.dirname(weights_path)
+        checkpoint_root = (
+            os.path.dirname(weights_dir)
+            if weights_dir.endswith("weights")
+            else weights_dir
         )
+
+        # Ensure a persistent Checkpointer exists and is configured
+        self._ensure_checkpointer(
+            config_updates={
+                "model_save_format": model_save_format,
+                "is_peft": is_peft,
+            },
+            checkpoint_root=checkpoint_root,
+        )
+
+        model_dir = (
+            weights_path
+            if weights_path.endswith("/model")
+            else os.path.join(weights_path, "model")
+        )
+
+        self.checkpointer.load_model(
+            model=self.model,
+            model_path=model_dir,
+        )
+
+        if optimizer_path and self.optimizer is not None:
+            self.checkpointer.load_optimizer(
+                optimizer=self.optimizer,
+                model=self.model,
+                weights_path=optimizer_path,
+                scheduler=self.model_and_optimizer_state.scheduler,
+            )
+
+    def _ensure_checkpointer(
+        self, config_updates=None, checkpoint_root: Optional[str] = None
+    ) -> None:
+        """Create or update a persistent Automodel Checkpointer bound to this worker ranks.
+
+        Args:
+            config_updates: Dict of CheckpointingConfig fields to update.
+            checkpoint_root: Optional root directory for checkpoints.
+        """
+        if config_updates is None:
+            config_updates = {}
+
+        # Compute dp/tp ranks
+        dp_rank = torch.distributed.get_rank(self.distributed_state.dp_mesh.get_group())
+        tp_rank = torch.distributed.get_rank(self.distributed_state.tp_mesh.get_group())
+        pp_rank = 0
+
+        if self.checkpointer is None:
+            # Initialize a base config with sensible defaults
+            base_cfg = AutomodelCheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=checkpoint_root or "",
+                model_save_format=config_updates.get(
+                    "model_save_format", "safetensors"
+                ),
+                model_cache_dir=config_updates.get("model_cache_dir", ""),
+                model_repo_id=config_updates.get("model_repo_id", ""),
+                save_consolidated=config_updates.get("save_consolidated", False),
+                is_peft=config_updates.get("is_peft", False),
+                model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
+                is_async=config_updates.get("is_async", False),
+                dequantize_base_checkpoint=config_updates.get(
+                    "dequantize_base_checkpoint", False
+                ),
+            )
+            self.checkpoint_config = base_cfg
+            self.checkpointer = Checkpointer(
+                config=base_cfg,
+                dp_rank=dp_rank,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                moe_mesh=self.distributed_state.moe_mesh,
+            )
+        else:
+            # Update mutable config fields on the existing instance
+            cfg = self.checkpointer.config
+            if checkpoint_root is not None:
+                cfg.checkpoint_dir = checkpoint_root
+            for k, v in config_updates.items():
+                if k == "model_save_format":
+                    # Ensure enum type
+                    v = SerializationFormat[v.upper()] if isinstance(v, str) else v
+                setattr(cfg, k, v)
+            # Ensure model_state_dict_keys is current
+            if getattr(self, "model_state_dict_keys", None) is not None:
+                cfg.model_state_dict_keys = (
+                    self.model_and_optimizer_state.model_state_dict_keys
+                )
 
     def shutdown(self) -> None:
         """Shutdown the policy."""
@@ -1927,6 +1774,9 @@ class DTensorPolicyWorkerV2:
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()
             self.zmq_context.term()
+        # Close checkpointer resources
+        if hasattr(self, "checkpointer") and self.checkpointer is not None:
+            self.checkpointer.close()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -1941,3 +1791,56 @@ class DTensorPolicyWorkerV2:
         ip = ray._private.services.get_node_ip_address()
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
+
+
+def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
+    """Detect model save format and PEFT status from checkpoint directory.
+
+    Args:
+        weights_path: Path to the checkpoint directory (e.g., weights/model)
+
+    Returns:
+        tuple: (model_save_format, is_peft) where:
+               model_save_format is "torch_save" for DCP or "safetensors" for safetensors
+               is_peft is True if PEFT/adapter patterns are detected
+    """
+    is_peft = False
+    model_save_format = "safetensors"
+    try:
+        # Iterate through all subdirectories and files recursively
+        all_files = []
+        for root, dirs, files in os.walk(weights_path):
+            all_files.extend(files)
+
+        if any(f.endswith(".distcp") for f in all_files):
+            model_save_format = "torch_save"
+        elif any(f.endswith(".safetensors") for f in all_files):
+            model_save_format = "safetensors"
+        elif any(f.endswith((".bin", ".pt", ".pth")) for f in all_files):
+            model_save_format = "torch_save"
+
+        if not is_peft:
+            is_peft = any("adapter" in f.lower() for f in all_files)
+
+    except (OSError, PermissionError):
+        pass
+
+    return model_save_format, is_peft
+
+
+def _infer_checkpoint_root(weights_path: str) -> str:
+    """Infer checkpoint root directory from weights path.
+
+    When weights_path ends with "…/weights/model", we need the parent of
+    the weights directory (the checkpoint root), not the weights directory itself.
+
+    Args:
+        weights_path: Path to model weights (e.g., "/path/to/policy/weights/model")
+
+    Returns:
+        str: Checkpoint root directory (e.g., "/path/to/policy")
+    """
+    weights_dir = os.path.dirname(weights_path)
+    if weights_dir.endswith("weights"):
+        return os.path.dirname(weights_dir)
+    return weights_dir
