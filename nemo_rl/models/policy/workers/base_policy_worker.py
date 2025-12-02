@@ -1,18 +1,13 @@
 import ray
 import torch
 import zmq
-from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.interfaces import (
-    LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
-)
+from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
-class BasePolicyWorker(ABC):
+class BasePolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(
@@ -125,94 +120,3 @@ class BasePolicyWorker(ABC):
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
-
-    @abstractmethod
-    def train(
-        self,
-        data: BatchedDataDict,
-        loss_fn: LossFunction,
-        eval_mode: bool = False,
-        gbs: Optional[int] = None,
-        mbs: Optional[int] = None,
-    ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
-        ...
-
-    @abstractmethod
-    def get_logprobs(
-        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[LogprobOutputSpec]:
-        """Get the logprobs of the model for a batch of data.
-        If micro_batch_size is provided, it will be used instead of the configured
-        logprob_batch_size.
-        Returns:
-          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
-          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
-          The logprob of input token i is specified at position i in the output logprobs tensor.
-        """
-        ...
-
-    @abstractmethod
-    def use_reference_model(self):
-        """Context manager that temporarily swaps the reference model and active model.
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
-        """
-        ...
-
-    @abstractmethod
-    def get_topk_logits(
-        self,
-        *,
-        data: BatchedDataDict[Any],
-        k: int,
-        micro_batch_size: Optional[int] = None,
-    ) -> BatchedDataDict[Any]:
-        """Get the top-k logits for a batch of data.
-        """
-        ...
-
-    @abstractmethod
-    def prepare_refit_info(self) -> None:
-        """Prepare the refit info for the model."""
-        ...
-
-    @abstractmethod
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream the weights of the model via ZMQ IPC."""
-        ...
-
-    @abstractmethod
-    def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights of the model for collective communication."""
-        ...
-
-    @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
-        """Prepare the model for LP inference."""
-        ...
-
-    @abstractmethod
-    def prepare_for_training(self, *args, **kwargs) -> None:
-        """Prepare the model for training."""
-        ...
-
-    @abstractmethod
-    def offload_before_refit(self) -> None:
-        """Offload the model before refit."""
-        ...
-
-    @abstractmethod
-    def offload_after_refit(self) -> None:
-        """Offload the model after refit."""
-        ...
-
-    @abstractmethod
-    def save_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None, **kwargs) -> None:
-        """Save the checkpoint of the model."""
-        ...
-
-    @abstractmethod
-    def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None) -> None:
-        """Load the checkpoint of the model."""
-        ...

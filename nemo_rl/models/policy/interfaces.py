@@ -100,6 +100,7 @@ class PolicyInterface(ABC):
         data: BatchedDataDict,
         loss_fn: LossFunction,
         eval_mode: bool = False,
+        *
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
@@ -134,6 +135,10 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
+    def load_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abstractmethod
     def shutdown(self) -> bool:
         pass
 
@@ -165,4 +170,8 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def prepare_for_lp_inference(self) -> None:
         pass
