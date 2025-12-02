@@ -50,6 +50,7 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "truncated_importance_sampling_ratio": None,
     "sequence_level_importance_ratios": False,
     "token_level_loss": True,
+    "force_on_policy_ratio": False,
 }
 
 

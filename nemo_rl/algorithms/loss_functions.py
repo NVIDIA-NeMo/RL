@@ -46,6 +46,7 @@ class ClippedPGLossConfig(TypedDict):
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
     token_level_loss: bool
+    force_on_policy_ratio: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
