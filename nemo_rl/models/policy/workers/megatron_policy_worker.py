@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
-import math
 import os
 import time
 import warnings
@@ -66,17 +65,11 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.engines import (
-    StaticInferenceEngine,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
-)
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
 )
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -85,7 +78,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -114,6 +106,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.megatron.common import (
+    _get_pack_sequence_parameters_for_megatron,
     _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
@@ -1163,21 +1156,21 @@ class MegatronPolicyWorker(BasePolicyWorker):
         self.model.eval()
 
         pp_seq_dim_size = input_seq_dim_size
-        pp_rank = get_pipeline_model_parallel_rank()
         pp_grp = get_pipeline_model_parallel_group()
-        pp_size = get_pipeline_model_parallel_world_size()
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-        # if pp_size > 1, we need to pad the full sequence to the max sequence length to maintain a static PP buffer
-        if (
-            self.cfg["sequence_packing"]["enabled"]
-            and self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            _, pad_full_seq_to = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
+        pad_factor = 1
+        pad_packed_seq_to_multiple_of = 1
+        pad_full_seq_to = None
+        if self.cfg["sequence_packing"]["enabled"]:
+            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
+            (
+                pad_factor,
+                pad_packed_seq_to_multiple_of,
+                pad_full_seq_to,
+            ) = _get_pack_sequence_parameters_for_megatron(
+                self.cfg["megatron_cfg"],
+                seq_dim_size,
             )
-            pp_seq_dim_size = pad_full_seq_to
-        else:
-            pad_full_seq_to = None
+            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
 
         mb_iterator, data_iterator_len, mbs = self.get_mb_iterator(data, logprob_batch_size)
 
@@ -1298,16 +1291,20 @@ class MegatronPolicyWorker(BasePolicyWorker):
         pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
-        # If using sequence packing with PP>1, pad full sequence to static PP buffer length
+        pad_factor = 1
+        pad_packed_seq_to_multiple_of = 1
         pad_full_seq_to = None
-        if (
-            self.cfg["sequence_packing"]["enabled"]
-            and self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            _, pad_full_seq_to = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
+        if self.cfg["sequence_packing"]["enabled"]:
+            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
+            (
+                pad_factor,
+                pad_packed_seq_to_multiple_of,
+                pad_full_seq_to,
+            ) = _get_pack_sequence_parameters_for_megatron(
+                self.cfg["megatron_cfg"],
+                seq_dim_size,
             )
-            pp_seq_dim_size = pad_full_seq_to
+            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
 
         mb_iterator, data_iterator_len, mbs = self.get_mb_iterator(data, logprob_batch_size)
 
@@ -1372,9 +1369,14 @@ class MegatronPolicyWorker(BasePolicyWorker):
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+        # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model.config.flash_decode = True
+        self.model.config.flash_decode = False
+        if self.should_disable_forward_pre_hook:
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1401,46 +1403,126 @@ class MegatronPolicyWorker(BasePolicyWorker):
             inference_max_requests=self.cfg["generation_batch_size"],
         )
 
-        from megatron.core.inference.contexts import StaticInferenceContext
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
+        from megatron.core.inference.sampling_params import SamplingParams
 
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
+        buffer_guaranteed_fraction = mcore_generation_config[
+            "buffer_guaranteed_fraction"
+        ]
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        max_tokens = mcore_generation_config["max_tokens"]
+        model_config = self.model.config
+        model_config.cuda_graph_impl = "local"
 
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, inference_context
+        dynamic_context = DynamicInferenceContext(
+            params_dtype=inference_wrapper_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=None,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+            max_tokens_override=max_tokens,
         )
+        inference_wrapped_model = GPTInferenceWrapper(
+            self.model, inference_wrapper_config, dynamic_context
+        )
+        inference_wrapped_model.prep_model_for_inference()
+
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        inference_engine = StaticInferenceEngine(
-            text_generation_controller=text_generation_controller,
-            max_batch_size=self.cfg["generation_batch_size"],
+
+        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+
+        # Calculate seed based on step, node, and rank to ensure reproducibility across workers
+        # Similar to vllm_worker.py seed calculation but with added step information
+        # Formula: seed = (node_idx * 1024 * 10000) + (step * 1024) + local_rank
+        # This allows for:
+        # - Multiple nodes (node_idx multiplier is large enough)
+        # - Up to 10000 steps per node before potential overlap
+        # - Up to 1024 local ranks (GPUs per node)
+        local_rank = torch.cuda.current_device()  # Local GPU index on the node
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        seed = (node_idx * 1024) + local_rank
+
+        dynamic_engine = DynamicInferenceEngine(
+            controller=text_generation_controller,
+            random_seed=seed,
+            context=dynamic_context,
+            enable_cuda_graph=True,
+            termination_id=self.megatron_tokenizer.eod,
         )
 
-        # detokenize the prompts
-        # detokenized_prompts = [
-        # self.tokenizer.decode(prompt)
-        # for prompt in data.get("input_ids")
-        # ]
-        # apply chat template
-        out = run_mcore_engine(
-            engine=inference_engine,
-            # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data["input_ids"],
-            prompt_lengths_tensor=data["input_lengths"],
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
-            - data["input_ids"].size(1),
+        # Handle None values for top_k - convert to integer as required by Megatron
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
-        # print(out)
+        sampling_params = SamplingParams(
+            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
+            top_k=top_k_val,
+            top_p=top_p_val,
+            return_segments=False,
+            top_n_logprobs=0,
+            return_log_probs=True,
+            return_prompt_top_n_logprobs=False,
+        )
+        input_ids = data["input_ids"]
+        prompt_tokens_tensor = input_ids.cuda()
+        prompt_lengths_tensor = data["input_lengths"]
+        request_id = 0
+
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            dynamic_engine.add_request(
+                request_id,
+                p[:prompt_len],
+                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
+            )
+            request_id += 1
+
+        result = []
+        while dynamic_engine.has_unfinished_requests():
+            result_step = dynamic_engine.step_modern(sampling_params, verbose=False)
+            if result_step["finished_requests"] is not None:
+                result.extend(result_step["finished_requests"])
+
+        # Sort results by request_id to maintain original batch order
+        result.sort(key=lambda x: x.request_id)
+
+        out = {
+            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
+            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_seq_len = max([len(tokens) for tokens in out["tokens"]])
+        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        padded_input_length = input_ids.size(1)
 
+        max_seq_len = padded_input_length + max_gen_seq_len
         # Create padded tensors for tokens and logprobs
         output_ids_padded = torch.full(
             (batch_size, max_seq_len),
@@ -1456,12 +1538,19 @@ class MegatronPolicyWorker(BasePolicyWorker):
         )
 
         # Fill in the padded tensors with actual values
+        generation_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
+        unpadded_sequence_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
         for i in range(batch_size):
             seq_len = len(out["tokens"][i])
             output_ids_padded[i, :seq_len] = torch.tensor(
                 out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
             )
-
+            generation_lengths[i] = seq_len - input_lengths[i].item()
+            unpadded_sequence_lengths[i] = seq_len
             logprob_len = len(out["logprobs"][i])
             logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
                 out["logprobs"][i],
@@ -1472,16 +1561,13 @@ class MegatronPolicyWorker(BasePolicyWorker):
         out_dict = {
             "output_ids": output_ids_padded,
             "logprobs": logprobs_padded,
-            "generation_lengths": torch.tensor(
-                [len(o) - input_lengths[i] for i, o in enumerate(out["logprobs"])]
-            ),
-            "unpadded_sequence_lengths": torch.tensor(
-                [len(o) for o in out["logprobs"]]
-            ),
+            "generation_lengths": generation_lengths,
+            "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
 
         self.model.config.flash_decode = False
         no_grad.__exit__(None, None, None)
+
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
     @torch.no_grad()
