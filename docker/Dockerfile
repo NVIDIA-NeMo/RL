@@ -14,6 +14,10 @@ FROM ${BASE_IMAGE} AS base
 # It is more convenient for users to run as root
 USER root
 
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
 RUN <<"EOF" bash -exu -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TZ=America/Los_Angeles
