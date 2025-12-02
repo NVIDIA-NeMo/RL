@@ -490,9 +490,71 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    # Handle backend-specific setup
+    def initialize_generation_with_policy(
+        init_generation_fn,
+        generation_name: str,
+        init_time_key: str,
+        colocated_inference: bool,
+        worker_init_timing_metrics: dict,
+    ):
+        """
+        Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
+        
+        Args:
+            init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
+            generation_name: Name of the generation engine ("vLLM" or "SGLang")
+            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
+            colocated_inference: Whether inference is colocated with training
+            worker_init_timing_metrics: Dictionary to store timing metrics
+            
+        Returns:
+            Tuple of (policy_generation, policy)
+        """
+        # Determine if parallel initialization is possible (non-colocated mode)
+        use_parallel_init = not colocated_inference
+
+        if use_parallel_init:
+            # Parallel initialization: Generation engine and Policy can initialize simultaneously
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated mode)",
+                flush=True,
+            )
+
+            # Execute both initializations in parallel
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                generation_future = executor.submit(init_generation_fn)
+                policy_future = executor.submit(init_policy)
+                policy_generation, generation_time = generation_future.result()
+                policy, policy_time = policy_future.result()
+            parallel_wall_time = time.perf_counter() - parallel_start_time
+
+            # Store timing metrics
+            worker_init_timing_metrics[init_time_key] = generation_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        else:
+            # Sequential initialization: colocated mode (GPU memory requires generation engine first)
+            print(
+                "  ⚙️  Using sequential worker initialization (colocated mode)",
+                flush=True,
+            )
+
+            # Initialize generation engine first (clean GPU memory), then policy
+            policy_generation, generation_time = init_generation_fn()
+            worker_init_timing_metrics[init_time_key] = generation_time
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+
+        return policy_generation, policy
+
+    # Handle generation-specific setup
     if backend == "megatron":
-        # Megatron backend: policy_generation is None, only initialize policy
+        # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -503,7 +565,7 @@ def setup(
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
     elif backend == "vllm":
-        # vLLM backend: setup config, then decide parallel vs sequential init
+        # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config["use_importance_sampling_correction"] is True, (
@@ -531,45 +593,13 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
-
-        if use_parallel_init:
-            # Parallel initialization: vLLM and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
-
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                vllm_future = executor.submit(init_vllm)
-                policy_future = executor.submit(init_policy)
-                policy_generation, vllm_time = vllm_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires vLLM first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize vLLM first (clean GPU memory), then policy
-            policy_generation, vllm_time = init_vllm()
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_vllm,
+            generation_name="vLLM",
+            init_time_key="vllm_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -582,45 +612,13 @@ def setup(
         if "model_path" not in generation_config or not generation_config.get("model_path"):
             generation_config["model_path"] = policy_config["model_name"]
         
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
-
-        if use_parallel_init:
-            # Parallel initialization: SGLang and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
-
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                sglang_future = executor.submit(init_sglang)
-                policy_future = executor.submit(init_policy)
-                policy_generation, sglang_time = sglang_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
-            worker_init_timing_metrics["sglang_init_time_s"] = sglang_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires SGLang first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize SGLang first (clean GPU memory), then policy
-            policy_generation, sglang_time = init_sglang()
-            worker_init_timing_metrics["sglang_init_time_s"] = sglang_time
-
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_sglang,
+            generation_name="SGLang",
+            init_time_key="sglang_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
 
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
