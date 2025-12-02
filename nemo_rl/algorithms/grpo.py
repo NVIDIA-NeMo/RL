@@ -607,6 +607,7 @@ def setup(
         )
 
     elif backend == "sglang":
+        generation_config = cast(SGLangConfig, generation_config)
         # Set model_name and model_path
         generation_config["model_name"] = policy_config["model_name"]
         if "model_path" not in generation_config or not generation_config.get("model_path"):

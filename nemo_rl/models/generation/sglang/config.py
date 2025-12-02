@@ -17,75 +17,76 @@ from typing import Any, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
-class SGLangConfig():
-    """Configuration for SGLang runtime. Refer to:
-    https://github.com/sgl-project/sglang for detailed documentation.
+class SGLangConfig(GenerationConfig):
+    """Configuration for SGLang runtime.
+    
+    Most fields below map directly to SGLang's ServerArgs (see:
+    https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py).
     """
 
-    model_path: str = ""
-    random_seed: int = 1
-    skip_tokenizer_init: bool = False
-    disable_cuda_graph: bool = False
-    disable_radix_cache: bool = True
-    disable_cuda_graph_padding: bool = False
-    enable_nccl_nvls: bool = False
-    disable_outlines_disk_cache: bool = False
-    disable_custom_all_reduce: bool = False
-    disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
-    enable_dp_attention: bool = False
-    enable_ep_moe: bool = False
-    enable_torch_compile: bool = False
-    torch_compile_max_bs: int = 32
-    cuda_graph_max_bs: int | None = None
-    cuda_graph_bs: list[int] | None = None
-    torchao_config: str = ""
-    enable_nan_detection: bool = False
-    enable_p2p_check: bool = False
-    triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: int = 8
-    num_continuous_decode_steps: int = 1
-    enable_memory_saver: bool = False
-    allow_auto_truncate: bool = False
-    attention_backend: str | None = "fa3"
-    enable_multimodal: bool = False
-    sampling_backend: str | None = None
-    context_length: int | None = 32768
-    mem_fraction_static: float | None = 0.9
-    max_running_requests: int | None = None
-    # NOTE: chunked_prefill_size is by default 8192 on GPUs with 80GB mem in SGLang,
-    # but we disable it to avoid precision issues
-    chunked_prefill_size: int | None = -1
-    max_prefill_tokens: int = 32768
-    schedule_policy: str = "lpm"
-    schedule_conservativeness: float = 1.0
-    cpu_offload_gb: int = 0
-    dtype: str = "bfloat16"
-    kv_cache_dtype: str = "auto"
-    dp_size: int = 1  # only used for dp attention
-    ep_size: int = 1
+    model_path: NotRequired[str]
+    gpus_per_server: NotRequired[int]
+    random_seed: NotRequired[int]
+    skip_tokenizer_init: NotRequired[bool]
+    disable_cuda_graph: NotRequired[bool]
+    disable_radix_cache: NotRequired[bool]
+    disable_cuda_graph_padding: NotRequired[bool]
+    enable_nccl_nvls: NotRequired[bool]
+    disable_outlines_disk_cache: NotRequired[bool]
+    disable_custom_all_reduce: NotRequired[bool]
+    disable_overlap_schedule: NotRequired[bool]
+    enable_mixed_chunk: NotRequired[bool]
+    enable_dp_attention: NotRequired[bool]
+    enable_ep_moe: NotRequired[bool]
+    enable_torch_compile: NotRequired[bool]
+    torch_compile_max_bs: NotRequired[int]
+    cuda_graph_max_bs: NotRequired[int | None]
+    cuda_graph_bs: NotRequired[list[int] | None]
+    torchao_config: NotRequired[str]
+    enable_nan_detection: NotRequired[bool]
+    enable_p2p_check: NotRequired[bool]
+    triton_attention_reduce_in_fp32: NotRequired[bool]
+    triton_attention_num_kv_splits: NotRequired[int]
+    num_continuous_decode_steps: NotRequired[int]
+    enable_memory_saver: NotRequired[bool]
+    allow_auto_truncate: NotRequired[bool]
+    attention_backend: NotRequired[str | None]
+    enable_multimodal: NotRequired[bool]
+    sampling_backend: NotRequired[str | None]
+    context_length: NotRequired[int | None]
+    mem_fraction_static: NotRequired[float | None]
+    max_running_requests: NotRequired[int | None]
+    chunked_prefill_size: NotRequired[int | None]
+    max_prefill_tokens: NotRequired[int]
+    schedule_policy: NotRequired[str]
+    schedule_conservativeness: NotRequired[float]
+    cpu_offload_gb: NotRequired[int]
+    dtype: NotRequired[str]
+    kv_cache_dtype: NotRequired[str]
+    dp_size: NotRequired[int]  # only used for dp attention
+    ep_size: NotRequired[int]
     # lora
-    enable_lora: bool | None = None
-    max_lora_rank: int | None = None
-    lora_target_modules: list[str] | None = None
-    lora_paths: list[str] | None = None
-    max_loaded_loras: int = 1
-    max_loras_per_batch: int = 1
-    lora_backend: str = "triton"
+    enable_lora: NotRequired[bool | None]
+    max_lora_rank: NotRequired[int | None]
+    lora_target_modules: NotRequired[list[str] | None]
+    lora_paths: NotRequired[list[str] | None]
+    max_loaded_loras: NotRequired[int]
+    max_loras_per_batch: NotRequired[int]
+    lora_backend: NotRequired[str]
     # logging
-    log_level: str = "warning"
-    log_level_http: str | None = "warning"
-    log_requests: bool = False
-    log_requests_level: int = 0
-    show_time_cost: bool = False
-    enable_metrics: bool = True  # Exports Prometheus-like metrics
+    log_level: NotRequired[str]
+    log_level_http: NotRequired[str | None]
+    log_requests: NotRequired[bool]
+    log_requests_level: NotRequired[int]
+    show_time_cost: NotRequired[bool]
+    enable_metrics: NotRequired[bool]  # Exports Prometheus-like metrics
     # The interval (in decoding iterations) to log throughput
     # and update prometheus metrics
-    decode_log_interval: int = 1
+    decode_log_interval: NotRequired[int]
     # Extra loader arguments
-    # NOTE: These arguments will be parsed into a dict json-string
-    # and passed as `model_loader_extra_config` to SGLang.
-    enable_multithread_load: bool = False
-    enable_fast_load: bool = False
+    enable_multithread_load: NotRequired[bool]
+    enable_fast_load: NotRequired[bool]
+    # Additional ServerArgs fields can be passed via this generic kwargs dict
+    sglang_kwargs: NotRequired[dict[str, Any]]
 
     
