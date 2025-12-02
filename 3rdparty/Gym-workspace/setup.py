@@ -21,7 +21,7 @@ final_packages = []
 final_package_dir = {}
 
 # If the submodule is present, expose `nemo_gym` package from the checkout
-src_dir = Path("NeMo-Gym")
+src_dir = Path("Gym")
 
 
 CACHED_DEPENDENCIES = [
@@ -50,7 +50,7 @@ if src_dir.exists():
         pyproject_toml = tomllib.load(f)
     if not pyproject_toml_path.exists():
         raise FileNotFoundError(
-            f"[NeMo-Gym][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
+            f"[Gym][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
         )
 
     packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
@@ -70,19 +70,19 @@ if src_dir.exists():
 
     if missing_in_cached or extra_in_cached:
         print(
-            "[NeMo-Gym][setup] Dependency mismatch between NeMo-Gym-workspace/NeMo-Gym/pyproject.toml vs NeMo-Gym-workspace/setup.py::CACHED_DEPENDENCIES.",
+            "[Gym][setup] Dependency mismatch between Gym-workspace/Gym/pyproject.toml vs Gym-workspace/setup.py::CACHED_DEPENDENCIES.",
             file=sys.stderr,
         )
         if missing_in_cached:
             print(
-                "  - Present in NeMo-Gym-workspace/NeMo-Gym/pyproject.toml but missing from CACHED_DEPENDENCIES:",
+                "  - Present in Gym-workspace/Gym/pyproject.toml but missing from CACHED_DEPENDENCIES:",
                 file=sys.stderr,
             )
             for dep in sorted(missing_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
         if extra_in_cached:
             print(
-                "  - Present in CACHED_DEPENDENCIES but not in NeMo-Gym-workspace/NeMo-Gym/pyproject.toml:",
+                "  - Present in CACHED_DEPENDENCIES but not in Gym-workspace/Gym/pyproject.toml:",
                 file=sys.stderr,
             )
             for dep in sorted(extra_in_cached):
@@ -94,7 +94,7 @@ if src_dir.exists():
         sys.exit(1)
     else:
         print(
-            "[NeMo-Gym][setup] Dependency sets are consistent with the submodule pyproject.",
+            "[Gym][setup] Dependency sets are consistent with the submodule pyproject.",
             file=sys.stderr,
         )
 
@@ -102,7 +102,7 @@ if src_dir.exists():
 setuptools.setup(
     name="nemo_gym",
     version="0.0.0",
-    description="Standalone packaging for the NeMo-Gym sub-module.",
+    description="Standalone packaging for the Gym sub-module.",
     author="NVIDIA",
     author_email="nemo-toolkit@nvidia.com",
     packages=final_packages,

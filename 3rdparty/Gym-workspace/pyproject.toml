@@ -6,5 +6,5 @@ build-backend = "setuptools.build_meta"
 name = "nemo_gym"
 dynamic = ["dependencies", "version"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
-description = "Standalone packaging for the NeMo-Gym sub-module."
+description = "Standalone packaging for the Gym sub-module."
 requires-python = ">=3.10"

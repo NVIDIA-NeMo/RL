@@ -1,7 +1,7 @@
 # Fail on errors
 set -e
 
-uv sync --group={build,docs,dev,test} --extra nemo_gym
+uv sync --all-groups --extra nemo_gym
 
 # Stop pesky previous Ray servers that may have not been able to spin down from previous users.
 uv run ray stop --force
