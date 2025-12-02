@@ -18,7 +18,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar
+from typing import Any, Callable, Iterator, Optional, TypeVar
 
 import ray
 import torch
@@ -71,34 +71,22 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_context_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
     get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
-    distributed_vocab_topk,
-    from_parallel_logits_to_logprobs,
-    from_parallel_logits_to_logprobs_packed_sequences,
-)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -106,10 +94,13 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.megatron.common import (
-    _get_pack_sequence_parameters_for_megatron,
-    _pack_sequences_for_megatron,
     broadcast_tensor,
-    forward_step_arbitrary_loss,
+    check_sequence_dim,
+    forward_maybe_backward,
+    get_mb_iterator,
+    loss_collection_fn,
+    logprobs_collection_fn,
+    topk_logits_collection_fn,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
@@ -944,7 +935,8 @@ class MegatronPolicyWorker(BasePolicyWorker):
             self.model.train()
 
         with ctx:
-            sequence_dim, seq_dim_size = self.check_sequence_dim(data)
+            ## TODO: duplicated code -- clean up
+            sequence_dim, seq_dim_size = check_sequence_dim(data)
 
             all_mb_metrics = []
             losses = []
@@ -982,29 +974,24 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     )
                 
                 loss_collection_fn_wrapped = partial(
-                    self.loss_collection_fn,
+                    loss_collection_fn,
                     loss_fn=loss_fn,
+                    cfg=self.cfg,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                 )
 
                 batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-                seqlen_key = None
-                pad_factor = 1
-                pad_full_seq_to = None
-                data_iterator, data_iterator_len, mbs = self.get_mb_iterator(batch, mbs)
-                if self.cfg["sequence_packing"]["enabled"]:
-                    seqlen_key = "input_lengths"
-                    tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
-                    cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                    pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
-                    if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                        # if fp8 is enabled, ensure the sequence is padded to multiples of 16
-                        pad_factor = math.lcm(16, pad_factor)
-                    if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
-                        _, pad_full_seq_to = (
-                            batch.get_microbatch_iterator_for_packable_sequences_len()
-                        )
+                (
+                    data_iterator,
+                    data_iterator_len,
+                    mbs,
+                    pad_factor,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                ) = get_mb_iterator(self.cfg, batch, mbs)
+                
+                seqlen_key = "input_lengths" if self.cfg["sequence_packing"]["enabled"] else None
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -1013,7 +1000,9 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     self.optimizer.zero_grad()
 
                     # Forward pass.
-                    losses_reduced = self.forward_maybe_backward(
+                    losses_reduced = forward_maybe_backward(
+                        model=self.model,
+                        cfg=self.cfg,
                         data_iterator=data_iterator,
                         seq_length_key=seqlen_key,
                         pad_individual_seqs_to_multiple_of=pad_factor,
@@ -1151,38 +1140,34 @@ class MegatronPolicyWorker(BasePolicyWorker):
         )
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim, input_seq_dim_size = self.check_sequence_dim(data)
+        sequence_dim, input_seq_dim_size = check_sequence_dim(data)
 
         self.model.eval()
 
-        pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
-        if self.cfg["sequence_packing"]["enabled"]:
-            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
-            (
-                pad_factor,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-            ) = _get_pack_sequence_parameters_for_megatron(
-                self.cfg["megatron_cfg"],
-                seq_dim_size,
-            )
-            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
+        
+        (
+            mb_iterator,
+            data_iterator_len,
+            mbs,
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = get_mb_iterator(self.cfg, data, logprob_batch_size)
+        
+        pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
-        mb_iterator, data_iterator_len, mbs = self.get_mb_iterator(data, logprob_batch_size)
-
-        list_of_logprobs = self.forward_maybe_backward(
+        list_of_logprobs = forward_maybe_backward(
+            model=self.model,
+            cfg=self.cfg,
             data_iterator=mb_iterator,
-            seq_length_key=None, ## TODO: need?
-            pad_individual_seqs_to_multiple_of=None, ## TODO: need?
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=pad_factor,
             seq_length=pp_seq_dim_size,
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
-            collection_fn=self.logprobs_collection_fn,
+            collection_fn=partial(logprobs_collection_fn, cfg=self.cfg),
             forward_only=True,
         )
         if is_pipeline_last_stage(ignore_virtual=True):
@@ -1284,40 +1269,36 @@ class MegatronPolicyWorker(BasePolicyWorker):
             else self.cfg["logprob_batch_size"]
         )
 
-        sequence_dim, input_seq_dim_size = self.check_sequence_dim(data)
+        sequence_dim, input_seq_dim_size = check_sequence_dim(data)
 
         self.model.eval()
 
-        pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
-        if self.cfg["sequence_packing"]["enabled"]:
-            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
-            (
-                pad_factor,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-            ) = _get_pack_sequence_parameters_for_megatron(
-                self.cfg["megatron_cfg"],
-                seq_dim_size,
-            )
-            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
+        (
+            mb_iterator,
+            data_iterator_len,
+            mbs,
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = get_mb_iterator(self.cfg, data, logprob_batch_size)
+        
+        pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
-        mb_iterator, data_iterator_len, mbs = self.get_mb_iterator(data, logprob_batch_size)
-
-        list_of_outputs = self.forward_maybe_backward(
+        list_of_outputs = forward_maybe_backward(
+            model=self.model,
+            cfg=self.cfg,
             data_iterator=mb_iterator,
-            seq_length_key=None, ## TODO: need?
-            pad_individual_seqs_to_multiple_of=None, ## TODO: need?
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=pad_factor,
             seq_length=pp_seq_dim_size,
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
             collection_fn=partial(
-                self.topk_logits_collection_fn,
+                topk_logits_collection_fn,
+                cfg=self.cfg,
                 k=k,
             ),
             forward_only=True,
@@ -1981,457 +1962,6 @@ class MegatronPolicyWorker(BasePolicyWorker):
             "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
         }
     
-    ### new APIs with refactor #####################################################
-    def preprocess_one_batch(
-        self,
-        data_iterator,
-        seq_length_key: Optional[str] = None,
-        pad_individual_seqs_to_multiple_of: int = 1,
-        pad_full_seq_to: Optional[int] = None,
-
-    ):
-        pack_sequences = self.cfg["sequence_packing"]["enabled"]
-        
-        #with straggler_timer(bdata=True):
-        data_dict = next(data_iterator).to("cuda")
-        input_ids = data_dict["input_ids"]
-        attention_mask = None
-        position_ids = None
-        packed_seq_params = None
-
-        original_batch_size = input_ids.shape[0]
-        original_seq_length = input_ids.shape[1]
-        seq_lengths = None  # Will be set if using packed sequences
-        cu_seqlens = None
-        cu_seqlens_padded = None
-
-        if pack_sequences:
-            # For packed sequences with padded input, we need sequence lengths
-            assert seq_length_key is not None, (
-                "seq_length_key must be provided for packed sequences"
-            )
-            assert seq_length_key in data_dict, (
-                f"{seq_length_key} not found in data_dict"
-            )
-
-            # Get sequence lengths and context parallel size
-            seq_lengths = data_dict[seq_length_key]
-
-            # Pack sequences
-            (
-                input_ids,
-                input_ids_cp_sharded,
-                packed_seq_params,
-                cu_seqlens,
-                cu_seqlens_padded,
-            ) = _pack_sequences_for_megatron(
-                input_ids,
-                seq_lengths,
-                pad_individual_seqs_to_multiple_of,
-                pad_full_seq_to,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
-            )
-        
-            # For packed sequences, position_ids and attention_mask are typically None
-            # The PackedSeqParams handles all necessary sequence information
-            position_ids = None
-            attention_mask = None
-        else:
-            input_ids_cp_sharded = input_ids
-            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
-                eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
-                reset_position_ids=False,
-                reset_attention_mask=False,
-                eod_mask_loss=False,
-                pad_mask_loss=False,
-            )
-        return (
-            data_dict,
-            input_ids,
-            input_ids_cp_sharded,
-            packed_seq_params,
-            cu_seqlens,
-            cu_seqlens_padded,
-            position_ids,
-            attention_mask,
-        )
-    
-    def forward_step(
-        self,
-        model,
-        data_dict,
-        input_ids_cp_sharded,
-        position_ids,
-        attention_mask,
-        packed_seq_params,
-    ):
-        multimodal_data = data_dict.get_multimodal_dict(
-            as_tensors=True, device=input_ids_cp_sharded.device
-        )
-        if len(multimodal_data) > 0:
-            position_ids = None
-
-        additional_kwargs = {}
-        # Mamba models currently do not support packed_seq_params
-        if packed_seq_params is not None:
-            additional_kwargs["packed_seq_params"] = packed_seq_params
-        #with straggler_timer:
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
-
-        # Apply temperature scaling to logits for training
-        # This matches the dtensor worker's _apply_temperature_scaling in the train method
-        ## TODO: make this work with current API
-        if (
-            "generation" in self.cfg
-            and self.cfg["generation"] is not None
-        ):
-            output_tensor.div_(self.cfg["generation"]["temperature"])
-            
-        return output_tensor
-
-    def forward_step_with_collection_fn(
-        self,
-        model,
-        data_iterator: Iterator[BatchedDataDict[Any]],
-        seq_length_key: Optional[str] = None,
-        pad_individual_seqs_to_multiple_of: int = 1,
-        pad_full_seq_to: Optional[int] = None,
-        collection_fn: Optional[Callable[Any, Callable]] = None,
-    ):
-        
-        (
-            data_dict,
-            input_ids,
-            input_ids_cp_sharded,
-            packed_seq_params,
-            cu_seqlens,
-            cu_seqlens_padded,
-            position_ids,
-            attention_mask,
-        ) = self.preprocess_one_batch(
-            data_iterator,
-            seq_length_key,
-            pad_individual_seqs_to_multiple_of,
-            pad_full_seq_to,
-        )
-
-        output_tensor = self.forward_step(
-            model,
-            data_dict,
-            input_ids_cp_sharded,
-            position_ids,
-            attention_mask,
-            packed_seq_params,
-        )
-
-        ## calling collection_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
-        return output_tensor, collection_fn(
-            data_dict=data_dict,
-            input_ids=input_ids,
-            input_ids_cp_sharded=input_ids_cp_sharded,
-            packed_seq_params=packed_seq_params,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_padded=cu_seqlens_padded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-        )
-
-    ## TODO: make this functional?
-    ## TODO: work on API. Probably don't need seq_length_key and pad_individual_seqs_to_multiple_of
-    def forward_maybe_backward(
-        self,
-        data_iterator,
-        seq_length_key,
-        pad_individual_seqs_to_multiple_of,
-        pad_full_seq_to,
-        num_microbatches,
-        seq_length,
-        mbs,
-        ## TODO: type hint
-        collection_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        forward_only: bool = False,
-    ) -> BatchedDataDict[Any]:
-        forward_step = partial(
-            self.forward_step_with_collection_fn,
-            seq_length_key=seq_length_key,
-            pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
-            pad_full_seq_to=pad_full_seq_to,
-            collection_fn=collection_fn,
-        )
-        forward_backward_func = get_forward_backward_func()
-        ## TODO: fill in details
-        return forward_backward_func(
-            forward_step=forward_step,
-            data_iterator=data_iterator,
-            model=self.model,
-            num_microbatches=num_microbatches,
-            seq_length=seq_length,
-            micro_batch_size=mbs,
-            decoder_seq_length=seq_length,
-            forward_only=forward_only,
-        )
-
-    ## collection_fn should return a callable that takes the output tensor and returns a tuple of (loss, metrics)
-    def loss_collection_fn(
-        self,
-        loss_fn: LossFunction, ## TODO: initialize using a partial within train
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
-        data_dict: BatchedDataDict[Any],
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        cp_normalize: bool = True,
-        **unused_kwargs,
-    ):
-        pack_sequences = self.cfg["sequence_packing"]["enabled"]
-
-        if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
-                loss_fn=loss_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-            )
-        
-        loss_fn_wrapped = partial(
-            loss_fn,
-            data=data_dict,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            vocab_parallel_rank=get_tensor_model_parallel_rank(),
-            vocab_parallel_group=get_tensor_model_parallel_group(),
-            context_parallel_group=get_context_parallel_group(),
-        )
-
-        if cp_normalize:
-            cp_size = get_context_parallel_world_size()
-            orig_loss_fn_wrapped = loss_fn_wrapped
-
-            def _div_by_cp_size(*args, **kwargs):
-                loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
-                return loss / cp_size, metrics
-
-            loss_fn_wrapped = _div_by_cp_size
-        
-        return loss_fn_wrapped
-    
-    def logprobs_collection_fn(
-        self,
-        data_dict: BatchedDataDict[Any],
-        input_ids,
-        cu_seqlens_padded,
-        **unused_kwargs,
-    ):
-        unpacked_input_ids = data_dict["input_ids"]
-        original_seq_length = unpacked_input_ids.shape[1]
-        
-        def collection_fn_inner(output_tensor):
-            stc = time.time()
-            tp_grp = get_tensor_model_parallel_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-            if self.cfg["sequence_packing"]["enabled"]:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-                    output_tensor,
-                    target=input_ids,
-                    cu_seqlens_padded=cu_seqlens_padded,
-                    unpacked_seqlen=original_seq_length,
-                    vocab_start_index=tp_rank * output_tensor.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                    group=tp_grp,
-                    inference_only=True,
-                    cp_group=get_context_parallel_group(),
-                    chunk_size=logprob_chunk_size,
-                )
-            else:
-                token_logprobs = from_parallel_logits_to_logprobs(
-                    output_tensor,
-                    target=unpacked_input_ids,
-                    vocab_start_index=tp_rank * output_tensor.shape[-1],
-                    vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                    tp_group=tp_grp,
-                    inference_only=True,
-                    chunk_size=logprob_chunk_size,
-                )
-
-            # Prepend 0 logprob for first token to maintain same sequence length as input
-            token_logprobs = torch.cat(
-                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-            )
-            return torch.tensor(0.0, device=token_logprobs.device), {
-                "logprobs": token_logprobs
-            }
-        return collection_fn_inner
-
-    
-    def topk_logits_collection_fn(
-        self,
-        k: int, ## TODO: partial to initialize
-        data_dict,
-        cu_seqlens_padded,
-        **additional_kwargs,
-    ):
-
-        pack = self.cfg["sequence_packing"]["enabled"]
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-        unpacked_seqlen = data_dict["input_ids"].shape[1]
-        seq_lengths = data_dict["input_lengths"]
-
-        def collection_fn_inner(output_tensor):
-            # Only the last PP stage produces final logits/top-k; earlier stages return empty
-            # if not is_pipeline_last_stage(ignore_virtual=True):
-            # return output_tensor.new_zeros(()), {}
-
-            tp_grp = get_tensor_model_parallel_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            vocab_shard_size = output_tensor.shape[-1]
-            vocab_start_index = tp_rank * vocab_shard_size
-
-            chunk_size = None
-            if "logprob_chunk_size" in self.cfg:
-                chunk_size = self.cfg["logprob_chunk_size"]
-
-            topk_vals_local, topk_idx_local = distributed_vocab_topk(
-                output_tensor,
-                k,
-                tp_grp,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_start_index + vocab_shard_size,
-                chunk_size=chunk_size,
-            )
-
-            if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
-                cp_grp = get_context_parallel_group()
-                if pack:
-                    # Per-sequence CP allgather following packed-sequence logic
-                    batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
-
-                    topk_vals_full = torch.zeros(
-                        (1, total_packed_len, k),
-                        dtype=topk_vals_local.dtype,
-                        device=topk_vals_local.device,
-                    )
-                    topk_idx_full = torch.zeros(
-                        (1, total_packed_len, k),
-                        dtype=topk_idx_local.dtype,
-                        device=topk_idx_local.device,
-                    )
-
-                    for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
-                        if end_idx > start_idx:
-                            local_vals_slice = topk_vals_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            local_idx_slice = topk_idx_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
-                            )
-                            gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
-                            )
-                            # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
-                            # Flatten leading dims and reshape to [1, expected_len, k] to match target.
-                            expected_len = end_idx - start_idx
-                            if (
-                                gathered_vals.dim() == 3
-                                and gathered_vals.shape[1] != expected_len
-                            ):
-                                gathered_vals = gathered_vals.reshape(
-                                    1, expected_len, gathered_vals.shape[-1]
-                                )
-                            if (
-                                gathered_idx.dim() == 3
-                                and gathered_idx.shape[1] != expected_len
-                            ):
-                                gathered_idx = gathered_idx.reshape(
-                                    1, expected_len, gathered_idx.shape[-1]
-                                )
-                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
-                else:
-                    # Sequence packing must be enabled when CP > 1
-                    raise RuntimeError(
-                        "Context Parallelism (CP>1) requires sequence packing to be enabled."
-                    )
-            else:
-                topk_vals_full = topk_vals_local
-                topk_idx_full = topk_idx_local
-
-            if pack:
-                batch_size = data_dict["input_ids"].shape[0]
-                out_vals = torch.zeros(
-                    (batch_size, unpacked_seqlen, k),
-                    dtype=topk_vals_full.dtype,
-                    device=topk_vals_full.device,
-                )
-                out_idx = torch.zeros(
-                    (batch_size, unpacked_seqlen, k),
-                    dtype=topk_idx_full.dtype,
-                    device=topk_idx_full.device,
-                )
-                for i in range(batch_size):
-                    seq_len = int(seq_lengths[i].item())
-                    start_idx = int(cu_seqlens_padded[i].item())
-                    if seq_len > 0:
-                        out_vals[i, :seq_len, :] = topk_vals_full[
-                            0, start_idx : start_idx + seq_len, :
-                        ]
-                        out_idx[i, :seq_len, :] = topk_idx_full[
-                            0, start_idx : start_idx + seq_len, :
-                        ]
-                return output_tensor.new_zeros(()), {
-                    "topk_logits": out_vals,
-                    "topk_indices": out_idx,
-                }
-            else:
-                return output_tensor.new_zeros(()), {
-                    "topk_logits": topk_vals_full,
-                    "topk_indices": topk_idx_full,
-                }
-        return collection_fn_inner
-    
-    def check_sequence_dim(self, data: BatchedDataDict[Any]):
-        # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        seq_dim_size = data["input_ids"].shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
-        return sequence_dim, seq_dim_size
-    
-    def get_mb_iterator(self, data: BatchedDataDict[Any], mbs: int):
-        if self.cfg["dynamic_batching"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-            data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            micro_batch_size = mbs
-        elif self.cfg["sequence_packing"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-            data_iterator_len, _ = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
-            )
-            micro_batch_size = 1
-        else:
-            mb_iterator = data.make_microbatch_iterator(mbs)
-            data_iterator_len = data.size // mbs
-            micro_batch_size = mbs
-        return mb_iterator, data_iterator_len, micro_batch_size
-
-
 class CustomFloat16Module(Float16Module):
     """Float 16 Module.
 
