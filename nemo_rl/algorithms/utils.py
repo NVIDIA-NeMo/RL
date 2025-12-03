@@ -769,3 +769,25 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+def log_histogram_metrics_to_wandb(
+    metric_name: str,
+    metric_values: list[Any],
+    step: int,
+    logger: Logger,
+) -> None:
+    """Log histogram metrics to wandb.
+
+    Args:
+        metric_name: Name of the metric
+        metric_values: List of metric values
+        step: Global step value
+        logger: Logger instance
+    """
+    if logger.wandb_logger:
+        import wandb  # pyright: ignore[reportMissingImports]
+
+        logger.wandb_logger.run.log(
+            {metric_name: wandb.Histogram(metric_values)}, step=step
+        )

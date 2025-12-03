@@ -40,6 +40,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     log_generation_metrics_to_wandb,
+    log_histogram_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
@@ -1566,6 +1567,23 @@ def grpo_train(
                     logger,
                 )
 
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            try:
+                for hist_metrics in [
+                    "gen_tokens_lengths",
+                    "input_tokens_lengths",
+                    "total_tokens_lengths",
+                ]:
+                    log_histogram_metrics_to_wandb(
+                        f"generation_metrics/{hist_metrics}",
+                        metrics[hist_metrics],
+                        total_steps + 1,
+                        logger,
+                    )
+            except Exception as e:
+                print(f"❌ Error plotting histograms to wandb: {e}")
+                pass
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -2488,6 +2506,23 @@ def async_grpo_train(
                     ],
                     logger,
                 )
+
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            try:
+                for hist_metrics in [
+                    "gen_tokens_lengths",
+                    "input_tokens_lengths",
+                    "total_tokens_lengths",
+                ]:
+                    log_histogram_metrics_to_wandb(
+                        f"generation_metrics/{hist_metrics}",
+                        metrics[hist_metrics],
+                        step + 1,
+                        logger,
+                    )
+            except Exception as e:
+                print(f"❌ Error plotting histograms to wandb: {e}")
+                pass
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
