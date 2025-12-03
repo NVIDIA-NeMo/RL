@@ -190,17 +190,6 @@ class VllmGeneration(GenerationInterface):
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
-        # If router is enabled, create a placeholder global worker ID mapping
-        # This will be updated after workers are created with the actual mapping
-        if "router_cfg" in self.cfg and self.cfg["router_cfg"].get("enabled"):
-            import json
-            # Don't create an initial map - Ray's worker placement order is unpredictable.
-            # Workers will use DP rank for port calculation during init, which works correctly
-            # since each DP group has unique DP ranks. The router will query actual ports later.
-            env_vars["NEMO_RL_ROUTER_ENABLED"] = "1"
-            env_vars["NEMO_RL_ROUTER_TOTAL_WORKERS"] = str(self.dp_size)
-            print(f"[Router Init] Router enabled for {self.dp_size} workers")
-        
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
@@ -224,29 +213,6 @@ class VllmGeneration(GenerationInterface):
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars,
             )
-        
-        # If router is enabled, set global worker IDs on all workers after creation
-        if "router_cfg" in self.cfg and self.cfg["router_cfg"].get("enabled"):
-            import ray
-            
-            print(f"[Router Init] Setting global worker IDs for {self.dp_size} workers...")
-            
-            # Set global worker IDs on all workers based on their index in dp_leader_worker_indices
-            # This ensures consistent IDs 0-(dp_size-1)
-            dp_leader_indices = self.worker_group.dp_leader_worker_indices
-            for global_worker_id, idx in enumerate(dp_leader_indices):
-                worker_ref = self.worker_group.workers[idx]
-                try:
-                    # Query worker info for logging
-                    node_ip = ray.get(worker_ref.get_node_ip.remote())
-                    dp_rank = ray.get(worker_ref.get_dp_rank.remote())
-                    print(f"[Router Init] Worker {global_worker_id} (idx={idx}): node_ip={node_ip}, dp_rank={dp_rank}")
-                    
-                    # Set the global worker ID on the worker for future use
-                    ray.get(worker_ref.set_global_worker_id.remote(global_worker_id))
-                    print(f"[Router Init] Set global_worker_id={global_worker_id} on worker {idx}")
-                except Exception as e:
-                    print(f"[Router Init] Warning: Failed to process worker {idx}: {e}")
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
@@ -288,21 +254,24 @@ class VllmGeneration(GenerationInterface):
             base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
             base_metrics_port = router_cfg.get("base_metrics_port", 5657)
             
-            # Get worker info (IP, kv_port, metrics_port) for distributed setup
-            worker_info = self._get_worker_addresses()
+            # Get worker addresses and ports for distributed setup
+            worker_address_tuples = self._get_worker_addresses()
+            worker_addresses = [addr for addr, _ in worker_address_tuples]
+            worker_ports = [port for _, port in worker_address_tuples]
 
             print(
                 f"[INFO] Initializing KvRouter with {self.dp_size} workers, "
                 f"block_size={self.block_size}, mode={self.router_mode}"
             )
-            # Check if there are multiple unique IPs to determine if it's a distributed setup
-            unique_ips = {info[0] for info in worker_info}
-            if len(unique_ips) > 1:
-                print(f"[INFO] Distributed setup detected: workers on {len(unique_ips)} different nodes")
+            if len(set(worker_addresses)) > 1:
+                print(f"[INFO] Distributed setup detected: workers on {len(set(worker_addresses))} different nodes")
             self.router = KvRouter(
                 block_size=self.block_size,
                 num_workers=self.dp_size,
-                worker_info=worker_info,
+                base_kv_events_port=base_kv_events_port,
+                base_metrics_port=base_metrics_port,
+                worker_addresses=worker_addresses,
+                worker_ports=worker_ports,  # Pass actual ports
             )
 
     def _get_tied_worker_bundle_indices(
@@ -450,44 +419,43 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
     
-    def _get_worker_addresses(self) -> list[tuple[str, int, int]]:
-        """Get (IP, kv_port, metrics_port) tuples for each worker for distributed router setup.
+    def _get_worker_addresses(self) -> list[tuple[str, int]]:
+        """Get (IP, port) tuples for each worker for distributed router setup.
         
-        For distributed Ray clusters, returns the actual node IP and ports where each worker
-        is publishing KV events and metrics. The list is indexed by the worker's actual
-        global_worker_id (which workers compute from their node IP and DP rank).
+        For distributed Ray clusters, returns the actual node IP and port where each worker
+        is publishing KV events. The list is indexed by worker index.
+        
+        IMPORTANT: In multi-node DP setups, each node has its own local DP ranks (0, 1, 2, ...),
+        so workers publish on their local DP rank ports. We query the actual port from each worker.
         
         Returns:
-            List of (IP, kv_port, metrics_port) tuples, indexed by global worker ID
+            List of (IP, port) tuples, one per DP group, indexed by worker index
         """
         import ray
         import logging
         logger = logging.getLogger(__name__)
         
+        worker_addresses = []
+        
         # Get the DP leader workers (one per DP group)
         dp_leader_indices = self.worker_group.dp_leader_worker_indices
         
-        # Query each worker for its IP and ports in Ray's order (dp_leader_indices)
-        # DO NOT SORT - preserve Ray's worker ordering which matches global_worker_id assignment
-        worker_info = []
-        for global_worker_id, idx in enumerate(dp_leader_indices):
+        for worker_idx, idx in enumerate(dp_leader_indices):
             worker_ref = self.worker_group.workers[idx]
             try:
-                # Get the node IP, DP rank, and ports from the worker
+                # Get the node IP and actual port from the worker
                 ip_addr = ray.get(worker_ref.get_node_ip.remote())
                 dp_rank = ray.get(worker_ref.get_dp_rank.remote())
                 kv_port = ray.get(worker_ref.get_kv_events_port.remote())
-                metrics_port = ray.get(worker_ref.get_metrics_port.remote())
                 
-                worker_info.append((ip_addr, kv_port, metrics_port))
-                logger.info(f"Worker {global_worker_id} (idx={idx}, DP rank={dp_rank}) -> {ip_addr}:{kv_port} (metrics: {metrics_port})")
+                worker_addresses.append((ip_addr, kv_port))
+                logger.info(f"Worker {worker_idx} (idx={idx}, DP rank={dp_rank}) -> {ip_addr}:{kv_port}")
             except Exception as e:
-                logger.warning(f"Error getting info for worker idx={idx}: {e}")
-                # Fallback to default ports if query fails
-                worker_info.append(("localhost", 5557 + global_worker_id, 5657 + global_worker_id))
+                logger.warning(f"Error getting info for worker {worker_idx}: {e}, using localhost:0")
+                worker_addresses.append(("localhost", 5557 + worker_idx))
         
-        logger.info(f"Worker info for router (by global worker ID): {worker_info}")
-        return worker_info
+        logger.info(f"Worker addresses for router (by worker index): {worker_addresses}")
+        return worker_addresses
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting

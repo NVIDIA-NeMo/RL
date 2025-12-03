@@ -78,6 +78,7 @@ class KvRouter:
         base_kv_events_port: int = 5557,
         base_metrics_port: int = 5657,
         worker_addresses: Optional[list[str]] = None,
+        worker_ports: Optional[list[int]] = None,  # Actual KV event ports
     ):
         self.num_workers = num_workers
         self.block_size = block_size
@@ -101,17 +102,32 @@ class KvRouter:
                 )
             self.worker_addresses = worker_addresses
             logger.info(f"Using distributed mode with worker addresses: {worker_addresses}")
+        
+        # Use provided ports or compute them from base_port + worker_id
+        if worker_ports is not None:
+            if len(worker_ports) != num_workers:
+                raise ValueError(
+                    f"Number of worker ports ({len(worker_ports)}) must match "
+                    f"number of workers ({num_workers})"
+                )
+            self.worker_kv_ports = worker_ports
+            self.worker_metrics_ports = [port + (base_metrics_port - base_kv_events_port) for port in worker_ports]
+            logger.info(f"Using explicit worker ports for KV events: {self.worker_kv_ports}")
+        else:
+            # Default: compute ports from base_port + worker_id (for single-node or simple setups)
+            self.worker_kv_ports = [base_kv_events_port + i for i in range(num_workers)]
+            self.worker_metrics_ports = [base_metrics_port + i for i in range(num_workers)]
 
         self.context = zmq.Context()
         self.load_listeners = [
             setup_zmq_subscriber(
-                self.context, f"tcp://{self.worker_addresses[worker_id]}:{base_metrics_port + worker_id}"
+                self.context, f"tcp://{self.worker_addresses[worker_id]}:{self.worker_metrics_ports[worker_id]}"
             )
             for worker_id in range(num_workers)
         ]
         self.kv_listeners = [
             ZmqKvEventListener(
-                f"tcp://{self.worker_addresses[worker_id]}:{base_kv_events_port + worker_id}", "", block_size
+                f"tcp://{self.worker_addresses[worker_id]}:{self.worker_kv_ports[worker_id]}", "", block_size
             )
             for worker_id in range(num_workers)
         ]
