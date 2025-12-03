@@ -100,7 +100,6 @@ policy:
     defer_fp32_logits: true
     moe_permute_fusion: false
     bias_activation_fusion: True
-    track_moe_metrics: False
     moe_per_layer_logging: False
 
     optimizer:

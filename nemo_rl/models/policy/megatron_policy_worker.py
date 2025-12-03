@@ -1183,7 +1183,8 @@ class MegatronPolicyWorker:
             "grad_norm": torch.tensor([grad_norm]),
         }
         # Collect MoE aux metrics averaged across microbatches
-        if self.cfg["megatron_cfg"]["track_moe_metrics"]:
+        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,

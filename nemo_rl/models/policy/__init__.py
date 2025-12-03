@@ -125,7 +125,6 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
-    track_moe_metrics: bool
     moe_per_layer_logging: bool
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
