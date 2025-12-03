@@ -27,7 +27,7 @@ def get_microbatch_iterator(
         ## TODO: handle other args
     elif cfg["sequence_packing"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-        data_iterator_len, seq_dim_size = (
+        data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
         (
@@ -36,7 +36,7 @@ def get_microbatch_iterator(
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cfg["megatron_cfg"],
-            seq_dim_size,
+            pack_seq_dim_size,
         )
         micro_batch_size = 1
     else:
