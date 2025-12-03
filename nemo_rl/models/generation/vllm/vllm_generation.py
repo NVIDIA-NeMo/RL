@@ -838,9 +838,11 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[int]]] = {
+        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
+            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
+            "generation_tokens": {},  # dp_idx -> list[int]
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -854,6 +856,12 @@ class VllmGeneration(GenerationInterface):
             num_pending_samples = stats.get("num_pending_samples")
             if num_pending_samples:
                 vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
+            if kv_cache_usage_perc:
+                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
+            generation_tokens = stats.get("generation_tokens")
+            if generation_tokens:
+                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
 
         return vllm_logger_metrics
 
@@ -898,3 +906,13 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Check if KV cache scales should be synchronized during refit.
+
+        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        """
+        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
+            "kv_cache_dtype"
+        ].startswith("fp8")

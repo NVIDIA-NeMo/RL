@@ -39,6 +39,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
@@ -500,6 +501,24 @@ def setup(
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
+        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+            # FP8 KV cache requires FP8 model precision
+            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
+                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                "FP8 KV cache can only be used together with FP8 model weights."
+            )
+            # FP8 KV cache compatibility checks
+            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                "DTensor backend is not supported with kv cache fp8 enabled."
+            )
+            assert not _should_use_async_rollouts(master_config), (
+                "Async rollouts is not supported with kv cache fp8 enabled."
+            )
+            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+            )
+
+        ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
@@ -577,7 +596,8 @@ def setup(
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
-    policy_generation.prepare_refit_info(state_dict_info)
+    if policy_generation is not None:
+        policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
 
@@ -876,6 +896,7 @@ def refit_policy_generation(
     colocated_inference: bool,
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
+    kv_scales: Optional[dict[str, float]] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -886,6 +907,7 @@ def refit_policy_generation(
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
         timer: Optional Timer used to time the prepare/transfer/update phase
+        kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
     if colocated_inference:
         policy.offload_before_refit()
@@ -913,7 +935,7 @@ def refit_policy_generation(
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes
+                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
             )
             futures_inference = policy_generation.update_weights_via_ipc_zmq()
             # wait for all futures to complete
@@ -922,7 +944,7 @@ def refit_policy_generation(
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective()
+            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
@@ -972,6 +994,8 @@ def grpo_train(
     )
     timeout.start_iterations()
 
+    kv_scales_cache = None  # Cache reused for computed kv scales
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
@@ -979,6 +1003,10 @@ def grpo_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
+
+    # Check if we need to sync KV cache scales
+    # When fallback to policy as the policy_generation, we use getattr to check.
+    sync_kv_scales = getattr(policy_generation, "requires_kv_scale_sync", False)
 
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
@@ -1001,6 +1029,7 @@ def grpo_train(
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Run validation at the start if configured
+    # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
@@ -1062,8 +1091,43 @@ def grpo_train(
                 )
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
+                        # Compute KV scales if needed for FP8 quantization
+                        if sync_kv_scales and kv_scales_cache is None:
+                            print("▶ Computing KV cache scales...", flush=True)
+                            policy.prepare_for_lp_inference()
+                            # Align with training data processing to ensure parallel training compatibility
+                            calib_flat, calib_input_lengths = (
+                                batched_message_log_to_flat_message(
+                                    repeated_batch["message_log"],
+                                    pad_value_dict={
+                                        "token_ids": tokenizer.pad_token_id
+                                    },
+                                    make_sequence_length_divisible_by=master_config[
+                                        "policy"
+                                    ]["make_sequence_length_divisible_by"],
+                                )
+                            )
+                            # Create calibration data from flattened messages
+                            calibration_data = BatchedDataDict[ClippedPGLossDataDict](
+                                {
+                                    "input_ids": calib_flat["token_ids"],
+                                    "input_lengths": calib_input_lengths,
+                                }
+                            )
+                            calibration_data.update(
+                                calib_flat.get_multimodal_dict(as_tensors=False)
+                            )
+                            calibration_data.to("cpu")
+                            kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+                                calibration_data, include_q=True
+                            )["layers"]
+
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference, timer=timer
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            timer=timer,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1074,7 +1138,10 @@ def grpo_train(
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
-                    policy_generation.clear_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "clear_vllm_logger_metrics"
+                    ):
+                        policy_generation.clear_vllm_logger_metrics()
                     # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                     if _should_use_penguin(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1126,7 +1193,14 @@ def grpo_train(
                     policy_generation.finish_generation()
                     # Collect vLLM logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1266,6 +1340,19 @@ def grpo_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
+                # Recompute KV scales after policy training if needed
+                if sync_kv_scales:
+                    with timer.time("recompute_kv_scales"):
+                        print(
+                            "▶ Recomputing KV cache scales after policy update...",
+                            flush=True,
+                        )
+                        kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+                            train_data, include_q=True
+                        )["layers"]
+                        # Set generation as stale to force refit with new scales
+                        POLICY_GENERATION_STALE = True
+
                 is_last_step = (total_steps + 1 >= max_num_steps) or (
                     (current_epoch + 1 == max_num_epochs)
                     and (current_step + 1 == len(dataloader))
@@ -1275,7 +1362,10 @@ def grpo_train(
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1468,6 +1558,18 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                log_generation_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    total_steps + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -1918,7 +2020,10 @@ def async_grpo_train(
     print("✅ All setup complete, starting buffer wait...")
 
     # Clear vLLM logger metrics after at start of training
-    policy_generation.clear_vllm_logger_metrics()
+    if policy_generation is not None and hasattr(
+        policy_generation, "clear_vllm_logger_metrics"
+    ):
+        policy_generation.clear_vllm_logger_metrics()
 
     # Wait for initial buffer fill
     print(
@@ -2167,7 +2272,14 @@ def async_grpo_train(
 
                     # Collect vLLM logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    if policy_generation is not None and hasattr(
+                        policy_generation, "get_vllm_logger_metrics"
+                    ):
+                        vllm_logger_metrics = (
+                            policy_generation.get_vllm_logger_metrics()
+                        )
+                    else:
+                        vllm_logger_metrics = {}
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -2183,7 +2295,10 @@ def async_grpo_train(
                         trajectory_collector.resume_after_refit.remote()
 
                 # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
-                policy_generation.clear_vllm_logger_metrics()
+                if policy_generation is not None and hasattr(
+                    policy_generation, "clear_vllm_logger_metrics"
+                ):
+                    policy_generation.clear_vllm_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None
@@ -2369,6 +2484,18 @@ def async_grpo_train(
             buffer_size_current = ray.get(replay_buffer.size.remote())
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
+
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                log_generation_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    step + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
