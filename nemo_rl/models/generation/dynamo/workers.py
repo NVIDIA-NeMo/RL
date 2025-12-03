@@ -41,11 +41,19 @@ logger = logging.getLogger(__name__)
 class MetricsPublisher(StatLoggerBase):
     """Stat logger publisher. Wrapper for the WorkerMetricsPublisher to match the StatLoggerBase interface."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, bind_ip: str = "0.0.0.0") -> None:
+        """
+        Initialize metrics publisher.
+        
+        Args:
+            port: Port number to bind to
+            bind_ip: IP address to bind to. Use specific IP for distributed setups, or "0.0.0.0" for all interfaces (single-node)
+        """
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.bind(f"tcp://*:{port}")
-        logger.info(f"ZMQ publisher initialized on port {port}")
+        self.socket.bind(f"tcp://{bind_ip}:{port}")
+        self.metrics_sent_count = 0
+        logger.info(f"[METRICS INIT] ZMQ metrics publisher initialized on {bind_ip}:{port}")
 
     def record(
         self,
@@ -60,6 +68,15 @@ class MetricsPublisher(StatLoggerBase):
         }
 
         self.socket.send_json(metrics_data)
+        self.metrics_sent_count += 1
+        
+        # Log every 100 metrics sent
+        if self.metrics_sent_count % 100 == 1:
+            logger.debug(
+                f"[METRICS PUBLISH] Sent {self.metrics_sent_count} metrics, "
+                f"latest: waiting={scheduler_stats.num_waiting_reqs}, "
+                f"kv_usage={scheduler_stats.kv_cache_usage:.3f}"
+            )
 
     def log_engine_initialized(self) -> None:
         pass
@@ -68,11 +85,19 @@ class MetricsPublisher(StatLoggerBase):
 class LoggerFactory:
     """Factory for creating stat logger publishers. Required by vLLM."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, bind_ip: str = "0.0.0.0") -> None:
+        """
+        Initialize logger factory.
+        
+        Args:
+            port: Port number for metrics
+            bind_ip: IP address to bind to. Use specific IP for distributed setups.
+        """
         self.port = port
+        self.bind_ip = bind_ip
 
     def __call__(self, vllm_config: VllmConfig, dp_rank: int) -> StatLoggerBase:
-        return MetricsPublisher(port=self.port)
+        return MetricsPublisher(port=self.port, bind_ip=self.bind_ip)
 
 
 class VllmWorkers:

@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import logging
+import os
 import threading
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
@@ -34,6 +35,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+logger = logging.getLogger(__name__)
 
 
 def _replace_prefix_tokens(
@@ -126,6 +129,16 @@ def _replace_prefix_tokens(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    def __init__(self, *args, global_worker_id: Optional[int] = None, **kwargs):
+        # Initialize _global_worker_id BEFORE calling super().__init__()
+        # because _create_engine (called by parent __init__) needs to access it
+        self._global_worker_id: Optional[int] = global_worker_id
+        if global_worker_id is not None:
+            print(f"[Router Init] Worker initialized with global_worker_id={global_worker_id}")
+        
+        # Now call parent __init__ which will call _create_engine
+        super().__init__(*args, **kwargs)
+    
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig, KVEventsConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -141,6 +154,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         stat_logger = None
         if router_cfg.get("enabled"):
             from nemo_rl.models.generation.dynamo.workers import LoggerFactory
+            
+            # NOTE: Do NOT override disable_log_stats here!
+            # vLLM automatically enables stat logging when stat_loggers are provided to AsyncLLM,
+            # regardless of the disable_log_stats flag. Explicitly setting it to False can break things.
+            logger.info("[Router] Configuring stat logger for metrics publishing")
             
             # Compute DP rank from bundle_indices to get unique ports per worker
             # Each DP group is a tied worker group with the same bundle_indices
@@ -158,25 +176,67 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             
             base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
             base_metrics_port = router_cfg.get("base_metrics_port", 5657)
-            zmq_port = base_kv_events_port + dp_rank
-            metrics_port = base_metrics_port + dp_rank
             block_size = router_cfg.get("block_size", 64)
             
+            # For distributed multi-node setups, we need globally unique port offsets
+            # Each node has local DP ranks 0-N, but we need global worker IDs 0-(total_workers-1)
+            
+            # Priority for determining global worker ID:
+            # 1) _global_worker_id (if set explicitly via set_global_worker_id)
+            # 2) Look up from environment variable map (node_ip + dp_rank -> global_id)
+            # 3) Fall back to dp_rank (single-node or non-router setup)
+            
+            # Determine port offset for this worker
+            # Priority:
+            # 1) Use _global_worker_id if set (via set_global_worker_id after init)
+            # 2) Fall back to DP rank (works for multi-node since each node has unique DP ranks)
+            
+            print(f"[Router DEBUG] _global_worker_id={self._global_worker_id}, dp_rank={dp_rank}")
+            
+            if self._global_worker_id is not None:
+                # Explicitly set via set_global_worker_id (but this happens AFTER init)
+                global_worker_id = self._global_worker_id
+                port_offset = global_worker_id
+                print(f"[Router] Using pre-set global_worker_id={global_worker_id} for port offset")
+            else:
+                # During init, use DP rank as port offset
+                # This works correctly because:
+                # - Single node: DP ranks 0-N map to global IDs 0-N
+                # - Multi-node: Each node has unique DP ranks 0-N, and router queries actual ports
+                port_offset = dp_rank
+                global_worker_id = dp_rank
+                print(f"[Router] Using DP rank {dp_rank} as port offset during init (no global_worker_id set yet)")
+            
+            zmq_port = base_kv_events_port + port_offset
+            metrics_port = base_metrics_port + port_offset
+            
+            print(f"[Router DEBUG] Calculated ports: zmq_port={zmq_port}, metrics_port={metrics_port}, port_offset={port_offset}")
+            
+            # Get the node IP to bind to for distributed setups
+            # In distributed clusters, we need to bind to the specific IP so routers on other nodes can connect
+            try:
+                import ray
+                node_ip = ray.util.get_node_ip_address()
+            except Exception as e:
+                print(f"[Router] Warning: Failed to get node IP: {e}, using 0.0.0.0")
+                node_ip = "0.0.0.0"  # Fallback to all interfaces
+            
             print(
-                f"[Router] Worker DP rank {dp_rank}: "
-                f"KV events port={zmq_port}, metrics port={metrics_port}"
+                f"[Router] Worker (global_id={global_worker_id}, local DP rank={dp_rank}): "
+                f"KV events port={zmq_port}, metrics port={metrics_port}, binding to {node_ip}"
             )
 
             llm_kwargs["kv_events_config"] = KVEventsConfig(
                 enable_kv_cache_events=True,
                 publisher="zmq",
-                endpoint=f"tcp://*:{zmq_port}",
+                endpoint=f"tcp://{node_ip}:{zmq_port}",
             )
 
             llm_kwargs["enable_prefix_caching"] = True
             llm_kwargs["block_size"] = block_size
 
-            stat_logger = [LoggerFactory(port=metrics_port)]
+            # Pass bind_ip to LoggerFactory so metrics are also bound to the specific node IP
+            stat_logger = [LoggerFactory(port=metrics_port, bind_ip=node_ip)]
             
             # Apply patch to ensure KV events are published
             from nemo_rl.models.generation.vllm.vllm_v1_kv_events_patch import patch_vllm_v1_kv_events
@@ -883,21 +943,102 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def get_node_ip(self) -> str:
         """Get the IP address of the node this worker is running on.
         
-        Returns the first IP from AVAILABLE_ADDR_LIST environment variable,
-        which is set by RayWorkerGroup during worker initialization.
+        Uses Ray's ray.util.get_node_ip_address() to get the actual node IP,
+        which works correctly in distributed Ray clusters.
         """
-        import os
-        import ast
+        import logging
+        logger = logging.getLogger(__name__)
         
-        # AVAILABLE_ADDR_LIST is set by RayWorkerGroup
-        addr_list_str = os.environ.get("AVAILABLE_ADDR_LIST", "['localhost']")
         try:
-            addr_list = ast.literal_eval(addr_list_str)
-            if addr_list and len(addr_list) > 0:
-                return addr_list[0]
-        except Exception:
-            pass
-        return "localhost"
+            import ray
+            # Ray's utility function to get the current node's IP
+            node_ip = ray.util.get_node_ip_address()
+            logger.info(f"[get_node_ip] Worker reporting IP: {node_ip}")
+            return node_ip
+        except Exception as e:
+            logger.warning(f"Failed to get node IP via Ray: {e}, falling back to localhost")
+            return "localhost"
+    
+    def get_dp_rank(self) -> int:
+        """Get the DP rank of this worker.
+        
+        Returns the DP rank that was computed during engine initialization.
+        This is used by the router to correctly map worker IPs to DP ranks.
+        """
+        # The DP rank was computed in _create_engine
+        # We need to recompute it here using the same logic
+        router_cfg = self.cfg.get("router_cfg", {})
+        if not router_cfg.get("enabled"):
+            return 0
+        
+        model_parallel_size = (
+            self.cfg["vllm_cfg"]["tensor_parallel_size"]
+            * self.cfg["vllm_cfg"]["pipeline_parallel_size"]
+        )
+        if self.bundle_indices is not None and len(self.bundle_indices) > 0:
+            dp_rank = self.bundle_indices[0] // model_parallel_size
+        else:
+            dp_rank = 0
+        
+        return dp_rank
+    
+    def set_global_worker_id(self, worker_id: int) -> None:
+        """Set the global worker ID for this worker.
+        
+        In distributed setups with multiple nodes, each node has local DP ranks 0-N,
+        but we need globally unique IDs for port assignment. This method is called
+        by VllmGeneration to assign a globally unique worker ID.
+        """
+        print(f"[Router DEBUG set_global_worker_id] Setting global_worker_id from {self._global_worker_id} to {worker_id} (DP rank={self.get_dp_rank()})")
+        self._global_worker_id = worker_id
+    
+    def get_kv_events_port(self) -> int:
+        """Get the actual ZMQ port this worker is publishing KV events on.
+        
+        Returns the port number, or 0 if router is not enabled.
+        
+        IMPORTANT: This returns the ACTUAL bound port, which is always based on DP rank.
+        Workers bind their sockets during __init__ using DP rank, so we must report
+        the same port here, regardless of global_worker_id.
+        """
+        router_cfg = self.cfg.get("router_cfg", {})
+        if not router_cfg.get("enabled"):
+            return 0
+        
+        base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
+        
+        # ALWAYS use DP rank because that's what we bound to during init
+        dp_rank = self.get_dp_rank()
+        port_offset = dp_rank
+        actual_port = base_kv_events_port + port_offset
+        
+        print(f"[Router DEBUG get_kv_events_port] Worker (global_id={self._global_worker_id}, dp_rank={dp_rank}) -> actual bound port={actual_port}")
+        
+        return actual_port
+
+    def get_metrics_port(self) -> int:
+        """Get the actual ZMQ port this worker is publishing metrics on.
+        
+        Returns the port number, or 0 if router is not enabled.
+        
+        IMPORTANT: This returns the ACTUAL bound port, which is always based on DP rank.
+        Workers bind their sockets during __init__ using DP rank, so we must report
+        the same port here, regardless of global_worker_id.
+        """
+        router_cfg = self.cfg.get("router_cfg", {})
+        if not router_cfg.get("enabled"):
+            return 0
+        
+        base_metrics_port = router_cfg.get("base_metrics_port", 5657)
+        
+        # ALWAYS use DP rank because that's what we bound to during init
+        dp_rank = self.get_dp_rank()
+        port_offset = dp_rank
+        actual_port = base_metrics_port + port_offset
+        
+        print(f"[Router DEBUG get_metrics_port] Worker (global_id={self._global_worker_id}, dp_rank={dp_rank}) -> actual bound port={actual_port}")
+        
+        return actual_port
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""

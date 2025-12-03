@@ -78,6 +78,8 @@ class KvRouter:
         base_kv_events_port: int = 5557,
         base_metrics_port: int = 5657,
         worker_addresses: Optional[list[str]] = None,
+        worker_ports: Optional[list[int]] = None,  # Actual KV event ports
+        worker_info: Optional[list[tuple[str, int, int]]] = None,  # (ip, kv_port, metrics_port) tuples
     ):
         self.num_workers = num_workers
         self.block_size = block_size
@@ -89,11 +91,23 @@ class KvRouter:
         
         self.round_robin_counter = 0
         
-        # Use localhost for all workers if addresses not provided (single-node setup)
-        if worker_addresses is None:
-            self.worker_addresses = ["localhost"] * num_workers
-            logger.info("No worker addresses provided, using localhost for all workers (single-node mode)")
-        else:
+        # If worker_info is provided, use it (new distributed mode)
+        if worker_info is not None:
+            if len(worker_info) != num_workers:
+                raise ValueError(
+                    f"Number of worker info entries ({len(worker_info)}) must match "
+                    f"number of workers ({num_workers})"
+                )
+            self.worker_addresses = [info[0] for info in worker_info]
+            self.worker_kv_ports = [info[1] for info in worker_info]
+            self.worker_metrics_ports = [info[2] for info in worker_info]
+            unique_ips = set(self.worker_addresses)
+            if len(unique_ips) > 1:
+                logger.info(f"Using distributed mode with {len(unique_ips)} nodes: {worker_info}")
+            else:
+                logger.info(f"Using single-node mode with worker info: {worker_info}")
+        # Fallback to old parameters for backward compatibility
+        elif worker_addresses is not None:
             if len(worker_addresses) != num_workers:
                 raise ValueError(
                     f"Number of worker addresses ({len(worker_addresses)}) must match "
@@ -101,20 +115,42 @@ class KvRouter:
                 )
             self.worker_addresses = worker_addresses
             logger.info(f"Using distributed mode with worker addresses: {worker_addresses}")
+            
+            # Use provided ports or compute them from base_port + worker_id
+            if worker_ports is not None:
+                if len(worker_ports) != num_workers:
+                    raise ValueError(
+                        f"Number of worker ports ({len(worker_ports)}) must match "
+                        f"number of workers ({num_workers})"
+                    )
+                self.worker_kv_ports = worker_ports
+                self.worker_metrics_ports = [port + (base_metrics_port - base_kv_events_port) for port in worker_ports]
+                logger.info(f"Using explicit worker ports for KV events: {self.worker_kv_ports}")
+            else:
+                # Default: compute ports from base_port + worker_id (for single-node or simple setups)
+                self.worker_kv_ports = [base_kv_events_port + i for i in range(num_workers)]
+                self.worker_metrics_ports = [base_metrics_port + i for i in range(num_workers)]
+        else:
+            # No worker info provided - use localhost and default ports (single-node setup)
+            self.worker_addresses = ["localhost"] * num_workers
+            self.worker_kv_ports = [base_kv_events_port + i for i in range(num_workers)]
+            self.worker_metrics_ports = [base_metrics_port + i for i in range(num_workers)]
+            logger.info("No worker info provided, using localhost and default ports for all workers (single-node mode)")
 
         self.context = zmq.Context()
-        self.load_listeners = [
-            setup_zmq_subscriber(
-                self.context, f"tcp://{self.worker_addresses[worker_id]}:{base_metrics_port + worker_id}"
-            )
-            for worker_id in range(num_workers)
-        ]
-        self.kv_listeners = [
-            ZmqKvEventListener(
-                f"tcp://{self.worker_addresses[worker_id]}:{base_kv_events_port + worker_id}", "", block_size
-            )
-            for worker_id in range(num_workers)
-        ]
+        self.load_listeners = []
+        for worker_id in range(num_workers):
+            addr = f"tcp://{self.worker_addresses[worker_id]}:{self.worker_metrics_ports[worker_id]}"
+            listener = setup_zmq_subscriber(self.context, addr)
+            self.load_listeners.append(listener)
+            logger.info(f"[INIT] Metrics listener for worker {worker_id}: {addr}")
+        
+        self.kv_listeners = []
+        for worker_id in range(num_workers):
+            addr = f"tcp://{self.worker_addresses[worker_id]}:{self.worker_kv_ports[worker_id]}"
+            listener = ZmqKvEventListener(addr, "", block_size)
+            self.kv_listeners.append(listener)
+            logger.info(f"[INIT] KV listener for worker {worker_id}: {addr}")
 
         self.background_tasks: list[asyncio.Task] = []
         self.load_tasks: list[asyncio.Task] = []
@@ -150,6 +186,9 @@ class KvRouter:
 
     async def periodic_update_load(self):
         async def update_load(worker_id: int):
+            metrics_received_count = 0
+            last_log_time = time.time()
+            
             try:
                 while True:
                     try:
@@ -159,6 +198,16 @@ class KvRouter:
                         metrics = LoadMetrics.model_validate(metrics_dict)
                         self.kv_usages[worker_id] = metrics.kv_cache_usage
                         self.waitings[worker_id] = metrics.num_waiting_reqs
+                        metrics_received_count += 1
+                        
+                        # Log metrics every 5 seconds
+                        current_time = time.time()
+                        if current_time - last_log_time >= 5.0:
+                            logger.debug(
+                                f"[METRICS] Worker {worker_id}: received {metrics_received_count} metrics, "
+                                f"kv_usage={metrics.kv_cache_usage:.3f}, waiting={metrics.num_waiting_reqs}"
+                            )
+                            last_log_time = current_time
                     except zmq.Again:
                         pass
                     except Exception as e:
@@ -168,8 +217,9 @@ class KvRouter:
 
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                logger.debug(
-                    "Load update task cancelled for worker %s", worker_id
+                logger.info(
+                    f"Load update task cancelled for worker {worker_id} "
+                    f"(received {metrics_received_count} metrics)"
                 )
                 raise
 
@@ -322,6 +372,18 @@ class KvRouter:
             if num_tokens <= 0:
                 raise ValueError("num_tokens must be positive")
 
+            # Log current router state every 10 requests
+            if not hasattr(self, '_request_count'):
+                self._request_count = 0
+            self._request_count += 1
+            
+            if self._request_count % 10 == 1:  # Log at request 1, 11, 21, etc.
+                logger.info(
+                    f"[ROUTER STATE] Request #{self._request_count}: "
+                    f"kv_usages={[f'{u:.3f}' for u in self.kv_usages]}, "
+                    f"waitings={self.waitings}"
+                )
+
             # local_hashes can be empty
             logger.debug(
                 f"[get_best_worker] num_tokens={num_tokens}, "
@@ -368,16 +430,28 @@ class KvRouter:
                 )
 
             logits_array = np.array(logits)
-            best_worker_id = int(
-                np.random.choice(np.flatnonzero(logits_array == logits_array.max()))
-            )
+            
+            # When there are ties (multiple workers with max logit), use round-robin instead of random
+            # This ensures fair distribution during cold-start and avoids random bias toward certain workers
+            max_logit = logits_array.max()
+            # Use epsilon-based comparison to handle floating point precision issues
+            # When all logits are ~0, tiny differences (e.g. -1e-17 vs -2e-17) shouldn't matter
+            epsilon = 1e-6
+            tied_workers = np.flatnonzero(np.abs(logits_array - max_logit) < epsilon)
+            
+            if len(tied_workers) > 1:
+                # Multiple workers tied - use round-robin for fairness
+                best_worker_id = tied_workers[self.round_robin_counter % len(tied_workers)]
+                self.round_robin_counter += 1
+                logger.debug(f"[Tie-break] {len(tied_workers)} workers tied with logit={max_logit:.3f}, using round-robin -> worker {best_worker_id}")
+            else:
+                # Clear winner
+                best_worker_id = int(tied_workers[0])
+                logger.debug(f"[Winner] Worker {best_worker_id} selected with logit={max_logit:.3f}")
 
-            # this is a predictive update which will be reset as new metrics are polled
-            # but it is helpful for handling short bursts of highly concurrent requests
-            # we omit updating the gpu_usage_perc as done in the rusty router for simplicity
-            # as this requires obtaining num_gpu_blocks from the engines and can be intrusive
-            # no need for async lock here, as the state is intended to be continuously overwritten
-            self.waitings[best_worker_id] += 1
+            # Note: We removed the predictive update (self.waitings[best_worker_id] += 1)
+            # because it was causing unfair distribution in multi-node setups.
+            # The actual metrics from workers (updated every ~100ms) are sufficient for load balancing.
 
             return best_worker_id
 
