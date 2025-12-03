@@ -28,6 +28,7 @@ from transformers import (
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.utils.logger import Logger
 
 
 def calculate_kl(
@@ -744,3 +745,27 @@ def print_performance_metrics(
     )
 
     return performance_metrics
+
+
+def log_generation_metrics_to_wandb(
+    vllm_logger_metrics: dict[str, dict[int, list[Any]]],
+    step: int,
+    timeline_interval: float,
+    logger: Logger,
+) -> None:
+    """Log vLLM metrics to wandb.
+
+    Args:
+        vllm_logger_metrics: Dictionary of vLLM logger metrics
+        step: Global step value
+        timeline_interval: Interval between timeline points (in seconds)
+        logger: Logger instance
+    """
+    for vllm_metric in vllm_logger_metrics.keys():
+        logger.log_plot_per_worker_timeline_metrics(
+            vllm_logger_metrics[vllm_metric],
+            step=step,
+            prefix="vllm_metrics",
+            name=vllm_metric,
+            timeline_interval=timeline_interval,
+        )

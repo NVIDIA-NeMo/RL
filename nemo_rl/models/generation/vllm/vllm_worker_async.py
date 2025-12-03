@@ -167,7 +167,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
+        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -190,6 +190,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
+        self.kv_cache_usage_perc: list[float] = []
+        self.generation_tokens: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -197,15 +199,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             while True:
                 try:
                     for m in get_metrics_snapshot():
-                        if isinstance(m, Gauge):
-                            # Log the vllm inflight batch sizes
-                            if m.name == "vllm:num_requests_running":
-                                with self._vllm_metrics_lock:
+                        with self._vllm_metrics_lock:
+                            if isinstance(m, Gauge):
+                                # Log the vllm inflight batch sizes
+                                if m.name == "vllm:num_requests_running":
                                     self.inflight_batch_sizes.append(int(m.value))
-                            # Log the vllm pending number of requests in the queue
-                            elif m.name == "vllm:num_requests_waiting":
-                                with self._vllm_metrics_lock:
+                                # Log the vllm pending number of requests in the queue
+                                elif m.name == "vllm:num_requests_waiting":
                                     self.num_pending_samples.append(int(m.value))
+                                # Log the vllm kv cache usage
+                                elif m.name == "vllm:kv_cache_usage_perc":
+                                    self.kv_cache_usage_perc.append(float(m.value))
+                            elif isinstance(m, Counter):
+                                if m.name == "vllm:generation_tokens":
+                                    self.generation_tokens.append(int(m.value))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -232,6 +239,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             metric = {
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
+                "generation_tokens": copy.deepcopy(self.generation_tokens),
             }
         return metric
 
@@ -242,6 +251,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         with self._vllm_metrics_lock:
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
+            self.generation_tokens = []
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
