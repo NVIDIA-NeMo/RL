@@ -17,10 +17,10 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
-    sequence_parallel: true
+    sequence_parallel: false
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08
@@ -31,7 +31,7 @@ policy:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   generation:
     vllm_cfg:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n8g
   wandb_enabled: true

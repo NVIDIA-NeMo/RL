@@ -76,7 +76,6 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
-    sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -218,9 +217,6 @@ class DTensorPolicyWorker:
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             torch_dtype=torch.float32,
             trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
@@ -1747,9 +1743,32 @@ class DTensorPolicyWorker:
         return get_free_memory_bytes(device_idx)
 
     @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorker."""
+        raise NotImplementedError(
+            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorker"
+        )
+
+    @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1782,8 +1801,15 @@ class DTensorPolicyWorker:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(

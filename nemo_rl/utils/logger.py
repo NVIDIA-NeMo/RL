@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
+import numpy as np
 import ray
 import requests
 import swanlab
@@ -65,6 +66,7 @@ class MLflowConfig(TypedDict):
     experiment_name: str
     run_name: str
     tracking_uri: NotRequired[str]
+    artifact_location: NotRequired[str | None]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -724,31 +726,30 @@ class MLflowLogger(LoggerInterface):
 
         Args:
             cfg: MLflow configuration
-            log_dir: Optional log directory
+            log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        if cfg["tracking_uri"]:
-            mlflow.set_tracking_uri(cfg["tracking_uri"])
+        tracking_uri = cfg.get("tracking_uri")
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
 
-        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        experiment_name = cfg["experiment_name"]
+        experiment = mlflow.get_experiment_by_name(experiment_name)
         if experiment is None:
-            if log_dir:
-                mlflow.create_experiment(
-                    name=cfg["experiment_name"],
-                    artifact_location=log_dir,
-                )
-            else:
-                mlflow.create_experiment(cfg["experiment_name"])
+            mlflow.create_experiment(
+                name=experiment_name,
+                **{"artifact_location": cfg.get("artifact_location", log_dir)}
+                if "artifact_location" in cfg or log_dir
+                else {},
+            )
         else:
-            mlflow.set_experiment(cfg["experiment_name"])
+            mlflow.set_experiment(experiment_name)
 
         # Start run
-        run_kwargs: dict[str, str] = {}
-        run_kwargs["run_name"] = cfg["run_name"]
-
+        run_name = cfg["run_name"]
+        run_kwargs = {"run_name": run_name}
         self.run = mlflow.start_run(**run_kwargs)
         print(
-            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
-            f"run {cfg['run_name']}"
+            f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}"
         )
 
     def log_metrics(
@@ -847,8 +848,10 @@ class Logger(LoggerInterface):
             self.loggers.append(tensorboard_logger)
 
         if cfg["mlflow_enabled"]:
-            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
-            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_log_dir = self.base_log_dir
+            if mlflow_log_dir:
+                mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
+                os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 
@@ -932,6 +935,87 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_plot_per_worker_timeline_metrics(
+        self,
+        metrics: dict[int, list[Any]],
+        step: int,
+        prefix: str,
+        name: str,
+        timeline_interval: float,
+    ) -> None:
+        """Log a plot of per-worker timeline metrics.
+
+        Args:
+            metrics: Dictionary of metrics to log, where the keys are the worker IDs and the values are the lists of metric values
+            - metrics: dict[str, list[Any]] = {worker_id: [metric_value_1, metric_value_2, ...]}
+            - metric values are time series values over time, the timing gap between the values is the timeline_interval
+            step: Global step value
+            name: Name of the plot
+            timeline_interval: Interval between timeline points (in seconds)
+        """
+        if not metrics:
+            print(
+                f"Skipping {name} per-worker timeline logging because no metrics were provided."
+            )
+            return
+
+        if timeline_interval <= 0:
+            raise ValueError(
+                f"timeline_interval must be positive; received {timeline_interval}"
+            )
+
+        # Plot the per-worker timeline metrics
+        x_series: list[list[float]] = []
+        y_series: list[list[float]] = []
+        series_labels: list[str] = []
+
+        if not any(metrics.values()):
+            print(
+                f"Skipping {name} per-worker timeline logging because all series were empty."
+            )
+            return
+
+        for worker_id in sorted(metrics.keys()):
+            metric_values = metrics[worker_id]
+            if not metric_values:
+                continue
+
+            x_series.append([i * timeline_interval for i in range(len(metric_values))])
+            y_series.append([float(v) for v in metric_values])
+            series_labels.append(f"worker_{worker_id}")
+
+        fig, ax = plt.subplots()
+        for label, xs, ys in zip(series_labels, x_series, y_series):
+            ax.plot(xs, ys, label=label)
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (per worker)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        plt.close(fig)
+
+        # Plot the average of the metrics
+        min_length = min(len(v) for v in metrics.values())
+        x_series = [i * timeline_interval for i in range(min_length)]
+        truncated_y_serise = [v[:min_length] for v in y_series]
+
+        avg_y_serise = np.mean(truncated_y_serise, axis=0)
+
+        fig, ax = plt.subplots()
+        ax.plot(x_series, avg_y_serise, label="average")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (average)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/average_{name}")
+        plt.close(fig)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

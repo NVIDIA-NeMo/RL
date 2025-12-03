@@ -24,7 +24,6 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.models.policy.utils import sliding_window_overwrite
 from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
 
 
@@ -38,7 +37,6 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
         model_name,
         torch_dtype=torch.float32,
         trust_remote_code=True,
-        **sliding_window_overwrite(model_name),
     )
 
 
