@@ -33,6 +33,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.fsdp import (
     FSDPModule,
 )
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
@@ -197,6 +198,12 @@ class DTensorPolicyWorker:
             self.dtype = torch.float16
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
+
+        # Initialize gradient scaler for float16 training
+        if self.dtype == torch.float16:
+            self.scaler = ShardedGradScaler(growth_interval=400)
+        else:
+            self.scaler = None
 
         print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
         self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
@@ -840,7 +847,10 @@ class DTensorPolicyWorker:
                             # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                             # but we want to sum them so we cancel out the average here
                             loss *= self.dp_size * self.cp_size
-                            loss.backward()
+                            if self.scaler is not None:
+                                self.scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
 
                     if num_valid_samples > 0:
                         mb_losses.append(loss.item())
@@ -849,6 +859,10 @@ class DTensorPolicyWorker:
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
                     with torch.no_grad():
+                        # Unscale gradients before clipping if using scaler
+                        if self.scaler is not None:
+                            self.scaler.unscale_(self.optimizer)
+
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
                             dp_cp_group=self.dp_cp_mesh.get_group(),
@@ -864,7 +878,11 @@ class DTensorPolicyWorker:
                         grad_norm = torch.tensor([grad_norm])
 
                     # Update parameters
-                    self.optimizer.step()
+                    if self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
