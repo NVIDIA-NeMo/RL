@@ -515,7 +515,7 @@ def parse_slurm_log(log_file: Path) -> dict:
 
 
 def print_results_table(results: list, show_all: bool = False, detailed: bool = False):
-    """Print results as a formatted table."""
+    """Print results as a formatted table, grouped by model."""
     if not results:
         print("\n❌ No results found.")
         return
@@ -526,8 +526,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
     RED = '\033[91m'
     CYAN = '\033[96m'
     BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
     RESET = '\033[0m'
     BOLD = '\033[1m'
+    DIM = '\033[2m'
     
     # Filter by status if needed
     if not show_all:
@@ -537,12 +539,26 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         print("\n⚠️  No completed/running results found. Use --all to see all runs.")
         return
     
-    # Sort by tokens_per_sec_per_gpu descending
-    results = sorted(results, key=lambda x: x.get('tokens_per_sec_per_gpu', 0), reverse=True)
+    # Group by model
+    from collections import defaultdict
+    model_groups = defaultdict(list)
+    for r in results:
+        model = r.get('model', 'Unknown')
+        model_groups[model].append(r)
+    
+    # Sort each group by num_nodes ascending (small to large)
+    for model in model_groups:
+        model_groups[model] = sorted(
+            model_groups[model], 
+            key=lambda x: (x.get('num_nodes', 0), x.get('total_gpus', 0))
+        )
+    
+    # Sort models alphabetically for consistent ordering
+    sorted_models = sorted(model_groups.keys())
     
     # Print header
     print(f"\n{BOLD}{'='*200}{RESET}")
-    print(f"{BOLD}GRPO Benchmark Results - GB200{RESET}")
+    print(f"{BOLD}GRPO Benchmark Results - GB200 (Grouped by Model){RESET}")
     print(f"{'='*200}")
     
     if detailed:
@@ -577,93 +593,118 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             f"{'Status':<10}"
         )
     
-    print(f"{CYAN}{header}{RESET}")
-    print("-" * 200)
+    # Model color palette for visual distinction
+    model_colors = [MAGENTA, CYAN, GREEN, YELLOW, BLUE]
     
-    for r in results:
-        model = r.get('model', 'Unknown')[:13]
-        status = r.get('status', 'Unknown')
-        is_async = r.get('is_async', False)
+    total_runs = 0
+    all_completed = []
+    
+    # Print each model group
+    for model_idx, model in enumerate(sorted_models):
+        model_results = model_groups[model]
+        model_color = model_colors[model_idx % len(model_colors)]
         
-        # Color status
-        if status in ['finished', 'COMPLETED']:
-            status_str = f"{GREEN}{status[:8]:<10}{RESET}"
-        elif status in ['running', 'RUNNING']:
-            status_str = f"{YELLOW}{status[:8]:<10}{RESET}"
-        else:
-            status_str = f"{RED}{status[:8]:<10}{RESET}"
+        # Print model group header
+        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (180 - len(model) - 15)}┐{RESET}")
+        print(f"{DIM}{header}{RESET}")
+        print(f"{DIM}{'-' * 200}{RESET}")
         
-        # Type indicator
-        type_str = f"{BLUE}async{RESET}" if is_async else "sync "
-        
-        # Format metrics
-        step_time = r.get('step_time_sec', 0)
-        tokens_sec_gpu = r.get('tokens_per_sec_per_gpu', 0)
-        mfu = r.get('gpu_util_mfu', 0)
-        tflops = r.get('per_gpu_tflops', 0)
-        
-        # MFU formatting (handle both 0-1 and 0-100 scales)
-        mfu_pct = mfu * 100 if mfu < 1 else mfu
-        
-        if detailed:
-            gen_time = r.get('generation_time', 0)
-            train_time = r.get('policy_training_time', 0)
-            logprobs_time = r.get('logprobs_time', 0)
-            gen_tok_gpu = r.get('gen_tokens_per_sec_per_gpu', 0)
+        for r in model_results:
+            model_name = r.get('model', 'Unknown')[:13]
+            status = r.get('status', 'Unknown')
+            is_async = r.get('is_async', False)
             
-            row = (
-                f"{model:<15} "
-                f"{type_str:<5} "
-                f"{r.get('num_nodes', 0):>3} "
-                f"{r.get('total_gpus', 0):>4} "
-                f"{r.get('t_tp', 1):>4} "
-                f"{r.get('t_pp', 1):>4} "
-                f"{r.get('t_ep', 1):>4} "
-                f"{r.get('g_tp', 1):>4} "
-                f"{step_time:>7.1f} "
-                f"{gen_time:>7.1f} "
-                f"{train_time:>7.1f} "
-                f"{logprobs_time:>7.1f} "
-                f"{tokens_sec_gpu:>10,.0f} "
-                f"{gen_tok_gpu:>10,.0f} "
-                f"{mfu_pct:>6.2f} "
-                f"{status_str}"
-            )
-        else:
-            row = (
-                f"{model:<15} "
-                f"{type_str:<5} "
-                f"{r.get('num_nodes', 0):>5} "
-                f"{r.get('total_gpus', 0):>5} "
-                f"{r.get('t_tp', 1):>4} "
-                f"{r.get('t_pp', 1):>4} "
-                f"{r.get('t_ep', 1):>4} "
-                f"{r.get('t_cp', 1):>4} "
-                f"{r.get('t_dp', 1):>4} "
-                f"{r.get('g_tp', 1):>4} "
-                f"{r.get('g_pp', 1):>4} "
-                f"{r.get('g_dp', 1):>4} "
-                f"{step_time:>8.2f} "
-                f"{tokens_sec_gpu:>10,.0f} "
-                f"{mfu_pct:>6.2f} "
-                f"{tflops:>7.1f} "
-                f"{status_str}"
-            )
-        print(row)
+            # Color status
+            if status in ['finished', 'COMPLETED']:
+                status_str = f"{GREEN}{status[:8]:<10}{RESET}"
+                all_completed.append(r)
+            elif status in ['running', 'RUNNING']:
+                status_str = f"{YELLOW}{status[:8]:<10}{RESET}"
+            else:
+                status_str = f"{RED}{status[:8]:<10}{RESET}"
+            
+            # Type indicator
+            type_str = f"{BLUE}async{RESET}" if is_async else "sync "
+            
+            # Format metrics
+            step_time = r.get('step_time_sec', 0)
+            tokens_sec_gpu = r.get('tokens_per_sec_per_gpu', 0)
+            mfu = r.get('gpu_util_mfu', 0)
+            tflops = r.get('per_gpu_tflops', 0)
+            
+            # MFU formatting (handle both 0-1 and 0-100 scales)
+            mfu_pct = mfu * 100 if mfu < 1 else mfu
+            
+            if detailed:
+                gen_time = r.get('generation_time', 0)
+                train_time = r.get('policy_training_time', 0)
+                logprobs_time = r.get('logprobs_time', 0)
+                gen_tok_gpu = r.get('gen_tokens_per_sec_per_gpu', 0)
+                
+                row = (
+                    f"{model_name:<15} "
+                    f"{type_str:<5} "
+                    f"{r.get('num_nodes', 0):>3} "
+                    f"{r.get('total_gpus', 0):>4} "
+                    f"{r.get('t_tp', 1):>4} "
+                    f"{r.get('t_pp', 1):>4} "
+                    f"{r.get('t_ep', 1):>4} "
+                    f"{r.get('g_tp', 1):>4} "
+                    f"{step_time:>7.1f} "
+                    f"{gen_time:>7.1f} "
+                    f"{train_time:>7.1f} "
+                    f"{logprobs_time:>7.1f} "
+                    f"{tokens_sec_gpu:>10,.0f} "
+                    f"{gen_tok_gpu:>10,.0f} "
+                    f"{mfu_pct:>6.2f} "
+                    f"{status_str}"
+                )
+            else:
+                row = (
+                    f"{model_name:<15} "
+                    f"{type_str:<5} "
+                    f"{r.get('num_nodes', 0):>5} "
+                    f"{r.get('total_gpus', 0):>5} "
+                    f"{r.get('t_tp', 1):>4} "
+                    f"{r.get('t_pp', 1):>4} "
+                    f"{r.get('t_ep', 1):>4} "
+                    f"{r.get('t_cp', 1):>4} "
+                    f"{r.get('t_dp', 1):>4} "
+                    f"{r.get('g_tp', 1):>4} "
+                    f"{r.get('g_pp', 1):>4} "
+                    f"{r.get('g_dp', 1):>4} "
+                    f"{step_time:>8.2f} "
+                    f"{tokens_sec_gpu:>10,.0f} "
+                    f"{mfu_pct:>6.2f} "
+                    f"{tflops:>7.1f} "
+                    f"{status_str}"
+                )
+            print(row)
+            total_runs += 1
+        
+        # Print model group summary
+        model_completed = [r for r in model_results if r.get('status') in ['finished', 'COMPLETED']]
+        if model_completed:
+            best_tok = max(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed)
+            avg_tok = sum(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed) / len(model_completed)
+            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 140}┘{RESET}")
     
-    print("=" * 200)
-    print(f"\n📊 Total runs: {len(results)}")
+    # Overall summary
+    print(f"\n{'='*200}")
+    print(f"\n📊 {BOLD}Overall Summary{RESET}")
+    print(f"   Total runs: {total_runs}")
+    print(f"   Models: {len(sorted_models)}")
     
-    # Summary statistics
-    completed = [r for r in results if r.get('status') in ['finished', 'COMPLETED']]
-    if completed:
-        avg_tokens_gpu = sum(r.get('tokens_per_sec_per_gpu', 0) for r in completed) / len(completed)
-        max_tokens_gpu = max(r.get('tokens_per_sec_per_gpu', 0) for r in completed)
-        avg_mfu = sum(r.get('gpu_util_mfu', 0) for r in completed) / len(completed)
+    if all_completed:
+        avg_tokens_gpu = sum(r.get('tokens_per_sec_per_gpu', 0) for r in all_completed) / len(all_completed)
+        max_tokens_gpu = max(r.get('tokens_per_sec_per_gpu', 0) for r in all_completed)
+        best_run = max(all_completed, key=lambda x: x.get('tokens_per_sec_per_gpu', 0))
+        avg_mfu = sum(r.get('gpu_util_mfu', 0) for r in all_completed) / len(all_completed)
         avg_mfu_pct = avg_mfu * 100 if avg_mfu < 1 else avg_mfu
         
+        print(f"   Completed runs: {len(all_completed)}")
+        print(f"   {GREEN}Best Tokens/sec/GPU: {max_tokens_gpu:,.0f}{RESET} ({best_run.get('model', 'Unknown')})")
         print(f"   Avg Tokens/sec/GPU: {avg_tokens_gpu:,.0f}")
-        print(f"   Max Tokens/sec/GPU: {max_tokens_gpu:,.0f}")
         print(f"   Avg MFU: {avg_mfu_pct:.2f}%")
 
 

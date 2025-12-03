@@ -20,19 +20,19 @@ def main():
 
     keys = [
         # "train/mean_total_tokens_per_sample",
-        "timing/train/total_step_time",
-        "timing/train/exposed_generation",
-        # "timing/train/generation",
+        "timing/train/total_step_time", # 
+        # "timing/train/exposed_generation", # for off-policy
+        "timing/train/generation", # on-policy
         "timing/train/policy_and_reference_logprobs",
         "timing/train/policy_training",
-        "timing/train/weight_sync", 
+        # "timing/train/weight_sync", 
         "timing/train/data_processing",
         "timing/train/reward_calculation",
         "timing/train/training_prep",
 
 
         # "timing/train/prepare_for_generation/total",
-        # "timing/train/prepare_for_generation/transfer_and_update_weights",
+        "timing/train/prepare_for_generation/transfer_and_update_weights",
         "performance/tokens_per_sec_per_gpu",
         "performance/generation_tokens_per_sec_per_gpu",
         "performance/training_worker_group_tokens_per_sec_per_gpu",

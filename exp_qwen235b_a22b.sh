@@ -55,17 +55,16 @@ policy.train_global_batch_size=512 \
 grpo.max_num_steps=20 \
 logger.wandb_enabled=True \
 logger.wandb.project='sync-grpo-gb200-benchmark' \
-logger.wandb.name='Qwen235B_A22B-N${NUM_NODES}-Gtp${g_tp}-Ttp${t_tp}pp${t_pp}ep${t_ep}'"
-
-CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl.sqsh
-HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home
-HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache
-MOUNTS="/lustre:/lustre"
-
+logger.wandb.name='Qwen235B_A22B-N${NUM_NODES}xG${GPUS_PER_NODE}-Train(tp${t_tp}.pp${t_pp}.ep${t_ep}.cp${t_cp}.vpp${t_vpp})-Gen(tp${g_tp}.pp${g_pp}.ep${g_ep})'" \
+CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl.sqsh \
+HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home \
+HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache \
+WANDB_API_KEY=$WANDB_API_KEY \
+MOUNTS="/lustre:/lustre" \
 sbatch \
     --nodes=${NUM_NODES} \
     --account=${account} \
-    --job-name=qwen235b-sync \
+    --job-name=qwen235b-N${NUM_NODES}xG${GPUS_PER_NODE}-T.tp${t_tp}.pp${t_pp}.ep${t_ep}-G.tp${g_tp}.pp${g_pp} \
     --partition=batch \
     --time=04:00:00 \
     --gres=gpu:4 \
