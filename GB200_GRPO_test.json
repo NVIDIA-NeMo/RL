@@ -1,0 +1,66 @@
+{
+  "description": "GB200 Benchmark Target Configurations",
+  "configs": [
+    {
+      "name": "Qwen32B",
+      "model": "Qwen3-32B",
+      "total_gpus": 16,
+      "rollout_gbs": 2048,
+      "train_gbs": 512,
+      "max_seqlen": 4096,
+      "g_tp": 1, "g_pp": 1, "g_dp": 16,
+      "t_tp": 4, "t_cp": 1, "t_ep": 1, "t_pp": 1, "t_dp": 4
+    },
+    {
+      "name": "Qwen30B-A3B",
+      "model": "Qwen3-30B-A3B",
+      "total_gpus": 16,
+      "rollout_gbs": 2048,
+      "train_gbs": 512,
+      "max_seqlen": 4096,
+      "g_tp": 1, "g_pp": 1, "g_dp": 16,
+      "t_tp": 1, "t_cp": 1, "t_ep": 8, "t_pp": 1, "t_dp": 2
+    },
+    {
+      "name": "LLaMA3-8B",
+      "model": "Llama-3.1-8B",
+      "total_gpus": 8,
+      "rollout_gbs": 2048,
+      "train_gbs": 512,
+      "max_seqlen": 4096,
+      "g_tp": 1, "g_pp": 1, "g_dp": 8,
+      "t_tp": 1, "t_cp": 1, "t_ep": 1, "t_pp": 1, "t_dp": 8
+    },
+    {
+      "name": "LLaMA3-70B-LowGBS",
+      "model": "Llama-3.1-70B",
+      "total_gpus": 16,
+      "rollout_gbs": 512,
+      "train_gbs": 512,
+      "max_seqlen": 4096,
+      "g_tp": 1, "g_pp": 1, "g_dp": 8,
+      "t_tp": 4, "t_cp": 1, "t_ep": 1, "t_pp": 2, "t_dp": 2
+    },
+    {
+      "name": "LLaMA3-70B",
+      "model": "Llama-3.1-70B",
+      "total_gpus": 16,
+      "rollout_gbs": 2048,
+      "train_gbs": 512,
+      "max_seqlen": 4096,
+      "g_tp": 2, "g_pp": 1, "g_dp": 8,
+      "t_tp": 4, "t_cp": 1, "t_ep": 1, "t_pp": 2, "t_dp": 2
+    },
+    {
+      "name": "LLaMA3-70B-HighSeq",
+      "model": "Llama-3.1-70B",
+      "total_gpus": 16,
+      "rollout_gbs": 2048,
+      "train_gbs": 512,
+      "max_seqlen": 16384,
+      "g_tp": 2, "g_pp": 1, "g_dp": 8,
+      "t_tp": 4, "t_cp": 1, "t_ep": 1, "t_pp": 2, "t_dp": 2
+    }
+  ]
+}
+

@@ -339,7 +339,10 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 # Max sequence length
                 config['max_seqlen'] = policy_cfg.get('max_total_sequence_length', 0)
                 
-                # GRPO config - Rollout and Training GBS
+                # Training GBS - from policy config (policy.train_global_batch_size)
+                config['train_gbs'] = policy_cfg.get('train_global_batch_size', 0)
+                
+                # GRPO config - Rollout GBS
                 grpo_cfg = run_config.get('grpo', {})
                 num_prompts = grpo_cfg.get('num_prompts_per_step', 0)
                 num_generations = grpo_cfg.get('num_generations_per_prompt', 0)
@@ -349,14 +352,17 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 config['num_prompts'] = num_prompts
                 config['num_generations'] = num_generations
                 
-                # Training GBS
-                config['train_gbs'] = grpo_cfg.get('training_global_batch_size', 0)
+                # Fallback: if train_gbs still 0, try grpo config
+                if config['train_gbs'] == 0:
+                    config['train_gbs'] = grpo_cfg.get('training_global_batch_size', 0)
                 
-                # Recalculate DP
-                mp = config['t_tp'] * config['t_pp']
-                if mp > 0 and config['total_gpus'] > 0:
-                    config['t_dp'] = config['total_gpus'] // mp
+                # Recalculate DP (must include EP for MoE models)
+                # Training DP = total_gpus / (TP * PP * EP)
+                t_mp = config['t_tp'] * config['t_pp'] * config['t_ep']
+                if t_mp > 0 and config['total_gpus'] > 0:
+                    config['t_dp'] = config['total_gpus'] // t_mp
                 
+                # Generation DP = total_gpus / (TP * PP)
                 g_mp = config['g_tp'] * config['g_pp']
                 if g_mp > 0 and config['total_gpus'] > 0:
                     config['g_dp'] = config['total_gpus'] // g_mp
@@ -838,9 +844,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
     sorted_models = sorted(model_groups.keys())
     
     # Print header
-    print(f"\n{BOLD}{'='*230}{RESET}")
+    print(f"\n{BOLD}{'='*245}{RESET}")
     print(f"{BOLD}GRPO Benchmark Results - GB200 (Grouped by Model){RESET}")
-    print(f"{'='*230}")
+    print(f"{'='*245}")
     
     if detailed:
         # Detailed view with timing breakdown
@@ -866,10 +872,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             f"{'Type':<5} "
             f"{'Nodes':>5} {'GPUs':>5} "
             f"{'R.GBS':>6} {'T.GBS':>6} {'SeqLen':>6} "
-            f"{'T.TP':>4} {'T.PP':>4} {'T.EP':>4} {'T.CP':>4} {'T.DP':>4} "
             f"{'G.TP':>4} {'G.PP':>4} {'G.DP':>4} "
+            f"{'T.TP':>4} {'T.CP':>4} {'T.EP':>4} {'T.PP':>4} {'T.DP':>4} "
             f"{'Step(s)':>8} "
-            f"{'Tok/s/GPU':>10} {'GenTok/GPU':>11} {'TrnTok/GPU':>11} "
+            f"{'E2ETok/GPU':>11} {'GenTok/GPU':>11} {'TrnTok/GPU':>11} {'PolTot/GPU':>11} "
             f"{'MFU%':>6} "
             f"{'TFLOPs':>7} "
             f"{'Status':<10}"
@@ -887,9 +893,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         model_color = model_colors[model_idx % len(model_colors)]
         
         # Print model group header
-        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (210 - len(model) - 15)}┐{RESET}")
+        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (225 - len(model) - 15)}┐{RESET}")
         print(f"{DIM}{header}{RESET}")
-        print(f"{DIM}{'-' * 230}{RESET}")
+        print(f"{DIM}{'-' * 245}{RESET}")
         
         for r in model_results:
             model_name = r.get('model', 'Unknown')[:13]
@@ -956,7 +962,8 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                 
                 # Get generation and training tokens per sec per GPU
                 gen_tok_gpu = r.get('gen_tokens_per_sec_per_gpu', 0)
-                train_tok_gpu = r.get('training_tokens_per_sec_per_gpu', 0)
+                train_tok_gpu = r.get('policy_training_tokens_per_sec_per_gpu', 0)  # Actual training (policy training)
+                pol_total_gpu = r.get('training_tokens_per_sec_per_gpu', 0)  # Policy total (training worker group)
                 
                 row = (
                     f"{model_name:<15} "
@@ -966,18 +973,19 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{rollout_gbs:>6} "
                     f"{train_gbs:>6} "
                     f"{max_seqlen:>6} "
-                    f"{r.get('t_tp', 1):>4} "
-                    f"{r.get('t_pp', 1):>4} "
-                    f"{r.get('t_ep', 1):>4} "
-                    f"{r.get('t_cp', 1):>4} "
-                    f"{r.get('t_dp', 1):>4} "
                     f"{r.get('g_tp', 1):>4} "
                     f"{r.get('g_pp', 1):>4} "
                     f"{r.get('g_dp', 1):>4} "
+                    f"{r.get('t_tp', 1):>4} "
+                    f"{r.get('t_cp', 1):>4} "
+                    f"{r.get('t_ep', 1):>4} "
+                    f"{r.get('t_pp', 1):>4} "
+                    f"{r.get('t_dp', 1):>4} "
                     f"{step_time:>8.2f} "
-                    f"{tokens_sec_gpu:>10,.0f} "
+                    f"{tokens_sec_gpu:>11,.0f} "
                     f"{gen_tok_gpu:>11,.0f} "
                     f"{train_tok_gpu:>11,.0f} "
+                    f"{pol_total_gpu:>11,.0f} "
                     f"{mfu_pct:>6.2f} "
                     f"{tflops:>7.1f} "
                     f"{status_str}"
@@ -999,10 +1007,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         if model_completed:
             best_tok = max(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed)
             avg_tok = sum(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed) / len(model_completed)
-            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 170}┘{RESET}")
+            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 185}┘{RESET}")
     
     # Overall summary
-    print(f"\n{'='*230}")
+    print(f"\n{'='*245}")
     print(f"\n📊 {BOLD}Overall Summary{RESET}")
     print(f"   Total runs: {total_runs}")
     print(f"   Models: {len(sorted_models)}")
@@ -1168,8 +1176,224 @@ def debug_wandb_run(project: str, entity: Optional[str] = None, run_id: Optional
             break
 
 
+def filter_results(results: list, filters: dict) -> list:
+    """Filter results based on specified criteria.
+    
+    Example filters:
+        {'rollout_gbs': 2048, 'train_gbs': 512, 'max_seqlen': 4096}
+        {'t_tp': 4, 't_pp': 1, 'g_tp': 1}
+        {'model': 'Qwen3-32B'}
+    """
+    if not filters:
+        return results
+    
+    filtered = []
+    for r in results:
+        match = True
+        for key, value in filters.items():
+            if key == 'model':
+                # Partial match for model name (case-insensitive)
+                if value.lower() not in r.get('model', '').lower():
+                    match = False
+                    break
+            else:
+                if r.get(key) != value:
+                    match = False
+                    break
+        if match:
+            filtered.append(r)
+    
+    return filtered
+
+
+def load_filter_configs(config_file: str) -> list:
+    """Load filter configurations from JSON file."""
+    with open(config_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data.get('configs', [])
+
+
+def load_presets_from_launch_grpo() -> list:
+    """Load preset configurations from launch_grpo.py.
+    
+    Returns a list of config dicts compatible with filter_by_configs().
+    """
+    try:
+        # Import PRESETS from launch_grpo.py
+        import sys
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        
+        from launch_grpo import PRESETS, calculate_dp
+        
+        configs = []
+        for preset_name, config in PRESETS.items():
+            # Calculate DP values
+            t_dp = calculate_dp(config.total_gpus, config.t_tp, config.t_pp, config.t_ep)
+            g_dp = calculate_dp(config.total_gpus, config.g_tp, config.g_pp)
+            rollout_gbs = config.num_prompts * config.num_generations
+            
+            configs.append({
+                'name': f"{preset_name} ({config.name})",
+                'preset_name': preset_name,
+                'model': config.name,
+                'total_gpus': config.total_gpus,
+                'rollout_gbs': rollout_gbs,
+                'train_gbs': config.train_gbs,
+                'max_seqlen': config.max_seqlen,
+                'g_tp': config.g_tp,
+                'g_pp': config.g_pp,
+                'g_dp': g_dp,
+                't_tp': config.t_tp,
+                't_cp': config.t_cp,
+                't_ep': config.t_ep,
+                't_pp': config.t_pp,
+                't_dp': t_dp,
+            })
+        
+        return configs
+    except ImportError as e:
+        print(f"⚠️  Could not import launch_grpo.py: {e}")
+        return []
+    except Exception as e:
+        print(f"⚠️  Error loading presets: {e}")
+        return []
+
+
+def match_config(result: dict, config: dict) -> tuple:
+    """Check if a result matches a target config.
+    
+    Returns:
+        (is_match: bool, mismatches: dict)
+        mismatches contains {field: (expected, actual)} for non-matching fields
+    """
+    # Fields to compare
+    compare_fields = [
+        'total_gpus', 'rollout_gbs', 'train_gbs', 'max_seqlen',
+        'g_tp', 'g_pp', 'g_dp',
+        't_tp', 't_cp', 't_ep', 't_pp', 't_dp'
+    ]
+    
+    mismatches = {}
+    
+    # Check model name (partial match)
+    config_model = config.get('model', '')
+    result_model = result.get('model', '')
+    if config_model and config_model.lower() not in result_model.lower():
+        mismatches['model'] = (config_model, result_model)
+    
+    # Check other fields (exact match)
+    for field in compare_fields:
+        expected = config.get(field)
+        actual = result.get(field)
+        
+        if expected is not None and actual is not None:
+            if expected != actual:
+                mismatches[field] = (expected, actual)
+    
+    is_match = len(mismatches) == 0
+    return is_match, mismatches
+
+
+def filter_by_configs(results: list, configs: list, show_mismatches: bool = True) -> list:
+    """Filter results by matching against target configurations.
+    
+    Returns results that match at least one config, and optionally shows
+    which configs are missing or have mismatches.
+    """
+    # ANSI colors
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    
+    matched_results = []
+    matched_configs = set()
+    
+    # For each result, find matching config
+    for result in results:
+        for i, config in enumerate(configs):
+            is_match, mismatches = match_config(result, config)
+            if is_match:
+                result['_matched_config'] = config.get('name', f'config_{i}')
+                matched_results.append(result)
+                matched_configs.add(i)
+                break
+    
+    if show_mismatches:
+        print(f"\n{BOLD}📋 Config Matching Report{RESET}")
+        print("=" * 100)
+        
+        for i, config in enumerate(configs):
+            config_name = config.get('name', f'config_{i}')
+            
+            if i in matched_configs:
+                # Find matching results
+                matching = [r for r in matched_results if r.get('_matched_config') == config_name]
+                print(f"\n{GREEN}✅ {config_name}{RESET}: {len(matching)} matching result(s)")
+            else:
+                print(f"\n{RED}❌ {config_name}{RESET}: No matching results")
+                
+                # Find closest match and show what's different
+                best_result = None
+                best_mismatches = None
+                min_mismatch_count = float('inf')
+                
+                for result in results:
+                    # Check if model matches at least
+                    config_model = config.get('model', '')
+                    result_model = result.get('model', '')
+                    if config_model.lower() in result_model.lower():
+                        _, mismatches = match_config(result, config)
+                        if len(mismatches) < min_mismatch_count:
+                            min_mismatch_count = len(mismatches)
+                            best_result = result
+                            best_mismatches = mismatches
+                
+                if best_result and best_mismatches:
+                    print(f"   {DIM}Closest match found with {len(best_mismatches)} difference(s):{RESET}")
+                    print(f"   {DIM}Expected config:{RESET}")
+                    expected_str = f"   GPUs={config.get('total_gpus')} R.GBS={config.get('rollout_gbs')} T.GBS={config.get('train_gbs')} SeqLen={config.get('max_seqlen')}"
+                    print(f"   {expected_str}")
+                    expected_str2 = f"   T: TP={config.get('t_tp')} CP={config.get('t_cp')} EP={config.get('t_ep')} PP={config.get('t_pp')} DP={config.get('t_dp')}"
+                    print(f"   {expected_str2}")
+                    expected_str3 = f"   G: TP={config.get('g_tp')} PP={config.get('g_pp')} DP={config.get('g_dp')}"
+                    print(f"   {expected_str3}")
+                    
+                    print(f"\n   {YELLOW}Mismatches:{RESET}")
+                    for field, (expected, actual) in best_mismatches.items():
+                        print(f"   {YELLOW}  • {field}: expected {expected}, got {actual}{RESET}")
+                else:
+                    print(f"   {DIM}No results with matching model found{RESET}")
+        
+        print("\n" + "=" * 100)
+    
+    return matched_results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Collect GRPO benchmark results")
+    parser = argparse.ArgumentParser(
+        description="Collect GRPO benchmark results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Filter Examples:
+  # Show only Qwen32B results
+  python summarize_results.py --model Qwen32B
+  
+  # Show results with specific batch sizes
+  python summarize_results.py --rollout-gbs 2048 --train-gbs 512
+  
+  # Show results with specific parallelism
+  python summarize_results.py --t-tp 4 --t-pp 1 --g-tp 1
+  
+  # Combine multiple filters
+  python summarize_results.py --model Llama --rollout-gbs 512 --max-seqlen 4096
+        """
+    )
     parser.add_argument("--project", default="sync-grpo-gb200-benchmark", 
                         help="WandB project name")
     parser.add_argument("--entity", default=None, help="WandB entity (team/user)")
@@ -1186,7 +1410,58 @@ def main():
                         help="Debug mode: show raw WandB data structure")
     parser.add_argument("--debug-run", help="Debug specific run by ID")
     
+    # Filter options
+    filter_group = parser.add_argument_group('Filter Options', 'Filter results by specific criteria')
+    filter_group.add_argument("--match-presets", "-m", action="store_true",
+                              help="Match results against presets defined in launch_grpo.py")
+    filter_group.add_argument("--filter-file", "-f", type=str, 
+                              help="JSON file with target configurations (e.g., benchmark_configs.json)")
+    filter_group.add_argument("--model", type=str, help="Filter by model name (partial match)")
+    filter_group.add_argument("--gpus", type=int, help="Filter by total GPU count")
+    filter_group.add_argument("--rollout-gbs", type=int, help="Filter by Rollout GBS")
+    filter_group.add_argument("--train-gbs", type=int, help="Filter by Training GBS")
+    filter_group.add_argument("--max-seqlen", type=int, help="Filter by Max Sequence Length")
+    # Training parallelism filters
+    filter_group.add_argument("--t-tp", type=int, help="Filter by Training Tensor Parallel")
+    filter_group.add_argument("--t-cp", type=int, help="Filter by Training Context Parallel")
+    filter_group.add_argument("--t-ep", type=int, help="Filter by Training Expert Parallel")
+    filter_group.add_argument("--t-pp", type=int, help="Filter by Training Pipeline Parallel")
+    filter_group.add_argument("--t-dp", type=int, help="Filter by Training Data Parallel")
+    # Generation parallelism filters
+    filter_group.add_argument("--g-tp", type=int, help="Filter by Generation Tensor Parallel")
+    filter_group.add_argument("--g-pp", type=int, help="Filter by Generation Pipeline Parallel")
+    filter_group.add_argument("--g-dp", type=int, help="Filter by Generation Data Parallel")
+    
     args = parser.parse_args()
+    
+    # Build filter dict from args
+    filters = {}
+    if args.model:
+        filters['model'] = args.model
+    if args.gpus:
+        filters['total_gpus'] = args.gpus
+    if args.rollout_gbs:
+        filters['rollout_gbs'] = args.rollout_gbs
+    if args.train_gbs:
+        filters['train_gbs'] = args.train_gbs
+    if args.max_seqlen:
+        filters['max_seqlen'] = args.max_seqlen
+    if args.t_tp:
+        filters['t_tp'] = args.t_tp
+    if args.t_cp:
+        filters['t_cp'] = args.t_cp
+    if args.t_ep:
+        filters['t_ep'] = args.t_ep
+    if args.t_pp:
+        filters['t_pp'] = args.t_pp
+    if args.t_dp:
+        filters['t_dp'] = args.t_dp
+    if args.g_tp:
+        filters['g_tp'] = args.g_tp
+    if args.g_pp:
+        filters['g_pp'] = args.g_pp
+    if args.g_dp:
+        filters['g_dp'] = args.g_dp
     
     # Debug mode
     if args.debug or args.debug_run:
@@ -1207,6 +1482,37 @@ def main():
         wandb_results = fetch_wandb_results(args.project, args.entity)
         results.extend(wandb_results)
         print(f"   Found {len(wandb_results)} runs")
+    
+    # Apply filters
+    if args.match_presets:
+        # Load presets from launch_grpo.py
+        print(f"\n🚀 Loading presets from launch_grpo.py")
+        target_configs = load_presets_from_launch_grpo()
+        if target_configs:
+            print(f"   Loaded {len(target_configs)} preset configurations")
+            results = filter_by_configs(results, target_configs, show_mismatches=True)
+            print(f"   Matching runs: {len(results)}")
+        else:
+            print("   ❌ No presets loaded")
+            return
+    elif args.filter_file:
+        # Load configs from JSON file
+        print(f"\n📁 Loading filter configs from: {args.filter_file}")
+        try:
+            target_configs = load_filter_configs(args.filter_file)
+            print(f"   Loaded {len(target_configs)} target configurations")
+            results = filter_by_configs(results, target_configs, show_mismatches=True)
+            print(f"   Matching runs: {len(results)}")
+        except FileNotFoundError:
+            print(f"   ❌ File not found: {args.filter_file}")
+            return
+        except json.JSONDecodeError as e:
+            print(f"   ❌ Invalid JSON: {e}")
+            return
+    elif filters:
+        print(f"\n🔍 Applying filters: {filters}")
+        results = filter_results(results, filters)
+        print(f"   Matching runs: {len(results)}")
     
     # Print table
     if results:
