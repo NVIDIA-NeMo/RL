@@ -14,17 +14,87 @@
 set -e
 
 # ============================================================
+# Model Presets (use MODEL=<name> for easy configuration)
+# ============================================================
+# Usage: MODEL=qwen32b ./run_vllm_benchmark.sh run-random
+#
+# Available presets:
+#   qwen32b      - Qwen2.5-32B-Instruct (Dense, 32B)
+#   qwen3-30b    - Qwen3-30B-A3B (MoE, 30B total, 3B active)
+#   qwen3-235b   - Qwen3-235B-A22B (MoE, 235B total, 22B active)
+#   llama70b     - Llama-3.1-70B-Instruct (Dense, 70B)
+#   llama405b    - Llama-3.1-405B-Instruct (Dense, 405B)
+#   deepseek-v3  - DeepSeek-V3 (MoE, 671B total, 37B active)
+#
+# Or use MODEL_PATH directly for custom models
+
+apply_model_preset() {
+    case "${MODEL:-}" in
+        qwen32b|qwen2.5-32b)
+            MODEL_PATH="Qwen/Qwen2.5-32B-Instruct"
+            : ${TP_SIZE:=4}
+            : ${NUM_NODES:=1}
+            ;;
+        qwen3-30b|qwen30b)
+            MODEL_PATH="Qwen/Qwen3-30B-A3B"
+            : ${TP_SIZE:=4}
+            : ${EP_SIZE:=4}
+            : ${NUM_NODES:=1}
+            IS_MOE=1
+            ;;
+        qwen3-235b|qwen235b)
+            MODEL_PATH="Qwen/Qwen3-235B-A22B"
+            : ${TP_SIZE:=8}
+            : ${EP_SIZE:=8}
+            : ${NUM_NODES:=2}
+            IS_MOE=1
+            ;;
+        llama70b|llama3-70b)
+            MODEL_PATH="meta-llama/Llama-3.1-70B-Instruct"
+            : ${TP_SIZE:=4}
+            : ${NUM_NODES:=1}
+            ;;
+        llama405b|llama3-405b)
+            MODEL_PATH="meta-llama/Llama-3.1-405B-Instruct"
+            : ${TP_SIZE:=8}
+            : ${PP_SIZE:=2}
+            : ${NUM_NODES:=4}
+            ;;
+        deepseek-v3|deepseekv3)
+            MODEL_PATH="deepseek-ai/DeepSeek-V3"
+            : ${TP_SIZE:=8}
+            : ${EP_SIZE:=8}
+            : ${NUM_NODES:=8}
+            IS_MOE=1
+            ;;
+        "")
+            # No preset, use MODEL_PATH directly
+            ;;
+        *)
+            echo "Unknown model preset: $MODEL"
+            echo "Available: qwen32b, qwen3-30b, qwen3-235b, llama70b, llama405b, deepseek-v3"
+            echo "Or use MODEL_PATH=<path> directly"
+            exit 1
+            ;;
+    esac
+}
+
+# ============================================================
 # Configuration
 # ============================================================
-NUM_NODES=${NUM_NODES:-4}
 GPUS_PER_NODE=4
 
-# Model (use local path for faster loading)
+# Apply model preset first (sets defaults)
+apply_model_preset
+
+# Override with environment variables if set
+NUM_NODES=${NUM_NODES:-1}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-32B-Instruct}
 
-# Parallelism
-TP_SIZE=${TP_SIZE:-1}
+# Parallelism (may be set by preset)
+TP_SIZE=${TP_SIZE:-4}
 PP_SIZE=${PP_SIZE:-1}
+EP_SIZE=${EP_SIZE:-1}
 
 # DP (Data Parallelism) is automatically calculated:
 # DP = (NUM_NODES × GPUS_PER_NODE) / (TP × PP)
@@ -109,7 +179,11 @@ case "${1:-help}" in
         echo "Nodes: $NUM_NODES (${GPUS_PER_NODE} GPUs each)"
         echo "Total GPUs: $TOTAL_GPUS"
         echo "Model: $MODEL_PATH"
-        echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, DP=$DP_SIZE (auto-calculated)"
+        if [ "$EP_SIZE" -gt 1 ]; then
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, EP=$EP_SIZE, DP=$DP_SIZE (MoE, auto-calculated)"
+        else
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, DP=$DP_SIZE (auto-calculated)"
+        fi
         echo "Prompts: $NUM_PROMPTS × $NUM_GENERATIONS"
         echo "Prompts file: $PROMPTS_FILE"
         echo "============================================================"
@@ -124,6 +198,9 @@ case "${1:-help}" in
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
+        EXPERT_PARALLEL_SIZE=$EP_SIZE \
+        GPUS_PER_NODE=$GPUS_PER_NODE \
+        GPU_MODEL="${GPU_MODEL:-unknown}" \
         NUM_PROMPTS=$NUM_PROMPTS \
         NUM_GENERATIONS=$NUM_GENERATIONS \
         MAX_MODEL_LEN=$MAX_MODEL_LEN \
@@ -136,7 +213,7 @@ case "${1:-help}" in
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/\$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: vllm_standalone_perf_exp/offline/\$SLURM_JOB_ID-logs/"
         echo "  - slurm-*.out    (main output)"
         echo "  - slurm-*.err    (errors)"
         echo "  - results.json   (benchmark results)"
@@ -154,7 +231,11 @@ case "${1:-help}" in
         echo "Nodes: $NUM_NODES (${GPUS_PER_NODE} GPUs each)"
         echo "Total GPUs: $TOTAL_GPUS"
         echo "Model: $MODEL_PATH"
-        echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, DP=$DP_SIZE (auto-calculated)"
+        if [ "$EP_SIZE" -gt 1 ]; then
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, EP=$EP_SIZE, DP=$DP_SIZE (MoE, auto-calculated)"
+        else
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, DP=$DP_SIZE (auto-calculated)"
+        fi
         echo "Prompts: $NUM_PROMPTS × $NUM_GENERATIONS (random)"
         echo "============================================================"
         
@@ -163,6 +244,9 @@ case "${1:-help}" in
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
+        EXPERT_PARALLEL_SIZE=$EP_SIZE \
+        GPUS_PER_NODE=$GPUS_PER_NODE \
+        GPU_MODEL="${GPU_MODEL:-unknown}" \
         NUM_PROMPTS=$NUM_PROMPTS \
         NUM_GENERATIONS=$NUM_GENERATIONS \
         MAX_MODEL_LEN=$MAX_MODEL_LEN \
@@ -176,7 +260,119 @@ case "${1:-help}" in
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/\$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: vllm_standalone_perf_exp/offline/\$SLURM_JOB_ID-logs/"
+        ;;
+    
+    run-throughput)
+        # Calculate DP for display
+        TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+        GPUS_PER_INSTANCE=$((TP_SIZE * PP_SIZE))
+        DP_SIZE=$((TOTAL_GPUS / GPUS_PER_INSTANCE))
+        
+        # Throughput benchmark parameters (vllm bench throughput)
+        INPUT_LENS=${INPUT_LENS:-"128 256 512 1024"}
+        OUTPUT_LENS=${OUTPUT_LENS:-"128 256 512 1024 2048"}
+        THROUGHPUT_NUM_PROMPTS=${THROUGHPUT_NUM_PROMPTS:-1000}
+        # IGNORE_EOS=1 (default): Force exact output length, ignore EOS token
+        # IGNORE_EOS=0: Allow early stopping at EOS token
+        IGNORE_EOS=${IGNORE_EOS:-1}
+        
+        echo "============================================================"
+        echo "Submitting vLLM Official Throughput Benchmark"
+        echo "============================================================"
+        echo "Nodes: $NUM_NODES (${GPUS_PER_NODE} GPUs each)"
+        echo "Total GPUs: $TOTAL_GPUS"
+        echo "Model: $MODEL_PATH"
+        if [ "$EP_SIZE" -gt 1 ]; then
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, EP=$EP_SIZE (MoE)"
+        else
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE"
+        fi
+        echo "Input lengths: $INPUT_LENS (EXACT, synthetic prompts)"
+        echo "Output lengths: $OUTPUT_LENS"
+        echo "Num prompts per config: $THROUGHPUT_NUM_PROMPTS"
+        if [ "$IGNORE_EOS" == "1" ]; then
+            echo "Length mode: FIXED input + FIXED output (--ignore-eos)"
+        else
+            echo "Length mode: FIXED input + VARIABLE output (EOS allowed)"
+        fi
+        echo "============================================================"
+        
+        cd "$SCRIPT_DIR"
+        
+        MODEL_PATH="$MODEL_PATH" \
+        TENSOR_PARALLEL_SIZE=$TP_SIZE \
+        PIPELINE_PARALLEL_SIZE=$PP_SIZE \
+        EXPERT_PARALLEL_SIZE=$EP_SIZE \
+        GPUS_PER_NODE=$GPUS_PER_NODE \
+        GPU_MODEL="${GPU_MODEL:-unknown}" \
+        INPUT_LENS="$INPUT_LENS" \
+        OUTPUT_LENS="$OUTPUT_LENS" \
+        NUM_PROMPTS=$THROUGHPUT_NUM_PROMPTS \
+        IGNORE_EOS=$IGNORE_EOS \
+        MAX_MODEL_LEN=$MAX_MODEL_LEN \
+        sbatch \
+            --nodes=$NUM_NODES \
+            --gres=gpu:$GPUS_PER_NODE \
+            benchmark_vllm_throughput.sbatch
+        
+        echo ""
+        echo "Logs will be in: vllm_standalone_perf_exp/throughput/\$SLURM_JOB_ID-logs/"
+        echo "  - result_ISL*_OSL*.txt   (per-config results)"
+        echo "  - results_summary.txt    (summary CSV)"
+        echo "  - results.json           (JSON results)"
+        ;;
+    
+    run-online)
+        # Calculate DP for display
+        TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+        GPUS_PER_INSTANCE=$((TP_SIZE * PP_SIZE))
+        DP_SIZE=$((TOTAL_GPUS / GPUS_PER_INSTANCE))
+        
+        # Online serving parameters
+        MAX_CONCURRENCY=${MAX_CONCURRENCY:-64}
+        ONLINE_NUM_PROMPTS=${ONLINE_NUM_PROMPTS:-$((MAX_CONCURRENCY * 5))}
+        MAX_ISL=${MAX_ISL:-150}
+        MAX_OSL=${MAX_OSL:-"1000 2000"}
+        
+        echo "============================================================"
+        echo "Submitting vLLM Online Serving Benchmark"
+        echo "============================================================"
+        echo "Nodes: $NUM_NODES (${GPUS_PER_NODE} GPUs each)"
+        echo "Total GPUs: $TOTAL_GPUS"
+        echo "Model: $MODEL_PATH"
+        if [ "$EP_SIZE" -gt 1 ]; then
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE, EP=$EP_SIZE (MoE)"
+        else
+            echo "Parallelism: TP=$TP_SIZE, PP=$PP_SIZE"
+        fi
+        echo "Max concurrency: $MAX_CONCURRENCY"
+        echo "Num prompts: $ONLINE_NUM_PROMPTS"
+        echo "ISL: $MAX_ISL, OSL: $MAX_OSL"
+        echo "============================================================"
+        
+        cd "$SCRIPT_DIR"
+        
+        MODEL_PATH="$MODEL_PATH" \
+        TENSOR_PARALLEL_SIZE=$TP_SIZE \
+        PIPELINE_PARALLEL_SIZE=$PP_SIZE \
+        EXPERT_PARALLEL_SIZE=$EP_SIZE \
+        GPUS_PER_NODE=$GPUS_PER_NODE \
+        GPU_MODEL="${GPU_MODEL:-unknown}" \
+        MAX_CONCURRENCY=$MAX_CONCURRENCY \
+        NUM_PROMPTS=$ONLINE_NUM_PROMPTS \
+        MAX_ISL="$MAX_ISL" \
+        MAX_OSL="$MAX_OSL" \
+        MAX_MODEL_LEN=$MAX_MODEL_LEN \
+        sbatch \
+            --nodes=$NUM_NODES \
+            --gres=gpu:$GPUS_PER_NODE \
+            benchmark_vllm_online.sbatch
+        
+        echo ""
+        echo "Logs will be in: vllm_standalone_perf_exp/online/\$SLURM_JOB_ID-logs/"
+        echo "  - result_ISL*_OSL*.txt   (per-config results)"
+        echo "  - results_summary.txt    (summary CSV)"
         ;;
     
     build)
@@ -285,6 +481,7 @@ case "${1:-help}" in
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
+        EXPERT_PARALLEL_SIZE=$EP_SIZE \
         NUM_PROMPTS=$NUM_PROMPTS \
         NUM_GENERATIONS=$NUM_GENERATIONS \
         PROMPTS_FILE="$PROMPTS_FILE" \
@@ -295,40 +492,76 @@ case "${1:-help}" in
         ;;
     
     help|*)
-        echo "vLLM Offline Benchmark Runner"
+        echo "vLLM Benchmark Runner (Offline, Online & Throughput)"
         echo ""
         echo "Usage: $0 <command>"
         echo ""
-        echo "Commands:"
+        echo "Offline Benchmark Commands (batch processing, max throughput):"
         echo "  prepare         Prepare prompts from NeMo-RL dataset (submits SLURM job)"
+        echo "  run             Run offline benchmark with prepared prompts"
+        echo "  run-random      Run offline benchmark with random prompts"
+        echo ""
+        echo "Throughput Benchmark Commands (vllm bench throughput - fixed ISL/OSL):"
+        echo "  run-throughput  Run official vLLM throughput benchmark (sweeps ISL/OSL)"
+        echo ""
+        echo "Online Benchmark Commands (server mode, latency measurement):"
+        echo "  run-online      Run online serving benchmark (vllm serve + vllm bench)"
+        echo ""
+        echo "Build Commands:"
         echo "  build           Build venv for benchmark (one-time, uses container vLLM)"
         echo "  build-custom    Build venv with custom vLLM from GitHub"
         echo "  build-local     Build venv with local vLLM source (for development)"
-        echo "  run             Run benchmark with prepared prompts"
-        echo "  run-random      Run benchmark with random prompts (no prepare needed)"
         echo "  run-custom-vllm Run benchmark (after build-custom or build-local)"
         echo ""
         echo "Environment variables:"
-        echo "  NUM_NODES       Number of nodes (default: 4)"
-        echo "  MODEL_PATH      Model path or HuggingFace name"
-        echo "  TP_SIZE         Tensor parallel size (default: 4)"
+        echo "  MODEL           Model preset name (qwen32b, qwen3-30b, etc.)"
+        echo "  MODEL_PATH      Model path or HuggingFace name (overrides MODEL)"
+        echo "  NUM_NODES       Number of nodes (auto-set by preset)"
+        echo "  TP_SIZE         Tensor parallel size (auto-set by preset)"
         echo "  PP_SIZE         Pipeline parallel size (default: 1)"
+        echo "  EP_SIZE         Expert parallel size for MoE (auto-set by preset)"
         echo "  # DP is auto-calculated: DP = (NUM_NODES × GPUS_PER_NODE) / (TP × PP)"
+        echo ""
+        echo "HuggingFace variables:"
+        echo "  HF_HOME         HuggingFace home directory (for model cache)"
+        echo "  HF_TOKEN        HuggingFace token (for gated models)"
+        echo ""
+        echo "Offline-specific variables:"
         echo "  NUM_PROMPTS     Number of unique prompts (default: 64)"
         echo "  NUM_GENERATIONS Generations per prompt (default: 32)"
-        echo "  SEED            Random seed for dataset (default: 42, must match grpo.seed)"
-        echo "  VLLM_GIT_REPO   Custom vLLM git repo (for build-custom)"
-        echo "  VLLM_GIT_BRANCH Custom vLLM git branch (for build-custom)"
-        echo "  VLLM_LOCAL_PATH Local vLLM source directory (for build-local)"
+        echo ""
+        echo "Throughput-specific variables (run-throughput):"
+        echo "  INPUT_LENS      Input sequence lengths, space-separated (default: '128 256 512 1024')"
+        echo "  OUTPUT_LENS     Output sequence lengths, space-separated (default: '128 256 512 1024 2048')"
+        echo "  THROUGHPUT_NUM_PROMPTS  Prompts per config (default: 1000)"
+        echo "  IGNORE_EOS      Force exact output length (default: 1)"
+        echo "                  1 = generate exactly output-len tokens (--ignore-eos)"
+        echo "                  0 = allow early stopping at EOS token"
+        echo ""
+        echo "Online-specific variables (run-online):"
+        echo "  MAX_CONCURRENCY Max concurrent requests (default: 64)"
+        echo "  MAX_ISL         Input sequence length (default: 150)"
+        echo "  MAX_OSL         Output sequence lengths, space-separated (default: '1000 2000')"
         echo ""
         echo "Parallelism example (4 nodes × 4 GPUs = 16 GPUs):"
         echo "  TP=4, PP=1 → DP=4 (4 vLLM instances, each using 4 GPUs)"
         echo "  TP=8, PP=1 → DP=2 (2 vLLM instances, each using 8 GPUs)"
-        echo "  TP=4, PP=2 → DP=2 (2 vLLM instances, each using 8 GPUs)"
         echo ""
         echo "Examples:"
-        echo "  # Quick start (random prompts)"
-        echo "  $0 run-random"
+        echo "  # Offline benchmark (using model preset)"
+        echo "  MODEL=qwen32b $0 run-random"
+        echo ""
+        echo "  # Official throughput benchmark (fixed ISL/OSL sweep)"
+        echo "  MODEL=qwen32b $0 run-throughput"
+        echo ""
+        echo "  # Throughput with custom ISL/OSL ranges"
+        echo "  MODEL=qwen32b INPUT_LENS='256 512' OUTPUT_LENS='512 1024 2048' $0 run-throughput"
+        echo ""
+        echo "  # Online benchmark (server mode)"
+        echo "  MODEL=qwen32b $0 run-online"
+        echo ""
+        echo "  # Online with custom ISL/OSL"
+        echo "  MODEL=qwen3-30b MAX_ISL=200 MAX_OSL='500 1000 2000' $0 run-online"
         echo ""
         echo "  # With NeMo-RL dataset prompts"
         echo "  $0 prepare           # Submit job to prepare prompts"
@@ -348,6 +581,33 @@ case "${1:-help}" in
         echo "  $0 run-custom-vllm   # Run benchmark"
         echo "  # After more edits, rebuild:"
         echo "  VLLM_LOCAL_PATH=~/vllm $0 build-local"
+        echo ""
+        echo "========================================================"
+        echo "Model Presets (Easy Mode!):"
+        echo "========================================================"
+        echo ""
+        echo "  # Just use MODEL=<preset> - settings are auto-configured!"
+        echo ""
+        echo "  MODEL=qwen32b $0 run-random      # Qwen2.5-32B (1 node, TP=4)"
+        echo "  MODEL=qwen3-30b $0 run-random    # Qwen3-30B MoE (1 node, TP=4, EP=4)"
+        echo "  MODEL=qwen3-235b $0 run-random   # Qwen3-235B MoE (2 nodes, TP=8, EP=8)"
+        echo "  MODEL=llama70b $0 run-random     # Llama-3.1-70B (1 node, TP=4)"
+        echo "  MODEL=deepseek-v3 $0 run-random  # DeepSeek-V3 (8 nodes, TP=8, EP=8)"
+        echo ""
+        echo "  # Override preset defaults if needed:"
+        echo "  MODEL=qwen3-30b NUM_NODES=2 $0 run-random"
+        echo ""
+        echo "  # Or use custom model path:"
+        echo "  MODEL_PATH=/path/to/model TP_SIZE=4 $0 run-random"
+        echo ""
+        echo "Available presets:"
+        echo "  qwen32b     - Qwen2.5-32B-Instruct (32B Dense)"
+        echo "  qwen3-30b   - Qwen3-30B-A3B (30B MoE, 3B active)"
+        echo "  qwen3-235b  - Qwen3-235B-A22B (235B MoE, 22B active)"
+        echo "  llama70b    - Llama-3.1-70B-Instruct (70B Dense)"
+        echo "  llama405b   - Llama-3.1-405B-Instruct (405B Dense)"
+        echo "  deepseek-v3 - DeepSeek-V3 (671B MoE, 37B active)"
+        echo ""
         ;;
 esac
 
