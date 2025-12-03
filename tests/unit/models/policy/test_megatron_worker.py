@@ -129,6 +129,7 @@ def create_megatron_test_config(
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {

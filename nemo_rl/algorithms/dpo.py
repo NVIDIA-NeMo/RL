@@ -603,6 +603,10 @@ def dpo_train(
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update(
+                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
                     if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:

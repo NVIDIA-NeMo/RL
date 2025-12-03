@@ -106,6 +106,7 @@ policy: &POLICY_BASE
         apply_rope_fusion: True
         bias_activation_fusion: True
         defer_fp32_logits: False
+        moe_per_layer_logging: False
         
         optimizer:
             optimizer: "adam"
