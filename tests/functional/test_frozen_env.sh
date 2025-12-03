@@ -90,18 +90,21 @@ else
 fi
 
 echo
-echo "Test 2b: Pyproject mutation - import nemo_rl should fail after mutation"
+echo "Test 2b: Pyproject mutation - import nemo_rl should warn after mutation"
 echo "  Adding newline to top of pyproject.toml..."
 # Add a newline to the top of pyproject.toml
 echo "" | cat - pyproject.toml > pyproject.toml.tmp && mv pyproject.toml.tmp pyproject.toml
 
-echo -n "  Testing python -c 'import nemo_rl' (should fail) ... "
-if python -c "import nemo_rl" 2>/dev/null; then
-    echo "✗ FAILED"
-    echo "ERROR: import nemo_rl succeeded after pyproject.toml mutation (should fail)"
-    exit 1
+echo -n "  Testing python -c 'import nemo_rl' (should print warning) ... "
+IMPORT_OUTPUT=$(python -c "import nemo_rl" 2>&1 || true)
+if echo "$IMPORT_OUTPUT" | grep -q "WARNING: Container/Code Version Mismatch Detected"; then
+    echo "✓ OK (warning printed as expected)"
 else
-    echo "✓ OK (import failed as expected)"
+    echo "✗ FAILED"
+    echo "ERROR: import nemo_rl did not print version mismatch warning after pyproject.toml mutation"
+    echo "Output was:"
+    echo "$IMPORT_OUTPUT"
+    exit 1
 fi
 
 # Restore pyproject.toml for next test
@@ -111,7 +114,7 @@ rsync -a pyproject.toml "$TEMP_DIR/pyproject.toml"
 cd "$TEMP_DIR"
 
 echo
-echo "Test 2c: Submodule mutation - import nemo_rl should fail after updating submodule"
+echo "Test 2c: Submodule mutation - import nemo_rl should warn after updating submodule"
 echo "  Updating 3rdparty/megatron-lm submodule to HEAD of main branch..."
 
 # Check if megatron-lm submodule exists
@@ -125,13 +128,16 @@ else
         echo "  Successfully updated submodule to latest main"
         
         cd "$TEMP_DIR"
-        echo -n "  Testing python -c 'import nemo_rl' (should fail) ... "
-        if python -c "import nemo_rl" 2>/dev/null; then
-            echo "✗ FAILED"
-            echo "ERROR: import nemo_rl succeeded after submodule mutation (should fail)"
-            exit 1
+        echo -n "  Testing python -c 'import nemo_rl' (should print warning) ... "
+        IMPORT_OUTPUT=$(python -c "import nemo_rl" 2>&1 || true)
+        if echo "$IMPORT_OUTPUT" | grep -q "WARNING: Container/Code Version Mismatch Detected"; then
+            echo "✓ OK (warning printed as expected)"
         else
-            echo "✓ OK (import failed as expected)"
+            echo "✗ FAILED"
+            echo "ERROR: import nemo_rl did not print version mismatch warning after submodule mutation"
+            echo "Output was:"
+            echo "$IMPORT_OUTPUT"
+            exit 1
         fi
     else
         echo "  WARNING: Could not update submodule (network issue?), skipping this test"
@@ -207,7 +213,7 @@ echo "=========================================="
 echo
 echo "Summary:"
 echo "  ✓ Test 1: All ${#PYTHON_EXECUTABLES[@]} python-* executables can import ray"
-echo "  ✓ Test 2: Mutation detection working (pyproject.toml and submodule changes detected)"
+echo "  ✓ Test 2: Mutation detection working (pyproject.toml and submodule changes trigger warnings)"
 echo "  ✓ Test 3: Import isolation between worker environments verified"
 echo
 
