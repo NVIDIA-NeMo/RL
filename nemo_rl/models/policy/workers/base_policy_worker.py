@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 class AbstractPolicyWorker:
@@ -114,6 +115,8 @@ class AbstractPolicyWorker:
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
 
+    # Temporary fix, 'data' is a kwarg due to some sort of ray bug
+    @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
