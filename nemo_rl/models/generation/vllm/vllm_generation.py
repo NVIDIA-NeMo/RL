@@ -577,6 +577,14 @@ class VllmGeneration(GenerationInterface):
                     # sample_result is a tuple: (original_idx, BatchedDataDict)
                     # Tag the result with worker index for downstream attribution
                     original_idx, result_batch = sample_result
+                    if os.getenv("NRL_VLLM_SEND_SHAPES_ONLY", "false") == "true":
+                        result_batch["output_ids"] = torch.randint(
+                            0, 1000, result_batch["output_ids"]
+                        )
+                        result_batch["logprobs"] = torch.randn(result_batch["logprobs"])
+                        print(
+                            f"🌀🌀[LONGSEQ-DEBUG][generate_async] reconstruct item! (original_idx: {original_idx})"
+                        )
                     # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
                     result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
                     sample_result = (original_idx, result_batch)
@@ -625,15 +633,6 @@ class VllmGeneration(GenerationInterface):
 
             if msg_type == "sample":
                 # Yield individual sample result immediately
-                if os.getenv("NRL_VLLM_SEND_SHAPES_ONLY", "false") == "true":
-                    item[1]["output_ids"] = torch.randint(
-                        0, 1000, item[1]["output_ids"]
-                    )
-                    item[1]["logprobs"] = torch.randn(item[1]["logprobs"])
-                    print(
-                        f"🌀🌀[LONGSEQ-DEBUG][generate_async] reconstruct item! (original_idx: {item[0]})"
-                    )
-
                 yield item
             elif msg_type == "error":
                 # Cancel the task and propagate error
