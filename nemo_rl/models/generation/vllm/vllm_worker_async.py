@@ -174,31 +174,23 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             zmq_port = base_kv_events_port + port_offset
             metrics_port = base_metrics_port + port_offset
             
-            # Get the node IP to bind to for distributed setups
-            # In distributed clusters, we need to bind to the specific IP so routers on other nodes can connect
-            try:
-                import ray
-                node_ip = ray.util.get_node_ip_address()
-            except Exception as e:
-                print(f"[Router] Warning: Failed to get node IP: {e}, using 0.0.0.0")
-                node_ip = "0.0.0.0"  # Fallback to all interfaces
-            
+            endpoint = f"tcp://*:{zmq_port}"
             print(
                 f"[Router] Worker (global_id={global_worker_id}, local DP rank={dp_rank}): "
-                f"KV events port={zmq_port}, metrics port={metrics_port}, binding to {node_ip}"
+                f"KV events port={zmq_port}, metrics port={metrics_port}"
             )
+            print(f"[Router] Worker {global_worker_id} binding KV events to: {endpoint}")
 
             llm_kwargs["kv_events_config"] = KVEventsConfig(
                 enable_kv_cache_events=True,
                 publisher="zmq",
-                endpoint=f"tcp://{node_ip}:{zmq_port}",
+                endpoint=endpoint,
             )
 
             llm_kwargs["enable_prefix_caching"] = True
             llm_kwargs["block_size"] = block_size
 
-            # Pass bind_ip to LoggerFactory so metrics are also bound to the specific node IP
-            stat_logger = [LoggerFactory(port=metrics_port, bind_ip=node_ip)]
+            stat_logger = [LoggerFactory(port=metrics_port)]
             
             # Apply patch to ensure KV events are published
             from nemo_rl.models.generation.vllm.vllm_v1_kv_events_patch import patch_vllm_v1_kv_events

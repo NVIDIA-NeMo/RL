@@ -119,18 +119,19 @@ class KvRouter:
             self.worker_metrics_ports = [base_metrics_port + i for i in range(num_workers)]
 
         self.context = zmq.Context()
-        self.load_listeners = [
-            setup_zmq_subscriber(
-                self.context, f"tcp://{self.worker_addresses[worker_id]}:{self.worker_metrics_ports[worker_id]}"
-            )
-            for worker_id in range(num_workers)
-        ]
-        self.kv_listeners = [
-            ZmqKvEventListener(
-                f"tcp://{self.worker_addresses[worker_id]}:{self.worker_kv_ports[worker_id]}", "", block_size
-            )
-            for worker_id in range(num_workers)
-        ]
+        
+        # Create listeners with detailed logging
+        self.load_listeners = []
+        for worker_id in range(num_workers):
+            endpoint = f"tcp://{self.worker_addresses[worker_id]}:{self.worker_metrics_ports[worker_id]}"
+            logger.info(f"Router connecting to worker {worker_id} metrics at: {endpoint}")
+            self.load_listeners.append(setup_zmq_subscriber(self.context, endpoint))
+        
+        self.kv_listeners = []
+        for worker_id in range(num_workers):
+            endpoint = f"tcp://{self.worker_addresses[worker_id]}:{self.worker_kv_ports[worker_id]}"
+            logger.info(f"Router connecting to worker {worker_id} KV events at: {endpoint}")
+            self.kv_listeners.append(ZmqKvEventListener(endpoint, "", block_size))
 
         self.background_tasks: list[asyncio.Task] = []
         self.load_tasks: list[asyncio.Task] = []
