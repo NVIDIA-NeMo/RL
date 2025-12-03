@@ -16,7 +16,6 @@ t_tp=1
 t_ep=1
 t_pp=1
 t_cp=1
-t_vpp=1
 
 if [ ${t_tp} -eq 1 ]; then t_sp=False; else t_sp=True; fi
 
@@ -38,7 +37,6 @@ policy.megatron_cfg.tensor_model_parallel_size=${t_tp} \
 policy.megatron_cfg.expert_model_parallel_size=${t_ep} \
 policy.megatron_cfg.pipeline_model_parallel_size=${t_pp} \
 policy.megatron_cfg.context_parallel_size=${t_cp} \
-policy.megatron_cfg.num_layers_per_virtual_pipeline_stage=${t_vpp} \
 policy.megatron_cfg.sequence_parallel=${t_sp} \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
@@ -50,7 +48,7 @@ policy.train_global_batch_size=512 \
 grpo.max_num_steps=20 \
 logger.wandb_enabled=True \
 logger.wandb.project='sync-grpo-gb200-benchmark' \
-logger.wandb.name='Llama8B-N${NUM_NODES}xG${GPUS_PER_NODE}-Train(tp${t_tp}.pp${t_pp}.ep${t_ep}.cp${t_cp}.vpp${t_vpp})-Gen(tp${g_tp}.pp${g_pp}.ep${g_ep})'" \
+logger.wandb.name='Llama8B_N${NUM_NODES}xG${GPUS_PER_NODE}_Ttp${t_tp}pp${t_pp}ep${t_ep}cp${t_cp}_Gtp${g_tp}pp${g_pp}ep${g_ep}'" \
 CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl.sqsh \
 HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home \
 HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache \
