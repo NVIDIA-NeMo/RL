@@ -75,8 +75,8 @@ for MODEL in "${MODELS[@]}"; do
             MAX_TOKENS=$MAX_TOKENS \
             "$SCRIPT_DIR/run_vllm_benchmark.sh" run-random 2>&1)
         
-        # Extract job ID from output
-        JOB_ID=$(echo "$JOB_OUTPUT" | grep -oP 'Submitted batch job \K\d+' || echo "unknown")
+        # Extract job ID from output (use sed for compatibility)
+        JOB_ID=$(echo "$JOB_OUTPUT" | grep 'Submitted batch job' | sed 's/.*Submitted batch job \([0-9]*\).*/\1/' || echo "unknown")
         JOB_IDS+=("$JOB_ID")
         
         echo "  → Job ID: $JOB_ID"
