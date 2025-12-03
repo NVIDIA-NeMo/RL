@@ -1,9 +1,10 @@
 
 from functools import partial
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 
+from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -24,14 +25,29 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.megatron.data import process_microbatch
 
 def forward_step(
-    model,
-    data_dict,
-    cfg,
-    input_ids_cp_sharded,
-    position_ids,
-    attention_mask,
-    packed_seq_params,
-):
+    model: GPTModel,
+    data_dict: BatchedDataDict[Any],
+    cfg: Dict[str, Any],
+    input_ids_cp_sharded: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+) -> torch.Tensor:
+    """
+    Perform a single forward pass through the model.
+    
+    Args:
+        model: The model to run forward pass on
+        data_dict (BatchedDataDict): Dictionary containing batch data
+        cfg (dict): Configuration dictionary
+        input_ids_cp_sharded: Context-parallel sharded input token IDs
+        position_ids: Position IDs for tokens
+        attention_mask: Attention mask for the sequence
+        packed_seq_params: Parameters for packed sequences (optional)
+        
+    Returns:
+        torch.Tensor: Output tensor from the model (logits)
+    """
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
@@ -63,13 +79,34 @@ def forward_step(
 
 def forward_with_processor(
     data_iterator: Iterator[BatchedDataDict[Any]],
-    model,
-    cfg,
+    model: GPTModel,
+    cfg: Dict[str, Any],
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
-    processor_fn: Optional[Callable[Any, Callable]] = None,
-):
+    processor_fn: Optional[Callable[..., Callable]] = None,
+) -> Tuple[torch.Tensor, Callable]:
+    """
+    Perform forward pass with data processing and return output tensor and processor function.
+    
+    This function handles data preprocessing (including sequence packing if enabled),
+    runs the forward step through the model, and prepares a processor function for
+    post-processing the outputs.
+    
+    Args:
+        data_iterator: Iterator yielding batched data dictionaries
+        model: The model to run forward pass on  
+        cfg (dict): Configuration dictionary
+        seq_length_key: Key for sequence length in data dict (optional)
+        pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
+        pad_full_seq_to: Target length for full sequence padding (optional)
+        processor_fn: Function that creates output processor (optional)
+        
+    Returns:
+        tuple: (output_tensor, processor_fn_wrapped)
+            - output_tensor: Raw model outputs (logits)
+            - processor_fn_wrapped: Function to process outputs into loss/metrics
+    """
     pack_sequences = cfg["sequence_packing"]["enabled"]
     data_dict = next(data_iterator).to("cuda")
     (
@@ -113,20 +150,42 @@ def forward_with_processor(
 
     return output_tensor, processor_fn_wrapped
 
-def forward_maybe_backward(
-    model,
-    cfg,
-    data_iterator,
-    seq_length_key,
-    pad_individual_seqs_to_multiple_of,
-    pad_full_seq_to,
-    num_microbatches,
-    seq_length,
-    mbs,
-    ## TODO: type hint
-    processor_fn: Callable[[torch.Tensor], torch.Tensor],
+def megatron_forward_backward(
+    model: GPTModel,
+    cfg: Dict[str, Any],
+    data_iterator: Iterator[BatchedDataDict[Any]],
+    seq_length_key: Optional[str],
+    pad_individual_seqs_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+    num_microbatches: int,
+    seq_length: int,
+    mbs: int,
+    processor_fn: Callable[..., Callable],
     forward_only: bool = False,
-) -> BatchedDataDict[Any]:
+) -> Any:
+    """
+    Execute forward and backward passes using Megatron's utilities.
+    
+    This is the main training loop function that coordinates forward and backward
+    passes across multiple microbatches using Megatron's pipeline parallel
+    execution framework.
+    
+    Args:
+        model: The model to train
+        cfg (dict): Configuration dictionary
+        data_iterator: Iterator providing training data batches
+        seq_length_key: Key for sequence length in data
+        pad_individual_seqs_to_multiple_of: Padding multiple for sequences 
+        pad_full_seq_to: Target length for full sequence padding
+        num_microbatches (int): Number of microbatches to process
+        seq_length (int): Sequence length
+        mbs (int): Micro batch size
+        processor_fn: Function to process model logits into loss/metrics
+        forward_only (bool): If True, skip backward pass
+        
+    Returns:
+        BatchedDataDict: Results from the forward/backward execution
+    """
     forward_step = partial(
         forward_with_processor,
         cfg=cfg,
@@ -147,18 +206,37 @@ def forward_maybe_backward(
         forward_only=forward_only,
     )
 
-## processor_fn should return a callable that takes the output tensor and returns a tuple of (loss, metrics)
 def loss_processor(
     loss_fn: LossFunction,
-    cfg: dict,
+    cfg: Dict[str, Any],
     global_valid_seqs: torch.Tensor,
     global_valid_toks: torch.Tensor,
     ## the following args depend on the batch and are passed in by forward_with_processor
     data_dict: BatchedDataDict[Any],
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_normalize: bool = True,
-    **unused_kwargs,
-):
+    **unused_kwargs: Any,
+) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
+    """
+    Create a loss processor function for training.
+    
+    This function wraps a loss function with the necessary context and parameters
+    to compute loss and metrics from model outputs. It handles sequence packing
+    and context parallelism normalization.
+    
+    Args:
+        loss_fn: The base loss function to wrap
+        cfg (dict): Configuration dictionary
+        global_valid_seqs: Global count of valid sequences 
+        global_valid_toks: Global count of valid tokens
+        data_dict: Batched data dictionary
+        packed_seq_params: Parameters for packed sequences (optional)
+        cp_normalize (bool): Whether to normalize by context parallel size
+        **unused_kwargs: Additional unused keyword arguments
+        
+    Returns:
+        Callable: Function that takes output tensor and returns (loss, metrics) tuple
+    """
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     if pack_sequences and packed_seq_params is not None:
@@ -192,13 +270,29 @@ def loss_processor(
     return loss_fn_wrapped
 
 def logprobs_processor(
-    cfg: dict,
+    cfg: Dict[str, Any],
     ## the following args depend on the batch
     data_dict: BatchedDataDict[Any],
-    input_ids,
-    cu_seqlens_padded,
-    **unused_kwargs,
-):
+    input_ids: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    **unused_kwargs: Any,
+) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    """
+    Create a processor function that computes token log probabilities.
+    
+    This function returns a processor that takes model logits and converts them
+    to token-level log probabilities, handling both packed and unpacked sequences.
+    
+    Args:
+        cfg (dict): Configuration dictionary
+        data_dict: Batched data dictionary containing input sequences
+        input_ids: Processed input token IDs
+        cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+        **unused_kwargs: Additional unused keyword arguments
+        
+    Returns:
+        Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
+    """
     unpacked_input_ids = data_dict["input_ids"]
     original_seq_length = unpacked_input_ids.shape[1]
     
@@ -241,13 +335,31 @@ def logprobs_processor(
 
 
 def topk_logits_processor(
-    cfg: dict,
+    cfg: Dict[str, Any],
     k: int,
     ## arguments that depend on the batch
-    data_dict,
-    cu_seqlens_padded,
-    **additional_kwargs,
-):
+    data_dict: BatchedDataDict[Any],
+    cu_seqlens_padded: torch.Tensor,
+    **unused_kwargs: Any,
+) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    """
+    Create a processor function that computes top-k logits and indices.
+    
+    This function returns a processor that extracts the top-k highest logits
+    and their corresponding vocabulary indices from model outputs. It handles
+    tensor parallelism, context parallelism, and sequence packing.
+    
+    Args:
+        cfg (dict): Configuration dictionary
+        k (int): Number of top logits to extract
+        data_dict: Batched data dictionary
+        cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+        **unused_kwargs: Additional unused keyword arguments
+        
+    Returns:
+        Callable: Function that takes output tensor and returns 
+                  (dummy_loss, {"topk_logits": values, "topk_indices": indices})
+    """
 
     pack = cfg["sequence_packing"]["enabled"]
     cp_size = cfg["megatron_cfg"]["context_parallel_size"]

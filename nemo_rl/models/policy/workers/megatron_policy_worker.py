@@ -58,6 +58,7 @@ from megatron.bridge.training.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.bridge.models.conversion.param_mapping import broadcast_obj_from_pp_rank
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
@@ -97,11 +98,10 @@ from nemo_rl.models.megatron.data import (
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
-    broadcast_object_across_pp_ranks,
     broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.train import (
-    forward_maybe_backward,
+    megatron_forward_backward,
     loss_processor,
     logprobs_processor,
     topk_logits_processor,
@@ -357,7 +357,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     self.optimizer.zero_grad()
 
                     # Forward pass.
-                    losses_reduced = forward_maybe_backward(
+                    losses_reduced = megatron_forward_backward(
                         model=self.model,
                         cfg=self.cfg,
                         data_iterator=data_iterator,
@@ -505,7 +505,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         
         pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
-        list_of_logprobs = forward_maybe_backward(
+        list_of_logprobs = megatron_forward_backward(
             model=self.model,
             cfg=self.cfg,
             data_iterator=mb_iterator,
@@ -629,7 +629,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         
         pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
-        list_of_outputs = forward_maybe_backward(
+        list_of_outputs = megatron_forward_backward(
             model=self.model,
             cfg=self.cfg,
             data_iterator=mb_iterator,
@@ -951,7 +951,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                 )
 
             # Broadcast size_in_bytes across pipeline parallel ranks
-            return broadcast_object_across_pp_ranks(size_in_bytes)
+            return broadcast_obj_from_pp_rank(size_in_bytes)
 
         for task in self.refit_conversion_tasks:
             param_info.append(
