@@ -130,7 +130,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.packed_tensor import packed_comm_producer
 
 try:
     from megatron.core.distributed import (
@@ -902,6 +902,22 @@ class MegatronPolicyWorker:
 
         # world_size = train_world_size + inference_world_size
         # variable train_world_size is used in inference cluster
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
+
+    def init_p2p(
+        self, group_id: int, ip: str, port: int, world_size: int
+    ) -> None:
+        """Initialize the p2p communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        if (group_id == 0 and self.rank % 2 != 0) or (group_id == 1 and self.rank % 2 == 0):
+            return
+        self.p2p_dst = self.rank + 1 if group_id == 0 else self.rank - 1
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=self.rank, world_size=world_size
         )
@@ -2029,10 +2045,29 @@ class MegatronPolicyWorker:
         )
 
         # param_iterator will return (name, tensor), we only need tensor
-        packed_broadcast_producer(
+        packed_comm_producer(
             iterator=hf_params_generator,
             group=self.model_update_group,
-            src=0,
+            collective_type="broadcast",
+            collective_arg=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    @torch.no_grad()
+    def stream_weights_via_p2p(self) -> None:
+        """Send the weights for p2p communication."""
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+        )
+        
+        # param_iterator will return (name, tensor), we only need tensor
+        packed_comm_producer(
+            iterator=hf_params_generator,
+            group=self.model_update_group,
+            collective_type="p2p",
+            collective_arg=self.p2p_dst,
             post_iter_func=lambda x: x[1],
         )
 

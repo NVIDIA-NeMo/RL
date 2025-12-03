@@ -422,6 +422,14 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    def init_p2p(
+        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+    ) -> None:
+        self.llm.collective_rpc(
+            "init_p2p",
+            args=(rank_prefix, group_id, ip, port, world_size),
+        )
+
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -678,6 +686,37 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_p2p")
+    def update_weights_via_p2p(self) -> bool:
+        """Update the model weights from collective communication."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_via_p2p can only be used with async_engine=False. Use update_weights_via_p2p_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_via_p2p", args=tuple()
             )
             worker_result = result_or_coro[0]
 

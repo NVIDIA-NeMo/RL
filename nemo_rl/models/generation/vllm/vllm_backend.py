@@ -24,7 +24,7 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.packed_tensor import packed_comm_consumer
 
 try:
     import vllm  # noqa: F401
@@ -60,6 +60,23 @@ class VllmInternalWorkerExtension:
         self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             pg, device=self.device
         )
+
+    def init_p2p(
+        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+    ) -> None:
+        """Initialize the p2p communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+        
+        local_rank = torch.distributed.get_rank()
+        rank = rank_prefix + local_rank
+        if (group_id == 0 and rank % 2 != 1) or (group_id == 1 and rank % 2 == 1):
+            return
+        self.p2p_src = rank - 1 if group_id == 0 else rank + 1
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=rank, world_size=world_size
+        )
+        self.model_update_group = PyNcclCommunicator(pg, device=self.device)
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -209,10 +226,57 @@ class VllmInternalWorkerExtension:
         load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
 
         try:
-            packed_broadcast_consumer(
+            packed_comm_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,
-                src=0,
+                collective_type="broadcast",
+                collective_arg=0,
+                post_unpack_func=load_model_weight_func,
+            )
+        except Exception as e:
+            print(
+                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+            )
+            return False
+
+        return True
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_via_p2p"
+    )
+    def update_weights_via_p2p(self) -> bool:
+        """Update the model weights from collective communication."""
+        assert self.state_dict_info is not None, (
+            "state_dict_info is not prepared. "
+            "Please call prepare_refit_info when initializing the worker."
+        )
+
+        def _load_model_weights(weights, model_runner):
+            """Load model weights.
+
+            Args:
+                weights: List[(name, tensor)]
+                model_runner: vLLM ModelRunner
+
+            Returns:
+                None
+            """
+            from nemo_rl.models.generation import fp8
+
+            if fp8.is_fp8_model(model_runner.vllm_config):
+                # the fp8 load_weights additionally casts bf16 weights into fp8
+                fp8.load_weights(weights, model_runner)
+            else:
+                model_runner.model.load_weights(weights=weights)
+
+        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+
+        try:
+            packed_comm_consumer(
+                iterator=iter(self.state_dict_info.items()),
+                group=self.model_update_group,
+                collective_type="p2p",
+                collective_arg=self.p2p_src,
                 post_unpack_func=load_model_weight_func,
             )
         except Exception as e:

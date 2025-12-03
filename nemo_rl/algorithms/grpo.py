@@ -574,6 +574,25 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif grpo_config["refit_via_p2p"]:
+        t0 = time.perf_counter()
+        world_size = train_cluster.world_size()
+        for group_id in range(2):
+            ip, port = train_cluster.get_master_address_and_port()
+            futures_train = policy.init_p2p(
+                group_id,
+                ip,
+                port,
+                world_size,
+            )
+            futures_inference = policy_generation.init_p2p(
+                group_id,
+                ip,
+                port,
+                world_size,
+            )
+            ray.get(futures_train + futures_inference)
+        worker_init_timing_metrics["p2p_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -874,6 +893,7 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
+    refit_via_p2p: bool,
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
 ) -> None:
@@ -916,6 +936,13 @@ def refit_policy_generation(
                 buffer_size_bytes=buffer_size_bytes
             )
             futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
+        elif refit_via_p2p:
+            futures_train = policy.stream_weights_via_p2p()
+            futures_inference = policy_generation.update_weights_via_p2p()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -999,12 +1026,13 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    refit_via_p2p = master_config["grpo"]["refit_via_p2p"]
 
     # Run validation at the start if configured
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(policy, policy_generation, colocated_inference, refit_via_p2p)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1063,7 +1091,7 @@ def grpo_train(
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference, timer=timer
+                            policy, policy_generation, colocated_inference, refit_via_p2p, timer=timer
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1275,7 +1303,7 @@ def grpo_train(
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy, policy_generation, colocated_inference, refit_via_p2p
                         )
                         POLICY_GENERATION_STALE = False
                     else:

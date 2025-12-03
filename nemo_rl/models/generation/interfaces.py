@@ -223,6 +223,13 @@ class GenerationInterface(ABC):
         pass
 
     @abstractmethod
+    def init_p2p(
+        self, group_id: int, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the p2p communication."""
+        pass
+
+    @abstractmethod
     def generate(
         self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
     ) -> BatchedDataDict["GenerationOutputSpec"]:
@@ -246,6 +253,10 @@ class GenerationInterface(ABC):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
+        raise NotImplementedError
+    
+    def update_weights_via_p2p(self) -> list[ray.ObjectRef]:
+        """Update the model weights from p2p communication."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches

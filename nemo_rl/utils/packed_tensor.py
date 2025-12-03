@@ -36,7 +36,7 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
-def packed_broadcast_producer(iterator, group, src, post_iter_func):
+def packed_comm_producer(iterator, group, collective_type, collective_arg, post_iter_func):
     """Broadcast a list of tensors in a packed manner.
 
     Args:
@@ -49,6 +49,7 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
         None
 
     """
+    assert collective_type in ["broadcast", "p2p"], "Invalid collective type"
     target_packed_tensor_size = get_target_packed_tensor_size()
 
     num_buffers = get_num_buffers()
@@ -84,18 +85,24 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                 packed_tensors[buffer_idx] = torch.cat(
                     packing_tensor_list[buffer_idx], dim=0
                 )
-                group.broadcast(packed_tensors[buffer_idx], src=src)
+                if collective_type == "broadcast":
+                    group.broadcast(packed_tensors[buffer_idx], src=collective_arg)
+                elif collective_type == "p2p":
+                    group.send(packed_tensors[buffer_idx], dst=collective_arg)
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
                 if len(packing_tensor_list[buffer_idx]) > 0:
                     packed_tensors[buffer_idx] = torch.cat(
                         packing_tensor_list[buffer_idx], dim=0
                     )
-                    group.broadcast(packed_tensors[buffer_idx], src=src)
+                    if collective_type == "broadcast":
+                        group.broadcast(packed_tensors[buffer_idx], src=collective_arg)
+                    elif collective_type == "p2p":
+                        group.send(packed_tensors[buffer_idx], dst=collective_arg)
                 break
 
 
-def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+def packed_comm_consumer(iterator, group, collective_type, collective_arg, post_unpack_func):
     """Consume a packed tensor and unpack it into a list of tensors.
 
     Args:
@@ -109,6 +116,7 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
 
     """
 
+    assert collective_type in ["broadcast", "p2p"], "Invalid collective type"
     def unpack_tensor(
         packed_tensor: torch.Tensor, meta_data_list: list[Any]
     ) -> List[Tuple[str, torch.Tensor]]:
@@ -176,7 +184,10 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                 packed_tensors[buffer_idx] = torch.empty(
                     packing_tensor_sizes[buffer_idx], dtype=torch.uint8, device="cuda"
                 )
-                group.broadcast(packed_tensors[buffer_idx], src=src)
+                if collective_type == "broadcast":
+                    group.broadcast(packed_tensors[buffer_idx], src=collective_arg)
+                elif collective_type == "p2p":
+                    group.recv(packed_tensors[buffer_idx], src=collective_arg)
                 # Load the packed tensor into the model
                 post_unpack_func(
                     unpack_tensor(
@@ -192,7 +203,10 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                         dtype=torch.uint8,
                         device="cuda",
                     )
-                    group.broadcast(packed_tensors[buffer_idx], src=src)
+                    if collective_type == "broadcast":
+                        group.broadcast(packed_tensors[buffer_idx], src=collective_arg)
+                    elif collective_type == "p2p":
+                        group.recv(packed_tensors[buffer_idx], src=collective_arg)
                     # Load the packed tensor into the model
                     post_unpack_func(
                         unpack_tensor(

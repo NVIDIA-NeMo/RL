@@ -592,6 +592,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    async def init_p2p_async(
+        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_p2p",
+            args=(rank_prefix, group_id, ip, port, world_size),
+        )
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -990,6 +998,42 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    async def update_weights_via_p2p_async(self) -> bool:
+        """Async version of update_weights_via_p2p."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_via_p2p_async can only be used with async_engine=True. Use update_weights_via_p2p instead."
+                )
+
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_via_p2p", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):

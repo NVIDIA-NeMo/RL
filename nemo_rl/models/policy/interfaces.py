@@ -146,6 +146,12 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def init_p2p(
+        self, group_id: int, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
     def offload_before_refit(self) -> None:
         pass
 
@@ -165,4 +171,8 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def stream_weights_via_p2p(self) -> list[ray.ObjectRef]:
         pass

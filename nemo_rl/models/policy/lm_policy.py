@@ -262,6 +262,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def init_p2p(
+        self, group_id: int, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the p2p communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_p2p",
+            group_id=group_id,
+            ip=ip,
+            port=port,
+            world_size=world_size,
+        )
+        return futures
+
     def get_logprobs(
         self, data: BatchedDataDict[GenerationDatumSpec]
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -699,6 +712,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "broadcast_weights_for_collective"
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
+    
+    def stream_weights_via_p2p(self) -> list[ray.ObjectRef]:
+        """Send the weights for p2p communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_p2p"
+        )
         return futures
 
     def offload_before_refit(self) -> None:
