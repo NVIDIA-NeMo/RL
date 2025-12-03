@@ -157,6 +157,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
