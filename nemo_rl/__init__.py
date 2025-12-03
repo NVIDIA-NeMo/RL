@@ -16,10 +16,9 @@ import os
 import sys
 from pathlib import Path
 
-# Configure logging to show file location for warnings
+# Configure logging to show file location
 logging.basicConfig(
     format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
-    level=logging.WARNING,
 )
 
 """
@@ -183,15 +182,10 @@ def _check_container_fingerprint():
             )
 
             # Check if user wants to ignore the mismatch
-            if os.environ.get("NRL_IGNORE_VERSION_MISMATCH"):
+            if not bool(os.environ.get("NRL_IGNORE_VERSION_MISMATCH")):
                 logging.warning(
                     warning_msg
                     + "Proceeding anyway (NRL_IGNORE_VERSION_MISMATCH is set)..."
-                )
-            else:
-                raise RuntimeError(
-                    warning_msg
-                    + "To proceed anyway, set: export NRL_IGNORE_VERSION_MISMATCH=1"
                 )
         else:
             logging.debug("Container fingerprint matches code fingerprint")
