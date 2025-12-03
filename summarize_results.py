@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 
 def get_slurm_jobs():
     """Get list of recent SLURM jobs for current user."""
@@ -106,7 +108,8 @@ def parse_wandb_name(name: str) -> dict:
     """Parse WandB run name to extract configuration.
     
     Supports multiple formats:
-    - New format: Qwen32B-N8xG4-Train(tp4.pp4.ep1.cp1.vpp1)-Gen(tp4.pp1.ep1)
+    - New format (parentheses): Qwen32B-N8xG4-Train(tp4.pp4.ep1.cp1.vpp1)-Gen(tp4.pp1.ep1)
+    - New format (underscores): Qwen32B_N8xG4_Ttp4pp4ep1cp1vpp1_Gtp4pp1ep1
     - Old format: async-qwen-32B-seg64-Gtp1-Gep1-Gpp1-Ttp1-Tep1-Tpp2-32T32G
     """
     result = {
@@ -118,37 +121,77 @@ def parse_wandb_name(name: str) -> dict:
         'g_tp': 1, 'g_pp': 1, 'g_ep': 1, 'g_dp': 1,
     }
     
+    train_match = None
+    gen_match = None
+    
     # ============================================
-    # Try NEW format first: Model-NxG-Train(...)-Gen(...)
+    # Try NEW format with underscores: Model_NxG_Ttp...vpp..._Gtp...ep...
+    # Example: Qwen32B_N8xG4_Ttp4pp4ep1cp1vpp1_Gtp4pp1ep1
     # ============================================
     
-    # Extract model name (first part before -N)
-    model_match = re.match(r'^([^-]+(?:-[^N][^-]*)*)', name)
-    if model_match:
-        result['model'] = model_match.group(1)
-    
-    # Extract NxG (nodes x gpus_per_node) - New format
-    nxg_match = re.search(r'-N(\d+)xG(\d+)', name)
-    if nxg_match:
-        result['num_nodes'] = int(nxg_match.group(1))
-        result['gpus_per_node'] = int(nxg_match.group(2))
+    # Extract NxG with underscore prefix
+    nxg_underscore_match = re.search(r'_N(\d+)xG(\d+)', name)
+    if nxg_underscore_match:
+        result['num_nodes'] = int(nxg_underscore_match.group(1))
+        result['gpus_per_node'] = int(nxg_underscore_match.group(2))
         result['total_gpus'] = result['num_nodes'] * result['gpus_per_node']
+        
+        # Extract model name (everything before _N)
+        model_match = re.match(r'^([^_]+)', name)
+        if model_match:
+            result['model'] = model_match.group(1)
+        
+        # Extract Training params: _Ttp4pp4ep1cp1vpp1 (old) or _Ttp4pp4ep1cp1 (new, no vpp)
+        train_underscore_match = re.search(r'_Ttp(\d+)pp(\d+)ep(\d+)cp(\d+)(?:vpp(\d+))?', name)
+        if train_underscore_match:
+            train_match = train_underscore_match
+            result['t_tp'] = int(train_underscore_match.group(1))
+            result['t_pp'] = int(train_underscore_match.group(2))
+            result['t_ep'] = int(train_underscore_match.group(3))
+            result['t_cp'] = int(train_underscore_match.group(4))
+            if train_underscore_match.group(5):
+                result['t_vpp'] = int(train_underscore_match.group(5))
+        
+        # Extract Generation params: _Gtp4pp1ep1
+        gen_underscore_match = re.search(r'_Gtp(\d+)pp(\d+)ep(\d+)', name)
+        if gen_underscore_match:
+            gen_match = gen_underscore_match
+            result['g_tp'] = int(gen_underscore_match.group(1))
+            result['g_pp'] = int(gen_underscore_match.group(2))
+            result['g_ep'] = int(gen_underscore_match.group(3))
     
-    # Extract Training params: Train(tp4.pp4.ep1.cp1.vpp1)
-    train_match = re.search(r'Train\(tp(\d+)\.pp(\d+)\.ep(\d+)\.cp(\d+)\.vpp(\d+)\)', name)
-    if train_match:
-        result['t_tp'] = int(train_match.group(1))
-        result['t_pp'] = int(train_match.group(2))
-        result['t_ep'] = int(train_match.group(3))
-        result['t_cp'] = int(train_match.group(4))
-        result['t_vpp'] = int(train_match.group(5))
+    # ============================================
+    # Try NEW format with parentheses: Model-NxG-Train(...)-Gen(...)
+    # ============================================
     
-    # Extract Generation params: Gen(tp4.pp1.ep1)
-    gen_match = re.search(r'Gen\(tp(\d+)\.pp(\d+)\.ep(\d+)\)', name)
-    if gen_match:
-        result['g_tp'] = int(gen_match.group(1))
-        result['g_pp'] = int(gen_match.group(2))
-        result['g_ep'] = int(gen_match.group(3))
+    if not nxg_underscore_match:
+        # Extract model name (first part before -N)
+        model_match = re.match(r'^([^-]+(?:-[^N][^-]*)*)', name)
+        if model_match:
+            result['model'] = model_match.group(1)
+        
+        # Extract NxG (nodes x gpus_per_node) - New format with hyphen
+        nxg_match = re.search(r'-N(\d+)xG(\d+)', name)
+        if nxg_match:
+            result['num_nodes'] = int(nxg_match.group(1))
+            result['gpus_per_node'] = int(nxg_match.group(2))
+            result['total_gpus'] = result['num_nodes'] * result['gpus_per_node']
+        
+        # Extract Training params: Train(tp4.pp4.ep1.cp1.vpp1)
+        train_match = re.search(r'Train\(tp(\d+)\.pp(\d+)\.ep(\d+)\.cp(\d+)\.vpp(\d+)\)', name)
+        if train_match:
+            result['t_tp'] = int(train_match.group(1))
+            result['t_pp'] = int(train_match.group(2))
+            result['t_ep'] = int(train_match.group(3))
+            result['t_cp'] = int(train_match.group(4))
+            result['t_vpp'] = int(train_match.group(5))
+        
+        # Extract Generation params: Gen(tp4.pp1.ep1)
+        gen_match = re.search(r'Gen\(tp(\d+)\.pp(\d+)\.ep(\d+)\)', name)
+        if gen_match:
+            result['g_tp'] = int(gen_match.group(1))
+            result['g_pp'] = int(gen_match.group(2))
+            result['g_ep'] = int(gen_match.group(3))
     
     # ============================================
     # Try OLD format: async-qwen-32B-seg64-Gtp1-Gep1-Gpp1-Ttp1-Tep1-Tpp2-32T32G
@@ -303,18 +346,9 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                     config['g_dp'] = config['total_gpus'] // g_mp
             
             # ============================================
-            # Get metrics from summary
-            # Based on get_wandb_log_for_nemorl.py metric keys
-            # Supports both sync (on-policy) and async (off-policy)
+            # Get metrics using 5-step moving average (like get_wandb_log_for_nemorl.py)
+            # This provides more stable metrics by averaging around a target step
             # ============================================
-            
-            # Helper to get first non-zero value from multiple keys
-            def get_metric(*keys):
-                for key in keys:
-                    val = summary.get(key)
-                    if val is not None and val != 0:
-                        return val
-                return 0
             
             # Detect if async (off-policy) based on run name or config
             is_async = 'async' in run.name.lower()
@@ -323,110 +357,176 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
             if async_cfg.get('enabled'):
                 is_async = True
             
+            # Define metric keys to fetch (same as get_wandb_log_for_nemorl.py)
+            metric_keys = [
+                # Timing metrics
+                'timing/train/total_step_time',
+                'timing/train/generation',
+                'timing/train/exposed_generation',  # for async/off-policy
+                'timing/train/policy_and_reference_logprobs',
+                'timing/train/policy_training',
+                'timing/train/data_processing',
+                'timing/train/reward_calculation',
+                'timing/train/training_prep',
+                'timing/train/prepare_for_generation/transfer_and_update_weights',
+                # Performance metrics
+                'performance/tokens_per_sec_per_gpu',
+                'performance/generation_tokens_per_sec_per_gpu',
+                'performance/training_worker_group_tokens_per_sec_per_gpu',
+                'performance/policy_training_tokens_per_sec_per_gpu',
+                'performance/policy_and_reference_logprobs_tokens_per_sec_per_gpu',
+                'performance/train_flops_per_gpu',
+                'performance/train_fp_utilization',
+                'performance/tokens_per_sec',
+                'performance/seq_per_sec',
+            ]
+            
+            # Initialize metrics dict with defaults
+            metrics = {key: 0 for key in metric_keys}
+            
+            # Try to get 5-step moving average from history
+            # Parameters: at_step=5, average_steps=5 (same as get_wandb_log_for_nemorl.py)
+            at_step = 5
+            average_steps = 5
+            
+            try:
+                # Fetch history for this run
+                history = run.history(keys=metric_keys, pandas=True)
+                
+                if history is not None and len(history) > 0:
+                    # Calculate step range for averaging (same logic as get_wandb_log_for_nemorl.py)
+                    min_step = at_step - average_steps // 2  # step 3
+                    max_step = at_step + average_steps // 2 - 1 + (average_steps % 2)  # step 7
+                    
+                    # Adjust if run has fewer steps
+                    max_available_step = len(history) - 1
+                    if max_available_step < min_step:
+                        # Not enough steps, use all available
+                        min_step = 0
+                        max_step = max_available_step
+                    elif max_available_step < max_step:
+                        # Adjust range to available steps
+                        max_step = max_available_step
+                    
+                    # Get the slice and calculate mean
+                    history_slice = history.iloc[min_step:max_step + 1]
+                    
+                    if len(history_slice) > 0:
+                        avg_metrics = history_slice.mean()
+                        
+                        # Update metrics dict with averaged values
+                        for key in metric_keys:
+                            if key in avg_metrics and not pd.isna(avg_metrics[key]):
+                                metrics[key] = avg_metrics[key]
+            except Exception as e:
+                # If history fetch fails, fall back to summary
+                pass
+            
+            # Fallback: If metrics are still 0, try to get from summary
+            def get_metric_with_fallback(primary_key, *fallback_keys):
+                """Get metric from averaged history, fall back to summary if not available."""
+                val = metrics.get(primary_key, 0)
+                if val and val != 0:
+                    return val
+                # Try fallback keys from summary
+                for key in [primary_key] + list(fallback_keys):
+                    val = summary.get(key)
+                    if val is not None and val != 0:
+                        return val
+                return 0
+            
             # ============================================
-            # Timing metrics (from get_wandb_log_for_nemorl.py)
+            # Extract timing metrics
             # ============================================
             
             # Total step time
-            step_time = get_metric(
-                'timing/train/total_step_time',  # Primary key from get_wandb_log_for_nemorl.py
+            step_time = get_metric_with_fallback(
+                'timing/train/total_step_time',
                 'train/step_time', 
-                'step_time', 
-                'timing/step_time',
+                'step_time',
             )
             
             # Generation time - different for sync vs async
             if is_async:
-                # Async (off-policy): uses exposed_generation
-                generation_time = get_metric(
+                generation_time = get_metric_with_fallback(
                     'timing/train/exposed_generation',
                     'timing/train/generation',
                 )
             else:
-                # Sync (on-policy): uses generation
-                generation_time = get_metric(
+                generation_time = get_metric_with_fallback(
                     'timing/train/generation',
-                    'timing/generation',
                 )
             
             # Policy training time
-            policy_training_time = get_metric(
+            policy_training_time = get_metric_with_fallback(
                 'timing/train/policy_training',
-                'timing/policy_training',
             )
             
             # Logprobs calculation time
-            logprobs_time = get_metric(
+            logprobs_time = get_metric_with_fallback(
                 'timing/train/policy_and_reference_logprobs',
-                'timing/logprobs',
             )
             
             # Other timing metrics
-            data_processing_time = get_metric('timing/train/data_processing')
-            reward_calculation_time = get_metric('timing/train/reward_calculation')
-            training_prep_time = get_metric('timing/train/training_prep')
-            weight_transfer_time = get_metric('timing/train/prepare_for_generation/transfer_and_update_weights')
+            data_processing_time = get_metric_with_fallback('timing/train/data_processing')
+            reward_calculation_time = get_metric_with_fallback('timing/train/reward_calculation')
+            training_prep_time = get_metric_with_fallback('timing/train/training_prep')
+            weight_transfer_time = get_metric_with_fallback('timing/train/prepare_for_generation/transfer_and_update_weights')
             
             # ============================================
-            # Performance metrics (from get_wandb_log_for_nemorl.py)
+            # Extract performance metrics
             # ============================================
             
             # Tokens per second per GPU (primary metric)
-            tokens_per_sec_per_gpu = get_metric(
-                'performance/tokens_per_sec_per_gpu',  # Primary key
+            tokens_per_sec_per_gpu = get_metric_with_fallback(
+                'performance/tokens_per_sec_per_gpu',
                 'train/tokens_per_sec_per_gpu',
-                'tokens_per_sec_per_gpu',
             )
             
             # Generation tokens per second per GPU
-            gen_tokens_per_sec_per_gpu = get_metric(
+            gen_tokens_per_sec_per_gpu = get_metric_with_fallback(
                 'performance/generation_tokens_per_sec_per_gpu',
                 'generation/tokens_per_sec_per_gpu',
             )
             
             # Training worker group tokens per second per GPU
-            training_tokens_per_sec_per_gpu = get_metric(
+            training_tokens_per_sec_per_gpu = get_metric_with_fallback(
                 'performance/training_worker_group_tokens_per_sec_per_gpu',
-                'performance/policy_training_tokens_per_sec_per_gpu',
             )
             
             # Policy training tokens per second per GPU
-            policy_training_tokens_per_sec_per_gpu = get_metric(
+            policy_training_tokens_per_sec_per_gpu = get_metric_with_fallback(
                 'performance/policy_training_tokens_per_sec_per_gpu',
             )
             
             # Logprobs tokens per second per GPU
-            logprobs_tokens_per_sec_per_gpu = get_metric(
+            logprobs_tokens_per_sec_per_gpu = get_metric_with_fallback(
                 'performance/policy_and_reference_logprobs_tokens_per_sec_per_gpu',
             )
             
             # TFLOPs per GPU
-            tflops = get_metric(
-                'performance/train_flops_per_gpu',  # Primary key
+            tflops = get_metric_with_fallback(
+                'performance/train_flops_per_gpu',
                 'train/per_gpu_tflops',
                 'per_gpu_tflops',
-                'tflops',
             )
             # Convert from FLOPs to TFLOPs if needed (if value > 1e9, it's likely in FLOPs)
             if tflops > 1e9:
                 tflops = tflops / 1e12
             
             # MFU (Model FLOPs Utilization)
-            mfu = get_metric(
-                'performance/train_fp_utilization',  # Primary key (0-1 scale)
+            mfu = get_metric_with_fallback(
+                'performance/train_fp_utilization',
                 'performance/train_mfu',
                 'train/gpu_util_mfu',
-                'gpu_util_mfu',
-                'mfu',
             )
             
             # ============================================
             # Calculate total tokens per second
             # ============================================
-            tokens_per_sec = get_metric(
+            tokens_per_sec = get_metric_with_fallback(
                 'performance/tokens_per_sec',
                 'train/tokens_per_sec',
-                'tokens_per_sec',
             )
             
             # If tokens_per_sec not available but tokens_per_sec_per_gpu is, calculate it
@@ -438,18 +538,177 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 tokens_per_sec_per_gpu = tokens_per_sec / config['total_gpus']
             
             # Seq per sec
-            seq_per_sec = get_metric(
+            seq_per_sec = get_metric_with_fallback(
                 'performance/seq_per_sec',
                 'train/seq_per_sec',
-                'seq_per_sec',
             )
+            
+            # Get log directory from config
+            log_dir = ''
+            slurm_log_dir = ''
+            if run_config:
+                logger_cfg = run_config.get('logger', {})
+                log_dir = logger_cfg.get('log_dir', '')
+            
+            # Try to find matching SLURM log directory by matching WandB run ID in log content
+            try:
+                import glob
+                
+                # Find SLURM log directories
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                slurm_dirs = glob.glob(os.path.join(base_path, '*-logs'))
+                
+                # Sort by directory name (job ID) descending to check newest first
+                slurm_dirs = sorted(slurm_dirs, key=lambda x: os.path.basename(x), reverse=True)
+                
+                # WandB run ID is unique - use it for exact matching
+                wandb_run_id = run.id
+                
+                for sdir in slurm_dirs:
+                    ray_driver_log = os.path.join(sdir, 'ray-driver.log')
+                    if os.path.exists(ray_driver_log):
+                        try:
+                            with open(ray_driver_log, 'r') as f:
+                                # Read file to find wandb run ID
+                                # Look for patterns like "runs/zpnsm4js" or "run-20251202_204311-zpnsm4js"
+                                content = f.read()
+                                if f"runs/{wandb_run_id}" in content or f"-{wandb_run_id}" in content:
+                                    slurm_log_dir = sdir
+                                    break
+                        except Exception:
+                            continue
+            except Exception:
+                pass  # Silently ignore if we can't find SLURM logs
+            
+            # Determine actual status by checking SLURM log directory
+            actual_status = run.state
+            slurm_job_id = ''
+            
+            def check_log_for_success(log_path: str) -> str:
+                """Check ray-driver.log for success/failure indicators.
+                
+                Success indicators (highest priority):
+                - "Max number of steps has been reached"
+                - "Training Results:"
+                - "Training Model Floating Point Utilization"
+                
+                Failure indicators:
+                - "Traceback" at the end of file
+                - "Error:" or "Exception:" without success indicators
+                """
+                try:
+                    with open(log_path, 'r') as f:
+                        # Read last 10KB to check for completion messages
+                        f.seek(0, 2)  # Go to end
+                        file_size = f.tell()
+                        f.seek(max(0, file_size - 10000))
+                        last_content = f.read()
+                        
+                        # Success indicators - if any of these exist, it's finished successfully
+                        success_indicators = [
+                            'Max number of steps has been reached',
+                            'Training Results:',
+                            'Training Model Floating Point Utilization',
+                            'stopping training early',
+                            'Training completed',
+                        ]
+                        
+                        has_success = any(indicator in last_content for indicator in success_indicators)
+                        
+                        if has_success:
+                            return 'finished'
+                        
+                        # Check for errors only if no success indicators
+                        # Look for Traceback at the very end (last 2KB)
+                        very_last = last_content[-2000:] if len(last_content) > 2000 else last_content
+                        
+                        error_indicators = [
+                            'Traceback (most recent call last)',
+                            'Error:',
+                            'FAILED',
+                            'Exception:',
+                        ]
+                        
+                        has_error = any(indicator in very_last for indicator in error_indicators)
+                        
+                        if has_error:
+                            return 'crashed'
+                        
+                        # No clear indicator - check if file was recently modified
+                        import time
+                        mtime = os.path.getmtime(log_path)
+                        age_seconds = time.time() - mtime
+                        
+                        if age_seconds < 300:  # Modified in last 5 minutes
+                            return 'running'
+                        else:
+                            return 'unknown'
+                            
+                except Exception:
+                    return 'unknown'
+            
+            if slurm_log_dir:
+                # Extract SLURM job ID from directory name (e.g., "1138121-logs" -> "1138121")
+                dir_name = os.path.basename(slurm_log_dir)
+                if '-logs' in dir_name:
+                    slurm_job_id = dir_name.replace('-logs', '')
+                
+                ray_driver_log = os.path.join(slurm_log_dir, 'ray-driver.log')
+                
+                if os.path.exists(ray_driver_log):
+                    # Check log content for success/failure
+                    log_status = check_log_for_success(ray_driver_log)
+                    
+                    if log_status in ['finished', 'crashed']:
+                        actual_status = log_status
+                    elif run.state == 'running':
+                        # WandB says running - verify with SLURM
+                        if slurm_job_id:
+                            try:
+                                import subprocess
+                                result_check = subprocess.run(
+                                    ['squeue', '-j', slurm_job_id, '-h', '-o', '%T'],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                slurm_state = result_check.stdout.strip()
+                                if slurm_state == 'RUNNING':
+                                    actual_status = 'running'
+                                elif slurm_state == 'PENDING':
+                                    actual_status = 'pending'
+                                elif slurm_state == '':
+                                    # Job not in queue - use log status or check sacct
+                                    if log_status != 'unknown':
+                                        actual_status = log_status
+                                    else:
+                                        result_sacct = subprocess.run(
+                                            ['sacct', '-j', slurm_job_id, '-n', '-o', 'State', '--parsable2'],
+                                            capture_output=True, text=True, timeout=5
+                                        )
+                                        sacct_state = result_sacct.stdout.strip().split('\n')[0] if result_sacct.stdout else ''
+                                        if 'COMPLETED' in sacct_state:
+                                            actual_status = 'finished'
+                                        elif 'FAILED' in sacct_state or 'CANCELLED' in sacct_state or 'TIMEOUT' in sacct_state:
+                                            actual_status = 'failed'
+                                        else:
+                                            actual_status = log_status
+                            except Exception:
+                                actual_status = log_status
+                        else:
+                            actual_status = log_status
+                else:
+                    # No ray-driver.log - job likely crashed early
+                    actual_status = 'crashed'
             
             result = {
                 'run_id': run.id,
                 'run_name': run.name,
-                'status': run.state,
+                'status': actual_status,
+                'wandb_status': run.state,
+                'slurm_job_id': slurm_job_id,
                 'created_at': run.created_at,
                 'is_async': is_async,
+                'log_dir': log_dir,
+                'slurm_log_dir': slurm_log_dir,
                 **config,
                 # Primary metrics
                 'step_time_sec': step_time,
@@ -472,8 +731,8 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 'policy_training_tokens_per_sec_per_gpu': policy_training_tokens_per_sec_per_gpu,
                 'logprobs_tokens_per_sec_per_gpu': logprobs_tokens_per_sec_per_gpu,
                 # Training metrics
-                'train_loss': get_metric('train/loss', 'loss'),
-                'train_accuracy': get_metric('train/accuracy', 'accuracy'),
+                'train_loss': get_metric_with_fallback('train/loss', 'loss'),
+                'train_accuracy': get_metric_with_fallback('train/accuracy', 'accuracy'),
             }
             
             results.append(result)
@@ -614,14 +873,18 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             status = r.get('status', 'Unknown')
             is_async = r.get('is_async', False)
             
-            # Color status
+            # Color status based on actual state
             if status in ['finished', 'COMPLETED']:
-                status_str = f"{GREEN}{status[:8]:<10}{RESET}"
+                status_str = f"{GREEN}{'finished':<10}{RESET}"
                 all_completed.append(r)
             elif status in ['running', 'RUNNING']:
-                status_str = f"{YELLOW}{status[:8]:<10}{RESET}"
+                status_str = f"{YELLOW}{'running':<10}{RESET}"
+            elif status in ['pending', 'PENDING']:
+                status_str = f"{CYAN}{'pending':<10}{RESET}"
+            elif status in ['crashed', 'failed', 'FAILED', 'CANCELLED', 'TIMEOUT']:
+                status_str = f"{RED}{status:<10}{RESET}"
             else:
-                status_str = f"{RED}{status[:8]:<10}{RESET}"
+                status_str = f"{DIM}{status:<10}{RESET}"
             
             # Type indicator
             type_str = f"{BLUE}async{RESET}" if is_async else "sync "
@@ -634,6 +897,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             
             # MFU formatting (handle both 0-1 and 0-100 scales)
             mfu_pct = mfu * 100 if mfu < 1 else mfu
+            
+            # Get log_dir for reference
+            log_dir = r.get('log_dir', '')
             
             if detailed:
                 gen_time = r.get('generation_time', 0)
@@ -680,6 +946,15 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{status_str}"
                 )
             print(row)
+            # Print log directory on next line for easy reference
+            slurm_log_dir = r.get('slurm_log_dir', '')
+            if slurm_log_dir:
+                # Show SLURM ray-driver.log path
+                ray_driver_path = os.path.join(slurm_log_dir, 'ray-driver.log')
+                print(f"{DIM}    └─ {ray_driver_path}{RESET}")
+            elif log_dir:
+                # Fallback to WandB log dir
+                print(f"{DIM}    └─ WandB: {log_dir}{RESET}")
             total_runs += 1
         
         # Print model group summary
