@@ -237,9 +237,9 @@ class MegatronPolicyWorker(BasePolicyWorker):
         
         # Step 5: Setup reference model if needed
         if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
+            self.model = self._move_model(self.model, "cpu")
             self.reference_state_dict = setup_reference_model_state(config, self.megatron_cfg, pretrained_path)
-            self.model = self.move_model(self.model, "cuda")
+            self.model = self._move_model(self.model, "cuda")
         
         # Step 6: Finalize setup
         (
@@ -701,7 +701,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         no_grad.__enter__()
         self.model.config.flash_decode = False
         if self.should_disable_forward_pre_hook:
-            self.model = self.move_model(
+            self.model = self._move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
         # Verify input is right padded
@@ -1008,11 +1008,11 @@ class MegatronPolicyWorker(BasePolicyWorker):
         )
 
     def prepare_for_lp_inference(self):
-        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        self.model = self._move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
         # offload grads to cpu
-        self.model = self.move_model(
+        self.model = self._move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
 
@@ -1031,7 +1031,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
-        self.model = self.move_model(
+        self.model = self._move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
@@ -1059,7 +1059,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         print(
             f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
-        self.model = self.move_model(
+        self.model = self._move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1086,7 +1086,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         """Offload as much as possible on the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        self.model = self._move_model(self.model, "cpu")
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
@@ -1098,9 +1098,8 @@ class MegatronPolicyWorker(BasePolicyWorker):
         )
         no_grad.__exit__(None, None, None)
 
-    ## TODO: rename this to move_model_to_device
     @torch.no_grad()
-    def move_model(
+    def _move_model(
         self,
         model: torch.nn.Module,
         device: str,
