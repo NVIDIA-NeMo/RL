@@ -274,10 +274,6 @@ def setup_megatron_model(
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
 
-    # If deferring fp32 logits, disable mixed-precision wrapper entirely
-    if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
-        mixed_precision_wrapper = None
-
     # Model, optimizer, and learning rate.
     model = get_model(
         cfg.model,
@@ -663,6 +659,9 @@ class MegatronPolicyWorker:
             assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
                 "defer_fp32_logits must be True if logprob_chunk_size is set"
             )
+        self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
+            "defer_fp32_logits", None
+        ) and (model_cfg.fp16 or model_cfg.bf16)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -796,8 +795,6 @@ class MegatronPolicyWorker:
             ref_mixed_precision_wrapper = Float16Module
             if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
                 ref_mixed_precision_wrapper = CustomFloat16Module
-            if self.cfg["megatron_cfg"].get("defer_fp32_logits", None):
-                ref_mixed_precision_wrapper = None
 
             reference_model = get_model(
                 self.megatron_cfg.model,
@@ -1068,6 +1065,7 @@ class MegatronPolicyWorker:
                             pad_individual_seqs_to_multiple_of=pad_factor,
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                             pad_full_seq_to=pad_full_seq_to,
+                            defer_fp32_logits=self.defer_fp32_logits,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,
@@ -1283,6 +1281,9 @@ class MegatronPolicyWorker:
             # Mamba models currently do not support packed_seq_params
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
+
+            if self.defer_fp32_logits:
+                additional_kwargs["fp32_output"] = False
 
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,

@@ -358,6 +358,7 @@ def forward_step_arbitrary_loss(
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
+    defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
 ):
@@ -372,6 +373,9 @@ def forward_step_arbitrary_loss(
         loss_fn (LossFunction): Loss function to apply
         pack_sequences (bool): Whether to pack sequences for efficiency
         seq_length_key (Optional[str]): Key in data_dict containing actual sequence lengths
+        pad_individual_seqs_to_multiple_of (int): Pad individual sequences to a multiple of this value
+        pad_full_seq_to (Optional[int]): Pad packed sequences to this value
+        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         cp_normalize (bool): Whether to normalize the loss by the cp_size
         policy_cfg (Optional[dict]): Policy configuration containing generation parameters
 
@@ -452,6 +456,9 @@ def forward_step_arbitrary_loss(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    if defer_fp32_logits:
+        additional_kwargs["fp32_output"] = False
 
     with straggler_timer:
         output_tensor = model(
