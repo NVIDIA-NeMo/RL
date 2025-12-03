@@ -336,6 +336,22 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                     # Extract short name (e.g., "Qwen/Qwen3-32B" -> "Qwen3-32B")
                     config['model'] = model_name.split('/')[-1] if '/' in model_name else model_name
                 
+                # Max sequence length
+                config['max_seqlen'] = policy_cfg.get('max_total_sequence_length', 0)
+                
+                # GRPO config - Rollout and Training GBS
+                grpo_cfg = run_config.get('grpo', {})
+                num_prompts = grpo_cfg.get('num_prompts_per_step', 0)
+                num_generations = grpo_cfg.get('num_generations_per_prompt', 0)
+                
+                # Rollout GBS = num_prompts × num_generations
+                config['rollout_gbs'] = num_prompts * num_generations if num_prompts and num_generations else 0
+                config['num_prompts'] = num_prompts
+                config['num_generations'] = num_generations
+                
+                # Training GBS
+                config['train_gbs'] = grpo_cfg.get('training_global_batch_size', 0)
+                
                 # Recalculate DP
                 mp = config['t_tp'] * config['t_pp']
                 if mp > 0 and config['total_gpus'] > 0:
@@ -710,6 +726,12 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 'log_dir': log_dir,
                 'slurm_log_dir': slurm_log_dir,
                 **config,
+                # Batch sizes
+                'rollout_gbs': config.get('rollout_gbs', 0),
+                'train_gbs': config.get('train_gbs', 0),
+                'max_seqlen': config.get('max_seqlen', 0),
+                'num_prompts': config.get('num_prompts', 0),
+                'num_generations': config.get('num_generations', 0),
                 # Primary metrics
                 'step_time_sec': step_time,
                 'tokens_per_sec': tokens_per_sec,
@@ -816,9 +838,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
     sorted_models = sorted(model_groups.keys())
     
     # Print header
-    print(f"\n{BOLD}{'='*200}{RESET}")
+    print(f"\n{BOLD}{'='*230}{RESET}")
     print(f"{BOLD}GRPO Benchmark Results - GB200 (Grouped by Model){RESET}")
-    print(f"{'='*200}")
+    print(f"{'='*230}")
     
     if detailed:
         # Detailed view with timing breakdown
@@ -843,10 +865,11 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             f"{'Model':<15} "
             f"{'Type':<5} "
             f"{'Nodes':>5} {'GPUs':>5} "
+            f"{'R.GBS':>6} {'T.GBS':>6} {'SeqLen':>6} "
             f"{'T.TP':>4} {'T.PP':>4} {'T.EP':>4} {'T.CP':>4} {'T.DP':>4} "
             f"{'G.TP':>4} {'G.PP':>4} {'G.DP':>4} "
             f"{'Step(s)':>8} "
-            f"{'Tok/s/GPU':>10} "
+            f"{'Tok/s/GPU':>10} {'GenTok/GPU':>11} {'TrnTok/GPU':>11} "
             f"{'MFU%':>6} "
             f"{'TFLOPs':>7} "
             f"{'Status':<10}"
@@ -864,9 +887,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         model_color = model_colors[model_idx % len(model_colors)]
         
         # Print model group header
-        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (180 - len(model) - 15)}┐{RESET}")
+        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (210 - len(model) - 15)}┐{RESET}")
         print(f"{DIM}{header}{RESET}")
-        print(f"{DIM}{'-' * 200}{RESET}")
+        print(f"{DIM}{'-' * 230}{RESET}")
         
         for r in model_results:
             model_name = r.get('model', 'Unknown')[:13]
@@ -926,11 +949,23 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{status_str}"
                 )
             else:
+                # Get batch sizes
+                rollout_gbs = r.get('rollout_gbs', 0)
+                train_gbs = r.get('train_gbs', 0)
+                max_seqlen = r.get('max_seqlen', 0)
+                
+                # Get generation and training tokens per sec per GPU
+                gen_tok_gpu = r.get('gen_tokens_per_sec_per_gpu', 0)
+                train_tok_gpu = r.get('training_tokens_per_sec_per_gpu', 0)
+                
                 row = (
                     f"{model_name:<15} "
                     f"{type_str:<5} "
                     f"{r.get('num_nodes', 0):>5} "
                     f"{r.get('total_gpus', 0):>5} "
+                    f"{rollout_gbs:>6} "
+                    f"{train_gbs:>6} "
+                    f"{max_seqlen:>6} "
                     f"{r.get('t_tp', 1):>4} "
                     f"{r.get('t_pp', 1):>4} "
                     f"{r.get('t_ep', 1):>4} "
@@ -941,6 +976,8 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{r.get('g_dp', 1):>4} "
                     f"{step_time:>8.2f} "
                     f"{tokens_sec_gpu:>10,.0f} "
+                    f"{gen_tok_gpu:>11,.0f} "
+                    f"{train_tok_gpu:>11,.0f} "
                     f"{mfu_pct:>6.2f} "
                     f"{tflops:>7.1f} "
                     f"{status_str}"
@@ -962,10 +999,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         if model_completed:
             best_tok = max(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed)
             avg_tok = sum(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed) / len(model_completed)
-            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 140}┘{RESET}")
+            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 170}┘{RESET}")
     
     # Overall summary
-    print(f"\n{'='*200}")
+    print(f"\n{'='*230}")
     print(f"\n📊 {BOLD}Overall Summary{RESET}")
     print(f"   Total runs: {total_runs}")
     print(f"   Models: {len(sorted_models)}")
@@ -995,6 +1032,8 @@ def save_csv(results: list, output_path: str):
         't_tp', 't_pp', 't_ep', 't_cp', 't_vpp', 't_dp',
         # Generation parallelism
         'g_tp', 'g_pp', 'g_ep', 'g_dp',
+        # Batch sizes
+        'rollout_gbs', 'train_gbs', 'max_seqlen', 'num_prompts', 'num_generations',
         # Primary metrics
         'step_time_sec', 'tokens_per_sec', 'tokens_per_sec_per_gpu',
         'seq_per_sec', 'gpu_util_mfu', 'per_gpu_tflops',
