@@ -302,7 +302,7 @@ def setup_model_config(
     _validate_chunking_config(config)
     
     # Create checkpoint configs
-    checkpoint_config, ref_checkpoint_config = _create_checkpoint_configs(
+    checkpoint_config = _create_checkpoint_config(
         pretrained_path, config.get("weights_path")
     )
     
@@ -314,15 +314,7 @@ def setup_model_config(
         model_cfg, checkpoint_config, config, hf_model_name, env_config.dtype
     )
     
-    # Calculate final padded vocab size
-    from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
-    final_padded_vocab_size = calculate_padded_vocab_size(
-        megatron_cfg.model.vocab_size,
-        megatron_cfg.model.make_vocab_size_divisible_by,
-        config["megatron_cfg"]["tensor_model_parallel_size"],
-    )
-    
-    return megatron_cfg
+    return megatron_cfg, model_cfg
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -441,12 +433,12 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
         )
 
 
-def _create_checkpoint_configs(
+def _create_checkpoint_config(
     pretrained_path: str, 
     weights_path: Optional[str]
 ) -> tuple[CheckpointConfig, CheckpointConfig]:
     """Create checkpoint configurations."""
-    checkpoint_config = CheckpointConfig(
+    return CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
@@ -456,16 +448,6 @@ def _create_checkpoint_configs(
         fully_parallel_load=True,
         load_rng=False,
     )
-    
-    ref_checkpoint_config = CheckpointConfig(
-        pretrained_checkpoint=pretrained_path,
-        save=None,
-        load=None,
-        fully_parallel_load=True,
-        load_rng=False,
-    )
-    
-    return checkpoint_config, ref_checkpoint_config
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
@@ -605,10 +587,6 @@ def setup_megatron_model(
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
 
-    # If deferring fp32 logits, disable mixed-precision wrapper entirely
-    if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
-        mixed_precision_wrapper = None
-
     # Model, optimizer, and learning rate.
     model = get_model(
         megatron_cfg.model,
@@ -727,8 +705,6 @@ def setup_reference_model_state(
     ref_mixed_precision_wrapper = Float16Module
     if config["megatron_cfg"].get("freeze_moe_router", False):
         ref_mixed_precision_wrapper = CustomFloat16Module
-    if config["megatron_cfg"].get("defer_fp32_logits", None):
-        ref_mixed_precision_wrapper = None
 
     reference_model = get_model(
         megatron_cfg.model,

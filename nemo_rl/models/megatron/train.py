@@ -32,6 +32,7 @@ def forward_step(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    defer_fp32_logits: Optional[bool] = False,
 ) -> torch.Tensor:
     """
     Perform a single forward pass through the model.
@@ -58,6 +59,8 @@ def forward_step(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+    if defer_fp32_logits:
+        additional_kwargs["fp32_output"] = False
     #with straggler_timer:
     output_tensor = model(
         input_ids=input_ids_cp_sharded,
@@ -85,6 +88,7 @@ def forward_with_processor(
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     processor_fn: Optional[Callable[..., Callable]] = None,
+    defer_fp32_logits: Optional[bool] = True,
 ) -> Tuple[torch.Tensor, Callable]:
     """
     Perform forward pass with data processing and return output tensor and processor function.
@@ -133,6 +137,7 @@ def forward_with_processor(
         position_ids,
         attention_mask,
         packed_seq_params,
+        defer_fp32_logits,
     )
 
     ## calling processor_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
@@ -162,6 +167,7 @@ def megatron_forward_backward(
     mbs: int,
     processor_fn: Callable[..., Callable],
     forward_only: bool = False,
+    defer_fp32_logits: Optional[bool] = True,
 ) -> Any:
     """
     Execute forward and backward passes using Megatron's utilities.
@@ -193,6 +199,7 @@ def megatron_forward_backward(
         pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         processor_fn=processor_fn,
+        defer_fp32_logits=defer_fp32_logits,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(

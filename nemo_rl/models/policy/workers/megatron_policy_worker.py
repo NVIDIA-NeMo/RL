@@ -207,8 +207,11 @@ class MegatronPolicyWorker(BasePolicyWorker):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Step 3: Setup model configuration
-        self.megatron_cfg = setup_model_config(config, env_config, hf_model_name, pretrained_path, tokenizer)
-        
+        self.megatron_cfg, model_cfg, final_padded_vocab_size = setup_model_config(config, env_config, hf_model_name, pretrained_path, tokenizer) 
+        self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
+            "defer_fp32_logits", None
+        ) and (model_cfg.fp16 or model_cfg.bf16)
+
         self.final_padded_vocab_size = calculate_padded_vocab_size(
             self.megatron_cfg.model.vocab_size,
             self.megatron_cfg.model.make_vocab_size_divisible_by,
@@ -369,6 +372,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                         mbs=mbs,
                         processor_fn=loss_processor_wrapped,
                         forward_only=eval_mode,
+                        defer_fp32_logits=self.defer_fp32_logits,
                     )
 
                 # Empty unused memory.
@@ -517,6 +521,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             num_microbatches=data_iterator_len,
             processor_fn=partial(logprobs_processor, cfg=self.cfg),
             forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
         )
         if is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []

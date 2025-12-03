@@ -27,7 +27,7 @@ def get_microbatch_iterator(
         ## TODO: handle other args
     elif cfg["sequence_packing"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-        data_iterator_len, _ = (
+        data_iterator_len, seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
         (
