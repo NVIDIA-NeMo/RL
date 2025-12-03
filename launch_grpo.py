@@ -56,12 +56,15 @@ class ModelConfig:
     num_generations: int = 32
 
 
-# B200/GB200: 4 GPUs per node
+# B200/GB200: 4 GPUs per node, 192GB memory per GPU
+# Settings are derived from H100 benchmarks (half the GPUs)
 PRESETS = {
     # ============================================
-    # Qwen3-32B: 16 GPUs
-    # Training: TP4, CP1, EP1, PP1, VPP1, DP4
-    # Generation: TP1, PP1, DP16
+    # Qwen3-32B: 16 GPUs (4 nodes)
+    # H100 32 GPUs → GB200 16 GPUs
+    # Training: TP4, CP1, EP1, PP1, DP4 (MP=4, DP=4)
+    # Generation: TP1, PP1, DP16 (B200 192GB fits 32B model)
+    # Note: B200 192GB allows PP=1 (no pipeline bubble)
     # ============================================
     "qwen32b": ModelConfig(
         name="Qwen3-32B",
@@ -74,23 +77,25 @@ PRESETS = {
     ),
     
     # ============================================
-    # Qwen3-30B-A3B (MoE): 8 GPUs
-    # Training: TP4, CP1, EP1, PP1, VPP1, DP2
-    # Generation: TP1, PP1, DP8
+    # Qwen3-30B-A3B (MoE): 16 GPUs (4 nodes)
+    # H100 32 GPUs → GB200 16 GPUs
+    # Training: TP1, CP1, EP8, PP1, DP2 (MP=8, DP=2, EP=8 for MoE)
+    # Generation: TP1, PP1, DP16 (MoE 3B active fits easily)
     # ============================================
     "qwen30b": ModelConfig(
         name="Qwen3-30B-A3B",
         model_name="Qwen/Qwen3-30B-A3B",
-        total_gpus=8,
+        total_gpus=16,
         gpus_per_node=4,
-        t_tp=4, t_cp=1, t_ep=1, t_pp=1,
+        t_tp=1, t_cp=1, t_ep=8, t_pp=1,
         g_tp=1, g_pp=1,
         config_file="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml",
     ),
     
     # ============================================
-    # Llama-3.1-8B-Instruct: 8 GPUs
-    # Training: TP2, CP1, EP1, PP1, VPP1, DP4
+    # Llama-3.1-8B-Instruct: 8 GPUs (2 nodes)
+    # H100 16 GPUs → GB200 8 GPUs
+    # Training: TP1, CP1, EP1, PP1, DP8 (MP=1, DP=8)
     # Generation: TP1, PP1, DP8
     # ============================================
     "llama8b": ModelConfig(
@@ -98,41 +103,65 @@ PRESETS = {
         model_name="meta-llama/Llama-3.1-8B-Instruct",
         total_gpus=8,
         gpus_per_node=4,
-        t_tp=2, t_cp=1, t_ep=1, t_pp=1,
+        t_tp=1, t_cp=1, t_ep=1, t_pp=1,
         g_tp=1, g_pp=1,
         config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
     ),
     
     # ============================================
-    # Llama-3.1-70B-Instruct: 16 GPUs
-    # Training: TP4, CP1, EP1, PP1, VPP1, DP4
-    # Generation: TP2, PP1, DP8
-    # Note: Uses 8B config as base, overrides model
+    # Llama-3.1-70B-Instruct: 16 GPUs (4 nodes)
+    # H100 32 GPUs → GB200 16 GPUs
+    # Training: TP4, CP1, EP1, PP2, DP2 (MP=8, DP=2)
+    # Generation: TP2, PP1, DP8 (70B needs TP2 for KV cache)
+    # Note: B200 192GB allows PP=2 (reduced pipeline bubble)
     # ============================================
     "llama70b": ModelConfig(
         name="Llama-3.1-70B",
         model_name="meta-llama/Llama-3.1-70B-Instruct",
         total_gpus=16,
         gpus_per_node=4,
-        t_tp=4, t_cp=1, t_ep=1, t_pp=1,
+        t_tp=4, t_cp=1, t_ep=1, t_pp=2,
         g_tp=2, g_pp=1,
         config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
         max_seqlen=4096,
     ),
     
     # ============================================
-    # Llama-3.1-70B High Sequence Length: 16 GPUs
-    # Same as above but with longer sequences
+    # Llama-3.1-70B Low Rollout GBS: 16 GPUs (4 nodes)
+    # H100 32 GPUs → GB200 16 GPUs
+    # Rollout GBS: 512 (16 prompts × 32 gens)
+    # Training: TP4, CP1, EP1, PP2, DP2 (reduced PP for higher DP)
+    # Generation: TP2, PP1, DP8 (B200 192GB allows lower TP)
+    # ============================================
+    "llama70b-lowgbs": ModelConfig(
+        name="Llama-3.1-70B-LowGBS",
+        model_name="meta-llama/Llama-3.1-70B-Instruct",
+        total_gpus=16,
+        gpus_per_node=4,
+        t_tp=4, t_cp=1, t_ep=1, t_pp=2,
+        g_tp=2, g_pp=1,
+        config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
+        max_seqlen=4096,
+        train_gbs=512,
+        num_prompts=16,
+        num_generations=32,
+    ),
+    
+    # ============================================
+    # Llama-3.1-70B High Sequence Length: 16 GPUs (4 nodes)
+    # Same as above but with 16384 sequence length
+    # Training: TP4, CP1, EP1, PP2, DP2 (reduced PP for higher DP)
+    # Generation: TP2, PP1, DP8
     # ============================================
     "llama70b-highseq": ModelConfig(
         name="Llama-3.1-70B-HighSeq",
         model_name="meta-llama/Llama-3.1-70B-Instruct",
         total_gpus=16,
         gpus_per_node=4,
-        t_tp=4, t_cp=1, t_ep=1, t_pp=1,
+        t_tp=4, t_cp=1, t_ep=1, t_pp=2,
         g_tp=2, g_pp=1,
         config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
-        max_seqlen=8192,
+        max_seqlen=16384,
     ),
 }
 
@@ -174,6 +203,7 @@ def build_command(config: ModelConfig,
 cluster.num_nodes={num_nodes} \\
 cluster.gpus_per_node={config.gpus_per_node} \\
 policy.model_name={config.model_name} \\
+policy.max_total_sequence_length={config.max_seqlen} \\
 policy.generation.vllm_cfg.tensor_parallel_size={config.g_tp} \\
 policy.generation.vllm_cfg.pipeline_parallel_size={config.g_pp} \\
 policy.megatron_cfg.tensor_model_parallel_size={config.t_tp} \\
@@ -218,6 +248,7 @@ def print_config_summary(config: ModelConfig):
     num_nodes = config.total_gpus // config.gpus_per_node
     t_dp = calculate_dp(config.total_gpus, config.t_tp, config.t_pp, config.t_ep)
     g_dp = calculate_dp(config.total_gpus, config.g_tp, config.g_pp)
+    rollout_gbs = config.num_prompts * config.num_generations
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -225,6 +256,11 @@ def print_config_summary(config: ModelConfig):
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Model: {config.model_name:<54} ║
 ║  Nodes: {num_nodes:<3}  |  GPUs/Node: {config.gpus_per_node:<2}  |  Total GPUs: {config.total_gpus:<4}         ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Batch Settings:                                                 ║
+║    Rollout GBS: {rollout_gbs:<5} ({config.num_prompts} prompts × {config.num_generations} gens)               ║
+║    Training GBS: {config.train_gbs:<5}                                           ║
+║    Max SeqLen: {config.max_seqlen:<6}                                            ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Training Parallelism:                                           ║
 ║    TP={config.t_tp:<2} | CP={config.t_cp:<2} | EP={config.t_ep:<2} | PP={config.t_pp:<2} | DP={t_dp:<2}                       ║
@@ -237,15 +273,16 @@ def print_config_summary(config: ModelConfig):
 def list_presets():
     """List all available presets."""
     print("\n📋 Available Presets:\n")
-    print(f"{'Preset':<20} {'Model':<30} {'GPUs':>6} {'Train (TP,CP,EP,PP,DP)':>24} {'Gen (TP,PP,DP)':>16}")
-    print("-" * 100)
+    print(f"{'Preset':<18} {'Model':<30} {'GPUs':>5} {'R-GBS':>6} {'T-GBS':>6} {'SeqLen':>7} {'Train (TP,CP,EP,PP,DP)':>22} {'Gen (TP,PP,DP)':>14}")
+    print("-" * 120)
     
     for name, config in PRESETS.items():
         t_dp = calculate_dp(config.total_gpus, config.t_tp, config.t_pp, config.t_ep)
         g_dp = calculate_dp(config.total_gpus, config.g_tp, config.g_pp)
         train_str = f"{config.t_tp},{config.t_cp},{config.t_ep},{config.t_pp},{t_dp}"
         gen_str = f"{config.g_tp},{config.g_pp},{g_dp}"
-        print(f"{name:<20} {config.model_name:<30} {config.total_gpus:>6} {train_str:>24} {gen_str:>16}")
+        rollout_gbs = config.num_prompts * config.num_generations
+        print(f"{name:<18} {config.model_name:<30} {config.total_gpus:>5} {rollout_gbs:>6} {config.train_gbs:>6} {config.max_seqlen:>7} {train_str:>22} {gen_str:>14}")
     
     print("\n💡 Usage: python launch_grpo.py --preset <preset_name>")
     print("   Example: python launch_grpo.py --preset qwen32b --dry-run\n")
