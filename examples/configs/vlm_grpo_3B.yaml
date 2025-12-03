@@ -206,6 +206,7 @@ policy:
     vllm_cfg:
       async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
       precision: ${policy.precision}
+      kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
