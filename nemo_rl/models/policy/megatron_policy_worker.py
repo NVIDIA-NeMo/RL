@@ -13,12 +13,13 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar
+from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -65,17 +66,11 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.engines import (
-    StaticInferenceEngine,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
-)
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
 )
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -106,16 +101,22 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.fp8 import (
+    convert_calibration_to_vllm_format,
+    get_vllm_qkv_scale_names,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
     _get_pack_sequence_parameters_for_megatron,
     _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
+    get_moe_metrics,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
@@ -273,10 +274,6 @@ def setup_megatron_model(
 
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
-
-    # If deferring fp32 logits, disable mixed-precision wrapper entirely
-    if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
-        mixed_precision_wrapper = None
 
     # Model, optimizer, and learning rate.
     model = get_model(
@@ -663,6 +660,9 @@ class MegatronPolicyWorker:
             assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
                 "defer_fp32_logits must be True if logprob_chunk_size is set"
             )
+        self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
+            "defer_fp32_logits", None
+        ) and (model_cfg.fp16 or model_cfg.bf16)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -796,8 +796,6 @@ class MegatronPolicyWorker:
             ref_mixed_precision_wrapper = Float16Module
             if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
                 ref_mixed_precision_wrapper = CustomFloat16Module
-            if self.cfg["megatron_cfg"].get("defer_fp32_logits", None):
-                ref_mixed_precision_wrapper = None
 
             reference_model = get_model(
                 self.megatron_cfg.model,
@@ -983,6 +981,7 @@ class MegatronPolicyWorker:
             )
             all_mb_metrics = []
             losses = []
+            total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
@@ -1049,6 +1048,9 @@ class MegatronPolicyWorker:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
 
+                # Track total microbatches for MoE aux-loss averaging
+                total_num_microbatches += int(data_iterator_len)
+
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
@@ -1068,6 +1070,7 @@ class MegatronPolicyWorker:
                             pad_individual_seqs_to_multiple_of=pad_factor,
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                             pad_full_seq_to=pad_full_seq_to,
+                            defer_fp32_logits=self.defer_fp32_logits,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,
@@ -1177,6 +1180,16 @@ class MegatronPolicyWorker:
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
         }
+        # Collect MoE aux metrics averaged across microbatches
+        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        if num_moe_experts is not None and num_moe_experts > 1:
+            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            moe_metrics = get_moe_metrics(
+                loss_scale=moe_loss_scale,
+                per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+            )
+            if moe_metrics:
+                metrics["moe_metrics"] = moe_metrics
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1283,6 +1296,9 @@ class MegatronPolicyWorker:
             # Mamba models currently do not support packed_seq_params
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
+
+            if self.defer_fp32_logits:
+                additional_kwargs["fp32_output"] = False
 
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
@@ -1770,9 +1786,14 @@ class MegatronPolicyWorker:
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+        # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model.config.flash_decode = True
+        self.model.config.flash_decode = False
+        if self.should_disable_forward_pre_hook:
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1799,46 +1820,126 @@ class MegatronPolicyWorker:
             inference_max_requests=self.cfg["generation_batch_size"],
         )
 
-        from megatron.core.inference.contexts import StaticInferenceContext
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
+        from megatron.core.inference.sampling_params import SamplingParams
 
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
+        buffer_guaranteed_fraction = mcore_generation_config[
+            "buffer_guaranteed_fraction"
+        ]
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        max_tokens = mcore_generation_config["max_tokens"]
+        model_config = self.model.config
+        model_config.cuda_graph_impl = "local"
 
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, inference_context
+        dynamic_context = DynamicInferenceContext(
+            params_dtype=inference_wrapper_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=None,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+            max_tokens_override=max_tokens,
         )
+        inference_wrapped_model = GPTInferenceWrapper(
+            self.model, inference_wrapper_config, dynamic_context
+        )
+        inference_wrapped_model.prep_model_for_inference()
+
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        inference_engine = StaticInferenceEngine(
-            text_generation_controller=text_generation_controller,
-            max_batch_size=self.cfg["generation_batch_size"],
+
+        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+
+        # Calculate seed based on step, node, and rank to ensure reproducibility across workers
+        # Similar to vllm_worker.py seed calculation but with added step information
+        # Formula: seed = (node_idx * 1024 * 10000) + (step * 1024) + local_rank
+        # This allows for:
+        # - Multiple nodes (node_idx multiplier is large enough)
+        # - Up to 10000 steps per node before potential overlap
+        # - Up to 1024 local ranks (GPUs per node)
+        local_rank = torch.cuda.current_device()  # Local GPU index on the node
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        seed = (node_idx * 1024) + local_rank
+
+        dynamic_engine = DynamicInferenceEngine(
+            controller=text_generation_controller,
+            random_seed=seed,
+            context=dynamic_context,
+            enable_cuda_graph=True,
+            termination_id=self.megatron_tokenizer.eod,
         )
 
-        # detokenize the prompts
-        # detokenized_prompts = [
-        # self.tokenizer.decode(prompt)
-        # for prompt in data.get("input_ids")
-        # ]
-        # apply chat template
-        out = run_mcore_engine(
-            engine=inference_engine,
-            # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data["input_ids"],
-            prompt_lengths_tensor=data["input_lengths"],
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
-            - data["input_ids"].size(1),
+        # Handle None values for top_k - convert to integer as required by Megatron
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
-        # print(out)
+        sampling_params = SamplingParams(
+            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
+            top_k=top_k_val,
+            top_p=top_p_val,
+            return_segments=False,
+            top_n_logprobs=0,
+            return_log_probs=True,
+            return_prompt_top_n_logprobs=False,
+        )
+        input_ids = data["input_ids"]
+        prompt_tokens_tensor = input_ids.cuda()
+        prompt_lengths_tensor = data["input_lengths"]
+        request_id = 0
+
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            dynamic_engine.add_request(
+                request_id,
+                p[:prompt_len],
+                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
+            )
+            request_id += 1
+
+        result = []
+        while dynamic_engine.has_unfinished_requests():
+            result_step = dynamic_engine.step_modern(sampling_params, verbose=False)
+            if result_step["finished_requests"] is not None:
+                result.extend(result_step["finished_requests"])
+
+        # Sort results by request_id to maintain original batch order
+        result.sort(key=lambda x: x.request_id)
+
+        out = {
+            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
+            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_seq_len = max([len(tokens) for tokens in out["tokens"]])
+        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        padded_input_length = input_ids.size(1)
 
+        max_seq_len = padded_input_length + max_gen_seq_len
         # Create padded tensors for tokens and logprobs
         output_ids_padded = torch.full(
             (batch_size, max_seq_len),
@@ -1854,12 +1955,19 @@ class MegatronPolicyWorker:
         )
 
         # Fill in the padded tensors with actual values
+        generation_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
+        unpadded_sequence_lengths = torch.zeros(
+            batch_size, dtype=torch.long, device=data["input_ids"].device
+        )
         for i in range(batch_size):
             seq_len = len(out["tokens"][i])
             output_ids_padded[i, :seq_len] = torch.tensor(
                 out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
             )
-
+            generation_lengths[i] = seq_len - input_lengths[i].item()
+            unpadded_sequence_lengths[i] = seq_len
             logprob_len = len(out["logprobs"][i])
             logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
                 out["logprobs"][i],
@@ -1870,16 +1978,13 @@ class MegatronPolicyWorker:
         out_dict = {
             "output_ids": output_ids_padded,
             "logprobs": logprobs_padded,
-            "generation_lengths": torch.tensor(
-                [len(o) - input_lengths[i] for i, o in enumerate(out["logprobs"])]
-            ),
-            "unpadded_sequence_lengths": torch.tensor(
-                [len(o) for o in out["logprobs"]]
-            ),
+            "generation_lengths": generation_lengths,
+            "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
 
         self.model.config.flash_decode = False
         no_grad.__exit__(None, None, None)
+
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
     def zero_out_weights(self):
@@ -1925,14 +2030,10 @@ class MegatronPolicyWorker:
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-        for name, tensor in hf_params_generator:
-            metadata = (tensor.shape, tensor.dtype)
-            refit_param_info_hf[name] = metadata
+        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
@@ -1993,24 +2094,74 @@ class MegatronPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
-    @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream model weights to peer process via ZMQ IPC socket."""
-        self.maybe_init_zmq()
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
-        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
-
-        # Generate HF parameters for streaming
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
+        This helper is used by both IPC-based streaming and collective broadcast
+        so that the logic for adding KV scales stays consistent in one place.
+        """
+        base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # Use the shared implementation
+        # Yield the original parameters first.
+        for name, tensor in base_iter:
+            yield name, tensor
+
+        # Check whether FP8 KV cache is enabled.
+        use_fp8_kv_cache = False
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            use_fp8_kv_cache = (
+                "vllm_cfg" in generation_cfg
+                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+            )
+
+        if not use_fp8_kv_cache:
+            return
+
+        # Append KV (and potentially Q) scale entries to match metadata.
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        keys: list[str] = []
+        for layer_idx in range(num_layers):
+            scale_names = get_vllm_qkv_scale_names(layer_idx)
+            keys.extend(scale_names.values())
+
+        for param_name in keys:
+            if kv_scales and param_name in kv_scales:
+                scale_value = kv_scales[param_name]
+            else:
+                scale_value = 1.0
+            scale_tensor = torch.tensor(
+                scale_value, dtype=torch.float32, device="cuda"
+            ).reshape(1)
+            yield param_name, scale_tensor
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
-            params_generator=hf_params_generator,
+            params_generator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -2018,17 +2169,13 @@ class MegatronPolicyWorker:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-
-        # param_iterator will return (name, tensor), we only need tensor
+        # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=hf_params_generator,
+            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
@@ -2353,6 +2500,203 @@ class MegatronPolicyWorker:
             "total_params": total_params,
             "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
         }
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
+
+        - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
+        - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
+        - By default only returns and saves K/V scales, optionally returns Q.
+
+        Args:
+            data: Representative sample batch for calibration, following get_logprobs input conventions.
+            micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
+            percentile: Percentile for amax (e.g. 99.9).
+            margin: Margin factor, e.g. 1.05.
+            save_path: If provided, rank0 will save results as JSON.
+            include_q: Whether to also return Q scale (usually only K/V needed).
+
+        Returns:
+            { "format": "fp8", "percentile": float, "margin": float,
+              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+        """
+
+        # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
+        # Defaults align with FP8 e4m3 max magnitude.
+        # Use different defaults for Q, K, V to adapt to distribution diffefences
+        def _get_env_float(name: str, default: float) -> float:
+            try:
+                val = os.getenv(name, None)
+                return float(val) if val is not None and val != "" else default
+            except Exception:
+                return default
+
+        FP8_MAX_Q = _get_env_float("FP8_MAX_Q", 448.0)
+        FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
+        FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
+
+        self.model.eval()
+
+        # Record local percentile amax for q/k/v of each layer
+        layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
+        hook_handles = []
+
+        def _extract_layer_key(module_name: str) -> str:
+            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
+            if m is not None:
+                return f"layer_{m.group(1)}"
+            return module_name
+
+        # Hook to capture q/k/v after q/k norm and RoPE
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
+                args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                    args = args[0]
+                # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
+                q = args[0]
+                k = args[1]
+                v = args[2]
+                if include_q:
+                    layer_to_samples_q[layer_key].append(
+                        float(torch.amax(torch.abs(q)).item())
+                    )
+                layer_to_samples_k[layer_key].append(
+                    float(torch.amax(torch.abs(k)).item())
+                )
+                layer_to_samples_v[layer_key].append(
+                    float(torch.amax(torch.abs(v)).item())
+                )
+
+            return _pre_hook
+
+        matched_modules = []
+        # Try to register forward_pre_hook on core_attention first
+        for name, module in self.model.named_modules():
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(
+                        _pre_hook_builder_core_attention(name)
+                    )
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(
+                        f"Error registering pre-hook for qkv scale calibration on {name}: {e}"
+                        " Please check if the model is compatible with the current calibration logic. "
+                        "The expected module name is 'self_attention.core_attention'."
+                    )
+                    raise
+
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
+        try:
+            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception as e:
+                    print(f"Error removing hook for qkv scale calibration: {e}")
+                    raise
+
+        # Compute local percentile amax
+        def _percentile(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
+            rank = max(
+                0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
+            )
+            return float(t[rank].item())
+
+        local_layer_to_pamax = {}
+        for layer_key in set(
+            list(layer_to_samples_k.keys())
+            + list(layer_to_samples_v.keys())
+            + (list(layer_to_samples_q.keys()) if include_q else [])
+        ):
+            entry = {}
+            if include_q:
+                entry["q_amax_p"] = _percentile(
+                    layer_to_samples_q.get(layer_key, []), percentile
+                )
+            entry["k_amax_p"] = _percentile(
+                layer_to_samples_k.get(layer_key, []), percentile
+            )
+            entry["v_amax_p"] = _percentile(
+                layer_to_samples_v.get(layer_key, []), percentile
+            )
+            local_layer_to_pamax[layer_key] = entry
+
+        # Merge across all ranks: take maximum of percentile amax (conservative approach)
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        gathered = [None for _ in range(world_size)] if world_size > 1 else None
+        if world_size > 1:
+            torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
+            merged = defaultdict(dict)
+            for d in gathered:  # type: ignore
+                if d is None:
+                    continue
+                for k, v in d.items():
+                    dst = merged[k]
+                    for kk, vv in v.items():
+                        dst[kk] = max(dst.get(kk, 0.0), float(vv))
+            layer_to_pamax = dict(merged)
+        else:
+            layer_to_pamax = local_layer_to_pamax
+
+        # Compute scale (symmetric quantization): scale = pamax / fp8_max
+        result_layers = {}
+        for layer_key, vals in layer_to_pamax.items():
+            out_entry = {}
+            if include_q:
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_Q
+                out_entry["q_scale"] = float(q_scale)
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_K
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_V
+            out_entry["k_scale"] = float(k_scale)
+            out_entry["v_scale"] = float(v_scale)
+            result_layers[layer_key] = out_entry
+
+        vllm_format_scales = convert_calibration_to_vllm_format(result_layers)
+
+        final_result = {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": vllm_format_scales,
+        }
+
+        # Sync results across all ranks (broadcast rank0's result)
+        if world_size > 1:
+            if torch.distributed.get_rank() == 0:
+                obj_list = [final_result]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]
+            else:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]  # type: ignore
+
+        return final_result
 
 
 class CustomFloat16Module(Float16Module):

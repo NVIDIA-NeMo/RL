@@ -122,6 +122,29 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Calibrate FP8 scales for Q/K/V activations used by KV cache.
+
+        Args:
+            data: BatchedDataDict containing input_ids and input_lengths.
+            micro_batch_size: Optional override for micro batch size during calibration.
+            percentile: Percentile for per-tensor amax estimation.
+            margin: Safety margin multiplier applied to amax.
+            include_q: Whether to also compute scale for Q in addition to K/V.
+
+        Returns:
+            Dict with overall configuration and per-layer scales.
+        """
+        pass
+
+    @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         pass
 
@@ -164,5 +187,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         pass

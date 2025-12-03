@@ -26,6 +26,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+    reduce_aux_losses_tracker_across_ranks,
+)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
@@ -358,6 +363,7 @@ def forward_step_arbitrary_loss(
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
+    defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
 ):
@@ -372,6 +378,9 @@ def forward_step_arbitrary_loss(
         loss_fn (LossFunction): Loss function to apply
         pack_sequences (bool): Whether to pack sequences for efficiency
         seq_length_key (Optional[str]): Key in data_dict containing actual sequence lengths
+        pad_individual_seqs_to_multiple_of (int): Pad individual sequences to a multiple of this value
+        pad_full_seq_to (Optional[int]): Pad packed sequences to this value
+        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         cp_normalize (bool): Whether to normalize the loss by the cp_size
         policy_cfg (Optional[dict]): Policy configuration containing generation parameters
 
@@ -452,6 +461,9 @@ def forward_step_arbitrary_loss(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    if defer_fp32_logits:
+        additional_kwargs["fp32_output"] = False
 
     with straggler_timer:
         output_tensor = model(
@@ -592,3 +604,49 @@ def broadcast_tensor(
     dist.broadcast(tensor, src=src_rank, group=group)
 
     return tensor
+
+
+def get_moe_metrics(
+    loss_scale: float,
+    total_loss_dict: Optional[dict] = None,
+    per_layer_logging: bool = False,
+) -> dict[str, Any]:
+    """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
+
+    This function reduces MoE auxiliary losses across ranks, aggregates them, and
+    returns a dictionary of metrics.
+
+    Args:
+        loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
+        total_loss_dict: If provided, accumulate means into this dict (by name).
+        per_layer_logging: If True, include per-layer values in the returned dict.
+
+    Returns:
+        dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
+        the mean value is returned under the same key (e.g., "load_balancing_loss").
+        If per_layer_logging is True, per-layer values are returned under keys of the
+        form "moe/{name}_layer_{i}".
+    """
+    reduce_aux_losses_tracker_across_ranks()
+    tracker = get_moe_layer_wise_logging_tracker()
+
+    metrics: dict[str, Any] = {}
+    if len(tracker) > 0:
+        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
+        for name, loss_list in aux_losses.items():
+            # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
+            num_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
+            aggregated_value = loss_list.sum() / num_layers
+            metrics[name] = float(aggregated_value.item())
+            if total_loss_dict is not None:
+                if name not in total_loss_dict:
+                    total_loss_dict[name] = aggregated_value
+                else:
+                    total_loss_dict[name] += aggregated_value
+
+            if per_layer_logging:
+                for i, loss in enumerate(loss_list.tolist()):
+                    metrics[f"moe/{name}_layer_{i}"] = float(loss)
+
+    clear_aux_losses_tracker()
+    return metrics
