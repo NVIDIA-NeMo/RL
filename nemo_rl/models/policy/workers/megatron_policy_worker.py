@@ -58,7 +58,6 @@ from megatron.bridge.training.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
-from megatron.bridge.models.conversion.param_mapping import broadcast_obj_from_pp_rank
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
@@ -97,6 +96,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
+    broadcast_obj_from_pp_rank,
     broadcast_loss_metrics_from_last_stage,
     broadcast_tensors_from_last_stage,
 )
@@ -207,7 +207,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Step 3: Setup model configuration
-        self.megatron_cfg, model_cfg, final_padded_vocab_size = setup_model_config(config, env_config, hf_model_name, pretrained_path, tokenizer) 
+        self.megatron_cfg, model_cfg  = setup_model_config(config, env_config, hf_model_name, pretrained_path, tokenizer)
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
         ) and (model_cfg.fp16 or model_cfg.bf16)
@@ -537,7 +537,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             logprobs = torch.cat(all_log_probs_padded, dim=0)
             tensors = {"logprobs": logprobs}
         else:
-            tensors = None
+            tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
