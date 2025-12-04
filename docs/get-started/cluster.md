@@ -83,14 +83,15 @@ sbatch \
     --nodes=${NUM_ACTOR_NODES} \
     --account=YOUR_ACCOUNT \
     --partition=YOUR_PARTITION \
-    --gpus-per-node=8 \
-    --time=04:00:00 \
+    --gres=gpu:8 \
+    --time=1:0:0 \
     --job-name=nemo-rl-interactive \
     ray.sub
 ```
 
 :::{tip}
-Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
+- Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
+- Depending on your Slurm cluster configuration, you may need `--gres=gpu:8` or `--gpus-per-node=8`. Check with your cluster admin if jobs don't receive GPUs.
 :::
 
 **2. Attach to the Cluster**
@@ -126,8 +127,8 @@ sbatch \
     --nodes=${NUM_ACTOR_NODES} \
     --account=YOUR_ACCOUNT \
     --partition=YOUR_PARTITION \
-    --gpus-per-node=8 \
-    --time=24:00:00 \
+    --gres=gpu:8 \
+    --time=1:0:0 \
     --job-name=nemo-rl-prod \
     ray.sub
 ```
