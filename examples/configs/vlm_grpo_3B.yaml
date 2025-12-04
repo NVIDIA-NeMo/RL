@@ -46,6 +46,7 @@ loss_fn:
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 
 checkpointing:
   enabled: true
