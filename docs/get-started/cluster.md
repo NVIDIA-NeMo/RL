@@ -151,7 +151,7 @@ The `ray.sub` script creates a log directory named after your Job ID (e.g., `198
 
 * **`ray-driver.log`**: The stdout/stderr of your Python script. Check this for training progress (loss values).
 * **`ray-worker-*.log`**: Logs for individual worker nodes (useful for debugging specific node failures).
-* **`dashboard.log`**: Debug info for the Ray dashboard.
+* **`ray-head.log`**: Output from the Ray head node (includes cluster initialization and dashboard startup info).
 
 ```bash
 tail -f 1980204-logs/ray-driver.log
@@ -206,9 +206,8 @@ The following variables allow for deeper customization of the Ray cluster. Most 
 | `METRICS_EXPORT_PORT=53009` | Port for exporting metrics from worker nodes. |
 | `PORT=54514` | Main port for the Ray head node (default: 54514; Ray's standard default is 6379, but this script uses 54514 for multi-node compatibility). |
 | `RAY_CLIENT_SERVER_PORT=10001` | Port for the Ray client server on the head node. |
-| `DASHBOARD_GRPC_PORT=52367` | gRPC port for the Ray dashboard on the head node. |
 | `DASHBOARD_PORT=8265` | Port for the Ray dashboard UI on the head node. |
 | `DASHBOARD_AGENT_LISTEN_PORT=52365` | Listening port for the dashboard agent on the head node. |
 | `MIN_WORKER_PORT=54001` | Minimum port in the range for Ray worker processes. |
-| `MAX_WORKER_PORT=54257` | Maximum port in the range for Ray worker processes. |
+| `MAX_WORKER_PORT=54513` | Maximum port in the range for Ray worker processes. |
 :::
