@@ -141,7 +141,7 @@ Initialize the project-specific virtual environment. NeMo RL uses a `.python-ver
    ```
 
    :::{important}
-   Do **not** specify a python version manually (e.g., `-p python3.12`). Let `uv` read the correct version from the configuration file to ensure compatibility.
+   Do **not** specify a python version manually (e.g., `-p python3.10`). Let `uv` read the correct version from the configuration file to ensure compatibility.
    :::
 
 2. **(Optional) Rebuilding Environments**:

@@ -70,71 +70,76 @@ Copy the command for your training type:
 ::::{tab-item} Interactive Mode (Recommended for Debugging)
 Interactive mode launches the cluster and gives you a shell on the **Head Node**. This is perfect for debugging because you can run scripts, check files, and kill/restart jobs without re-queueing.
 
-**1. Submit the Request**
-Ask for the resources you need (e.g., 1 node, 8 GPUs).
+1. Submit the Request.
 
-```bash
-# Run from the root of NeMo RL repo
-NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+   Ask for the resources you need (e.g., 1 node, 8 GPUs).
 
-CONTAINER=nvcr.io/nvidia/nemo:latest \
-MOUNTS="$PWD:$PWD" \
-sbatch \
-    --nodes=${NUM_ACTOR_NODES} \
-    --account=YOUR_ACCOUNT \
-    --partition=YOUR_PARTITION \
-    --gres=gpu:8 \
-    --time=1:0:0 \
-    --job-name=YOUR_JOBNAME \
-    ray.sub
-```
+   ```bash
+   # Run from the root of NeMo RL repo
+   NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
 
-:::{tip}
-- Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
-- Depending on your Slurm cluster configuration, you may need `--gres=gpu:8` or `--gpus-per-node=8`. Check with your cluster admin if jobs don't receive GPUs.
-:::
+   CONTAINER=nvcr.io/nvidia/nemo:latest \
+   MOUNTS="$PWD:$PWD" \
+   sbatch \
+       --nodes=${NUM_ACTOR_NODES} \
+       --account=YOUR_ACCOUNT \
+       --partition=YOUR_PARTITION \
+       --gres=gpu:8 \
+       --time=1:0:0 \
+       --job-name=YOUR_JOBNAME \
+       ray.sub
+   ```
 
-**2. Attach to the Cluster**
-Once the job starts, Slurm creates an attach script (e.g., `12345-attach.sh`). Run it:
+   :::{tip}
+   - Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
+   - Depending on your Slurm cluster configuration, you may need `--gres=gpu:8` or `--gpus-per-node=8`. Check with your cluster admin if jobs don't receive GPUs.
+   :::
 
-```bash
-bash <JOB_ID>-attach.sh
-```
+2. Attach to the Cluster.
 
-**3. Run Your Training**
-You are now inside the container on the head node. Run your command (see Cheatsheet above):
+   Once the job starts, Slurm creates an attach script (e.g., `12345-attach.sh`). Run it:
 
-```bash
-uv run examples/run_grpo_math.py
-```
+   ```bash
+   bash <JOB_ID>-attach.sh
+   ```
+
+3. Run Your Training.
+
+   You are now inside the container on the head node. Run your command (see Cheatsheet above):
+
+   ```bash
+   uv run examples/run_grpo_math.py
+   ```
 
 ::::
 
 ::::{tab-item} Batch Mode (Production)
 Batch mode is "fire and forget." You specify the command upfront, and the cluster shuts down automatically when it finishes.
 
-**1. Submit the Job**
-Include the `COMMAND` variable in your submission. Replace the command below with the one from the Cheatsheet.
+1. Submit the Job.
 
-```bash
-# Run from the root of NeMo RL repo
-NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+   Include the `COMMAND` variable in your submission. Replace the command below with the one from the Cheatsheet.
 
-COMMAND="uv run examples/run_grpo_math.py" \
-CONTAINER=nvcr.io/nvidia/nemo:latest \
-MOUNTS="$PWD:$PWD" \
-sbatch \
-    --nodes=${NUM_ACTOR_NODES} \
-    --account=YOUR_ACCOUNT \
-    --partition=YOUR_PARTITION \
-    --gres=gpu:8 \
-    --time=1:0:0 \
-    --job-name=YOUR_JOBNAME \
-    ray.sub
-```
+   ```bash
+   # Run from the root of NeMo RL repo
+   NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
 
-**2. Check Status**
-Slurm will write the output to a log file (e.g., `12345-logs/ray-driver.log`).
+   COMMAND="uv run examples/run_grpo_math.py" \
+   CONTAINER=nvcr.io/nvidia/nemo:latest \
+   MOUNTS="$PWD:$PWD" \
+   sbatch \
+       --nodes=${NUM_ACTOR_NODES} \
+       --account=YOUR_ACCOUNT \
+       --partition=YOUR_PARTITION \
+       --gres=gpu:8 \
+       --time=1:0:0 \
+       --job-name=YOUR_JOBNAME \
+       ray.sub
+   ```
+
+2. Check Status.
+
+    Slurm will write the output to a log file (e.g., `12345-logs/ray-driver.log`).
 ::::
 
 :::::
