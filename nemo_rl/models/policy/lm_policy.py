@@ -87,9 +87,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
         if megatron_enable:
-            worker_builder_cls = (
-                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
-            )
+            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -114,9 +112,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
-                )
+                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]

@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any, Optional
+
 import ray
 import torch
 import zmq
-from typing import Any, Optional
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
@@ -59,6 +60,7 @@ class AbstractPolicyWorker:
 
     def report_device_id(self) -> str:
         """Report the UUID of the current CUDA device using NVML.
+
         Returns:
             str: UUID of the device in the format "GPU-xxxxx"
         """
@@ -122,11 +124,16 @@ class AbstractPolicyWorker:
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
-        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None,
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get the logprobs from the reference policy for a batch of data.
+
         If micro_batch_size is provided, it will be used instead of the configured
         logprob_batch_size.
+
         Returns:
           a BatchedDataDict with key "reference_logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.

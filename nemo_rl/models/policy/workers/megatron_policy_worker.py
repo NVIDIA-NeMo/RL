@@ -23,7 +23,6 @@ from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
-import zmq
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.training import fault_tolerance
@@ -123,11 +122,9 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    get_gpu_info,
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )

@@ -23,7 +23,6 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
-import zmq
 from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
@@ -68,12 +67,10 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
