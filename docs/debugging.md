@@ -9,7 +9,7 @@ Since Ray programs can spawn multiple workers and actors, using the Ray Distribu
 ### Prerequisites
 
 * Install the [Ray Debugger VS Code/Cursor extension](https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html).
-* Launch the [interactive cluster](./cluster.md#interactive-launching) with `ray.sub`.
+* Launch the [interactive cluster](get-started/cluster.md#2-submit-a-job) with `ray.sub`.
 * Launch VS Code/Cursor on the SLURM login node (where `squeue`/`sbatch` is available).
 * Add `breakpoint()` in your code under actors & tasks (i.e. classes or functions decorated with `@ray.remote`).
 * **Ensure** `RAY_DEBUG=legacy` is not set since this debugging requires the default distributed debugger.
