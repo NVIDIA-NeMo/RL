@@ -82,7 +82,6 @@ from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_gpu_info,
     get_runtime_env_for_policy_worker,
-    import_class_from_path,
     resolve_model_class,
 )
 from nemo_rl.utils.automodel_checkpoint import (
@@ -92,6 +91,7 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.path import import_class_from_path
 
 
 @ray.remote(

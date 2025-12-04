@@ -17,11 +17,12 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 def format_dapo_math_17k(
     data: dict[str, str | float | int],
+    task_name: str = "DAPOMath17K",
 ) -> dict[str, list[Any] | str]:
     return {
         "messages": [
@@ -34,11 +35,13 @@ def format_dapo_math_17k(
                 "content": data["reward_model"]["ground_truth"],
             },
         ],
-        "task_name": "math",
+        "task_name": task_name,
     }
 
 
-def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
+def prepare_dapo_math_17k_dataset(
+    seed: int = 42, task_name: str = "DAPOMath17K"
+) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
     train_ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
@@ -51,9 +54,15 @@ def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
 
     # Format the examples, removing original columns
     train_formatted = train_ds.map(
-        format_dapo_math_17k, remove_columns=train_ds.column_names
+        format_dapo_math_17k,
+        remove_columns=train_ds.column_names,
+        fn_kwargs={"task_name": task_name},
     )
-    val_formatted = val_ds.map(format_dapo_math_17k, remove_columns=val_ds.column_names)
+    val_formatted = val_ds.map(
+        format_dapo_math_17k,
+        remove_columns=val_ds.column_names,
+        fn_kwargs={"task_name": task_name},
+    )
 
     return {
         "train": train_formatted,
@@ -61,15 +70,14 @@ def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     }
 
 
-class DAPOMath17KDataset:
+class DAPOMath17KDataset(RawDataset):
     def __init__(self, seed: int = 42) -> None:
         """Initialize the DAPO Math 17K dataset with train split.
 
         Args:
             seed: Random seed for reproducible splitting
         """
-        self.formatted_ds = prepare_dapo_math_17k_dataset(seed=seed)
-
-        self.task_spec = TaskDataSpec(
-            task_name="DAPOMath17K",
+        self.task_name = "DAPOMath17K"
+        self.formatted_ds = prepare_dapo_math_17k_dataset(
+            seed=seed, task_name=self.task_name
         )
