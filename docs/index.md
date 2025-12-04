@@ -56,7 +56,7 @@ Explore PyTorch DTensor and Megatron Core training backends and how to choose th
 
 ::::
 
-## Quickstarts
+## Get Started
 
 Start here to install NeMo RL and run your first training job.
 
@@ -71,7 +71,7 @@ Start here to install NeMo RL and run your first training job.
 {bdg-primary}`installation` {bdg-secondary}`first-run`
 :::
 
-:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` GRPO Quickstart
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` GRPO Worfklow
 :link: get-started/grpo
 :link-type: doc
 Run Group Relative Policy Optimization (GRPO) training.
@@ -79,7 +79,7 @@ Run Group Relative Policy Optimization (GRPO) training.
 {bdg-secondary}`on-policy` {bdg-secondary}`reinforcement-learning`
 :::
 
-:::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` SFT Quickstart
+:::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` SFT Worfklow
 :link: get-started/sft
 :link-type: doc
 Run supervised fine-tuning (SFT) on instruction datasets.
@@ -87,7 +87,7 @@ Run supervised fine-tuning (SFT) on instruction datasets.
 {bdg-secondary}`fine-tuning` {bdg-secondary}`instruction-following`
 :::
 
-:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` DPO Quickstart
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` DPO Worfklow
 :link: get-started/dpo
 :link-type: doc
 Run Direct Preference Optimization (DPO) training.
