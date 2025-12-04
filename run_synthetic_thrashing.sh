@@ -17,7 +17,7 @@ rm -f synthetic_thrashing_win.log
 uv run --extra dynamo examples/run_router_benchmark_ray.py \
     --num-nodes 2 --gpus-per-node 8 \
     --dataset synthetic \
-    --num-synthetic-prefixes 128 \
+    --num-synthetic-prefixes 32 \
     --num-generations-per-prompt 5 \
     --use-manual-routing \
     --sequential \
