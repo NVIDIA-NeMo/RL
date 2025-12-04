@@ -108,6 +108,11 @@ class LoggerInterface(ABC):
         """Log dictionary of hyperparameters."""
         pass
 
+    @abstractmethod
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics."""
+        pass
+
 
 class TensorboardLogger(LoggerInterface):
     """Tensorboard logger backend."""
@@ -349,6 +354,16 @@ class WandbLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to wandb.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        self.run.log({name: wandb.Histogram(histogram)}, step=step)
 
 
 class SwanlabLogger(LoggerInterface):
@@ -1016,6 +1031,17 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_plot(fig, step, f"{prefix}/average_{name}")
         plt.close(fig)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to all backends if available.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        for logger in self.loggers:
+            logger.log_histogram(histogram, step, name)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

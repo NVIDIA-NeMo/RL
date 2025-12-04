@@ -21,7 +21,6 @@ import json
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import reduce
 from typing import Any, Optional
 
 import ray
@@ -938,15 +937,15 @@ def run_async_multi_turn_rollout(
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Collect ISL, OSL, and ISL+OSL metrics for all samples
-        rollout_metrics["gen_tokens_lengths"] = reduce(
-            lambda x, y: x + y, [m["turn_gen_tokens"] for m in all_sample_metrics]
-        )
-        rollout_metrics["input_tokens_lengths"] = reduce(
-            lambda x, y: x + y, [m["turn_input_tokens"] for m in all_sample_metrics]
-        )
-        rollout_metrics["total_tokens_lengths"] = reduce(
-            lambda x, y: x + y, [m["turn_total_tokens"] for m in all_sample_metrics]
-        )
+        rollout_metrics["histogram/gen_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
+        ]
+        rollout_metrics["histogram/input_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_input_tokens"]
+        ]
+        rollout_metrics["histogram/total_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_total_tokens"]
+        ]
 
         return final_batch, rollout_metrics
 
