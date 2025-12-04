@@ -85,7 +85,7 @@ sbatch \
     --partition=YOUR_PARTITION \
     --gres=gpu:8 \
     --time=1:0:0 \
-    --job-name=nemo-rl-interactive \
+    --job-name=YOUR_JOBNAME \
     ray.sub
 ```
 
@@ -129,7 +129,7 @@ sbatch \
     --partition=YOUR_PARTITION \
     --gres=gpu:8 \
     --time=1:0:0 \
-    --job-name=nemo-rl-prod \
+    --job-name=YOUR_JOBNAME \
     ray.sub
 ```
 
