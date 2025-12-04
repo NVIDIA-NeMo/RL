@@ -380,7 +380,7 @@ class KvRouter:
                 waiting = waitings_normalized[worker_id]
                 logit = 2 * overlap - usage - waiting
                 logits.append(logit)
-                logger.info(
+                logger.debug(
                     f"worker_id: {worker_id}, logit = 2 * {overlap:.3f} - {usage:.3f} - {waiting:.3f} = {logit:.3f}"
                 )
 
@@ -407,7 +407,7 @@ class KvRouter:
         worker_id = self.round_robin_counter
         self.round_robin_counter = (self.round_robin_counter + 1) % self.num_workers
         
-        logger.info(f"Round robin selected worker_id: {worker_id}")
+        logger.debug(f"Round robin selected worker_id: {worker_id}")
         
         # Predictive update for handling concurrent request bursts
         self.waitings[worker_id] += 1

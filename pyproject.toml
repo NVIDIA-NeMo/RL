@@ -44,7 +44,7 @@ dependencies = [
     "matplotlib",
     "plotly",
     "sympy>=1.14.0",
-    "pillow>=11.3.0",
+    "pillow>=11.1.0",
     "torchvision>=0.22.0",
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow>=3.5.0,<3.6.0",
@@ -109,7 +109,8 @@ dynamo = [
     "ai-dynamo==0.6.1",
     "uvloop",
     "nixl<=0.7.0",
-    "vllm[flashinfer]==0.11.0"
+    "vllm[flashinfer]==0.11.0",
+    "aiperf"
 ]
 
 [dependency-groups]
