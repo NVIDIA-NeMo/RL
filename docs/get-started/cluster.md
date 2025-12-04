@@ -105,7 +105,7 @@ bash <JOB_ID>-attach.sh
 You are now inside the container on the head node. Run your command (see Cheatsheet above):
 
 ```bash
-uv run examples/run_sft.py
+uv run examples/run_grpo_math.py
 ```
 
 ::::
@@ -120,7 +120,7 @@ Include the `COMMAND` variable in your submission. Replace the command below wit
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
 
-COMMAND="uv run examples/run_sft.py" \
+COMMAND="uv run examples/run_grpo_math.py" \
 CONTAINER=nvcr.io/nvidia/nemo:latest \
 MOUNTS="$PWD:$PWD" \
 sbatch \
