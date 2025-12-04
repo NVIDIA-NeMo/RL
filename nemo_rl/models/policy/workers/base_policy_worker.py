@@ -94,12 +94,16 @@ class AbstractPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Shutdown the policy."""
-        # Clean up extension resources like ZMQ sockets
-        if hasattr(self, "zmq_socket"):
-            self.zmq_socket.close()
-            self.zmq_context.term()
+        try:
+            # Clean up extension resources like ZMQ sockets
+            if hasattr(self, "zmq_socket"):
+                self.zmq_socket.close()
+                self.zmq_context.term()
+            return True
+        except Exception:
+            return False
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -118,7 +122,7 @@ class AbstractPolicyWorker:
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
-        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get the logprobs from the reference policy for a batch of data.
         If micro_batch_size is provided, it will be used instead of the configured

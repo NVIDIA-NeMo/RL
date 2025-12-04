@@ -666,10 +666,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        # Placeholder implementation
-        pass
-
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 

@@ -99,7 +99,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(ColocatablePolicyInterface, AbstractPolicyWorker):
+class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 

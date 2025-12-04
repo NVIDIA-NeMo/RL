@@ -138,7 +138,7 @@ def get_cpu_state_dict(
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
 )  # pragma: no cover
-class DTensorPolicyWorker(ColocatablePolicyInterface, AbstractPolicyWorker):
+class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
