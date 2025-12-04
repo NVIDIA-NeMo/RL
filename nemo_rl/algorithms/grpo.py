@@ -1218,11 +1218,10 @@ def grpo_train(
 
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-                    # Clear vLLM logger metrics for each generation step
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "clear_vllm_logger_metrics"
-                    ):
-                        policy_generation.clear_vllm_logger_metrics()
+
+                    # Clear logger metrics for each generation step
+                    if policy_generation is not None:
+                        policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1272,16 +1271,10 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
-                    # Collect vLLM logger metrics for performance reporting after each generation step
-                    # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "get_vllm_logger_metrics"
-                    ):
-                        vllm_logger_metrics = (
-                            policy_generation.get_vllm_logger_metrics()
-                        )
-                    else:
-                        vllm_logger_metrics = {}
+                    # Collect generation logger metrics for performance reporting after each generation step
+                    # inflight batch sizes and num pending samples are collected from each worker
+                    if policy_generation is not None:
+                        generation_logger_metrics = policy_generation.get_logger_metrics()
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1530,7 +1523,7 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
 
                 metrics.update(rollout_metrics)
-                metrics["vllm_logger_metrics"] = vllm_logger_metrics
+                metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1653,7 +1646,7 @@ def grpo_train(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
-                    vllm_logger_metrics,
+                    generation_logger_metrics,
                     total_steps + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][
                         "vllm_metrics_logger_interval"
@@ -2123,11 +2116,9 @@ def async_grpo_train(
             trajectory_collector.resume.remote()
 
     print("✅ All setup complete, starting buffer wait...")
-    # Clear vLLM logger metrics after at start of training
-    if policy_generation is not None and hasattr(
-        policy_generation, "clear_vllm_logger_metrics"
-    ):
-        policy_generation.clear_vllm_logger_metrics()
+    # Clear logger metrics at start of training
+    if policy_generation is not None:
+        policy_generation.clear_logger_metrics()
 
     # Wait for initial buffer fill
     print(
@@ -2367,23 +2358,17 @@ def async_grpo_train(
                     train_results = policy.train(train_data, loss_fn)
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
-                vllm_logger_metrics = None
+                generation_logger_metrics = None
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Collect vLLM logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "get_vllm_logger_metrics"
-                    ):
-                        vllm_logger_metrics = (
-                            policy_generation.get_vllm_logger_metrics()
-                        )
-                    else:
-                        vllm_logger_metrics = {}
+                    # Collect generation logger metrics for performance reporting
+                    # inflight batch sizes and num pending samples are collected from each worker
+                    if policy_generation is not None:
+                        generation_logger_metrics = policy_generation.get_logger_metrics()
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -2398,11 +2383,9 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
 
-                # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
-                if policy_generation is not None and hasattr(
-                    policy_generation, "clear_vllm_logger_metrics"
-                ):
-                    policy_generation.clear_vllm_logger_metrics()
+                # Clear logger metrics after each refit (weight sync), starting a new logging cycle
+                if policy_generation is not None:
+                    policy_generation.clear_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None
@@ -2495,8 +2478,8 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
-                if vllm_logger_metrics is not None:
-                    metrics["vllm_logger_metrics"] = vllm_logger_metrics
+                if generation_logger_metrics is not None:
+                    metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Checkpointing (same as sync version)
@@ -2603,7 +2586,7 @@ def async_grpo_train(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
-                    vllm_logger_metrics,
+                    generation_logger_metrics,
                     step + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][
                         "vllm_metrics_logger_interval"
