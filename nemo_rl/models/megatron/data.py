@@ -19,7 +19,6 @@ def get_microbatch_iterator(
     cfg: dict[str, Any],
     mbs: int,
 ) -> tuple[Iterator, int, int, int, int, int, int]:
-    _, seq_dim_size = check_sequence_dim(data)
     if cfg["dynamic_batching"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
@@ -46,6 +45,8 @@ def get_microbatch_iterator(
         pad_factor = 1
         pad_packed_seq_to_multiple_of = 1
         pad_full_seq_to = None
+
+    _, seq_dim_size = check_sequence_dim(data)
     return (
         mb_iterator,
         data_iterator_len,

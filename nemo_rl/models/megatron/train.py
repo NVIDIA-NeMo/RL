@@ -24,7 +24,7 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.megatron.data import process_microbatch
 
-def forward_step(
+def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
     cfg: Dict[str, Any],
@@ -80,21 +80,21 @@ def forward_step(
         
     return output_tensor
 
-def forward_with_processor(
+def forward_with_collection_fn(
     data_iterator: Iterator[BatchedDataDict[Any]],
     model: GPTModel,
     cfg: Dict[str, Any],
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
-    processor_fn: Optional[Callable[..., Callable]] = None,
+    collection_fn: Optional[Callable[..., Callable]] = None,
     defer_fp32_logits: Optional[bool] = True,
 ) -> Tuple[torch.Tensor, Callable]:
     """
-    Perform forward pass with data processing and return output tensor and processor function.
+    Perform forward pass with data processing and return output tensor and collection function.
     
     This function handles data preprocessing (including sequence packing if enabled),
-    runs the forward step through the model, and prepares a processor function for
+    runs the forward step through the model, and prepares a collection function for
     post-processing the outputs.
     
     Args:
@@ -104,12 +104,12 @@ def forward_with_processor(
         seq_length_key: Key for sequence length in data dict (optional)
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
-        processor_fn: Function that creates output processor (optional)
+        collection_fn: Function that creates output collection function when called (optional)
         
     Returns:
-        tuple: (output_tensor, processor_fn_wrapped)
+        tuple: (output_tensor, collection_fn_wrapped)
             - output_tensor: Raw model outputs (logits)
-            - processor_fn_wrapped: Function to process outputs into loss/metrics
+            - collection_fn_wrapped: Function to create output collection function when called
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
     data_dict = next(data_iterator).to("cuda")
@@ -129,7 +129,7 @@ def forward_with_processor(
         pack_sequences=pack_sequences,
     )
 
-    output_tensor = forward_step(
+    output_tensor = model_forward(
         model,
         data_dict,
         cfg,
@@ -140,9 +140,9 @@ def forward_with_processor(
         defer_fp32_logits,
     )
 
-    ## calling processor_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
-    #### NOTE: the processor_fn passed in here should accept the following kwargs!
-    processor_fn_wrapped = processor_fn(
+    ## calling collection_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
+    #### NOTE: the collection_fn passed in here should accept the following kwargs!
+    collection_fn_wrapped = collection_fn(
         data_dict=data_dict,
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -153,7 +153,7 @@ def forward_with_processor(
         attention_mask=attention_mask,
     )
 
-    return output_tensor, processor_fn_wrapped
+    return output_tensor, collection_fn_wrapped
 
 def megatron_forward_backward(
     model: GPTModel,
@@ -165,7 +165,7 @@ def megatron_forward_backward(
     num_microbatches: int,
     seq_length: int,
     mbs: int,
-    processor_fn: Callable[..., Callable],
+    collection_fn: Callable[..., Callable],
     forward_only: bool = False,
     defer_fp32_logits: Optional[bool] = True,
 ) -> Any:
@@ -186,19 +186,19 @@ def megatron_forward_backward(
         num_microbatches (int): Number of microbatches to process
         seq_length (int): Sequence length
         mbs (int): Micro batch size
-        processor_fn: Function to process model logits into loss/metrics
+        collection_fn: Function to create output collection function when called
         forward_only (bool): If True, skip backward pass
         
     Returns:
         BatchedDataDict: Results from the forward/backward execution
     """
     forward_step = partial(
-        forward_with_processor,
+        forward_with_collection_fn,
         cfg=cfg,
         seq_length_key=seq_length_key,
         pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
-        processor_fn=processor_fn,
+        collection_fn=collection_fn,
         defer_fp32_logits=defer_fp32_logits,
     )
     forward_backward_func = get_forward_backward_func()
@@ -213,19 +213,19 @@ def megatron_forward_backward(
         forward_only=forward_only,
     )
 
-def loss_processor(
+def get_loss_fn(
     loss_fn: LossFunction,
     cfg: Dict[str, Any],
     global_valid_seqs: torch.Tensor,
     global_valid_toks: torch.Tensor,
-    ## the following args depend on the batch and are passed in by forward_with_processor
+    ## the following args depend on the batch and are passed in by forward_with_collection_fn
     data_dict: BatchedDataDict[Any],
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_normalize: bool = True,
     **unused_kwargs: Any,
 ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
     """
-    Create a loss processor function for training.
+    Create a loss collection function for training.
     
     This function wraps a loss function with the necessary context and parameters
     to compute loss and metrics from model outputs. It handles sequence packing
@@ -276,7 +276,7 @@ def loss_processor(
     
     return loss_fn_wrapped
 
-def logprobs_processor(
+def get_logprobs_fn(
     cfg: Dict[str, Any],
     ## the following args depend on the batch
     data_dict: BatchedDataDict[Any],
@@ -341,7 +341,7 @@ def logprobs_processor(
     return processor_fn_inner
 
 
-def topk_logits_processor(
+def get_topk_logits_fn(
     cfg: Dict[str, Any],
     k: int,
     ## arguments that depend on the batch

@@ -59,7 +59,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
-from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
@@ -102,9 +101,9 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
-    loss_processor,
-    logprobs_processor,
-    topk_logits_processor,
+    get_loss_fn,
+    get_logprobs_fn,
+    get_topk_logits_fn,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -112,21 +111,19 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    configure_dynamo_cache,
     get_gpu_info,
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_worker import BasePolicyWorker
 from nemo_rl.models.megatron.setup import (
-    destroy_parallel_state,
     finalize_megatron_setup,
     handle_model_import,
-    setup_environment_and_config,
-    setup_megatron_model,
-    setup_model_config,
+    setup_distributed,
+    setup_model_and_optimizer,
     setup_reference_model_state,
     validate_model_paths,
+    validate_and_set_config,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -172,51 +169,44 @@ class MegatronPolicyWorker(BasePolicyWorker):
     ):
         """Initialize the MegatronPolicyWorker."""
         
-        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
-        # with different order of node_bundles
-        configure_dynamo_cache()
-        
-        # Ensure clean slate before import
-        destroy_parallel_state()
-        
+        self.cfg = config
+
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         
-        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-        torch.distributed.init_process_group("nccl")
-        
-        # Step 1: Setup environment and basic configuration
-        env_config = setup_environment_and_config(config, self.rank)
-        
-        # Store config and environment settings
-        self.cfg = config
-        self.dtype = env_config.dtype
-        self.optimizer_cpu_offload = env_config.optimizer_cpu_offload
-        self.offload_optimizer_for_logprob = env_config.offload_optimizer_for_logprob
-        self.is_generation_colocated = env_config.is_generation_colocated
-        
+        # Step 1: Setup distributed
+        setup_distributed()
+
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(config)
-        
         # Handle model import if needed
         handle_model_import(config, hf_model_name, pretrained_path, pt_checkpoint_exists)
-        
+
         # Store tokenizer
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         # Step 3: Setup model configuration
-        self.megatron_cfg, model_cfg  = setup_model_config(config, env_config, hf_model_name, pretrained_path, tokenizer)
+        (
+            self.megatron_cfg,
+            model_cfg,
+            self.dtype,
+            self.optimizer_cpu_offload,
+            self.offload_optimizer_for_logprob,
+            self.is_generation_colocated,
+            self.final_padded_vocab_size,
+        ) = validate_and_set_config(
+            config,
+            self.rank,
+            hf_model_name,
+            pretrained_path,
+            tokenizer,
+        )
+
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
         ) and (model_cfg.fp16 or model_cfg.bf16)
-
-        self.final_padded_vocab_size = calculate_padded_vocab_size(
-            self.megatron_cfg.model.vocab_size,
-            self.megatron_cfg.model.make_vocab_size_divisible_by,
-            config["megatron_cfg"]["tensor_model_parallel_size"],
-        )
         
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -232,7 +222,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             self.scheduler,
             self.checkpointing_context,
             param_sync_func,
-        ) = setup_megatron_model(config, self.megatron_cfg, init_optimizer)
+        ) = setup_model_and_optimizer(config, self.megatron_cfg, init_optimizer)
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -331,16 +321,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     loss_fn,
                     dp_group=parallel_state.get_data_parallel_group(),
                 )
-                
-                loss_processor_wrapped = partial(
-                    loss_processor,
-                    loss_fn=loss_fn,
-                    cfg=self.cfg,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                )
 
-                batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
                 (
                     data_iterator,
                     data_iterator_len,
@@ -350,7 +331,15 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     pad_full_seq_to,
                     seq_dim_size,
                 ) = get_microbatch_iterator(batch, self.cfg, mbs)
-                
+
+                loss_fn_wrapped = partial(
+                    get_loss_fn,
+                    loss_fn=loss_fn,
+                    cfg=self.cfg,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                )
+
                 seqlen_key = "input_lengths" if self.cfg["sequence_packing"]["enabled"] else None
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -370,7 +359,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                         num_microbatches=data_iterator_len,
                         seq_length=seq_dim_size,
                         mbs=mbs,
-                        processor_fn=loss_processor_wrapped,
+                        collection_fn=loss_fn_wrapped,
                         forward_only=eval_mode,
                         defer_fp32_logits=self.defer_fp32_logits,
                     )
@@ -519,7 +508,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
-            processor_fn=partial(logprobs_processor, cfg=self.cfg),
+            collection_fn=partial(get_logprobs_fn, cfg=self.cfg),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
         )
@@ -644,8 +633,8 @@ class MegatronPolicyWorker(BasePolicyWorker):
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
-            processor_fn=partial(
-                topk_logits_processor,
+            collection_fn=partial(
+                get_topk_logits_fn,
                 cfg=self.cfg,
                 k=k,
             ),

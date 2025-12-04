@@ -42,6 +42,7 @@ from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
+from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -58,27 +59,12 @@ except ImportError:
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.utils import get_megatron_checkpoint_dir
+from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
+    get_megatron_checkpoint_dir,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-class EnvironmentConfig:
-    """Configuration for environment and basic settings."""
-    
-    def __init__(
-        self,
-        dtype: torch.dtype,
-        optimizer_cpu_offload: bool,
-        offload_optimizer_for_logprob: bool,
-        is_generation_colocated: Optional[bool],
-        rank: int,
-    ):
-        self.dtype = dtype
-        self.optimizer_cpu_offload = optimizer_cpu_offload
-        self.offload_optimizer_for_logprob = offload_optimizer_for_logprob
-        self.is_generation_colocated = is_generation_colocated
-        self.rank = rank
 
 
 def destroy_parallel_state():
@@ -180,12 +166,24 @@ def destroy_parallel_state():
     except ImportError:
         pass
 
-def setup_environment_and_config(
-    config: PolicyConfig,
-    rank: int,
-) -> EnvironmentConfig:
+def setup_distributed() -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
     
+    # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+    # with different order of node_bundles
+    configure_dynamo_cache()
+    # Ensure clean slate before import
+    destroy_parallel_state()
+    # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
+    torch.distributed.init_process_group("nccl")
+
+def validate_and_set_config(
+    config,
+    rank,
+    hf_model_name,
+    pretrained_path,
+    tokenizer,
+):
     # Handle generation colocation
     is_generation_colocated = None
     if "generation" in config and config["generation"] is not None:
@@ -214,14 +212,30 @@ def setup_environment_and_config(
             "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
         )
     
-    return EnvironmentConfig(
-        dtype=dtype,
-        optimizer_cpu_offload=optimizer_cpu_offload,
-        offload_optimizer_for_logprob=offload_optimizer_for_logprob,
-        is_generation_colocated=is_generation_colocated,
-        rank=rank,
+    megatron_cfg, model_cfg = setup_model_config(
+        config,
+        rank,
+        dtype,
+        hf_model_name,
+        pretrained_path,
+        tokenizer,
     )
 
+    final_padded_vocab_size = calculate_padded_vocab_size(
+        megatron_cfg.model.vocab_size,
+        megatron_cfg.model.make_vocab_size_divisible_by,
+        config["megatron_cfg"]["tensor_model_parallel_size"],
+    )
+
+    return (
+        megatron_cfg,
+        model_cfg,
+        dtype,
+        optimizer_cpu_offload,
+        offload_optimizer_for_logprob,
+        is_generation_colocated,
+        final_padded_vocab_size,
+    )
 
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths."""
@@ -242,7 +256,8 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
 def setup_model_config(
     config: PolicyConfig,
-    env_config: EnvironmentConfig,
+    rank,
+    dtype,
     hf_model_name: str,
     pretrained_path: str,
     tokenizer: TokenizerType,
@@ -254,7 +269,7 @@ def setup_model_config(
     
     if not os.path.exists(pretrained_run_config):
         raise FileNotFoundError(
-            f"Pretrained run config not found at {pretrained_run_config} on rank={env_config.rank}. "
+            f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
             "This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory "
             "not being mounted on this node. Please check"
         )
@@ -286,7 +301,7 @@ def setup_model_config(
     _apply_moe_config(model_cfg, config)
     
     # Apply precision settings
-    _apply_precision_config(model_cfg, config, env_config.dtype)
+    _apply_precision_config(model_cfg, config, dtype)
     
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
@@ -311,7 +326,7 @@ def setup_model_config(
     
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
-        model_cfg, checkpoint_config, config, hf_model_name, env_config.dtype
+        model_cfg, checkpoint_config, config, hf_model_name, dtype
     )
     
     return megatron_cfg, model_cfg
@@ -510,7 +525,7 @@ def _create_megatron_config(
         ),
     )
 
-def setup_megatron_model(
+def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
     load_optimizer: bool = True,
