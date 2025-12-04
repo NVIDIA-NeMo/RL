@@ -29,7 +29,7 @@ class AbstractPolicyWorker:
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> None:
         """Initialize the collective communication.
-        
+
         Args:
             ip: IP address for the process group
             port: Port for the process group
@@ -56,6 +56,7 @@ class AbstractPolicyWorker:
     def get_gpu_info(self) -> dict[str, Any]:
         """Return information about the GPU being used by this worker."""
         from nemo_rl.models.policy.utils import get_gpu_info
+
         return get_gpu_info(self.model)
 
     def report_device_id(self) -> str:
