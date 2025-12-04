@@ -65,9 +65,9 @@ Copy the command for your training type:
 | **Reward Model** | `uv run examples/run_rm.py` |
 | **GRPO** | `uv run examples/run_grpo_math.py` |
 
-::::{tab-set}
+:::::{tab-set}
 
-:::{tab-item} Interactive Mode (Recommended for Debugging)
+::::{tab-item} Interactive Mode (Recommended for Debugging)
 Interactive mode launches the cluster and gives you a shell on the **Head Node**. This is perfect for debugging because you can run scripts, check files, and kill/restart jobs without re-queueing.
 
 **1. Submit the Request**
@@ -108,9 +108,9 @@ You are now inside the container on the head node. Run your command (see Cheatsh
 uv run examples/run_sft.py
 ```
 
-:::
+::::
 
-:::{tab-item} Batch Mode (Production)
+::::{tab-item} Batch Mode (Production)
 Batch mode is "fire and forget." You specify the command upfront, and the cluster shuts down automatically when it finishes.
 
 **1. Submit the Job**
@@ -135,9 +135,9 @@ sbatch \
 
 **2. Check Status**
 Slurm will write the output to a log file (e.g., `12345-logs/ray-driver.log`).
-:::
-
 ::::
+
+:::::
 
 ---
 
