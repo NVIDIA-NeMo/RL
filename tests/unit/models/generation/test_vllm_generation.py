@@ -364,43 +364,6 @@ def test_vllm_missing_required_config_key(cluster):
     print(f"Successfully caught missing config key with error: {error_message}")
 
 
-def test_vllm_top_p_top_k_validation(cluster):
-    """Test that top_p and top_k validation works correctly with threshold-based logic."""
-    # Test that values above thresholds are allowed
-    config_above_thresholds = deepcopy(basic_vllm_test_config)
-    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
-    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
-
-    # Should not raise an error
-    try:
-        VllmGeneration(cluster, config_above_thresholds)
-        print("Successfully initialized with top_p=0.99 and top_k=8000")
-    except Exception as e:
-        pytest.fail(f"Should not raise error with values above thresholds: {e}")
-
-    # Test that values below thresholds are rejected
-    config_below_thresholds = deepcopy(basic_vllm_test_config)
-    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
-
-    with pytest.raises(ValueError) as excinfo:
-        VllmGeneration(cluster, config_below_thresholds)
-
-    error_message = str(excinfo.value)
-    assert "top_p sampling with values < 0.99 is not supported" in error_message
-    print(f"Successfully caught low top_p value with error: {error_message}")
-
-    # Test that low top_k values are rejected
-    config_low_top_k = deepcopy(basic_vllm_test_config)
-    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
-
-    with pytest.raises(ValueError) as excinfo:
-        VllmGeneration(cluster, config_low_top_k)
-
-    error_message = str(excinfo.value)
-    assert "top_k sampling with values < 8000 is not supported" in error_message
-    print(f"Successfully caught low top_k value with error: {error_message}")
-
-
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation
@@ -2509,3 +2472,309 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    "temperature,top_p,top_k",
+    [
+        # Test with temperature scaling only
+        (0.6, 1.0, None),
+        # Test with top-p sampling only
+        (1.0, 0.5, None),
+        # Test with top-k sampling only
+        (1.0, 1.0, 50),
+        # Test with combined sampling
+        (0.6, 0.5, 50),
+    ],
+)
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
+def test_vllm_policy_logprob_agreement_with_sampling(
+    cluster, tokenizer, temperature, top_p, top_k, tensor_parallel_size, policy_type
+):
+    """Test that policy worker logprobs match vLLM with sampling parameters.
+
+    This test validates that when using the same sampling parameters (temperature, top_k, top_p),
+    the policy workers produce logprobs that closely match vLLM's processed_logprobs.
+
+    We test both:
+    1. get_logprobs() - forward pass for logprob computation
+    2. train() with loss functions - ensures loss computation uses same logprobs
+
+    Args:
+        cluster: Ray virtual cluster fixture
+        tokenizer: Tokenizer fixture
+        temperature: Temperature for scaling logits
+        top_p: Top-p (nucleus) sampling parameter
+        top_k: Top-k sampling parameter
+        policy_type: Type of policy worker to test ("dtensor" or "megatron")
+    """
+    from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
+
+    # Use 2 prompts to match batch size configuration
+    prompts = [
+        "Hello, how are you?",
+        "The capital of France is",
+        "Write a short story about",
+        "Explain quantum physics in simple terms:",
+    ]
+
+    # Tokenize the prompts
+    tokenized = tokenizer(
+        prompts,
+        padding=True,
+        truncation=True,
+        max_length=32,
+        return_tensors="pt",
+        padding_side="right",
+    )
+    # Calculate input lengths from attention mask
+    input_lengths = tokenized["attention_mask"].sum(dim=1).to(torch.int32)
+
+    test_input_data = BatchedDataDict(
+        {
+            "input_ids": tokenized["input_ids"],
+            "input_lengths": input_lengths,
+        }
+    )
+
+    # Create configurations with specified sampling parameters
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["temperature"] = temperature
+    vllm_config["top_p"] = top_p
+    vllm_config["top_k"] = top_k
+    vllm_config["dtype"] = "float32"
+    vllm_config["vllm_cfg"]["precision"] = "float32"
+    vllm_config["vllm_cfg"]["enforce_eager"] = True
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+
+    if policy_type == "dtensor":
+        policy_config = deepcopy(basic_dtensor_test_config)
+        policy_config["dtensor_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+        policy_config["model_name"] = vllm_config["model_name"]
+        policy_config["tokenizer"]["name"] = vllm_config["tokenizer"]["name"]
+        policy_config["precision"] = "float32"
+        policy_config["logprob_batch_size"] = 2
+        policy_config["train_global_batch_size"] = 4
+        policy_config["train_micro_batch_size"] = 2
+        policy_config["dynamic_batching"]["enabled"] = False
+        policy_config["generation"] = deepcopy(vllm_config)
+    elif policy_type == "megatron":
+        policy_config = get_basic_megatron_test_config(
+            tp=tensor_parallel_size, pp=1, precision="float32"
+        )
+        policy_config["model_name"] = vllm_config["model_name"]
+        policy_config["tokenizer"]["name"] = vllm_config["tokenizer"]["name"]
+        policy_config["logprob_batch_size"] = 2
+        policy_config["train_global_batch_size"] = 4
+        policy_config["train_micro_batch_size"] = 2
+        policy_config["generation"] = deepcopy(vllm_config)
+    else:
+        raise ValueError(f"Unknown policy_type: {policy_type}")
+
+    print(f"\n{'=' * 80}")
+    print(f"Testing {policy_type} policy with:")
+    print(f"  temperature={temperature}, top_p={top_p}, top_k={top_k}")
+    print(f"{'=' * 80}\n")
+
+    # Create vLLM generation policy
+    print("Creating vLLM generation policy...")
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+
+    # Put vLLM to sleep and create training policy
+    print("Preparing for training policy creation...")
+    vllm_policy.finish_generation()
+
+    print(f"Creating {policy_type} policy...")
+    lm_policy = Policy(cluster, policy_config, tokenizer)
+
+    # Prepare refit info and refit vLLM with policy weights
+    print("Preparing refit info...")
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
+    print("Refitting vLLM policy with training policy weights...")
+    refit_policy_generation(lm_policy, vllm_policy, vllm_config["colocated"]["enabled"])
+
+    # Generate with vLLM to get logprobs
+    print("Generating with vLLM...")
+    vllm_policy.prepare_for_generation()
+    generation_results = vllm_policy.generate(test_input_data, greedy=False)
+
+    assert "output_ids" in generation_results, (
+        "output_ids not found in vLLM generation output"
+    )
+    assert "logprobs" in generation_results, (
+        "logprobs not found in vLLM generation output"
+    )
+
+    print(f"vLLM output shape: {generation_results['output_ids'].shape}")
+    print(f"vLLM logprobs shape: {generation_results['logprobs'].shape}")
+
+    # ========================================================================
+    # Part 1: Test get_logprobs() function
+    # ========================================================================
+    print(f"\n{'=' * 80}")
+    print("Part 1: Testing get_logprobs() function")
+    print(f"{'=' * 80}\n")
+
+    print(f"Computing logprobs with {policy_type} policy...")
+
+    fprop_logprob_data = BatchedDataDict(
+        {
+            "input_ids": generation_results["output_ids"],
+            "input_lengths": generation_results["unpadded_sequence_lengths"],
+        }
+    )
+
+    lm_policy.prepare_for_lp_inference()
+    fprop_results = lm_policy.get_logprobs(fprop_logprob_data)
+    policy_logprobs = fprop_results["logprobs"]
+    print(f"Policy logprobs shape: {policy_logprobs.shape}")
+
+    # Create mask for generated tokens only (exclude prompt tokens and padding)
+    padding_mask = torch.zeros_like(generation_results["logprobs"], dtype=torch.bool)
+    for i, (input_len, total_valid_len) in enumerate(
+        zip(
+            test_input_data.get("input_lengths"),
+            generation_results["unpadded_sequence_lengths"],
+        )
+    ):
+        # Only compare logprobs for generated tokens
+        padding_mask[i, input_len:total_valid_len] = True
+
+    # Compute absolute difference
+    abs_diff = torch.abs(generation_results["logprobs"] - policy_logprobs)
+    masked_abs_diff = abs_diff.masked_select(padding_mask)
+
+    # Compute metrics
+    max_abs_diff = masked_abs_diff.max().item() if masked_abs_diff.numel() > 0 else 0.0
+    mean_abs_diff = (
+        masked_abs_diff.mean().item() if masked_abs_diff.numel() > 0 else 0.0
+    )
+    avg_prob_mult_error = (
+        torch.mean(torch.exp(masked_abs_diff)).item()
+        if masked_abs_diff.numel() > 0
+        else 1.0
+    )
+
+    print("\nget_logprobs() Agreement Metrics:")
+    print(f"  Max absolute difference: {max_abs_diff:.6f}")
+    print(f"  Mean absolute difference: {mean_abs_diff:.6f}")
+    print(f"  Average probability multiplicative error: {avg_prob_mult_error:.6f}")
+    print(f"  Number of compared tokens: {masked_abs_diff.numel()}")
+
+    # Validate closeness for get_logprobs
+    assert avg_prob_mult_error <= 1.01, (
+        f"get_logprobs: Average probability multiplicative error ({avg_prob_mult_error:.6f}) exceeds threshold (1.01). "
+        f"vLLM and {policy_type} policy logprobs should closely match with same sampling parameters."
+    )
+
+    assert max_abs_diff <= 0.05, (
+        f"get_logprobs: Max absolute difference ({max_abs_diff:.6f}) exceeds threshold (0.05). "
+        f"vLLM and {policy_type} policy logprobs should closely match with same sampling parameters."
+    )
+
+    print("\n✓ Part 1 passed: get_logprobs() produces matching logprobs!")
+
+    # ========================================================================
+    # Part 2: Test train() function and loss functions
+    # ========================================================================
+    print(f"\n{'=' * 80}")
+    print("Part 2: Testing train() function and loss computation")
+    print(f"{'=' * 80}\n")
+
+    # Prepare training data using the generated sequences
+    max_seq_len = min(40, generation_results["output_ids"].shape[1])
+
+    generation_results["unpadded_sequence_lengths"] = torch.clamp(
+        generation_results["unpadded_sequence_lengths"], max=max_seq_len
+    )
+
+    train_input_ids = generation_results["output_ids"][:, :max_seq_len]
+    token_loss_mask = torch.ones_like(train_input_ids)
+
+    # Mask out prompt tokens and padding
+    for idx, (input_len, total_len) in enumerate(
+        zip(
+            test_input_data.get("input_lengths"),
+            generation_results["unpadded_sequence_lengths"],
+        )
+    ):
+        token_loss_mask[idx, :input_len] = 0  # Mask prompt
+        token_loss_mask[idx, total_len:] = 0  # Mask padding
+
+    # Create loss function with KL penalty=1.0 to test logprob matching
+    # If logprobs from train match vLLM, KL should be near zero
+    loss_config = {
+        "ratio_clip_min": 0.2,
+        "ratio_clip_max": 0.2,
+        "ratio_clip_c": None,
+        "reference_policy_kl_penalty": 1.0,  # Use KL to validate logprob matching
+        "reference_policy_kl_type": "k3",
+        "kl_input_clamp_value": None,
+        "kl_output_clamp_value": None,
+        "use_on_policy_kl_approximation": False,
+        "use_importance_sampling_correction": False,
+        "truncated_importance_sampling_ratio": None,
+        "token_level_loss": True,
+    }
+    loss_fn = ClippedPGLossFn(loss_config)
+
+    train_data = BatchedDataDict(
+        {
+            "input_ids": train_input_ids,
+            "input_lengths": generation_results["unpadded_sequence_lengths"],
+            "token_mask": token_loss_mask,
+            "sample_mask": torch.ones(train_input_ids.shape[0]),
+            "advantages": torch.ones_like(
+                train_input_ids, dtype=torch.float32
+            ),  # Dummy advantages
+            "prev_logprobs": generation_results["logprobs"][
+                :, :max_seq_len
+            ],  # From generation
+            "generation_logprobs": generation_results["logprobs"][
+                :, :max_seq_len
+            ],  # Same as prev
+            "reference_policy_logprobs": generation_results["logprobs"][
+                :, :max_seq_len
+            ],  # Same for KL test
+        }
+    )
+
+    print("Training with loss function (single step to compute KL)...")
+    lm_policy.prepare_for_training()
+    results = lm_policy.train(train_data, loss_fn)
+
+    kl_penalty = results["all_mb_metrics"].get("kl_penalty", None)
+    print("\nTrain + Loss Function Metrics:")
+    print(f"  KL penalty (should be near 0 if logprobs match): {kl_penalty}")
+    print(
+        f"  Token mult prob error: {results['all_mb_metrics'].get('token_mult_prob_error', 'N/A')}"
+    )
+
+    # If the train() path computes logprobs correctly with sampling params,
+    # the KL between curr_logprobs (from train) and reference_policy_logprobs
+    # (from vLLM generation) should be very small
+    assert kl_penalty is not None and isinstance(kl_penalty, list), (
+        "KL penalty should be a list and should be computed"
+    )
+    # Check all values in the kl_penalty list
+    for idx, kl in enumerate(kl_penalty):
+        assert kl <= 1e-4, (
+            f"train() + loss: KL penalty at index {idx} ({kl:.6f}) exceeds threshold (1e-4). "
+            f"This indicates that curr_logprobs from train() don't match vLLM generation logprobs. "
+            f"The train path should apply the same sampling parameters (temp={temperature}, top_p={top_p}, top_k={top_k})."
+        )
+
+    print("\n✓ Part 2 passed: train() and loss functions produce matching logprobs!")
+
+    print(f"\n{'=' * 80}")
+    print(f"✓✓✓ All tests passed for {policy_type} policy with sampling parameters!")
+    print(f"{'=' * 80}\n")
+
+    # Cleanup
+    lm_policy.finish_training()
+    vllm_policy.shutdown()
+    lm_policy.shutdown()

@@ -125,6 +125,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
     configure_dynamo_cache,
     get_gpu_info,
     get_megatron_checkpoint_dir,
@@ -469,6 +470,16 @@ class MegatronPolicyWorker:
             "optimizer_cpu_offload"
         ]
         self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
+
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            generation_cfg = self.cfg["generation"]
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg.get("top_k", None),
+                top_p=generation_cfg.get("top_p", 1.0),
+                temperature=generation_cfg.get("temperature", 1.0),
+            )
+        else:
+            self.sampling_params = None
 
         # Reward models are not yet supported with Megatron.
         if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
@@ -977,7 +988,9 @@ class MegatronPolicyWorker:
                     )
 
             forward_step = partial(
-                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+                forward_step_arbitrary_loss,
+                loss_fn=loss_fn,
+                sampling_params=self.sampling_params,
             )
             all_mb_metrics = []
             losses = []
@@ -1310,8 +1323,11 @@ class MegatronPolicyWorker:
 
             # Apply temperature scaling to logits for training
             # This matches the dtensor worker's _apply_temperature_scaling in the train method
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
+            if (
+                self.sampling_params is not None
+                and self.sampling_params.temperature != 1.0
+            ):
+                output_tensor.div_(self.sampling_params.temperature)
 
             def collection_fn(output_tensor):
                 stc = time.time()
@@ -1330,6 +1346,7 @@ class MegatronPolicyWorker:
                         inference_only=True,
                         cp_group=get_context_parallel_group(),
                         chunk_size=logprob_chunk_size,
+                        sampling_params=self.sampling_params,
                     )
                 else:
                     token_logprobs = from_parallel_logits_to_logprobs(
@@ -1340,6 +1357,7 @@ class MegatronPolicyWorker:
                         tp_group=tp_grp,
                         inference_only=True,
                         chunk_size=logprob_chunk_size,
+                        sampling_params=self.sampling_params,
                     )
 
                 # Prepend 0 logprob for first token to maintain same sequence length as input
@@ -1591,8 +1609,12 @@ class MegatronPolicyWorker:
                 **multimodal_data,
             )
 
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
+            # Apply temperature scaling
+            if (
+                self.sampling_params is not None
+                and self.sampling_params.temperature != 1.0
+            ):
+                output_tensor.div_(self.sampling_params.temperature)
 
             def collection_fn(_):
                 # Only the last PP stage produces final logits/top-k; earlier stages return empty
