@@ -14,8 +14,12 @@ def parse_result(filepath):
             m = re.search(pattern, content)
             return m.group(1) if m else default
         
-        req_tp = extract(r'Request throughput:\s*([0-9.]+)')
-        out_tp = extract(r'Output token throughput:\s*([0-9.]+)')
+        # Updated patterns to match actual vllm bench serve output format:
+        # "Request throughput (req/s):              3.42"
+        # "Output token throughput (tok/s):         6842.11"
+        # Also support older format without "(req/s)" and "(tok/s)"
+        req_tp = extract(r'Request throughput[^:]*:\s*([0-9.]+)')
+        out_tp = extract(r'Output token throughput[^:]*:\s*([0-9.]+)')
         ttft = extract(r'Mean TTFT \(ms\):\s*([0-9.]+)')
         itl = extract(r'Mean ITL \(ms\):\s*([0-9.]+)')
         
@@ -43,4 +47,3 @@ if __name__ == "__main__":
     
     req_tp, out_tp, ttft, itl = parse_result(filepath)
     print(f"{gpu_model},{nodes},{gpus_per_node},{total_gpus},{tp},{pp},{isl},{osl},{concurrency},{num_prompts},{req_tp},{out_tp},{ttft},{itl}")
-

@@ -20,6 +20,74 @@ import subprocess
 import re
 from pathlib import Path
 
+# ============================================================
+# GRPO Configuration definitions (matching grpo_benchmark_sweep.sh)
+# ============================================================
+# Format: (model_pattern, tp, pp, ep, nodes, isl, osl, num_prompts)
+# ISL:OSL = 1:4 ratio (OpenMathInstruct-2 dataset characteristics)
+GRPO_CONFIGS = [
+    # qwen32b: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=640, OSL=2560
+    ("Qwen3-32B", 1, 1, 1, 4, 640, 2560, 2048),
+    # qwen30b: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=640, OSL=2560
+    ("Qwen3-30B-A3B", 1, 1, 1, 4, 640, 2560, 2048),
+    # llama8b: Gen(TP=1, PP=1, DP=8), 2 nodes, ISL=256, OSL=1024
+    ("Llama-3.1-8B", 1, 1, 1, 2, 256, 1024, 2048),
+    ("Llama-3.1-8B-Instruct", 1, 1, 1, 2, 256, 1024, 2048),
+    # llama70b: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=128, OSL=512
+    ("Llama-3.1-70B", 2, 1, 1, 4, 128, 512, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 128, 512, 2048),
+    # llama70b-lowgbs: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=128, OSL=512, GBS=512
+    ("Llama-3.1-70B", 2, 1, 1, 4, 128, 512, 512),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 128, 512, 512),
+    # llama70b-highseq: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=256, OSL=1024
+    ("Llama-3.1-70B", 2, 1, 1, 4, 256, 1024, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 256, 1024, 2048),
+]
+
+
+def is_grpo_config(result):
+    """Check if a result matches any GRPO configuration."""
+    model = result.get('model', '')
+    tp = result.get('tp_size', 0)
+    pp = result.get('pp_size', 0)
+    nodes = result.get('num_nodes', 0)
+    isl = result.get('input_len', 0)
+    osl = result.get('output_len', 0)
+    nprompts = result.get('num_prompts', 0)
+    
+    for cfg in GRPO_CONFIGS:
+        model_pattern, cfg_tp, cfg_pp, cfg_ep, cfg_nodes, cfg_isl, cfg_osl, cfg_nprompts = cfg
+        
+        # Check if model matches (partial match)
+        if model_pattern not in model:
+            continue
+        
+        # Check parallelism
+        if tp != cfg_tp or pp != cfg_pp:
+            continue
+            
+        # Check nodes
+        if nodes != cfg_nodes:
+            continue
+            
+        # Check ISL/OSL (exact match)
+        if isl != cfg_isl or osl != cfg_osl:
+            continue
+            
+        # Check batch size
+        if nprompts != cfg_nprompts:
+            continue
+            
+        return True
+    
+    return False
+
+
+def filter_grpo_results(results):
+    """Filter results to only include GRPO configurations."""
+    return [r for r in results if is_grpo_config(r)]
+
+
 
 def get_running_jobs():
     """
@@ -665,6 +733,7 @@ def main():
     parser.add_argument("--base-dir", help="Override base directory")
     parser.add_argument("--group", "-g", action="store_true", help="Group results by configuration and show mean±std")
     parser.add_argument("--all", "-a", action="store_true", help="Include running/failed jobs with status column")
+    parser.add_argument("--grpo", action="store_true", help="Filter to only show GRPO configurations (from grpo_benchmark_sweep.sh)")
     parser.add_argument("--output", "-o", help="Output CSV file")
     parser.add_argument("--json", help="Output JSON file")
     
@@ -708,6 +777,12 @@ def main():
         print(f"Found {len(files)} result files")
         results = load_results(files, running_jobs)
         print(f"Loaded {len(results)} results")
+    
+    # Filter to GRPO configs if requested
+    if args.grpo:
+        original_count = len(results)
+        results = filter_grpo_results(results)
+        print(f"Filtered to {len(results)} GRPO results (from {original_count} total)")
     
     # Print table
     print_table(results, group_by_config=args.group, bench_type=bench_type_str)
