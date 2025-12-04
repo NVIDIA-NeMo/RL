@@ -534,7 +534,7 @@ def print_throughput_table(results):
     BOLD = '\033[1m'
     RESET = '\033[0m'
     
-    # Group results by model configuration
+    # Group results by model configuration (without job_id to consolidate)
     groups = defaultdict(list)
     for r in results:
         model = r.get('model', 'unknown')
@@ -549,44 +549,61 @@ def print_throughput_table(results):
             r.get('tp_size', 1),
             r.get('pp_size', 1),
             r.get('ep_size', 1),
-            r.get('_job_id', '?'),
-            r.get('_status', 'Unknown'),
         )
         groups[key].append(r)
     
     # Print each group
-    for (model, gpu, nodes, gpn, tp, pp, ep, job_id, status), items in sorted(groups.items()):
+    for (model, gpu, nodes, gpn, tp, pp, ep), items in sorted(groups.items()):
+        # Collect unique job IDs and statuses
+        job_ids = sorted(set(r.get('_job_id', '?') for r in items))
+        statuses = [r.get('_status', 'Unknown') for r in items]
+        completed = sum(1 for s in statuses if s == 'Completed')
+        total_jobs = len(job_ids)
+        
         # Group header
         model_short = model[:25] + "..." if len(model) > 25 else model
         print(f"\n{BOLD}{CYAN}{'─' * 100}{RESET}")
         print(f"{BOLD}Model: {model_short}{RESET}")
-        print(f"  Job: {job_id}  |  Status: {get_status_display(status)}  |  GPU: {gpu}  |  {nodes}N × {gpn}G  |  TP={tp}, PP={pp}, EP={ep}")
+        print(f"  GPU: {gpu}  |  {nodes}N × {gpn}G  |  TP={tp}, PP={pp}, EP={ep}  |  Jobs: {total_jobs} ({GREEN}{completed} completed{RESET})")
+        print(f"  Job IDs: {', '.join(job_ids)}")
         print(f"{CYAN}{'─' * 100}{RESET}")
         
-        # Sort items by ISL, then OSL
-        items_sorted = sorted(items, key=lambda x: (x.get('input_len', 0), x.get('output_len', 0)))
+        # Group by ISL/OSL/Prompts and calculate averages
+        from collections import defaultdict
+        import statistics
+        
+        isl_osl_groups = defaultdict(list)
+        for r in items:
+            key = (r.get('input_len', 0), r.get('output_len', 0), r.get('num_prompts', 0))
+            isl_osl_groups[key].append(r)
         
         # Table header
-        print(f"  {'ISL':>6} {'OSL':>6} {'Prompts':>8} {'Req/s':>10} {'Tok/s':>12} {'Tok/s/GPU':>12}")
-        print(f"  {'-'*6} {'-'*6} {'-'*8} {'-'*10} {'-'*12} {'-'*12}")
+        print(f"  {'ISL':>6} {'OSL':>6} {'Prompts':>8} {'Runs':>5} {'Req/s':>12} {'Tok/s (mean±std)':>22} {'Tok/s/GPU':>12}")
+        print(f"  {'-'*6} {'-'*6} {'-'*8} {'-'*5} {'-'*12} {'-'*22} {'-'*12}")
         
-        # Group by ISL for better visual
+        total_gpus = nodes * gpn
         current_isl = None
-        for r in items_sorted:
-            isl = r.get('input_len', 0)
-            osl = r.get('output_len', 0)
-            prompts = r.get('num_prompts', 0)
-            req_s = float(r.get('throughput_requests_per_sec', 0))
-            tok_s = float(r.get('throughput_tokens_per_sec', 0))
-            total_gpus = nodes * gpn
-            tok_s_gpu = tok_s / total_gpus if total_gpus > 0 else 0
+        
+        for (isl, osl, prompts), runs in sorted(isl_osl_groups.items()):
+            req_values = [float(r.get('throughput_requests_per_sec', 0)) for r in runs]
+            tok_values = [float(r.get('throughput_tokens_per_sec', 0)) for r in runs]
+            
+            req_mean = statistics.mean(req_values)
+            tok_mean = statistics.mean(tok_values)
+            tok_std = statistics.stdev(tok_values) if len(tok_values) > 1 else 0
+            tok_gpu = tok_mean / total_gpus if total_gpus > 0 else 0
             
             # Add visual separator between different ISL values
             if current_isl is not None and isl != current_isl:
                 print()
             current_isl = isl
             
-            print(f"  {isl:>6} {osl:>6} {prompts:>8} {req_s:>10.2f} {tok_s:>12,.0f} {tok_s_gpu:>12,.0f}")
+            if tok_std > 0:
+                tok_str = f"{tok_mean:>12,.0f} ± {tok_std:>6,.0f}"
+            else:
+                tok_str = f"{tok_mean:>12,.0f}         "
+            
+            print(f"  {isl:>6} {osl:>6} {prompts:>8} {len(runs):>5} {req_mean:>12.2f} {tok_str:>22} {tok_gpu:>12,.0f}")
     
     # Overall summary
     print(f"\n{BOLD}{'=' * 100}{RESET}")
