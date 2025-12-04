@@ -28,6 +28,7 @@ CACHED_DEPENDENCIES = [
     "openai<=2.6.1",
     "tqdm",
     "pydantic",
+    "psutil",
     "pydantic_core",
     "devtools",
     "fastapi",
