@@ -4,8 +4,8 @@
 #SBATCH -p batch
 #SBATCH -t 02:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o vllm_standalone_perf_exp/online/%j-logs/slurm-%j.out
-#SBATCH -e vllm_standalone_perf_exp/online/%j-logs/slurm-%j.err
+#SBATCH -o /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/online/%j-logs/slurm-%j.out
+#SBATCH -e /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/online/%j-logs/slurm-%j.err
 
 set -ex
 

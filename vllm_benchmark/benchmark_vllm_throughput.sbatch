@@ -4,8 +4,8 @@
 #SBATCH -p batch
 #SBATCH -t 02:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.out
-#SBATCH -e vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.err
+#SBATCH -o /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.out
+#SBATCH -e /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.err
 
 set -ex
 
@@ -282,11 +282,11 @@ fi
 
 # Get GPU model name (extract short name like GB200, H100, A100, etc.)
 GPU_MODEL_RAW=\$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-# Extract GPU model: "NVIDIA GB200" -> "GB200", "NVIDIA H100" -> "H100"
+# Extract GPU model: NVIDIA GB200 -> GB200, NVIDIA H100 -> H100
 # Note: Use grep -E instead of grep -oP for better compatibility (aarch64)
 GPU_MODEL=\$(echo \"\$GPU_MODEL_RAW\" | grep -oE 'GB200|H100|H200|A100|A10|L40|RTX[0-9]+' | head -1 || true)
 if [ -z \"\$GPU_MODEL\" ]; then
-    # Fallback: remove "NVIDIA " prefix and take first word
+    # Fallback: remove NVIDIA prefix and take first word
     GPU_MODEL=\$(echo \"\$GPU_MODEL_RAW\" | sed 's/NVIDIA //g' | awk '{print \$1}' | cut -c1-10)
 fi
 echo \"Detected GPU: \$GPU_MODEL_RAW -> \$GPU_MODEL\"
@@ -327,7 +327,7 @@ for ISL in $INPUT_LENS; do
         # Note: Use sed instead of grep -oP for better compatibility (aarch64)
         
         THROUGHPUT_REQ=\$(grep 'Throughput:' \$OUTPUT_FILE | sed 's/.*Throughput: *\([0-9.]*\) *requests.*/\1/' | head -1 || echo '0')
-        THROUGHPUT_TOK=\$(grep 'total tokens/s' \$OUTPUT_FILE | sed 's/.*[, ] *\([0-9.]*\) *total tokens.*/\1/' | head -1 || echo '0')
+        THROUGHPUT_TOK=\$(grep 'total tokens/s' \$OUTPUT_FILE | sed 's/.* \([0-9.]*\) total tokens.*/\1/' | head -1 || echo '0')
         TOTAL_TIME=\$(grep 'Total time:' \$OUTPUT_FILE | sed 's/.*Total time: *\([0-9.]*\).*/\1/' | head -1 || echo '0')
         
         # If parsing failed, try alternate format
