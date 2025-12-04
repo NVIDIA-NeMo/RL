@@ -21,9 +21,9 @@ Welcome to NeMo RL!
 
 **Steps**:
 
-1. Install `uv` and system prerequisites
-2. Clone the repository and initialize the environment
-3. Run a sample GRPO training job to verify installation
+1. Install `uv` and system prerequisites.
+2. Clone the repository and initialize the environment.
+3. Run a sample GRPO training job to verify installation.
 
 :::
 
