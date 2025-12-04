@@ -12,35 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import itertools
 import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional, Set, Union, cast
+from typing import Any, Generator, Optional, cast
 
 import ray
 import torch
-import zmq
 from accelerate import init_empty_weights
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+)
+from nemo_automodel.components.distributed.cp_utils import (
+    create_context_parallel_ctx,
+    get_train_context,
+)
+from nemo_automodel.components.distributed.grad_utils import (
+    clip_grad_by_total_norm_,
+    get_grad_norm,
+)
+from nemo_automodel.components.distributed.parallelizer import (
+    fsdp2_strategy_parallelize,
+)
+from nemo_automodel.components.distributed.tensor_utils import (
+    get_cpu_state_dict,
+    to_local_if_dtensor,
+)
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
 from torch.distributed.fsdp import (
-    FSDPModule,
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
-from torch.distributed.tensor.experimental import context_parallel
-from torch.distributed.tensor.experimental._attention import (
-    set_rotate_method,
-)
 from transformers import (
     AutoConfig,
-    AutoModelForSequenceClassification,
     AutoProcessor,
     AutoTokenizer,
 )
@@ -54,89 +67,36 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.dtensor.parallelize import (
-    _parallelize_model,
-    clip_grad_by_total_norm_,
-    get_grad_norm,
-    to_local_if_dtensor,
-)
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.utils.native_checkpoint import (
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-@contextmanager
-def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
-    """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
-    try:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.unshard()
-        yield
-    finally:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.reshard()
-
-
-@torch.no_grad()
-def get_cpu_state_dict(
-    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
-    pin_memory: bool = False,
-) -> dict[str, torch.Tensor]:
-    """Copy the state dict generator to CPU memory.
-
-    Args:
-        state_generator (Iterable[tuple[str, Union[torch.Tensor, DTensor]]]):
-            An iterable that yields (key, tensor) pairs from a model state.
-        pin_memory (bool, optional):
-            Whether to allocate the CPU tensors in pinned memory for faster GPU transfer.
-            Defaults to False.
-
-    Returns:
-        dict[str, torch.Tensor]: A dictionary mapping parameter names to CPU tensors.
-    """
-    new_state_dict = {}
-    for k, v in state_generator:
-        val = to_local_if_dtensor(v)
-
-        if len(val.shape) == 0:
-            new_state_dict[k] = val.cpu()
-        else:
-            cpu_tensor = torch.empty(
-                *val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype
-            )
-            cpu_tensor.copy_(val, non_blocking=True)
-            new_state_dict[k] = cpu_tensor
-
-    torch.cuda.synchronize()
-    return new_state_dict
-
-
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorker:
+class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -158,12 +118,12 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        """Initialize the DTensorPolicyWorker."""
+        """Initialize the DTensorPolicyWorkerV2."""
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
 
-        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
+        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
 
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
@@ -223,7 +183,10 @@ class DTensorPolicyWorker:
             **hf_config_overrides,
         )
 
-        # reward model
+        self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
+            model_config
+        )
+
         self._is_reward_model = (
             "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
         )
@@ -236,7 +199,7 @@ class DTensorPolicyWorker:
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
-                model_class = AutoModelForSequenceClassification
+                model_class = NeMoAutoModelForSequenceClassification
                 if model_config.num_labels != 1:
                     # For Bradley-Terry reward models, the linear head has a single output.
                     # In the transformers library, the default setting for model_config.num_labels is 2
@@ -258,6 +221,7 @@ class DTensorPolicyWorker:
             model_class = resolve_model_class(model_config.model_type)
 
         full_state_dict = None
+        model_state_dict_keys = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
@@ -265,17 +229,31 @@ class DTensorPolicyWorker:
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
                 config=model_config,
+                use_liger_kernel=False,
+                torch_dtype=str(model_config.torch_dtype),
             )
+
             full_state_dict = model.state_dict()
+            # Store the original model state dict keys before any parallelization
+            model_state_dict_keys = list(full_state_dict.keys())
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
+
         with init_empty_weights():
+            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
+            # so we need to set it to None if sequence packing is disabled
+            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
+                attn_implementation="flash_attention_2"
+                if self.enable_seq_packing
+                else None,
+                use_liger_kernel=False,
                 trust_remote_code=True,
+                torch_dtype=str(model_config.torch_dtype),
             )
 
         if self.model.config.pad_token_id is None:
@@ -318,24 +296,41 @@ class DTensorPolicyWorker:
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
+        # For FSDP2 compatibility, we need to support HSDP structure
+        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
+        dp_replicate_size = 1
+        dp_shard_size = dp_size
+
         # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
         # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
         # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
         prev_local_rank = os.environ["LOCAL_RANK"]
         os.environ["LOCAL_RANK"] = "0"
 
+        # Create device mesh with HSDP structure for FSDP2 compatibility
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
+            "cuda",
+            (dp_replicate_size, dp_shard_size, cp_size, tp_size),
+            mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
         )
         os.environ["LOCAL_RANK"] = prev_local_rank
 
-        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        # Create flattened submeshes for different use cases
+        # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
+        device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
 
-        self.dp_mesh, self.tp_mesh, self.cp_mesh = (
-            device_mesh["dp"],
-            device_mesh["tp"],
-            device_mesh["cp"],
-        )
+        # Flatten dp_shard + cp for FSDP2 sharding
+        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
+
+        # Flatten dp_replicate + dp_shard + cp for gradient operations
+        device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
+
+        # Store mesh references for backward compatibility
+        self.dp_cp_mesh = device_mesh["dp_cp"]
+        self.dp_mesh = device_mesh["dp"]
+        self.tp_mesh = device_mesh["tp"]
+        self.cp_mesh = device_mesh["cp"]
+
         self.dp_size = dp_size
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -345,17 +340,25 @@ class DTensorPolicyWorker:
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
         # ------------------------------------------------
-        self.model = _parallelize_model(
+        self.model = fsdp2_strategy_parallelize(
             self.model,
-            self.dp_cp_mesh,
-            self.tp_mesh,
-            param_dtype=self.dtype,
+            device_mesh=self.device_mesh,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=self.dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            ),
+            offload_policy=CPUOffloadPolicy(pin_memory=False)
+            if self.cpu_offload
+            else OffloadPolicy(),
             sequence_parallel=sequence_parallel_enabled,
-            cpu_offload=self.cpu_offload,
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
             ],
-            custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            dp_replicate_mesh_name="dp_replicate",
+            dp_shard_cp_mesh_name="dp_shard_cp",
+            tp_mesh_name="tp",
         )
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
@@ -369,6 +372,11 @@ class DTensorPolicyWorker:
                 broadcast_from_rank0=True,
             ),
         )
+
+        # Broadcast model state dict keys to all ranks and store as instance variable
+        keys_to_broadcast = [model_state_dict_keys]
+        torch.distributed.broadcast_object_list(keys_to_broadcast, src=0)
+        self.model_state_dict_keys = keys_to_broadcast[0]
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
@@ -447,68 +455,14 @@ class DTensorPolicyWorker:
                 "No weights path provided. Starting from scratch (default policy init)"
             )
 
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
-    @staticmethod
-    def create_context_parallel_ctx(
-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
-        cp_buffers: list[torch.Tensor],
-        cp_seq_dims: list[int],
-        cp_no_restore_buffers: Set[torch.Tensor],
-        cp_rotate_method: Optional[str] = None,
-    ):
-        """Create a context parallel context.
-
-        Args:
-            cp_mesh (DeviceMesh): The device mesh for context parallel.
-            cp_buffers (list[torch.Tensor]): The buffers for context parallel.
-            cp_seq_dims (list[int]): The sequence dimensions for context parallel.
-            cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
-            cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
-        """
-        if cp_rotate_method is not None:
-            set_rotate_method(cp_rotate_method)
-
-        return context_parallel(
-            cp_mesh,
-            buffers=cp_buffers,
-            buffer_seq_dims=cp_seq_dims,
-            no_restore_buffers=cp_no_restore_buffers,
-        )
-
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
-
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
-    @staticmethod
-    @contextlib.contextmanager
-    def train_context(cp_context: Optional[Generator[None, None, None]] = None):
-        with contextlib.ExitStack() as stack:
-            if cp_context is not None:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-                # TODO (xilunwu): support cuDNN backend
-
-                stack.enter_context(
-                    sdpa_kernel(
-                        [
-                            SDPBackend.FLASH_ATTENTION,
-                            SDPBackend.EFFICIENT_ATTENTION,
-                        ]
-                    )
-                )
-
-                stack.enter_context(cp_context)
-
-            yield
-
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> None:
-        """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
@@ -518,17 +472,18 @@ class DTensorPolicyWorker:
         device = torch.cuda.current_device()
         self.model_update_group = PyNcclCommunicator(pg, device=device)
 
-    def is_alive(self) -> bool:
+    def check_model_allow_flash_attn_args(self, model_config) -> bool:
+        # Some models doesn't support flash_attn_kwargs
+        # Check nemotron nas.
+        if (
+            model_config.architectures[0] == "DeciLMForCausalLM"
+            and model_config.model_type == "nemotron-nas"
+        ):
+            return False
+
         return True
 
-    def reset_peak_memory_stats(self) -> None:
-        torch.cuda.reset_peak_memory_stats()
-
-    def get_gpu_info(self) -> dict[str, Any]:
-        """Return information about the GPU being used by this worker."""
-        return get_gpu_info(self.model)
-
-    @wrap_with_nvtx_name("dtensor_policy_worker/train")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -715,14 +670,14 @@ class DTensorPolicyWorker:
                         )
 
                         # Create context parallel context
-                        context_parallel_ctx = self.create_context_parallel_ctx(
+                        context_parallel_ctx = create_context_parallel_ctx(
                             cp_mesh=self.cp_mesh,
                             cp_buffers=cp_buffers,
                             cp_seq_dims=[sequence_dim] * len(cp_buffers),
                             cp_no_restore_buffers=set(cp_buffers),
                         )
 
-                    with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with get_train_context(False, False, context_parallel_ctx)():
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
                             model_args = dict(
                                 input_ids=input_ids,
@@ -741,6 +696,12 @@ class DTensorPolicyWorker:
                                 del model_args["flash_attn_kwargs"]
                             # remove flash_attn_kwargs if there are multimodal kwargs
                             if len(vlm_kwargs) > 0:
+                                del model_args["flash_attn_kwargs"]
+
+                            if (
+                                not self.allow_flash_attn_args
+                                and "flash_attn_kwargs" in model_args
+                            ):
                                 del model_args["flash_attn_kwargs"]
 
                             outputs = self.model(**model_args)
@@ -810,6 +771,7 @@ class DTensorPolicyWorker:
                             )
                         else:
                             loss_fn_ = loss_fn
+
                         loss, loss_metrics = loss_fn_(
                             logits,
                             mb,
@@ -901,7 +863,7 @@ class DTensorPolicyWorker:
             return metrics
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -936,7 +898,7 @@ class DTensorPolicyWorker:
         all_log_probs = []
         self.model.eval()
 
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -1034,14 +996,14 @@ class DTensorPolicyWorker:
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
-                    context_parallel_ctx = self.create_context_parallel_ctx(
+                    context_parallel_ctx = create_context_parallel_ctx(
                         cp_mesh=self.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
 
-                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                with get_train_context(False, False, context_parallel_ctx)():
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
@@ -1052,6 +1014,12 @@ class DTensorPolicyWorker:
                             **vlm_kwargs,
                         )
                         if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        if (
+                            not self.allow_flash_attn_args
+                            and "flash_attn_kwargs" in model_args
+                        ):
                             del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)
@@ -1202,7 +1170,7 @@ class DTensorPolicyWorker:
         return return_data
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
-    @wrap_with_nvtx_name("dtensor_policy_worker/score")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
@@ -1214,8 +1182,8 @@ class DTensorPolicyWorker:
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
         self.model.eval()
-
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        print("Begin to batch datas")
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -1238,7 +1206,6 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(global_batch_size)
                 iterator_len = data.size // global_batch_size
-
             step = 0
             all_rm_scores = []
             for batch_idx, generate_batch in enumerate(
@@ -1280,7 +1247,6 @@ class DTensorPolicyWorker:
                         dtype=torch.bool,
                         device=input_ids.device,
                     )
-
                 context_parallel_ctx = None
                 if self.cp_size > 1:
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
@@ -1289,13 +1255,13 @@ class DTensorPolicyWorker:
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
-                    context_parallel_ctx = self.create_context_parallel_ctx(
+                    context_parallel_ctx = create_context_parallel_ctx(
                         cp_mesh=self.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
-                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                with get_train_context(False, False, context_parallel_ctx)():
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
@@ -1329,7 +1295,7 @@ class DTensorPolicyWorker:
         )
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_topk_logits")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits")
     def get_topk_logits(
         self,
         data: BatchedDataDict[Any],
@@ -1392,19 +1358,13 @@ class DTensorPolicyWorker:
             ):
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
-                vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
-                )
-                batch_size, seq_len = input_ids.shape
 
+                batch_size, seq_len = input_ids.shape
                 # Store original shapes for unpacking later
                 original_batch_size = batch_size
                 original_seq_len = seq_len
 
                 if self.enable_seq_packing:
-                    assert len(vlm_kwargs) == 0, (
-                        "multimodal kwargs are not supported for sequence packing"
-                    )
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
@@ -1438,42 +1398,30 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
-                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
-                if len(vlm_kwargs) > 0:
-                    position_ids = None
-
                 context_parallel_ctx = None
                 if self.cp_size > 1:
-                    assert len(vlm_kwargs) == 0, (
-                        "multimodal kwargs are not supported for context parallel"
-                    )
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
                         1, 1
                     )
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
-                    context_parallel_ctx = self.create_context_parallel_ctx(
+                    context_parallel_ctx = create_context_parallel_ctx(
                         cp_mesh=self.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
 
-                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                with get_train_context(False, False, context_parallel_ctx)():
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        model_args = dict(
+                        outputs = self.model(
                             input_ids=input_ids,
                             attention_mask=attention_mask_input_all_ones,
                             position_ids=position_ids,
                             use_cache=False,
                             flash_attn_kwargs=flash_attn_kwargs,
-                            **vlm_kwargs,
                         )
-                        if len(vlm_kwargs) > 0:
-                            del model_args["flash_attn_kwargs"]
-
-                        outputs = self.model(**model_args)
 
                     if not hasattr(outputs, "logits"):
                         logits = self.model.lm_head(outputs.last_hidden_state)
@@ -1656,24 +1604,6 @@ class DTensorPolicyWorker:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
-    def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """Get the logprobs from the reference policy for a batch of data.
-
-        Returns:
-          a BatchedDataDict with key "reference_logprobs" and shape [batch_size, sequence_length].
-          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
-          The logprob of input token i is specified at position i in the output logprobs tensor.
-        """
-        with self.use_reference_model():
-            reference_logprobs = self.get_logprobs(data, micro_batch_size)
-
-        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
-        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
-        return return_data
-
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
         noise_std = 0.01  # Standard deviation for the noise
@@ -1694,37 +1624,6 @@ class DTensorPolicyWorker:
         """
         return self.model.config
 
-    def report_device_id(self) -> str:
-        """Report the UUID of the current CUDA device using NVML.
-
-        Returns:
-            str: UUID of the device in the format "GPU-xxxxx"
-        """
-        from nemo_rl.utils.nvml import get_device_uuid
-
-        # Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        # Get device UUID using NVML
-        return get_device_uuid(device_idx)
-
-    def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
-
-    def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
-        if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
-
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
@@ -1735,13 +1634,6 @@ class DTensorPolicyWorker:
 
         return state_dict_info
 
-    def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
-        from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        device_idx = torch.cuda.current_device()
-        return get_free_memory_bytes(device_idx)
-
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
         self,
@@ -1751,13 +1643,13 @@ class DTensorPolicyWorker:
         margin: float = 1.05,
         include_q: bool = False,
     ) -> dict[str, Any]:
-        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorker."""
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorkerV2."""
         raise NotImplementedError(
-            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorker"
+            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorkerV2"
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
         self,
         buffer_size_bytes: int = 0,
@@ -1839,7 +1731,7 @@ class DTensorPolicyWorker:
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda
         if not self.cpu_offload:
@@ -1857,7 +1749,7 @@ class DTensorPolicyWorker:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1880,7 +1772,7 @@ class DTensorPolicyWorker:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1891,7 +1783,7 @@ class DTensorPolicyWorker:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
@@ -1942,11 +1834,30 @@ class DTensorPolicyWorker:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        if checkpointing_cfg is None:
+            raise ValueError(
+                "checkpointing_cfg must be provided when saving checkpoint"
+            )
+
+        # Extract only the checkpointing configuration keys that exist
+        checkpoint_kwargs = {
+            key: value
+            for key, value in checkpointing_cfg.items()
+            if key
+            in {
+                "model_save_format",
+                "save_consolidated",
+                "is_peft",
+                "peft_config",
+            }
+        }
+
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1955,10 +1866,14 @@ class DTensorPolicyWorker:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_state_dict_keys=self.model_state_dict_keys,
+            **checkpoint_kwargs,
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model."""
         load_checkpoint(
@@ -1968,24 +1883,3 @@ class DTensorPolicyWorker:
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
-
-    def shutdown(self) -> None:
-        """Shutdown the policy."""
-        # Clean up extension resources like ZMQ sockets
-        if hasattr(self, "zmq_socket"):
-            self.zmq_socket.close()
-            self.zmq_context.term()
-
-    def start_gpu_profiling(self) -> None:
-        """Start GPU profiling."""
-        torch.cuda.profiler.start()
-
-    def stop_gpu_profiling(self) -> None:
-        """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
-
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
-        """Report the node IP and GPU ID of the current worker."""
-        ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
-        return (ip, gpu_id)
