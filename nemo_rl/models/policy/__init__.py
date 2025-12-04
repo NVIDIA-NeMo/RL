@@ -21,6 +21,19 @@ class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class LoRAConfig(TypedDict):
+    enabled: bool
+    target_modules: NotRequired[list[str]]
+    exclude_modules: NotRequired[list[str]]
+    match_all_linear: NotRequired[bool]
+    dim: NotRequired[int]
+    alpha: NotRequired[int]
+    dropout: NotRequired[float]
+    dropout_position: NotRequired[Literal["pre", "post"]]
+    lora_A_init: NotRequired[str]
+    use_triton: NotRequired[bool]
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -32,6 +45,7 @@ class DTensorConfig(TypedDict):
     context_parallel_size: int
     custom_parallel_plan: str | None
     clear_cache_every_n_steps: NotRequired[int | None]
+    lora: NotRequired[LoRAConfig | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):

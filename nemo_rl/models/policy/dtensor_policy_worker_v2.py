@@ -14,18 +14,24 @@
 
 import gc
 import itertools
+import math
 import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
+import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 import zmq
 from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
+)
+from nemo_automodel.components._peft.lora import (
+    PeftConfig,
+    apply_lora_to_linear_modules,
 )
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
@@ -92,6 +98,15 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc (https://github.com/NVIDIA-NeMo/RL/issues/1586)
+def _patched_init_lora_weights(self, init_method: str):
+    if init_method == "xavier":
+        nn.init.xavier_normal_(self.lora_A.weight.data)
+    else:
+        nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
+    self.lora_B.weight.data.zero_()
 
 
 @ray.remote(
@@ -223,6 +238,19 @@ class DTensorPolicyWorkerV2:
 
         full_state_dict = None
         model_state_dict_keys = None
+
+        # lora config
+        lora_cfg = self.cfg["dtensor_cfg"].get("lora", None)
+        self.peft_config = None
+        self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
+        # patch the init_lora_weights method to use the xavier initialization
+        _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
+        if self.lora_enabled:
+            # Always use float32 since FSDP requires all parameters to be in the same dtype.
+            # autocast should cast the weights to the correct dtype during the forward pass.
+            cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
+            self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
+
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
@@ -233,6 +261,9 @@ class DTensorPolicyWorkerV2:
                 use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
             )
+
+            if self.peft_config is not None:
+                apply_lora_to_linear_modules(model, self.peft_config)
 
             full_state_dict = model.state_dict()
             # Store the original model state dict keys before any parallelization
@@ -256,6 +287,8 @@ class DTensorPolicyWorkerV2:
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
+            if self.lora_enabled:
+                apply_lora_to_linear_modules(self.model, self.peft_config)
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -1924,6 +1957,9 @@ class DTensorPolicyWorkerV2:
                 "peft_config",
             }
         }
+        if self.lora_enabled:
+            checkpoint_kwargs["is_peft"] = True
+            checkpoint_kwargs["peft_config"] = self.peft_config
 
         save_checkpoint(
             model=self.model,
