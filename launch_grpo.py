@@ -139,7 +139,7 @@ PRESETS = {
         total_gpus=16,
         gpus_per_node=4,
         t_tp=4, t_cp=1, t_ep=1, t_pp=2,
-        g_tp=2, g_pp=1,
+        g_tp=2, g_pp=1,  # 70B needs g_tp=2 for memory (G.DP=8)
         config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
         max_seqlen=4096,
         train_gbs=512,

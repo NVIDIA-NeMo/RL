@@ -38,7 +38,7 @@
       "rollout_gbs": 512,
       "train_gbs": 512,
       "max_seqlen": 4096,
-      "g_tp": 1, "g_pp": 1, "g_dp": 8,
+      "g_tp": 2, "g_pp": 1, "g_dp": 8,
       "t_tp": 4, "t_cp": 1, "t_ep": 1, "t_pp": 2, "t_dp": 2
     },
     {
