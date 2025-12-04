@@ -196,6 +196,7 @@ about/backends.md
 about/algorithms/index.md
 about/evaluation.md
 about/tips-and-tricks.md
+about/performance-summary.md
 ::::
 
 ::::{toctree}

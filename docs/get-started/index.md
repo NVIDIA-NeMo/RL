@@ -30,7 +30,9 @@ Welcome to NeMo RL!
 ## Prerequisites
 
 * **OS**: Linux (Ubuntu 22.04/20.04 recommended)
-* **Hardware**: NVIDIA GPU (Volta/Compute Capability 7.0+ required)
+* **Hardware**: 
+  * NVIDIA GPU (Volta/Compute Capability 7.0+ required)
+  * Sufficient VRAM for the model and batch sizes configured in the example (memory requirements vary by configuration; reduce batch sizes if you encounter out-of-memory errors)
 * **Software**: 
   * Python 3.12+
   * CUDA 12+
@@ -63,7 +65,7 @@ We use `uv` for fast, reliable package management.
    ```
 
    :::{warning}
-   If you previously ran without checking out submodules, you may need to rebuild virtual environments:
+   If you cloned without the `--recursive` flag, you may need to rebuild virtual environments:
    `NRL_FORCE_REBUILD_VENVS=true uv sync`
    :::
 
@@ -115,6 +117,18 @@ Let's verify your installation by running a **Group Relative Policy Optimization
    * NeMo RL will automatically start a local Ray cluster on your machine.
    * It will download a small model (`Qwen/Qwen2.5-1.5B-Instruct` or similar) and dataset.
    * You should see training logs indicating "Training started" and loss metrics streaming.
+   * The Ray dashboard URL will appear in the logs (typically `http://127.0.0.1:8265`).
+
+   **Example output**:
+   ```
+   Initializing Ray cluster...
+   Ray dashboard available at http://127.0.0.1:8265
+   Loading model: Qwen/Qwen2.5-1.5B-Instruct
+   Training started...
+   Step 1: reward=0.25, policy_kl_error=0.001
+   Step 2: reward=0.31, policy_kl_error=0.002
+   ...
+   ```
 
 ### Local Development Tips
 
@@ -133,7 +147,7 @@ CUDA_VISIBLE_DEVICES=0,3 uv run examples/run_grpo_math.py
 
 **Running Concurrent Jobs**
 
-You can run multiple independent training jobs on the same machine by isolating them to different GPUs. Each job spins up its own isolated Ray instance.
+You can run independent training jobs on the same machine by isolating them to different GPUs. Each job spins up its own isolated Ray instance.
 
 **Terminal 1 (Job A)**:
 
@@ -153,7 +167,7 @@ CUDA_VISIBLE_DEVICES=1 uv run examples/run_sft.py
 
 **Ray Dashboard**
 
-When a job starts, Ray provides a dashboard URL (usually `http://127.0.0.1:8265`) in the logs. Open this URL in your browser to view actor status, logs, and resource utilization.
+When a job starts, Ray provides a dashboard URL (`http://127.0.0.1:8265`) in the logs. Open this URL in your browser to view actor status, logs, and resource usage.
 
 **Weights & Biases**
 
@@ -165,7 +179,7 @@ If you set `WANDB_API_KEY`, metrics stream to W&B. This is the recommended way t
 When you execute a training script (for example, `uv run ...`), NeMo RL:
 
 1. Checks for an existing Ray cluster.
-2. If none is found, it automatically starts a local Ray instance using your available resources.
+2. If no cluster exists, it automatically starts a local Ray instance using your available resources.
 3. It shuts down the cluster when the script finishes (unless connected to a persistent Ray server).
 
 You generally do **not** need to start Ray manually.
@@ -182,6 +196,24 @@ You generally do **not** need to start Ray manually.
 * **OOM Errors**: If you run out of memory, try reducing the batch size or model size in the configuration YAML.
 :::
 
+### How It Works
+
+NeMo RL uses a distributed architecture built on **Ray** to coordinate multiple components (RL Actors) during training:
+
+* **Policy Model**: The model being trained (e.g., Qwen, Llama)
+* **Generation Backend**: Fast inference engine (vLLM) that generates responses
+* **Environment**: Reward evaluator (e.g., Math verifier) that scores outputs
+* **Training Backend**: PyTorch DTensor or Megatron Core for efficient distributed training
+
+Ray manages resource allocation, process isolation, and communication between these components, allowing NeMo RL to scale seamlessly from a single GPU to multi-node clusters.
+
+:::{seealso}
+For more details on the architecture, design philosophy, and how RL Actors coordinate, refer to:
+* [NeMo RL Overview](../about/overview.md) - High-level introduction and capabilities
+* [Design and Philosophy](../design-docs/design-and-philosophy.md) - Deep dive into the architecture
+* [Training Backends](../about/backends.md) - PyTorch DTensor vs Megatron Core comparison
+:::
+
 ## 3. Choose Your Path
 
 Now that you have a working setup, choose the workflow that matches your goal.
@@ -192,19 +224,19 @@ Now that you have a working setup, choose the workflow that matches your goal.
 :::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` Fine-Tune (SFT)
 :link: gs-sft
 :link-type: ref
-Start here if you have a base model and want to teach it instructions.
+**Start here** if you have a base model and want to teach it instructions. SFT is the standard first step in aligning language models using supervised learning on instruction-response pairs.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Align (DPO)
 :link: gs-dpo
 :link-type: ref
-Start here if you have preference data (A vs B) and want to align your model.
+**Start here** if you have preference data (chosen vs rejected pairs) and want to align your model to human preferences. DPO learns directly from preference comparisons without needing a separate reward model.
 :::
 
 :::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Reinforce (GRPO)
 :link: gs-grpo
 :link-type: ref
-Dive deeper into RL with GRPO, configuring rewards and complex reasoning tasks.
+**Start here** for reasoning tasks (math, coding) where you can verify correctness programmatically. GRPO is efficient for on-policy RL without requiring a separate critic model—perfect for tasks with deterministic rewards.
 :::
 
 ::::
