@@ -601,6 +601,17 @@ def setup(
 
     loss_fn = ClippedPGLossFn(loss_config)
 
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        print("  ✓ force_on_policy_ratio enabled")
+
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -1425,7 +1436,17 @@ def grpo_train(
 
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -2369,7 +2390,17 @@ def async_grpo_train(
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
