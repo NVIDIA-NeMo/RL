@@ -139,6 +139,7 @@ class SequencePackingGradientTestActor:
             "truncated_importance_sampling_ratio": None,
             "sequence_level_importance_ratios": False,
             "token_level_loss": True,
+            "force_on_policy_ratio": False,
         }
 
         base_loss_fn = ClippedPGLossFn(loss_config)
