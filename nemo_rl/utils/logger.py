@@ -158,6 +158,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to Tensorboard."""
+        return
+
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
 
@@ -433,6 +437,10 @@ class SwanlabLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to swanlab."""
+        return
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -807,6 +815,10 @@ class MLflowLogger(LoggerInterface):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_file:
             figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
             mlflow.log_artifact(tmp_file.name, f"plots/{name}")
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to MLflow."""
+        return
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
