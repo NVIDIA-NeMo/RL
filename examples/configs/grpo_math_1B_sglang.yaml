@@ -214,16 +214,17 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
-    # SGLang specific configuration
-    model_path: ${policy.model_name}  # Model path for SGLang server
-    gpus_per_server: 1  # Number of GPUs per SGLang server (tensor parallel size)
-    dtype: ${policy.precision}  # Model precision (bfloat16, float16, etc.)
-    context_length: 512  # Maximum context length
-    allow_auto_truncate: true
-    enable_memory_saver: false
-    max_running_requests: null
-    mem_fraction_static: 0.7
-    skip_server_warmup: true  # Skip server warmup to prevent timeout
+    sglang_cfg:
+      # SGLang specific configuration
+      model_path: ${policy.model_name} 
+      gpus_per_server: 1 
+      dtype: ${policy.precision}
+      context_length: 512  # Maximum context length
+      allow_auto_truncate: true
+      enable_memory_saver: false
+      max_running_requests: null
+      mem_fraction_static: 0.7
+      skip_server_warmup: true
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

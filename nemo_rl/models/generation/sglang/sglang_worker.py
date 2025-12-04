@@ -133,6 +133,7 @@ class SGLangGenerationWorker:
         self.cfg = config
         self.is_model_owner = bundle_indices is not None
         self.global_rank = int(os.environ.get("RANK", "0"))
+        self.sglang_cfg = config["sglang_cfg"]
         
         # Create a dedicated event loop thread for async operations
         # there will be issues if we use the event loop in the main thread
@@ -168,35 +169,34 @@ class SGLangGenerationWorker:
         
         # Build SGLang server arguments
         kwargs = {
-            "model_path": self.cfg.get("model_path", ""),
+            "model_path": self.sglang_cfg.get("model_path", ""),
             "trust_remote_code": True,
-            "random_seed": seed if seed is not None else self.cfg.get("random_seed", 1),
+            "random_seed": seed if seed is not None else self.sglang_cfg.get("random_seed", 1),
             # Memory settings
-            "enable_memory_saver": self.cfg.get("enable_memory_saver", False),
+            "enable_memory_saver": self.sglang_cfg.get("enable_memory_saver", False),
             "gpu_id_step": 1,
             "base_gpu_id": base_gpu_id,
             # Parallel settings
             "tp_size": tp_size,
-            "dp_size": self.cfg.get("dp_size", 1),
-            "pp_size": self.cfg.get("pp_size", 1),
-            "ep_size": self.cfg.get("ep_size", 1),
+            "dp_size": self.sglang_cfg.get("dp_size", 1),
+            "pp_size": self.sglang_cfg.get("pp_size", 1),
+            "ep_size": self.sglang_cfg.get("ep_size", 1),
             # Always skip warmup to prevent warmup timeout
-            "skip_server_warmup": True,
+            "skip_server_warmup": self.sglang_cfg.get("skip_server_warmup", True),
             # Server network settings - listen on all interfaces, use the free port we found
             "host": "0.0.0.0",
             "port": free_port,
             "torchao_config": "",
         }
         
-        # Add other config fields if they exist
         for key in [
             "dtype", "kv_cache_dtype", "context_length", "max_running_requests",
             "chunked_prefill_size", "max_prefill_tokens", "schedule_policy",
             "schedule_conservativeness", "cpu_offload_gb", "log_level",
             "mem_fraction_static", "allow_auto_truncate",
         ]:
-            if key in self.cfg:
-                kwargs[key] = self.cfg[key]
+            if key in self.sglang_cfg:
+                kwargs[key] = self.sglang_cfg[key]
 
         server_args = ServerArgs(**kwargs)
         # Save server_args and base_url for use in generate() and _make_request()
@@ -555,7 +555,7 @@ class SGLangGenerationWorker:
         if batch_size == 0:
             raise ValueError("Empty batch received")
         
-        context_length = self.cfg.get("context_length", None)
+        context_length = self.sglang_cfg.get("context_length", None)
         
         # Create async tasks for all samples
         tasks = []

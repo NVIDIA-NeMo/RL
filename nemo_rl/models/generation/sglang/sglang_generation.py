@@ -63,11 +63,12 @@ class SGLangGeneration(GenerationInterface):
         """
         # Store config
         self.cfg = config
+        self.sglang_cfg = config["sglang_cfg"]
         
-        gpus_per_server = self.cfg.get("gpus_per_server", None)
+        gpus_per_server = self.sglang_cfg.get("gpus_per_server", None)
         if gpus_per_server is None:
             raise ValueError(
-                "gpus_per_server must be set in SGLangConfig. "
+                "gpus_per_server must be set in SGLangConfig.sglang_cfg."
             )
         
         # Calculate number of servers based on available resources
@@ -102,6 +103,7 @@ class SGLangGeneration(GenerationInterface):
         
         # Initialize placement groups
         # For SGLang, we use PACK strategy to keep bundles together
+        # colocated is always at top level, not in sglang_cfg
         strategy = None if self.cfg.get("colocated", {}).get("enabled", False) else "PACK"
         cluster._init_placement_groups(
             strategy=strategy,

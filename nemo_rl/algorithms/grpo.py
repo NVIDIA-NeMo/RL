@@ -608,10 +608,10 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-        # Set model_name and model_path
-        generation_config["model_name"] = policy_config["model_name"]
-        if "model_path" not in generation_config or not generation_config.get("model_path"):
-            generation_config["model_path"] = policy_config["model_name"]
+        
+        # Set model_path if not already set
+        if "model_path" not in generation_config["sglang_cfg"]:
+            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
         
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
