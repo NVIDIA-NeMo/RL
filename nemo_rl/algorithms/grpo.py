@@ -39,6 +39,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
@@ -599,6 +600,17 @@ def setup(
         policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
+
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        print("  ✓ force_on_policy_ratio enabled")
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1414,13 +1426,27 @@ def grpo_train(
                     else 0.0,
                     **ds_metrics,
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update(
+                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -1553,6 +1579,18 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                log_generation_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    total_steps + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -2346,9 +2384,23 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update(
+                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -2463,6 +2515,18 @@ def async_grpo_train(
             buffer_size_current = ray.get(replay_buffer.size.remote())
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
+
+            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
+                "enable_vllm_metrics_logger", False
+            ) and master_config.get("logger", {}).get("wandb_enabled", False):
+                log_generation_metrics_to_wandb(
+                    vllm_logger_metrics,
+                    step + 1,
+                    master_config["policy"]["generation"]["vllm_cfg"][
+                        "vllm_metrics_logger_interval"
+                    ],
+                    logger,
+                )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")

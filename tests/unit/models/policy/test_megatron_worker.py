@@ -50,6 +50,7 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "truncated_importance_sampling_ratio": None,
     "sequence_level_importance_ratios": False,
     "token_level_loss": True,
+    "force_on_policy_ratio": False,
 }
 
 
@@ -129,6 +130,7 @@ def create_megatron_test_config(
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {

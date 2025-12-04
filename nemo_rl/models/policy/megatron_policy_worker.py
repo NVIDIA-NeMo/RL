@@ -116,6 +116,7 @@ from nemo_rl.models.megatron.common import (
     _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
+    get_moe_metrics,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
@@ -273,10 +274,6 @@ def setup_megatron_model(
 
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
-
-    # If deferring fp32 logits, disable mixed-precision wrapper entirely
-    if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
-        mixed_precision_wrapper = None
 
     # Model, optimizer, and learning rate.
     model = get_model(
@@ -663,6 +660,9 @@ class MegatronPolicyWorker:
             assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
                 "defer_fp32_logits must be True if logprob_chunk_size is set"
             )
+        self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
+            "defer_fp32_logits", None
+        ) and (model_cfg.fp16 or model_cfg.bf16)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -796,8 +796,6 @@ class MegatronPolicyWorker:
             ref_mixed_precision_wrapper = Float16Module
             if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
                 ref_mixed_precision_wrapper = CustomFloat16Module
-            if self.cfg["megatron_cfg"].get("defer_fp32_logits", None):
-                ref_mixed_precision_wrapper = None
 
             reference_model = get_model(
                 self.megatron_cfg.model,
@@ -983,6 +981,7 @@ class MegatronPolicyWorker:
             )
             all_mb_metrics = []
             losses = []
+            total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
@@ -1049,6 +1048,9 @@ class MegatronPolicyWorker:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
 
+                # Track total microbatches for MoE aux-loss averaging
+                total_num_microbatches += int(data_iterator_len)
+
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
@@ -1068,6 +1070,7 @@ class MegatronPolicyWorker:
                             pad_individual_seqs_to_multiple_of=pad_factor,
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                             pad_full_seq_to=pad_full_seq_to,
+                            defer_fp32_logits=self.defer_fp32_logits,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,
@@ -1177,6 +1180,16 @@ class MegatronPolicyWorker:
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
         }
+        # Collect MoE aux metrics averaged across microbatches
+        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        if num_moe_experts is not None and num_moe_experts > 1:
+            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            moe_metrics = get_moe_metrics(
+                loss_scale=moe_loss_scale,
+                per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+            )
+            if moe_metrics:
+                metrics["moe_metrics"] = moe_metrics
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1283,6 +1296,9 @@ class MegatronPolicyWorker:
             # Mamba models currently do not support packed_seq_params
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
+
+            if self.defer_fp32_logits:
+                additional_kwargs["fp32_output"] = False
 
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
