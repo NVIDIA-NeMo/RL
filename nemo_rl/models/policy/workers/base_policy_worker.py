@@ -148,3 +148,7 @@ class AbstractPolicyWorker:
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
+
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        # Placeholder implementation
+        pass

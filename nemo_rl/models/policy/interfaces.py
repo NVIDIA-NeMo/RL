@@ -145,6 +145,10 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abstractmethod
     def save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
         pass
 

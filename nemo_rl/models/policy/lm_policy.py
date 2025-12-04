@@ -673,6 +673,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        # Placeholder implementation
+        pass
+
     def calibrate_qkv_fp8_scales(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
