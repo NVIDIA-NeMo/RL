@@ -193,7 +193,7 @@ The following variables allow for deeper customization of the Ray cluster. Most 
 | `RUNTIME_ENV_AGENT_PORT=53005` | Port for the Ray runtime environment agent on worker nodes. |
 | `DASHBOARD_AGENT_GRPC_PORT=53007` | gRPC port for the Ray dashboard agent on worker nodes. |
 | `METRICS_EXPORT_PORT=53009` | Port for exporting metrics from worker nodes. |
-| `PORT=6379` | Main port for the Ray head node. |
+| `PORT=54514` | Main port for the Ray head node (default: 54514; Ray's standard default is 6379, but this script uses 54514 for multi-node compatibility). |
 | `RAY_CLIENT_SERVER_PORT=10001` | Port for the Ray client server on the head node. |
 | `DASHBOARD_GRPC_PORT=52367` | gRPC port for the Ray dashboard on the head node. |
 | `DASHBOARD_PORT=8265` | Port for the Ray dashboard UI on the head node. |
