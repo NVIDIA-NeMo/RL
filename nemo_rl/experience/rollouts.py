@@ -654,6 +654,8 @@ async def run_sample_multi_turn_rollout(
 
     # Track per-turn metrics
     turn_gen_tokens = []
+    turn_input_tokens = []
+    turn_total_tokens = []
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
 
@@ -685,6 +687,8 @@ async def run_sample_multi_turn_rollout(
             assistant_token_count += gen_token_count
             token_count += gen_token_count
             turn_gen_tokens.append(gen_token_count)
+            turn_input_tokens.append(int(input_lengths))
+            turn_total_tokens.append(int(input_lengths) + gen_token_count)
             # Per-worker load accounting
             if "gen_leader_worker_idx" in gen_metrics:
                 worker_idx = int(gen_metrics["gen_leader_worker_idx"])
@@ -770,6 +774,8 @@ async def run_sample_multi_turn_rollout(
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
         "turn_gen_tokens": turn_gen_tokens,
+        "turn_input_tokens": turn_input_tokens,
+        "turn_total_tokens": turn_total_tokens,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -929,6 +935,17 @@ def run_async_multi_turn_rollout(
                 for k, v in m["per_worker_token_counts"].items():
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+
+        # Collect ISL, OSL, and ISL+OSL metrics for all samples
+        rollout_metrics["histogram/gen_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
+        ]
+        rollout_metrics["histogram/input_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_input_tokens"]
+        ]
+        rollout_metrics["histogram/total_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_total_tokens"]
+        ]
 
         return final_batch, rollout_metrics
 
