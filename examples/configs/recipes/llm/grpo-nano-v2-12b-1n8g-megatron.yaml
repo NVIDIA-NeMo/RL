@@ -31,4 +31,4 @@ logger:
     project: nemo-rl
     name: grpo-nano-v2-12b-1n8g-megatron
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
