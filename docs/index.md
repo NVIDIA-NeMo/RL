@@ -245,6 +245,7 @@ design-docs/design-and-philosophy.md
 design-docs/padding.md
 design-docs/logger.md
 design-docs/uv.md
+design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md

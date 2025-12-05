@@ -204,7 +204,7 @@ jobs:
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
-      target: hermetic
+      target: release
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
