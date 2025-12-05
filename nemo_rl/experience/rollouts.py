@@ -936,7 +936,7 @@ def run_async_multi_turn_rollout(
 
 
 @dataclass
-class AsyncPenguinRolloutResult:
+class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
@@ -955,7 +955,7 @@ def _calculate_single_metric(
     }
 
 
-def run_async_penguin_rollout(
+def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
@@ -964,35 +964,35 @@ def run_async_penguin_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
-) -> AsyncPenguinRolloutResult:
-    """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+) -> AsyncNemoGymRolloutResult:
+    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
-    penguin_rows = input_batch["extra_env_info"]
+    nemo_gym_rows = input_batch["extra_env_info"]
 
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
-    # Penguin policy is "What you see is what you get".
-    assert not greedy, "`greedy` is not supported in Penguin path!"
+    # NeMo-Gym policy is "What you see is what you get".
+    assert not greedy, "`greedy` is not supported in NeMo-Gym path!"
     assert max_rollout_turns is None, (
-        "`max_rollout_turns` is not supported in Penguin path!"
+        "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    assert max_seq_len is None, "`max_seq_len` is not supported in Penguin path!"
+    assert max_seq_len is None, "`max_seq_len` is not supported in NeMo-Gym path!"
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], (
-        "Stop strings is not supported in the generation config in Penguin path!"
+        "Stop strings is not supported in the generation config in NeMo-Gym path!"
     )
     assert not generation_config["stop_token_ids"], (
-        "Stop strings is not supported in the generation config in Penguin path!"
+        "Stop strings is not supported in the generation config in NeMo-Gym path!"
     )
-    # Top k is not OpenAI compatible, so Penguin does not guarantee support over it.
+    # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
     assert not generation_config["top_k"], (
-        "Top k is not supported in the generation config in Penguin path!"
+        "Top k is not supported in the generation config in NeMo-Gym path!"
     )
 
     timer = Timer()
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
-    for row in penguin_rows:
+    for row in nemo_gym_rows:
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
         # row["max_tokens"] = max_seq_len
@@ -1005,16 +1005,16 @@ def run_async_penguin_rollout(
         # generation_config["max_new_tokens"]
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
-        penguin_environment = task_to_env["penguin"]
+        nemo_gym_environment = task_to_env["nemo_gym"]
         results, rollout_loop_timing_metrics = ray.get(
-            penguin_environment.run_rollouts.remote(
-                penguin_rows, tokenizer, timer_prefix
+            nemo_gym_environment.run_rollouts.remote(
+                nemo_gym_rows, tokenizer, timer_prefix
             )
         )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
-        batch_size = len(penguin_rows)
+        batch_size = len(nemo_gym_rows)
         max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
         all_sample_metrics = [
             {
@@ -1073,8 +1073,8 @@ def run_async_penguin_rollout(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for penguin_row, result in zip(penguin_rows, results):
-            agent_name = penguin_row["agent_ref"]["name"]
+        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            agent_name = nemo_gym_row["agent_ref"]["name"]
             agent_to_results[agent_name].append(result["full_result"])
 
         per_agent_metrics = {}
@@ -1138,7 +1138,7 @@ def run_async_penguin_rollout(
         }
     )
 
-    return AsyncPenguinRolloutResult(
+    return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,

@@ -20,8 +20,8 @@ import setuptools
 final_packages = []
 final_package_dir = {}
 
-# If the submodule is present, expose `penguin` package from the checkout
-src_dir = Path("Penguin")
+# If the submodule is present, expose `nemo_gym` package from the checkout
+src_dir = Path("Gym")
 
 
 CACHED_DEPENDENCIES = [
@@ -41,6 +41,7 @@ CACHED_DEPENDENCIES = [
     "aiohttp",
     "yappi",
     "ray[default]",
+    "psutil",
 ]
 
 if src_dir.exists():
@@ -49,7 +50,7 @@ if src_dir.exists():
         pyproject_toml = tomllib.load(f)
     if not pyproject_toml_path.exists():
         raise FileNotFoundError(
-            f"[Penguin][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
+            f"[Gym][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
         )
 
     packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
@@ -69,19 +70,19 @@ if src_dir.exists():
 
     if missing_in_cached or extra_in_cached:
         print(
-            "[Penguin][setup] Dependency mismatch between Penguin-workspace/Penguin/pyproject.toml vs Penguin-workspace/setup.py::CACHED_DEPENDENCIES.",
+            "[Gym][setup] Dependency mismatch between Gym-workspace/Gym/pyproject.toml vs Gym-workspace/setup.py::CACHED_DEPENDENCIES.",
             file=sys.stderr,
         )
         if missing_in_cached:
             print(
-                "  - Present in Penguin-workspace/Penguin/pyproject.toml but missing from CACHED_DEPENDENCIES:",
+                "  - Present in Gym-workspace/Gym/pyproject.toml but missing from CACHED_DEPENDENCIES:",
                 file=sys.stderr,
             )
             for dep in sorted(missing_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
         if extra_in_cached:
             print(
-                "  - Present in CACHED_DEPENDENCIES but not in Penguin-workspace/Penguin/pyproject.toml:",
+                "  - Present in CACHED_DEPENDENCIES but not in Gym-workspace/Gym/pyproject.toml:",
                 file=sys.stderr,
             )
             for dep in sorted(extra_in_cached):
@@ -93,19 +94,19 @@ if src_dir.exists():
         sys.exit(1)
     else:
         print(
-            "[Penguin][setup] Dependency sets are consistent with the submodule pyproject.",
+            "[Gym][setup] Dependency sets are consistent with the submodule pyproject.",
             file=sys.stderr,
         )
 
 
 setuptools.setup(
-    name="penguin",
+    name="nemo_gym",
     version="0.0.0",
-    description="Standalone packaging for the Penguin sub-module.",
+    description="Standalone packaging for the Gym sub-module.",
     author="NVIDIA",
     author_email="nemo-toolkit@nvidia.com",
     packages=final_packages,
     package_dir=final_package_dir,
-    py_modules=["is_penguin_installed"],
+    py_modules=["is_nemo_gym_installed"],
     install_requires=CACHED_DEPENDENCIES,
 )
