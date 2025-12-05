@@ -135,7 +135,7 @@ class BaseVllmGenerationWorker:
         ## use the bf16 version of the model rather than the quantized version
         ## megatron --> hf export is done in bf16 so this ensures the vllm
         ## model is compatible with megatron
-        if "openai/gpt-oss" in self.model_name:
+        if self.model_name in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
             size = self.model_name.split("-")[-1]
             self.model_name = f"unsloth/gpt-oss-{size}-BF16"
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
