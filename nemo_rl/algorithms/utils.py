@@ -748,24 +748,24 @@ def print_performance_metrics(
 
 
 def log_generation_metrics_to_wandb(
-    vllm_logger_metrics: dict[str, dict[int, list[Any]]],
+    generation_logger_metrics: dict[str, dict[int, list[Any]]],
     step: int,
     timeline_interval: float,
     logger: Logger,
 ) -> None:
-    """Log vLLM metrics to wandb.
+    """Log generation metrics to wandb.
 
     Args:
-        vllm_logger_metrics: Dictionary of vLLM logger metrics
+        generation_logger_metrics: Dictionary of generation logger metrics
         step: Global step value
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
-    for vllm_metric in vllm_logger_metrics.keys():
+    for generation_metric in generation_logger_metrics.keys():
         logger.log_plot_per_worker_timeline_metrics(
-            vllm_logger_metrics[vllm_metric],
+            generation_logger_metrics[generation_metric],
             step=step,
-            prefix="vllm_metrics",
-            name=vllm_metric,
+            prefix="generation_metrics",
+            name=generation_metric,
             timeline_interval=timeline_interval,
         )
