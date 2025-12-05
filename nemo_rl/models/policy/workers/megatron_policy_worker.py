@@ -13,12 +13,13 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Callable, Iterator, Optional, TypeVar
+from typing import Any, Callable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -84,11 +85,17 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.fp8 import (
+    convert_calibration_to_vllm_format,
+    get_vllm_qkv_scale_names,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -309,6 +316,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
         with ctx:
             all_mb_metrics = []
             losses = []
+            total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
                 ( 
                     batch,
@@ -331,6 +339,8 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     pad_full_seq_to,
                     seq_dim_size,
                 ) = get_microbatch_iterator(batch, self.cfg, mbs)
+                # Track total microbatches for MoE aux-loss averaging
+                total_num_microbatches += int(data_iterator_len)
 
                 loss_fn_wrapped = LossCollection(
                     loss_fn=loss_fn,
@@ -354,6 +364,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                         data_iterator=data_iterator,
                         seq_length_key=seqlen_key,
                         pad_individual_seqs_to_multiple_of=pad_factor,
+                        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                         pad_full_seq_to=pad_full_seq_to,
                         num_microbatches=data_iterator_len,
                         seq_length=seq_dim_size,
@@ -454,6 +465,17 @@ class MegatronPolicyWorker(BasePolicyWorker):
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
         }
+         # Collect MoE aux metrics averaged across microbatches
+        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        if num_moe_experts is not None and num_moe_experts > 1:
+            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            moe_metrics = get_moe_metrics(
+                loss_scale=moe_loss_scale,
+                per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+            )
+            if moe_metrics:
+                metrics["moe_metrics"] = moe_metrics
+
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -503,9 +525,10 @@ class MegatronPolicyWorker(BasePolicyWorker):
             data_iterator=mb_iterator,
             seq_length_key="input_lengths",
             pad_individual_seqs_to_multiple_of=pad_factor,
+            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+            pad_full_seq_to=pad_full_seq_to,
             seq_length=pp_seq_dim_size,
             mbs=mbs,
-            pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
             collection_fn=LogprobsCollection(cfg=self.cfg),
             forward_only=True,
@@ -619,7 +642,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             pad_full_seq_to,
             input_seq_dim_size,
         ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
-        
+
         pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
         list_of_outputs = megatron_forward_backward(
@@ -628,12 +651,14 @@ class MegatronPolicyWorker(BasePolicyWorker):
             data_iterator=mb_iterator,
             seq_length_key="input_lengths",
             pad_individual_seqs_to_multiple_of=pad_factor,
+            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+            pad_full_seq_to=pad_full_seq_to,
             seq_length=pp_seq_dim_size,
             mbs=mbs,
-            pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
             collection_fn=TopkLogitsCollection(cfg=self.cfg, k=k),
             forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
@@ -894,14 +919,9 @@ class MegatronPolicyWorker(BasePolicyWorker):
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-        for name, tensor in hf_params_generator:
-            metadata = (tensor.shape, tensor.dtype)
-            refit_param_info_hf[name] = metadata
+        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
@@ -955,24 +975,74 @@ class MegatronPolicyWorker(BasePolicyWorker):
             )
         return param_info
 
-    @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream model weights to peer process via ZMQ IPC socket."""
-        self.maybe_init_zmq()
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
-        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
-
-        # Generate HF parameters for streaming
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
+        This helper is used by both IPC-based streaming and collective broadcast
+        so that the logic for adding KV scales stays consistent in one place.
+        """
+        base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # Use the shared implementation
+        # Yield the original parameters first.
+        for name, tensor in base_iter:
+            yield name, tensor
+
+        # Check whether FP8 KV cache is enabled.
+        use_fp8_kv_cache = False
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            use_fp8_kv_cache = (
+                "vllm_cfg" in generation_cfg
+                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+            )
+
+        if not use_fp8_kv_cache:
+            return
+
+        # Append KV (and potentially Q) scale entries to match metadata.
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        keys: list[str] = []
+        for layer_idx in range(num_layers):
+            scale_names = get_vllm_qkv_scale_names(layer_idx)
+            keys.extend(scale_names.values())
+
+        for param_name in keys:
+            if kv_scales and param_name in kv_scales:
+                scale_value = kv_scales[param_name]
+            else:
+                scale_value = 1.0
+            scale_tensor = torch.tensor(
+                scale_value, dtype=torch.float32, device="cuda"
+            ).reshape(1)
+            yield param_name, scale_tensor
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
-            params_generator=hf_params_generator,
+            params_generator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -980,17 +1050,13 @@ class MegatronPolicyWorker(BasePolicyWorker):
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-
-        # param_iterator will return (name, tensor), we only need tensor
+        # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=hf_params_generator,
+            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
@@ -1295,4 +1361,201 @@ class MegatronPolicyWorker(BasePolicyWorker):
             "total_params": total_params,
             "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
         }
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
+
+        - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
+        - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
+        - By default only returns and saves K/V scales, optionally returns Q.
+
+        Args:
+            data: Representative sample batch for calibration, following get_logprobs input conventions.
+            micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
+            percentile: Percentile for amax (e.g. 99.9).
+            margin: Margin factor, e.g. 1.05.
+            save_path: If provided, rank0 will save results as JSON.
+            include_q: Whether to also return Q scale (usually only K/V needed).
+
+        Returns:
+            { "format": "fp8", "percentile": float, "margin": float,
+              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+        """
+
+        # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
+        # Defaults align with FP8 e4m3 max magnitude.
+        # Use different defaults for Q, K, V to adapt to distribution diffefences
+        def _get_env_float(name: str, default: float) -> float:
+            try:
+                val = os.getenv(name, None)
+                return float(val) if val is not None and val != "" else default
+            except Exception:
+                return default
+
+        FP8_MAX_Q = _get_env_float("FP8_MAX_Q", 448.0)
+        FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
+        FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
+
+        self.model.eval()
+
+        # Record local percentile amax for q/k/v of each layer
+        layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
+        hook_handles = []
+
+        def _extract_layer_key(module_name: str) -> str:
+            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
+            if m is not None:
+                return f"layer_{m.group(1)}"
+            return module_name
+
+        # Hook to capture q/k/v after q/k norm and RoPE
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
+                args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                    args = args[0]
+                # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
+                q = args[0]
+                k = args[1]
+                v = args[2]
+                if include_q:
+                    layer_to_samples_q[layer_key].append(
+                        float(torch.amax(torch.abs(q)).item())
+                    )
+                layer_to_samples_k[layer_key].append(
+                    float(torch.amax(torch.abs(k)).item())
+                )
+                layer_to_samples_v[layer_key].append(
+                    float(torch.amax(torch.abs(v)).item())
+                )
+
+            return _pre_hook
+
+        matched_modules = []
+        # Try to register forward_pre_hook on core_attention first
+        for name, module in self.model.named_modules():
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(
+                        _pre_hook_builder_core_attention(name)
+                    )
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(
+                        f"Error registering pre-hook for qkv scale calibration on {name}: {e}"
+                        " Please check if the model is compatible with the current calibration logic. "
+                        "The expected module name is 'self_attention.core_attention'."
+                    )
+                    raise
+
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
+        try:
+            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception as e:
+                    print(f"Error removing hook for qkv scale calibration: {e}")
+                    raise
+
+        # Compute local percentile amax
+        def _percentile(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
+            rank = max(
+                0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
+            )
+            return float(t[rank].item())
+
+        local_layer_to_pamax = {}
+        for layer_key in set(
+            list(layer_to_samples_k.keys())
+            + list(layer_to_samples_v.keys())
+            + (list(layer_to_samples_q.keys()) if include_q else [])
+        ):
+            entry = {}
+            if include_q:
+                entry["q_amax_p"] = _percentile(
+                    layer_to_samples_q.get(layer_key, []), percentile
+                )
+            entry["k_amax_p"] = _percentile(
+                layer_to_samples_k.get(layer_key, []), percentile
+            )
+            entry["v_amax_p"] = _percentile(
+                layer_to_samples_v.get(layer_key, []), percentile
+            )
+            local_layer_to_pamax[layer_key] = entry
+
+        # Merge across all ranks: take maximum of percentile amax (conservative approach)
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        gathered = [None for _ in range(world_size)] if world_size > 1 else None
+        if world_size > 1:
+            torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
+            merged = defaultdict(dict)
+            for d in gathered:  # type: ignore
+                if d is None:
+                    continue
+                for k, v in d.items():
+                    dst = merged[k]
+                    for kk, vv in v.items():
+                        dst[kk] = max(dst.get(kk, 0.0), float(vv))
+            layer_to_pamax = dict(merged)
+        else:
+            layer_to_pamax = local_layer_to_pamax
+
+        # Compute scale (symmetric quantization): scale = pamax / fp8_max
+        result_layers = {}
+        for layer_key, vals in layer_to_pamax.items():
+            out_entry = {}
+            if include_q:
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_Q
+                out_entry["q_scale"] = float(q_scale)
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_K
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_V
+            out_entry["k_scale"] = float(k_scale)
+            out_entry["v_scale"] = float(v_scale)
+            result_layers[layer_key] = out_entry
+
+        vllm_format_scales = convert_calibration_to_vllm_format(result_layers)
+
+        final_result = {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": vllm_format_scales,
+        }
+
+        # Sync results across all ranks (broadcast rank0's result)
+        if world_size > 1:
+            if torch.distributed.get_rank() == 0:
+                obj_list = [final_result]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]
+            else:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]  # type: ignore
+
+        return final_result
     

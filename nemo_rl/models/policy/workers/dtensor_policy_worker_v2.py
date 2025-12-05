@@ -22,7 +22,6 @@ from typing import Any, Generator, Optional, cast
 
 import ray
 import torch
-import zmq
 from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
@@ -74,17 +73,17 @@ from nemo_rl.models.huggingface.common import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
 )
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -98,7 +97,7 @@ from nemo_rl.models.policy.workers.base_worker import BasePolicyWorker
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(BasePolicyWorker):
+class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -1625,9 +1624,32 @@ class DTensorPolicyWorkerV2(BasePolicyWorker):
         return state_dict_info
 
     @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorkerV2."""
+        raise NotImplementedError(
+            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorkerV2"
+        )
+
+    @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1660,8 +1682,15 @@ class DTensorPolicyWorkerV2(BasePolicyWorker):
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(

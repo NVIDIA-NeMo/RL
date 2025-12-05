@@ -19,11 +19,13 @@ def get_microbatch_iterator(
     cfg: dict[str, Any],
     mbs: int,
 ) -> tuple[Iterator, int, int, int, int, int, int]:
+    micro_batch_size = mbs
+    pad_factor = 1
+    pad_full_seq_to = None
+    pad_packed_seq_to_multiple_of = 1
     if cfg["dynamic_batching"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-        micro_batch_size = mbs
-        ## TODO: handle other args
     elif cfg["sequence_packing"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
@@ -41,10 +43,6 @@ def get_microbatch_iterator(
     else:
         mb_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
-        micro_batch_size = mbs
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
 
     _, seq_dim_size = check_sequence_dim(data)
     return (
@@ -61,6 +59,7 @@ def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     pack_sequences: bool = False,
 ):
@@ -99,7 +98,8 @@ def process_microbatch(
             input_ids,
             seq_lengths,
             pad_individual_seqs_to_multiple_of,
-            pad_full_seq_to or 1,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
             cp_rank=get_context_parallel_rank(),
             cp_size=get_context_parallel_world_size(),
         )

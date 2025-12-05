@@ -41,7 +41,7 @@ def model_forward(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
-    defer_fp32_logits: Optional[bool] = False,
+    defer_fp32_logits: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Perform a single forward pass through the model.
@@ -54,6 +54,7 @@ def model_forward(
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
+        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -96,6 +97,7 @@ def forward_with_collection_fn(
     collection_fn: CollectionFunction,
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = True,
 ) -> Tuple[torch.Tensor, Callable]:
@@ -133,6 +135,7 @@ def forward_with_collection_fn(
         data_dict,
         seq_length_key,
         pad_individual_seqs_to_multiple_of,
+        pad_packed_seq_to_multiple_of,
         pad_full_seq_to,
         pack_sequences=pack_sequences,
     )
@@ -177,13 +180,14 @@ def megatron_forward_backward(
     data_iterator: Iterator[BatchedDataDict[Any]],
     seq_length_key: Optional[str],
     pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
     pad_full_seq_to: Optional[int],
     num_microbatches: int,
     seq_length: int,
     mbs: int,
     collection_fn: CollectionFunction,
     forward_only: bool = False,
-    defer_fp32_logits: Optional[bool] = True,
+    defer_fp32_logits: Optional[bool] = None,
 ) -> Any:
     """
     Execute forward and backward passes using Megatron's utilities.
@@ -197,13 +201,14 @@ def megatron_forward_backward(
         cfg (dict): Configuration dictionary
         data_iterator: Iterator providing training data batches
         seq_length_key: Key for sequence length in data
-        pad_individual_seqs_to_multiple_of: Padding multiple for sequences 
-        pad_full_seq_to: Target length for full sequence padding
+        pad_individual_seqs_to_multiple_of (int): Pad individual sequences to a multiple of this value
+        pad_full_seq_to (Optional[int]): Pad packed sequences to this value
         num_microbatches (int): Number of microbatches to process
         seq_length (int): Sequence length
         mbs (int): Micro batch size
         collection_fn: Collection function to post-process the logits
         forward_only (bool): If True, skip backward pass
+        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         
     Returns:
         BatchedDataDict: Results from the forward/backward execution
@@ -213,6 +218,7 @@ def megatron_forward_backward(
         cfg=cfg,
         seq_length_key=seq_length_key,
         pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         collection_fn=collection_fn,
         defer_fp32_logits=defer_fp32_logits,
