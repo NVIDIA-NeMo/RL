@@ -272,6 +272,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -541,6 +542,39 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
+# Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
+# Patches this method to not create new torch.nn.Parameter for layer weights
+# to maintain weight loaders.
+def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
+    assert layer.weight_block_size is not None
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import (
+        is_deep_gemm_e8m0_used,
+        should_use_deepgemm_for_fp8_linear,
+    )
+
+    # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
+    # requantize the weight and input to the specific scale
+    # at the same time.
+    should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
+        layer.orig_dtype, layer.weight
+    )
+    if should_use_deepgemm:
+        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=layer.weight.data,
+            ws=layer.weight_scale.data,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
+        )
+        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
+        # Instead of creating new torch.nn.Parameter, we update the data in place.
+        layer.weight.data.copy_(dg_weight)
+        layer.weight_scale.data.copy_(dg_weight_scale)
+
+
 def process_weights_after_loading(self, layer) -> None:
     """This function is used to process the weights after loading for a Linear layer.
 
@@ -548,7 +582,6 @@ def process_weights_after_loading(self, layer) -> None:
     new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
     """
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        maybe_post_process_fp8_weight_block,
         process_fp8_weight_block_strategy,
     )
 
@@ -566,7 +599,7 @@ def process_weights_after_loading(self, layer) -> None:
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
         layer.update_param_tp_status()
 
-    maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+    maybe_post_process_fp8_weight_block(layer)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
