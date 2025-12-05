@@ -91,7 +91,6 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.models.policy.workers.base_worker import BasePolicyWorker
 
 
 @ray.remote(

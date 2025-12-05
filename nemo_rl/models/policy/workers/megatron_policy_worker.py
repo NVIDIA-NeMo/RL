@@ -14,52 +14,22 @@
 import gc
 import os
 import re
-import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from functools import partial
-from typing import Any, Callable, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
-import zmq
-from megatron.bridge import AutoBridge
-from megatron.bridge.models.model_provider import get_model
-from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
-    checkpoint_exists,
-    init_checkpointing_context,
-    load_checkpoint,
     maybe_finalize_async_save,
     save_checkpoint,
 )
-from megatron.bridge.training.config import (
-    CheckpointConfig,
-    ConfigContainer,
-    DistributedDataParallelConfig,
-    LoggerConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    TokenizerConfig,
-    TrainingConfig,
-)
-from megatron.bridge.training.initialize import (
-    initialize_megatron,
-    set_jit_fusion_options,
-)
-from megatron.bridge.training.optim import setup_optimizer
-from megatron.bridge.training.setup import (
-    _update_model_config_funcs,
-)
-from megatron.bridge.training.state import GlobalState
-from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
@@ -74,12 +44,9 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_last_rank,
     is_pipeline_last_stage,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -96,7 +63,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -115,12 +81,9 @@ from nemo_rl.models.megatron.train import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    get_gpu_info,
-    get_megatron_checkpoint_dir,
-    get_runtime_env_for_policy_worker,
+    get_runtime_env_for_policy_worker
 )
 from nemo_rl.models.policy.workers.base_worker import BasePolicyWorker
 from nemo_rl.models.megatron.setup import (
@@ -465,7 +428,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
         }
-         # Collect MoE aux metrics averaged across microbatches
+        # Collect MoE aux metrics averaged across microbatches
         num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
@@ -475,7 +438,6 @@ class MegatronPolicyWorker(BasePolicyWorker):
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
-
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1203,7 +1165,6 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     model.load_state_dict(new_state_dict)
         return model
 
-    ## TODO: rename this to move_optimizer_to_device
     def move_optimizer(self, device: str):
         # Iterate through the state dictionaries for each parameter group
         if isinstance(self.optimizer, ChainedOptimizer):
