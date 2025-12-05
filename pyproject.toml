@@ -17,6 +17,7 @@ requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
+  "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                                            # for flash-attn parallel build
   "torch==2.8.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
