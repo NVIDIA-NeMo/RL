@@ -1,0 +1,91 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 16
+  batch_multiplier: 3 # Multiplier for dataloader batch size calculation
+  max_rollout_turns: 1
+  max_num_steps: 10
+  use_leave_one_out_baseline: false
+  val_period: 5
+  max_val_samples: 256
+  val_batch_size: 256
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 2048
+    max_response_length: 6144
+loss_fn:
+  reference_policy_kl_penalty: 0.0  # Corresponds to actor_rollout_ref.actor.kl_loss_coef
+  ratio_clip_max: 0.28  # clip_ratio_high
+  ratio_clip_min: 0.2   # clip_ratio_low
+  ratio_clip_c: 10.0
+checkpointing:
+  checkpoint_dir: results/grpo_dapomath17k_dsv3_megatron
+  keep_top_k: 100
+policy:
+  model_name: /path/to/dsv3-bf16-checkpoint
+  hf_config_overrides:
+    max_position_embeddings: 8192
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${mul:${policy.dtensor_cfg.tensor_parallel_size},
+    ${mul:2, ${policy.dtensor_cfg.context_parallel_size}}}
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 4
+    sequence_parallel: true
+    moe_permute_fusion: true
+    apply_rope_fusion: false
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_init: 5.0e-08
+  sequence_packing:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 64
+      enforce_eager: true
+data:
+  max_input_seq_length: 2048  # max_prompt_length
+  prompt_file: null
+  dataset_name: DAPOMath17K
+env:
+  dapo:
+    num_workers: 64
+  math:
+    num_workers: 64
+    math_verify_impl: "dapo_math_verify"
+
+logger:
+  monitor_gpus: true
+  wandb:
+    project: DAPO
+    name: DAPO-DeepSeek-671b-megatron
+  mlflow:
+    experiment_name: DAPO
+    run_name: DAPO-DeepSeek-671b-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
+
