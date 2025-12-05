@@ -266,10 +266,8 @@ class LossCollection:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
 
-        pack_sequences = self.cfg["sequence_packing"]["enabled"]
-
         loss_fn = self.loss_fn
-
+        pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             # remove padding
             loss_fn = SequencePackingLossWrapper(
@@ -327,7 +325,7 @@ class LogprobsCollection:
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
-        
+
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
@@ -379,15 +377,15 @@ class TopkLogitsCollection:
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
         Create a processor function that computes top-k logits and indices.
-        
+
         This function returns a processor that extracts the top-k highest logits
         and their corresponding vocabulary indices from model outputs. It handles
         tensor parallelism, context parallelism, and sequence packing.
-        
+
         Args:
             data_dict: Batched data dictionary
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
-            
+
         Returns:
             Callable: Function that takes output tensor and returns 
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
