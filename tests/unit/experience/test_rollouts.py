@@ -32,23 +32,23 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.environments.penguin import penguin_example_to_nemo_rl_datum_spec
+from nemo_rl.environments.nemo_gym import nemo_gym_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_penguin_rollout,
+    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
-from tests.unit.environments.test_penguin import (
-    PENGUIN_INSTALLED,
+from tests.unit.environments.test_nemo_gym import (
+    NEMO_GYM_INSTALLED,
     cluster,  # noqa: F401
-    penguin,  # noqa: F401
-    penguin_sanity_test_data,  # noqa: F401
-    penguin_tokenizer,  # noqa: F401
-    penguin_vllm_generation,  # noqa: F401
+    nemo_gym,  # noqa: F401
+    nemo_gym_sanity_test_data,  # noqa: F401
+    nemo_gym_tokenizer,  # noqa: F401
+    nemo_gym_vllm_generation,  # noqa: F401
 )
 
 # Import the test environment definitions
@@ -748,27 +748,27 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
 
 @pytest.mark.skipif(
-    not PENGUIN_INSTALLED,
-    reason="Skipping Penguin test since Penguin is not installed!",
+    not NEMO_GYM_INSTALLED,
+    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
 )
-def test_run_async_penguin_rollout(
-    penguin,  # noqa: F811
-    penguin_vllm_generation,  # noqa: F811
-    penguin_sanity_test_data,  # noqa: F811
-    penguin_tokenizer,  # noqa: F811
+def test_run_async_nemo_gym_rollout(
+    nemo_gym,  # noqa: F811
+    nemo_gym_vllm_generation,  # noqa: F811
+    nemo_gym_sanity_test_data,  # noqa: F811
+    nemo_gym_tokenizer,  # noqa: F811
 ):
     nemo_rl_compatible_examples: list[DatumSpec] = [
-        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
-        for idx, penguin_example in enumerate(penguin_sanity_test_data["input"])
+        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
+        for idx, nemo_gym_example in enumerate(nemo_gym_sanity_test_data["input"])
     ]
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
-    actual_result = run_async_penguin_rollout(
-        policy_generation=penguin_vllm_generation,
+    actual_result = run_async_nemo_gym_rollout(
+        policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
-        tokenizer=penguin_tokenizer,
-        task_to_env={"penguin": penguin},
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
         max_seq_len=None,
-        generation_config=penguin_vllm_generation.cfg,
+        generation_config=nemo_gym_vllm_generation.cfg,
         max_rollout_turns=None,
     )
     actual_result = asdict(actual_result)
@@ -872,6 +872,6 @@ def test_run_async_penguin_rollout(
 
     """
     If the result here does not match, please check the following:
-    1. In nemo_rl/experience/rollouts.py::run_async_penguin_rollout, the sampling params are passed appropriately
+    1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """

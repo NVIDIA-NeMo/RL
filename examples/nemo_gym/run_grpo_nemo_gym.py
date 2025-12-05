@@ -36,7 +36,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     StatefulDataLoader,
     TokenizerType,
-    _should_use_penguin,
+    _should_use_nemo_gym,
     grpo_train,
     refit_policy_generation,
     setup,
@@ -48,13 +48,13 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.penguin import (
-    Penguin,
-    PenguinConfig,
-    penguin_example_to_nemo_rl_datum_spec,
-    setup_penguin_config,
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    nemo_gym_example_to_nemo_rl_datum_spec,
+    setup_nemo_gym_config,
 )
-from nemo_rl.experience.rollouts import run_async_penguin_rollout
+from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -75,29 +75,29 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
-def setup_single_penguin_dataset(
+def setup_single_nemo_gym_dataset(
     jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None
 ):
     with open(jsonl_fpath) as f:
-        penguin_examples = list(map(json.loads, f))
+        nemo_gym_examples = list(map(json.loads, f))
 
-    print(f"Loaded data at {jsonl_fpath}. Found {len(penguin_examples)} examples")
+    print(f"Loaded data at {jsonl_fpath}. Found {len(nemo_gym_examples)} examples")
 
     if num_repeats:
-        previous_length = len(penguin_examples)
-        penguin_examples = list(
+        previous_length = len(nemo_gym_examples)
+        nemo_gym_examples = list(
             chain.from_iterable(
-                repeat(penguin_example, num_repeats)
-                for penguin_example in penguin_examples
+                repeat(nemo_gym_example, num_repeats)
+                for nemo_gym_example in nemo_gym_examples
             )
         )
         print(
-            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(penguin_examples)}!"
+            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(nemo_gym_examples)}!"
         )
 
     nemo_rl_compatible_examples: list[DatumSpec] = [
-        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
-        for idx, penguin_example in enumerate(penguin_examples)
+        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
+        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
     ]
 
     passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
@@ -129,7 +129,7 @@ def collect_trajectories(
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config["policy"]["generation"]
     for val_batch in val_dataloader:
-        penguin_rollout_result = run_async_penguin_rollout(
+        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
             policy_generation=policy_generation,
             input_batch=val_batch,
             tokenizer=tokenizer,
@@ -141,7 +141,7 @@ def collect_trajectories(
         )
 
         rows_to_log: list[str] = []
-        for key, value in penguin_rollout_result.rollout_metrics.items():
+        for key, value in nemo_gym_rollout_result.rollout_metrics.items():
             if "full_result" not in key:
                 continue
 
@@ -195,18 +195,18 @@ def main() -> None:
         config["policy"]["generation"], tokenizer
     )
 
-    # Penguin specific config setup.
-    setup_penguin_config(config, tokenizer)
+    # NeMo-Gym specific config setup.
+    setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
-    assert _should_use_penguin(config)
+    assert _should_use_nemo_gym(config)
 
     print("\n▶ Setting up data...")
-    train_dataset = setup_single_penguin_dataset(
+    train_dataset = setup_single_nemo_gym_dataset(
         jsonl_fpath=config["data"]["train_jsonl_fpath"],
         tokenizer=tokenizer,
     )
-    val_dataset = setup_single_penguin_dataset(
+    val_dataset = setup_single_nemo_gym_dataset(
         jsonl_fpath=config["data"]["validation_jsonl_fpath"],
         tokenizer=tokenizer,
     )
@@ -247,23 +247,23 @@ The validation set you pass in will directly be used for validation with no addi
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
     is_trajectory_collection = (
-        config["env"]["penguin"].pop("is_trajectory_collection", False) or False
+        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
-    penguin_config = PenguinConfig(
+    nemo_gym_config = NemoGymConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["penguin"],
+        initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    penguin = Penguin.options(
+    nemo_gym = NemoGym.options(
         runtime_env={
             "py_executable": get_actor_python_env(
-                "nemo_rl.environments.penguin.Penguin"
+                "nemo_rl.environments.nemo_gym.NemoGym"
             ),
         }
-    ).remote(penguin_config)
-    # Blocking wait for penguin to spin up
-    ray.get(penguin.health_check.remote())
-    task_to_env = {"penguin": penguin}
+    ).remote(nemo_gym_config)
+    # Blocking wait for NeMo-Gym to spin up
+    ray.get(nemo_gym.health_check.remote())
+    task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:

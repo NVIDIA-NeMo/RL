@@ -50,7 +50,7 @@ def _replace_prefix_tokens(
     in order to preserve the monotonic tokens property for optimized multi-turn
     training.
 
-    Some environments (namely Penguin) require an OpenAI compatible server
+    Some environments (namely NeMo-Gym) require an OpenAI compatible server
     endpoint rather than an inference engine handle. This is fine for the most
     part, but it may cause issues when the environment is used as a part of
     training.
@@ -303,7 +303,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
-                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
                         if "prompt_token_ids" in message:
