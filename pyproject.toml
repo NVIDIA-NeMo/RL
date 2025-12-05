@@ -165,7 +165,7 @@ triton = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.4" }
 mamba-ssm = { git = "https://github.com/yfw/mamba", branch = "general_stride_fix" }
 
 [tool.uv.workspace]
@@ -217,6 +217,7 @@ link-mode = "copy"
 override-dependencies = [
   "transformer-engine[pytorch]==2.8.0",
   "opencv-python-headless>=4.11.0",
+  "nvidia-modelopt[torch]>=0.39.0",
 ]
 
 # Augment build dependencies for packages that need torch at build time
