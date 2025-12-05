@@ -6,10 +6,7 @@ loss_fn:
   use_importance_sampling_correction: true
 policy:
   model_name: openai/gpt-oss-20b
-  train_global_batch_size: 512
   train_micro_batch_size: 1
-  generation_batch_size: 32 # Only used when generating using megatron backend
-  logprob_batch_size: 4
   max_total_sequence_length: 4096
   megatron_cfg:
     enabled: true
@@ -18,8 +15,6 @@ policy:
     sequence_parallel: true
     moe_permute_fusion: true
   dtensor_cfg:
-    enabled: false
-  dynamic_batching:
     enabled: false
   sequence_packing:
     enabled: false

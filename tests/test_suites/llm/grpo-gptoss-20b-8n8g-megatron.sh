@@ -25,7 +25,7 @@ uv run examples/run_grpo_math.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    $@ \
+    "$@" \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
