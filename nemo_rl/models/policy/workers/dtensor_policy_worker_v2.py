@@ -460,18 +460,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
-    def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
-    ) -> None:
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
-        )
-        device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
-
     def check_model_allow_flash_attn_args(self, model_config) -> bool:
         # Some models doesn't support flash_attn_kwargs
         # Check nemotron nas.
