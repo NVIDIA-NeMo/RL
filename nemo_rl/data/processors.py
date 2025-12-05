@@ -231,3 +231,101 @@ def multichoice_qa_processor(
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
     return output
+
+
+
+
+def genrm_rlhf_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary for GenRM RLHF training tasks.
+
+    The datum_dict should contain:
+    - messages: List of message lists, where each list is a full conversation
+      that MUST end with a user message
+
+    The last user message MUST contain metadata with:
+      - conversation_history: Previous conversation context (required, can be empty list)
+
+    The processor will:
+    1. Extract metadata from the last user message
+    2. Use the entire conversation as the generation prompt
+    """
+    # Extract the messages (should be a list containing message lists)
+    messages_list = datum_dict["messages"]
+
+    # Get the first (and likely only) message list
+    if messages_list and len(messages_list) > 0:
+        messages = messages_list[0]
+    else:
+        raise ValueError("No messages found in datum_dict")
+
+    # The last message must be a user turn with required metadata
+    assert messages, "Messages list is empty"
+    assert messages[-1].get("role") == "user", "Last message must be a user turn"
+    assert "metadata" in messages[-1], "Last user turn must have metadata"
+    assert "conversation_history" in messages[-1]["metadata"], (
+        "Metadata must contain conversation_history"
+    )
+
+    # Extract metadata from the last user turn
+    metadata = {
+        "conversation_history": messages[-1]["metadata"]["conversation_history"]
+    }
+
+    # Clean conversation for tokenization (remove metadata from messages)
+    clean_conversation = [
+        {"role": msg["role"], "content": msg["content"]} for msg in messages
+    ]
+
+    # Apply chat template to the entire conversation and tokenize
+    templated_conversation = tokenizer.apply_chat_template(
+        clean_conversation,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=True,
+    )
+
+    # Tokenize and create message log entry
+    token_ids = tokenizer(
+        templated_conversation,
+        return_tensors="pt",
+        add_special_tokens=False,  # Already added by apply_chat_template
+    )["input_ids"][0]
+
+    # Handle max sequence length
+    length = len(token_ids)
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # Truncate if necessary
+        token_ids = token_ids[:max_seq_length]
+        length = max_seq_length
+        loss_multiplier = 0.0
+
+    message_log: LLMMessageLogType = [
+        {
+            "role": "user",  # Full conversation prompt for generation
+            "content": templated_conversation,
+            "token_ids": token_ids,
+        }
+    ]
+
+    # Prepare extra_env_info with conversation history
+    extra_env_info = {
+        "conversation_history": metadata.get("conversation_history", []),
+    }
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "genrm_rlhf"),
+    }
+
+    return output
