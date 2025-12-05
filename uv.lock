@@ -21,8 +21,8 @@ members = [
     "megatron-bridge",
     "megatron-core",
     "nemo-automodel",
+    "nemo-gym",
     "nemo-rl",
-    "penguin",
     "template-project",
 ]
 overrides = [
@@ -3199,6 +3199,50 @@ test = [
 ]
 
 [[package]]
+name = "nemo-gym"
+source = { editable = "3rdparty/Gym-workspace" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "devtools" },
+    { name = "fastapi" },
+    { name = "gradio" },
+    { name = "hydra-core" },
+    { name = "mlflow" },
+    { name = "omegaconf" },
+    { name = "openai" },
+    { name = "psutil" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "ray", extra = ["default"] },
+    { name = "tdigest" },
+    { name = "tqdm" },
+    { name = "uvicorn" },
+    { name = "uvloop" },
+    { name = "yappi" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp" },
+    { name = "devtools" },
+    { name = "fastapi" },
+    { name = "gradio" },
+    { name = "hydra-core" },
+    { name = "mlflow" },
+    { name = "omegaconf" },
+    { name = "openai", specifier = "<=2.6.1" },
+    { name = "psutil" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "ray", extras = ["default"] },
+    { name = "tdigest", specifier = ">=0.5.2.2" },
+    { name = "tqdm" },
+    { name = "uvicorn" },
+    { name = "uvloop" },
+    { name = "yappi" },
+]
+
+[[package]]
 name = "nemo-rl"
 source = { editable = "." }
 dependencies = [
@@ -3254,8 +3298,8 @@ mcore = [
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
-penguin = [
-    { name = "penguin" },
+nemo-gym = [
+    { name = "nemo-gym" },
 ]
 vllm = [
     { name = "causal-conv1d" },
@@ -3331,6 +3375,7 @@ requires-dist = [
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-LM-workspace" },
     { name = "mlflow", specifier = ">=3.5.0,<3.6.0" },
     { name = "nemo-automodel", marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
+    { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace" },
     { name = "ninja" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
@@ -3339,7 +3384,6 @@ requires-dist = [
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
-    { name = "penguin", marker = "extra == 'penguin'", editable = "3rdparty/Penguin-workspace" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "plotly" },
     { name = "pyzmq" },
@@ -3363,7 +3407,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.0" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore", "penguin"]
+provides-extras = ["automodel", "vllm", "mcore", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
@@ -4142,48 +4186,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/70/b8/2e79377efaa1e5f0d70a497db7914ffd355846e760ffa2f7883ab0f600fb/peft-0.17.1.tar.gz", hash = "sha256:e6002b42517976c290b3b8bbb9829a33dd5d470676b2dec7cb4df8501b77eb9f", size = 568192, upload-time = "2025-08-21T09:25:22.703Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/fe/a2da1627aa9cb6310b6034598363bd26ac301c4a99d21f415b1b2855891e/peft-0.17.1-py3-none-any.whl", hash = "sha256:3d129d64def3d74779c32a080d2567e5f7b674e77d546e3585138216d903f99e", size = 504896, upload-time = "2025-08-21T09:25:18.974Z" },
-]
-
-[[package]]
-name = "penguin"
-source = { editable = "3rdparty/Penguin-workspace" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "devtools" },
-    { name = "fastapi" },
-    { name = "gradio" },
-    { name = "hydra-core" },
-    { name = "mlflow" },
-    { name = "omegaconf" },
-    { name = "openai" },
-    { name = "pydantic" },
-    { name = "pydantic-core" },
-    { name = "ray", extra = ["default"] },
-    { name = "tdigest" },
-    { name = "tqdm" },
-    { name = "uvicorn" },
-    { name = "uvloop" },
-    { name = "yappi" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp" },
-    { name = "devtools" },
-    { name = "fastapi" },
-    { name = "gradio" },
-    { name = "hydra-core" },
-    { name = "mlflow" },
-    { name = "omegaconf" },
-    { name = "openai", specifier = "<=2.6.1" },
-    { name = "pydantic" },
-    { name = "pydantic-core" },
-    { name = "ray", extras = ["default"] },
-    { name = "tdigest", specifier = ">=0.5.2.2" },
-    { name = "tqdm" },
-    { name = "uvicorn" },
-    { name = "uvloop" },
-    { name = "yappi" },
 ]
 
 [[package]]
