@@ -1,6 +1,6 @@
 
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
 import torch
 
@@ -23,6 +23,15 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.data import process_microbatch
+
+
+# Union type for any collection function (defined after classes below)
+CollectionFunction = Union[
+    "LossCollection",
+    "LogprobsCollection",
+    "TopkLogitsCollection",
+]
+
 
 def model_forward(
     model: GPTModel,
@@ -84,10 +93,10 @@ def forward_with_collection_fn(
     data_iterator: Iterator[BatchedDataDict[Any]],
     model: GPTModel,
     cfg: Dict[str, Any],
+    collection_fn: CollectionFunction,
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
-    collection_fn: Optional[Callable[..., Callable]] = None,
     defer_fp32_logits: Optional[bool] = True,
 ) -> Tuple[torch.Tensor, Callable]:
     """
@@ -104,7 +113,7 @@ def forward_with_collection_fn(
         seq_length_key: Key for sequence length in data dict (optional)
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
-        collection_fn: Function that creates output collection function when called (optional)
+        collection_fn: Collection function to post-process the logits
         
     Returns:
         tuple: (output_tensor, collection_fn_wrapped)
@@ -119,7 +128,6 @@ def forward_with_collection_fn(
         attention_mask,
         position_ids,
         packed_seq_params,
-        cu_seqlens,
         cu_seqlens_padded,
     ) = process_microbatch(
         data_dict,
@@ -141,17 +149,25 @@ def forward_with_collection_fn(
     )
 
     ## calling collection_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
-    #### NOTE: the collection_fn passed in here should accept the following kwargs!
-    collection_fn_wrapped = collection_fn(
-        data_dict=data_dict,
-        input_ids=input_ids,
-        input_ids_cp_sharded=input_ids_cp_sharded,
-        packed_seq_params=packed_seq_params,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_padded=cu_seqlens_padded,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-    )
+    # Use type checking to dispatch to the correct collection method
+    if isinstance(collection_fn, LossCollection):
+        collection_fn_wrapped = collection_fn(
+            data_dict=data_dict,
+            packed_seq_params=packed_seq_params,
+        )
+    elif isinstance(collection_fn, LogprobsCollection):
+        collection_fn_wrapped = collection_fn(
+            data_dict=data_dict,
+            input_ids=input_ids,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+    elif isinstance(collection_fn, TopkLogitsCollection):
+        collection_fn_wrapped = collection_fn(
+            data_dict=data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+    else:
+        raise TypeError(f"Unknown collection function type: {type(collection_fn)}")
 
     return output_tensor, collection_fn_wrapped
 
@@ -165,7 +181,7 @@ def megatron_forward_backward(
     num_microbatches: int,
     seq_length: int,
     mbs: int,
-    collection_fn: Callable[..., Callable],
+    collection_fn: CollectionFunction,
     forward_only: bool = False,
     defer_fp32_logits: Optional[bool] = True,
 ) -> Any:
@@ -186,7 +202,7 @@ def megatron_forward_backward(
         num_microbatches (int): Number of microbatches to process
         seq_length (int): Sequence length
         mbs (int): Micro batch size
-        collection_fn: Function to create output collection function when called
+        collection_fn: Collection function to post-process the logits
         forward_only (bool): If True, skip backward pass
         
     Returns:
@@ -213,280 +229,289 @@ def megatron_forward_backward(
         forward_only=forward_only,
     )
 
-def get_loss_fn(
-    loss_fn: LossFunction,
-    cfg: Dict[str, Any],
-    global_valid_seqs: torch.Tensor,
-    global_valid_toks: torch.Tensor,
-    ## the following args depend on the batch and are passed in by forward_with_collection_fn
-    data_dict: BatchedDataDict[Any],
-    packed_seq_params: Optional[PackedSeqParams] = None,
-    cp_normalize: bool = True,
-    **unused_kwargs: Any,
-) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
-    """
-    Create a loss collection function for training.
+class LossCollection:
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cfg: Dict[str, Any],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        cp_normalize: bool = True,
+    ):
+        self.loss_fn = loss_fn
+        self.cfg = cfg
+        self.global_valid_seqs = global_valid_seqs
+        self.global_valid_toks = global_valid_toks
+        self.cp_normalize = cp_normalize
     
-    This function wraps a loss function with the necessary context and parameters
-    to compute loss and metrics from model outputs. It handles sequence packing
-    and context parallelism normalization.
-    
-    Args:
-        loss_fn: The base loss function to wrap
-        cfg (dict): Configuration dictionary
-        global_valid_seqs: Global count of valid sequences 
-        global_valid_toks: Global count of valid tokens
-        data_dict: Batched data dictionary
-        packed_seq_params: Parameters for packed sequences (optional)
-        cp_normalize (bool): Whether to normalize by context parallel size
-        **unused_kwargs: Additional unused keyword arguments
+    def __call__(self, data_dict: BatchedDataDict[Any], packed_seq_params: Optional[PackedSeqParams] = None) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
+        """
+        Create a loss collection function for training.
         
-    Returns:
-        Callable: Function that takes output tensor and returns (loss, metrics) tuple
-    """
-    pack_sequences = cfg["sequence_packing"]["enabled"]
+        This function wraps a loss function with the necessary context and parameters
+        to compute loss and metrics from model outputs. It handles sequence packing
+        and context parallelism normalization.
 
-    if pack_sequences and packed_seq_params is not None:
-        # remove padding
-        loss_fn = SequencePackingLossWrapper(
-            loss_fn=loss_fn,
-            cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-            cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-        )
-    
-    loss_fn_wrapped = partial(
-        loss_fn,
-        data=data_dict,
-        global_valid_seqs=global_valid_seqs,
-        global_valid_toks=global_valid_toks,
-        vocab_parallel_rank=get_tensor_model_parallel_rank(),
-        vocab_parallel_group=get_tensor_model_parallel_group(),
-        context_parallel_group=get_context_parallel_group(),
-    )
+        Args:
+            loss_fn: The base loss function to wrap
+            cfg (dict): Configuration dictionary
+            global_valid_seqs: Global count of valid sequences
+            global_valid_toks: Global count of valid tokens
+            data_dict: Batched data dictionary
+            packed_seq_params: Parameters for packed sequences (optional)
+            cp_normalize (bool): Whether to normalize by context parallel size
 
-    if cp_normalize:
-        cp_size = get_context_parallel_world_size()
-        orig_loss_fn_wrapped = loss_fn_wrapped
+        Returns:
+            Callable: Function that takes output tensor and returns (loss, metrics) tuple
+        """
 
-        def _div_by_cp_size(*args, **kwargs):
-            loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
-            return loss / cp_size, metrics
+        pack_sequences = self.cfg["sequence_packing"]["enabled"]
 
-        loss_fn_wrapped = _div_by_cp_size
-    
-    return loss_fn_wrapped
+        loss_fn = self.loss_fn
 
-def get_logprobs_fn(
-    cfg: Dict[str, Any],
-    ## the following args depend on the batch
-    data_dict: BatchedDataDict[Any],
-    input_ids: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    **unused_kwargs: Any,
-) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-    """
-    Create a processor function that computes token log probabilities.
-    
-    This function returns a processor that takes model logits and converts them
-    to token-level log probabilities, handling both packed and unpacked sequences.
-    
-    Args:
-        cfg (dict): Configuration dictionary
-        data_dict: Batched data dictionary containing input sequences
-        input_ids: Processed input token IDs
-        cu_seqlens_padded: Cumulative sequence lengths for packed sequences
-        **unused_kwargs: Additional unused keyword arguments
-        
-    Returns:
-        Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
-    """
-    unpacked_input_ids = data_dict["input_ids"]
-    original_seq_length = unpacked_input_ids.shape[1]
-    
-    def processor_fn_inner(output_tensor):
-        tp_grp = get_tensor_model_parallel_group()
-        tp_rank = get_tensor_model_parallel_rank()
-        logprob_chunk_size = cfg.get("logprob_chunk_size", None)
-        if cfg["sequence_packing"]["enabled"]:
-            token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-                output_tensor,
-                target=input_ids,
-                cu_seqlens_padded=cu_seqlens_padded,
-                unpacked_seqlen=original_seq_length,
-                vocab_start_index=tp_rank * output_tensor.shape[-1],
-                vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                group=tp_grp,
-                inference_only=True,
-                cp_group=get_context_parallel_group(),
-                chunk_size=logprob_chunk_size,
-            )
-        else:
-            token_logprobs = from_parallel_logits_to_logprobs(
-                output_tensor,
-                target=unpacked_input_ids,
-                vocab_start_index=tp_rank * output_tensor.shape[-1],
-                vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                tp_group=tp_grp,
-                inference_only=True,
-                chunk_size=logprob_chunk_size,
+        if pack_sequences and packed_seq_params is not None:
+            # remove padding
+            loss_fn = SequencePackingLossWrapper(
+                loss_fn=loss_fn,
+                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
             )
 
-        # Prepend 0 logprob for first token to maintain same sequence length as input
-        token_logprobs = torch.cat(
-            [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+        loss_fn_wrapped = partial(
+            loss_fn,
+            data=data_dict,
+            global_valid_seqs=self.global_valid_seqs,
+            global_valid_toks=self.global_valid_toks,
+            vocab_parallel_rank=get_tensor_model_parallel_rank(),
+            vocab_parallel_group=get_tensor_model_parallel_group(),
+            context_parallel_group=get_context_parallel_group(),
         )
-        return torch.tensor(0.0, device=token_logprobs.device), {
-            "logprobs": token_logprobs
-        }
-    return processor_fn_inner
 
+        if self.cp_normalize:
+            cp_size = get_context_parallel_world_size()
+            orig_loss_fn_wrapped = loss_fn_wrapped
 
-def get_topk_logits_fn(
-    cfg: Dict[str, Any],
-    k: int,
-    ## arguments that depend on the batch
-    data_dict: BatchedDataDict[Any],
-    cu_seqlens_padded: torch.Tensor,
-    **unused_kwargs: Any,
-) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-    """
-    Create a processor function that computes top-k logits and indices.
-    
-    This function returns a processor that extracts the top-k highest logits
-    and their corresponding vocabulary indices from model outputs. It handles
-    tensor parallelism, context parallelism, and sequence packing.
-    
-    Args:
-        cfg (dict): Configuration dictionary
-        k (int): Number of top logits to extract
-        data_dict: Batched data dictionary
-        cu_seqlens_padded: Cumulative sequence lengths for packed sequences
-        **unused_kwargs: Additional unused keyword arguments
+            def _div_by_cp_size(*args, **kwargs):
+                loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
+                return loss / cp_size, metrics
+
+            loss_fn_wrapped = _div_by_cp_size
+
+        return loss_fn_wrapped
+
+class LogprobsCollection:
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        input_ids: torch.Tensor,
+        cu_seqlens_padded: torch.Tensor,
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """
+        Create a processor function that computes token log probabilities.
+
+        This function returns a processor that takes model logits and converts them
+        to token-level log probabilities, handling both packed and unpacked sequences.
+
+        Args:
+            data_dict: Batched data dictionary containing input sequences
+            input_ids: Processed input token IDs
+            cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+
+        Returns:
+            Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
+        """
+        unpacked_input_ids = data_dict["input_ids"]
+        original_seq_length = unpacked_input_ids.shape[1]
         
-    Returns:
-        Callable: Function that takes output tensor and returns 
-                  (dummy_loss, {"topk_logits": values, "topk_indices": indices})
-    """
-
-    pack = cfg["sequence_packing"]["enabled"]
-    cp_size = cfg["megatron_cfg"]["context_parallel_size"]
-    unpacked_seqlen = data_dict["input_ids"].shape[1]
-    seq_lengths = data_dict["input_lengths"]
-
-    def processor_fn_inner(output_tensor):
-        # Only the last PP stage produces final logits/top-k; earlier stages return empty
-        # if not is_pipeline_last_stage(ignore_virtual=True):
-        # return output_tensor.new_zeros(()), {}
-
-        tp_grp = get_tensor_model_parallel_group()
-        tp_rank = get_tensor_model_parallel_rank()
-        vocab_shard_size = output_tensor.shape[-1]
-        vocab_start_index = tp_rank * vocab_shard_size
-
-        chunk_size = None
-        if "logprob_chunk_size" in cfg:
-            chunk_size = cfg["logprob_chunk_size"]
-
-        topk_vals_local, topk_idx_local = distributed_vocab_topk(
-            output_tensor,
-            k,
-            tp_grp,
-            vocab_start_index=vocab_start_index,
-            vocab_end_index=vocab_start_index + vocab_shard_size,
-            chunk_size=chunk_size,
-        )
-
-        if cfg["megatron_cfg"]["context_parallel_size"] > 1:
-            cp_grp = get_context_parallel_group()
-            if pack:
-                # Per-sequence CP allgather following packed-sequence logic
-                batch_size = data_dict["input_ids"].shape[0]
-                total_packed_len = int(cu_seqlens_padded[-1].item())
-
-                topk_vals_full = torch.zeros(
-                    (1, total_packed_len, k),
-                    dtype=topk_vals_local.dtype,
-                    device=topk_vals_local.device,
+        def processor_fn_inner(output_tensor):
+            tp_grp = get_tensor_model_parallel_group()
+            tp_rank = get_tensor_model_parallel_rank()
+            logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+            if self.cfg["sequence_packing"]["enabled"]:
+                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                    output_tensor,
+                    target=input_ids,
+                    cu_seqlens_padded=cu_seqlens_padded,
+                    unpacked_seqlen=original_seq_length,
+                    vocab_start_index=tp_rank * output_tensor.shape[-1],
+                    vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
+                    group=tp_grp,
+                    inference_only=True,
+                    cp_group=get_context_parallel_group(),
+                    chunk_size=logprob_chunk_size,
                 )
-                topk_idx_full = torch.zeros(
-                    (1, total_packed_len, k),
-                    dtype=topk_idx_local.dtype,
-                    device=topk_idx_local.device,
-                )
-
-                for i in range(batch_size):
-                    start_idx = int(cu_seqlens_padded[i].item())
-                    end_idx = int(cu_seqlens_padded[i + 1].item())
-                    if end_idx > start_idx:
-                        local_vals_slice = topk_vals_local[
-                            :, start_idx // cp_size : end_idx // cp_size, :
-                        ]
-                        local_idx_slice = topk_idx_local[
-                            :, start_idx // cp_size : end_idx // cp_size, :
-                        ]
-                        gathered_vals = allgather_cp_sharded_tensor(
-                            local_vals_slice, cp_grp, seq_dim=1
-                        )
-                        gathered_idx = allgather_cp_sharded_tensor(
-                            local_idx_slice, cp_grp, seq_dim=1
-                        )
-                        # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
-                        # Flatten leading dims and reshape to [1, expected_len, k] to match target.
-                        expected_len = end_idx - start_idx
-                        if (
-                            gathered_vals.dim() == 3
-                            and gathered_vals.shape[1] != expected_len
-                        ):
-                            gathered_vals = gathered_vals.reshape(
-                                1, expected_len, gathered_vals.shape[-1]
-                            )
-                        if (
-                            gathered_idx.dim() == 3
-                            and gathered_idx.shape[1] != expected_len
-                        ):
-                            gathered_idx = gathered_idx.reshape(
-                                1, expected_len, gathered_idx.shape[-1]
-                            )
-                        topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                        topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
             else:
-                # Sequence packing must be enabled when CP > 1
-                raise RuntimeError(
-                    "Context Parallelism (CP>1) requires sequence packing to be enabled."
+                token_logprobs = from_parallel_logits_to_logprobs(
+                    output_tensor,
+                    target=unpacked_input_ids,
+                    vocab_start_index=tp_rank * output_tensor.shape[-1],
+                    vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
+                    tp_group=tp_grp,
+                    inference_only=True,
+                    chunk_size=logprob_chunk_size,
                 )
-        else:
-            topk_vals_full = topk_vals_local
-            topk_idx_full = topk_idx_local
 
-        if pack:
-            batch_size = data_dict["input_ids"].shape[0]
-            out_vals = torch.zeros(
-                (batch_size, unpacked_seqlen, k),
-                dtype=topk_vals_full.dtype,
-                device=topk_vals_full.device,
+            # Prepend 0 logprob for first token to maintain same sequence length as input
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
             )
-            out_idx = torch.zeros(
-                (batch_size, unpacked_seqlen, k),
-                dtype=topk_idx_full.dtype,
-                device=topk_idx_full.device,
+            return torch.tensor(0.0, device=token_logprobs.device), {
+                "logprobs": token_logprobs
+            }
+        return processor_fn_inner
+
+
+class TopkLogitsCollection:
+
+    def __init__(self, cfg: Dict[str, Any], k: int):
+        self.cfg = cfg
+        self.k = k
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        cu_seqlens_padded: torch.Tensor,
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """
+        Create a processor function that computes top-k logits and indices.
+        
+        This function returns a processor that extracts the top-k highest logits
+        and their corresponding vocabulary indices from model outputs. It handles
+        tensor parallelism, context parallelism, and sequence packing.
+        
+        Args:
+            data_dict: Batched data dictionary
+            cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            
+        Returns:
+            Callable: Function that takes output tensor and returns 
+                      (dummy_loss, {"topk_logits": values, "topk_indices": indices})
+        """
+
+        pack = self.cfg["sequence_packing"]["enabled"]
+        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+        unpacked_seqlen = data_dict["input_ids"].shape[1]
+        seq_lengths = data_dict["input_lengths"]
+
+        def processor_fn_inner(output_tensor):
+            # Only the last PP stage produces final logits/top-k; earlier stages return empty
+            # if not is_pipeline_last_stage(ignore_virtual=True):
+            # return output_tensor.new_zeros(()), {}
+
+            tp_grp = get_tensor_model_parallel_group()
+            tp_rank = get_tensor_model_parallel_rank()
+            vocab_shard_size = output_tensor.shape[-1]
+            vocab_start_index = tp_rank * vocab_shard_size
+
+            chunk_size = None
+            if "logprob_chunk_size" in self.cfg:
+                chunk_size = self.cfg["logprob_chunk_size"]
+
+            topk_vals_local, topk_idx_local = distributed_vocab_topk(
+                output_tensor,
+                self.k,
+                tp_grp,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_start_index + vocab_shard_size,
+                chunk_size=chunk_size,
             )
-            for i in range(batch_size):
-                seq_len = int(seq_lengths[i].item())
-                start_idx = int(cu_seqlens_padded[i].item())
-                if seq_len > 0:
-                    out_vals[i, :seq_len, :] = topk_vals_full[
-                        0, start_idx : start_idx + seq_len, :
-                    ]
-                    out_idx[i, :seq_len, :] = topk_idx_full[
-                        0, start_idx : start_idx + seq_len, :
-                    ]
-            return output_tensor.new_zeros(()), {
-                "topk_logits": out_vals,
-                "topk_indices": out_idx,
-            }
-        else:
-            return output_tensor.new_zeros(()), {
-                "topk_logits": topk_vals_full,
-                "topk_indices": topk_idx_full,
-            }
-    return processor_fn_inner
+
+            if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
+                cp_grp = get_context_parallel_group()
+                if pack:
+                    # Per-sequence CP allgather following packed-sequence logic
+                    batch_size = data_dict["input_ids"].shape[0]
+                    total_packed_len = int(cu_seqlens_padded[-1].item())
+
+                    topk_vals_full = torch.zeros(
+                        (1, total_packed_len, self.k),
+                        dtype=topk_vals_local.dtype,
+                        device=topk_vals_local.device,
+                    )
+                    topk_idx_full = torch.zeros(
+                        (1, total_packed_len, self.k),
+                        dtype=topk_idx_local.dtype,
+                        device=topk_idx_local.device,
+                    )
+
+                    for i in range(batch_size):
+                        start_idx = int(cu_seqlens_padded[i].item())
+                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        if end_idx > start_idx:
+                            local_vals_slice = topk_vals_local[
+                                :, start_idx // cp_size : end_idx // cp_size, :
+                            ]
+                            local_idx_slice = topk_idx_local[
+                                :, start_idx // cp_size : end_idx // cp_size, :
+                            ]
+                            gathered_vals = allgather_cp_sharded_tensor(
+                                local_vals_slice, cp_grp, seq_dim=1
+                            )
+                            gathered_idx = allgather_cp_sharded_tensor(
+                                local_idx_slice, cp_grp, seq_dim=1
+                            )
+                            # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
+                            # Flatten leading dims and reshape to [1, expected_len, k] to match target.
+                            expected_len = end_idx - start_idx
+                            if (
+                                gathered_vals.dim() == 3
+                                and gathered_vals.shape[1] != expected_len
+                            ):
+                                gathered_vals = gathered_vals.reshape(
+                                    1, expected_len, gathered_vals.shape[-1]
+                                )
+                            if (
+                                gathered_idx.dim() == 3
+                                and gathered_idx.shape[1] != expected_len
+                            ):
+                                gathered_idx = gathered_idx.reshape(
+                                    1, expected_len, gathered_idx.shape[-1]
+                                )
+                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
+                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                else:
+                    # Sequence packing must be enabled when CP > 1
+                    raise RuntimeError(
+                        "Context Parallelism (CP>1) requires sequence packing to be enabled."
+                    )
+            else:
+                topk_vals_full = topk_vals_local
+                topk_idx_full = topk_idx_local
+
+            if pack:
+                batch_size = data_dict["input_ids"].shape[0]
+                out_vals = torch.zeros(
+                    (batch_size, unpacked_seqlen, self.k),
+                    dtype=topk_vals_full.dtype,
+                    device=topk_vals_full.device,
+                )
+                out_idx = torch.zeros(
+                    (batch_size, unpacked_seqlen, self.k),
+                    dtype=topk_idx_full.dtype,
+                    device=topk_idx_full.device,
+                )
+                for i in range(batch_size):
+                    seq_len = int(seq_lengths[i].item())
+                    start_idx = int(cu_seqlens_padded[i].item())
+                    if seq_len > 0:
+                        out_vals[i, :seq_len, :] = topk_vals_full[
+                            0, start_idx : start_idx + seq_len, :
+                        ]
+                        out_idx[i, :seq_len, :] = topk_idx_full[
+                            0, start_idx : start_idx + seq_len, :
+                        ]
+                return output_tensor.new_zeros(()), {
+                    "topk_logits": out_vals,
+                    "topk_indices": out_idx,
+                }
+            else:
+                return output_tensor.new_zeros(()), {
+                    "topk_logits": topk_vals_full,
+                    "topk_indices": topk_idx_full,
+                }
+        return processor_fn_inner

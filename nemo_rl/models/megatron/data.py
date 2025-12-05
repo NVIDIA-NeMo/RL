@@ -125,7 +125,6 @@ def process_microbatch(
         attention_mask,
         position_ids,
         packed_seq_params,
-        cu_seqlens,
         cu_seqlens_padded,
     )
 

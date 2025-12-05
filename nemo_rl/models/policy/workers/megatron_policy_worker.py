@@ -101,9 +101,9 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
-    get_loss_fn,
-    get_logprobs_fn,
-    get_topk_logits_fn,
+    LossCollection,
+    LogprobsCollection,
+    TopkLogitsCollection,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -332,8 +332,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
                     seq_dim_size,
                 ) = get_microbatch_iterator(batch, self.cfg, mbs)
 
-                loss_fn_wrapped = partial(
-                    get_loss_fn,
+                loss_fn_wrapped = LossCollection(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                     global_valid_seqs=global_valid_seqs,
@@ -508,7 +507,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
-            collection_fn=partial(get_logprobs_fn, cfg=self.cfg),
+            collection_fn=LogprobsCollection(cfg=self.cfg),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
         )
@@ -633,11 +632,7 @@ class MegatronPolicyWorker(BasePolicyWorker):
             mbs=mbs,
             pad_full_seq_to=pad_full_seq_to,
             num_microbatches=data_iterator_len,
-            collection_fn=partial(
-                get_topk_logits_fn,
-                cfg=self.cfg,
-                k=k,
-            ),
+            collection_fn=TopkLogitsCollection(cfg=self.cfg, k=k),
             forward_only=True,
         )
 
