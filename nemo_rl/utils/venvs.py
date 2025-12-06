@@ -93,6 +93,13 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
+    # TODO this is temporarily needed b/c container has mcore before fix to build-meta was introduced
+    subprocess.run(
+        "uv pip install setuptools setuptools_scm torch==2.9.0 --torch-backend=cu129".split(),
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
+
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
