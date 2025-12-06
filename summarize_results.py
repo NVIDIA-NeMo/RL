@@ -844,9 +844,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
     sorted_models = sorted(model_groups.keys())
     
     # Print header
-    print(f"\n{BOLD}{'='*245}{RESET}")
+    print(f"\n{BOLD}{'='*265}{RESET}")
     print(f"{BOLD}GRPO Benchmark Results - GB200 (Grouped by Model){RESET}")
-    print(f"{'='*245}")
+    print(f"{'='*265}")
     
     if detailed:
         # Detailed view with timing breakdown
@@ -874,7 +874,7 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             f"{'R.GBS':>6} {'T.GBS':>6} {'SeqLen':>6} "
             f"{'G.TP':>4} {'G.PP':>4} {'G.DP':>4} "
             f"{'T.TP':>4} {'T.CP':>4} {'T.EP':>4} {'T.PP':>4} {'T.DP':>4} "
-            f"{'Step(s)':>8} "
+            f"{'Step(s)':>8} {'ExpGen(s)':>10} {'Train(s)':>9} "
             f"{'E2ETok/GPU':>11} {'GenTok/GPU':>11} {'TrnTok/GPU':>11} {'PolTot/GPU':>11} "
             f"{'MFU%':>6} "
             f"{'TFLOPs':>7} "
@@ -893,9 +893,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         model_color = model_colors[model_idx % len(model_colors)]
         
         # Print model group header
-        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (225 - len(model) - 15)}┐{RESET}")
+        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (245 - len(model) - 15)}┐{RESET}")
         print(f"{DIM}{header}{RESET}")
-        print(f"{DIM}{'-' * 245}{RESET}")
+        print(f"{DIM}{'-' * 265}{RESET}")
         
         for r in model_results:
             model_name = r.get('model', 'Unknown')[:13]
@@ -965,6 +965,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                 train_tok_gpu = r.get('policy_training_tokens_per_sec_per_gpu', 0)  # Actual training (policy training)
                 pol_total_gpu = r.get('training_tokens_per_sec_per_gpu', 0)  # Policy total (training worker group)
                 
+                # Get timing latency metrics
+                gen_time = r.get('generation_time', 0)  # timing/train/generation (or exposed_generation for async)
+                policy_train_time = r.get('policy_training_time', 0)  # timing/train/policy_training
+                
                 row = (
                     f"{model_name:<15} "
                     f"{type_str:<5} "
@@ -982,6 +986,8 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{r.get('t_pp', 1):>4} "
                     f"{r.get('t_dp', 1):>4} "
                     f"{step_time:>8.2f} "
+                    f"{gen_time:>10.2f} "
+                    f"{policy_train_time:>9.2f} "
                     f"{tokens_sec_gpu:>11,.0f} "
                     f"{gen_tok_gpu:>11,.0f} "
                     f"{train_tok_gpu:>11,.0f} "
@@ -1007,10 +1013,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         if model_completed:
             best_tok = max(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed)
             avg_tok = sum(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed) / len(model_completed)
-            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 185}┘{RESET}")
+            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 205}┘{RESET}")
     
     # Overall summary
-    print(f"\n{'='*245}")
+    print(f"\n{'='*265}")
     print(f"\n📊 {BOLD}Overall Summary{RESET}")
     print(f"   Total runs: {total_runs}")
     print(f"   Models: {len(sorted_models)}")
@@ -1022,10 +1028,16 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         avg_mfu = sum(r.get('gpu_util_mfu', 0) for r in all_completed) / len(all_completed)
         avg_mfu_pct = avg_mfu * 100 if avg_mfu < 1 else avg_mfu
         
+        # Calculate average latency metrics
+        avg_step_time = sum(r.get('step_time_sec', 0) for r in all_completed) / len(all_completed)
+        avg_gen_time = sum(r.get('generation_time', 0) for r in all_completed) / len(all_completed)
+        avg_train_time = sum(r.get('policy_training_time', 0) for r in all_completed) / len(all_completed)
+        
         print(f"   Completed runs: {len(all_completed)}")
         print(f"   {GREEN}Best Tokens/sec/GPU: {max_tokens_gpu:,.0f}{RESET} ({best_run.get('model', 'Unknown')})")
         print(f"   Avg Tokens/sec/GPU: {avg_tokens_gpu:,.0f}")
         print(f"   Avg MFU: {avg_mfu_pct:.2f}%")
+        print(f"   Avg Latency: Step={avg_step_time:.2f}s | ExpGen={avg_gen_time:.2f}s | Train={avg_train_time:.2f}s")
 
 
 def save_csv(results: list, output_path: str):
