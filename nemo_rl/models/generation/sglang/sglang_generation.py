@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import os
 from collections import defaultdict
 from typing import (
@@ -42,6 +43,8 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 # See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
 TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
 TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
+
+logger = logging.getLogger(__name__)
 
 
 class SGLangGeneration(GenerationInterface):
@@ -82,7 +85,7 @@ class SGLangGeneration(GenerationInterface):
             )
         
         if total_gpus % gpus_per_server != 0:
-            print(
+            logger.warning(
                 f"[WARNING] Total GPUs ({total_gpus}) is not divisible by GPUs per server ({gpus_per_server}). "
                 f"Will use {num_servers} servers, leaving {total_gpus % gpus_per_server} GPUs unused."
             )
@@ -341,7 +344,7 @@ class SGLangGeneration(GenerationInterface):
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except Exception as e:
-            print(f"Error during SGLang policy shutdown: {e}")
+            logger.error(f"Error during SGLang policy shutdown: {e}")
             return False
 
     def __del__(self) -> None:
@@ -371,10 +374,10 @@ class SGLangGeneration(GenerationInterface):
             results = [r for r in results if r is not None]
             success = all(result for result in results) if results else True
             if success:
-                print("[sglang refit] All SGLang server caches flushed successfully", flush=True)
+                logger.info("[sglang refit] All SGLang server caches flushed successfully")
             else:
-                print("[sglang refit] WARNING - Some SGLang server caches failed to flush", flush=True)
+                logger.warning("[sglang refit] WARNING - Some SGLang server caches failed to flush")
             return success
         except Exception as e:
-            print(f"[sglang refit] Error flushing SGLang caches: {e}", flush=True)
+            logger.error(f"[sglang refit] Error flushing SGLang caches: {e}")
             return False

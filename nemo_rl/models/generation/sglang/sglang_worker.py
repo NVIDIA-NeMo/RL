@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import logging
 import os
 import sys
 from typing import Any, Optional, cast
@@ -42,6 +43,8 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+
+logger = logging.getLogger(__name__)
 
 
 @ray.remote(
@@ -157,7 +160,7 @@ class SGLangGenerationWorker:
         global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
         
         
-        print(
+        logger.info(
             f"[SGLang Server] Rank {self.global_rank}: "
             f"base_gpu_id={base_gpu_id}, tp_size={tp_size}, "
             f"bundle_indices={bundle_indices}, global_cvd={global_cvd}"
@@ -203,7 +206,7 @@ class SGLangGenerationWorker:
         self.server_args = server_args
         self.base_url = f"http://{node_ip}:{free_port}"
         
-        print(f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}")
+        logger.info(f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}")
         
         self.session = None
         self.connector = None
@@ -236,38 +239,34 @@ class SGLangGenerationWorker:
                 response = requests.get(url, timeout=10)
                 if response.status_code == 200:
                     if attempt > 0:
-                        print(
+                        logger.info(
                             f"[SGLang Worker] Rank {self.global_rank} Cache flushed successfully "
-                            f"(attempt {attempt + 1})",
-                            flush=True
+                            f"(attempt {attempt + 1})"
                         )
                     return True
             except requests.exceptions.ConnectionError:
                 # Server might not be ready yet - only retry for first few attempts
                 if attempt >= connection_retry_limit:
-                    print(
+                    logger.warning(
                         f"[SGLang Worker] Rank {self.global_rank} Connection failed after "
-                        f"{connection_retry_limit} attempts",
-                        flush=True
+                        f"{connection_retry_limit} attempts"
                     )
                     return False
             except Exception as e:
                 # For other errors, log and retry (except on last attempt)
                 if attempt == max_attempts - 1:
-                    print(
+                    logger.error(
                         f"[SGLang Worker] Rank {self.global_rank} Failed to flush cache after "
-                        f"{max_attempts} attempts: {e}",
-                        flush=True
+                        f"{max_attempts} attempts: {e}"
                     )
                     return False
             
             time.sleep(1)
         
         # All attempts exhausted without success
-        print(
+        logger.error(
             f"[SGLang Worker] Rank {self.global_rank} Timeout: Cache flush failed after "
-            f"{max_attempts} attempts. Server may have pending requests.",
-            flush=True
+            f"{max_attempts} attempts. Server may have pending requests."
         )
         return False
 
@@ -357,7 +356,7 @@ class SGLangGenerationWorker:
             if base_max_tokens > max_allowed_new_tokens:
                 final_max_tokens = max_allowed_new_tokens
                 if sample_index == 0:
-                    print(
+                    logger.warning(
                         f"[SGLang Worker] Rank {self.global_rank} Warning: "
                         f"Sample {sample_index} input length ({input_len}) + max_new_tokens ({base_max_tokens}) "
                         f"would exceed context_length ({context_length}). "
@@ -433,7 +432,7 @@ class SGLangGenerationWorker:
                 response.raise_for_status()
                 result = await response.json()
         except Exception as e:
-            print(f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}")
+            logger.error(f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}")
             raise
         
         # Extract generated tokens and logprobs
@@ -475,7 +474,7 @@ class SGLangGenerationWorker:
             results[idx] = value
             count += 1
             if count % 50 == 0 or count == len(tasks):
-                print(f"[SGLang Worker] Rank {self.global_rank} Completed {count}/{len(tasks)} tasks")
+                logger.debug(f"[SGLang Worker] Rank {self.global_rank} Completed {count}/{len(tasks)} tasks")
 
         return results
 
@@ -502,7 +501,7 @@ class SGLangGenerationWorker:
                 try:
                     response = session.get(f"{self.base_url}/health_generate", headers=headers, timeout=10)
                     if response.status_code == 200:
-                        print(f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}")
+                        logger.info(f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}")
                         break
                 except requests.RequestException:
                     pass
@@ -557,7 +556,7 @@ class SGLangGenerationWorker:
         # Original input length with padding
         padded_input_length = input_ids.size(1)
         
-        print(f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}")
+        logger.debug(f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}")
         
         if batch_size == 0:
             raise ValueError("Empty batch received")
@@ -651,7 +650,7 @@ class SGLangGenerationWorker:
         logprobs = torch.stack(logprobs_list)
         generation_lengths = torch.tensor(generation_lengths_list, dtype=torch.long)
         unpadded_sequence_lengths = torch.tensor(unpadded_sequence_lengths_list, dtype=torch.long)
-        print(f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)")
+        logger.debug(f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)")
         return BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": output_ids,
@@ -679,9 +678,9 @@ class SGLangGenerationWorker:
             if hasattr(self, "async_loop_thread"):
                 try:
                     self.async_loop_thread.shutdown()
-                    print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                    logger.info(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
                 except Exception as e:
-                    print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
+                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
             return True
         
         try:
@@ -693,22 +692,22 @@ class SGLangGenerationWorker:
                             await self.connector.close()
                     
                     self.async_loop_thread.run(close_session())
-                    print(f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed.")
+                    logger.info(f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed.")
                 except Exception as e:
-                    print(f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}")
+                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}")
             
             # Shutdown async loop thread after session cleanup
             if hasattr(self, "async_loop_thread"):
                 try:
                     self.async_loop_thread.shutdown()
-                    print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                    logger.info(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
                 except Exception as e:
-                    print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
+                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
             
             if not hasattr(self, "server_process") or self.server_process is None:
                 return True
             
-            print(
+            logger.info(
                 f"[SGLang Worker] Rank {self.global_rank} Shutting down server at {self.base_url}..."
             )
             
@@ -723,7 +722,7 @@ class SGLangGenerationWorker:
             return True
             
         except Exception as e:
-            print(
+            logger.error(
                 f"[SGLang Worker] Rank {self.global_rank} Error during shutdown: {e}"
             )
             return False
