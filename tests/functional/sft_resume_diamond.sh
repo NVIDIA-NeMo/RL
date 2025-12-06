@@ -61,3 +61,5 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_4s
 #uv run tests/check_metrics.py $JSON_METRICS \
 #    'max(data["train/token_mult_prob_error"]) < 1.05'
 
+
+# TODO: metric check, first need smoke test to pass
