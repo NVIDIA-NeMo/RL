@@ -20,6 +20,7 @@ PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
 time uv run --no-sync bash ./tests/functional/sft.sh
+time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
