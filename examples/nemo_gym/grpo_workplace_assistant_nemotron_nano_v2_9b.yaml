@@ -1,12 +1,12 @@
 grpo:
   max_num_epochs: 1
-  num_prompts_per_step: 4
+  num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
-  max_num_steps: 10
+  max_num_steps: 36 
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 5
+  val_period: 6
   val_at_start: true
   overlong_filtering: false
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
@@ -48,7 +48,7 @@ checkpointing:
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 1  # Saves a checkpoint every 1 step (i.e., after first step and every subsequent step)
+  save_period: 6  # Save checkpoint every 6 steps (aligned with val_period)
   checkpoint_must_save_by: null
 
 policy:
@@ -264,6 +264,4 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
-
-
+  num_nodes: 1  # Single node by default; set to 2+ for multi-node training
