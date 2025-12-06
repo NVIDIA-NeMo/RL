@@ -51,7 +51,7 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[manifest.dependency-metadata]]
 name = "mamba-ssm"
-version = "2.2.4"
+version = "2.2.6"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[package]]
@@ -2441,8 +2441,8 @@ wheels = [
 
 [[package]]
 name = "mamba-ssm"
-version = "2.2.4"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4#2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+version = "2.2.6"
+source = { git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06#6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" }
 dependencies = [
     { name = "causal-conv1d" },
     { name = "ninja" },
@@ -2625,7 +2625,7 @@ requires-dist = [
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.3" },
     { name = "datasets" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
-    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
     { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-LM-workspace" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
@@ -3368,8 +3368,8 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.8.1" },
     { name = "hydra-core" },
-    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
-    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
+    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },

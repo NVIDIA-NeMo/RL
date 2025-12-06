@@ -166,7 +166,7 @@ triton = [
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.3" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" }
 
 [tool.uv.workspace]
 members = [
@@ -244,7 +244,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "2.2.4"
+version = "2.2.6"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]
