@@ -81,6 +81,8 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    group_ids: list[str | None] | None = None,
+    last_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -92,25 +94,58 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    group_ids: list[str | None]   If provided (and not all None), then will use this to define groups
+                                  instead of `prompts`.
+    last_mask: tensor (b,)        Must be provided if `group_ids` is provided. `last_mask[i]` is True
+                                  element `i` is the last transition of a trajectory.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
-    unique_prompts = torch.unique(prompts, dim=0)
+    from typing import cast
+
+    use_group_ids = group_ids is not None and not any(
+        group_id is None for group_id in group_ids
+    )
+    if use_group_ids:
+        unique_groups: list[str] | torch.Tensor = list(set(cast(list[str], group_ids)))
+        num_groups = len(unique_groups)
+        assert last_mask is not None, (
+            "`last_mask` must be provided if `group_ids` is provided"
+        )
+    else:
+        unique_groups = torch.unique(prompts, dim=0)
+        num_groups = len(unique_groups)
+
+    if last_mask is None:
+        last_mask = torch.ones_like(rewards, device=prompts.device, dtype=torch.bool)
+    last_mask = last_mask.to(prompts.device)
 
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
-    std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
     else:
         reward_device = torch.device(f"cuda:{device_ordinal}")
 
-    for i in range(len(unique_prompts)):
-        is_matching_prompt = (prompts == unique_prompts[i]).all(1)
-        prompt_idx = torch.arange(len(prompts), device=reward_device)[
+    for i in range(num_groups):
+        if use_group_ids:
+            is_matching_prompt = torch.tensor(
+                [gid == unique_groups[i] for gid in cast(list[str], group_ids)],
+                device=prompts.device,
+            )
+        else:
+            is_matching_prompt = (prompts == unique_groups[i]).all(1)
+        # This is used for *assigning* baseline/std to rewards and covers all transitions in
+        # this group.
+        all_prompt_idx = torch.arange(len(prompts), device=reward_device)[
             is_matching_prompt
+        ]
+        # This used for *calculating* baseline/std and covers only terminal transitions in
+        # this group.
+        prompt_idx = torch.arange(len(prompts), device=reward_device)[
+            is_matching_prompt & last_mask
         ]
 
         if leave_one_out_baseline:
@@ -123,7 +158,7 @@ def calculate_baseline_and_std_per_prompt(
         if valid_mask[prompt_idx].sum() <= 1:
             # Ignore sample: there are no valid responses, so set baseline equal to reward
             # to ignore it in the loss computation
-            baseline[prompt_idx] = rewards[prompt_idx]
+            baseline[all_prompt_idx] = rewards[all_prompt_idx]
         else:
             num_valid = valid_mask[prompt_idx].float().sum() - int(
                 leave_one_out_baseline
@@ -142,18 +177,61 @@ def calculate_baseline_and_std_per_prompt(
                 / num_valid
             )
 
-            baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
-            std[prompt_idx] = (
-                (
-                    (prompt_baseline_square - prompt_baseline.square())
-                    * (num_valid / (num_valid - 1))
-                )
-                .sqrt()
-                .nan_to_num(0)
-            )
+            # Here we have a bit of a hack that needs to be made more rigorous.
+            # In the case that prompt_idx is a subset of all_prompt_idx, we need to
+            # assign values to the extra indices. This is non-trivial if LOO is used,
+            # since e.g. prompt_baseline isn't constant. We assume that tensors look like:
+            # all_prompt_idx: [2, 3, 5, 6]
+            # prompt_idx:     [   3,    6]
+            # In this case, element 2 should inherit element 3's value, etc.
+            # Concretely, we are assuming:
+            # 1. prompt_idx is sorted (currently guaranteed by arange above)
+            # 2. an entry of all_prompt_idx should be "rounded up" to the next-highest (or equal)
+            #    entry of prompt_idx. This is currently guaranteed by the transitions coming in
+            #    ordered.
+            idx_map = torch.searchsorted(prompt_idx, all_prompt_idx)
+            expanded_prompt_baseline = prompt_baseline[idx_map]
+            expanded_prompt_baseline_square = prompt_baseline_square[idx_map]
 
+            baseline[all_prompt_idx] = expanded_prompt_baseline
+            sq_baseline[all_prompt_idx] = expanded_prompt_baseline_square
+
+    std = (sq_baseline - baseline.square()).sqrt().nan_to_num(0)
     return baseline, std
+
+
+def compute_grpo_advantages(
+    rewards: torch.Tensor,
+    baseline: torch.Tensor,
+    std: torch.Tensor,
+    normalize_rewards: bool,
+    discount_factor: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute GRPO advantages from rewards, baseline, and std.
+
+    Args:
+        rewards: tensor (b,)            Rewards for each sample
+        baseline: tensor (b,)           Baseline for each sample
+        std: tensor (b,)                Standard deviation for each group
+        normalize_rewards: bool         Whether to normalize by std
+        discount_factor: tensor (b,)    Optional discount factor per sample
+
+    Returns:
+        tensor (b, 1) of advantages
+    """
+    advantages = (rewards - baseline).unsqueeze(-1)
+
+    if normalize_rewards:
+        # don't sharpen the ones with no variation
+        zero_std_mask = std > 0
+        advantages[zero_std_mask] = (
+            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+        )
+
+    if discount_factor is not None:
+        advantages = advantages * discount_factor.unsqueeze(-1)
+
+    return advantages
 
 
 def surpress_user_warnings(f):  # type: ignore
