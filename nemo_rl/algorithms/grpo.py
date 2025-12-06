@@ -1006,7 +1006,11 @@ def refit_policy_generation(
             if isinstance(policy_generation, SGLangGeneration):
                 sglang_url_to_gpu_uuids = policy_generation.get_sglang_url_to_gpu_uuids()
                 # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()                
+                flush_success = policy_generation.invalidate_kv_cache()
+                if not flush_success:
+                    print(
+                        "SGLang KV cache invalidation failed before weight update. "
+                    )
                 futures_train = policy.stream_weights_via_http(
                     sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
                 )

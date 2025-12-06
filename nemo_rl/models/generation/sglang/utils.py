@@ -58,6 +58,6 @@ class AsyncLoopThread:
         if self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout=2.0)
-        if self.loop.is_running():
+        if not self.loop.is_closed():
             self.loop.close()
 

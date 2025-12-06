@@ -490,10 +490,17 @@ class SGLangGenerationWorker:
             "Content-Type": "application/json; charset=utf-8",
         }
 
+        max_wait_time = 300  # 5 minutes timeout
+        start_time = time.time()
         with requests.Session() as session:
             while True:
+                if time.time() - start_time > max_wait_time:
+                    kill_process_tree(p.pid)
+                    raise TimeoutError(
+                        f"[SGLang Server] Rank {self.global_rank} Server failed to start within {max_wait_time}s"
+                    )
                 try:
-                    response = session.get(f"{self.base_url}/health_generate", headers=headers)
+                    response = session.get(f"{self.base_url}/health_generate", headers=headers, timeout=10)
                     if response.status_code == 200:
                         print(f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}")
                         break
@@ -501,7 +508,7 @@ class SGLangGenerationWorker:
                     pass
 
                 if not p.is_alive():
-                    raise Exception(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
+                    raise RuntimeError(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
 
                 time.sleep(2)
         return p
@@ -668,14 +675,13 @@ class SGLangGenerationWorker:
         Returns:
             bool: True if shutdown was successful, False otherwise
         """
-        if hasattr(self, "async_loop_thread"):
-            try:
-                self.async_loop_thread.shutdown()
-                print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
-            except Exception as e:
-                print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
-        
         if not self.is_model_owner:
+            if hasattr(self, "async_loop_thread"):
+                try:
+                    self.async_loop_thread.shutdown()
+                    print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                except Exception as e:
+                    print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
             return True
         
         try:
@@ -690,6 +696,14 @@ class SGLangGenerationWorker:
                     print(f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed.")
                 except Exception as e:
                     print(f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}")
+            
+            # Shutdown async loop thread after session cleanup
+            if hasattr(self, "async_loop_thread"):
+                try:
+                    self.async_loop_thread.shutdown()
+                    print(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                except Exception as e:
+                    print(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
             
             if not hasattr(self, "server_process") or self.server_process is None:
                 return True
@@ -729,6 +743,6 @@ class SGLangGenerationWorker:
         headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
-        response = requests.post(url, json=payload or {}, headers=headers)
+        response = requests.post(url, json=payload or {}, headers=headers, timeout=60)
         response.raise_for_status()
         return response.json()
