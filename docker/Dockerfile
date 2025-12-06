@@ -77,6 +77,7 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 ENV CAUSAL_CONV1D_FORCE_BUILD="TRUE"
+ENV MAMBA_FORCE_BUILD="TRUE"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
