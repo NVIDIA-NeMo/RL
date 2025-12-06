@@ -41,7 +41,9 @@ echo "  Vllm Wheel location: $VLLM_PRECOMPILED_WHEEL_LOCATION"
 
 # Clone the repository
 echo "Cloning repository..."
-git clone "$GIT_URL" "$BUILD_DIR"
+# When running inside Docker with --mount=type=ssh, the known_hosts file is empty.
+# Skip host key verification for internal builds (only applies to SSH URLs).
+GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" git clone "$GIT_URL" "$BUILD_DIR"
 cd "$BUILD_DIR"
 git checkout "$GIT_REF"
 
