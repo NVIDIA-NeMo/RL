@@ -122,11 +122,24 @@ Depending on your data shape, you may want to change these values."""
                 nemo_gym_result = await task
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                # Check if this result contains transitions
+                contains_transitions = nemo_gym_result["response"].get(
+                    "contains_transitions", False
                 )
-
-            nemo_rl_results.append(nemo_rl_result)
+                if contains_transitions:
+                    # Postprocess as transitions - expands to multiple training samples
+                    nemo_rl_result_list = (
+                        self._postprocess_nemo_gym_transitions_to_nemo_rl_results(
+                            nemo_gym_result, tokenizer
+                        )
+                    )
+                    nemo_rl_results.extend(nemo_rl_result_list)
+                else:
+                    # Standard single-trajectory postprocessing
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_result, tokenizer
+                    )
+                    nemo_rl_results.append(nemo_rl_result)
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
@@ -196,6 +209,98 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
+
+    def _postprocess_nemo_gym_transition_to_nemo_rl_result(
+        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+    ) -> dict:
+        """Postprocess a single transition to NeMo RL format.
+
+        When operating on transitions, we don't guarantee monotonicity, which _postprocess_nemo_gym_to_nemo_rl_result
+        requires. Without monotonicity, it becomes trickier to split up token IDs into messages, although
+        it would still be possible to iterate through messages in *reverse* order. But really, we only need
+        to separate the last (trainable) assistant message from the rest of the (untrainable) tokens. This
+        function puts all those untrainable tokens into a single user message.
+        """
+        nemo_rl_message_log = []
+        for output_item_dict in reversed(nemo_gym_result["response"]["output"]):
+            # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
+            if "generation_token_ids" not in output_item_dict:
+                continue
+
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(output_item_dict["prompt_token_ids"]),
+                }
+            )
+            nemo_rl_message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                    "generation_logprobs": torch.tensor(
+                        output_item_dict["generation_log_probs"]
+                    ),
+                }
+            )
+
+            # We pop to remove larger tensors from logging.
+            output_item_dict["prompt_str"] = tokenizer.decode(
+                output_item_dict.pop("prompt_token_ids")
+            )
+            output_item_dict["generation_str"] = tokenizer.decode(
+                output_item_dict.pop("generation_token_ids")
+            )
+            output_item_dict.pop("generation_log_probs")
+
+            break
+
+        return {
+            "message_log": nemo_rl_message_log,
+            "input_message_log": nemo_rl_message_log[:1],
+            "full_result": nemo_gym_result,
+        }
+
+    def _postprocess_nemo_gym_transitions_to_nemo_rl_results(
+        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+    ) -> list[dict]:
+        """Postprocess a list of transitions to NeMo RL format.
+
+        Should be called if nemo_gym_result contains a list of transitions,
+        not one monotonic message history.
+        """
+        transitions = nemo_gym_result["response"]["output"]
+        total_length = len(transitions)
+
+        output: list[dict] = []
+
+        for timestep, transition in enumerate(transitions, start=1):
+            # Match the data structure expected by _postprocess_nemo_gym_transition_to_nemo_rl_result,
+            # while preserving as much of the original nemo_gym_result as possible.
+            # NOTE: This is where we broadcast the reward to all transitions. In particular,
+            # we are assuming that the rewards are assigned per-trajectory (well, it's
+            # really an assumption coming from NeMo-Gym).
+            # NOTE: deepcopy was too expensive, so do it like this.
+            wrapped_transition = nemo_gym_result | {
+                "response": nemo_gym_result["response"] | {"output": transition}
+            }
+            output.append(
+                {
+                    **self._postprocess_nemo_gym_transition_to_nemo_rl_result(
+                        wrapped_transition, tokenizer
+                    ),
+                    "metadata": {
+                        "contains_transitions": True,
+                        "timestep": timestep,
+                        "trajectory_length": total_length,
+                        "is_last": timestep == total_length,
+                        "group_id": wrapped_transition["response"]["group_id"],
+                    },
+                }
+            )
+
+        return output
 
     def shutdown(self) -> None:
         self.rh.shutdown()
