@@ -18,7 +18,10 @@ import gc
 import threading
 import time
 import uuid
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import GuidedDecodingParams
 
 import ray
 import torch
@@ -31,6 +34,7 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    GuidedDecodingConfig,
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
@@ -607,12 +611,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
@@ -704,6 +710,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
                 max_new_tokens=allowed_new_tokens,
+                guided_decoding_params=self._get_vllm_guided_decoding_params(
+                    guided_decoding_config
+                ),
             )
 
             request_id = str(uuid.uuid4())
@@ -824,13 +833,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 raise e
 
     async def generate_text_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_params: Optional["GuidedDecodingParams"] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate text responses asynchronously, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict containing prompts with text strings
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_params: Guided decoding parameters for vLLM, None to disable guided decoding.
 
         Yields:
             Tuple of (original_index, BatchedDataDict containing single text response)
@@ -877,6 +890,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 stop_token_ids=self.cfg["stop_token_ids"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
+                guided_decoding=guided_decoding_params,
             )
 
             request_id = str(uuid.uuid4())

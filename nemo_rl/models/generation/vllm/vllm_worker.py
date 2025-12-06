@@ -16,7 +16,10 @@ import copy
 import gc
 import os
 import sys
-from typing import Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import GuidedDecodingParams
 
 import ray
 import torch
@@ -26,6 +29,7 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    GuidedDecodingConfig,
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -341,6 +345,31 @@ class BaseVllmGenerationWorker:
         """Check if the worker is alive."""
         return True
 
+    def _get_vllm_guided_decoding_params(
+        self, guided_decoding_config: Optional[GuidedDecodingConfig]
+    ) -> Optional["GuidedDecodingParams"]:
+        """Get the guided decoding parameters for vLLM."""
+        from vllm.sampling_params import GuidedDecodingParams
+
+        if guided_decoding_config is None:
+            return None
+
+        match guided_decoding_config["mode"]:
+            case "json":
+                return GuidedDecodingParams(json=guided_decoding_config["json"])
+            case "regex":
+                return GuidedDecodingParams(regex=guided_decoding_config["regex"])
+            case "choice":
+                return GuidedDecodingParams(choice=guided_decoding_config["choice"])
+            case "grammar":
+                return GuidedDecodingParams(grammar=guided_decoding_config["grammar"])
+            case "json_object":
+                return GuidedDecodingParams(json_object=True)
+            case _:
+                raise ValueError(
+                    f"Unsupported guided decoding mode: {guided_decoding_config['mode']}"
+                )
+
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
 
@@ -360,6 +389,7 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        guided_decoding_params: Optional["GuidedDecodingParams"] = None,
     ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
@@ -379,6 +409,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            guided_decoding=guided_decoding_params,
         )
 
     def start_gpu_profiling(self) -> None:
@@ -427,13 +458,17 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
@@ -461,6 +496,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            guided_decoding_params=self._get_vllm_guided_decoding_params(
+                guided_decoding_config
+            ),
         )
 
         # verify inputs have correct padding
@@ -554,13 +592,17 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_params: Optional["GuidedDecodingParams"] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate text responses using vLLM generation.
 
         Args:
             data: BatchedDataDict containing prompts with text strings
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_params: Guided decoding parameters for vLLM, None to disable guided decoding.
 
         Returns:
             BatchedDataDict containing:
@@ -599,6 +641,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            guided_decoding=guided_decoding_params,
         )
 
         # Generate outputs

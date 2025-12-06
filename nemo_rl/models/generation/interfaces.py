@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -115,6 +115,30 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
+class GuidedDecodingConfig(TypedDict):
+    """Configuration for guided decoding.
+
+    `mode`: The guided decoding mode, can be one of `json`, `regex`, `choice`, `grammar`, or `json_object`.
+
+    For the selected mode, its corresponding field must be provided:
+
+      - `json`: the output must be a JSON object matching the provided schema
+      - `regex`: the output must match the provided regex
+      - `choice`: the output must be one of the provided choices
+      - `grammar`: the output must be a valid grammar
+      - `json_object`: the output must be some JSON object
+
+    This class is intentially similar to the GuidedDecodingParams class in vLLM,
+    however, we do not want to inject that dependency here.
+    """
+
+    mode: str
+    json: NotRequired[Union[str, dict]]
+    regex: NotRequired[str]
+    choice: NotRequired[list[str]]
+    grammar: NotRequired[str]
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -127,6 +151,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
+    guided_decoding: NotRequired[GuidedDecodingConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
 
@@ -224,7 +249,10 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def generate(
-        self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
+        self,
+        data: BatchedDataDict["GenerationDatumSpec"],
+        greedy: bool,
+        guided_decoding_config: Optional[GuidedDecodingConfig],
     ) -> BatchedDataDict["GenerationOutputSpec"]:
         pass
 

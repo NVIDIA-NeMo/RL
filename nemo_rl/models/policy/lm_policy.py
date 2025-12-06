@@ -36,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GuidedDecodingConfig,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -552,9 +553,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return aggregated_results
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
+        # Guided decoding is currently only supported for vLLM backend
+        assert guided_decoding_config is None, (
+            "Guided decoding is currently only supported for vLLM backend"
+        )
+
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
