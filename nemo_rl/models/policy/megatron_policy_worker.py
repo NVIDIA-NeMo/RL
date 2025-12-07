@@ -2344,7 +2344,7 @@ class MegatronPolicyWorker:
     def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Report the node IP and GPU ID of the current worker."""
         ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
+        gpu_id = int(ray.get_gpu_ids()[0])
         return (ip, gpu_id)
 
     def check_tensor_parallel_attributes(self) -> dict[str, Any]:

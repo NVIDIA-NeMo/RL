@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import zmq
+import ray
 
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -62,7 +63,7 @@ class VllmInternalWorkerExtension:
         )
 
     def init_p2p(
-        self, rank_prefix: int, group_id: int, ip: str, port: int
+        self, rank_prefix: int, worker_id: int, ip: str, port: int
     ) -> None:
         """Initialize the p2p communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -70,8 +71,7 @@ class VllmInternalWorkerExtension:
         
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank
-        expected_group_id = rank - 1 if rank % 2 == 1 else rank + 1
-        if expected_group_id != group_id:
+        if worker_id != rank:
             return
         self.p2p_src = int(not (bool(rank % 2)))
         pg = StatelessProcessGroup.create(
@@ -305,7 +305,6 @@ class VllmInternalWorkerExtension:
 
     def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Report the node IP and GPU ID of the current worker."""
-        import ray
         ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
+        gpu_id = int(ray.get_gpu_ids()[0])
         return (ip, gpu_id)

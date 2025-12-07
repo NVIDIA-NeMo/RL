@@ -176,3 +176,7 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def stream_weights_via_p2p(self) -> list[ray.ObjectRef]:
         pass
+
+    @abstractmethod
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        pass

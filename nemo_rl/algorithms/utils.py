@@ -749,6 +749,42 @@ def print_performance_metrics(
 
     return performance_metrics
 
+
+def print_ip_and_gpu_id_of_workers(policy: ColocatablePolicyInterface, policy_generation: Optional[GenerationInterface]) -> None:
+    """Print the node IP and GPU ID of the policy and generation workers."""
+    def _print_in_table(results: list[tuple[str, int]], table_title: str) -> None:
+        all_node_ips = sorted(set([result[0] for result in results]))
+        all_gpu_ids = sorted(set([result[1] for result in results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+        table = PrettyTable()
+        table.title = table_title
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)
+
+    policy_results = policy.report_node_ip_and_gpu_id()
+    _print_in_table(policy_results, "Policy workers mapping to Nodes and GPUs")
+    if policy_generation is not None:
+        policy_generation_results = policy_generation.report_node_ip_and_gpu_id()
+        _print_in_table(policy_generation_results, "Generation workers mapping to Nodes and GPUs")
+
+
 def init_p2p_between_policy_and_generation(
     colocated_cluster: RayVirtualCluster, 
     policy: ColocatablePolicyInterface, 
@@ -756,19 +792,34 @@ def init_p2p_between_policy_and_generation(
 ) -> None:
     """Initialize the p2p communication between the policy and the generation."""
 
+    def _find_peer(
+        train_worker_id: int, 
+        policy_node_and_gpu_id_list: list[tuple[str, int]], 
+        generation_node_and_gpu_id_to_worker_map: list[tuple[str, int]]
+    ) -> int:
+        train_node_ip, train_gpu_id = policy_node_and_gpu_id_list[train_worker_id]
+        gen_node_ip, gen_gpu_id = train_node_ip, (train_gpu_id ^ 1)
+        gen_worker_id = generation_node_and_gpu_id_to_worker_map[(gen_node_ip, gen_gpu_id)]
+        return gen_worker_id
+
     world_size = colocated_cluster.world_size()
     if world_size < 2:
         raise ValueError("World size must be at least 2 for p2p communication")
     
-    for group_id in range(world_size):
+    policy_node_and_gpu_id_list = policy.report_node_ip_and_gpu_id()
+    generation_node_and_gpu_id_list = policy_generation.report_node_ip_and_gpu_id()
+    generation_node_and_gpu_id_to_worker_map = { tup: idx for idx, tup in enumerate(generation_node_and_gpu_id_list)}
+    
+    for train_worker_id in range(world_size):
+        gen_worker_id = _find_peer(train_worker_id, policy_node_and_gpu_id_list, generation_node_and_gpu_id_to_worker_map)
         if colocated_cluster._sorted_bundle_indices is not None:
             train_pg_idx = 0
-            train_bundle_idx = colocated_cluster._sorted_bundle_indices[group_id]
+            train_bundle_idx = colocated_cluster._sorted_bundle_indices[train_worker_id]
         else:
-            train_pg_idx = group_id // colocated_cluster.num_gpus_per_node
+            train_pg_idx = train_worker_id // colocated_cluster.num_gpus_per_node
             train_bundle_idx = 0
         ip, port = colocated_cluster.get_available_address_and_port(train_pg_idx, train_bundle_idx)
-        print(f"Initializing p2p communication between policy and generation on group {group_id} with ip {ip} and port {port}")
-        futures_train = policy.init_p2p(group_id, ip, port)
-        futures_inference = policy_generation.init_p2p(group_id, ip, port)
+        print(f"Initializing p2p communication between policy and generation on group {train_worker_id} with ip {ip} and port {port}")
+        futures_train = policy.init_p2p(train_worker_id, ip, port)
+        futures_inference = policy_generation.init_p2p(gen_worker_id, ip, port)
         ray.get(futures_train + futures_inference)

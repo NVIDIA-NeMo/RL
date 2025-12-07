@@ -794,35 +794,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
-    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Print the node IP and GPU ID of the current worker."""
         results = ray.get(
             self.worker_group.run_all_workers_single_data(
                 "report_node_ip_and_gpu_id",
             )
         )
-        all_node_ips = sorted(set([result[0] for result in results]))
-        all_gpu_ids = sorted(set([result[1] for result in results]))
-
-        worker_id_list = [
-            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
-        ]
-        for worker_id, (ip, gpu_id) in enumerate(results):
-            node_idx = all_node_ips.index(ip)
-            gpu_idx = all_gpu_ids.index(gpu_id)
-            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
-
-        from prettytable import PrettyTable
-
-        table = PrettyTable()
-        table.title = "Policy worker mapping to Nodes and GPUs"
-        table.field_names = ["Node_IP"] + [
-            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
-        ]
-        for i, node_idx in enumerate(all_node_ips):
-            row = [node_idx]
-            for j in range(len(all_gpu_ids)):
-                row.append(tuple(worker_id_list[i][j]))
-            table.add_row(row)
-
-        print(table)
+        return results

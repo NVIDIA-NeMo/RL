@@ -374,7 +374,7 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def init_p2p(
-        self, group_id: int, ip: str, port: int
+        self, worker_id: int, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         # Choose the appropriate method based on async_engine setting
@@ -396,7 +396,7 @@ class VllmGeneration(GenerationInterface):
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={
-                "group_id": group_id,
+                "worker_id": worker_id,
                 "ip": ip,
                 "port": port,
             },
@@ -900,7 +900,7 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Print the node IP and GPU ID of the current worker."""
         method_name = "report_node_ip_and_gpu_id_async" if self.cfg["vllm_cfg"]["async_engine"] else "report_node_ip_and_gpu_id"
         results = ray.get(
@@ -909,28 +909,5 @@ class VllmGeneration(GenerationInterface):
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
         )
-        results = [ tup for result in results for tup in result]
-        all_node_ips = sorted(set([result[0] for result in results]))
-        all_gpu_ids = sorted(set([result[1] for result in results]))
-
-        worker_id_list = [
-            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
-        ]
-        for worker_id, (ip, gpu_id) in enumerate(results):
-            node_idx = all_node_ips.index(ip)
-            gpu_idx = all_gpu_ids.index(gpu_id)
-            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
-
-        from prettytable import PrettyTable
-        table = PrettyTable()
-        table.title = "Policy worker mapping to Nodes and GPUs"
-        table.field_names = ["Node_IP"] + [
-            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
-        ]
-        for i, node_idx in enumerate(all_node_ips):
-            row = [node_idx]
-            for j in range(len(all_gpu_ids)):
-                row.append(tuple(worker_id_list[i][j]))
-            table.add_row(row)
-
-        print(table)
+        results = [ tup for result in results for tup in result ]
+        return results

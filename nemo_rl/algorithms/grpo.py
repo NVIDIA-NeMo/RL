@@ -42,6 +42,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
     set_seed,
     init_p2p_between_policy_and_generation,
+    print_ip_and_gpu_id_of_workers,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -554,9 +555,7 @@ def setup(
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
-    policy.print_node_ip_and_gpu_id()
-    if policy_generation is not None:
-        policy_generation.print_node_ip_and_gpu_id()
+    print_ip_and_gpu_id_of_workers(policy, policy_generation)
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
@@ -579,6 +578,7 @@ def setup(
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
     elif grpo_config["refit_via_p2p"]:
         assert colocated_inference, "P2P communication is only supported for colocated inference"
+        assert cluster.world_size() >= 2, "World size must be at least 2 for p2p communication"
         t0 = time.perf_counter()
         if policy_generation is not None:
             init_p2p_between_policy_and_generation(
