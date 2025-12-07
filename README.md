@@ -85,7 +85,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT, DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo Automdeol).
+- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
