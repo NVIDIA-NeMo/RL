@@ -374,7 +374,7 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def init_p2p(
-        self, group_id: int, ip: str, port: int, world_size: int
+        self, group_id: int, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         # Choose the appropriate method based on async_engine setting
@@ -399,7 +399,6 @@ class VllmGeneration(GenerationInterface):
                 "group_id": group_id,
                 "ip": ip,
                 "port": port,
-                "world_size": world_size,
             },
         )
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
@@ -903,9 +902,10 @@ class VllmGeneration(GenerationInterface):
 
     def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Print the node IP and GPU ID of the current worker."""
+        method_name = "report_node_ip_and_gpu_id_async" if self.cfg["vllm_cfg"]["async_engine"] else "report_node_ip_and_gpu_id"
         results = ray.get(
             self.worker_group.run_all_workers_single_data(
-                "report_node_ip_and_gpu_id",
+                method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
         )

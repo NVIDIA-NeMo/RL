@@ -224,7 +224,7 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def init_p2p(
-        self, group_id: int, ip: str, port: int, world_size: int
+        self, group_id: int, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         pass

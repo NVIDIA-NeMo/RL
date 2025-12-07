@@ -147,7 +147,7 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def init_p2p(
-        self, group_id: int, ip: str, port: int, world_size: int
+        self, group_id: int, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         pass
 

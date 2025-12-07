@@ -62,7 +62,7 @@ class VllmInternalWorkerExtension:
         )
 
     def init_p2p(
-        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+        self, rank_prefix: int, group_id: int, ip: str, port: int
     ) -> None:
         """Initialize the p2p communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -70,11 +70,12 @@ class VllmInternalWorkerExtension:
         
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank
-        if (group_id == 0 and rank % 2 != 1) or (group_id == 1 and rank % 2 == 1):
+        expected_group_id = rank - 1 if rank % 2 == 1 else rank + 1
+        if expected_group_id != group_id:
             return
-        self.p2p_src = rank - 1 if group_id == 0 else rank + 1
+        self.p2p_src = int(not (bool(rank % 2)))
         pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size
+            host=ip, port=port, rank=(rank % 2), world_size=2
         )
         self.model_update_group = PyNcclCommunicator(pg, device=self.device)
 

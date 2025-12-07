@@ -423,11 +423,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
 
     def init_p2p(
-        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+        self, rank_prefix: int, group_id: int, ip: str, port: int
     ) -> None:
         self.llm.collective_rpc(
             "init_p2p",
-            args=(rank_prefix, group_id, ip, port, world_size),
+            args=(rank_prefix, group_id, ip, port),
         )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")

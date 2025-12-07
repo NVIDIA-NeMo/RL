@@ -263,7 +263,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def init_p2p(
-        self, group_id: int, ip: str, port: int, world_size: int
+        self, group_id: int, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -271,7 +271,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             group_id=group_id,
             ip=ip,
             port=port,
-            world_size=world_size,
         )
         return futures
 

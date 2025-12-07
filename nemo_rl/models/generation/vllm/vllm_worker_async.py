@@ -593,11 +593,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
 
     async def init_p2p_async(
-        self, rank_prefix: int, group_id: int, ip: str, port: int, world_size: int
+        self, rank_prefix: int, group_id: int, ip: str, port: int
     ) -> None:
         await self.llm.collective_rpc(
             "init_p2p",
-            args=(rank_prefix, group_id, ip, port, world_size),
+            args=(rank_prefix, group_id, ip, port),
         )
 
     async def generate_async(

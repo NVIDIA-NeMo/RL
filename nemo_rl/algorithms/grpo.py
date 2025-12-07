@@ -41,6 +41,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     print_performance_metrics,
     set_seed,
+    init_p2p_between_policy_and_generation,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -577,23 +578,12 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
     elif grpo_config["refit_via_p2p"]:
+        assert colocated_inference, "P2P communication is only supported for colocated inference"
         t0 = time.perf_counter()
-        world_size = train_cluster.world_size()
-        for group_id in range(2):
-            ip, port = train_cluster.get_master_address_and_port()
-            futures_train = policy.init_p2p(
-                group_id,
-                ip,
-                port,
-                world_size,
+        if policy_generation is not None:
+            init_p2p_between_policy_and_generation(
+                cluster, policy, policy_generation,
             )
-            futures_inference = policy_generation.init_p2p(
-                group_id,
-                ip,
-                port,
-                world_size,
-            )
-            ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["p2p_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info

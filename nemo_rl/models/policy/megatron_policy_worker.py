@@ -909,17 +909,17 @@ class MegatronPolicyWorker:
         self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def init_p2p(
-        self, group_id: int, ip: str, port: int, world_size: int
+        self, group_id: int, ip: str, port: int
     ) -> None:
         """Initialize the p2p communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        if (group_id == 0 and self.rank % 2 != 0) or (group_id == 1 and self.rank % 2 == 0):
+        if group_id != self.rank:
             return
-        self.p2p_dst = self.rank + 1 if group_id == 0 else self.rank - 1
+        self.p2p_dst = int(not (bool(self.rank % 2)))
         pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
+            host=ip, port=port, rank=(self.rank % 2), world_size=2
         )
         device = torch.cuda.current_device()
         self.model_update_group = PyNcclCommunicator(pg, device=device)

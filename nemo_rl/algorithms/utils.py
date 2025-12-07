@@ -17,6 +17,7 @@ import random
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
+import ray
 
 import numpy as np
 import torch
@@ -28,6 +29,9 @@ from transformers import (
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 
 
 def calculate_kl(
@@ -744,3 +748,27 @@ def print_performance_metrics(
     )
 
     return performance_metrics
+
+def init_p2p_between_policy_and_generation(
+    colocated_cluster: RayVirtualCluster, 
+    policy: ColocatablePolicyInterface, 
+    policy_generation: GenerationInterface,
+) -> None:
+    """Initialize the p2p communication between the policy and the generation."""
+
+    world_size = colocated_cluster.world_size()
+    if world_size < 2:
+        raise ValueError("World size must be at least 2 for p2p communication")
+    
+    for group_id in range(world_size):
+        if colocated_cluster._sorted_bundle_indices is not None:
+            train_pg_idx = 0
+            train_bundle_idx = colocated_cluster._sorted_bundle_indices[group_id]
+        else:
+            train_pg_idx = group_id // colocated_cluster.num_gpus_per_node
+            train_bundle_idx = 0
+        ip, port = colocated_cluster.get_available_address_and_port(train_pg_idx, train_bundle_idx)
+        print(f"Initializing p2p communication between policy and generation on group {group_id} with ip {ip} and port {port}")
+        futures_train = policy.init_p2p(group_id, ip, port)
+        futures_inference = policy_generation.init_p2p(group_id, ip, port)
+        ray.get(futures_train + futures_inference)
