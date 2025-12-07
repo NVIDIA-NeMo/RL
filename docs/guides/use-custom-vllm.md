@@ -89,8 +89,48 @@ If your custom vLLM is hosted in a **private repository** (e.g., internal GitLab
 2. The key must **not be expired** - check your Git server's SSH key settings
 3. The key must be loaded into your local ssh-agent
 
-### Step 1: Verify your SSH key works
+**Step 1: Verify your SSH key works**
 
+```sh
+# For GitLab (adjust host/port as needed)
+ssh -T git@gitlab.example.com -p 12051
+
+# You should see: "Welcome to GitLab, @username!"
+# If you see "Your SSH key has expired", renew it on the server
+```
+
+**Step 2: Load your SSH key into the agent**
+
+```sh
+# Check if an ssh-agent is already running
+echo $SSH_AUTH_SOCK
+
+# If empty, start one (this also sets SSH_AUTH_SOCK which `docker buildx` expects to be set when using `--ssh default`)
+eval "$(ssh-agent -s)"
+
+# Clear any old/expired keys from the agent
+ssh-add -D
+
+# Add your SSH key (use the key registered on your Git server)
+ssh-add ~/.ssh/id_ed25519
+
+# Verify it's loaded
+ssh-add -l
+```
+
+**Step 3: Run the Docker build with SSH forwarding**
+
+```sh
+docker buildx build \
+  --build-arg BUILD_CUSTOM_VLLM=1 \
+  --target release \
+  --build-context nemo-rl=. \
+  -f docker/Dockerfile \
+  --ssh default \
+  --tag <registry>/nemo-rl:latest \
+  --push \
+  .
+```
 
 ## Running Applications with a Custom vLLM Container
 
