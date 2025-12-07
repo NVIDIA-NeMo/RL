@@ -32,7 +32,7 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.processors import math_hf_data_processor
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.utils import get_env
+from nemo_rl.environments.utils import create_env
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -72,7 +72,7 @@ def setup_data(
 ]:
     print("\n▶ Setting up envs...")
     env_name = data_config["env_name"]
-    env = get_env(env_name=env_name, env_configs=env_configs)
+    env = create_env(env_name=env_name, env_configs=env_configs)
 
     print("\n▶ Setting up data...")
     default_task_spec = TaskDataSpec(
@@ -88,7 +88,7 @@ def setup_data(
     # load dataset
     data: Any = load_response_dataset(data_config, seed)
     task_spec = data.task_spec
-    task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+    task_name = data.task_name
     assert hasattr(data, "processor"), "Dataset must have a processor attribute"
     task_data_processors[task_name] = (task_spec, data.processor)
 

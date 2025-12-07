@@ -111,7 +111,7 @@ task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] 
 
 # Resolve task_name from dataset or spec
 task_spec = data.task_spec
-task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+task_name = data.task_name
 assert hasattr(data, "processor"), "Dataset must have a processor attribute"
 task_data_processors[task_name] = (task_spec, data.processor)
 ```
@@ -130,7 +130,7 @@ Then, you can set the data up as follows:
 
 # 1) Select environment from data config
 env_name = data_config["env_name"]
-env = get_env(env_name=env_name, env_configs=env_configs)
+env = create_env(env_name=env_name, env_configs=env_configs)
 
 # 2) Build default TaskDataSpec from config (prompts loaded from files if present)
 default_task_spec = TaskDataSpec(
@@ -149,7 +149,7 @@ data = load_response_dataset(data_config, seed)
 
 # 5) Resolve task spec/name and ensure dataset provides a processor
 task_spec = data.task_spec
-task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+task_name = data.task_name
 assert hasattr(data, "processor"), "Dataset must have a processor attribute"
 task_data_processors[task_name] = (task_spec, data.processor)
 
@@ -185,7 +185,7 @@ For more information about environments, see the [Environments Guide](environmen
 ### Env–Task Mapping
 
 - env:
-  - The environment actor for reward/evaluation, constructed via `get_env(env_name=..., env_configs=...)`.
+  - The environment actor for reward/evaluation, constructed via `create_env(env_name=..., env_configs=...)`.
   - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
 - task_to_env:
   - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
@@ -194,7 +194,7 @@ Example (simplified):
 
 ```python
 env_name = data_config["env_name"]  # declared under config.data
-env = get_env(env_name=env_name, env_configs=env_configs)
+env = create_env(env_name=env_name, env_configs=env_configs)
 
 task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: env)
 task_to_env[task_name] = env

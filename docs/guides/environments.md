@@ -142,3 +142,115 @@ See [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) for a complete exam
 ### Configuration Examples
 
 See [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) for a complete configuration example.
+
+
+## Registering Custom Environments
+
+NeMo RL provides a flexible environment registration mechanism that allows you to add custom environments without modifying the source code.
+
+### Using the `register_env` Interface
+
+You can use the `register_env` function to dynamically register new environments without modifying NeMo RL's internal code.
+
+**Function Signature:**
+
+```python
+from nemo_rl.environments.utils import register_env
+
+register_env(env_name: str, actor_class_fqn: str) -> None
+```
+
+**Parameters:**
+
+- `env_name`: Unique identifier name for the environment (string)
+- `actor_class_fqn`: Fully Qualified Name of the environment Actor class, in the format `'module.path.ClassName'`
+
+### Example: Registering a Custom Environment
+
+Suppose you've created a custom reinforcement learning environment for code generation tasks:
+
+**1. Create Your Custom Environment Actor Class**
+
+```python
+# File: my_custom_envs/code_gen_env.py
+import ray
+from nemo_rl.environments.interfaces import EnvironmentInterface
+
+@ray.remote
+class CodeGenEnvironmentActor(EnvironmentInterface):
+    """Custom code generation environment."""
+    
+    def __init__(self, config):
+        self.config = config
+        # Initialize your environment
+        
+    async def reset(self):
+        # Reset environment logic
+        return initial_state
+        
+    async def step(self, action):
+        # Execute action, return reward, etc.
+        return observation, reward, done, info
+        
+    # Implement other required interface methods...
+```
+
+**2. Register the Environment in Your Training Script**
+
+```python
+# File: train.py
+from nemo_rl.environments.utils import register_env
+
+# Register your custom environment
+register_env(
+    env_name="code_gen",
+    actor_class_fqn="my_custom_envs.code_gen_env.CodeGenEnvironmentActor"
+)
+
+# Now you can use "code_gen" in your config
+# Training code...
+```
+
+**3. Use the Registered Environment in Your Config**
+
+```yaml
+# config.yaml
+env:
+  code_gen:
+    num_workers: 2
+    max_code_length: 512
+    test_cases_per_problem: 5
+
+data:
+  env_name: code_gen  # Use your registered environment name
+```
+
+### Important Notes
+
+- **Uniqueness**: Each environment name must be unique. Attempting to register an existing environment name will raise a `ValueError`
+- **Class Path**: The `actor_class_fqn` must be a fully importable Python path
+- **Interface Implementation**: Your custom Actor class should implement all necessary methods defined in `EnvironmentInterface`
+- **Registration Timing**: Make sure to call `register_env` before using the environment (typically at the beginning of your training script)
+
+### Advanced Example: Conditional Registration
+
+You can also conditionally register different environments based on configuration:
+
+```python
+from nemo_rl.environments.utils import register_env
+import os
+
+# Choose different environment implementations based on environment variable
+if os.getenv("USE_PRODUCTION_ENV") == "true":
+    register_env(
+        env_name="my_task",
+        actor_class_fqn="my_envs.production.ProductionTaskActor"
+    )
+else:
+    register_env(
+        env_name="my_task",
+        actor_class_fqn="my_envs.dev.DevTaskActor"
+    )
+```
+
+This flexible registration mechanism allows you to easily extend NeMo RL with custom reinforcement learning environments without modifying the framework's core code.

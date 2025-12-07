@@ -92,15 +92,16 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     return chunks
 
 
-def get_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
-    if env_name not in ENV_REGISTRY:
-        raise ValueError(f"Invalid env name: {env_name}")
+def create_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
+    assert env_name in ENV_REGISTRY, (
+        f"Env name {env_name} is not registered in ENV_REGISTRY. Please call register_env() to register the environment."
+    )
     actor_class_fqn = ENV_REGISTRY[env_name]["actor_class_fqn"]
     actor_class = import_class_from_path(actor_class_fqn)
     env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(actor_class_fqn),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+            "env_vars": dict(os.environ),
         }
     ).remote(env_configs[env_name])
     return env

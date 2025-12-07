@@ -18,7 +18,7 @@ import pytest
 import ray
 
 from nemo_rl.environments.code_jaccard_environment import CodeJaccardEnvConfig
-from nemo_rl.environments.utils import get_env
+from nemo_rl.environments.utils import create_env
 
 
 @pytest.fixture(scope="module")
@@ -28,7 +28,7 @@ def code_jaccard_env_config():
 
 @pytest.fixture(scope="module")
 def code_jaccard_env(code_jaccard_env_config):
-    env = get_env("code_jaccard", {"code_jaccard": code_jaccard_env_config})
+    env = create_env("code_jaccard", {"code_jaccard": code_jaccard_env_config})
     yield env
     env.shutdown.remote()
     ray.kill(env)

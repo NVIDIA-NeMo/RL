@@ -20,6 +20,7 @@ class RawDataset:
     def __init__(self, data_config: dict, seed: int = 42):
         self.data_config: dict = data_config
         self.seed: int = seed
+        self.task_name: str | None = None
         self.processor: TaskDataProcessFnCallable | None = None
         self.task_spec: TaskDataSpec | None = None
         raise NotImplementedError("__init__ is not implemented")
