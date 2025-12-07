@@ -173,13 +173,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        if cluster._sorted_bundle_indices is not None:
+        if cluster._nid_and_bundle_id_sorted_by_ip_and_gpu is not None:
             # The cluster has initialized a unified placemenet group across nodes
             # In this case, we need to create workers based on sorted bundle indices
-            group_size = cluster.num_gpus_per_node
             tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+                (nid, [bundle_idx])
+                for nid, bundle_idx in cluster._nid_and_bundle_id_sorted_by_ip_and_gpu
             ]
 
             self.worker_group = RayWorkerGroup(

@@ -258,11 +258,11 @@ class VllmGeneration(GenerationInterface):
                 num_groups = total // model_parallel_size
 
                 groups: list[tuple[int, list[int]]] = []
-                gpus_per_node = cluster.num_gpus_per_node
                 for i in range(num_groups):
-                    slice_ = cluster._sorted_bundle_indices[i * model_parallel_size : (i + 1) * model_parallel_size]
-                    first_node = i * model_parallel_size // gpus_per_node
-                    groups.append((first_node, slice_))
+                    slice_ = cluster._nid_and_bundle_id_sorted_by_ip_and_gpu[i * model_parallel_size : (i + 1) * model_parallel_size]
+                    first_node = slice_[0][0]
+                    bundle_indices = [ x[1] for x in slice_ ]
+                    groups.append((first_node, bundle_indices))
                 return groups
 
             tied_groups = allocate_worker_groups(unified_pg, tp_size, pp_size)

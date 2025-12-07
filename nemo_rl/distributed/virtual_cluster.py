@@ -175,8 +175,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 class GetGPUIDActor:  # pragma: no cover
     """Util actor class to return GPU id of the current worker."""
 
-    def get_gpu_id(self):
-        return ray.get_gpu_ids()[0]
+    def get_ip_and_gpu_id(self):
+        return ray._private.services.get_node_ip_address(), int(ray.get_gpu_ids()[0])
 
 
 class ResourceInsufficientError(Exception):
@@ -219,6 +219,7 @@ class RayVirtualCluster:
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
+        self._nid_and_bundle_id_sorted_by_ip_and_gpu: Optional[list[int]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
@@ -262,7 +263,10 @@ class RayVirtualCluster:
                     strategy, use_unified_pg
                 )
                 if use_unified_pg and self.use_gpus:
-                    self._sorted_bundle_indices = self._get_sorted_bundle_indices()
+                    (
+                        self._nid_and_bundle_id_sorted_by_ip_and_gpu,
+                        self._sorted_bundle_indices
+                    ) = self._get_sorted_bundle_indices()
                 return self._node_placement_groups
             except ResourceInsufficientError as e:
                 print(e)
@@ -419,9 +423,9 @@ class RayVirtualCluster:
             self.get_placement_groups()
 
         # If sorted bundle indices are available, get the address and port for the first bundle index
-        if self._sorted_bundle_indices is not None:
+        if self._nid_and_bundle_id_sorted_by_ip_and_gpu is not None:
             return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
+                pg_idx=0, bundle_idx=self._nid_and_bundle_id_sorted_by_ip_and_gpu[0][1]
             )
 
         # Otherwise, get the address and port for bundle index 0
@@ -444,6 +448,8 @@ class RayVirtualCluster:
         pg_data = placement_group_table(pg)
         num_bundles = len(pg_data["bundles"])
         bundle_to_node_ids = pg_data["bundles_to_node_id"]
+        sorted_node_ids = sorted(set(bundle_to_node_ids.values()))
+        node_id_to_index = { node_id: idx for idx, node_id in enumerate(sorted_node_ids) }
 
         # use info actor to get the GPU id
         info_actors = []
@@ -460,19 +466,23 @@ class RayVirtualCluster:
                 ).remote()
             )
 
-        gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+        ip_and_gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
         for actor in info_actors:
             ray.kill(actor)
 
         # original index, node_id, gpu_id
         bundle_infos = [
-            (i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)
+            (i, ip_and_gpu_ids[i][0], ip_and_gpu_ids[i][1]) for i in range(num_bundles)
         ]
-        pg_reordered_bundle_indices = [
-            bundle_info[0]
-            for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
-        ]  # sort by node_id, then gpu_id
-        return pg_reordered_bundle_indices
+        pg_reordered_nid_and_bundle_indices = []
+        pg_reordered_bundle_indices = []
+        for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2])):
+            bundle_index = bundle_info[0]
+            nid = bundle_to_node_ids[bundle_index]
+            node_index = node_id_to_index[nid]
+            pg_reordered_nid_and_bundle_indices.append((node_index, bundle_index))
+            pg_reordered_bundle_indices.append(bundle_index)
+        return pg_reordered_nid_and_bundle_indices, pg_reordered_bundle_indices
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
