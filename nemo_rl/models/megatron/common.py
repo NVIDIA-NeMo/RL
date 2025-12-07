@@ -26,6 +26,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+    reduce_aux_losses_tracker_across_ranks,
+)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
@@ -33,10 +38,19 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return (
+        ((value + multiple - 1) // multiple * multiple)
+        if value % multiple != 0
+        else value
+    )
+
+
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
     seq_lengths: torch.Tensor,
     pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
     pad_packed_seq_to: Optional[int] = None,
     cp_rank: int = 0,
     cp_size: int = 1,
@@ -47,7 +61,9 @@ def _pack_sequences_for_megatron(
         input_ids: Input token IDs [batch_size, seq_length]
         seq_lengths: Actual sequence lengths for each sample [batch_size]
         pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
+        pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
         pad_packed_seq_to: Pad packed sequences to this value (before CP)
+            - The three parameters above can be calculated using _get_pack_sequence_parameters_for_megatron, we do not recommend users to set these parameters manually.
         cp_size: Context parallelism size
 
     Returns:
@@ -61,13 +77,21 @@ def _pack_sequences_for_megatron(
     batch_size = input_ids.shape[0]
 
     # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
-    cu_seqlens = [0]
-    cu_seqlens_padded = (
-        [0]
-        if pad_individual_seqs_to_multiple_of > 1 or pad_packed_seq_to is not None
-        else None
+    needs_padding = (
+        pad_individual_seqs_to_multiple_of > 1
+        or pad_packed_seq_to_multiple_of > 1
+        or pad_packed_seq_to is not None
     )
+
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0] if needs_padding else None
     valid_tokens = []
+
+    # Round up the pad_packed_seq_to to the nearest multiple of pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to is not None:
+        pad_packed_seq_to = _round_up_to_multiple(
+            pad_packed_seq_to, pad_packed_seq_to_multiple_of
+        )
 
     pad_factor = pad_individual_seqs_to_multiple_of
 
@@ -83,22 +107,26 @@ def _pack_sequences_for_megatron(
         cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
         # For context parallelism, track padded sequence lengths
-        if pad_factor > 1 or pad_packed_seq_to is not None:
+        if needs_padding:
             # Pad sequence length to multiple of (cp_size * 2)
-            padded_seq_len = ((seq_len + pad_factor - 1) // pad_factor) * pad_factor
+            padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
             cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_seq_len)
 
     # Convert to tensors
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
-    if pad_factor > 1 or pad_packed_seq_to is not None:
+    if needs_padding:
         cu_seqlens_padded = torch.tensor(
             cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
         )
         if pad_packed_seq_to is not None:
             cu_seqlens_padded[-1] = pad_packed_seq_to
+        elif pad_packed_seq_to_multiple_of > 1:
+            cu_seqlens_padded[-1] = _round_up_to_multiple(
+                cu_seqlens_padded[-1], pad_packed_seq_to_multiple_of
+            )
 
     # Calculate max sequence length (padded if using CP)
-    if pad_factor > 1 or (pad_packed_seq_to is not None):
+    if needs_padding:
         seq_lens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
         max_seqlen = seq_lens_padded.max().item()
     else:
@@ -119,11 +147,22 @@ def _pack_sequences_for_megatron(
                 else seq_lengths[b]
             )
             # if last element, pad to the max sequence length
-            if b == batch_size - 1 and pad_packed_seq_to is not None:
-                padded_seq_len = pad_packed_seq_to - running_seq_len
-                running_seq_len += padded_seq_len
+            if b == batch_size - 1 and needs_padding:
+                if pad_packed_seq_to is not None:
+                    padded_seq_len = pad_packed_seq_to - running_seq_len
+                elif pad_packed_seq_to_multiple_of > 1:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+                    padded_seq_len = (
+                        _round_up_to_multiple(
+                            running_seq_len + padded_seq_len,
+                            pad_packed_seq_to_multiple_of,
+                        )
+                        - running_seq_len
+                    )
+                else:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
             else:
-                padded_seq_len = ((seq_len + pad_factor - 1) // pad_factor) * pad_factor
+                padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
 
             running_seq_len += padded_seq_len
 
@@ -152,8 +191,17 @@ def _pack_sequences_for_megatron(
         # For 'thd' format, the shape should be [1, T] where T is total tokens
         packed_input_ids = torch.cat(valid_tokens, dim=0).unsqueeze(0)
         all_input_ids = packed_input_ids
-        if pad_packed_seq_to is not None:
-            pad_len = pad_packed_seq_to - packed_input_ids.shape[1]
+        if needs_padding:
+            if pad_packed_seq_to is not None:
+                pad_len = pad_packed_seq_to - packed_input_ids.shape[1]
+            elif pad_packed_seq_to_multiple_of > 1:
+                current_seq_len = packed_input_ids.shape[1]
+                pad_this_seq_to = _round_up_to_multiple(
+                    current_seq_len, pad_packed_seq_to_multiple_of
+                )
+                pad_len = pad_this_seq_to - current_seq_len
+            else:
+                pad_len = 0
             if pad_len > 0:
                 packed_input_ids = torch.nn.functional.pad(
                     packed_input_ids, (0, pad_len), value=0
@@ -181,6 +229,61 @@ def _pack_sequences_for_megatron(
         packed_seq_params,
         cu_seqlens,
         cu_seqlens_padded,
+    )
+
+
+def _get_pack_sequence_parameters_for_megatron(
+    megatron_cfg: dict,
+    max_seq_len_in_batch: int,
+):
+    """Get pack sequence parameters for Megatron model processing with optional context parallelism.
+
+    Args:
+        megatron_cfg: Megatron configuration
+        max_seq_len_in_batch: Maximum sequence length in batch
+
+    Returns:
+        Tuple of:
+        - pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
+        - pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
+        - pad_packed_seq_to: Pad packed sequences to this value (before CP)
+    """
+    tp_size = megatron_cfg["tensor_model_parallel_size"]
+    sp = megatron_cfg["sequence_parallel"]
+    pp_size = megatron_cfg["pipeline_model_parallel_size"]
+    cp_size = megatron_cfg["context_parallel_size"]
+    fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
+    use_fp8 = fp8_cfg.get("enabled", False)
+    use_blockwise_fp8 = fp8_cfg.get("fp8_recipe", None) == "blockwise"
+
+    # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
+    pad_individual_seqs_to_multiple_of = 1
+    if cp_size > 1:
+        pad_individual_seqs_to_multiple_of *= cp_size * 2
+    if tp_size > 1 and sp:
+        pad_individual_seqs_to_multiple_of *= tp_size
+
+    # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
+    if use_fp8:
+        divisor = 128 if use_blockwise_fp8 else 16
+        pad_packed_seq_to_multiple_of = divisor
+        if cp_size > 1:
+            pad_packed_seq_to_multiple_of *= cp_size * 2
+        if tp_size > 1 and sp:
+            pad_packed_seq_to_multiple_of *= tp_size
+    else:
+        pad_packed_seq_to_multiple_of = 1
+
+    # when PP is used, all sequences must have the same length, so we need to pad the packed sequence to the max sequence length in the batch.
+    if pp_size > 1:
+        pad_packed_seq_to = max_seq_len_in_batch
+    else:
+        pad_packed_seq_to = None
+
+    return (
+        pad_individual_seqs_to_multiple_of,
+        pad_packed_seq_to_multiple_of,
+        pad_packed_seq_to,
     )
 
 
@@ -258,7 +361,9 @@ def forward_step_arbitrary_loss(
     pack_sequences: bool = False,
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
+    defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
 ):
@@ -273,6 +378,9 @@ def forward_step_arbitrary_loss(
         loss_fn (LossFunction): Loss function to apply
         pack_sequences (bool): Whether to pack sequences for efficiency
         seq_length_key (Optional[str]): Key in data_dict containing actual sequence lengths
+        pad_individual_seqs_to_multiple_of (int): Pad individual sequences to a multiple of this value
+        pad_full_seq_to (Optional[int]): Pad packed sequences to this value
+        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         cp_normalize (bool): Whether to normalize the loss by the cp_size
         policy_cfg (Optional[dict]): Policy configuration containing generation parameters
 
@@ -321,6 +429,7 @@ def forward_step_arbitrary_loss(
                 input_ids,
                 seq_lengths,
                 pad_individual_seqs_to_multiple_of,
+                pad_packed_seq_to_multiple_of,
                 pad_full_seq_to,
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
@@ -348,12 +457,20 @@ def forward_step_arbitrary_loss(
     if len(multimodal_data) > 0:
         position_ids = None
 
+    additional_kwargs = {}
+    # Mamba models currently do not support packed_seq_params
+    if packed_seq_params is not None:
+        additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    if defer_fp32_logits:
+        additional_kwargs["fp32_output"] = False
+
     with straggler_timer:
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
+            **additional_kwargs,
             **multimodal_data,
         )
 
@@ -487,3 +604,49 @@ def broadcast_tensor(
     dist.broadcast(tensor, src=src_rank, group=group)
 
     return tensor
+
+
+def get_moe_metrics(
+    loss_scale: float,
+    total_loss_dict: Optional[dict] = None,
+    per_layer_logging: bool = False,
+) -> dict[str, Any]:
+    """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
+
+    This function reduces MoE auxiliary losses across ranks, aggregates them, and
+    returns a dictionary of metrics.
+
+    Args:
+        loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
+        total_loss_dict: If provided, accumulate means into this dict (by name).
+        per_layer_logging: If True, include per-layer values in the returned dict.
+
+    Returns:
+        dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
+        the mean value is returned under the same key (e.g., "load_balancing_loss").
+        If per_layer_logging is True, per-layer values are returned under keys of the
+        form "moe/{name}_layer_{i}".
+    """
+    reduce_aux_losses_tracker_across_ranks()
+    tracker = get_moe_layer_wise_logging_tracker()
+
+    metrics: dict[str, Any] = {}
+    if len(tracker) > 0:
+        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
+        for name, loss_list in aux_losses.items():
+            # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
+            num_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
+            aggregated_value = loss_list.sum() / num_layers
+            metrics[name] = float(aggregated_value.item())
+            if total_loss_dict is not None:
+                if name not in total_loss_dict:
+                    total_loss_dict[name] = aggregated_value
+                else:
+                    total_loss_dict[name] += aggregated_value
+
+            if per_layer_logging:
+                for i, loss in enumerate(loss_list.tolist()):
+                    metrics[f"moe/{name}_layer_{i}"] = float(loss)
+
+    clear_aux_losses_tracker()
+    return metrics
