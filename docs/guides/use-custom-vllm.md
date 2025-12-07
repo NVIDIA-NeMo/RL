@@ -84,12 +84,12 @@ docker buildx build \
 
 If your custom vLLM is hosted in a **private repository** (e.g., internal GitLab), you need to set up SSH agent forwarding for Docker to clone it during the build.
 
-**Prerequisites:**
+#### Prerequisites
 1. Your SSH key must be registered on the Git server (GitLab/GitHub)
 2. The key must **not be expired** - check your Git server's SSH key settings
 3. The key must be loaded into your local ssh-agent
 
-**Step 1: Verify your SSH key works**
+#### Step 1: Verify your SSH key works
 
 ```sh
 # For GitLab (adjust host/port as needed)
@@ -99,7 +99,7 @@ ssh -T git@gitlab.example.com -p 12051
 # If you see "Your SSH key has expired", renew it on the server
 ```
 
-**Step 2: Load your SSH key into the agent**
+#### Step 2: Load your SSH key into the agent
 
 ```sh
 # Check if an ssh-agent is already running
@@ -118,7 +118,7 @@ ssh-add ~/.ssh/id_ed25519
 ssh-add -l
 ```
 
-**Step 3: Run the Docker build with SSH forwarding**
+#### Step 3: Run the Docker build with SSH forwarding
 
 ```sh
 docker buildx build \
