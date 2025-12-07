@@ -78,7 +78,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **New Models** - gpt-oss, Qwen3-Next, Nemotron-Nano3.
 - 🔜 **Expand Algorithms** - LoRA support for SFT/RL
-- 🔜 **Resiliency** - Fault tolernace and auto scaling support
+- 🔜 **Resiliency** - Fault tolerance and auto-scaling support
 - 🔜 **GB200** - Add container support for GB200.
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
