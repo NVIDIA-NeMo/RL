@@ -79,3 +79,78 @@ docker buildx build \
   --push \
   .
 ```
+
+### SSH Setup for Private Repositories
+
+If your custom vLLM is hosted in a **private repository** (e.g., internal GitLab), you need to set up SSH agent forwarding for Docker to clone it during the build.
+
+#### Prerequisites
+1. Your SSH key must be registered on the Git server (GitLab/GitHub)
+2. The key must **not be expired** - check your Git server's SSH key settings
+3. The key must be loaded into your local ssh-agent
+
+#### Step 1: Verify your SSH key works
+
+```sh
+# For GitLab (adjust host/port as needed)
+ssh -T git@gitlab.example.com -p 12051
+
+# You should see: "Welcome to GitLab, @username!"
+# If you see "Your SSH key has expired", renew it on the server
+```
+
+#### Step 2: Load your SSH key into the agent
+
+```sh
+# Check if an ssh-agent is already running
+echo $SSH_AUTH_SOCK
+
+# If empty, start one (this also sets SSH_AUTH_SOCK which `docker buildx` expects to be set when using `--ssh default`)
+eval "$(ssh-agent -s)"
+
+# Clear any old/expired keys from the agent
+ssh-add -D
+
+# Add your SSH key (use the key registered on your Git server)
+ssh-add ~/.ssh/id_ed25519
+
+# Verify it's loaded
+ssh-add -l
+```
+
+#### Step 3: Run the Docker build with SSH forwarding
+
+```sh
+docker buildx build \
+  --build-arg BUILD_CUSTOM_VLLM=1 \
+  --target release \
+  --build-context nemo-rl=. \
+  -f docker/Dockerfile \
+  --ssh default \
+  --tag <registry>/nemo-rl:latest \
+  --push \
+  .
+```
+
+## Running Applications with a Custom vLLM Container
+
+When using a container built with custom vLLM, **use the frozen environment workflow** (bare `python`) instead of `uv run` with `NRL_FORCE_REBUILD_VENVS=true`.
+
+```sh
+# Recommended: use bare python (frozen environment)
+python examples/run_grpo_math.py
+
+# NOT recommended with custom vLLM containers:
+# uv run examples/run_grpo_math.py
+# or
+# NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo_math.py
+```
+
+### Why Not Use `uv run` or Rebuild Venvs?
+
+Rebuilding worker virtual environments (via `uv run` or `NRL_FORCE_REBUILD_VENVS=true`) requires having the custom vLLM compiled locally. However, compiling vLLM requires a container environment with the correct CUDA toolchain—creating a chicken-and-egg problem.
+
+The container already has vLLM built and cached in the frozen environments. Using bare `python` leverages these pre-built environments directly, avoiding the need to recompile vLLM at runtime.
+
+> [!TIP]
+> For more details on frozen environments and how they differ from `uv run`, see the [Dependency Management](../design-docs/dependency-management.md#frozen-environments) documentation.
