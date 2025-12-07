@@ -2510,7 +2510,6 @@ def async_grpo_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
-                    policy.offload_after_refit()
 
             log_data = {"content": flat_messages["content"]}
             log_data["rewards"] = rewards.tolist()
