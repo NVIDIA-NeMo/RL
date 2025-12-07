@@ -89,7 +89,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **Hugging Face Integration** - OOB support in the DTenor path, CKPT coversion available for Megatron path through Megatron Bridge middleware.
+- ✅ **Hugging Face Integration** - OOB support in the DTensor path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
 - ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
