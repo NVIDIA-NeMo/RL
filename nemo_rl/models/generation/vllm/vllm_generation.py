@@ -246,25 +246,6 @@ class VllmGeneration(GenerationInterface):
             # Single unified placement group used when we need multiple nodes for model parallelism
             unified_pg = placement_groups[0]
 
-            def get_node_bundles(
-                pg: PlacementGroup,
-            ) -> dict[str, list[int]]:
-                # Retrieve mapping from node ID to bundle indices from a placement group.
-                try:
-                    pg_table = ray.util.placement_group_table(pg)
-                    bundle_to_node = pg_table["bundles_to_node_id"]
-                except Exception as e:
-                    raise RuntimeError(
-                        "Failed to retrieve bundle/node mapping from placement group"
-                    ) from e
-
-                node_bundles: dict[str, list[int]] = defaultdict(list)
-                for bundle_idx, node_id in bundle_to_node.items():
-                    node_bundles[node_id].append(bundle_idx)
-                for bundles in node_bundles.values():
-                    bundles.sort()
-                return dict(node_bundles)
-
             def allocate_worker_groups(
                 pg: PlacementGroup, tp_size: int, pp_size: int
             ) -> list[tuple[int, list[int]]]:
@@ -272,44 +253,16 @@ class VllmGeneration(GenerationInterface):
 
                 # Retrieve both bundle mapping and per-node bundles
                 pg_table = ray.util.placement_group_table(pg)
-                bundle_to_node = pg_table["bundles_to_node_id"]
-                node_bundles = get_node_bundles(pg)
-
-                if not node_bundles:
-                    raise ValueError("Placement group contains no bundles")
-
-                # Ensure all nodes have the same number of bundles
-                counts = [len(b) for b in node_bundles.values()]
-                assert len(set(counts)) == 1, (
-                    "All nodes must have identical bundle counts"
-                )
-
-                total = sum(counts)
+                total = len(pg_table["bundles"])
                 model_parallel_size = tp_size * pp_size
                 num_groups = total // model_parallel_size
-                if num_groups == 0:
-                    raise ValueError(
-                        "Unable to allocate any worker groups with the available resources."
-                    )
 
-                # Create reproducible node indices
-                sorted_nodes = sorted(node_bundles)
-                node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
-
-                # Flatten bundles in node order
-                flat: list[int] = []
-                for nid in sorted_nodes:
-                    flat.extend(node_bundles[nid])
-
-                # Slice into groups and assign logical index
                 groups: list[tuple[int, list[int]]] = []
+                gpus_per_node = cluster.num_gpus_per_node
                 for i in range(num_groups):
-                    slice_ = flat[
-                        i * model_parallel_size : (i + 1) * model_parallel_size
-                    ]
-                    first_node = bundle_to_node[slice_[0]]
-                    groups.append((node_idx[first_node], slice_))
-
+                    slice_ = cluster._sorted_bundle_indices[i * model_parallel_size : (i + 1) * model_parallel_size]
+                    first_node = i * model_parallel_size // gpus_per_node
+                    groups.append((first_node, slice_))
                 return groups
 
             tied_groups = allocate_worker_groups(unified_pg, tp_size, pp_size)
@@ -843,6 +796,7 @@ class VllmGeneration(GenerationInterface):
     
     def update_weights_via_p2p(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using p2p communication."""
+        print(f"Update weights via p2p, worker group: {self.worker_group}")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
@@ -946,3 +900,37 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
+
+    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Print the node IP and GPU ID of the current worker."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "report_node_ip_and_gpu_id",
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+        )
+        results = [ tup for result in results for tup in result]
+        all_node_ips = sorted(set([result[0] for result in results]))
+        all_gpu_ids = sorted(set([result[1] for result in results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+        table = PrettyTable()
+        table.title = "Policy worker mapping to Nodes and GPUs"
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)
