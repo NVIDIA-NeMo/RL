@@ -42,40 +42,40 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-4}  # GB200: 4, H100: 8
 declare -a GRPO_CONFIGS=(
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ qwen32b | 16 GPUs | 4 Nodes | R-GBS=2048 | Gen(TP=1, PP=1, DP=16)          │
-    # │ H100 avg seqlen: 3226 → ISL=640 + OSL=2560 = 3200 (1:4 ratio)              │
+    # │ H100 avg seqlen: 3226 → ISL=150 + OSL=2560 = 3200 (1:4 ratio)              │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "qwen32b|Qwen/Qwen3-32B|1|1|1|4|640|2560|2048|3226|Qwen3-32B GRPO (TP=1 PP=1 DP=16)"
+    "qwen32b|Qwen/Qwen3-32B|1|1|1|4|150|2560|2048|2710|Qwen3-32B GRPO (TP=1 PP=1 DP=16)"
     
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ qwen30b MoE | 16 GPUs | 4 Nodes | R-GBS=2048 | Gen(TP=1, PP=1, DP=16)      │
-    # │ H100 avg seqlen: 3156 → ISL=640 + OSL=2560 = 3200 (1:4 ratio)              │
+    # │ H100 avg seqlen: 3156 → ISL=150 + OSL=2560 = 3200 (1:4 ratio)              │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "qwen30b|Qwen/Qwen3-30B-A3B|1|1|1|4|640|2560|2048|3156|Qwen3-30B MoE GRPO (TP=1 PP=1 DP=16)"
+    "qwen30b|Qwen/Qwen3-30B-A3B|1|1|1|4|150|2560|2048|2710|Qwen3-30B MoE GRPO (TP=1 PP=1 DP=16)"
     
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ llama8b | 8 GPUs | 2 Nodes | R-GBS=2048 | Gen(TP=1, PP=1, DP=8)            │
-    # │ H100 avg seqlen: 1056 → ISL=256 + OSL=1024 = 1280 (1:4 ratio)              │
+    # │ H100 avg seqlen: 1056 → ISL=150 + OSL=1024 = 1280 (1:4 ratio)              │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "llama8b|meta-llama/Llama-3.1-8B-Instruct|1|1|1|2|256|1024|2048|1056|LLaMA3-8B GRPO (TP=1 PP=1 DP=8)"
+    "llama8b|meta-llama/Llama-3.1-8B-Instruct|1|1|1|2|150|1024|2048|1174|LLaMA3-8B GRPO (TP=1 PP=1 DP=8)"
     
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ llama70b | 16 GPUs | 4 Nodes | R-GBS=2048 | Gen(TP=2, PP=1, DP=8)          │
-    # │ H100 avg seqlen: 740 → ISL=128 + OSL=512 = 640 (1:4 ratio)                 │
+    # │ H100 avg seqlen: 740 → ISL=150 + OSL=512 = 640 (1:4 ratio)                 │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "llama70b|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|128|512|2048|740|LLaMA3-70B GRPO (TP=2 PP=1 DP=8)"
+    "llama70b|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|512|2048|662|LLaMA3-70B GRPO (TP=2 PP=1 DP=8)"
     
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ llama70b-lowgbs | 16 GPUs | 4 Nodes | R-GBS=512 | Gen(TP=2, PP=1, DP=8)    │
-    # │ H100 avg seqlen: 740 → ISL=128 + OSL=512 = 640 (1:4 ratio)                 │
+    # │ H100 avg seqlen: 740 → ISL=150 + OSL=512 = 640 (1:4 ratio)                 │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "llama70b-lowgbs|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|128|512|512|740|LLaMA3-70B LowGBS GRPO (TP=2 PP=1 DP=8)"
+    "llama70b-lowgbs|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|512|512|662|LLaMA3-70B LowGBS GRPO (TP=2 PP=1 DP=8)"
     
     # ┌─────────────────────────────────────────────────────────────────────────────┐
     # │ llama70b-highseq | 16 GPUs | 4 Nodes | R-GBS=2048 | Gen(TP=2, PP=1, DP=8)  │
-    # │ MaxSeqLen: 16384, H100 avg seqlen: 785 → ISL=256 + OSL=1024 = 1280         │
+    # │ MaxSeqLen: 16384, H100 avg seqlen: 785 → ISL=150 + OSL=1024 = 1280         │
     # │ (higher ISL/OSL for long context scenario)                                  │
     # └─────────────────────────────────────────────────────────────────────────────┘
-    "llama70b-highseq|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|256|1024|2048|785|LLaMA3-70B HighSeq GRPO (TP=2 PP=1 DP=8)"
+    "llama70b-highseq|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|1024|2048|1174|LLaMA3-70B HighSeq GRPO (TP=2 PP=1 DP=8)"
 )
 
 # ============================================================
@@ -83,9 +83,23 @@ declare -a GRPO_CONFIGS=(
 # ============================================================
 declare -a SWEEP_CONFIGS=(
     # Different ISL/OSL combinations for sensitivity analysis (1:4 ratio)
-    "qwen32b-short|Qwen/Qwen3-32B|1|1|1|4|256|1024|2048|1280|Qwen3-32B Short (ISL=256 OSL=1024)"
-    "qwen32b-long|Qwen/Qwen3-32B|1|1|1|4|768|3072|2048|3840|Qwen3-32B Long (ISL=768 OSL=3072)"
-    "llama8b-long|meta-llama/Llama-3.1-8B-Instruct|1|1|1|2|512|2048|2048|2560|LLaMA3-8B Long (ISL=512 OSL=2048)"
+    "qwen32b-short|Qwen/Qwen3-32B|1|1|1|4|150|1024|2048|1174|Qwen3-32B Short (ISL=150 OSL=1024)"
+    "qwen32b-long|Qwen/Qwen3-32B|1|1|1|4|150|3072|2048|3222|Qwen3-32B Long (ISL=150 OSL=3072)"
+    "llama8b-long|meta-llama/Llama-3.1-8B-Instruct|1|1|1|2|150|2048|2048|2198|LLaMA3-8B Long (ISL=150 OSL=2048)"
+    "llama8b-long|meta-llama/Llama-3.1-8B-Instruct|1|1|1|2|150|4096|2048|2198|LLaMA3-8B 4K Long (ISL=150 OSL=4096)"
+
+    # Reasoning / Chain-of-Thought Scenarios (Short Input, Very Long Output)
+    "qwen32b-cot-4k|Qwen/Qwen3-32B|1|1|1|4|150|4096|2048|4246|Qwen3-32B CoT 4K (ISL=150 OSL=4096)"
+    "qwen32b-cot-8k|Qwen/Qwen3-32B|1|1|1|4|150|8192|2048|8342|Qwen3-32B CoT 8K (ISL=150 OSL=8192)"
+    
+    # Qwen3-30B-A3B MoE - Long Chain-of-Thought scenarios
+    "qwen30b-cot-4k|Qwen/Qwen3-30B-A3B|1|1|1|4|150|4096|2048|4246|Qwen3-30B MoE CoT 4K (ISL=150 OSL=4096)"
+    "qwen30b-cot-8k|Qwen/Qwen3-30B-A3B|1|1|1|4|150|8192|2048|8342|Qwen3-30B MoE CoT 8K (ISL=150 OSL=8192)"
+    
+    # LLaMA-3.1-70B - Long Chain-of-Thought scenarios (TP=2, PP=1, DP=8)
+    "llama70b-cot-2k|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|2048|2048|2198|LLaMA3-70B CoT 2K (ISL=150 OSL=2048)"
+    "llama70b-cot-4k|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|4096|2048|4246|LLaMA3-70B CoT 4K (ISL=150 OSL=4096)"
+    "llama70b-cot-8k|meta-llama/Llama-3.1-70B-Instruct|2|1|1|4|150|8192|2048|8342|LLaMA3-70B CoT 8K (ISL=150 OSL=8192)"
 )
 
 # ============================================================
