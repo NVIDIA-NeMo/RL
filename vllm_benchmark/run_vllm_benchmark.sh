@@ -35,11 +35,13 @@ apply_model_preset() {
             MODEL_PATH="Qwen/Qwen2.5-32B-Instruct"
             : ${TP_SIZE:=4}
             : ${NUM_NODES:=1}
+            : ${MAX_MODEL_LEN:=32768}  # Max context: 32K
             ;;
         qwen3-32b)
             MODEL_PATH="Qwen/Qwen3-32B"
             : ${TP_SIZE:=4}
             : ${NUM_NODES:=1}
+            : ${MAX_MODEL_LEN:=32768}  # Max context: 32K
             ;;
         
         # Qwen Models - MoE
@@ -48,6 +50,7 @@ apply_model_preset() {
             : ${TP_SIZE:=4}
             : ${EP_SIZE:=4}
             : ${NUM_NODES:=1}
+            : ${MAX_MODEL_LEN:=32768}  # Max context: 32K
             IS_MOE=1
             ;;
         qwen3-235b|qwen235b)
@@ -55,6 +58,7 @@ apply_model_preset() {
             : ${TP_SIZE:=8}
             : ${EP_SIZE:=8}
             : ${NUM_NODES:=2}
+            : ${MAX_MODEL_LEN:=32768}  # Max context: 32K
             IS_MOE=1
             ;;
         
@@ -63,17 +67,20 @@ apply_model_preset() {
             MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
             : ${TP_SIZE:=1}
             : ${NUM_NODES:=1}
+            : ${MAX_MODEL_LEN:=131072}  # Max context: 128K
             ;;
         llama70b|llama3-70b)
             MODEL_PATH="meta-llama/Llama-3.1-70B-Instruct"
             : ${TP_SIZE:=4}
             : ${NUM_NODES:=1}
+            : ${MAX_MODEL_LEN:=131072}  # Max context: 128K
             ;;
         llama405b|llama3-405b)
             MODEL_PATH="meta-llama/Llama-3.1-405B-Instruct"
             : ${TP_SIZE:=8}
             : ${PP_SIZE:=2}
             : ${NUM_NODES:=4}
+            : ${MAX_MODEL_LEN:=131072}  # Max context: 128K
             ;;
         
         # DeepSeek Models
@@ -82,6 +89,7 @@ apply_model_preset() {
             : ${TP_SIZE:=8}
             : ${EP_SIZE:=8}
             : ${NUM_NODES:=8}
+            : ${MAX_MODEL_LEN:=65536}  # Max context: 64K
             IS_MOE=1
             ;;
         
@@ -143,7 +151,7 @@ NEMO_RL_CONTAINER=${NEMO_RL_CONTAINER:-/lustre/fsw/portfolios/coreai/projects/co
 HF_HOME=${HF_HOME:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home}
 
 # Generation parameters
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}  # Default for most models
 MAX_TOKENS=${MAX_TOKENS:-2048}
 TEMPERATURE=${TEMPERATURE:-1.0}
 

@@ -256,7 +256,7 @@ RESULTS_FILE=$LOGS_DIR/results.json
 RESULTS_SUMMARY=$LOGS_DIR/results_summary.txt
 
 # Write header
-echo 'Model,GPU,Nodes,GPUs/Node,TP,PP,EP,InputLen,OutputLen,NumPrompts,Throughput(req/s),Throughput(tok/s),TotalTime(s)' > \$RESULTS_SUMMARY
+echo 'Model,GPU,Nodes,GPUs/Node,TP,PP,EP,InputLen,RequestedOSL,ActualOSL,NumPrompts,Throughput(req/s),Throughput(tok/s),Throughput(tok/s/GPU),TotalTime(s)' > \$RESULTS_SUMMARY
 
 # Build common vLLM args
 VLLM_ARGS=\"--model $MODEL_PATH\"
@@ -307,18 +307,34 @@ FIRST_RESULT=1
 # Sweep through ISL/OSL combinations
 for ISL in $INPUT_LENS; do
     for OSL in $OUTPUT_LENS; do
+        # Check if ISL + OSL exceeds MAX_MODEL_LEN
+        REQUESTED_OSL=\$OSL
+        REQUIRED_LEN=\$((\$ISL + \$OSL))
+        if [ \$REQUIRED_LEN -gt $MAX_MODEL_LEN ]; then
+            EFFECTIVE_OSL=\$(($MAX_MODEL_LEN - \$ISL))
+            echo 'WARNING: ISL='\$ISL' + OSL='\$OSL' = '\$REQUIRED_LEN' > MAX_MODEL_LEN=$MAX_MODEL_LEN'
+            echo '         Adjusting OSL: '\$OSL' -> '\$EFFECTIVE_OSL
+        else
+            EFFECTIVE_OSL=\$OSL
+        fi
+        
+        # Skip if EFFECTIVE_OSL is too small
+        if [ \$EFFECTIVE_OSL -le 0 ]; then
+            echo 'ERROR: EFFECTIVE_OSL <= 0, skipping ISL='\$ISL' OSL='\$OSL
+            continue
+        fi
         echo ''
         echo '============================================================'
-        echo \"Running: ISL=\$ISL, OSL=\$OSL\"
+        echo \"Running: ISL=\$ISL, OSL=\$EFFECTIVE_OSL (requested: \$OSL)\"
         echo '============================================================'
         
-        OUTPUT_FILE=$LOGS_DIR/result_ISL\${ISL}_OSL\${OSL}.txt
+        OUTPUT_FILE=$LOGS_DIR/result_ISL\${ISL}_ReqOSL\${REQUESTED_OSL}_ActOSL\${EFFECTIVE_OSL}.txt
         
         # Run vllm bench throughput
         vllm bench throughput \
             \$VLLM_ARGS \
             --input-len \$ISL \
-            --output-len \$OSL \
+            --output-len \$EFFECTIVE_OSL \
             2>&1 | tee \$OUTPUT_FILE
         
         # Parse results from output
@@ -343,10 +359,13 @@ for ISL in $INPUT_LENS; do
         THROUGHPUT_TOK=\${THROUGHPUT_TOK:-0}
         TOTAL_TIME=\${TOTAL_TIME:-0}
         
-        echo \"Parsed: req/s=\$THROUGHPUT_REQ, tok/s=\$THROUGHPUT_TOK, time=\$TOTAL_TIME\"
+        # Calculate per-GPU throughput
+        PER_GPU_TOK=\$(awk "BEGIN {printf \"%.2f\", \$THROUGHPUT_TOK / $NUM_GPUS}")
+        
+        echo \"Parsed: req/s=\$THROUGHPUT_REQ, tok/s=\$THROUGHPUT_TOK (\$PER_GPU_TOK tok/s/GPU), time=\$TOTAL_TIME\"
         
         # Append to CSV
-        echo \"\$MODEL_SHORT,\$GPU_MODEL,$NUM_NODES,$NUM_GPUS_PER_NODE,$TENSOR_PARALLEL_SIZE,$PIPELINE_PARALLEL_SIZE,$EXPERT_PARALLEL_SIZE,\$ISL,\$OSL,$NUM_PROMPTS,\$THROUGHPUT_REQ,\$THROUGHPUT_TOK,\$TOTAL_TIME\" >> \$RESULTS_SUMMARY
+        echo \"\$MODEL_SHORT,\$GPU_MODEL,$NUM_NODES,$NUM_GPUS_PER_NODE,$TENSOR_PARALLEL_SIZE,$PIPELINE_PARALLEL_SIZE,$EXPERT_PARALLEL_SIZE,\$ISL,\$REQUESTED_OSL,\$EFFECTIVE_OSL,$NUM_PROMPTS,\$THROUGHPUT_REQ,\$THROUGHPUT_TOK,\$PER_GPU_TOK,\$TOTAL_TIME\" >> \$RESULTS_SUMMARY
         
         # Append to JSON
         if [ \$FIRST_RESULT -eq 0 ]; then
@@ -365,10 +384,12 @@ for ISL in $INPUT_LENS; do
   \"pp_size\": $PIPELINE_PARALLEL_SIZE,
   \"ep_size\": $EXPERT_PARALLEL_SIZE,
   \"input_len\": \$ISL,
-  \"output_len\": \$OSL,
+  \"requested_output_len\": \$REQUESTED_OSL,
+  \"actual_output_len\": \$EFFECTIVE_OSL,
   \"num_prompts\": $NUM_PROMPTS,
   \"throughput_requests_per_sec\": \$THROUGHPUT_REQ,
   \"throughput_tokens_per_sec\": \$THROUGHPUT_TOK,
+  \"throughput_tokens_per_sec_per_gpu\": \$PER_GPU_TOK,
   \"total_time_sec\": \$TOTAL_TIME,
   \"benchmark_type\": \"throughput\"
 }

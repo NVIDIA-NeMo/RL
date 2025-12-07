@@ -26,22 +26,54 @@ from pathlib import Path
 # Format: (model_pattern, tp, pp, ep, nodes, isl, osl, num_prompts)
 # ISL:OSL = 1:4 ratio (OpenMathInstruct-2 dataset characteristics)
 GRPO_CONFIGS = [
-    # qwen32b: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=640, OSL=2560
-    ("Qwen3-32B", 1, 1, 1, 4, 640, 2560, 2048),
-    # qwen30b: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=640, OSL=2560
-    ("Qwen3-30B-A3B", 1, 1, 1, 4, 640, 2560, 2048),
-    # llama8b: Gen(TP=1, PP=1, DP=8), 2 nodes, ISL=256, OSL=1024
-    ("Llama-3.1-8B", 1, 1, 1, 2, 256, 1024, 2048),
-    ("Llama-3.1-8B-Instruct", 1, 1, 1, 2, 256, 1024, 2048),
-    # llama70b: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=128, OSL=512
-    ("Llama-3.1-70B", 2, 1, 1, 4, 128, 512, 2048),
-    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 128, 512, 2048),
-    # llama70b-lowgbs: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=128, OSL=512, GBS=512
-    ("Llama-3.1-70B", 2, 1, 1, 4, 128, 512, 512),
-    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 128, 512, 512),
-    # llama70b-highseq: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=256, OSL=1024
-    ("Llama-3.1-70B", 2, 1, 1, 4, 256, 1024, 2048),
-    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 256, 1024, 2048),
+    # ============================================================
+    # Updated to match grpo_benchmark_sweep.sh (ISL=150 for all)
+    # Format: (model_pattern, tp, pp, ep, nodes, isl, osl, num_prompts)
+    # ============================================================
+    
+    # qwen32b: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=150, OSL=2560
+    ("Qwen3-32B", 1, 1, 1, 4, 150, 2560, 2048),
+    # qwen32b-short: ISL=150, OSL=1024
+    ("Qwen3-32B", 1, 1, 1, 4, 150, 1024, 2048),
+    # qwen32b-long: ISL=150, OSL=3072
+    ("Qwen3-32B", 1, 1, 1, 4, 150, 3072, 2048),
+    # qwen32b-cot-4k: ISL=150, OSL=4096
+    ("Qwen3-32B", 1, 1, 1, 4, 150, 4096, 2048),
+    # qwen32b-cot-8k: ISL=150, OSL=8192
+    ("Qwen3-32B", 1, 1, 1, 4, 150, 8192, 2048),
+    
+    # qwen30b MoE: Gen(TP=1, PP=1, DP=16), 4 nodes, ISL=150, OSL=2560
+    ("Qwen3-30B-A3B", 1, 1, 1, 4, 150, 2560, 2048),
+    # qwen30b-cot-4k: ISL=150, OSL=4096
+    ("Qwen3-30B-A3B", 1, 1, 1, 4, 150, 4096, 2048),
+    # qwen30b-cot-8k: ISL=150, OSL=8192
+    ("Qwen3-30B-A3B", 1, 1, 1, 4, 150, 8192, 2048),
+    
+    # llama8b: Gen(TP=1, PP=1, DP=8), 2 nodes, ISL=150, OSL=1024
+    ("Llama-3.1-8B", 1, 1, 1, 2, 150, 1024, 2048),
+    ("Llama-3.1-8B-Instruct", 1, 1, 1, 2, 150, 1024, 2048),
+    # llama8b-long: ISL=150, OSL=2048
+    ("Llama-3.1-8B", 1, 1, 1, 2, 150, 2048, 2048),
+    ("Llama-3.1-8B-Instruct", 1, 1, 1, 2, 150, 2048, 2048),
+    
+    # llama70b: Gen(TP=2, PP=1, DP=8), 4 nodes, ISL=150, OSL=512
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 512, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 512, 2048),
+    # llama70b-lowgbs: ISL=150, OSL=512, GBS=512
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 512, 512),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 512, 512),
+    # llama70b-highseq: ISL=150, OSL=1024
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 1024, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 1024, 2048),
+    # llama70b-cot-2k: ISL=150, OSL=2048
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 2048, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 2048, 2048),
+    # llama70b-cot-4k: ISL=150, OSL=4096
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 4096, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 4096, 2048),
+    # llama70b-cot-8k: ISL=150, OSL=8192
+    ("Llama-3.1-70B", 2, 1, 1, 4, 150, 8192, 2048),
+    ("Llama-3.1-70B-Instruct", 2, 1, 1, 4, 150, 8192, 2048),
 ]
 
 
@@ -52,7 +84,7 @@ def is_grpo_config(result):
     pp = result.get('pp_size', 0)
     nodes = result.get('num_nodes', 0)
     isl = result.get('input_len', 0)
-    osl = result.get('output_len', 0)
+    osl = result.get('actual_output_len', result.get('output_len', 0))
     nprompts = result.get('num_prompts', 0)
     
     for cfg in GRPO_CONFIGS:
@@ -83,9 +115,45 @@ def is_grpo_config(result):
     return False
 
 
+def is_grpo_model(result):
+    """Check if a result matches any GRPO model configuration (ignoring ISL/OSL)."""
+    model = result.get('model', '')
+    tp = result.get('tp_size', 0)
+    pp = result.get('pp_size', 0)
+    nodes = result.get('num_nodes', 0)
+    
+    # Unique model configs (model_pattern, tp, pp, nodes)
+    seen_configs = set()
+    for cfg in GRPO_CONFIGS:
+        model_pattern, cfg_tp, cfg_pp, cfg_ep, cfg_nodes, cfg_isl, cfg_osl, cfg_nprompts = cfg
+        seen_configs.add((model_pattern, cfg_tp, cfg_pp, cfg_nodes))
+    
+    for model_pattern, cfg_tp, cfg_pp, cfg_nodes in seen_configs:
+        # Check if model matches (partial match)
+        if model_pattern not in model:
+            continue
+        
+        # Check parallelism
+        if tp != cfg_tp or pp != cfg_pp:
+            continue
+            
+        # Check nodes
+        if nodes != cfg_nodes:
+            continue
+        
+        return True
+    
+    return False
+
+
 def filter_grpo_results(results):
     """Filter results to only include GRPO configurations."""
     return [r for r in results if is_grpo_config(r)]
+
+
+def filter_grpo_model_results(results):
+    """Filter results to only include GRPO model configurations (all ISL/OSL)."""
+    return [r for r in results if is_grpo_model(r)]
 
 
 
@@ -315,7 +383,7 @@ def load_all_jobs(job_dirs, running_jobs):
             'dp_size': 0,
             'total_gpus': 0,
             'generation_throughput_tokens_per_sec': 0,
-            'tokens_per_sec_per_gpu': 0,
+            'throughput_tokens_per_sec_per_gpu': 0,
             'total_time_sec': 0,
             'total_requests': 0,
         }
@@ -484,7 +552,7 @@ def print_individual_table(results):
               f"{r.get('total_gpus', '?'):>5} "
               f"{r.get('total_requests', '?'):>8} "
               f"{r.get('generation_throughput_tokens_per_sec', 0):>12,.0f} "
-              f"{r.get('tokens_per_sec_per_gpu', 0):>12,.0f} "
+              f"{r.get('throughput_tokens_per_sec_per_gpu', r.get('tokens_per_sec_per_gpu', 0)):>12,.0f} "
               f"{r.get('total_time_sec', 0):>10.1f}")
     
     print("=" * 190)
@@ -574,24 +642,30 @@ def print_throughput_table(results):
         
         isl_osl_groups = defaultdict(list)
         for r in items:
-            key = (r.get('input_len', 0), r.get('output_len', 0), r.get('num_prompts', 0))
+            key = (r.get('input_len', 0), r.get('requested_output_len', r.get('output_len', 0)), r.get('actual_output_len', r.get('output_len', 0)), r.get('num_prompts', 0))
             isl_osl_groups[key].append(r)
         
         # Table header
-        print(f"  {'ISL':>6} {'OSL':>6} {'Prompts':>8} {'Runs':>5} {'Req/s':>12} {'Tok/s (mean±std)':>22} {'Tok/s/GPU':>12}")
-        print(f"  {'-'*6} {'-'*6} {'-'*8} {'-'*5} {'-'*12} {'-'*22} {'-'*12}")
+        print(f"  {'ISL':>6} {'ReqOSL':>8} {'ActOSL':>8} {'Prompts':>8} {'Runs':>5} {'Req/s':>12} {'Tok/s (mean±std)':>22} {'Tok/s/GPU':>12}")
+        print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*8} {'-'*5} {'-'*12} {'-'*22} {'-'*12}")
         
         total_gpus = nodes * gpn
         current_isl = None
         
-        for (isl, osl, prompts), runs in sorted(isl_osl_groups.items()):
+        for (isl, req_osl, act_osl, prompts), runs in sorted(isl_osl_groups.items()):
             req_values = [float(r.get('throughput_requests_per_sec', 0)) for r in runs]
             tok_values = [float(r.get('throughput_tokens_per_sec', 0)) for r in runs]
+            gpu_values = [float(r.get('throughput_tokens_per_sec_per_gpu', 0)) for r in runs]
             
             req_mean = statistics.mean(req_values)
             tok_mean = statistics.mean(tok_values)
             tok_std = statistics.stdev(tok_values) if len(tok_values) > 1 else 0
-            tok_gpu = tok_mean / total_gpus if total_gpus > 0 else 0
+            
+            # Use reported per-GPU value if available, otherwise calculate
+            if any(v > 0 for v in gpu_values):
+                tok_gpu = statistics.mean(gpu_values)
+            else:
+                tok_gpu = tok_mean / total_gpus if total_gpus > 0 else 0
             
             # Add visual separator between different ISL values
             if current_isl is not None and isl != current_isl:
@@ -603,7 +677,9 @@ def print_throughput_table(results):
             else:
                 tok_str = f"{tok_mean:>12,.0f}         "
             
-            print(f"  {isl:>6} {osl:>6} {prompts:>8} {len(runs):>5} {req_mean:>12.2f} {tok_str:>22} {tok_gpu:>12,.0f}")
+            # Show adjusted indicator if requested != actual
+            osl_indicator = "(*)" if req_osl != act_osl else ""
+            print(f"  {isl:>6} {req_osl:>8} {act_osl:>8}{osl_indicator} {prompts:>8} {len(runs):>5} {req_mean:>12.2f} {tok_str:>22} {tok_gpu:>12,.0f}")
     
     # Overall summary
     print(f"\n{BOLD}{'=' * 100}{RESET}")
@@ -616,7 +692,7 @@ def print_throughput_table(results):
     # Unique configurations
     unique_configs = set()
     for r in results:
-        unique_configs.add((r.get('input_len'), r.get('output_len')))
+        unique_configs.add((r.get('input_len'), r.get('actual_output_len', r.get('output_len'))))
     
     summary_parts = [f"{GREEN}{completed} Completed{RESET}"]
     if running > 0:
@@ -651,7 +727,7 @@ def print_grouped_table(results):
     stats = []
     for (gpu_model, model, nodes, gpus_per_node, tp, pp, dp, ep), group in groups.items():
         throughputs = [r.get('generation_throughput_tokens_per_sec', 0) for r in group]
-        per_gpu = [r.get('tokens_per_sec_per_gpu', 0) for r in group]
+        per_gpu = [r.get('throughput_tokens_per_sec_per_gpu', r.get('tokens_per_sec_per_gpu', 0)) for r in group]
         times = [r.get('total_time_sec', 0) for r in group]
         gpus = group[0].get('total_gpus', 0)
         
@@ -750,7 +826,8 @@ def main():
     parser.add_argument("--base-dir", help="Override base directory")
     parser.add_argument("--group", "-g", action="store_true", help="Group results by configuration and show mean±std")
     parser.add_argument("--all", "-a", action="store_true", help="Include running/failed jobs with status column")
-    parser.add_argument("--grpo", action="store_true", help="Filter to only show GRPO configurations (from grpo_benchmark_sweep.sh)")
+    parser.add_argument("--grpo", action="store_true", help="Filter to only show exact GRPO configurations (ISL/OSL must match)")
+    parser.add_argument("--grpo-all", action="store_true", help="Filter to GRPO models but show ALL ISL/OSL combinations")
     parser.add_argument("--output", "-o", help="Output CSV file")
     parser.add_argument("--json", help="Output JSON file")
     
@@ -799,7 +876,11 @@ def main():
     if args.grpo:
         original_count = len(results)
         results = filter_grpo_results(results)
-        print(f"Filtered to {len(results)} GRPO results (from {original_count} total)")
+        print(f"Filtered to {len(results)} exact GRPO config results (from {original_count} total)")
+    elif args.grpo_all:
+        original_count = len(results)
+        results = filter_grpo_model_results(results)
+        print(f"Filtered to {len(results)} GRPO model results (all ISL/OSL, from {original_count} total)")
     
     # Print table
     print_table(results, group_by_config=args.group, bench_type=bench_type_str)
