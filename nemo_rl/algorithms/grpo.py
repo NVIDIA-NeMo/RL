@@ -921,32 +921,33 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+            if refit_via_p2p:
+                futures_train = policy.stream_weights_via_p2p()
+                futures_inference = policy_generation.update_weights_via_p2p()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
             else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
+                # get model param keys, which is grouped by size
+                if _refit_buffer_size_gb is not None:
+                    buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+                else:
+                    # Empirically sets ratio as 30% to maximize efficiency.
+                    # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+                    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+                    buffer_size_bytes = int(
+                        policy.get_free_memory_bytes() * float(memory_ratio)
+                    )
 
-            futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes
-            )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-        elif refit_via_p2p:
-            futures_train = policy.stream_weights_via_p2p()
-            futures_inference = policy_generation.update_weights_via_p2p()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                futures_train = policy.stream_weights_via_ipc_zmq(
+                    buffer_size_bytes=buffer_size_bytes
+                )
+                futures_inference = policy_generation.update_weights_via_ipc_zmq()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
             futures_train = policy.broadcast_weights_for_collective()
