@@ -36,7 +36,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     checkpointing.enabled=true \
     checkpointing.save_period=3 \
     checkpointing.checkpoint_dir=/tmp/lora_sft_checkpoints \
-    $@ \
+    "$@" \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS

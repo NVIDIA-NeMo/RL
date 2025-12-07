@@ -21,19 +21,6 @@ class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
-class LoRAConfig(TypedDict):
-    enabled: bool
-    target_modules: NotRequired[list[str]]
-    exclude_modules: NotRequired[list[str]]
-    match_all_linear: NotRequired[bool]
-    dim: NotRequired[int]
-    alpha: NotRequired[int]
-    dropout: NotRequired[float]
-    dropout_position: NotRequired[Literal["pre", "post"]]
-    lora_A_init: NotRequired[str]
-    use_triton: NotRequired[bool]
-
-
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -45,7 +32,6 @@ class DTensorConfig(TypedDict):
     context_parallel_size: int
     custom_parallel_plan: str | None
     clear_cache_every_n_steps: NotRequired[int | None]
-    lora: NotRequired[LoRAConfig | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -145,6 +131,23 @@ class MegatronConfig(TypedDict):
     distributed_data_parallel_config: MegatronDDPConfig
 
 
+class LoRAConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class LoRAConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    match_all_linear: bool
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init: str
+    use_triton: bool
+
+
 class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
@@ -203,6 +206,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

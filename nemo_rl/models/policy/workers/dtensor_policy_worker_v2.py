@@ -239,12 +239,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_state_dict_keys = None
 
         # lora config
-        lora_cfg = self.cfg["dtensor_cfg"].get("lora", None)
+        lora_cfg = self.cfg.get("lora_cfg", None)
         self.peft_config = None
         self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
         # patch the init_lora_weights method to use the xavier initialization
         _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
         if self.lora_enabled:
+            if self.cfg["dtensor_cfg"]["tensor_parallel_size"] > 1:
+                assert not lora_cfg["use_triton"], (
+                    "Triton is not supported when tensor_parallel_size > 1"
+                )
             # Always use float32 since FSDP requires all parameters to be in the same dtype.
             # autocast should cast the weights to the correct dtype during the forward pass.
             cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}

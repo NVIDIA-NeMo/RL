@@ -517,9 +517,6 @@ class TestSaveLoadIntegration:
             f"Expected layers.3.lora_B.weight shape (1, 2), got {lora_state_dict['layers.3.lora_B.weight'].shape}"
         )
 
-        initial_distribute = torch.distributed.is_initialized()
-        print(f"Initial distribute: {initial_distribute}")
-
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "test_model")
             save_checkpoint(
