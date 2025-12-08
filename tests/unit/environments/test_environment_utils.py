@@ -16,7 +16,7 @@ import pytest
 from nemo_rl.environments.utils import ENV_REGISTRY, register_env
 
 
-def test_register_new_env_success(self):
+def test_register_new_env_success():
     """Test successfully registering a new environment."""
     # Save original registry state
     original_registry = ENV_REGISTRY.copy()
@@ -34,7 +34,7 @@ def test_register_new_env_success(self):
         ENV_REGISTRY.update(original_registry)
 
 
-def test_register_env_duplicate_raises_error(self):
+def test_register_env_duplicate_raises_error():
     """Test that registering a duplicate environment name raises ValueError."""
     # Save original registry state
     original_registry = ENV_REGISTRY.copy()
