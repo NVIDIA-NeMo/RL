@@ -1225,44 +1225,73 @@ def load_filter_configs(config_file: str) -> list:
     return data.get('configs', [])
 
 
-def load_presets_from_launch_grpo() -> list:
-    """Load preset configurations from launch_grpo.py.
+def load_presets_from_launch_grpo(cluster_type: str = "h100") -> list:
+    """Load preset configurations from model_configs.yaml.
+    
+    Args:
+        cluster_type: "h100" or "gb200"
     
     Returns a list of config dicts compatible with filter_by_configs().
     """
     try:
-        # Import PRESETS from launch_grpo.py
         import sys
         script_dir = os.path.dirname(os.path.abspath(__file__))
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
         
-        from launch_grpo import PRESETS, calculate_dp
+        from launch_grpo import (
+            load_model_configs, 
+            get_available_presets, 
+            get_model_config,
+            calculate_dp
+        )
+        
+        gpus_per_node = 8 if cluster_type == "h100" else 4
         
         configs = []
-        for preset_name, config in PRESETS.items():
-            # Calculate DP values
-            t_dp = calculate_dp(config.total_gpus, config.t_tp, config.t_pp, config.t_ep)
-            g_dp = calculate_dp(config.total_gpus, config.g_tp, config.g_pp)
-            rollout_gbs = config.num_prompts * config.num_generations
-            
-            configs.append({
-                'name': f"{preset_name} ({config.name})",
-                'preset_name': preset_name,
-                'model': config.name,
-                'total_gpus': config.total_gpus,
-                'rollout_gbs': rollout_gbs,
-                'train_gbs': config.train_gbs,
-                'max_seqlen': config.max_seqlen,
-                'g_tp': config.g_tp,
-                'g_pp': config.g_pp,
-                'g_dp': g_dp,
-                't_tp': config.t_tp,
-                't_cp': config.t_cp,
-                't_ep': config.t_ep,
-                't_pp': config.t_pp,
-                't_dp': t_dp,
-            })
+        for preset_name in get_available_presets():
+            try:
+                model_cfg = get_model_config(preset_name, cluster_type)
+                
+                gen_cfg = model_cfg.get("generation", {})
+                train_cfg = model_cfg.get("training", {})
+                
+                g_tp = gen_cfg.get("tp", 1)
+                g_pp = gen_cfg.get("pp", 1)
+                t_tp = train_cfg.get("tp", 1)
+                t_cp = train_cfg.get("cp", 1)
+                t_ep = train_cfg.get("ep", 1)
+                t_pp = train_cfg.get("pp", 1)
+                
+                total_gpus = model_cfg.get("num_gpus", 0)
+                rollout_gbs = model_cfg.get("num_prompts", 64) * model_cfg.get("num_generations", 32)
+                
+                # Calculate DP values
+                t_dp = calculate_dp(total_gpus, t_tp, t_pp, t_ep)
+                g_dp = calculate_dp(total_gpus, g_tp, g_pp)
+                
+                model_short = model_cfg.get("model_name", "").split("/")[-1]
+                
+                configs.append({
+                    'name': f"{preset_name} ({model_short})",
+                    'preset_name': preset_name,
+                    'model': model_short,
+                    'total_gpus': total_gpus,
+                    'rollout_gbs': rollout_gbs,
+                    'train_gbs': model_cfg.get("train_gbs", 512),
+                    'max_seqlen': model_cfg.get("max_seqlen", 4096),
+                    'g_tp': g_tp,
+                    'g_pp': g_pp,
+                    'g_dp': g_dp,
+                    't_tp': t_tp,
+                    't_cp': t_cp,
+                    't_ep': t_ep,
+                    't_pp': t_pp,
+                    't_dp': t_dp,
+                })
+            except Exception as e:
+                print(f"⚠️  Error loading preset {preset_name}: {e}")
+                continue
         
         return configs
     except ImportError as e:
@@ -1406,8 +1435,8 @@ Filter Examples:
   python summarize_results.py --model Llama --rollout-gbs 512 --max-seqlen 4096
         """
     )
-    parser.add_argument("--project", default="sync-grpo-gb200-benchmark", 
-                        help="WandB project name")
+    parser.add_argument("--project", default=None, 
+                        help="WandB project name (default: auto-select based on --cluster)")
     parser.add_argument("--entity", default=None, help="WandB entity (team/user)")
     parser.add_argument("--slurm", action="store_true", help="Show SLURM job summary")
     parser.add_argument("--all", "-a", action="store_true", 
@@ -1424,8 +1453,10 @@ Filter Examples:
     
     # Filter options
     filter_group = parser.add_argument_group('Filter Options', 'Filter results by specific criteria')
+    filter_group.add_argument("--cluster", "-c", choices=["h100", "gb200"], default=None,
+                              help="Cluster type for preset matching (default: h100)")
     filter_group.add_argument("--match-presets", "-m", action="store_true",
-                              help="Match results against presets defined in launch_grpo.py")
+                              help="Match results against presets defined in model_configs.yaml")
     filter_group.add_argument("--filter-file", "-f", type=str, 
                               help="JSON file with target configurations (e.g., benchmark_configs.json)")
     filter_group.add_argument("--model", type=str, help="Filter by model name (partial match)")
@@ -1445,6 +1476,13 @@ Filter Examples:
     filter_group.add_argument("--g-dp", type=int, help="Filter by Generation Data Parallel")
     
     args = parser.parse_args()
+    
+    # Auto-select project name based on cluster type if not specified
+    if args.project is None:
+        if args.cluster == "gb200":
+            args.project = "sync-grpo-gb200-benchmark"
+        else:
+            args.project = "sync-grpo-h100-benchmark"
     
     # Build filter dict from args
     filters = {}
@@ -1497,9 +1535,10 @@ Filter Examples:
     
     # Apply filters
     if args.match_presets:
-        # Load presets from launch_grpo.py
-        print(f"\n🚀 Loading presets from launch_grpo.py")
-        target_configs = load_presets_from_launch_grpo()
+        # Load presets from model_configs.yaml
+        cluster_type = args.cluster or "h100"  # Default to h100 for matching
+        print(f"\n🚀 Loading presets from model_configs.yaml (cluster: {cluster_type})")
+        target_configs = load_presets_from_launch_grpo(cluster_type)
         if target_configs:
             print(f"   Loaded {len(target_configs)} preset configurations")
             results = filter_by_configs(results, target_configs, show_mismatches=True)
