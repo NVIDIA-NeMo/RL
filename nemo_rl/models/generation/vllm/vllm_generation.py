@@ -372,9 +372,36 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+    
+    def set_p2p_comm_group_address_and_port(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        """Set the p2p communication group address and port."""
+        data_splitted = []
+        total_workers = len(self.worker_group.workers)
+        if self.dp_size == 0:
+            raise RuntimeError(
+                "Data parallel size is zero, cannot initialize collective."
+            )
+        workers_per_group = total_workers // self.dp_size
+        for i in range(self.dp_size):
+            data_splitted.append(
+                comm_group_address_and_port[i * workers_per_group : (i + 1) * workers_per_group]
+            )
+        
+        method_name = (
+            "set_p2p_comm_group_address_and_port_async" if self.cfg["vllm_cfg"]["async_engine"] else "set_p2p_comm_group_address_and_port"
+        )
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            comm_group_address_and_port=data_splitted,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return futures
 
     def init_p2p(
-        self, worker_id: int, ip: str, port: int
+        self, total_rounds: int, init_p2p_round: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         # Choose the appropriate method based on async_engine setting
@@ -396,9 +423,8 @@ class VllmGeneration(GenerationInterface):
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={
-                "worker_id": worker_id,
-                "ip": ip,
-                "port": port,
+                "total_rounds": total_rounds,
+                "init_p2p_round": init_p2p_round,
             },
         )
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside

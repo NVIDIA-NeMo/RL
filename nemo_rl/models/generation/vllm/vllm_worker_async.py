@@ -592,12 +592,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    async def set_p2p_comm_group_address_and_port_async(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        """Set the p2p communication group address and port."""
+        await self.llm.collective_rpc(
+            "set_p2p_comm_group_address_and_port",
+            args=(comm_group_address_and_port,),
+        )
+
     async def init_p2p_async(
-        self, rank_prefix: int, worker_id: int, ip: str, port: int
+        self, rank_prefix: int, total_rounds: int, init_p2p_round: int
     ) -> None:
         await self.llm.collective_rpc(
             "init_p2p",
-            args=(rank_prefix, worker_id, ip, port),
+            args=(rank_prefix, total_rounds, init_p2p_round),
         )
 
     async def generate_async(

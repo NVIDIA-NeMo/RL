@@ -809,17 +809,30 @@ def init_p2p_between_policy_and_generation(
     policy_node_and_gpu_id_list = policy.report_node_ip_and_gpu_id()
     generation_node_and_gpu_id_list = policy_generation.report_node_ip_and_gpu_id()
     generation_node_and_gpu_id_to_worker_map = { tup: idx for idx, tup in enumerate(generation_node_and_gpu_id_list)}
-    
-    for train_worker_id in range(world_size):
-        gen_worker_id = _find_peer(train_worker_id, policy_node_and_gpu_id_list, generation_node_and_gpu_id_to_worker_map)
+
+    train_comm_group_address_and_port = []
+    for worker_id in range(world_size):
         if colocated_cluster._sorted_bundle_indices is not None:
             train_pg_idx = 0
-            train_bundle_idx = colocated_cluster._sorted_bundle_indices[train_worker_id]
+            train_bundle_idx = colocated_cluster._sorted_bundle_indices[worker_id]
         else:
-            train_pg_idx = train_worker_id // colocated_cluster.num_gpus_per_node
+            train_pg_idx = worker_id // colocated_cluster.num_gpus_per_node
             train_bundle_idx = 0
         ip, port = colocated_cluster.get_available_address_and_port(train_pg_idx, train_bundle_idx)
-        print(f"Initializing p2p communication between policy and generation on group {train_worker_id} with ip {ip} and port {port}")
-        futures_train = policy.init_p2p(train_worker_id, ip, port)
-        futures_inference = policy_generation.init_p2p(gen_worker_id, ip, port)
+        train_comm_group_address_and_port.append((ip, port))
+    ray.get(
+        policy.set_p2p_comm_group_address_and_port(train_comm_group_address_and_port)
+    )
+
+    gen_comm_group_address_and_port = []
+    for i in range(world_size):
+        gen_comm_group_address_and_port.append(train_comm_group_address_and_port[i ^ 1])
+    ray.get(
+        policy_generation.set_p2p_comm_group_address_and_port(gen_comm_group_address_and_port)
+    )
+
+    split = 1
+    for init_p2p_round in range(split):
+        futures_train = policy.init_p2p(split, init_p2p_round)
+        futures_inference = policy_generation.init_p2p(split, init_p2p_round)
         ray.get(futures_train + futures_inference)

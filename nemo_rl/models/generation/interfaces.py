@@ -223,8 +223,15 @@ class GenerationInterface(ABC):
         pass
 
     @abstractmethod
+    def set_p2p_comm_group_address_and_port(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        """Set the p2p communication group address and port."""
+        pass
+
+    @abstractmethod
     def init_p2p(
-        self, worker_id: int, ip: str, port: int
+        self, total_rounds: int, init_p2p_round: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         pass

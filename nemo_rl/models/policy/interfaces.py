@@ -146,8 +146,14 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def set_p2p_comm_group_address_and_port(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        pass
+
+    @abstractmethod
     def init_p2p(
-        self, group_id: int, ip: str, port: int
+        self, init_p2p_round: int
     ) -> list[ray.ObjectRef]:
         pass
 

@@ -261,15 +261,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def set_p2p_comm_group_address_and_port(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        """Set the p2p communication group address and port."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "set_p2p_comm_group_address_and_port",
+            comm_group_address_and_port=comm_group_address_and_port,
+        )
+        return futures
+
     def init_p2p(
-        self, group_id: int, ip: str, port: int
+        self, total_rounds: int, init_p2p_round: int
     ) -> list[ray.ObjectRef]:
         """Initialize the p2p communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "init_p2p",
-            group_id=group_id,
-            ip=ip,
-            port=port,
+            total_rounds=total_rounds,
+            init_p2p_round=init_p2p_round,
         )
         return futures
 

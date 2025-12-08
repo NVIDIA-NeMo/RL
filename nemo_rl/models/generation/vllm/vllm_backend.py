@@ -61,19 +61,27 @@ class VllmInternalWorkerExtension:
         self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             pg, device=self.device
         )
+    
+    def set_p2p_comm_group_address_and_port(
+        self, comm_group_address_and_port: list[tuple[str, int]]
+    ) -> None:
+        """Set the p2p communication group address and port."""
+        rank = torch.distributed.get_rank()
+        self.p2p_comm_group_address_and_port = comm_group_address_and_port[rank]
 
     def init_p2p(
-        self, rank_prefix: int, worker_id: int, ip: str, port: int
+        self, rank_prefix: int, total_rounds: int, init_p2p_round: int
     ) -> None:
         """Initialize the p2p communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
-        
+        ip, port = self.p2p_comm_group_address_and_port
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank
-        if worker_id != rank:
+        p2p_src_global = rank ^ 1
+        if p2p_src_global % total_rounds != init_p2p_round:
             return
-        self.p2p_src = int(not (bool(rank % 2)))
+        self.p2p_src = p2p_src_global % 2
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=(rank % 2), world_size=2
         )
