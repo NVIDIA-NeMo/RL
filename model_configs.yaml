@@ -325,6 +325,68 @@ qwen235b:
       pp: 8
 
 # ============================================
+# GPT-OSS-20B (Dense Model)
+# ============================================
+gptoss20b:
+  model_name: "openai/gpt-oss-20b"
+  config_file: "examples/configs/recipes/llm/grpo-gptoss-20b-8n8g-megatron.yaml"
+  
+  h100:
+    # 16 GPUs (2 nodes) - Current working config
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+      # dp: 4
+    training:
+      tp: 4
+      cp: 1
+      ep: 1  # Dense model, no experts
+      pp: 4
+      # dp: 1
+  
+  h100_1node:
+    # 8 GPUs (1 node) - Target for memory optimization
+    num_gpus: 8
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+      # dp: 2
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+      # dp: 1
+  
+  gb200:
+    # 16 GPUs (4 nodes)
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+
+# ============================================
 # DeepSeek-V3 (671B MoE)
 # ============================================
 deepseek_v3:

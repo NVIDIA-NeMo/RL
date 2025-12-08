@@ -289,11 +289,11 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-# Sync Ray package to ensure version matches uv.lock
-# This ensures the Ray cluster and driver use the same version
-echo "[INFO] Syncing Ray package from uv.lock..."
-cd $SLURM_SUBMIT_DIR && uv sync --locked --refresh-package ray 2>&1 || echo "[WARNING] uv sync failed, continuing with existing venv"
-echo "[INFO] Ray version after sync: \$(ray --version)"
+# Sync Ray version to match pyproject.toml
+# This ensures cluster uses same ray version as driver (uv run)
+echo "[INFO] Syncing Ray from pyproject.toml..."
+cd $SLURM_SUBMIT_DIR && uv sync --quiet 2>&1 || echo "[WARNING] uv sync failed, continuing with existing version"
+echo "[INFO] Ray version: \$(ray --version)"
 
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
@@ -397,10 +397,11 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-# Sync Ray package to ensure version matches uv.lock (same as head node)
-echo "[INFO] Syncing Ray package from uv.lock..."
-cd $SLURM_SUBMIT_DIR && uv sync --locked --refresh-package ray 2>&1 || echo "[WARNING] uv sync failed, continuing with existing venv"
-echo "[INFO] Ray version after sync: \$(ray --version)"
+# Sync Ray version to match pyproject.toml
+# This ensures cluster uses same ray version as driver (uv run)
+echo "[INFO] Syncing Ray from pyproject.toml..."
+cd $SLURM_SUBMIT_DIR && uv sync --quiet 2>&1 || echo "[WARNING] uv sync failed, continuing with existing version"
+echo "[INFO] Ray version: \$(ray --version)"
 
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
@@ -476,6 +477,7 @@ echo "All workers connected!"
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
+  # Driver uses pyproject.toml ray version via uv run (same as cluster after uv sync)
   srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
