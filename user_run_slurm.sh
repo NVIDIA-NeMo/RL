@@ -50,9 +50,10 @@ fi
 # CONTAINER="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/gitlab-master.nvidia.com/terryk/images/nemo-rl:flash-attn-2.7.4-f09cb2a2.squashfs" \
 # CONTAINER="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/gitlab-master.nvidia.com/terryk/images/nemo-rl:flash-attn-2.7.4-f09cb2a2.squashfs" \
 # CONTAINER="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/nvcr.io/nvidian/nemo-rl:bd2e645-37644239.squashfs" \
+# CONTAINER="/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/nemo-rl-v0.4.0.sqsh" \
 ACCOUNT=${ACCOUNT:-"coreai_dlalgo_nemorl"}
 HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN} \
-CONTAINER="/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/nemo-rl-v0.4.0.sqsh" \
+CONTAINER="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/nvcr.io/nvidian/nemo-rl:25ff3f6-39379275.squashfs" \
 WANDB_API_KEY=${WANDB_API_KEY} \
 HF_HOME=/lustre/fsw/portfolios/coreai/users/zhiyul/hf \
 MOUNTS=$MOUNTS \
