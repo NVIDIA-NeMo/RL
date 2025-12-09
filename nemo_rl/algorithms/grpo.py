@@ -756,8 +756,8 @@ def setup(
         nemo_gym_config = NemoGymConfig(
             model_name=policy_generation.cfg["model_name"],
             base_urls=policy_generation.dp_openai_server_base_urls,
-            gpu_nodes=[node["node_id"] for node in nemo_gym_nodes],
-            num_gpus_per_node=nemo_gym_num_gpus_per_node,
+            ray_gpu_nodes=[node["node_id"] for node in nemo_gym_nodes],
+            ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
             ray_namespace=ray_namespace,
             initial_global_config_dict=env_configs["nemo_gym"],
         )

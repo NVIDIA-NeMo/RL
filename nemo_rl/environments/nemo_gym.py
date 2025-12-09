@@ -27,8 +27,8 @@ from nemo_rl.utils.timer import Timer
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
-    gpu_nodes: List[Dict[str, Any]]
-    num_gpus_per_node: Optional[int]
+    ray_gpu_nodes: List[str]
+    ray_num_gpus_per_node: Optional[int]
     ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
 
@@ -86,9 +86,9 @@ Depending on your data shape, you may want to change these values."""
             initial_global_config_dict["ray_namespace"] = ray_namespace
             print(f"Ray namespace: {ray_namespace}")
 
-        initial_global_config_dict["ray_gpu_nodes"] = self.cfg["gpu_nodes"]
+        initial_global_config_dict["ray_gpu_nodes"] = self.cfg["ray_gpu_nodes"]
         initial_global_config_dict["ray_num_gpus_per_node"] = self.cfg[
-            "num_gpus_per_node"
+            "ray_num_gpus_per_node"
         ]
         print(
             f"Ray reserved GPU nodes: {len(initial_global_config_dict['ray_gpu_nodes'])}"
