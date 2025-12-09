@@ -24,6 +24,7 @@ import numpy as np
 import ray
 import ray.util.state
 import torch
+from ray.actor import ActorProxy
 from ray.util.placement_group import (
     placement_group,
     remove_placement_group,
@@ -208,7 +209,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
-    Optional[NemoGym],
+    Optional[ActorProxy[NemoGym]],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
     Optional[StatefulDataLoader],

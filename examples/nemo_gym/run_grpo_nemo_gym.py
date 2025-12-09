@@ -234,7 +234,7 @@ The validation set you pass in will directly be used for validation with no addi
     (
         policy,
         policy_generation,
-        nemo_gym,
+        nemo_gym_env,
         cluster,
         dataloader,
         val_dataloader,
@@ -245,7 +245,7 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    task_to_env = {"nemo_gym": nemo_gym}
+    task_to_env = {"nemo_gym": nemo_gym_env}
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:
