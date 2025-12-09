@@ -471,8 +471,9 @@ class RayVirtualCluster:
             ray.kill(actor)
 
         # original index, node_id, gpu_id
+        ip_map = lambda ip_address: tuple(int(x) for x in ip_address.split("."))
         bundle_infos = [
-            (i, ip_and_gpu_ids[i][0], ip_and_gpu_ids[i][1]) for i in range(num_bundles)
+            (i, ip_map(ip_and_gpu_ids[i][0]), ip_and_gpu_ids[i][1]) for i in range(num_bundles)
         ]
         pg_reordered_nid_and_bundle_indices = []
         pg_reordered_bundle_indices = []
