@@ -19,22 +19,51 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from importlib.util import find_spec
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
 
 
+def _get_transformer_engine_file(relative_path: str) -> str:
+    """Return absolute path to a Transformer Engine file or raise if it cannot be found.
+
+    The relative_path should be a POSIX-style path under the transformer_engine
+    package root, e.g. "pytorch/triton/permutation.py".
+    """
+    spec = find_spec("transformer_engine")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(
+            "Transformer Engine package not found while attempting to patch "
+            f"'{relative_path}'. Ensure `transformer-engine` is installed and "
+            "available in this environment."
+        )
+
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, *relative_path.split("/"))
+
+    if not os.path.exists(file_path):
+        raise RuntimeError(
+            "Failed to locate expected Transformer Engine file to patch. "
+            f"Looked for '{relative_path}' at '{file_path}'. "
+            "This likely indicates an unexpected Transformer Engine installation "
+            "layout or version mismatch."
+        )
+
+    return file_path
+
+
 def _apply_transformer_engine_patch():
-    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files."""
+    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files.
+
+    This locates the target file via importlib metadata instead of importing
+    `transformer_engine`, to avoid side effects during initialization. If the
+    permutation module has already been imported, it will be reloaded so that
+    the patched source takes effect.
+    """
     try:
-        import transformer_engine
-
-        te_path = os.path.dirname(transformer_engine.__file__)
-        perm_file = os.path.join(te_path, "pytorch", "triton", "permutation.py")
-
-        if not os.path.exists(perm_file):
-            return
+        perm_file = _get_transformer_engine_file("pytorch/triton/permutation.py")
 
         with open(perm_file, "r") as f:
             content = f.read()
@@ -68,21 +97,24 @@ def _apply_transformer_engine_patch():
                 try:
                     with open(perm_file, "w") as f:
                         f.write(new_content)
-                    print("Successfully patched transformer_engine.")
+                    print("Successfully patched transformer_engine permutation.py.")
                 except OSError as e:
                     print(
                         f"Could not write patch to transformer_engine (permission denied?): {e}"
                     )
-            else:
-                print("Could not find patch locations in permutation.py")
 
-    except (ImportError, FileNotFoundError, AttributeError):
-        pass
+        # If the permutation module is already imported in this process,
+        # reload it so that the patched source takes effect for subsequent use.
+        import importlib
+        import sys
+
+        perm_module_name = "transformer_engine.pytorch.triton.permutation"
+        if perm_module_name in sys.modules:
+            importlib.reload(sys.modules[perm_module_name])
+
     except Exception as e:
         print(f"Error checking/patching transformer_engine: {e}")
 
-
-_apply_transformer_engine_patch()
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
@@ -508,6 +540,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        _apply_transformer_engine_patch()
+
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
