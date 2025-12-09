@@ -401,6 +401,8 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 'performance/train_fp_utilization',
                 'performance/tokens_per_sec',
                 'performance/seq_per_sec',
+                # Generation length metrics (important for throughput analysis)
+                'train/mean_gen_tokens_per_sample',
             ]
             
             # Initialize metrics dict with defaults
@@ -564,6 +566,27 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 'performance/seq_per_sec',
                 'train/seq_per_sec',
             )
+            
+            # ============================================
+            # Mean Generation Length (full run average)
+            # This metric varies per step, so we calculate the average over ALL steps
+            # Also track min/max to show variability
+            # ============================================
+            mean_gen_length = 0
+            mean_gen_length_std = 0
+            min_gen_length = 0
+            max_gen_length = 0
+            try:
+                gen_len_history = run.history(keys=['train/mean_gen_tokens_per_sample'], pandas=True)
+                if gen_len_history is not None and len(gen_len_history) > 0:
+                    gen_len_col = gen_len_history['train/mean_gen_tokens_per_sample'].dropna()
+                    if len(gen_len_col) > 0:
+                        mean_gen_length = gen_len_col.mean()
+                        mean_gen_length_std = gen_len_col.std()
+                        min_gen_length = gen_len_col.min()
+                        max_gen_length = gen_len_col.max()
+            except Exception:
+                pass
             
             # Get log directory from config
             log_dir = ''
@@ -758,6 +781,11 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                 'training_tokens_per_sec_per_gpu': training_tokens_per_sec_per_gpu,
                 'policy_training_tokens_per_sec_per_gpu': policy_training_tokens_per_sec_per_gpu,
                 'logprobs_tokens_per_sec_per_gpu': logprobs_tokens_per_sec_per_gpu,
+                # Generation length (important for throughput analysis)
+                'mean_gen_length': mean_gen_length,
+                'mean_gen_length_std': mean_gen_length_std,
+                'min_gen_length': min_gen_length,
+                'max_gen_length': max_gen_length,
                 # Training metrics
                 'train_loss': get_metric_with_fallback('train/loss', 'loss'),
                 'train_accuracy': get_metric_with_fallback('train/accuracy', 'accuracy'),
@@ -844,9 +872,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
     sorted_models = sorted(model_groups.keys())
     
     # Print header
-    print(f"\n{BOLD}{'='*265}{RESET}")
+    print(f"\n{BOLD}{'='*294}{RESET}")
     print(f"{BOLD}GRPO Benchmark Results - GB200 (Grouped by Model){RESET}")
-    print(f"{'='*265}")
+    print(f"{'='*294}")
     
     if detailed:
         # Detailed view with timing breakdown
@@ -875,6 +903,7 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
             f"{'G.TP':>4} {'G.PP':>4} {'G.DP':>4} "
             f"{'T.TP':>4} {'T.CP':>4} {'T.EP':>4} {'T.PP':>4} {'T.DP':>4} "
             f"{'Step(s)':>8} {'ExpGen(s)':>10} {'Train(s)':>9} "
+            f"{'GenLen(Avg)':>11} {'GenLen(Min-Max)':>16} "
             f"{'E2ETok/GPU':>11} {'GenTok/GPU':>11} {'TrnTok/GPU':>11} {'PolTot/GPU':>11} "
             f"{'MFU%':>6} "
             f"{'TFLOPs':>7} "
@@ -893,9 +922,9 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         model_color = model_colors[model_idx % len(model_colors)]
         
         # Print model group header
-        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (245 - len(model) - 15)}┐{RESET}")
+        print(f"\n{model_color}{BOLD}┌─ {model} ({len(model_results)} runs) {'─' * (274 - len(model) - 15)}┐{RESET}")
         print(f"{DIM}{header}{RESET}")
-        print(f"{DIM}{'-' * 265}{RESET}")
+        print(f"{DIM}{'-' * 294}{RESET}")
         
         for r in model_results:
             model_name = r.get('model', 'Unknown')[:13]
@@ -969,6 +998,12 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                 gen_time = r.get('generation_time', 0)  # timing/train/generation (or exposed_generation for async)
                 policy_train_time = r.get('policy_training_time', 0)  # timing/train/policy_training
                 
+                # Get mean generation length (important for throughput analysis)
+                mean_gen_len = r.get('mean_gen_length', 0)
+                min_gen_len = r.get('min_gen_length', 0)
+                max_gen_len = r.get('max_gen_length', 0)
+                gen_len_range = f"{min_gen_len:.0f}-{max_gen_len:.0f}" if min_gen_len > 0 else "N/A"
+                
                 row = (
                     f"{model_name:<15} "
                     f"{type_str:<5} "
@@ -988,6 +1023,8 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{step_time:>8.2f} "
                     f"{gen_time:>10.2f} "
                     f"{policy_train_time:>9.2f} "
+                    f"{mean_gen_len:>11.0f} "
+                    f"{gen_len_range:>16} "
                     f"{tokens_sec_gpu:>11,.0f} "
                     f"{gen_tok_gpu:>11,.0f} "
                     f"{train_tok_gpu:>11,.0f} "
@@ -1013,10 +1050,10 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
         if model_completed:
             best_tok = max(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed)
             avg_tok = sum(r.get('tokens_per_sec_per_gpu', 0) for r in model_completed) / len(model_completed)
-            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 205}┘{RESET}")
+            print(f"{model_color}{BOLD}└─ Best: {best_tok:,.0f} tok/s/GPU | Avg: {avg_tok:,.0f} tok/s/GPU {'─' * 234}┘{RESET}")
     
     # Overall summary
-    print(f"\n{'='*265}")
+    print(f"\n{'='*294}")
     print(f"\n📊 {BOLD}Overall Summary{RESET}")
     print(f"   Total runs: {total_runs}")
     print(f"   Models: {len(sorted_models)}")
@@ -1064,6 +1101,8 @@ def save_csv(results: list, output_path: str):
         # Detailed throughput
         'gen_tokens_per_sec_per_gpu', 'training_tokens_per_sec_per_gpu',
         'policy_training_tokens_per_sec_per_gpu', 'logprobs_tokens_per_sec_per_gpu',
+        # Generation length (important for throughput analysis)
+        'mean_gen_length', 'mean_gen_length_std', 'min_gen_length', 'max_gen_length',
         # Training metrics
         'train_loss', 'train_accuracy', 
         'status', 'created_at'
