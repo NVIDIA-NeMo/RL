@@ -784,14 +784,14 @@ def setup(
                 "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
             },
         }
-        gym = NemoGym.options(**nemo_gym_options).remote(
+        nemo_gym_actor = NemoGym.options(**nemo_gym_options).remote(
             nemo_gym_config, logger.base_log_dir
         )
         # Blocking wait for NeMo Gym to spin up
-        ray.get(gym._spinup.remote())
+        ray.get(nemo_gym_actor._spinup.remote())
 
     else:
-        gym = None
+        nemo_gym_actor = None
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -829,7 +829,7 @@ def setup(
     return (
         policy,
         policy_generation,
-        gym,
+        nemo_gym_actor,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
