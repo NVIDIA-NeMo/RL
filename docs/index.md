@@ -170,6 +170,7 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 :hidden:
 
 about/overview
+about/performance-summary
 about/features
 about/backends
 about/quick-start
@@ -179,6 +180,8 @@ about/evaluation
 about/clusters
 about/tips-and-tricks
 ```
+
+
 
 ```{toctree}
 :caption: Environment Start
@@ -242,6 +245,7 @@ design-docs/design-and-philosophy.md
 design-docs/padding.md
 design-docs/logger.md
 design-docs/uv.md
+design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md

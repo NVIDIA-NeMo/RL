@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 import threading
+import time
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -48,7 +50,7 @@ def _replace_prefix_tokens(
     in order to preserve the monotonic tokens property for optimized multi-turn
     training.
 
-    Some environments (namely Penguin) require an OpenAI compatible server
+    Some environments (namely NeMo-Gym) require an OpenAI compatible server
     endpoint rather than an inference engine handle. This is fine for the most
     part, but it may cause issues when the environment is used as a part of
     training.
@@ -129,6 +131,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
 
         # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
@@ -137,7 +140,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+        self.stat_loggers = (
+            [PrometheusStatLogger]
+            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            else []
+        )
+        self.llm = AsyncLLM.from_engine_args(
+            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+        )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
@@ -145,12 +155,112 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 self._setup_vllm_server()
             )
 
+        # vLLM Metrics Logger
+        # Metrics logger only enabled for per-actor, model-owner only
+        self._vllm_metrics_lock = threading.Lock()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._start_vllm_metrics_logger()
+
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM logger metrics.
+
+        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Runs only on the model-owner actor.
+        """
+        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+
+        assert self.cfg["vllm_cfg"].get("async_engine", False), (
+            "vLLM metrics logger is only supported with async engine enabled"
+        )
+        # Run only on the model-owner actor
+        if not getattr(self, "is_model_owner", False):
+            return
+
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
+
+        # Lazy import inside thread target to avoid import overhead if disabled
+        stop_event = threading.Event()
+        self._vllm_metrics_logger_stop_event = stop_event
+
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+        self.kv_cache_usage_perc: list[float] = []
+        self.generation_tokens: list[int] = []
+
+        def _logger_loop():
+            # Delay a little to let engine settle
+            time.sleep(min(2.0, interval_s))
+            while True:
+                try:
+                    for m in get_metrics_snapshot():
+                        with self._vllm_metrics_lock:
+                            if isinstance(m, Gauge):
+                                # Log the vllm inflight batch sizes
+                                if m.name == "vllm:num_requests_running":
+                                    self.inflight_batch_sizes.append(int(m.value))
+                                # Log the vllm pending number of requests in the queue
+                                elif m.name == "vllm:num_requests_waiting":
+                                    self.num_pending_samples.append(int(m.value))
+                                # Log the vllm kv cache usage
+                                elif m.name == "vllm:kv_cache_usage_perc":
+                                    self.kv_cache_usage_perc.append(float(m.value))
+                            elif isinstance(m, Counter):
+                                if m.name == "vllm:generation_tokens":
+                                    self.generation_tokens.append(int(m.value))
+                except Exception:
+                    print(
+                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        flush=True,
+                    )
+                    pass
+                time.sleep(interval_s)
+
+        t = threading.Thread(
+            target=_logger_loop, name="vllm-metrics-logger", daemon=True
+        )
+        t.start()
+        self._vllm_metrics_logger_thread = t
+        print(
+            "📋[vLLM Metric Logger] vLLM metrics logger thread started",
+            flush=True,
+        )
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            metric = {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
+                "generation_tokens": copy.deepcopy(self.generation_tokens),
+            }
+        return metric
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+
+        with self._vllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
+            self.generation_tokens = []
+
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
         from logging import Filter as LoggingFilter
@@ -193,7 +303,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
-                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
                         if "prompt_token_ids" in message:
