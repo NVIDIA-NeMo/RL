@@ -130,7 +130,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_comm_producer
+from nemo_rl.utils.packed_tensor import packed_comm_producer, packed_broadcast_producer
 
 try:
     from megatron.core.distributed import (
@@ -2135,8 +2135,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
-            collective_type="broadcast",
-            collective_arg=0,
+            src=0,
             post_iter_func=lambda x: x[1],
         )
 

@@ -25,7 +25,7 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_comm_consumer
+from nemo_rl.utils.packed_tensor import packed_comm_consumer, packed_broadcast_consumer
 
 try:
     import vllm  # noqa: F401
@@ -267,11 +267,10 @@ class VllmInternalWorkerExtension:
         load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
 
         try:
-            packed_comm_consumer(
+            packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,
-                collective_type="broadcast",
-                collective_arg=0,
+                src=0,
                 post_unpack_func=load_model_weight_func,
             )
         except Exception as e:

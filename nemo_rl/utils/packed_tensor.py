@@ -215,3 +215,33 @@ def packed_comm_consumer(iterator, group, collective_type, collective_arg, post_
                         )
                     )
                 break
+
+
+def packed_broadcast_producer(iterator, group, src, post_iter_func):
+    """Broadcast a list of tensors in a packed manner.
+
+    Args:
+        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
+        group: process group (vllm PyNcclCommunicator)
+        src: source rank (0 in current implementation)
+        post_iter_func: function to apply to each tensor before packing, should return a tensor
+
+    Returns:
+        None
+    """
+    packed_comm_producer(iterator, group, "broadcast", src, post_iter_func)
+
+
+def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+    """Consume a packed tensor and unpack it into a list of tensors.
+
+    Args:
+        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
+        group: process group (vllm PyNcclCommunicator)
+        src: source rank (0 in current implementation)
+        post_unpack_func: function to apply to each tensor after unpacking
+
+    Returns:
+        None
+    """
+    packed_comm_consumer(iterator, group, "broadcast", src, post_unpack_func)
