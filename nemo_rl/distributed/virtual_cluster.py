@@ -18,6 +18,7 @@ import time
 from typing import Optional, TypedDict
 
 import ray
+from ray.util import get_node_ip_address
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -503,3 +504,18 @@ class RayVirtualCluster:
         user calls shutdown().
         """
         self.shutdown()
+
+
+@ray.remote  # pragma: no cover
+class RayClusterSetupHelper:
+    def __init__(self, *init_args, **init_kwargs):
+        self.init_args = init_args
+        self.init_kwargs = init_kwargs
+
+    def _get_node_info(self) -> dict:
+        try:
+            node_id = ray.get_runtime_context().get_node_id()
+        except Exception:
+            node_id = None
+        node_ip = get_node_ip_address()
+        return {"node_id": node_id, "node_ip": node_ip}

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 import ray
 import torch
@@ -27,6 +27,9 @@ from nemo_rl.utils.timer import Timer
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    gpu_nodes: List[Dict[str, Any]]
+    num_gpus_per_node: Optional[int]
+    namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
 
 
@@ -37,6 +40,7 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
         self.node_ip = _get_node_ip_local()
         self.head_server_port = _get_free_port_local()
 
@@ -77,6 +81,22 @@ Depending on your data shape, you may want to change these values."""
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
 
+        ray_namespace = self.cfg.get("namespace", None)
+        if ray_namespace is not None:
+            initial_global_config_dict["ray_namespace"] = ray_namespace
+            print(f"Ray namespace: {ray_namespace}")
+
+        initial_global_config_dict["ray_gpu_nodes"] = self.cfg["gpu_nodes"]
+        initial_global_config_dict["ray_num_gpus_per_node"] = self.cfg[
+            "num_gpus_per_node"
+        ]
+        print(
+            f"Ray reserved GPU nodes: {len(initial_global_config_dict['ray_gpu_nodes'])}"
+        )
+        print(
+            f"Ray num GPUs per node: {initial_global_config_dict['ray_num_gpus_per_node']}"
+        )
+
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
             "host": "0.0.0.0",
@@ -99,9 +119,6 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
-
-    def health_check(self) -> bool:
-        return True
 
     async def run_rollouts(
         self,
