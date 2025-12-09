@@ -29,7 +29,7 @@ class NemoGymConfig(TypedDict):
     base_urls: List[str]
     gpu_nodes: List[Dict[str, Any]]
     num_gpus_per_node: Optional[int]
-    namespace: Optional[str]
+    ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
 
 
@@ -81,7 +81,7 @@ Depending on your data shape, you may want to change these values."""
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
 
-        ray_namespace = self.cfg.get("namespace", None)
+        ray_namespace = self.cfg.get("ray_namespace", None)
         if ray_namespace is not None:
             initial_global_config_dict["ray_namespace"] = ray_namespace
             print(f"Ray namespace: {ray_namespace}")
