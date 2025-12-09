@@ -118,7 +118,7 @@ def helpsteer3_data_processor(
                     max_seq_length // len(message_log), len(chat_message["token_ids"])
                 )
             ]
-        loss_multiplier = 0.1  # Reduce loss for truncated sequences
+        loss_multiplier = 0.0  # Reduce loss for truncated sequences
 
     output: DatumSpec = {
         "message_log": message_log,
