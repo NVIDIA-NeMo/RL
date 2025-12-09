@@ -5,8 +5,8 @@
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = ssh://git@gitlab-master.nvidia.com:12051/liding/Megatron-Bridge.git
-	branch = liding/nm6_recipes_pr_2
+	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+	branch = liding/nm6_one_off
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
