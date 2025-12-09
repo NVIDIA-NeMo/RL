@@ -32,7 +32,7 @@ else
 fi
 
 uv run examples/run_grpo_math.py \
-    --config examples/configs/recipes/llm/dapo-deepseek-v3-671b.yaml \
+    --config examples/configs/recipes/llm/performance/dapo-deepseek-v3-64n8g.yaml \
     grpo.num_prompts_per_step=64 \
     grpo.num_generations_per_prompt=8 \
     grpo.max_num_steps=10 \
