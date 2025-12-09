@@ -760,36 +760,30 @@ def setup(
             ray_namespace=ray_namespace,
             initial_global_config_dict=env_configs["nemo_gym"],
         )
-        nemo_gym_py_exec = get_actor_python_env(
-            "nemo_rl.environments.nemo_gym.NemoGym"
-        )
+        nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
         if nemo_gym_py_exec.startswith("uv"):
             # Lazily build a dedicated venv across all Ray nodes on-demand.
             nemo_gym_py_exec = create_local_venv_on_each_node(
-                nemo_gym_py_exec,
-                "nemo_rl.environments.nemo_gym.NemoGym"
+                nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
         for nemo_gym_helper in nemo_gym_helpers:
             ray.kill(nemo_gym_helper, no_restart=True)
         del nemo_gym_helpers
         nemo_gym_options = {}
         if nemo_gym_num_nodes:
-            # nemo_gym_head_node_id = nemo_gym_nodes[0]["node_id"]
             nemo_gym_head_node_id = ray_cur_node_id
             nemo_gym_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
                 node_id=nemo_gym_head_node_id,
                 soft=True,
             )
-        nemo_gym_options["runtime_env"] = (
-            {
-                "py_executable": nemo_gym_py_exec,
-                "env_vars": {
-                    **os.environ,
-                    "VIRTUAL_ENV": nemo_gym_py_exec,
-                    "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-                },
-            }
-        )
+        nemo_gym_options["runtime_env"] = {
+            "py_executable": nemo_gym_py_exec,
+            "env_vars": {
+                **os.environ,
+                "VIRTUAL_ENV": nemo_gym_py_exec,
+                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+            },
+        }
         gym = NemoGym.options(**nemo_gym_options).remote(
             nemo_gym_config, logger.base_log_dir
         )
