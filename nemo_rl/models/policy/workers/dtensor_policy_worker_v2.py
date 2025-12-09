@@ -23,6 +23,7 @@ from typing import Any, Generator, Optional, cast
 import ray
 import torch
 from accelerate import init_empty_weights
+from hydra.utils import get_class
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
@@ -90,7 +91,6 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.utils.path import import_class_from_path
 
 
 @ray.remote(
@@ -406,7 +406,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         if init_optimizer:
-            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
                 self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
             )
@@ -415,9 +415,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         if "scheduler" in self.cfg and self.optimizer is not None:
             if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = import_class_from_path(
-                    cast(str, self.cfg["scheduler"]["name"])
-                )
+                scheduler_cls = get_class(cast(str, self.cfg["scheduler"]["name"]))
                 self.scheduler = scheduler_cls(
                     self.optimizer, **self.cfg["scheduler"]["kwargs"]
                 )
@@ -426,7 +424,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for scheduler_cfg in self.cfg["scheduler"]:
                     if "name" in scheduler_cfg:
                         schedulers.append(
-                            import_class_from_path(scheduler_cfg["name"])(
+                            get_class(scheduler_cfg["name"])(
                                 self.optimizer, **scheduler_cfg["kwargs"]
                             )
                         )

@@ -14,9 +14,10 @@
 import os
 from typing import Any, Dict, NotRequired, TypedDict
 
+from hydra.utils import get_object
+
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.utils.path import import_class_from_path
 
 
 # Environment registry entry schema.
@@ -97,7 +98,7 @@ def create_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
         f"Env name {env_name} is not registered in ENV_REGISTRY. Please call register_env() to register the environment."
     )
     actor_class_fqn = ENV_REGISTRY[env_name]["actor_class_fqn"]
-    actor_class = import_class_from_path(actor_class_fqn)
+    actor_class = get_object(actor_class_fqn)
     env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(actor_class_fqn),
