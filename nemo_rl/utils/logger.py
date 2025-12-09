@@ -379,19 +379,6 @@ class SwanlabLogger(LoggerInterface):
             f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
         )
 
-    def define_metric(
-        self,
-        name: str,
-        step_metric: Optional[str] = None,
-    ) -> None:
-        """Define a metric with custom step metric.
-
-        Args:
-            name: Name of the metric or pattern (e.g. 'ray/*')
-            step_metric: Optional name of the step metric to use
-        """
-        self.run.define_metric(name, step_metric=step_metric)
-
     def log_metrics(
         self,
         metrics: dict[str, Any],
@@ -889,11 +876,6 @@ class Logger(LoggerInterface):
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
                 self.wandb_logger.define_metric(
-                    f"{metric_prefix}/*", step_metric=step_metric
-                )
-
-            if cfg["swanlab_enabled"] and self.swanlab_logger:
-                self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
