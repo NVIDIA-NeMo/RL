@@ -347,6 +347,148 @@ def validate(
     return val_metrics, timing_metrics
 
 
+def _warmup_compiled_graph(
+    policy: PolicyInterface,
+    loss_fn,
+    tokenizer: PreTrainedTokenizerBase,
+    master_config: dict,
+) -> None:
+    """Warmup Ray Compiled Graph with maximum sequence length.
+    
+    This creates fake data with max_total_sequence_length to ensure the
+    compiled graph is built with the worst-case input shape, avoiding
+    recompilation during actual training.
+    
+    Args:
+        policy: The policy to warmup
+        loss_fn: Loss function to use
+        tokenizer: Tokenizer for creating fake tokens
+        master_config: Master configuration dict
+    """
+    import os
+    import torch
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    
+    # Get configuration
+    max_seq_len = master_config["policy"]["max_total_sequence_length"]
+    gbs = master_config["policy"]["train_global_batch_size"]
+    mbs = master_config["policy"]["train_micro_batch_size"]
+    
+    # Allow override via environment variable
+    warmup_seq_len = int(os.environ.get("NEMO_RL_WARMUP_SEQ_LEN", max_seq_len))
+    warmup_gbs = int(os.environ.get("NEMO_RL_WARMUP_GBS", gbs))
+    
+    print(f"  🔧 Warmup config: SEQ_LEN={warmup_seq_len}, GBS={warmup_gbs}, MBS={mbs}")
+    print(f"  📦 Creating fake data with shape: ({warmup_gbs}, {warmup_seq_len})")
+    
+    # Create fake data with max sequence length
+    # Use valid token IDs from the tokenizer's vocabulary
+    vocab_size = len(tokenizer)
+    fake_input_ids = torch.randint(
+        low=0, 
+        high=min(vocab_size, 32000),  # Use reasonable token range
+        size=(warmup_gbs, warmup_seq_len),
+        dtype=torch.long
+    )
+    
+    # Create attention mask (all ones = no padding)
+    fake_attention_mask = torch.ones(
+        (warmup_gbs, warmup_seq_len),
+        dtype=torch.long
+    )
+    
+    # Create position IDs
+    fake_position_ids = torch.arange(
+        warmup_seq_len,
+        dtype=torch.long
+    ).unsqueeze(0).expand(warmup_gbs, -1)
+    
+    # Create labels (same as input_ids for SFT)
+    fake_labels = fake_input_ids.clone()
+    
+    # Create loss mask (all ones = compute loss on all tokens)
+    fake_loss_mask = torch.ones(
+        (warmup_gbs, warmup_seq_len),
+        dtype=torch.float32
+    )
+    
+    # All sequences have the same length (max_seq_len)
+    fake_input_lengths = torch.full(
+        (warmup_gbs,),
+        warmup_seq_len,
+        dtype=torch.long
+    )
+    
+    # Create sample mask (all sequences are valid, no padding/dummy sequences)
+    fake_sample_mask = torch.ones(
+        (warmup_gbs,),
+        dtype=torch.float32
+    )
+    
+    # Create token mask (all tokens contribute to loss, used for token-level loss)
+    fake_token_mask = torch.ones(
+        (warmup_gbs, warmup_seq_len),
+        dtype=torch.float32
+    )
+    
+    # Create microbatch indices and lengths for sequence packing
+    # For warmup, all sequences have same length, so we create simple placeholders
+    num_microbatches = warmup_gbs // mbs
+    fake_micro_batch_indices = []
+    fake_micro_batch_lengths = []
+    
+    for mb_idx in range(num_microbatches):
+        start_idx = mb_idx * mbs
+        end_idx = start_idx + mbs
+        # Each microbatch contains mbs sequences, each of length warmup_seq_len
+        fake_micro_batch_indices.append(list(range(start_idx, end_idx)))
+        fake_micro_batch_lengths.append([warmup_seq_len] * mbs)
+    
+    # Create BatchedDataDict with fake data
+    warmup_data = BatchedDataDict({
+        "input_ids": fake_input_ids,
+        "attention_mask": fake_attention_mask,
+        "position_ids": fake_position_ids,
+        "labels": fake_labels,
+        "loss_mask": fake_loss_mask,
+        "input_lengths": fake_input_lengths,
+        "sample_mask": fake_sample_mask,
+        "token_mask": fake_token_mask,
+        "micro_batch_indices": fake_micro_batch_indices,
+        "micro_batch_lengths": fake_micro_batch_lengths,
+    })
+    
+    # Store warmup data in Ray object store for efficient sharing across workers
+    print(f"  🚀 Running warmup training step...")
+    
+    # Run one training step to trigger graph compilation
+    # Use eval_mode=True to skip optimizer step (we don't care about gradients)
+    try:
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        start_time.record()
+        _ = policy.train(
+            data=warmup_data,
+            loss_fn=loss_fn,
+            eval_mode=True,  # Skip optimizer step
+            gbs=warmup_gbs,
+            mbs=mbs,
+        )
+        end_time.record()
+        
+        # Wait for completion
+        torch.cuda.synchronize()
+        warmup_time = start_time.elapsed_time(end_time) / 1000.0  # Convert to seconds
+        
+        print(f"  ✅ Warmup step completed in {warmup_time:.2f}s")
+        print(f"  💾 Compiled graph is now cached and ready for training")
+        
+    except Exception as e:
+        print(f"  ⚠️  Warmup failed: {e}")
+        print(f"  ℹ️  Continuing with normal training (graph will compile on first real step)")
+
+
 def sft_train(
     policy,
     train_dataloader,
@@ -406,31 +548,60 @@ def sft_train(
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
+    # Warmup compiled graph with max sequence length if enabled
+    import os
+    from nemo_rl.distributed.ray_compiled_graph import should_use_compiled_graph
+    
+    # Only warmup if BOTH warmup flag AND RCG are enabled
+    warmup_enabled = os.environ.get("NEMO_RL_WARMUP_COMPILED_GRAPH", "0") == "1"
+    rcg_enabled = should_use_compiled_graph()
+    
+    if warmup_enabled and rcg_enabled and total_steps == 0:
+        print("\n🔥 Warming up Ray Compiled Graph with max sequence length...")
+        _warmup_compiled_graph(
+            policy=policy,
+            loss_fn=loss_fn,
+            tokenizer=tokenizer,
+            master_config=master_config,
+        )
+        print("✅ Warmup complete! Proceeding with normal training...\n")
+
     policy.prepare_for_training()
 
     while (
         current_epoch < max_num_epochs
         and total_steps < master_config["sft"]["max_num_steps"]
     ):
-        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
+        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}", flush=True)
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}",
+                flush=True,
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 # Prepare batch and generate responses
-                print("▶ Preparing batch...")
+                print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    import time as time_module
+                    import torch
+                    dp_start = time_module.time()
+                    
+                    torch.cuda.nvtx.range_push("data_processing/add_loss_mask")
+                    mask_start = time_module.time()
                     ## add loss mask based on role to every message
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
                     )
+                    mask_time = time_module.time() - mask_start
+                    torch.cuda.nvtx.range_pop()
 
+                    torch.cuda.nvtx.range_push("data_processing/flatten_and_pad")
+                    flat_start = time_module.time()
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -438,7 +609,11 @@ def sft_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
+                    flat_time = time_module.time() - flat_start
+                    torch.cuda.nvtx.range_pop()
 
+                    torch.cuda.nvtx.range_push("data_processing/create_batch_dict")
+                    batch_start = time_module.time()
                     train_data: BatchedDataDict = BatchedDataDict(
                         {
                             "input_ids": cat_and_padded["token_ids"],
@@ -450,10 +625,15 @@ def sft_train(
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
-
-                print("▶ Taking a training step...")
+                    batch_time = time_module.time() - batch_start
+                    torch.cuda.nvtx.range_pop()
+                    
+                print("▶ Taking a training step...", flush=True)
+                
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
+                
+                # Debug: write to file with SLURM job ID
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -574,6 +754,28 @@ def sft_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+            
+            # Add worker timing metrics from train_results
+            if "worker_computation_time_max" in train_results:
+                timing_metrics["worker_computation_time_max"] = train_results["worker_computation_time_max"]
+            if "worker_computation_time_min" in train_results:
+                timing_metrics["worker_computation_time_min"] = train_results["worker_computation_time_min"]
+            if "worker_imbalance" in train_results:
+                timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
+            
+            # Debug: write timing_metrics to file
+            import time as time_module
+            log_dir = os.environ.get('WORKER_LOG_DIR', '/tmp')
+            job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
+            debug_file = os.path.join(log_dir, f'{job_id}_sft_timing_debug.log')
+            
+            try:
+                with open(debug_file, "a") as f:
+                    f.write(f"timing_metrics after get_timing_metrics: {dict(timing_metrics)}\n")
+                    f.write(f"{'='*80}\n\n")
+                    f.flush()
+            except Exception:
+                pass
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")

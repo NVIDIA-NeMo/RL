@@ -16,6 +16,8 @@ import fnmatch
 import logging
 from copy import deepcopy
 from typing import Any
+import os
+import time
 
 from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE, NRL_NSYS_WORKER_PATTERNS
 
@@ -48,20 +50,101 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
             logging.info(
                 f"Nsight profiling enabled for worker '{worker_name}' (matched pattern '{pattern}')"
             )
+            # Replace ':' with '_' in worker name and step range for Windows compatibility
+            safe_worker_name = worker_name.replace(':', '_')
+            safe_step_range = NRL_NSYS_PROFILE_STEP_RANGE.replace(':', '_')
             return {
                 "nsight": {
                     "t": "cuda,cudnn,cublas,nvtx",
-                    "o": f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+                    "o": f"'{safe_worker_name}_{safe_step_range}_%p'",
                     "stop-on-exit": "true",
                     # Capture range is required to control the scope of the profile
                     # Profile will only start/stop when torch.cuda.profiler.start()/stop() is called
                     "capture-range": "cudaProfilerApi",
                     "capture-range-end": "stop",
                     "cuda-graph-trace": "node",
+                    # "cudabacktrace": "all",
+                    # "python-backtrace": "cuda",
                 }
             }
 
     return {}
+
+def log_worker_initialization_info(worker_name: str = "Worker") -> None:
+    """Log worker initialization information including process ID and logical ranks.
+    
+    This function logs the process ID and available logical ranks (tensor parallel, 
+    pipeline parallel, context parallel) to help map nsys profile files back to 
+    specific workers and their roles in distributed training.
+    
+    Args:
+        worker_name: Name/type of the worker being initialized
+    """
+    pid = os.getpid()
+    
+    # Get basic distributed info if available
+    try:
+        import torch
+        if torch.distributed.is_initialized():
+            global_rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            
+            # Try to get Megatron parallel ranks if available
+            try:
+                from megatron.core.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_pipeline_model_parallel_rank,
+                    get_context_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                    get_pipeline_model_parallel_world_size,
+                    get_context_parallel_world_size,
+                )
+                
+                tp_rank = get_tensor_model_parallel_rank()
+                pp_rank = get_pipeline_model_parallel_rank()
+                cp_rank = get_context_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                pp_size = get_pipeline_model_parallel_world_size()
+                cp_size = get_context_parallel_world_size()
+                
+                log_message = (
+                    f"🚀 {worker_name} initialized: PID={pid}, GlobalRank={global_rank}/{world_size}, "
+                    f"TP={tp_rank}/{tp_size}, PP={pp_rank}/{pp_size}, CP={cp_rank}/{cp_size}"
+                )
+            except ImportError:
+                # Megatron not available, just log basic info
+                log_message = f"🚀 {worker_name} initialized: PID={pid}, GlobalRank={global_rank}/{world_size}"
+        else:
+            # Distributed not initialized
+            log_message = f"🚀 {worker_name} initialized: PID={pid} (distributed not initialized)"
+            
+    except ImportError:
+        # PyTorch not available
+        log_message = f"🚀 {worker_name} initialized: PID={pid} (torch not available)"
+    
+    # Write to both stdout and a dedicated log file to bypass Ray deduplication
+    print(log_message)
+    
+    # Also write to a dedicated worker mapping file
+    try:
+        log_dir = os.environ.get('WORKER_LOG_DIR', '/tmp')
+        
+        # Include SLURM job ID in filename if available
+        job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
+        
+        # Allow custom run identifier for A/B testing (e.g., baseline vs optimized)
+        run_id = os.environ.get('RUN_IDENTIFIER', '')
+        if run_id:
+            worker_log_file = os.path.join(log_dir, f'{job_id}_{run_id}_worker_pid_mapping.log')
+        else:
+            worker_log_file = os.path.join(log_dir, f'{job_id}_worker_pid_mapping.log')
+        
+        with open(worker_log_file, 'a') as f:
+            f.write(f"{time.time():.6f}: {log_message}\n")
+            f.flush()
+    except Exception:
+        # If file writing fails, don't crash the worker
+        pass
 
 
 def recursive_merge_options(

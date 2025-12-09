@@ -33,6 +33,178 @@ from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
 
+import torch
+
+
+# Configuration: fields that should be sent as shapes instead of full tensors
+# This is an optimization to reduce data transfer overhead via Ray
+TENSOR_SHAPE_REPLACEMENT_FIELDS = ["input_ids"]
+
+# Data transfer optimization:
+# When NEMO_RL_OPTIMIZE_DATA_TRANSFER=1, tensors are sent to TP0PP0CP0 only,
+# then broadcast via NCCL to other ranks within the same DP shard.
+
+
+def replace_tensors_with_shapes(data_dict, fields_to_replace=None):
+    """Replace specified tensor fields with shape metadata.
+    
+    Creates shape metadata that will be used to reconstruct empty tensors
+    for NCCL broadcast.
+    
+    Args:
+        data_dict: A dict-like object (e.g., BatchedDataDict/SlicedDataDict)
+        fields_to_replace: List of field names to replace with shapes. 
+                          Defaults to TENSOR_SHAPE_REPLACEMENT_FIELDS.
+    
+    Returns:
+        Modified data_dict with tensors replaced by shape metadata
+    """
+    if fields_to_replace is None:
+        fields_to_replace = TENSOR_SHAPE_REPLACEMENT_FIELDS
+    
+    replaced_count = 0
+    for field in fields_to_replace:
+        if field in data_dict:
+            value = data_dict[field]
+            if torch.is_tensor(value):
+                original_size_mb = value.numel() * value.element_size() / (1024 * 1024)
+                # Store shape and dtype info
+                data_dict[field] = {
+                    "__tensor_shape__": True,
+                    "shape": tuple(value.shape),
+                    "dtype": value.dtype,
+                }
+                replaced_count += 1
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"[OPTIMIZE] Replaced {field} tensor ({original_size_mb:.2f} MB) with shape metadata"
+                )
+    
+    return data_dict
+
+
+def reconstruct_tensors_from_shapes(data_dict, fields_to_reconstruct=None):
+    """Reconstruct empty tensors from shape metadata.
+    
+    Creates empty tensors on CPU that will be moved to GPU and filled by NCCL broadcast.
+    
+    Args:
+        data_dict: A dict-like object with shape metadata
+        fields_to_reconstruct: List of field names to reconstruct.
+                              Defaults to TENSOR_SHAPE_REPLACEMENT_FIELDS.
+    
+    Returns:
+        Modified data_dict with shapes replaced by empty tensors
+    """
+    if fields_to_reconstruct is None:
+        fields_to_reconstruct = TENSOR_SHAPE_REPLACEMENT_FIELDS
+    
+    reconstructed_count = 0
+    for field in fields_to_reconstruct:
+        if field in data_dict:
+            value = data_dict[field]
+            if isinstance(value, dict) and value.get("__tensor_shape__"):
+                shape = value["shape"]
+                dtype = value["dtype"]
+                
+                # Create empty tensor on CPU, will be moved to GPU and filled by NCCL broadcast
+                data_dict[field] = torch.empty(shape, dtype=dtype)
+                reconstructed_count += 1
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"[OPTIMIZE] Created empty {field} tensor with shape {shape} for NCCL broadcast"
+                )
+    
+    if reconstructed_count > 0:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"[NEMO_RL_OPTIMIZE_DATA_TRANSFER] Worker reconstructed {reconstructed_count} tensor(s) from shape metadata"
+        )
+    
+    return data_dict
+
+
+def broadcast_tensors_from_data_leader(data_dict, process_groups, fields_to_broadcast=None):
+    """Broadcast tensors from TP0PP0CP0 (data leader) to all ranks in the same DP shard.
+    
+    This function should be called after data.to("cuda") to ensure tensors are on GPU.
+    The data leader (TP=0, PP=0, CP=0) has the full tensor data and broadcasts it
+    to other ranks in its DP shard via NCCL.
+    
+    Args:
+        data_dict: A dict-like object containing tensors to broadcast
+        process_groups: Dict mapping group names to torch.distributed process groups
+                       e.g., {"tp": tp_group, "pp": pp_group, "cp": cp_group}
+        fields_to_broadcast: List of field names to broadcast.
+                            Defaults to TENSOR_SHAPE_REPLACEMENT_FIELDS.
+    
+    Returns:
+        Modified data_dict with tensors broadcast from data leader
+    """
+    if fields_to_broadcast is None:
+        fields_to_broadcast = TENSOR_SHAPE_REPLACEMENT_FIELDS
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    import time
+    from megatron.core import parallel_state
+    total_broadcast_time = 0
+    
+    # Get current rank's parallelism coordinates
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank()
+    
+    # The data leader is the rank with TP=0, PP=0, CP=0 within each DP shard
+    is_data_leader = (tp_rank == 0 and pp_rank == 0 and cp_rank == 0)
+    
+    logger.debug(f"[NCCL_BROADCAST] Rank TP={tp_rank},PP={pp_rank},CP={cp_rank},DP={dp_rank}, is_data_leader={is_data_leader}")
+    
+    for field in fields_to_broadcast:
+        if field in data_dict and torch.is_tensor(data_dict[field]):
+            tensor = data_dict[field]
+            field_start = time.time()
+            
+            # Strategy: Broadcast along each dimension from the leader in that dimension
+            # 1. TP broadcast: TP0 → all TP ranks (within same PP, CP)
+            # 2. PP broadcast: PP0 → all PP ranks (within same TP, CP) 
+            # 3. CP broadcast: CP0 → all CP ranks (within same TP, PP)
+            
+            for group_name, group in [("tp", process_groups.get("tp")), 
+                                     ("pp", process_groups.get("pp")), 
+                                     ("cp", process_groups.get("cp"))]:
+                if group is not None:
+                    group_size = torch.distributed.get_world_size(group)
+                    if group_size == 1:
+                        continue
+                    
+                    # Source is local rank 0 in this group
+                    src_local_rank = 0
+                    src_global_rank = torch.distributed.get_global_rank(group, src_local_rank)
+                    
+                    group_start = time.time()
+                    torch.cuda.synchronize()
+                    torch.distributed.broadcast(tensor, src=src_global_rank, group=group)
+                    torch.cuda.synchronize()
+                    group_time = time.time() - group_start
+                    
+                    if group_time > 0.01:
+                        tensor_size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+                        logger.info(
+                            f"[NCCL_PERF] {group_name} broadcast of {field}: {group_time:.3f}s "
+                            f"(size: {tensor_size_mb:.2f} MB, group_size: {group_size}, src={src_global_rank})"
+                        )
+            
+            field_time = time.time() - field_start
+            total_broadcast_time += field_time
+
+    return data_dict
+
 
 @dataclass
 class MultiWorkerFuture:
@@ -128,6 +300,95 @@ class MultiWorkerFuture:
         return all_results
 
 
+class NeMoRayWorkerWrapper:
+    """Simple wrapper for NeMo workers (vLLM-style architecture).
+    
+    This wrapper is what gets ray.remote() applied to it, similar to vLLM's RayWorkerWrapper.
+    Having a simple wrapper class allows Ray's compiled graph to properly inspect method signatures.
+    
+    NOTE: Ray's ActorHandle doesn't forward unknown methods to __getattr__, so we provide
+    an explicit execute_method() for calling arbitrary methods on the wrapped worker.
+    """
+    
+    def __init__(self, worker_class, *init_args, **init_kwargs):
+        """Initialize the wrapper and create the actual worker."""
+        # Suppress Ray's verbose compiled DAG teardown logging on this worker
+        import logging
+        logging.getLogger('ray.dag.compiled_dag_node').setLevel(logging.WARNING)
+        
+        self.worker = worker_class(*init_args, **init_kwargs)
+    
+    def train_compiled(
+        self,
+        train_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Wrapper for train() for Ray Compiled Graph.
+        
+        This method is defined on the simple wrapper class (not the complex worker),
+        matching vLLM's execute_model_ray pattern. This allows Ray's compiled graph
+        to properly inspect the signature.
+        
+        With NCCL optimization enabled, leaders receive full data and followers receive
+        shape-only data. The routing is done at DAG compile time, so this method just
+        passes through whatever it receives. NCCL broadcast in worker.train() reconstructs
+        full data for followers.
+        
+        Args:
+            train_input: Dict containing training parameters (full data or shapes)
+        
+        Returns:
+            Training outputs from worker.train()
+        """
+        # Check if this is NCCL-optimized input (contains leader_data and follower_data)
+        if "leader_data" in train_input and "follower_data" in train_input:
+            # Determine if this worker is a data leader based on MP ranks
+            from megatron.core import parallel_state
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            cp_rank = parallel_state.get_context_parallel_rank()
+            is_leader = (tp_rank == 0 and pp_rank == 0 and cp_rank == 0)
+            
+            # Choose appropriate data based on rank
+            if is_leader:
+                # Leader: Use full data directly
+                actual_input = train_input["leader_data"]
+            else:
+                # Follower: Use shape metadata
+                actual_input = train_input["follower_data"]
+        else:
+            # Regular input (no NCCL optimization)
+            actual_input = train_input
+        
+        result = self.worker.train(
+            data=actual_input["data"],
+            loss_fn=actual_input["loss_fn"],
+            eval_mode=actual_input.get("eval_mode", False),
+            gbs=actual_input.get("gbs"),
+            mbs=actual_input.get("mbs"),
+        )
+        return result
+    
+    def execute_method(self, method_name: str, *args, **kwargs):
+        """Execute an arbitrary method on the wrapped worker.
+        
+        This is needed because Ray's ActorHandle doesn't forward unknown methods
+        to __getattr__. Similar to vLLM's execute_method pattern.
+        
+        Args:
+            method_name: Name of the method to call on the wrapped worker
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+        
+        Returns:
+            Result of the method call
+        """
+        method = getattr(self.worker, method_name)
+        return method(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        """Delegate attribute access to the wrapped worker (for local access only)."""
+        return getattr(self.worker, name)
+
 class RayWorkerBuilder:
     @ray.remote
     class IsolatedWorkerInitializer:
@@ -204,8 +465,11 @@ class RayWorkerBuilder:
                 placement_group_capture_child_tasks=True,
             )
             options["num_gpus"] = num_gpus
-            worker = worker_class.options(**options).remote(
-                *self.init_args, **worker_kwargs
+            
+            # Apply ray.remote() to the wrapper class (vLLM-style architecture)
+            # This allows Ray's compiled graph to properly inspect method signatures
+            worker = ray.remote(**options)(NeMoRayWorkerWrapper).remote(
+                worker_class, *self.init_args, **worker_kwargs
             )
             return worker
 
@@ -652,8 +916,8 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
-        return method.remote(*args, **kwargs)
+        # All Ray workers are now wrapped in NeMoRayWorkerWrapper, so use execute_method
+        return worker.execute_method.remote(method_name, *args, **kwargs)
 
     def run_all_workers_multiple_data(
         self,
@@ -737,11 +1001,12 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                # All Ray workers are wrapped, so use execute_method
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
+                worker_kwargs.update(common_kwargs)
                 futures.append(
-                    method.remote(*worker_args, **worker_kwargs, **common_kwargs)
+                    worker.execute_method.remote(method_name, *worker_args, **worker_kwargs)
                 )
                 data_idx += 1
 
@@ -793,8 +1058,8 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
-                futures.append(method.remote(*args, **kwargs))
+                # All Ray workers are wrapped, so use execute_method
+                futures.append(worker.execute_method.remote(method_name, *args, **kwargs))
 
         return futures
 
@@ -852,6 +1117,19 @@ class RayWorkerGroup:
         if output_is_replicated is None:
             output_is_replicated = []
 
+        # Check if tensor shape optimization is enabled via environment variable
+        enable_tensor_shape_optimization = os.environ.get(
+            "NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0"
+        ) == "1"
+        
+        if enable_tensor_shape_optimization:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"[NEMO_RL_OPTIMIZE_DATA_TRANSFER] Tensor shape optimization enabled. "
+                f"Will replace {TENSOR_SHAPE_REPLACEMENT_FIELDS} with shape metadata and use NCCL broadcast."
+            )
+
         futures = []
 
         # Validate axes
@@ -899,6 +1177,8 @@ class RayWorkerGroup:
                 # Find the appropriate data slice for this worker
                 worker_args = args
                 worker_kwargs = kwargs
+                
+                # Determine which shard this worker needs (based on sharded axes)
                 for axis in in_sharded_axes:
                     if axis in worker_coords:
                         # Select the appropriate slice for this axis
@@ -907,10 +1187,45 @@ class RayWorkerGroup:
                             key: value[worker_coords[axis]]
                             for key, value in worker_kwargs.items()
                         }
+                        break
+
+                # Apply tensor shape optimization if enabled
+                if enable_tensor_shape_optimization:
+                    # Replace large tensors with shapes in the data kwarg
+                    if "data" in worker_kwargs:
+                        from copy import deepcopy
+                        
+                        # Determine if this worker is a "data leader" (TP0PP0CP0 within its DP shard)
+                        # Data leaders receive full tensors and broadcast to others via NCCL
+                        is_data_leader = True
+                        # Check if worker is at rank 0 for all non-DP axes
+                        for axis in self.sharding_annotations.names:
+                            if axis == "data_parallel":
+                                continue  # Skip DP axis
+                            if axis in worker_coords and worker_coords[axis] != 0:
+                                is_data_leader = False
+                                break
+                        
+                        # Make a shallow copy to avoid modifying the original
+                        worker_kwargs = deepcopy(worker_kwargs)
+                        
+                        if is_data_leader:
+                            # Data leaders receive full tensors (no replacement)
+                            import logging
+                            logger = logging.getLogger(__name__)
+                            logger.debug(
+                                f"[OPTIMIZE] Worker {worker_idx} is data leader (coords={worker_coords}), "
+                                f"sending full tensors for NCCL broadcast"
+                            )
+                        else:
+                            # Non-leaders: replace with shape metadata
+                            worker_kwargs["data"] = replace_tensors_with_shapes(
+                                worker_kwargs["data"]
+                            )
 
                 # Call the method on the worker with its data slice
-                future = getattr(worker, method_name).remote(
-                    *worker_args, **worker_kwargs, **common_kwargs
+                future = worker.execute_method.remote(
+                    method_name, *worker_args, **worker_kwargs, **common_kwargs
                 )
                 futures.append(future)
                 called_workers.append(worker_idx)
@@ -920,8 +1235,8 @@ class RayWorkerGroup:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
                     worker_args = [None] * len(args)
                     worker_kwargs = {key: None for key in kwargs.keys()}
-                    future = getattr(worker, method_name).remote(
-                        *worker_args, **worker_kwargs, **common_kwargs
+                    future = worker.execute_method.remote(
+                        method_name, *worker_args, **worker_kwargs, **common_kwargs
                     )
                     futures.append(future)
                     called_workers.append(worker_idx)

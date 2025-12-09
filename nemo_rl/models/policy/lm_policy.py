@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union
@@ -30,6 +31,11 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_compiled_graph import (
+    CompiledGraphWorkerGroup,
+    get_compiled_graph_config,
+    should_use_compiled_graph,
+)
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
@@ -178,7 +184,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
             ]
 
-            self.worker_group = RayWorkerGroup(
+            worker_group = RayWorkerGroup(
                 cluster,
                 worker_builder,
                 name_prefix=name_prefix,
@@ -188,7 +194,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         else:
-            self.worker_group = RayWorkerGroup(
+            worker_group = RayWorkerGroup(
                 cluster,
                 worker_builder,
                 name_prefix=name_prefix,
@@ -196,6 +202,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars or {},
             )
+
+        # Wrap worker group with Ray Compiled Graph if enabled
+        if should_use_compiled_graph():
+            compiled_graph_config = get_compiled_graph_config()
+            self.worker_group = CompiledGraphWorkerGroup(
+                worker_group=worker_group,
+                compiled_graph_config=compiled_graph_config,
+            )
+            print(f"🚀 Ray Compiled Graph ENABLED: asyncio={compiled_graph_config['enable_asyncio']}, "
+                  f"overlap_comm={compiled_graph_config['overlap_communication']}")
+        else:
+            self.worker_group = worker_group
+            print("Using standard Ray remote calls (compiled graph disabled)")
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -498,6 +517,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 self.flops_tracker.track_batch(input_lengths.tolist())
 
         # Train each shard in parallel
+        start_time = time.time()
         futures = self.worker_group.run_all_workers_sharded_data(
             "train",
             data=sharded_data,
@@ -521,10 +541,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         results = self.worker_group.get_all_worker_results(futures)
 
+        # Calculate worker imbalance
+        worker_computation_times = [r.get("worker_computation_time", 0) for r in results]
+        max_worker_time = max(worker_computation_times) if worker_computation_times else 0
+        min_worker_time = min(worker_computation_times) if worker_computation_times else 0
+        worker_imbalance = max_worker_time - min_worker_time
+
         # Aggregate the results
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
+            "worker_computation_time_max": max_worker_time,
+            "worker_computation_time_min": min_worker_time,
+            "worker_imbalance": worker_imbalance,
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
@@ -831,7 +860,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         user calls worker_group.shutdown().
         """
         if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+            try:
+                self.worker_group.shutdown(cleanup_method="shutdown")
+            except Exception:
+                # Suppress errors if workers are already dead (e.g., from compiled DAG teardown)
+                # This is expected during program exit when cleanup order is unpredictable
+                pass
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

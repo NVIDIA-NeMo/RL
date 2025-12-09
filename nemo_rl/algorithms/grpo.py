@@ -1565,6 +1565,15 @@ def grpo_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
+            
+            # Add worker timing metrics from train_results
+            if "worker_computation_time_max" in train_results:
+                timing_metrics["worker_computation_time_max"] = train_results["worker_computation_time_max"]
+            if "worker_computation_time_min" in train_results:
+                timing_metrics["worker_computation_time_min"] = train_results["worker_computation_time_min"]
+            if "worker_imbalance" in train_results:
+                timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
+            
             # track example with high token mult prob error above 1.05
             if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
@@ -2522,6 +2531,14 @@ def async_grpo_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )
+            
+            # Add worker timing metrics from train_results
+            if "worker_computation_time_max" in train_results:
+                timing_metrics["worker_computation_time_max"] = train_results["worker_computation_time_max"]
+            if "worker_computation_time_min" in train_results:
+                timing_metrics["worker_computation_time_min"] = train_results["worker_computation_time_min"]
+            if "worker_imbalance" in train_results:
+                timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
 
             # Add buffer stats
             buffer_size_current = ray.get(replay_buffer.size.remote())

@@ -76,6 +76,7 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
+    get_data_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
     get_pipeline_model_parallel_world_size,
@@ -131,6 +132,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.distributed.worker_group_utils import log_worker_initialization_info
 
 try:
     from megatron.core.distributed import (
@@ -362,7 +364,6 @@ def destroy_parallel_state():
             pass  # Ignore errors during cleanup
         # Reset the global async calls queue by creating a new instance
         nemo_async_utils._async_calls_queue = AsyncCallsQueue()
-        print(f"[DEBUG] Reset NeMo async calls queue (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
@@ -415,15 +416,16 @@ def destroy_parallel_state():
         except:
             pass
         base_strategy.async_calls = AsyncCallsQueue()
-        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
+# NOTE: @ray.remote is NOT applied here. The NeMoRayWorkerWrapper gets @ray.remote applied instead.
+# This allows the wrapper to instantiate this class directly: worker_class(*args, **kwargs)
 class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+    # Default options to use when applying ray.remote() at runtime
+    _default_options = {"runtime_env": get_runtime_env_for_policy_worker("megatron_policy_worker")}
+    
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -757,6 +759,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
         )
 
+        # Log worker initialization info for nsys profile mapping
+        log_worker_initialization_info("MegatronPolicyWorker")
+
         # Set the param sync function for the model
         if (
             self.megatron_cfg.ddp.overlap_param_gather
@@ -908,6 +913,57 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        import time
+        worker_start_time = time.time()
+        
+        # Reconstruct tensors from shapes if optimization is enabled
+        import os
+        import logging
+        import sys
+        logger = logging.getLogger(__name__)
+        
+        optimize_enabled = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
+        verify_nccl = os.environ.get("NEMO_RL_VERIFY_NCCL", "0") == "1"
+        
+        # Import parallel_state at top level since it's used later (lines 985, 1038, 1200)
+        from megatron.core import parallel_state
+        
+        if optimize_enabled:
+            from nemo_rl.distributed.worker_groups import (
+                reconstruct_tensors_from_shapes,
+                broadcast_tensors_from_data_leader,
+            )
+            
+            data = reconstruct_tensors_from_shapes(data)
+            
+            # Move data to CUDA before NCCL broadcast (NCCL requires GPU tensors)
+            data = data.to("cuda")
+            
+            # Get process groups for broadcasting
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            cp_group = parallel_state.get_context_parallel_group()
+            
+            process_groups = {
+                "tp": tp_group,
+                "pp": pp_group,
+                "cp": cp_group,
+            }
+            
+            # Broadcast input_ids from TP0PP0CP0 to all ranks in the same DP shard
+            data = broadcast_tensors_from_data_leader(data, process_groups)
+            
+            # Verify NCCL broadcast correctness (only when env var is set)
+            if verify_nccl:
+                from nemo_rl.distributed.nccl_verification import verify_nccl_broadcast_correctness
+                verify_nccl_broadcast_correctness(
+                    data,
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    pp_rank=get_pipeline_model_parallel_rank(),
+                    cp_rank=get_context_parallel_rank(),
+                    dp_rank=get_data_parallel_rank(),
+                )
+        
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -956,6 +1012,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
+            # Initialize variables in case num_global_batches is 0
+            grad_norm = 0.0
+            num_zeros_in_grad = 0.0
+            update_successful = True
+            
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
@@ -1146,6 +1207,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 group=parallel_state.get_data_parallel_group(),
             )
 
+        worker_computation_time = time.time() - worker_start_time
+        
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
@@ -1153,6 +1216,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
+            "worker_computation_time": worker_computation_time,
         }
         # Collect MoE aux metrics averaged across microbatches
         num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
@@ -1183,6 +1247,46 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        # Reconstruct tensors from shapes if NCCL optimization is enabled
+        # This MUST happen before any code tries to access tensor properties
+        optimize_enabled = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
+        
+        if optimize_enabled:
+            from nemo_rl.distributed.worker_groups import (
+                reconstruct_tensors_from_shapes,
+                broadcast_tensors_from_data_leader,
+            )
+            data = reconstruct_tensors_from_shapes(data)
+            
+            # Move data to CUDA before NCCL broadcast (NCCL requires GPU tensors)
+            data = data.to("cuda")
+            
+            # Get process groups for broadcasting
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            cp_group = parallel_state.get_context_parallel_group()
+            
+            process_groups = {
+                "tp": tp_group,
+                "pp": pp_group,
+                "cp": cp_group,
+            }
+            
+            # Broadcast input_ids from TP0PP0CP0 to all ranks in the same DP shard
+            data = broadcast_tensors_from_data_leader(data, process_groups)
+            
+            # Verify NCCL broadcast correctness (only when env var is set)
+            verify_nccl = os.environ.get("NEMO_RL_VERIFY_NCCL", "0") == "1"
+            if verify_nccl:
+                from nemo_rl.distributed.nccl_verification import verify_nccl_broadcast_correctness
+                verify_nccl_broadcast_correctness(
+                    data,
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    pp_rank=get_pipeline_model_parallel_rank(),
+                    cp_rank=get_context_parallel_rank(),
+                    dp_rank=get_data_parallel_rank(),
+                )
+        
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -1224,6 +1328,43 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ):
             nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
+            
+            # NCCL broadcast for optimized data transfer
+            if optimize_enabled:
+                # Get process groups for broadcasting
+                tp_group = parallel_state.get_tensor_model_parallel_group()
+                pp_group = parallel_state.get_pipeline_model_parallel_group()
+                cp_group = parallel_state.get_context_parallel_group()
+                
+                process_groups = {
+                    "tp": tp_group,
+                    "pp": pp_group,
+                    "cp": cp_group,
+                }
+                
+                print(f"🔥🔥🔥 [NCCL_GROUPS] TP={tp_group}, PP={pp_group}, CP={cp_group}", file=sys.stderr, flush=True)
+                
+                # Broadcast input_ids from TP0PP0CP0 to all ranks in the same DP shard
+                data_dict = broadcast_tensors_from_data_leader(data_dict, process_groups)
+                
+                print(f"🔥🔥🔥 [NCCL_DONE] Broadcast completed!", file=sys.stderr, flush=True)
+                
+                # Verify NCCL broadcast correctness (only when env var is set)
+                if os.environ.get("NEMO_RL_VERIFY_NCCL", "0") == "1":
+                    print(f"🔥🔥🔥 [VERIFY_START] About to verify! Step={self.consumed_samples // self.cfg['train_global_batch_size']}", file=sys.stderr, flush=True)
+                    
+                    from nemo_rl.distributed.nccl_verification import verify_nccl_broadcast_correctness
+                    verify_nccl_broadcast_correctness(
+                        data_dict,
+                        step_num=self.consumed_samples // self.cfg["train_global_batch_size"],
+                        tp_rank=get_tensor_model_parallel_rank(),
+                        pp_rank=get_pipeline_model_parallel_rank(),
+                        cp_rank=get_context_parallel_rank(),
+                        dp_rank=get_data_parallel_rank(),
+                    )
+                    
+                    print(f"🔥🔥🔥 [VERIFY_DONE] Verification completed!", file=sys.stderr, flush=True)
+            
             if self.cfg["sequence_packing"]["enabled"]:
                 original_seq_length = data_dict["input_ids"].shape[1]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
