@@ -224,33 +224,3 @@ env:
 data:
   env_name: code_gen  # Use your registered environment name
 ```
-
-### Important Notes
-
-- **Uniqueness**: Each environment name must be unique. Attempting to register an existing environment name will raise a `ValueError`
-- **Class Path**: The `actor_class_fqn` must be a fully importable Python path
-- **Interface Implementation**: Your custom Actor class should implement all necessary methods defined in `EnvironmentInterface`
-- **Registration Timing**: Make sure to call `register_env` before using the environment (typically at the beginning of your training script)
-
-### Advanced Example: Conditional Registration
-
-You can also conditionally register different environments based on configuration:
-
-```python
-from nemo_rl.environments.utils import register_env
-import os
-
-# Choose different environment implementations based on environment variable
-if os.getenv("USE_PRODUCTION_ENV") == "true":
-    register_env(
-        env_name="my_task",
-        actor_class_fqn="my_envs.production.ProductionTaskActor"
-    )
-else:
-    register_env(
-        env_name="my_task",
-        actor_class_fqn="my_envs.dev.DevTaskActor"
-    )
-```
-
-This flexible registration mechanism allows you to easily extend NeMo RL with custom reinforcement learning environments without modifying the framework's core code.
