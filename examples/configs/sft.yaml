@@ -98,6 +98,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
 
     optimizer:
       optimizer: "adam"

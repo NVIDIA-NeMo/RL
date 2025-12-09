@@ -55,8 +55,8 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
-    # Use Penguin dependencies
-    PENGUIN = f"uv run --locked --extra penguin --directory {git_root}"
+    # Use NeMo-Gym dependencies
+    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

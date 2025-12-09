@@ -32,6 +32,7 @@ from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.utils.logger import Logger
 
 
 def calculate_kl(
@@ -836,3 +837,27 @@ def init_p2p_between_policy_and_generation(
         futures_train = policy.init_p2p(split, init_p2p_round)
         futures_inference = policy_generation.init_p2p(split, init_p2p_round)
         ray.get(futures_train + futures_inference)
+
+
+def log_generation_metrics_to_wandb(
+    generation_logger_metrics: dict[str, dict[int, list[Any]]],
+    step: int,
+    timeline_interval: float,
+    logger: Logger,
+) -> None:
+    """Log generation metrics to wandb.
+
+    Args:
+        generation_logger_metrics: Dictionary of generation logger metrics
+        step: Global step value
+        timeline_interval: Interval between timeline points (in seconds)
+        logger: Logger instance
+    """
+    for generation_metric in generation_logger_metrics.keys():
+        logger.log_plot_per_worker_timeline_metrics(
+            generation_logger_metrics[generation_metric],
+            step=step,
+            prefix="generation_metrics",
+            name=generation_metric,
+            timeline_interval=timeline_interval,
+        )
