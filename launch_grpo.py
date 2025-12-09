@@ -67,9 +67,11 @@ def detect_cluster_type(partition: str = "batch") -> str:
         if result.returncode == 0:
             output = result.stdout.strip()
             import re
-            match = re.search(r'gpu(?::[^:]+)?:(\d+)', output)
+            # Match gpu:N or gpu:type:N format (e.g., "gpu:4(S:0-1)" or "gpu:h100:8")
+            match = re.search(r'gpu:(\d+)', output)
             if match:
                 gpus = int(match.group(1))
+                print(f"[DEBUG] Detected {gpus} GPUs per node from GRES: {output}")
                 if gpus == 8:
                     return "h100"
                 elif gpus == 4:

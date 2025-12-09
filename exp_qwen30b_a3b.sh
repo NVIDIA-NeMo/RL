@@ -62,7 +62,7 @@ sbatch \
     --nodes=${NUM_NODES} \
     --account=${account} \
     --job-name=qwen30b-a3b-N${NUM_NODES}xG${GPUS_PER_NODE}-T.tp${T_TP}.pp${T_PP}.ep${T_EP}-G.tp${G_TP}.pp${G_PP} \
-    --partition=batch \
+    --partition=${PARTITION} \
     --time=04:00:00 \
     ${GRES_FLAG} \
     --segment ${NUM_NODES} \

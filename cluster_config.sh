@@ -9,7 +9,8 @@ detect_gpus_per_node() {
     local partition="${1:-batch}"
     
     # Try to get GPU count from SLURM GRES configuration
-    local gres_gpus=$(sinfo -p "$partition" -h -o "%G" 2>/dev/null | grep -oP 'gpu(:[^:]+)?:(\d+)' | grep -oP '\d+$' | head -1 || true)
+    # Format: "gpu:4(S:0-1)" or "gpu:8" -> extract the number after "gpu:"
+    local gres_gpus=$(sinfo -p "$partition" -h -o "%G" 2>/dev/null | grep -oP 'gpu:\d+' | grep -oP '\d+' | head -1 || true)
     
     if [[ -n "$gres_gpus" && "$gres_gpus" -gt 0 ]]; then
         echo "$gres_gpus"
@@ -22,6 +23,9 @@ detect_gpus_per_node() {
 # Auto-detect cluster type and set configuration
 setup_cluster_config() {
     local partition="${1:-batch}"
+    
+    # Set partition for sbatch
+    PARTITION="${PARTITION:-$partition}"
     
     # Detect GPUs per node
     if [[ -z "${GPUS_PER_NODE:-}" ]]; then
@@ -52,6 +56,7 @@ setup_cluster_config() {
     # Print detected configuration
     echo "[INFO] Cluster Configuration:"
     echo "  - Cluster Type: ${CLUSTER_TYPE:-Unknown}"
+    echo "  - Partition: $PARTITION"
     echo "  - GPUs per Node: $GPUS_PER_NODE"
     echo "  - Container: $CONTAINER"
     echo "  - GRES Flag: $GRES_FLAG"
@@ -63,6 +68,7 @@ export_cluster_config() {
     export CONTAINER
     export GRES_FLAG
     export CLUSTER_TYPE
+    export PARTITION
     export HF_HOME
     export HF_DATASETS_CACHE
     export MOUNTS
