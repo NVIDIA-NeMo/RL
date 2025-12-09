@@ -817,7 +817,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             tp_group=self.tp_mesh.get_group(),
                             dtype=torch.float32,
                         )
-                        if self.max_grad_norm is not None:
+                        if self.max_grad_norm is not None and self.max_grad_norm > 0:
                             clip_grad_by_total_norm_(
                                 self.model.parameters(),
                                 max_grad_norm=self.max_grad_norm,
