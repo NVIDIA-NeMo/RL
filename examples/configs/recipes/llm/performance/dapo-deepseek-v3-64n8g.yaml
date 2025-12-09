@@ -1,4 +1,4 @@
-defaults: ../../grpo_math_1B.yaml
+defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
