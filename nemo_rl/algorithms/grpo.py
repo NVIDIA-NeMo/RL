@@ -355,7 +355,7 @@ def setup(
 
     assert policy_nodes > 0, (
         "policy_nodes must be > 0, but got "
-        f"policy_nodes:{policy_nodes} + nemo_gym_nodes:{nemo_gym_num_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}",
+        f"policy_nodes:{policy_nodes} + nemo_gym_nodes:{nemo_gym_num_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
     )
 
     ray_runtime_ctx = ray.get_runtime_context()
