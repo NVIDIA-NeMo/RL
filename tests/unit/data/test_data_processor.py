@@ -124,9 +124,7 @@ def test_math_data_processor():
 def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     # Initialize dataset
     data = dataset_cls()
-    task_name = (
-        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
-    )
+    task_name = data.task_name
     # Setup tokenizer
     tokenizer = get_tokenizer(
         TokenizerConfig(
