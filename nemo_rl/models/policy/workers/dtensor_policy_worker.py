@@ -191,6 +191,8 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
+        if self.max_grad_norm == 0.0: # allow zero grad norm for consistency with megatron
+            self.max_grad_norm = None
 
         if self.cfg["precision"] == "float32":
             self.dtype = torch.float32
@@ -829,7 +831,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             tp_group=self.tp_mesh.get_group(),
                             dtype=torch.float32,
                         )
-                        if self.max_grad_norm is not None:
+                        if self.max_grad_norm is not None and self.max_grad_norm > 0:
                             clip_grad_by_total_norm_(
                                 self.model.parameters(),
                                 max_grad_norm=self.max_grad_norm,

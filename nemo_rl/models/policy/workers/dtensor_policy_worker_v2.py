@@ -235,6 +235,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
+        if self.max_grad_norm == 0.0: # allow zero grad norm for consistency with megatron
+            self.max_grad_norm = None
 
         try:
             self.dtype = STRING_TO_DTYPE[self.cfg["precision"]]
@@ -952,25 +954,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
+                    with torch.no_grad():
+                        grad_norm = get_grad_norm(
+                            self.model.parameters(),
+                            dp_cp_group=self.dp_cp_mesh.get_group(),
+                            tp_group=self.tp_mesh.get_group(),
+                            dtype=torch.float32,
+                        )
+                        if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                            clip_grad_by_total_norm_(
+                                self.model.parameters(),
+                                max_grad_norm=self.max_grad_norm,
+                                total_norm=grad_norm,
+                            )
+                        grad_norm = torch.tensor([grad_norm])
 
                     # Update parameters
                     self.optimizer.step()
