@@ -1,0 +1,386 @@
+# ============================================
+# Model Parallelism Configurations
+# For H100 (8 GPUs/node) and GB200 (4 GPUs/node)
+# Based on NeMo-RL 0.4 benchmarks
+# ============================================
+
+# Common settings
+defaults:
+  max_steps: 20
+  val_period: 1000
+  async_grpo: false
+  sequence_packing: true
+  checkpointing: false
+
+# ============================================
+# Llama-3.1-8B-Instruct
+# ============================================
+llama8b:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  config_file: "examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 16 GPUs (2 nodes), 1496 tok/s/GPU
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+      # dp: 16
+    training:
+      tp: 1
+      cp: 1
+      ep: 1
+      pp: 2
+      # dp: 8
+  
+  gb200:
+    # Scaled from H100: 8 GPUs (2 nodes)
+    num_gpus: 8
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 1
+      pp: 1
+
+# ============================================
+# Llama-3.1-70B-Instruct
+# ============================================
+llama70b:
+  model_name: "meta-llama/Llama-3.1-70B-Instruct"
+  config_file: "examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 32 GPUs (4 nodes), 232 tok/s/GPU, R.GBS=2048
+    # Best throughput config with Gen TP=4
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+      # dp: 8
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 8
+      # dp: 1
+  
+  h100_lowgbs:
+    # NeMo-RL 0.4: 32 GPUs (4 nodes), 124 tok/s/GPU, R.GBS=512
+    # Lower rollout GBS with higher Gen TP=8
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 8
+      pp: 1
+      # dp: 4
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 8
+      # dp: 1
+  
+  h100_highseq:
+    # NeMo-RL 0.4: 32 GPUs (4 nodes), 125 tok/s/GPU, SeqLen=16384
+    # High sequence length variant
+    num_gpus: 32
+    max_seqlen: 16384
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 8
+  
+  gb200:
+    # GB200: 16 GPUs (4 nodes), R.GBS=2048, Gen TP=2
+    # Best throughput config
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+      # dp: 8
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+      # dp: 2
+  
+  gb200_lowgbs:
+    # GB200: 16 GPUs (4 nodes), R.GBS=512, Gen TP=2
+    # Lower rollout GBS variant
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+      # dp: 8
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+      # dp: 2
+  
+  gb200_highseq:
+    # GB200: 16 GPUs (4 nodes), SeqLen=16384
+    # High sequence length variant
+    num_gpus: 16
+    max_seqlen: 16384
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+
+# ============================================
+# Qwen3-32B
+# ============================================
+qwen32b:
+  model_name: "Qwen/Qwen3-32B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n8g.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 32 GPUs (4 nodes), 532 tok/s/GPU
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+      # dp: 8
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 4
+      # dp: 2
+  
+  gb200:
+    # Scaled from H100: 32 GPUs (8 nodes)
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 4
+
+# ============================================
+# Qwen3-30B-A3B (MoE)
+# ============================================
+qwen30b:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 32 GPUs (4 nodes), 1228 tok/s/GPU
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+      # dp: 8 (actually 16 but using ep?)
+    training:
+      tp: 1
+      cp: 1
+      ep: 8
+      pp: 1
+      # dp: 4
+  
+  gb200:
+    # Scaled from H100: 16 GPUs (4 nodes)
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 8
+      pp: 1
+
+# ============================================
+# Qwen3-235B-A22B (Large MoE)
+# ============================================
+qwen235b:
+  model_name: "Qwen/Qwen3-235B-A22B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 128 GPUs (16 nodes), 48 tok/s/GPU
+    num_gpus: 128
+    max_seqlen: 8192
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 16
+      pp: 1
+      # dp: 8
+    training:
+      tp: 2
+      cp: 2
+      ep: 16
+      pp: 8
+      # dp: 1
+  
+  h100_256:
+    # NeMo-RL 0.4: 256 GPUs (32 nodes)
+    num_gpus: 256
+    max_seqlen: 8192
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 16
+      pp: 1
+    training:
+      tp: 2
+      cp: 2
+      ep: 16
+      pp: 8
+  
+  gb200:
+    # Scaled from H100: 128 GPUs (32 nodes)
+    num_gpus: 128
+    max_seqlen: 8192
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 16
+      pp: 1
+    training:
+      tp: 2
+      cp: 2
+      ep: 16
+      pp: 8
+
+# ============================================
+# DeepSeek-V3 (671B MoE)
+# ============================================
+deepseek_v3:
+  model_name: "deepseek-ai/DeepSeek-V3"
+  config_file: "examples/configs/recipes/llm/performance/grpo-deepseek-v3.yaml"
+  
+  h100:
+    # NeMo-RL 0.4: 256 GPUs (32 nodes), best config
+    num_gpus: 256
+    max_seqlen: 1536
+    rollout_gbs: 2048
+    train_gbs: 2048
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 32
+      pp: 1
+      # dp: 8
+    training:
+      tp: 1
+      cp: 1
+      ep: 16
+      pp: 16
+      # dp: 1
+  
+  h100_fp8:
+    # FP8 generation variant
+    num_gpus: 256
+    max_seqlen: 1536
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32
+    generation:
+      tp: 16
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 16
+      pp: 16
+  
+  gb200:
+    # Scaled from H100: 256 GPUs (64 nodes)
+    num_gpus: 256
+    max_seqlen: 1536
+    rollout_gbs: 2048
+    train_gbs: 2048
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 32
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 16
+      pp: 16
+
