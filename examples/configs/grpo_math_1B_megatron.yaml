@@ -175,6 +175,9 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "sj_megatron_1B"
+  swanlab:
+    project: "grpo-dev"
+    name: "sj_megatron_1B"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"
