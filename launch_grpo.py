@@ -159,7 +159,7 @@ PRESETS = {
         total_gpus=16,
         gpus_per_node=4,
         t_tp=4, t_cp=1, t_ep=1, t_pp=2,
-        g_tp=2, g_pp=1,
+        g_tp=2, g_pp=1,  # Original setting for A/B test
         config_file="examples/configs/recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml",
         max_seqlen=16384,
     ),
@@ -176,7 +176,8 @@ def build_command(config: ModelConfig,
                   wandb_project: str = "sync-grpo-gb200-benchmark",
                   max_steps: int = 20,
                   time_limit: str = "04:00:00",
-                  account: str = "coreai_dlalgo_nemorl") -> str:
+                  account: str = "coreai_dlalgo_nemorl",
+                  enable_vllm_metrics: bool = False) -> str:
     """Build the sbatch command for a given configuration."""
     
     num_nodes = config.total_gpus // config.gpus_per_node
@@ -192,7 +193,8 @@ def build_command(config: ModelConfig,
     segment = 16 if num_nodes >= 16 else num_nodes
     
     # Build WandB name (no special characters for Hydra)
-    wandb_name = f"{config.name.replace('-', '_').replace('.', '_')}_N{num_nodes}xG{config.gpus_per_node}_Ttp{config.t_tp}pp{config.t_pp}ep{config.t_ep}cp{config.t_cp}_Gtp{config.g_tp}pp{config.g_pp}"
+    vllm_metrics_suffix = "_vllm_metrics" if enable_vllm_metrics else ""
+    wandb_name = f"{config.name.replace('-', '_').replace('.', '_')}_N{num_nodes}xG{config.gpus_per_node}_Ttp{config.t_tp}pp{config.t_pp}ep{config.t_ep}cp{config.t_cp}_Gtp{config.g_tp}pp{config.g_pp}{vllm_metrics_suffix}"
     
     # Build job name
     job_name = f"{config.name.lower().replace('.', '')}-N{num_nodes}xG{config.gpus_per_node}-T.tp{config.t_tp}.pp{config.t_pp}-G.tp{config.g_tp}.pp{config.g_pp}"
@@ -222,6 +224,13 @@ grpo.max_num_steps={max_steps} \\
 logger.wandb_enabled=True \\
 logger.wandb.project='{wandb_project}' \\
 logger.wandb.name='{wandb_name}'"""
+
+    # Add vLLM metrics logging if enabled
+    if enable_vllm_metrics:
+        command += """ \\
+policy.generation.vllm_cfg.async_engine=true \\
+policy.generation.vllm_cfg.enable_vllm_metrics_logger=true \\
+policy.generation.vllm_cfg.vllm_metrics_logger_interval=0.5"""
     
     # Full sbatch command
     sbatch_cmd = f"""COMMAND="{command}" \\
@@ -234,7 +243,7 @@ sbatch \\
     --nodes={num_nodes} \\
     --account={account} \\
     --job-name={job_name} \\
-    --partition=batch \\
+    --partition=batch_long \\
     --time={time_limit} \\
     --gres=gpu:4 \\
     --segment {segment} \\
@@ -285,7 +294,8 @@ def list_presets():
         print(f"{name:<18} {config.model_name:<30} {config.total_gpus:>5} {rollout_gbs:>6} {config.train_gbs:>6} {config.max_seqlen:>7} {train_str:>22} {gen_str:>14}")
     
     print("\n💡 Usage: python launch_grpo.py --preset <preset_name>")
-    print("   Example: python launch_grpo.py --preset qwen32b --dry-run\n")
+    print("   Example: python launch_grpo.py --preset qwen32b --dry-run")
+    print("   With vLLM metrics: python launch_grpo.py --preset qwen32b --enable-vllm-metrics\n")
 
 
 def launch_job(config: ModelConfig, dry_run: bool = False, **kwargs):
@@ -382,6 +392,8 @@ Examples:
     # Execution options
     parser.add_argument("--dry-run", "-n", action="store_true",
                         help="Show command without executing")
+    parser.add_argument("--enable-vllm-metrics", action="store_true",
+                        help="Enable vLLM metrics logging (requires async_engine=true)")
     
     args = parser.parse_args()
     
@@ -401,7 +413,8 @@ Examples:
                       wandb_project=args.wandb_project,
                       max_steps=args.max_steps,
                       time_limit=args.time,
-                      account=args.account)
+                      account=args.account,
+                      enable_vllm_metrics=args.enable_vllm_metrics)
         return
     
     # Use preset
@@ -411,7 +424,8 @@ Examples:
                   wandb_project=args.wandb_project,
                   max_steps=args.max_steps,
                   time_limit=args.time,
-                  account=args.account)
+                  account=args.account,
+                  enable_vllm_metrics=args.enable_vllm_metrics)
         return
     
     # Custom configuration
@@ -447,7 +461,8 @@ Examples:
                   wandb_project=args.wandb_project,
                   max_steps=args.max_steps,
                   time_limit=args.time,
-                  account=args.account)
+                  account=args.account,
+                  enable_vllm_metrics=args.enable_vllm_metrics)
         return
     
     # No valid options provided
