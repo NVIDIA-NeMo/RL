@@ -785,9 +785,7 @@ def setup(
                 "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
             },
         }
-        nemo_gym_actor = NemoGym.options(**nemo_gym_options).remote(
-            nemo_gym_config, logger.base_log_dir
-        )
+        nemo_gym_actor = NemoGym.options(**nemo_gym_options).remote(nemo_gym_config)
         # Blocking wait for NeMo Gym to spin up
         ray.get(nemo_gym_actor._spinup.remote())
 
