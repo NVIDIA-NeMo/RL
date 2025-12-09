@@ -113,7 +113,23 @@ mkdir -p $LOG_DIR
 # Number of GPUs per worker node
 #GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
-GPUS_PER_NODE=4
+# GPUS_PER_NODE=4
+
+# Number of GPUs per worker node - Auto-detect from SLURM GRES
+# Override by setting GPUS_PER_NODE environment variable before running
+if [[ -z "${GPUS_PER_NODE:-}" ]]; then
+  # Get GPU count from SLURM GRES configuration (works on login node too)
+  _gres_gpus=$(sinfo -p "$SLURM_JOB_PARTITION" -h -o "%G" 2>/dev/null | grep -oP 'gpu(:[^:]+)?:(\d+)' | grep -oP '\d+$' | head -1 || true)
+  if [[ -n "$_gres_gpus" && "$_gres_gpus" -gt 0 ]]; then
+    GPUS_PER_NODE="$_gres_gpus"
+  else
+    # Fallback: default to 8
+    GPUS_PER_NODE=8
+    echo "[WARNING] Could not auto-detect GPUS_PER_NODE, using default: $GPUS_PER_NODE"
+  fi
+  unset _gres_gpus
+fi
+echo "[INFO] GPUS_PER_NODE: $GPUS_PER_NODE"
 
 
 # Detect GRES support and set GRES_ARG
@@ -272,6 +288,12 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+# Sync Ray package to ensure version matches uv.lock
+# This ensures the Ray cluster and driver use the same version
+echo "[INFO] Syncing Ray package from uv.lock..."
+cd $SLURM_SUBMIT_DIR && uv sync --locked --refresh-package ray 2>&1 || echo "[WARNING] uv sync failed, continuing with existing venv"
+echo "[INFO] Ray version after sync: \$(ray --version)"
+
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
     --disable-usage-stats \
@@ -375,6 +397,11 @@ log-sync-sidecar &
 
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+
+# Sync Ray package to ensure version matches uv.lock (same as head node)
+echo "[INFO] Syncing Ray package from uv.lock..."
+cd $SLURM_SUBMIT_DIR && uv sync --locked --refresh-package ray 2>&1 || echo "[WARNING] uv sync failed, continuing with existing venv"
+echo "[INFO] Ray version after sync: \$(ray --version)"
 
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
