@@ -401,12 +401,7 @@ class SwanlabLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # If step_metric is provided, use the corresponding value from metrics as step
-        if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
-        else:
-            self.run.log(metrics, step=step)
+        self.run.log(metrics, step=step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to swanlab.
