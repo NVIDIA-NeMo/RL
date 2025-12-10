@@ -265,7 +265,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 torch_dtype=str(model_config.torch_dtype),
             )
 
-            if self.peft_config is not None:
+            if self.lora_enabled:
                 apply_lora_to_linear_modules(model, self.peft_config)
 
             full_state_dict = model.state_dict()

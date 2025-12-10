@@ -8,9 +8,6 @@ policy:
   tokenizer:
     name: meta-llama/Llama-3.2-1B
   make_sequence_length_divisible_by: 1
-  lora_cfg:
-    enabled: true
-    dim: 32
 data:
   dataset_name: openmathinstruct2
   prompt_file: examples/prompts/math.txt

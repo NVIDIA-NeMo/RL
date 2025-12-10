@@ -139,13 +139,13 @@ class LoRAConfig(TypedDict):
     enabled: Literal[True]
     target_modules: list[str]
     exclude_modules: list[str]
-    match_all_linear: bool
+    match_all_linear: NotRequired[bool]
     dim: int
     alpha: int
     dropout: float
     dropout_position: Literal["pre", "post"]
     lora_A_init: str
-    use_triton: bool
+    use_triton: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):

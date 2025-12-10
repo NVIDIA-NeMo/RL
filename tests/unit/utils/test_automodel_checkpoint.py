@@ -90,17 +90,6 @@ def mock_lora_config():
 
 
 @pytest.fixture
-def mock_distributed():
-    """Mock torch.distributed calls for non-distributed tests."""
-    with (
-        patch("torch.distributed.is_initialized", return_value=False),
-        patch("torch.distributed.get_rank", return_value=0),
-    ):
-        yield
-    torch.distributed.destroy_process_group()
-
-
-@pytest.fixture
 def init_distributed():
     """Initialize a single-process distributed environment for testing."""
 
