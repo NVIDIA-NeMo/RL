@@ -167,22 +167,27 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
 
+Notes:
+- LoRA is supported with DTensor v2 and Megatron backends. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
+- Triton kernels are only used in the DTensor v2 path. For TP > 1, Automodel currently does not support Triton kernels (see note below).
+
 ### Configuration Parameters
 
-The LoRA configuration is specified under the `policy.lora_cfg` section:
+The LoRA configuration is specified under the `policy.dtensor_cfg.lora_cfg` section:
 
 policy:
-  lora_cfg:
-    enabled: False  # Set to True to enable LoRA fine-tuning
-    target_modules: []  # List of module names to apply LoRA
-    exclude_modules: []  # List of module names to exclude from LoRA
-    match_all_linear: true  # Apply LoRA to all linear layers
-    dim: 8  # LoRA rank (r): controls adaptation capacity
-    alpha: 32  # LoRA scaling factor (effective lr = alpha/dim)
-    dropout: 0.0  # Dropout probability for LoRA layers
-    dropout_position: "post"  # Dropout position: "pre" or "post"
-    lora_A_init: "xavier"  # Initialization method: "xavier" or "uniform"
-    use_triton: true  # Use Triton-optimized kernels
+  dtensor_cfg:
+    lora_cfg:
+      enabled: False            # Set to True to enable LoRA fine-tuning
+      target_modules: []        # List of module names to apply LoRA
+      exclude_modules: []       # List of module names to exclude from LoRA
+      match_all_linear: true    # Apply LoRA to all linear layers
+      dim: 8                    # LoRA rank (r): controls adaptation capacity
+      alpha: 32                 # LoRA scaling factor (effective lr = alpha/dim)
+      dropout: 0.0              # Dropout probability for LoRA layers
+      dropout_position: "post"  # Dropout position: "pre" or "post"
+      lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
+      use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
 
 ### Parameter Details
 - **`enabled`** (bool): Whether to enable LoRA training
@@ -194,12 +199,12 @@ policy:
 - **`dropout`** (float): Dropout probability for regularization
 - **`dropout_position`** (str): Apply dropout before ("pre") or after ("post") LoRA
 - **`lora_A_init`** (str): Initialization method for LoRA A matrix
-- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for dtensor v2 only. **Note**: [Automodel not support triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues
+- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues
 
 ### Example Usage
 
 ```bash
-uv run examples/run_sft.py policy.lora_cfg.enabled=True
+uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
 
 For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).

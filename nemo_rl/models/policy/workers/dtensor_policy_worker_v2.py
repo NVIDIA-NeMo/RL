@@ -239,7 +239,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_state_dict_keys = None
 
         # lora config
-        lora_cfg = self.cfg.get("lora_cfg", None)
+        lora_cfg = self.cfg["dtensor_cfg"].get("lora_cfg", None)
         self.peft_config = None
         self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
         # patch the init_lora_weights method to use the xavier initialization

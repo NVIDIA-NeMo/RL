@@ -12,12 +12,13 @@ policy:
   tokenizer:
     name: meta-llama/Llama-3.1-8B-Instruct
     chat_template: default
+  dtensor_cfg:
+    lora_cfg:
+      enabled: true
+      dim: 128
+      alpha: 128
   train_global_batch_size: 128
   max_total_sequence_length: 4096
-  lora_cfg:
-    enabled: true
-    dim: 128
-    alpha: 128
   make_sequence_length_divisible_by: 2
   optimizer:
     kwargs:
