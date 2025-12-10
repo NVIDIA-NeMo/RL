@@ -916,7 +916,7 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
-    refit_via_p2p: bool,
+    refit_via_p2p: bool = False,
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
