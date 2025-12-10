@@ -374,9 +374,8 @@ class SwanlabLogger(LoggerInterface):
     """SwanLab logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
-        """
-        Initialize the SwanlabLogger by starting a Swanlab run and storing the resulting run on self.run.
-        
+        """Initialize the SwanlabLogger by starting a Swanlab run and storing the resulting run on self.run.
+
         Parameters:
             cfg (SwanlabConfig): Configuration for the Swanlab run (e.g., project and name).
             log_dir (Optional[str]): Optional offline log directory passed to Swanlab's init.
@@ -393,9 +392,8 @@ class SwanlabLogger(LoggerInterface):
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
     ) -> None:
-        """
-        Log metrics to the associated Swanlab run.
-        
+        """Log metrics to the associated Swanlab run.
+
         Parameters:
             metrics (dict[str, Any]): Mapping of metric names to metric values.
             step (int): Global step value to associate with all logged metrics.
@@ -411,9 +409,8 @@ class SwanlabLogger(LoggerInterface):
         self.run.log(metrics, step=step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
-        """
-        Update the Swanlab run configuration with the provided hyperparameters.
-        
+        """Update the Swanlab run configuration with the provided hyperparameters.
+
         Parameters:
             params (Mapping[str, Any]): Mapping of hyperparameter names to values to store in the run configuration.
         """
@@ -823,9 +820,8 @@ class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
     def __init__(self, cfg: LoggerConfig):
-        """
-        Create and configure enabled logging backends and optionally start GPU monitoring.
-        
+        """Create and configure enabled logging backends and optionally start GPU monitoring.
+
         Parameters:
             cfg (LoggerConfig): Configuration mapping. Expected keys include:
                 - "log_dir": base directory for backend logs.
