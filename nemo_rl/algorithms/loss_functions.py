@@ -169,6 +169,29 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
+        # sampling mask mismatch handling
+        # vllm samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+        # during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+        # token X may fall outside the training policy's top-k/p set -> prev_logprobs[X] = -inf
+        # Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+        neginf_positions = torch.isinf(prev_logprobs) | torch.isinf(
+            reference_policy_logprobs
+        )
+        neginf_count = (neginf_positions & mask.bool()).sum().item()
+        total_valid_tokens = mask.sum().item()
+        if neginf_count > 0:
+            print(
+                f"[WARNING]: {neginf_count}/{int(total_valid_tokens)} valid tokens have -inf logprobs (top-k/top-p mismatch). "
+                "Masking out these positions from loss/metrics calculation."
+            )
+
+        # mask out -inf positions
+        mask = mask * (~neginf_positions).float()
+        prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
+        reference_policy_logprobs = torch.where(
+            mask.bool(), reference_policy_logprobs, 0.0
+        )
+
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
@@ -276,9 +299,16 @@ class ClippedPGLossFn(LossFunction):
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
 
-        # Apply masking to avoid NaN in KL/Ratios when logprobs are -inf at masked positions
-        # This happens when top-k/p filtering removes the padding token
-        # This avoids -inf * 0 = NaN when doing calculations similar to the masked_mean
+        # Handle -inf in curr_logprobs as well (same top-k/top-p mismatch issue)
+        curr_is_neginf = torch.isinf(curr_logprobs)
+        curr_neginf_count = (curr_is_neginf & mask.bool()).sum().item()
+        if curr_neginf_count > 0:
+            print(
+                f"[WARNING]: {curr_neginf_count} additional -inf positions detected in curr_logprobs, masking out."
+            )
+
+        # mask out -inf positions in curr_logprobs
+        mask = mask * (~curr_is_neginf).float()
         curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
 
         # Calculate KL regularization.
@@ -635,7 +665,10 @@ class PreferenceLoss(LossFunction):
         data: BatchedDataDict[PreferenceLossDataDict],
         global_valid_seqs: Tensor,
         global_valid_toks: Tensor | None,
+        sampling_params: TrainingSamplingParams | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del sampling_params  # not used
+
         sample_mask = data["sample_mask"]
 
         rewards = rewards.squeeze(-1)
