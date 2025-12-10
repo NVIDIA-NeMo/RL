@@ -761,12 +761,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             assert self.megatron_cfg.optimizer.fp16 == True, (
                 "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16"
             )
-        else:
-            assert self.megatron_cfg.model.fp32 == True, (
-                "policy.megatron_cfg.model.fp32=True must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
+        elif self.dtype == torch.float32:
+            assert (
+                self.megatron_cfg.model.bf16 == False
+                and self.megatron_cfg.model.fp16 == False
+            ), (
+                "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
             )
-            assert self.megatron_cfg.optimizer.fp32 == True, (
-                "policy.megatron_cfg.optimizer.fp32=True must be set if policy.precision=float32"
+            assert (
+                self.megatron_cfg.optimizer.bf16 == False
+                and self.megatron_cfg.optimizer.fp16 == False
+            ), (
+                "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
             )
         self.megatron_cfg.validate()
         (
