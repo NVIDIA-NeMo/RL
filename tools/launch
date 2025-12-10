@@ -144,16 +144,20 @@ for SCRIPT in $SCRIPTS; do
             )
         fi
     
+        # Build environment variable exports for the COMMAND
+        ENV_EXPORTS="export HF_HOME=$HF_HOME HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
+        if [[ -n "${EXTRA_ENV:-}" ]]; then
+            # Parse EXTRA_ENV (space-separated VAR=value pairs) and add to exports
+            ENV_EXPORTS="$ENV_EXPORTS ${EXTRA_ENV}"
+        fi
+    
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 cd \$SCRIPT_DIR
 
-${EXTRA_ENV:-} \\
-HF_HOME=$HF_HOME \\
-HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="apt install -y jq && uv run $rel_script ${RELEASE_ARGS[@]}" \\
+COMMAND="$ENV_EXPORTS && apt install -y jq && uv run $rel_script ${RELEASE_ARGS[@]}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\
