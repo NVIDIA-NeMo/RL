@@ -150,6 +150,7 @@ def add_loss_mask_to_message_log(
         roles_to_train_on (list[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
         only_unmask_final (bool): If True, only unmask the final message in the log. Default: False
     """
+
     for i, role in enumerate(roles_to_train_on):
         roles_to_train_on[i] = role.lower()
 
@@ -448,6 +449,7 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    thinking_prefixes: list[str] = [],
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -499,7 +501,7 @@ def get_formatted_message_log(
             return task_data_spec.prompt.format(content)
         # this is a list of dicts, format only the text ones
         for item in content:
-            if item["type"] == "text":
+            if hasattr(item, "type") and item["type"] == "text":
                 item["text"] = task_data_spec.prompt.format(item["text"])
         return content
 
@@ -523,6 +525,8 @@ def get_formatted_message_log(
             ]
             + message_log_strs[first_user_msg_id + 1 :]
         )
+
+    formatted_message_list = []
 
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
@@ -605,8 +609,20 @@ def get_formatted_message_log(
                 elif not stripped_message_chunk.endswith(tokenizer.eos_token):
                     message_chunk += tokenizer.eos_token
 
+        for thinking_prefix in thinking_prefixes:
+            if message_chunk.startswith(thinking_prefix):
+                message_chunk = message_chunk[len(thinking_prefix):]
+                formatted_message_list[i-1] += thinking_prefix
+
+        formatted_message_list.append(message_chunk)
+        prev_formatted_message = formatted_message
+
+    for i, message in enumerate(message_log_strs):
+        message_chunk = formatted_message_list[i]
+
         # get images too (extend this for other modalities)
-        images_cur_message = get_images_from_message(message)
+        ## TODO: this fails on tool calls. How are tool calls supposed to work??
+        images_cur_message = [] #get_images_from_message(message)
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
@@ -640,7 +656,7 @@ def get_formatted_message_log(
         if content is None or not content:
             # Handle None or missing content (e.g., assistant messages with only tool_calls)
             new_message["content"] = message_chunk
-        elif isinstance(content, str):
+        elif isinstance(content, str) or isinstance(content, dict): # fix tool calls
             new_message["content"] = message_chunk
         else:
             # format the content list of new message the same way as the original message but replace the text with the new message chunk
@@ -654,7 +670,6 @@ def get_formatted_message_log(
                     new_message["content"].append(item)
 
         new_message_log.append(new_message)
-        prev_formatted_message = formatted_message
 
     return new_message_log
 

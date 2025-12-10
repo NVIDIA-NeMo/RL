@@ -74,6 +74,10 @@ def sft_preprocessor(
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
         tools=datum_dict.get("tools", None),  # Pass tools from data if present
+        thinking_prefixes=[
+            "<|im_start|>assistant\n<think>\n",
+            "<|im_start|>assistant\n<think></think>",
+        ]
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)

@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import Any
 
+from nemo_rl.data.datasets.response_datasets.cinnamon_orca_dataset import CinnamonOrcaDataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
@@ -56,7 +57,7 @@ def load_response_dataset(data_config, seed: int = 42):
             prompt_file=data_config["prompt_file"],
         )
     elif dataset_name == "openai_format":
-        base_dataset = OpenAIFormatDataset(
+        base_dataset = CinnamonOrcaDataset(
             data_config["train_data_path"],
             data_config["val_data_path"],
             data_config["chat_key"],
