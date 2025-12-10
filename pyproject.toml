@@ -219,6 +219,12 @@ override-dependencies = [
   "opencv-python-headless>=4.11.0",
   "nvidia-modelopt[torch]>=0.39.0",
 ]
+# CVE fxies
+constraint-dependencies = [
+  "brotli>=1.2.0", # Address CVE GHSA-2qfp-q593-8484
+  "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+  "urllib3>=2.6.0", # Address CVE GHSA-gm62-xv2j-4w53
+]
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
