@@ -862,19 +862,36 @@ class CompiledGraphWorkerGroup:
             
             # Compute return_from_workers based on output_is_replicated
             # This is critical for proper result deduplication!
+            # NOTE: With MultiDPCompiledGraphExecutor, refs are ordered by:
+            #       [DP0_workers..., DP1_workers..., DP2_workers..., etc.]
+            #       within each DP shard, workers are ordered by PP->CP->TP
             if output_is_replicated is None:
                 output_is_replicated = []
             
             return_from_workers = []
-            for worker_idx in range(len(self.worker_group._workers)):
-                worker_coords = self.worker_group.sharding_annotations.get_worker_coords(worker_idx)
-                return_from_this_worker = True
-                for axis in output_is_replicated:
-                    if axis in worker_coords and worker_coords[axis] != 0:
-                        return_from_this_worker = False
-                        break
-                if return_from_this_worker:
-                    return_from_workers.append(worker_idx)
+            # Since MultiDPCompiledGraphExecutor returns refs in DP-major order,
+            # we need to compute which ref indices to return, not which worker indices
+            pp_size = self.worker_group.sharding_annotations.get_axis_size("pipeline_parallel")
+            cp_size = self.worker_group.sharding_annotations.get_axis_size("context_parallel")
+            tp_size = self.worker_group.sharding_annotations.get_axis_size("tensor_parallel")
+            
+            ref_idx = 0
+            for dp_rank in range(dp_size):
+                for pp_rank in range(pp_size):
+                    for cp_rank in range(cp_size):
+                        for tp_rank in range(tp_size):
+                            # Check if this coordinate should return results
+                            should_return = True
+                            if "context_parallel" in output_is_replicated and cp_rank != 0:
+                                should_return = False
+                            if "tensor_parallel" in output_is_replicated and tp_rank != 0:
+                                should_return = False
+                            if "pipeline_parallel" in output_is_replicated and pp_rank != 0:
+                                should_return = False
+                            
+                            if should_return:
+                                return_from_workers.append(ref_idx)
+                            ref_idx += 1
             
             # Wrap in MultiWorkerFuture
             from nemo_rl.distributed.worker_groups import MultiWorkerFuture

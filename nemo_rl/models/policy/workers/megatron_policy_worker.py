@@ -79,6 +79,7 @@ from megatron.core.parallel_state import (
     get_data_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
+    get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
