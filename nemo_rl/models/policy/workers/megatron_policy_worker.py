@@ -133,7 +133,6 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.distributed.worker_group_utils import log_worker_initialization_info
 
 try:
     from megatron.core.distributed import (
@@ -759,9 +758,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ) = setup_megatron_model(
             policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
         )
-
-        # Log worker initialization info for nsys profile mapping
-        log_worker_initialization_info("MegatronPolicyWorker")
 
         # Set the param sync function for the model
         if (

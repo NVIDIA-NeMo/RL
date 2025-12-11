@@ -572,36 +572,24 @@ def sft_train(
         current_epoch < max_num_epochs
         and total_steps < master_config["sft"]["max_num_steps"]
     ):
-        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}", flush=True)
+        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}",
-                flush=True,
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 # Prepare batch and generate responses
-                print("▶ Preparing batch...", flush=True)
+                print("▶ Preparing batch...")
                 with timer.time("data_processing"):
-                    import time as time_module
-                    import torch
-                    dp_start = time_module.time()
-                    
-                    torch.cuda.nvtx.range_push("data_processing/add_loss_mask")
-                    mask_start = time_module.time()
                     ## add loss mask based on role to every message
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
                     )
-                    mask_time = time_module.time() - mask_start
-                    torch.cuda.nvtx.range_pop()
-
-                    torch.cuda.nvtx.range_push("data_processing/flatten_and_pad")
-                    flat_start = time_module.time()
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -609,11 +597,6 @@ def sft_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
-                    flat_time = time_module.time() - flat_start
-                    torch.cuda.nvtx.range_pop()
-
-                    torch.cuda.nvtx.range_push("data_processing/create_batch_dict")
-                    batch_start = time_module.time()
                     train_data: BatchedDataDict = BatchedDataDict(
                         {
                             "input_ids": cat_and_padded["token_ids"],
@@ -625,15 +608,11 @@ def sft_train(
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
-                    batch_time = time_module.time() - batch_start
-                    torch.cuda.nvtx.range_pop()
                     
-                print("▶ Taking a training step...", flush=True)
+                print("▶ Taking a training step...")
                 
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
-                
-                # Debug: write to file with SLURM job ID
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -762,20 +741,6 @@ def sft_train(
                 timing_metrics["worker_computation_time_min"] = train_results["worker_computation_time_min"]
             if "worker_imbalance" in train_results:
                 timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
-            
-            # Debug: write timing_metrics to file
-            import time as time_module
-            log_dir = os.environ.get('WORKER_LOG_DIR', '/tmp')
-            job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
-            debug_file = os.path.join(log_dir, f'{job_id}_sft_timing_debug.log')
-            
-            try:
-                with open(debug_file, "a") as f:
-                    f.write(f"timing_metrics after get_timing_metrics: {dict(timing_metrics)}\n")
-                    f.write(f"{'='*80}\n\n")
-                    f.flush()
-            except Exception:
-                pass
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
