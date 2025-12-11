@@ -211,7 +211,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 worker_group=worker_group,
                 compiled_graph_config=compiled_graph_config,
             )
-            print(f"🚀 Ray Compiled Graph ENABLED: overlap_comm={compiled_graph_config['overlap_communication']}")
+            print(
+                f"🚀 Ray Compiled Graph ENABLED: overlap_comm={compiled_graph_config['overlap_communication']}"
+            )
         else:
             self.worker_group = worker_group
             print("Using standard Ray remote calls (compiled graph disabled)")
@@ -542,9 +544,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = self.worker_group.get_all_worker_results(futures)
 
         # Calculate worker imbalance
-        worker_computation_times = [r.get("worker_computation_time", 0) for r in results]
-        max_worker_time = max(worker_computation_times) if worker_computation_times else 0
-        min_worker_time = min(worker_computation_times) if worker_computation_times else 0
+        worker_computation_times = [
+            r.get("worker_computation_time", 0) for r in results
+        ]
+        max_worker_time = (
+            max(worker_computation_times) if worker_computation_times else 0
+        )
+        min_worker_time = (
+            min(worker_computation_times) if worker_computation_times else 0
+        )
         worker_imbalance = max_worker_time - min_worker_time
 
         # Aggregate the results

@@ -20,7 +20,6 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
-import ray
 import torch
 from accelerate import init_empty_weights
 from nemo_automodel import (
@@ -97,8 +96,10 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 # Ray.remote() is now applied at runtime in RayWorkerBuilder (like vLLM does).
 class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     # Runtime environment to use when applying ray.remote() at runtime
-    _ray_remote_runtime_env = get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-    
+    _ray_remote_runtime_env = get_runtime_env_for_policy_worker(
+        "dtensor_policy_worker_v2"
+    )
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -496,8 +497,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         import time
+
         worker_start_time = time.time()
-        
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -857,7 +859,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     mb_metrics[k].append(v)
 
             worker_computation_time = time.time() - worker_start_time
-            
+
             metrics = {
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,

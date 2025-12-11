@@ -21,7 +21,6 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar, cast
 
-import ray
 import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
@@ -424,8 +423,10 @@ def destroy_parallel_state():
 # This allows the wrapper to instantiate this class directly: worker_class(*args, **kwargs)
 class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     # Default options to use when applying ray.remote() at runtime
-    _default_options = {"runtime_env": get_runtime_env_for_policy_worker("megatron_policy_worker")}
-    
+    _default_options = {
+        "runtime_env": get_runtime_env_for_policy_worker("megatron_policy_worker")
+    }
+
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -911,11 +912,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         import time
+
         worker_start_time = time.time()
-        
+
         # Import parallel_state since it's used later
         from megatron.core import parallel_state
-        
+
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1155,7 +1157,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         worker_computation_time = time.time() - worker_start_time
-        
+
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),

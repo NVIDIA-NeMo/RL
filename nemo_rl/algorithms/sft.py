@@ -355,11 +355,11 @@ def _warmup_compiled_graph(
     rcg_config: dict,
 ) -> None:
     """Warmup Ray Compiled Graph with maximum sequence length.
-    
+
     This creates fake data with max_total_sequence_length to ensure the
     compiled graph is built with the worst-case input shape, avoiding
     recompilation during actual training.
-    
+
     Args:
         policy: The policy to warmup
         loss_fn: Loss function to use
@@ -368,106 +368,94 @@ def _warmup_compiled_graph(
         rcg_config: Ray Compiled Graph configuration dict
     """
     import torch
+
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-    
+
     # Get configuration
     max_seq_len = master_config["policy"]["max_total_sequence_length"]
     gbs = master_config["policy"]["train_global_batch_size"]
     mbs = master_config["policy"]["train_micro_batch_size"]
-    
+
     # Get warmup config from rcg_config (use defaults if not specified)
     warmup_seq_len = rcg_config["warmup_seq_len"] or max_seq_len
     warmup_gbs = rcg_config["warmup_gbs"] or gbs
-    
+
     print(f"  🔧 Warmup config: SEQ_LEN={warmup_seq_len}, GBS={warmup_gbs}, MBS={mbs}")
     print(f"  📦 Creating fake data with shape: ({warmup_gbs}, {warmup_seq_len})")
-    
+
     # Create fake data with max sequence length
     # Use valid token IDs from the tokenizer's vocabulary
     vocab_size = len(tokenizer)
     fake_input_ids = torch.randint(
-        low=0, 
+        low=0,
         high=min(vocab_size, 32000),  # Use reasonable token range
         size=(warmup_gbs, warmup_seq_len),
-        dtype=torch.long
+        dtype=torch.long,
     )
-    
+
     # Create attention mask (all ones = no padding)
-    fake_attention_mask = torch.ones(
-        (warmup_gbs, warmup_seq_len),
-        dtype=torch.long
-    )
-    
+    fake_attention_mask = torch.ones((warmup_gbs, warmup_seq_len), dtype=torch.long)
+
     # Create position IDs
-    fake_position_ids = torch.arange(
-        warmup_seq_len,
-        dtype=torch.long
-    ).unsqueeze(0).expand(warmup_gbs, -1)
-    
+    fake_position_ids = (
+        torch.arange(warmup_seq_len, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(warmup_gbs, -1)
+    )
+
     # Create labels (same as input_ids for SFT)
     fake_labels = fake_input_ids.clone()
-    
+
     # Create loss mask (all ones = compute loss on all tokens)
-    fake_loss_mask = torch.ones(
-        (warmup_gbs, warmup_seq_len),
-        dtype=torch.float32
-    )
-    
+    fake_loss_mask = torch.ones((warmup_gbs, warmup_seq_len), dtype=torch.float32)
+
     # All sequences have the same length (max_seq_len)
-    fake_input_lengths = torch.full(
-        (warmup_gbs,),
-        warmup_seq_len,
-        dtype=torch.long
-    )
-    
+    fake_input_lengths = torch.full((warmup_gbs,), warmup_seq_len, dtype=torch.long)
+
     # Create sample mask (all sequences are valid, no padding/dummy sequences)
-    fake_sample_mask = torch.ones(
-        (warmup_gbs,),
-        dtype=torch.float32
-    )
-    
+    fake_sample_mask = torch.ones((warmup_gbs,), dtype=torch.float32)
+
     # Create token mask (all tokens contribute to loss, used for token-level loss)
-    fake_token_mask = torch.ones(
-        (warmup_gbs, warmup_seq_len),
-        dtype=torch.float32
-    )
-    
+    fake_token_mask = torch.ones((warmup_gbs, warmup_seq_len), dtype=torch.float32)
+
     # Create microbatch indices and lengths for sequence packing
     # For warmup, all sequences have same length, so we create simple placeholders
     num_microbatches = warmup_gbs // mbs
     fake_micro_batch_indices = []
     fake_micro_batch_lengths = []
-    
+
     for mb_idx in range(num_microbatches):
         start_idx = mb_idx * mbs
         end_idx = start_idx + mbs
         # Each microbatch contains mbs sequences, each of length warmup_seq_len
         fake_micro_batch_indices.append(list(range(start_idx, end_idx)))
         fake_micro_batch_lengths.append([warmup_seq_len] * mbs)
-    
+
     # Create BatchedDataDict with fake data
-    warmup_data = BatchedDataDict({
-        "input_ids": fake_input_ids,
-        "attention_mask": fake_attention_mask,
-        "position_ids": fake_position_ids,
-        "labels": fake_labels,
-        "loss_mask": fake_loss_mask,
-        "input_lengths": fake_input_lengths,
-        "sample_mask": fake_sample_mask,
-        "token_mask": fake_token_mask,
-        "micro_batch_indices": fake_micro_batch_indices,
-        "micro_batch_lengths": fake_micro_batch_lengths,
-    })
-    
+    warmup_data = BatchedDataDict(
+        {
+            "input_ids": fake_input_ids,
+            "attention_mask": fake_attention_mask,
+            "position_ids": fake_position_ids,
+            "labels": fake_labels,
+            "loss_mask": fake_loss_mask,
+            "input_lengths": fake_input_lengths,
+            "sample_mask": fake_sample_mask,
+            "token_mask": fake_token_mask,
+            "micro_batch_indices": fake_micro_batch_indices,
+            "micro_batch_lengths": fake_micro_batch_lengths,
+        }
+    )
+
     # Store warmup data in Ray object store for efficient sharing across workers
-    print(f"  🚀 Running warmup training step...")
-    
+    print("  🚀 Running warmup training step...")
+
     # Run one training step to trigger graph compilation
     # Use eval_mode=True to skip optimizer step (we don't care about gradients)
     try:
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
-        
+
         start_time.record()
         _ = policy.train(
             data=warmup_data,
@@ -477,17 +465,19 @@ def _warmup_compiled_graph(
             mbs=mbs,
         )
         end_time.record()
-        
+
         # Wait for completion
         torch.cuda.synchronize()
         warmup_time = start_time.elapsed_time(end_time) / 1000.0  # Convert to seconds
-        
+
         print(f"  ✅ Warmup step completed in {warmup_time:.2f}s")
-        print(f"  💾 Compiled graph is now cached and ready for training")
-        
+        print("  💾 Compiled graph is now cached and ready for training")
+
     except Exception as e:
         print(f"  ⚠️  Warmup failed: {e}")
-        print(f"  ℹ️  Continuing with normal training (graph will compile on first real step)")
+        print(
+            "  ℹ️  Continuing with normal training (graph will compile on first real step)"
+        )
 
 
 def sft_train(
@@ -551,11 +541,11 @@ def sft_train(
 
     # Warmup compiled graph with max sequence length if RCG is enabled
     from nemo_rl.distributed.ray_compiled_graph import get_compiled_graph_config
-    
+
     # Get RCG config from policy config
     rcg_config = master_config["policy"].get("ray_compiled_graph", None)
     compiled_graph_config = get_compiled_graph_config(rcg_config)
-    
+
     # Automatically warmup when RCG is enabled (only at start of training)
     if compiled_graph_config.get("enabled", False) and total_steps == 0:
         print("\n🔥 Warming up Ray Compiled Graph with max sequence length...")
@@ -736,12 +726,16 @@ def sft_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-            
+
             # Add worker timing metrics from train_results
             if "worker_computation_time_max" in train_results:
-                timing_metrics["worker_computation_time_max"] = train_results["worker_computation_time_max"]
+                timing_metrics["worker_computation_time_max"] = train_results[
+                    "worker_computation_time_max"
+                ]
             if "worker_computation_time_min" in train_results:
-                timing_metrics["worker_computation_time_min"] = train_results["worker_computation_time_min"]
+                timing_metrics["worker_computation_time_min"] = train_results[
+                    "worker_computation_time_min"
+                ]
             if "worker_imbalance" in train_results:
                 timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
 
