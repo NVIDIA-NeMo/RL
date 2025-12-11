@@ -80,12 +80,12 @@ from nemo_rl.models.megatron.train import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker
 )
-from nemo_rl.models.policy.workers.base_worker import BasePolicyWorker
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -95,6 +95,7 @@ from nemo_rl.models.megatron.setup import (
     validate_model_paths,
     validate_and_set_config,
 )
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -114,7 +115,7 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
-class MegatronPolicyWorker(BasePolicyWorker):
+class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
