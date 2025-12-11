@@ -137,6 +137,7 @@ policy:
       lr_decay_iters: 100000  # Must be greater than lr_warmup_iters
       lr_warmup_iters: 13
       lr_warmup_init: 5.0e-7
+      override_opt_param_scheduler: true
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -199,6 +200,7 @@ policy:
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
+      kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
