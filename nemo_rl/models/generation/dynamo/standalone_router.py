@@ -61,30 +61,46 @@ class KvRouter:
         num_workers: int = 4,
         base_kv_events_port: int = 5557,
         base_metrics_port: int = 5657,
+        worker_ips: Optional[List[str]] = None,
+        # Router config (matching Rust KvRouterConfig defaults)
+        overlap_score_weight: float = 1.0,
+        router_temperature: float = 0.0,  # 0 = greedy, >0 = softmax sampling
     ):
         self.num_workers = num_workers
         self.block_size = block_size
+        self.overlap_score_weight = overlap_score_weight
+        self.router_temperature = router_temperature
 
         self.radix_tree = RadixTree()
 
         self.kv_usages = [0.0] * num_workers
         self.waitings = [0] * num_workers
+        # Track active decode blocks per worker (for cost function)
+        self.decode_blocks = [0] * num_workers
         
         self.round_robin_counter = 0
 
+        # Use worker IPs if provided, otherwise fall back to localhost
+        if worker_ips is None:
+            worker_ips = ["localhost"] * num_workers
+        
         self.context = zmq.Context()
-        self.load_listeners = [
-            setup_zmq_subscriber(
-                self.context, f"tcp://localhost:{base_metrics_port + worker_id}"
+        self.load_listeners = []
+        self.kv_listeners = []
+        
+        for worker_id in range(num_workers):
+            worker_ip = worker_ips[worker_id] if worker_id < len(worker_ips) else "localhost"
+            metrics_endpoint = f"tcp://{worker_ip}:{base_metrics_port + worker_id}"
+            kv_endpoint = f"tcp://{worker_ip}:{base_kv_events_port + worker_id}"
+            
+            print(f"[Router] Worker {worker_id}: metrics={metrics_endpoint}, kv={kv_endpoint}")
+            
+            self.load_listeners.append(
+                setup_zmq_subscriber(self.context, metrics_endpoint)
             )
-            for worker_id in range(num_workers)
-        ]
-        self.kv_listeners = [
-            ZmqKvEventListener(
-                f"tcp://localhost:{base_kv_events_port + worker_id}", "", block_size
+            self.kv_listeners.append(
+                ZmqKvEventListener(kv_endpoint, "", block_size)
             )
-            for worker_id in range(num_workers)
-        ]
 
         self.background_tasks: list[asyncio.Task] = []
         self.load_tasks: list[asyncio.Task] = []
@@ -196,47 +212,88 @@ class KvRouter:
             self.indexer_tasks = []
 
     async def get_best_worker(self, local_hashes: list[int], num_tokens: int) -> int:
+        """Select the best worker using the Dynamo KV router cost function.
+        
+        Cost function (lower is better):
+            logit = overlap_weight * prefill_blocks + decode_blocks
+            
+        Where:
+            - prefill_blocks = tokens that need prefilling / block_size
+            - overlap = cached blocks that can be reused (reduces prefill)
+            - decode_blocks = active decode blocks on the worker
+            
+        Selection:
+            - temperature=0: Greedy (select min logit, random tie-break)
+            - temperature>0: Softmax sampling (lower logit = higher probability)
+        """
         try:
             if num_tokens <= 0:
                 raise ValueError("num_tokens must be positive")
 
             # local_hashes can be empty
             raw_scores = self.radix_tree.find_matches(local_hashes).scores
-
-            overlap_scores = {
-                worker_id: raw_scores.get(worker_id, 0) * self.block_size / num_tokens
-                for worker_id in range(self.num_workers)
-            }
-
-            kv_usages = self.kv_usages[:]
-            waitings = self.waitings[:]
-
-            max_waiting = max(waitings) if waitings else 0
-            waitings_normalized = [
-                waiting / max_waiting if max_waiting else 0.0 for waiting in waitings
-            ]
-
-            logits = []
-            for worker_id in range(self.num_workers):
-                overlap = overlap_scores[worker_id]
-                usage = kv_usages[worker_id]
-                waiting = waitings_normalized[worker_id]
-                logit = 2 * overlap - usage - waiting
-                logits.append(logit)
-                logger.info(
-                    f"worker_id: {worker_id}, logit = 2 * {overlap:.3f} - {usage:.3f} - {waiting:.3f} = {logit:.3f}"
+            
+            # Debug: log raw scores and input info periodically
+            if hasattr(self, '_get_best_worker_count'):
+                self._get_best_worker_count += 1
+            else:
+                self._get_best_worker_count = 1
+            
+            if self._get_best_worker_count <= 3 or self._get_best_worker_count % 100 == 0:
+                print(
+                    f"[Router] get_best_worker #{self._get_best_worker_count}: "
+                    f"num_hashes={len(local_hashes)}, num_tokens={num_tokens}, "
+                    f"raw_scores={dict(raw_scores)}"
                 )
 
-            logits_array = np.array(logits)
-            best_worker_id = int(
-                np.random.choice(np.flatnonzero(logits_array == logits_array.max()))
-            )
+            # raw_scores keys are tuples (worker_id, rank) - aggregate by worker_id
+            # Sum all scores for each worker_id regardless of the second element
+            # overlap = number of cached blocks for this worker
+            overlap_blocks = {}
+            for key, score in raw_scores.items():
+                if isinstance(key, tuple):
+                    wid = key[0]
+                else:
+                    wid = key
+                overlap_blocks[wid] = overlap_blocks.get(wid, 0) + score
 
-            # this is a predictive update which will be reset as new metrics are polled
-            # but it is helpful for handling short bursts of highly concurrent requests
-            # we omit updating the gpu_usage_perc as done in the rusty router for simplicity
-            # as this requires obtaining num_gpu_blocks from the engines and can be intrusive
-            # no need for async lock here, as the state is intended to be continuously overwritten
+            # Calculate logits for each worker (lower is better)
+            worker_logits = {}
+            for worker_id in range(self.num_workers):
+                # Number of cached blocks for this worker
+                overlap = overlap_blocks.get(worker_id, 0)
+                
+                # prefill_tokens = total tokens - cached tokens
+                # This is the number of tokens that need to be prefilled
+                cached_tokens = overlap * self.block_size
+                prefill_tokens = max(0, num_tokens - cached_tokens)
+                prefill_blocks = prefill_tokens / self.block_size
+                
+                # decode_blocks = active decode blocks on this worker
+                # Use waiting requests as a proxy for decode load
+                decode_blocks = self.decode_blocks[worker_id] + self.waitings[worker_id]
+                
+                # Cost function: overlap_weight * prefill_blocks + decode_blocks
+                # Lower is better (minimize prefill cost + decode load)
+                logit = self.overlap_score_weight * prefill_blocks + decode_blocks
+                worker_logits[worker_id] = logit
+                
+                logger.info(
+                    f"worker_id: {worker_id}, logit = {self.overlap_score_weight:.1f} * {prefill_blocks:.3f} + {decode_blocks} "
+                    f"= {logit:.3f} (overlap={overlap} blocks, cached={cached_tokens} tokens)"
+                )
+
+            # Select worker based on temperature
+            if self.router_temperature <= 0:
+                # Greedy selection: pick minimum logit with random tie-break
+                min_logit = min(worker_logits.values())
+                min_workers = [wid for wid, logit in worker_logits.items() if logit == min_logit]
+                best_worker_id = int(np.random.choice(min_workers))
+            else:
+                # Softmax sampling (lower logit = higher probability)
+                best_worker_id = self._softmax_sample(worker_logits, self.router_temperature)
+
+            # Predictive update for handling concurrent request bursts
             self.waitings[best_worker_id] += 1
 
             return best_worker_id
@@ -244,6 +301,37 @@ class KvRouter:
         except Exception as e:
             logger.error(f"Error in get_best_worker: {e}")
             raise
+    
+    def _softmax_sample(self, logits: dict[int, float], temperature: float) -> int:
+        """Softmax sampling over logits (lower logit = higher probability).
+        
+        Matches the Rust softmax_sample implementation in scheduler.rs.
+        """
+        if len(logits) == 1:
+            return list(logits.keys())[0]
+        
+        keys = list(logits.keys())
+        values = list(logits.values())
+        
+        min_val = min(values)
+        max_val = max(values)
+        
+        if min_val == max_val:
+            # All values same, uniform probability
+            return int(np.random.choice(keys))
+        
+        # Normalize and negate (lower is better, so negate for softmax)
+        normalized = [-(v / (max_val - min_val)) for v in values]
+        
+        # Apply temperature and softmax
+        scaled = [v / temperature for v in normalized]
+        max_scaled = max(scaled)
+        exp_values = [np.exp(v - max_scaled) for v in scaled]  # Subtract max for numerical stability
+        sum_exp = sum(exp_values)
+        probabilities = [v / sum_exp for v in exp_values]
+        
+        # Sample from distribution
+        return int(np.random.choice(keys, p=probabilities))
 
     async def get_worker_round_robin(self, local_hashes: list[int], num_tokens: int) -> int:
         # Select worker in round robin fashion
@@ -294,12 +382,17 @@ class RouterAPI:
         base_kv_events_port: int = 5557,
         base_metrics_port: int = 5657,
         port: int = 7000,
+        # Router config (matching Rust KvRouterConfig defaults)
+        overlap_score_weight: float = 1.0,
+        router_temperature: float = 0.0,
     ):
         self.port = port
         self.block_size = block_size
         self.num_workers = num_workers
         self.base_kv_events_port = base_kv_events_port
         self.base_metrics_port = base_metrics_port
+        self.overlap_score_weight = overlap_score_weight
+        self.router_temperature = router_temperature
         self.router = None
         self.server: Optional[uvicorn.Server] = None
         self.app = FastAPI(
@@ -315,6 +408,8 @@ class RouterAPI:
             num_workers=self.num_workers,
             base_kv_events_port=self.base_kv_events_port,
             base_metrics_port=self.base_metrics_port,
+            overlap_score_weight=self.overlap_score_weight,
+            router_temperature=self.router_temperature,
         )
         await self.router.start_background_tasks()
         logger.info("Router API started successfully")
@@ -404,6 +499,14 @@ def main():
     parser.add_argument(
         "--port", type=int, default=7000, help="Port to serve the Router API on"
     )
+    parser.add_argument(
+        "--overlap-score-weight", type=float, default=1.0,
+        help="Weight for overlap score in cost function (default: 1.0)"
+    )
+    parser.add_argument(
+        "--router-temperature", type=float, default=0.0,
+        help="Temperature for softmax sampling (0.0 = greedy, default: 0.0)"
+    )
 
     args = parser.parse_args()
 
@@ -416,6 +519,8 @@ def main():
         base_kv_events_port=args.base_kv_events_port,
         base_metrics_port=args.base_metrics_port,
         port=args.port,
+        overlap_score_weight=args.overlap_score_weight,
+        router_temperature=args.router_temperature,
     )
 
     async def run_with_shutdown():

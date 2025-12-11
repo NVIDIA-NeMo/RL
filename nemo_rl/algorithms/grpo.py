@@ -1222,6 +1222,21 @@ def grpo_train(
                         repeated_batch, master_config["grpo"]["reward_shaping"]
                     )
 
+                # TEMP: Print generation timing (comment out the 'continue' below to run full training)
+                gen_time = timer.get_latest_elapsed("generation")
+                prep_time = timer.get_latest_elapsed("prepare_for_generation/total")
+                print(f"\n⏱️  Generation Timing (Step {current_step+1}):", flush=True)
+                print(f"  • prepare_for_generation: {prep_time:.2f}s", flush=True)
+                print(f"  • generation (rollout): {gen_time:.2f}s", flush=True)
+                print(f"  • total: {prep_time + gen_time:.2f}s", flush=True)
+                if rollout_metrics:
+                    print(f"  • mean_gen_tokens_per_sample: {rollout_metrics.get('mean_gen_tokens_per_sample', 'N/A')}", flush=True)
+                # Uncomment the following 4 lines to skip training and quickly iterate through generations:
+                # timer.reset()
+                # current_step += 1
+                # total_steps += 1
+                # continue
+
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
                 with timer.time("reward_calculation"):

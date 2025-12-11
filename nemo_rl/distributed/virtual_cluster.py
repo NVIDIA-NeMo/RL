@@ -59,7 +59,7 @@ class PY_EXECUTABLES:
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
     # Use ai-dynamo dependencies
-    DYNAMO = "uv run --locked --extra dynamo --extra vllm"
+    DYNAMO = f"uv run --locked --extra dynamo --extra vllm --directory {git_root}"
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:

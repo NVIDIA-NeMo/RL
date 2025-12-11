@@ -140,7 +140,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         router_cfg = self.cfg.get("router_cfg", {})
-        stat_logger = None
+        self.stat_loggers = []
         if router_cfg.get("enabled"):
             from nemo_rl.models.generation.dynamo.workers import LoggerFactory
             
@@ -178,14 +178,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             llm_kwargs["enable_prefix_caching"] = True
             llm_kwargs["block_size"] = block_size
 
-            stat_logger = [LoggerFactory(port=metrics_port)]
+            # Router metrics publisher (publishes to ZMQ for router to consume)
+            self.stat_loggers.append(LoggerFactory(port=metrics_port))
+            print(f"[Worker] Router metrics publisher created for port {metrics_port}")
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.stat_loggers = (
-            [PrometheusStatLogger]
-            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
-            else []
-        )
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            # Prometheus stat logger for internal vLLM metrics
+            self.stat_loggers.append(PrometheusStatLogger)
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
@@ -984,6 +984,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             list_of_worker_results = result_or_coro
 
         return cast(list[str], list_of_worker_results)
+
+    async def report_node_ip_async(self) -> str:
+        """Report the IP address of the node this worker is running on."""
+        return _get_node_ip_local()
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""

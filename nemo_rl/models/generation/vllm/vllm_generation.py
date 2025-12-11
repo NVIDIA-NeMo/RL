@@ -253,17 +253,43 @@ class VllmGeneration(GenerationInterface):
             self.block_size = router_cfg.get("block_size", 64)
             base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
             base_metrics_port = router_cfg.get("base_metrics_port", 5657)
+            # Router cost function config (matching Rust KvRouterConfig defaults)
+            overlap_score_weight = router_cfg.get("overlap_score_weight", 1.0)
+            router_temperature = router_cfg.get("router_temperature", 0.0)
 
+            # Get worker IPs for the DP leader workers
+            worker_ips = self._get_dp_leader_worker_ips()
             print(
                 f"[INFO] Initializing KvRouter with {self.dp_size} workers, "
-                f"block_size={self.block_size}, mode={self.router_mode}"
+                f"block_size={self.block_size}, mode={self.router_mode}, "
+                f"overlap_weight={overlap_score_weight}, temp={router_temperature}, "
+                f"worker_ips={worker_ips}"
             )
             self.router = KvRouter(
                 block_size=self.block_size,
                 num_workers=self.dp_size,
                 base_kv_events_port=base_kv_events_port,
                 base_metrics_port=base_metrics_port,
+                worker_ips=worker_ips,
+                overlap_score_weight=overlap_score_weight,
+                router_temperature=router_temperature,
             )
+            
+            # Start router background tasks in a separate thread
+            import threading
+            
+            def start_router_tasks():
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                print("[INFO] Starting KvRouter background tasks...")
+                loop.run_until_complete(self.router.start_background_tasks())
+                # Keep the loop running to process background tasks
+                loop.run_forever()
+            
+            self._router_thread = threading.Thread(target=start_router_tasks, daemon=True)
+            self._router_thread.start()
+            print("[INFO] KvRouter background thread started")
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -395,6 +421,28 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def _get_dp_leader_worker_ips(self) -> list[str]:
+        """Get the IP addresses of the DP leader workers for router communication."""
+        # Get the IP from each DP leader worker
+        dp_leader_indices = self.worker_group.dp_leader_worker_indices
+        worker_ips = []
+        
+        # Call report_node_ip_async on each DP leader worker
+        futures = []
+        for dp_idx, leader_idx in enumerate(dp_leader_indices):
+            worker = self.worker_group.workers[leader_idx]
+            futures.append(worker.report_node_ip_async.remote())
+        
+        # Get all results
+        ips = ray.get(futures)
+        
+        for dp_idx, ip in enumerate(ips):
+            leader_idx = dp_leader_indices[dp_idx]
+            print(f"[Router] DP shard {dp_idx} (worker {leader_idx}) IP: {ip}")
+            worker_ips.append(ip)
+        
+        return worker_ips
 
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
         """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
@@ -610,7 +658,8 @@ class VllmGeneration(GenerationInterface):
             else:  # best_worker mode
                 dp_shard_idx = await self.router.get_best_worker(local_hashes, num_tokens)
         else:
-            raise RuntimeError("Router is not enabled")
+            # raise RuntimeError("Router is not enabled")
+            print("[WARNING] Router is not enabled, using round-robin selection")
             # Fall back to round-robin selection if router is not enabled
             dp_shard_idx = self.current_generate_dp_shard_idx
             self.current_generate_dp_shard_idx += 1
@@ -627,9 +676,6 @@ class VllmGeneration(GenerationInterface):
             greedy=greedy,
         )
 
-        # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
 
         # Create a queue to collect sample results from the worker as they complete
         result_queue = asyncio.Queue()
