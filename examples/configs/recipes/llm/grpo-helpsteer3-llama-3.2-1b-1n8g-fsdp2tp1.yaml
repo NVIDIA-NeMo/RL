@@ -1,0 +1,24 @@
+defaults: ../../grpo_helpsteer3.yaml
+
+# GRPO Algorithm Configuration for Llama-3.2-1B with HelpSteer3
+grpo:
+  max_num_epochs: 3
+
+checkpointing:
+  checkpoint_dir: "results/grpo-helpsteer3-llama-3.2-1b-5"
+
+policy:
+  generation:
+    stop_token_ids: 
+      - 128009  # <|eot_id|> for Llama-3.2
+
+logger:
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: "grpo-helpsteer3-llama-3.2-1b"
+    name: "grpo-helpsteer3-llama-3.2-1b-tp${policy.dtensor_cfg.tensor_parallel_size}"
+  tensorboard:
+    log_dir: "tb_logs-grpo-helpsteer3-llama-3.2-1b"
+  mlflow:
+    run_name: "grpo-helpsteer3-llama-3.2-1b"
