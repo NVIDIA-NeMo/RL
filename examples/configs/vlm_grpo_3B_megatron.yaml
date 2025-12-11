@@ -104,6 +104,7 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    ignore_eos: false
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

@@ -231,3 +231,36 @@ def multichoice_qa_processor(
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
     return output
+
+
+def random_input_len_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for random input length."""
+    input_len_or_input_len_generator = task_data_spec.input_len_or_input_len_generator
+    if callable(input_len_or_input_len_generator):
+        input_len = input_len_or_input_len_generator(idx)
+    else:
+        input_len = input_len_or_input_len_generator
+
+    message_log: LLMMessageLogType = []
+    user_message = {
+        "role": "user",
+        "content": "Synthetic random input data",
+        "token_ids": torch.randint(0, tokenizer.vocab_size, (input_len,)),  # type: ignore
+    }
+    message_log.append(user_message)  # type: ignore
+    assert input_len <= max_seq_length  # type: ignore
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": input_len,  # type: ignore
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "extra_env_info": {},
+        "task_name": "random",
+    }
+    return output
