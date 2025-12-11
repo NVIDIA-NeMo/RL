@@ -3,6 +3,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
+export NRT_REBUILD_VENVS=true
 # allow user to pass an existing HF checkpoint path based on instruction in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md
 export MODEL_NAME=${NRL_DEEPSEEK_V3_HF_CKPT:-"unsloth/DeepSeek-V3-0324-BF16"}
 
