@@ -4,7 +4,7 @@ This document explains how to train reward models (RM) within NeMo RL. Currently
 
 ## Launch a Training Job
 
-The script, [examples/run_rm.py](../../examples/run_rm.py), is used to train a Bradley-Terry reward model. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
+The script, [examples/run_rm.py](../../examples/run_rm.py), is used to train a Bradley-Terry reward model. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../get-started/cluster.md).
 
 Be sure to launch the job using `uv`. The command to launch a training job is as follows:
 
