@@ -24,7 +24,6 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.models.policy.utils import sliding_window_overwrite
 from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
 
 
@@ -38,7 +37,6 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
         model_name,
         torch_dtype=torch.float32,
         trust_remote_code=True,
-        **sliding_window_overwrite(model_name),
     )
 
 
@@ -115,6 +113,8 @@ THEORETICAL_TFLOPS = {
     ("NVIDIA A100 80GB PCIe", torch.float32): 312 / 2 if is_using_tf32() else 19.5,
     ("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2,
     ("NVIDIA H100 80GB HBM3", torch.float32): 989 / 2 if is_using_tf32() else 67.0,
+    ("NVIDIA H200", torch.bfloat16): 1979 / 2,
+    ("NVIDIA H200", torch.float32): 989 / 2 if is_using_tf32() else 67.0,
     ("NVIDIA B200", torch.bfloat16): 4500 / 2,
     ("NVIDIA B200", torch.float32): 2200 / 2 if is_using_tf32() else 80.0,
     ("NVIDIA B300", torch.bfloat16): 4500 / 2,
