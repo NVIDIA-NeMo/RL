@@ -516,17 +516,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        # Reconstruct tensors from shapes if optimization is enabled
-        import os
-        optimize_enabled = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
-        
-        if optimize_enabled:
-            from nemo_rl.distributed.worker_groups import (
-                reconstruct_tensors_from_shapes,
-                broadcast_tensors_from_data_leader,
-            )
-            data = reconstruct_tensors_from_shapes(data)
-        
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -560,16 +549,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         with ctx:
             # Get data from batch and move to device
             data.to("cuda")
-            
-            # NCCL broadcast for optimized data transfer
-            if optimize_enabled:
-                # Get process groups for broadcasting (DTensor uses DeviceMesh groups)
-                process_groups = {
-                    "tp": self.tp_mesh.get_group() if hasattr(self, 'tp_mesh') else None,
-                    "cp": self.cp_mesh.get_group() if hasattr(self, 'cp_mesh') else None,
-                }
-                # Broadcast input_ids from TP0PP0CP0 to all ranks in the same DP shard
-                data = broadcast_tensors_from_data_leader(data, process_groups)
 
             losses = []
             all_mb_metrics = []

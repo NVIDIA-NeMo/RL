@@ -199,20 +199,11 @@ class CompiledGraphExecutor:
             f"Attempting DAG compilation (PP={self.pp_size})..."
         )
         
-        # Check if NCCL optimization is enabled
-        enable_nccl_opt = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
-        
         with InputNode() as input_dict:
             # NeMo-RL's train() method expects keyword arguments:
             #   train(data=..., loss_fn=..., eval_mode=..., gbs=..., mbs=...)
             # 
-            # With NCCL optimization enabled, input_dict structure:
-            #   {"leader_data": {...}, "follower_data": {...}}
-            # Without optimization:
-            #   {"data": ..., "loss_fn": ..., "eval_mode": ..., ...}
-            #
-            # For PP>1: Only PP stage 0 receives input data with NCCL optimization.
-            # Other PP stages receive inputs internally via Megatron's PP communication.
+            # For PP>1: Megatron handles inter-stage communication internally via send/recv.
             
             outputs = []
             
@@ -225,11 +216,8 @@ class CompiledGraphExecutor:
                 
                 for idx, worker in enumerate(tp_cp_workers):
                     if self.method_name == "train":
-                        # All workers get the same input_dict (homogeneous DAG)
-                        # - With NCCL opt (PP stage 0): Contains leader_data + follower_data
-                        #   Workers choose based on rank (pp_rank==0 and tp_rank==0 and cp_rank==0)
-                        # - Without NCCL opt or PP>0: Contains regular data
-                        #   For PP>0, Megatron handles inter-stage communication internally
+                        # All workers get the same input_dict
+                        # For PP>1, Megatron handles inter-stage communication internally
                         dag_node = worker.train_compiled.bind(input_dict)
                     elif self.method_name == "get_logprobs":
                         # TODO: Add get_logprobs_compiled wrapper if needed
@@ -286,18 +274,12 @@ class CompiledGraphExecutor:
         else:
             input_data = kwargs
         
-        # Check if we're using NCCL optimization (heterogeneous DAG)
-        enable_nccl_opt = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
-        
         # Use execute_async if asyncio is enabled
         if self.enable_asyncio:
             import asyncio
             # Ray compiled DAG with asyncio requires execute_async
             # execute_async returns a CompiledDAGFuture, we need to await it
             async def _execute_and_get():
-                # Always pass input_data as single dict (homogeneous DAG)
-                # With NCCL opt, it contains leader_data + follower_data
-                # Without NCCL opt, it contains just the data
                 future = await self.compiled_dag.execute_async(input_data)
                 # Get the actual result from the CompiledDAGFuture
                 return await future
@@ -311,9 +293,6 @@ class CompiledGraphExecutor:
                 # No running loop, create one
                 return asyncio.run(_execute_and_get())
         else:
-            # Always pass input_data as single dict (homogeneous DAG)
-            # With NCCL opt, it contains leader_data + follower_data
-            # Without NCCL opt, it contains just the data
             return self.compiled_dag.execute(input_data)
     
     def teardown(self, suppress_logging: bool = True):
@@ -491,43 +470,6 @@ def get_compiled_graph_config() -> dict[str, Any]:
     }
 
 
-def _create_follower_data_dict(data_for_workers):
-    """Create follower data with shape metadata from leader data.
-    
-    Args:
-        data_for_workers: The original data dict containing tensors
-        
-    Returns:
-        New data dict with tensors replaced by shape metadata
-    """
-    import torch
-    from nemo_rl.distributed.worker_groups import TENSOR_SHAPE_REPLACEMENT_FIELDS
-    
-    follower_data_dict = type(data_for_workers)()
-    
-    # Copy all fields, replacing tensors with shape metadata for specific fields
-    for field in data_for_workers.keys():
-        value = data_for_workers[field]
-        if field in TENSOR_SHAPE_REPLACEMENT_FIELDS and torch.is_tensor(value):
-            # Replace with shape metadata
-            follower_data_dict[field] = {
-                "__tensor_shape__": True,
-                "shape": tuple(value.shape),
-                "dtype": value.dtype,
-            }
-        else:
-            # Share reference (safe for immutable data and non-replaced tensors)
-            follower_data_dict[field] = value
-    
-    # CRITICAL: Copy attributes (not dict keys) like micro_batch_indices, micro_batch_lengths
-    # These are needed for sequence packing
-    for attr in ['micro_batch_indices', 'micro_batch_lengths', 'elem_counts_per_gb']:
-        if hasattr(data_for_workers, attr):
-            setattr(follower_data_dict, attr, getattr(data_for_workers, attr))
-    
-    return follower_data_dict
-
-
 class CompiledGraphWorkerGroup:
     """Wrapper around RayWorkerGroup that uses compiled graphs when enabled.
     
@@ -633,14 +575,10 @@ class CompiledGraphWorkerGroup:
         )
         
         if should_use_compiled:
-            # Check if NCCL optimization is enabled
-            enable_nccl_opt = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
-            nccl_status = "NCCL=ON" if enable_nccl_opt else "NCCL=OFF"
-            
             # Use print to ensure visibility (logger.info might be filtered)
-            print(f"🚀 Executing '{method_name}' with Ray Compiled Graph (PP={pp_size}, DP={dp_size}, {nccl_status})")
+            print(f"🚀 Executing '{method_name}' with Ray Compiled Graph (PP={pp_size}, DP={dp_size})")
             logger.info(
-                f"🚀 Executing '{method_name}' with Ray Compiled Graph (PP={pp_size}, DP={dp_size}, {nccl_status})"
+                f"🚀 Executing '{method_name}' with Ray Compiled Graph (PP={pp_size}, DP={dp_size})"
             )
         
         if not should_use_compiled:
@@ -741,33 +679,11 @@ class CompiledGraphWorkerGroup:
                 logger.warning(f"Expected dict with key 0 or list for DP=1, got: {type(sharded_data_dict)}")
                 data_for_workers = sharded_data_dict
             
-            # Check if NCCL optimization is enabled
-            enable_nccl_opt = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
-            
-            if enable_nccl_opt:
-                # NCCL optimization: create separate leader and follower data
-                leader_data = {"data": data_for_workers}
-                if common_kwargs:
-                    leader_data.update(common_kwargs)
-                
-                # Create follower data with shape metadata
-                follower_data_dict = _create_follower_data_dict(data_for_workers)
-                follower_data = {"data": follower_data_dict}
-                if common_kwargs:
-                    follower_data.update(common_kwargs)
-                
-                # Pass leader_data directly (not ObjectRef) - Ray handles efficient sharing
-                input_dict = {
-                    "leader_data": leader_data,        # Full data (Ray handles sharing)
-                    "follower_data": follower_data     # Small metadata
-                }
-                refs = executor.execute(input_dict)
-            else:
-                # No optimization: all workers get same data
-                input_dict = {"data": data_for_workers}
-                if common_kwargs:
-                    input_dict.update(common_kwargs)
-                refs = executor.execute(input_dict)
+            # All workers get same data
+            input_dict = {"data": data_for_workers}
+            if common_kwargs:
+                input_dict.update(common_kwargs)
+            refs = executor.execute(input_dict)
             
             # Compute return_from_workers based on output_is_replicated
             # This is critical for proper result deduplication!
@@ -802,63 +718,19 @@ class CompiledGraphWorkerGroup:
                     raise ValueError(f"Expected {dp_size} data elements for DP={dp_size}, got {len(sharded_data_dict)}")
                 sharded_data_dict = {i: sharded_data_dict[i] for i in range(dp_size)}
             
-            # Check if NCCL optimization is enabled
-            enable_nccl_opt = os.environ.get("NEMO_RL_OPTIMIZE_DATA_TRANSFER", "0") == "1"
+            # Prepare uniform data for each DP shard
+            input_dicts_per_dp = {}
+            for dp_rank in range(dp_size):
+                if dp_rank not in sharded_data_dict:
+                    logger.error(f"Missing data for DP rank {dp_rank}. Available keys: {list(sharded_data_dict.keys())}")
+                    raise ValueError(f"Missing data for DP rank {dp_rank}")
+                
+                input_dict = {"data": sharded_data_dict[dp_rank]}
+                if common_kwargs:
+                    input_dict.update(common_kwargs)
+                input_dicts_per_dp[dp_rank] = input_dict
             
-            if enable_nccl_opt:
-                # NCCL optimization: prepare separate leader/follower data for each DP shard
-                # IMPORTANT: Each DP shard may have different shapes (especially with sequence packing)
-                # so we must create metadata from each shard's actual data, not reuse a template!
-                leader_dicts_per_dp = {}
-                follower_dicts_per_dp = {}
-                
-                for dp_rank in range(dp_size):
-                    if dp_rank not in sharded_data_dict:
-                        logger.error(f"Missing data for DP rank {dp_rank}. Available keys: {list(sharded_data_dict.keys())}")
-                        raise ValueError(f"Missing data for DP rank {dp_rank}")
-                    
-                    data_for_this_dp = sharded_data_dict[dp_rank]
-                    
-                    # Leader data: just wrap the original data (zero overhead)
-                    leader_data = {"data": data_for_this_dp}
-                    if common_kwargs:
-                        leader_data.update(common_kwargs)
-                    leader_dicts_per_dp[dp_rank] = leader_data
-                    
-                    # Follower data: create shape metadata from THIS DP shard's data
-                    follower_data_dict = _create_follower_data_dict(data_for_this_dp)
-                    follower_data = {"data": follower_data_dict}
-                    if common_kwargs:
-                        follower_data.update(common_kwargs)
-                    follower_dicts_per_dp[dp_rank] = follower_data
-                
-                # NOTE: We pass leader_data directly (not as ObjectRef) because RCG doesn't handle
-                # ObjectRefs in inputs well. Ray's internal mechanisms will handle efficient sharing.
-                # All workers in the same DP shard get the same dict, and they choose what to use
-                # based on their rank (leaders use leader_data, followers use follower_data).
-                
-                # Prepare input dict for each DP shard
-                input_per_dp = {}
-                for dp_rank in range(dp_size):
-                    input_per_dp[dp_rank] = {
-                        "leader_data": leader_dicts_per_dp[dp_rank],  # Full data (Ray handles sharing)
-                        "follower_data": follower_dicts_per_dp[dp_rank]  # Small metadata dict
-                    }
-                refs = executor.execute(input_per_dp)
-            else:
-                # No optimization: prepare uniform data for each DP shard
-                input_dicts_per_dp = {}
-                for dp_rank in range(dp_size):
-                    if dp_rank not in sharded_data_dict:
-                        logger.error(f"Missing data for DP rank {dp_rank}. Available keys: {list(sharded_data_dict.keys())}")
-                        raise ValueError(f"Missing data for DP rank {dp_rank}")
-                    
-                    input_dict = {"data": sharded_data_dict[dp_rank]}
-                    if common_kwargs:
-                        input_dict.update(common_kwargs)
-                    input_dicts_per_dp[dp_rank] = input_dict
-                
-                refs = executor.execute(input_dicts_per_dp)
+            refs = executor.execute(input_dicts_per_dp)
             
             # Compute return_from_workers based on output_is_replicated
             # This is critical for proper result deduplication!
