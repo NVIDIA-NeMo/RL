@@ -171,6 +171,17 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: int
 
 
+class RayCompiledGraphConfig(TypedDict):
+    """Configuration for Ray Compiled Graph (RCG) optimization.
+    
+    When enabled=true, RCG warmup is automatically performed before training starts.
+    """
+    enabled: bool
+    warmup_seq_len: NotRequired[int]  # Sequence length for warmup (defaults to max_total_sequence_length)
+    warmup_gbs: NotRequired[int]  # Global batch size for warmup (defaults to train_global_batch_size)
+    overlap_communication: NotRequired[bool]  # Overlap GPU compute and communication (experimental)
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -203,3 +214,4 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+    ray_compiled_graph: NotRequired[RayCompiledGraphConfig]

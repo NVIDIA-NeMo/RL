@@ -352,6 +352,7 @@ def _warmup_compiled_graph(
     loss_fn,
     tokenizer: PreTrainedTokenizerBase,
     master_config: dict,
+    rcg_config: dict,
 ) -> None:
     """Warmup Ray Compiled Graph with maximum sequence length.
     
@@ -364,8 +365,8 @@ def _warmup_compiled_graph(
         loss_fn: Loss function to use
         tokenizer: Tokenizer for creating fake tokens
         master_config: Master configuration dict
+        rcg_config: Ray Compiled Graph configuration dict
     """
-    import os
     import torch
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     
@@ -374,9 +375,9 @@ def _warmup_compiled_graph(
     gbs = master_config["policy"]["train_global_batch_size"]
     mbs = master_config["policy"]["train_micro_batch_size"]
     
-    # Allow override via environment variable
-    warmup_seq_len = int(os.environ.get("NEMO_RL_WARMUP_SEQ_LEN", max_seq_len))
-    warmup_gbs = int(os.environ.get("NEMO_RL_WARMUP_GBS", gbs))
+    # Get warmup config from rcg_config (use defaults if not specified)
+    warmup_seq_len = rcg_config["warmup_seq_len"] or max_seq_len
+    warmup_gbs = rcg_config["warmup_gbs"] or gbs
     
     print(f"  🔧 Warmup config: SEQ_LEN={warmup_seq_len}, GBS={warmup_gbs}, MBS={mbs}")
     print(f"  📦 Creating fake data with shape: ({warmup_gbs}, {warmup_seq_len})")
@@ -548,21 +549,22 @@ def sft_train(
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
-    # Warmup compiled graph with max sequence length if enabled
-    import os
-    from nemo_rl.distributed.ray_compiled_graph import should_use_compiled_graph
+    # Warmup compiled graph with max sequence length if RCG is enabled
+    from nemo_rl.distributed.ray_compiled_graph import get_compiled_graph_config
     
-    # Only warmup if BOTH warmup flag AND RCG are enabled
-    warmup_enabled = os.environ.get("NEMO_RL_WARMUP_COMPILED_GRAPH", "0") == "1"
-    rcg_enabled = should_use_compiled_graph()
+    # Get RCG config from policy config
+    rcg_config = master_config["policy"].get("ray_compiled_graph", None)
+    compiled_graph_config = get_compiled_graph_config(rcg_config)
     
-    if warmup_enabled and rcg_enabled and total_steps == 0:
+    # Automatically warmup when RCG is enabled (only at start of training)
+    if compiled_graph_config.get("enabled", False) and total_steps == 0:
         print("\n🔥 Warming up Ray Compiled Graph with max sequence length...")
         _warmup_compiled_graph(
             policy=policy,
             loss_fn=loss_fn,
             tokenizer=tokenizer,
             master_config=master_config,
+            rcg_config=compiled_graph_config,
         )
         print("✅ Warmup complete! Proceeding with normal training...\n")
 
@@ -576,7 +578,7 @@ def sft_train(
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}",
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -590,6 +592,7 @@ def sft_train(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
                     )
+
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -597,6 +600,7 @@ def sft_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
+
                     train_data: BatchedDataDict = BatchedDataDict(
                         {
                             "input_ids": cat_and_padded["token_ids"],
@@ -608,9 +612,8 @@ def sft_train(
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
-                    
+
                 print("▶ Taking a training step...")
-                
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 

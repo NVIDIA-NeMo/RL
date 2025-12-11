@@ -204,14 +204,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         # Wrap worker group with Ray Compiled Graph if enabled
-        if should_use_compiled_graph():
-            compiled_graph_config = get_compiled_graph_config()
+        rcg_config = config.get("ray_compiled_graph", None)
+        if should_use_compiled_graph(rcg_config):
+            compiled_graph_config = get_compiled_graph_config(rcg_config)
             self.worker_group = CompiledGraphWorkerGroup(
                 worker_group=worker_group,
                 compiled_graph_config=compiled_graph_config,
             )
-            print(f"🚀 Ray Compiled Graph ENABLED: asyncio={compiled_graph_config['enable_asyncio']}, "
-                  f"overlap_comm={compiled_graph_config['overlap_communication']}")
+            print(f"🚀 Ray Compiled Graph ENABLED: overlap_comm={compiled_graph_config['overlap_communication']}")
         else:
             self.worker_group = worker_group
             print("Using standard Ray remote calls (compiled graph disabled)")

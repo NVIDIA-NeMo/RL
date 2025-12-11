@@ -49,7 +49,6 @@ For full details, see: docs/ray_compiled_graph.md
 """
 
 import logging
-import os
 from typing import Any, Optional, Union
 
 import ray
@@ -85,9 +84,7 @@ class CompiledGraphExecutor:
         sharding_annotations: NamedSharding,
         method_name: str = "train",
         dp_rank: int = 0,
-        enable_asyncio: bool = False,
         overlap_communication: bool = False,
-        tensor_transport: Optional[str] = None,
     ):
         """Initialize the CompiledGraphExecutor for a single DP shard.
         
@@ -96,17 +93,13 @@ class CompiledGraphExecutor:
             sharding_annotations: NamedSharding describing worker organization (PP, TP, CP, DP)
             method_name: Name of the method to call on workers (e.g., "train", "get_logprobs")
             dp_rank: Which DP shard this executor handles (default 0 for DP=1 case)
-            enable_asyncio: Enable asyncio support for better concurrency
             overlap_communication: Overlap GPU compute and communication (experimental)
-            tensor_transport: Transport type for intermediate tensors ("nccl" or None for default)
         """
         self.workers = workers
         self.sharding_annotations = sharding_annotations
         self.method_name = method_name
         self.dp_rank = dp_rank
-        self.enable_asyncio = enable_asyncio
         self.overlap_communication = overlap_communication
-        self.tensor_transport = tensor_transport
         
         # Extract parallelism dimensions
         self.pp_size = sharding_annotations.get_axis_size("pipeline_parallel")
@@ -242,7 +235,6 @@ class CompiledGraphExecutor:
         
         try:
             compiled_dag = forward_dag.experimental_compile(
-                enable_asyncio=self.enable_asyncio,
                 _overlap_gpu_communication=self.overlap_communication,
             )
             logger.info("✅ DAG compilation successful!")
@@ -274,26 +266,8 @@ class CompiledGraphExecutor:
         else:
             input_data = kwargs
         
-        # Use execute_async if asyncio is enabled
-        if self.enable_asyncio:
-            import asyncio
-            # Ray compiled DAG with asyncio requires execute_async
-            # execute_async returns a CompiledDAGFuture, we need to await it
-            async def _execute_and_get():
-                future = await self.compiled_dag.execute_async(input_data)
-                # Get the actual result from the CompiledDAGFuture
-                return await future
-            
-            # Since this method is sync, run the async code
-            try:
-                loop = asyncio.get_running_loop()
-                # Already in async context
-                return asyncio.run_coroutine_threadsafe(_execute_and_get(), loop).result()
-            except RuntimeError:
-                # No running loop, create one
-                return asyncio.run(_execute_and_get())
-        else:
-            return self.compiled_dag.execute(input_data)
+        # Execute the compiled DAG synchronously
+        return self.compiled_dag.execute(input_data)
     
     def teardown(self, suppress_logging: bool = True):
         """Clean up the compiled DAG resources.
@@ -345,9 +319,7 @@ class MultiDPCompiledGraphExecutor:
         workers: list[ray.actor.ActorHandle],
         sharding_annotations: NamedSharding,
         method_name: str,
-        enable_asyncio: bool = False,
         overlap_communication: bool = False,
-        tensor_transport: Optional[str] = None,
     ):
         """Initialize multi-DP compiled graph executor.
         
@@ -355,9 +327,7 @@ class MultiDPCompiledGraphExecutor:
             workers: List of all Ray actor handles
             sharding_annotations: Sharding configuration
             method_name: Name of the method to execute
-            enable_asyncio: Enable asyncio for all DAGs
             overlap_communication: Overlap communication for all DAGs
-            tensor_transport: Transport method for intermediate tensors
         """
         self.workers = workers
         self.sharding_annotations = sharding_annotations
@@ -375,9 +345,7 @@ class MultiDPCompiledGraphExecutor:
                 sharding_annotations=sharding_annotations,
                 method_name=method_name,
                 dp_rank=dp_rank,
-                enable_asyncio=enable_asyncio,
                 overlap_communication=overlap_communication,
-                tensor_transport=tensor_transport,
             )
             self.dp_executors.append(executor)
         
@@ -447,26 +415,44 @@ class MultiDPCompiledGraphExecutor:
                     lg.setLevel(level)
 
 
-def should_use_compiled_graph() -> bool:
-    """Check if Ray Compiled Graph should be used based on environment variables.
+def should_use_compiled_graph(config: Optional[dict[str, Any]]) -> bool:
+    """Check if Ray Compiled Graph should be used.
+    
+    Args:
+        config: RCG config dict from policy config, or None if not configured.
     
     Returns:
         True if compiled graph should be used, False otherwise
     """
-    return os.environ.get("NEMO_RL_USE_COMPILED_GRAPH", "0") == "1"
+    if config is None:
+        return False
+    return config.get("enabled", False)
 
 
-def get_compiled_graph_config() -> dict[str, Any]:
-    """Get configuration for Ray Compiled Graph from environment variables.
+def get_compiled_graph_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Get configuration for Ray Compiled Graph.
+    
+    Args:
+        config: RCG config dict from policy config, or None if not configured.
     
     Returns:
-        Dictionary with compiled graph configuration options
+        Dictionary with compiled graph configuration options (all defaults if config is None)
     """
+    if config is None:
+        # Return defaults when RCG is not configured
+        return {
+            "enabled": False,
+            "warmup_seq_len": None,
+            "warmup_gbs": None,
+            "overlap_communication": False,
+        }
+    
+    # Use provided config with defaults
     return {
-        "enabled": should_use_compiled_graph(),
-        "enable_asyncio": os.environ.get("NEMO_RL_COMPILED_GRAPH_ASYNCIO", "0") == "1",
-        "overlap_communication": os.environ.get("NEMO_RL_COMPILED_GRAPH_OVERLAP_COMM", "0") == "1",
-        "tensor_transport": os.environ.get("NEMO_RL_COMPILED_GRAPH_TRANSPORT", None),
+        "enabled": config.get("enabled", False),
+        "warmup_seq_len": config.get("warmup_seq_len", None),
+        "warmup_gbs": config.get("warmup_gbs", None),
+        "overlap_communication": config.get("overlap_communication", False),
     }
 
 
@@ -516,9 +502,7 @@ class CompiledGraphWorkerGroup:
                     workers=self.worker_group._workers,
                     sharding_annotations=self.worker_group.sharding_annotations,
                     method_name=method_name,
-                    enable_asyncio=self.config["enable_asyncio"],
                     overlap_communication=self.config["overlap_communication"],
-                    tensor_transport=self.config["tensor_transport"],
                 )
                 self.compiled_executors[method_name] = executor
                 logger.info(f"✅ Created compiled graph executor for method '{method_name}'")
@@ -613,9 +597,7 @@ class CompiledGraphWorkerGroup:
                         sharding_annotations=self.worker_group.sharding_annotations,
                         method_name=method_name,
                         dp_rank=0,
-                        enable_asyncio=self.config["enable_asyncio"],
                         overlap_communication=self.config["overlap_communication"],
-                        tensor_transport=self.config["tensor_transport"],
                     )
                 else:
                     # Multiple DP shards: create one DAG per DP shard
@@ -626,9 +608,7 @@ class CompiledGraphWorkerGroup:
                         workers=self.worker_group._workers,
                         sharding_annotations=self.worker_group.sharding_annotations,
                         method_name=method_name,
-                        enable_asyncio=self.config["enable_asyncio"],
                         overlap_communication=self.config["overlap_communication"],
-                        tensor_transport=self.config["tensor_transport"],
                     )
                 
                 self.compiled_executors[executor_key] = executor

@@ -495,6 +495,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        import time
+        worker_start_time = time.time()
+        
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -853,6 +856,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for k, v in m.items():
                     mb_metrics[k].append(v)
 
+            worker_computation_time = time.time() - worker_start_time
+            
             metrics = {
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,
@@ -860,6 +865,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "gpu_name": torch.cuda.get_device_name(),
                 "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
+                "worker_computation_time": worker_computation_time,
             }
 
             return metrics
