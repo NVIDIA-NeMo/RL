@@ -203,7 +203,7 @@ val_task_to_env = task_to_env  # validation usually mirrors training mapping
 
 ## Policy Model
 
-We define a [PolicyInterface](../../nemo_rl/models/interfaces.py) that contains everything you need to train a Policy model.
+We define a {py:class}`~nemo_rl.models.policy.interfaces.PolicyInterface` that contains everything you need to train a Policy model.
 
 This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
