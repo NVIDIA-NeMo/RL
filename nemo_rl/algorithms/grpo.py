@@ -1227,16 +1227,46 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    env_info = repeated_batch["extra_env_info"]
+
+                    def maybe_get(key: str) -> list | None:
+                        try:
+                            return [info[key] for info in env_info]
+                        except KeyError:
+                            return None
+
+                    group_ids = maybe_get("group_id")
+                    is_last = maybe_get("is_last")
+                    last_mask = (
+                        torch.tensor(is_last, dtype=torch.bool) if is_last else None
+                    )
+                    timesteps = maybe_get("timestep")
+                    trajectory_lengths = maybe_get("trajectory_length")
 
                     print("▶ Computing advantages...", flush=True)
+
                     baseline, std = calculate_baseline_and_std_per_prompt(
                         input_ids,
                         rewards,
                         torch.ones_like(rewards),
+                        group_ids=group_ids,
+                        last_mask=last_mask,
                         leave_one_out_baseline=master_config["grpo"][
                             "use_leave_one_out_baseline"
                         ],
                     )
+
+                    if timesteps is not None:
+                        discount_factor: torch.Tensor | None = master_config[
+                            "grpo"
+                        ].get("discount_factor", 1.0) ** (
+                            torch.tensor(trajectory_lengths) - torch.tensor(timesteps)
+                        )
+                        assert last_mask is not None
+                        rewards_for_logging = rewards[last_mask]
+                    else:
+                        discount_factor = None
+                        rewards_for_logging = rewards
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
                         dynamic_sampling(
@@ -1265,13 +1295,26 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
+                    # Import compute_grpo_advantages if discount_factor is used
+                    if discount_factor is not None:
+                        from nemo_rl.algorithms.utils import compute_grpo_advantages
+
+                        advantages = compute_grpo_advantages(
+                            rewards,
+                            baseline,
+                            std,
+                            master_config["grpo"]["normalize_rewards"],
+                            discount_factor,
                         )
+                    else:
+                        advantages = (rewards - baseline).unsqueeze(-1)
+
+                        if master_config["grpo"]["normalize_rewards"]:
+                            advantages = normalize_advantages_with_epsilon(
+                                advantages=advantages,
+                                std=std,
+                            )
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
@@ -1286,11 +1329,19 @@ def grpo_train(
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
+                        contains_transitions = repeated_batch["extra_env_info"][i].get(
+                            "contains_transitions", False
+                        )
+                        assistant_message_idcs: list[int] = []
+                        last_assistant_message_idx: int | None = None
+
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
+                                assistant_message_idcs.append(j)
+                                last_assistant_message_idx = j
                             else:
                                 message["token_loss_mask"] = torch.zeros_like(
                                     message["token_ids"]
@@ -1302,6 +1353,18 @@ def grpo_train(
                             message["advantages"] = advantages[i].expand(
                                 message["token_ids"].shape
                             )
+
+                        if (
+                            contains_transitions
+                            and last_assistant_message_idx is not None
+                        ):
+                            # mask everything but the last assistant message
+                            for j in assistant_message_idcs:
+                                if j == last_assistant_message_idx:
+                                    continue
+                                repeated_batch["message_log"][i][j][
+                                    "token_loss_mask"
+                                ] *= 0
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1328,6 +1391,23 @@ def grpo_train(
                         flat_messages.get_multimodal_dict(as_tensors=False)
                     )
                     train_data.to("cpu")
+
+                    # This is a huge HACK, but we do this for now to make sure the data is divisible by batch size
+                    train_data_size = train_data.size
+                    bsz = master_config["policy"]["train_global_batch_size"]
+                    round_batch_size = train_data_size - (train_data.size % bsz)
+                    if round_batch_size < train_data_size:
+                        idcs = (
+                            # Randomly dropout transitions to reach round_batch_size. Preserve order.
+                            torch.randperm(train_data_size)[:round_batch_size]
+                            .sort()
+                            .values
+                        )
+                        train_data.reorder_data(idcs)
+                        print(
+                            f"WARNING: Dropped {train_data_size - round_batch_size}/{train_data_size} "
+                            f"samples to make batch size divisible by {bsz}."
+                        )
 
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
@@ -2196,6 +2276,21 @@ def async_grpo_train(
                     prompt_only_ids = prompt_batched_flat["token_ids"]
 
                     rewards = repeated_batch["total_reward"]
+                    env_info = repeated_batch["extra_env_info"]
+
+                    def maybe_get(key: str) -> list | None:
+                        try:
+                            return [info[key] for info in env_info]
+                        except KeyError:
+                            return None
+
+                    group_ids = maybe_get("group_id")
+                    is_last = maybe_get("is_last")
+                    last_mask = (
+                        torch.tensor(is_last, dtype=torch.bool) if is_last else None
+                    )
+                    timesteps = maybe_get("timestep")
+                    trajectory_lengths = maybe_get("trajectory_length")
 
                     print("▶ Computing advantages...")
 
@@ -2203,11 +2298,44 @@ def async_grpo_train(
                         prompt_only_ids,
                         rewards,
                         torch.ones_like(rewards),
+                        group_ids=group_ids,
+                        last_mask=last_mask,
                         leave_one_out_baseline=master_config["grpo"][
                             "use_leave_one_out_baseline"
                         ],
                     )
-                    advantages = (rewards - baseline).unsqueeze(-1)
+
+                    if timesteps is not None:
+                        discount_factor: torch.Tensor | None = master_config[
+                            "grpo"
+                        ].get("discount_factor", 1.0) ** (
+                            torch.tensor(trajectory_lengths) - torch.tensor(timesteps)
+                        )
+                        assert last_mask is not None
+                        rewards_for_logging = rewards[last_mask]
+                    else:
+                        discount_factor = None
+                        rewards_for_logging = rewards
+
+                    # Import compute_grpo_advantages if discount_factor is used
+                    if discount_factor is not None:
+                        from nemo_rl.algorithms.utils import compute_grpo_advantages
+
+                        advantages = compute_grpo_advantages(
+                            rewards,
+                            baseline,
+                            std,
+                            master_config["grpo"]["normalize_rewards"],
+                            discount_factor,
+                        )
+                    else:
+                        advantages = (rewards - baseline).unsqueeze(-1)
+
+                        if master_config["grpo"]["normalize_rewards"]:
+                            advantages = normalize_advantages_with_epsilon(
+                                advantages=advantages,
+                                std=std,
+                            )
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -2219,25 +2347,23 @@ def async_grpo_train(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
-                        )
-
-                        print(
-                            f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                        )
-
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Add loss mask and advantages to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
+                        contains_transitions = repeated_batch["extra_env_info"][i].get(
+                            "contains_transitions", False
+                        )
+                        assistant_message_idcs: list[int] = []
+                        last_assistant_message_idx: int | None = None
+
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
+                                assistant_message_idcs.append(j)
+                                last_assistant_message_idx = j
                             else:
                                 message["token_loss_mask"] = torch.zeros_like(
                                     message["token_ids"]
@@ -2249,6 +2375,18 @@ def async_grpo_train(
                             message["advantages"] = advantages[i].expand(
                                 message["token_ids"].shape
                             )
+
+                        if (
+                            contains_transitions
+                            and last_assistant_message_idx is not None
+                        ):
+                            # mask everything but the last assistant message
+                            for j in assistant_message_idcs:
+                                if j == last_assistant_message_idx:
+                                    continue
+                                repeated_batch["message_log"][i][j][
+                                    "token_loss_mask"
+                                ] *= 0
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
