@@ -76,10 +76,8 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
-    get_data_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -364,6 +362,7 @@ def destroy_parallel_state():
             pass  # Ignore errors during cleanup
         # Reset the global async calls queue by creating a new instance
         nemo_async_utils._async_calls_queue = AsyncCallsQueue()
+        print(f"[DEBUG] Reset NeMo async calls queue (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
@@ -416,6 +415,7 @@ def destroy_parallel_state():
         except:
             pass
         base_strategy.async_calls = AsyncCallsQueue()
+        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
@@ -964,11 +964,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
-            # Initialize variables in case num_global_batches is 0
-            grad_norm = 0.0
-            num_zeros_in_grad = 0.0
-            update_successful = True
-            
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
@@ -1240,7 +1235,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ):
             nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
-            
             if self.cfg["sequence_packing"]["enabled"]:
                 original_seq_length = data_dict["input_ids"].shape[1]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]

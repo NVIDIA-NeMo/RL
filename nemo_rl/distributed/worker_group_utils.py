@@ -63,6 +63,7 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
 
     return {}
 
+
 def recursive_merge_options(
     default_options: dict[str, Any], extra_options: dict[str, Any]
 ) -> dict[str, Any]:
