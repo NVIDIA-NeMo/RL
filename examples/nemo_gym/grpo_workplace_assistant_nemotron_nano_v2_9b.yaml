@@ -225,16 +225,16 @@ policy:
 data:
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples
-  train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/resources_servers/workplace_assistant/data/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/resources_servers/workplace_assistant/data/validation.jsonl
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/validation.jsonl
   agent_name: workplace_assistant_simple_agent
   shuffle: true
   num_workers: 0
 
 env:
-  should_use_penguin: true
-  should_log_penguin_responses: true  # If you have low logging storage, set this to false
-  penguin:  # This is passed into Penguin as the initial_global_config_dict
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml

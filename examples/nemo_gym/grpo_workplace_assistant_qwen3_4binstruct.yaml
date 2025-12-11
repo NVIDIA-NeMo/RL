@@ -241,9 +241,9 @@ data:
   num_workers: 0
 
 env:
-  should_use_penguin: true
-  should_log_penguin_responses: true  # If you have low logging storage, set this to false
-  penguin:  # This is passed into Penguin as the initial_global_config_dict
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
