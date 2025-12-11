@@ -195,11 +195,6 @@ def test_nemo_gym_sanity(
         return d
 
     def _standardize(l: list[dict]):
-        # Sort by input_message_log token_ids to ensure deterministic ordering
-        # since NeMo-Gym returns results in completion order, not input order
-        standardized = list(map(_standardize_single_result, l))
-        return sorted(
-            standardized, key=lambda d: tuple(d["input_message_log"][0]["token_ids"])
-        )
+        return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)

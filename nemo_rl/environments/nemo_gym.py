@@ -111,6 +111,23 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
+        # Attach a per-example index into the metadata so that we can
+        # recover the original input ordering from the results, even if gym
+        # returns them in completion order instead of input order.
+        for idx, example in enumerate(nemo_gym_examples):
+            rcp = example.get("responses_create_params")
+            if rcp is None:
+                continue
+            # `metadata` is validated by OpenAI's `Metadata` type; keep it as a plain
+            # JSON object with string keys and values. We store `nemo_rl_idx` as a
+            # string and cast back to int on the way out.
+            metadata = rcp.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["nemo_gym_idx"] = str(idx)
+            rcp["metadata"] = metadata
+            example["responses_create_params"] = rcp
+
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
@@ -133,6 +150,14 @@ Depending on your data shape, you may want to change these values."""
         total_time = timing_metrics.pop("_run_rollouts_total")
         timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
             100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        )
+
+        # Ensure the returned results match the input order
+        nemo_rl_results = sorted(
+            nemo_rl_results,
+            key=lambda r: int(
+                r["full_result"]["responses_create_params"]["metadata"]["nemo_gym_idx"]
+            ),
         )
 
         return nemo_rl_results, timing_metrics
