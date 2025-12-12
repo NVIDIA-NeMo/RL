@@ -78,7 +78,7 @@ def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
             if "load_from_disk" in str(e):
                 raw_dataset = load_from_disk(data_path)
             else:
-                raise
+                raise e
 
     if data_split:
         raw_dataset = raw_dataset[data_split]
