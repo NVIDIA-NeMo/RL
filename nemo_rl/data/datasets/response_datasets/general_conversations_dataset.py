@@ -109,7 +109,10 @@ class GeneralConversationsJsonlDataset:
             media_path = os.path.join(media_directory, fragment)
             if os.path.isfile(media_path):
                 fragment = media_path
-        return [{"type": tag, tag: fragment}]
+        ret = []
+        for t in tag.split('-'):
+            ret.append({"type": t, t: fragment})
+        return ret
 
     def add_messages_key(
         self, example: dict[str, Any],

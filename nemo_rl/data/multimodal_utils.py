@@ -13,10 +13,16 @@
 # limitations under the License.
 
 import re
+import inspect
 from typing import Optional, Union
 
 import torch
+from transformers.audio_utils import load_audio
+from transformers.video_utils import load_video
 from transformers import PreTrainedTokenizerBase
+
+load_audio_kwargs = [param for param in inspect.signature(load_audio).parameters]
+load_video_kwargs = [param for param in inspect.signature(load_video).parameters]
 
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -206,6 +212,24 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     # all_keys.update(processor.model_input_names)
     all_keys.difference_update(set(processor.tokenizer.model_input_names))
     return list(all_keys)
+
+
+def get_multimodal_default_settings_from_processor(processor):
+    if isinstance(processor, PreTrainedTokenizerBase):
+        return []
+
+    default_settings = {}
+    if hasattr(processor, "video_processor"):
+        video_settings_dict = processor.video_processor.to_dict()
+        if "fps" in video_settings_dict and video_settings_dict["fps"] is None and \
+            "num_frames" in video_settings_dict and video_settings_dict["num_frames"] is None and \
+            "max_frames" in video_settings_dict and video_settings_dict["max_frames"] is not None:
+            video_settings_dict["num_frames"] = video_settings_dict["max_frames"]
+        default_settings["video"] = {arg: video_settings_dict[arg] for arg in load_video_kwargs if arg in video_settings_dict}
+    if hasattr(processor, "feature_extractor"):
+        audio_settings_dict = processor.feature_extractor.to_dict()
+        default_settings["audio"] = {arg: audio_settings_dict[arg] for arg in load_audio_kwargs if arg in audio_settings_dict}
+    return default_settings
 
 
 def get_dim_to_pack_along(processor, key: str) -> int:
