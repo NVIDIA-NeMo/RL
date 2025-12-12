@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from functools import partial
 from typing import Any, Optional
 from collections import defaultdict
 
@@ -19,6 +21,9 @@ from nemo_rl.data import multimodal_utils
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.datasets.response_datasets import conversation_base
 from nemo_rl.data.interfaces import TaskDataSpec
+
+
+_DEBUG=True
 
 
 class GeneralConversationsJsonlDataset:
@@ -72,9 +77,10 @@ class GeneralConversationsJsonlDataset:
         val_data_path: Optional[str] = None,
         train_split: Optional[str] = None,
         val_split: Optional[str] = None,
+        train_media_data_dir: Optional[str] = None,
+        val_media_data_dir: Optional[str] = None,
     ):
         self.task_name = "general-conversation-jsonl"
-        self.use_audio_in_video = True
         train_ds = load_dataset_from_path(train_data_path, train_split)
         if val_data_path:
             val_ds = load_dataset_from_path(val_data_path, val_split)
@@ -82,9 +88,9 @@ class GeneralConversationsJsonlDataset:
             val_ds = None
 
         # format the dataset
-        train_ds = train_ds.map(self.add_messages_key)
+        train_ds = train_ds.map(partial(self.add_messages_key, media_directory=train_media_data_dir), keep_in_memory=True if _DEBUG else False)
         if val_ds:
-            val_ds = val_ds.map(self.add_messages_key)
+            val_ds = val_ds.map(partial(self.add_messages_key, media_directory=val_media_data_dir), keep_in_memory=True if _DEBUG else False)
 
         # store the formatted dataset
         self.formatted_ds = {
@@ -95,11 +101,19 @@ class GeneralConversationsJsonlDataset:
         self.task_spec = TaskDataSpec(task_name="GeneralConversationsJsonlDataset")
 
     @classmethod
-    def process_message_fragment(cls, tag: str, fragment: Any) -> dict[str, Any]:
-        return {"type": tag, tag: fragment}
+    def process_message_fragment(cls, tag: str, fragment: Any, media_directory: Optional[str] = None) -> dict[str, Any]:
+        if media_directory is not None and \
+            tag in multimodal_utils.media_tags and \
+            isinstance(fragment, str) and \
+            not os.path.isfile(fragment):
+            media_path = os.path.join(media_directory, fragment)
+            if os.path.isfile(media_path):
+                fragment = media_path
+        return [{"type": tag, tag: fragment}]
 
     def add_messages_key(
-        self, example: dict[str, Any]
+        self, example: dict[str, Any],
+        media_directory: Optional[str] = None
     ) -> dict[str, list[dict[str, Any]]]:
         """
         Convert the json structure into an OpenAI-API-like message log.
@@ -125,7 +139,7 @@ class GeneralConversationsJsonlDataset:
                     allow_empty_text=True,
                     check_if_media_file_exist=False,
                     tried_default_extensions=tried_default_extensions,
-                    process_message_fragment=self.process_message_fragment,
+                    process_message_fragment=partial(self.process_message_fragment, media_directory=media_directory),
                 )
 
                 processed_example["messages"].append({"role": role, "content": content})
