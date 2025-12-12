@@ -911,12 +911,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        import time
-
         worker_start_time = time.time()
-
-        # Import parallel_state since it's used later
-        from megatron.core import parallel_state
 
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -1156,8 +1151,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 group=parallel_state.get_data_parallel_group(),
             )
 
-        worker_computation_time = time.time() - worker_start_time
-
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
@@ -1165,7 +1158,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
-            "worker_computation_time": worker_computation_time,
         }
         # Collect MoE aux metrics averaged across microbatches
         num_moe_experts = getattr(self.model.config, "num_moe_experts", None)

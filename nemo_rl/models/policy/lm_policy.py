@@ -519,7 +519,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 self.flops_tracker.track_batch(input_lengths.tolist())
 
         # Train each shard in parallel
-        start_time = time.time()
         futures = self.worker_group.run_all_workers_sharded_data(
             "train",
             data=sharded_data,
@@ -543,25 +542,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         results = self.worker_group.get_all_worker_results(futures)
 
-        # Calculate worker imbalance
-        worker_computation_times = [
-            r.get("worker_computation_time", 0) for r in results
-        ]
-        max_worker_time = (
-            max(worker_computation_times) if worker_computation_times else 0
-        )
-        min_worker_time = (
-            min(worker_computation_times) if worker_computation_times else 0
-        )
-        worker_imbalance = max_worker_time - min_worker_time
-
         # Aggregate the results
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
-            "worker_computation_time_max": max_worker_time,
-            "worker_computation_time_min": min_worker_time,
-            "worker_imbalance": worker_imbalance,
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]

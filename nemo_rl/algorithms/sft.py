@@ -727,18 +727,6 @@ def sft_train(
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
-            # Add worker timing metrics from train_results
-            if "worker_computation_time_max" in train_results:
-                timing_metrics["worker_computation_time_max"] = train_results[
-                    "worker_computation_time_max"
-                ]
-            if "worker_computation_time_min" in train_results:
-                timing_metrics["worker_computation_time_min"] = train_results[
-                    "worker_computation_time_min"
-                ]
-            if "worker_imbalance" in train_results:
-                timing_metrics["worker_imbalance"] = train_results["worker_imbalance"]
-
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
             if "total_flops" in train_results:
