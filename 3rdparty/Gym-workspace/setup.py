@@ -42,6 +42,7 @@ CACHED_DEPENDENCIES = [
     "yappi",
     "ray[default]",
     "psutil",
+    "datasets",
 ]
 
 if src_dir.exists():
