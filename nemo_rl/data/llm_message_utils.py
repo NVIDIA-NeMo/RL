@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from PIL import Image
 from collections import defaultdict
 from typing import Any, Optional, Union, cast
 
 import torch
 from datasets import Dataset
+from transformers.audio_utils import load_audio
+from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
@@ -27,7 +30,9 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     media_tags,
+    get_dim_to_pack_along,
     get_multimodal_keys_from_processor,
+    get_multimodal_default_settings_from_processor,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -425,7 +430,7 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
 
 
 def get_media_from_message(message: dict[str, Any]) -> list[Any]:
-    """Get all images from a message log item."""
+    """Get all media from a message log item."""
     # Handle None or missing content (e.g., assistant messages with only tool_calls)
     if message.get("content") is None:
         return []
@@ -433,7 +438,7 @@ def get_media_from_message(message: dict[str, Any]) -> list[Any]:
     if isinstance(message["content"], str):
         return []
     # iterate over the content list
-    media = defaultdict(list)
+    media = defaultdict(dict)
     for item in message["content"]:
         tag = item["type"]
         if tag in media_tags:
@@ -472,6 +477,7 @@ def get_formatted_message_log(
     )  # we just use the str:str parts here
 
     multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+    multimodal_load_kwargs = get_multimodal_default_settings_from_processor(tokenizer)
 
     def _format_content_helper(
         content: Union[str, list[dict[str, Any]]],
@@ -622,13 +628,20 @@ def get_formatted_message_log(
             media_kwargs = defaultdict(list)
             use_audio_in_video = False
             if "image" in media_cur_message:
-                media_kwargs["images"] += media_cur_message["image"]
-            if "video" in media_cur_message:
-                media_kwargs["videos"] += media_cur_message["video"]
-            if "video-sound" in media_cur_message:
-                media_kwargs["videos"] += media_cur_message["video-sound"]
+                media_kwargs["images"] += [Image.open(img) if isinstance(img, str) else img for img in media_cur_message["image"]]
             if "audio" in media_cur_message:
-                media_kwargs["audio"] += media_cur_message["audio"]
+                for aud in media_cur_message["audio"]:
+                    if isinstance(aud, str):
+                        # TODO: load_audio may not work if the file is video
+                        media_kwargs["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
+                    else:
+                        media_kwargs["audio"].append(aud)
+            if "video" in media_cur_message:
+                for vid in media_cur_message["video"]:
+                    if isinstance(vid, str):
+                        media_kwargs["video"].append(load_audio(vid, **multimodal_load_kwargs["video"]))
+                    else:
+                        media_kwargs["video"].append(vid)
 
             processed_chunk = tokenizer(
                 text=[message_chunk],
@@ -641,7 +654,7 @@ def get_formatted_message_log(
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=get_dim_to_pack_along(tokenizer, key))
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
