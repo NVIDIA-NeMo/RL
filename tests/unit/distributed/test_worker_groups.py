@@ -275,11 +275,12 @@ def test_basic_worker_creation_and_method_calls(register_test_actor, virtual_clu
 
     messages = [f"hello from test {i}" for i in range(2)]
     futures = [
-        worker.echo.remote(messages[i]) for i, worker in enumerate(worker_group.workers)
+        worker.execute_method.remote("echo", messages[i])
+        for i, worker in enumerate(worker_group.workers)
     ]
     results = ray.get(futures)
 
-    pids = ray.get([w.get_pid.remote() for w in worker_group.workers])
+    pids = ray.get([w.execute_method.remote("get_pid") for w in worker_group.workers])
     assert pids[0] != pids[1], "Actors should be in different processes"
 
     for i, result in enumerate(results):
@@ -310,7 +311,7 @@ def test_actor_initialization_with_args_kwargs(register_test_actor, virtual_clus
     assert len(worker_group.workers) == 1
     worker = worker_group.workers[0]
 
-    ret_args, ret_kwargs = ray.get(worker.get_init_args_kwargs.remote())
+    ret_args, ret_kwargs = ray.get(worker.execute_method.remote("get_init_args_kwargs"))
 
     assert ret_args == init_args  # *args are received as a tuple
 
@@ -335,7 +336,7 @@ def test_environment_variables_setup(register_test_actor, virtual_cluster):
     world_size = str(len(worker_group.workers))  # "2"
 
     futures = [
-        w.get_rank_world_size_node_rank_local_rank.remote()
+        w.execute_method.remote("get_rank_world_size_node_rank_local_rank")
         for w in worker_group.workers
     ]
     results = ray.get(futures)
@@ -351,7 +352,9 @@ def test_environment_variables_setup(register_test_actor, virtual_cluster):
         assert node_rank == "0"  # Only one node in this cluster
         assert local_rank == str(i)  # Corresponds to bundle_idx
 
-        m_addr, m_port = ray.get(worker_group.workers[i].get_master_addr_port.remote())
+        m_addr, m_port = ray.get(
+            worker_group.workers[i].execute_method.remote("get_master_addr_port")
+        )
         assert m_addr == expected_master_addr
         assert m_port == expected_master_port
 
@@ -385,14 +388,16 @@ def test_custom_environment_variables(register_test_actor, virtual_cluster):
     for i, worker in enumerate(worker_group.workers):
         # Check each custom environment variable
         for var_name, expected_value in custom_env_vars.items():
-            actual_value = ray.get(worker.get_env_var.remote(var_name))
+            actual_value = ray.get(
+                worker.execute_method.remote("get_env_var", var_name)
+            )
             assert actual_value == expected_value, (
                 f"Worker {i}: Expected {var_name}={expected_value}, got {actual_value}"
             )
 
         # Also verify that the standard distributed environment variables are still set
         rank, ws, node_rank, local_rank = ray.get(
-            worker.get_rank_world_size_node_rank_local_rank.remote()
+            worker.execute_method.remote("get_rank_world_size_node_rank_local_rank")
         )
         assert rank == str(i)
         assert ws == "2"
@@ -430,13 +435,17 @@ def test_custom_environment_variables_override_existing(
     worker = worker_group.workers[0]
 
     # Check that the custom environment variable overrides the original
-    pythonpath_value = ray.get(worker.get_env_var.remote("DUMMY_PYTHONPATH"))
+    pythonpath_value = ray.get(
+        worker.execute_method.remote("get_env_var", "DUMMY_PYTHONPATH")
+    )
     assert pythonpath_value == "/overridden/python/path", (
         f"Expected DUMMY_PYTHONPATH to be overridden, got {pythonpath_value}"
     )
 
     # Check that the new custom variable is set
-    custom_value = ray.get(worker.get_env_var.remote("CUSTOM_OVERRIDE"))
+    custom_value = ray.get(
+        worker.execute_method.remote("get_env_var", "CUSTOM_OVERRIDE")
+    )
     assert custom_value == "overridden_value", (
         f"Expected CUSTOM_OVERRIDE=overridden_value, got {custom_value}"
     )
@@ -461,7 +470,7 @@ def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     # So bundle_indices_seen_in_init should be True.
 
     configured_gpus, bundle_indices_seen, env_var_set = ray.get(
-        worker.check_configured_worker_effect.remote()
+        worker.execute_method.remote("check_configured_worker_effect")
     )
 
     assert configured_gpus == 0  # num_gpus passed to configure_worker
@@ -474,7 +483,9 @@ def test_configure_worker_interaction(register_test_actor, virtual_cluster):
 def test_run_single_worker_single_data(worker_group_1d_sharding):
     worker_group = worker_group_1d_sharding
     assert len(worker_group.workers) == 2
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     data_for_worker0 = SlicedDataDict({"id": 0, "val": "w0_val"})
     data_for_worker1 = SlicedDataDict({"id": 1, "val": "w1_val"})
@@ -501,13 +512,17 @@ def test_run_single_worker_single_data(worker_group_1d_sharding):
     assert len(results) == 2
 
     # Check worker 0
-    d, args, _, count = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    d, args, _, count = ray.get(
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
+    )
     assert count == 1
     assert d == data_for_worker0
     assert args == ()
 
     # Check worker 1
-    d, args, _, count = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    d, args, _, count = ray.get(
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
+    )
     assert count == 1
     assert d == data_for_worker1
     assert args == ()
@@ -518,7 +533,9 @@ def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     assert len(worker_group.workers) == 2
 
     # Reset records before call
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     test_data = SlicedDataDict({"key": "value_single"})
     test_arg1 = "arg_single"
@@ -540,7 +557,9 @@ def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     assert len(results) == 2  # Should run on all 2 workers
 
     for worker in worker_group.workers:
-        data, args, kwargs, count = ray.get(worker.get_recorded_data.remote())
+        data, args, kwargs, count = ray.get(
+            worker.execute_method.remote("get_recorded_data")
+        )
         assert count == 1
         assert data == test_data
         assert args == ()
@@ -550,7 +569,9 @@ def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
 def test_run_all_workers_single_data_2d_sharding_no_filter(worker_group_2d_sharding):
     worker_group = worker_group_2d_sharding
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     test_data = SlicedDataDict({"key": "value_2d_no_filter"})
     futures = worker_group.run_all_workers_single_data("record_call", data=test_data)
@@ -558,7 +579,7 @@ def test_run_all_workers_single_data_2d_sharding_no_filter(worker_group_2d_shard
     assert len(results) == 4  # Runs on all 4 workers
 
     for worker in worker_group.workers:
-        data, _, _, count = ray.get(worker.get_recorded_data.remote())
+        data, _, _, count = ray.get(worker.execute_method.remote("get_recorded_data"))
         assert count == 1
         assert data == test_data
 
@@ -566,7 +587,9 @@ def test_run_all_workers_single_data_2d_sharding_no_filter(worker_group_2d_shard
 def test_run_all_workers_single_data_2d_sharding_filter_tp(worker_group_2d_sharding):
     worker_group = worker_group_2d_sharding  # dp=2, tp=2
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     test_data = SlicedDataDict({"key": "value_2d_filter_tp"})
     # Only run on tp rank 0 for each dp rank
@@ -580,7 +603,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_tp(worker_group_2d_shard
     # Ranks 1 (dp0,tp1) and 3 (dp1,tp1) should NOT have been called
     expected_called_ranks = [0, 2]
     for i, worker in enumerate(worker_group.workers):
-        data, _, _, count = ray.get(worker.get_recorded_data.remote())
+        data, _, _, count = ray.get(worker.execute_method.remote("get_recorded_data"))
         if i in expected_called_ranks:
             assert count == 1
             assert data == test_data
@@ -592,7 +615,9 @@ def test_run_all_workers_single_data_2d_sharding_filter_tp(worker_group_2d_shard
 def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sharding):
     worker_group = worker_group_2d_sharding  # dp=2, tp=2
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     test_data = SlicedDataDict({"key": "value_2d_filter_dp_tp"})
     # Only run on dp rank 0 AND tp rank 0
@@ -605,7 +630,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sh
     # Only rank 0 (dp0,tp0) should have been called
     expected_called_ranks = [0]
     for i, worker in enumerate(worker_group.workers):
-        data, _, _, count = ray.get(worker.get_recorded_data.remote())
+        data, _, _, count = ray.get(worker.execute_method.remote("get_recorded_data"))
         if i in expected_called_ranks:
             assert count == 1
             assert data == test_data
@@ -617,7 +642,9 @@ def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sh
 def test_run_all_workers_multiple_data_1d_sharding(worker_group_1d_sharding):
     worker_group = worker_group_1d_sharding
     assert len(worker_group.workers) == 2
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     data_for_worker0 = SlicedDataDict({"id": 0, "val": "w0_val"})
     data_for_worker1 = SlicedDataDict({"id": 1, "val": "w1_val"})
@@ -640,14 +667,18 @@ def test_run_all_workers_multiple_data_1d_sharding(worker_group_1d_sharding):
     assert len(results) == 2
 
     # Check worker 0
-    d, args, kwargs, count = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    d, args, kwargs, count = ray.get(
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
+    )
     assert count == 1
     assert d == data_for_worker0
     assert args == ()
     assert kwargs == {"common": common_arg}
 
     # Check worker 1
-    d, args, kwargs, count = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    d, args, kwargs, count = ray.get(
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
+    )
     assert count == 1
     assert d == data_for_worker1
     assert args == ()
@@ -659,7 +690,9 @@ def test_run_all_workers_multiple_data_fewer_data_than_workers(
 ):
     worker_group = worker_group_2d_sharding  # 4 workers
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     data_for_worker0 = SlicedDataDict({"id": 0})
     data_for_worker1 = SlicedDataDict({"id": 1})
@@ -675,7 +708,9 @@ def test_run_all_workers_multiple_data_fewer_data_than_workers(
 def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
     worker_group = worker_group_1d_sharding  # 2 workers, sharded on "data"
     assert len(worker_group.workers) == 2
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     # Data is a list, sharded along the "data" axis
     sharded_data_input = [
@@ -699,12 +734,16 @@ def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
     assert len(results) == 2  # Each worker gets one piece of data
 
     # Worker 0 gets data[0]
-    d0, _, _, c0 = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    d0, _, _, c0 = ray.get(
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
+    )
     assert c0 == 1
     assert d0 == sharded_data_input[0]
 
     # Worker 1 gets data[1]
-    d1, _, _, c1 = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    d1, _, _, c1 = ray.get(
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
+    )
     assert c1 == 1
     assert d1 == sharded_data_input[1]
 
@@ -716,7 +755,9 @@ def test_run_all_workers_sharded_data_2d_shard_dp_replicate_tp(
         worker_group_2d_sharding  # 4 workers, dp=2, tp=2. layout=[[0,1],[2,3]]
     )
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     # Data sharded along dp (2 elements), replicated along tp
     # data_for_dp0 is for workers (0,1) (dp=0, tp=0,1)
@@ -736,22 +777,30 @@ def test_run_all_workers_sharded_data_2d_shard_dp_replicate_tp(
     assert len(results) == 4
 
     # Worker 0 (dp0, tp0) gets data_for_dp0
-    d0, _, _, c0 = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    d0, _, _, c0 = ray.get(
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
+    )
     assert c0 == 1
     assert d0 == data_for_dp0
 
     # Worker 1 (dp0, tp1) gets data_for_dp0
-    d1, _, _, c1 = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    d1, _, _, c1 = ray.get(
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
+    )
     assert c1 == 1
     assert d1 == data_for_dp0
 
     # Worker 2 (dp1, tp0) gets data_for_dp1
-    d2, _, _, c2 = ray.get(worker_group.workers[2].get_recorded_data.remote())
+    d2, _, _, c2 = ray.get(
+        worker_group.workers[2].execute_method.remote("get_recorded_data")
+    )
     assert c2 == 1
     assert d2 == data_for_dp1
 
     # Worker 3 (dp1, tp1) gets data_for_dp1
-    d3, _, _, c3 = ray.get(worker_group.workers[3].get_recorded_data.remote())
+    d3, _, _, c3 = ray.get(
+        worker_group.workers[3].execute_method.remote("get_recorded_data")
+    )
     assert c3 == 1
     assert d3 == data_for_dp1
 
@@ -761,7 +810,9 @@ def test_run_all_workers_sharded_data_2d_free_axis_dp_shard_tp(
 ):
     worker_group = worker_group_2d_sharding  # dp=2, tp=2. layout=[[0,1],[2,3]]
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     # Data sharded along tp (2 elements). dp is a free axis (only dp=0 gets data)
     # data_for_tp0 is for worker 0 (dp=0, tp=0)
@@ -780,21 +831,29 @@ def test_run_all_workers_sharded_data_2d_free_axis_dp_shard_tp(
     assert future_bundle.return_from_workers == [0, 1]
 
     # Worker 0 (dp0, tp0) gets data_for_tp0
-    d0, _, _, c0 = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    d0, _, _, c0 = ray.get(
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
+    )
     assert c0 == 1
     assert d0 == data_for_tp0
 
     # Worker 1 (dp0, tp1) gets data_for_tp1
-    d1, _, _, c1 = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    d1, _, _, c1 = ray.get(
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
+    )
     assert c1 == 1
     assert d1 == data_for_tp1
 
     # Worker 2 (dp1, tp0) - not called
-    _, _, _, c2 = ray.get(worker_group.workers[2].get_recorded_data.remote())
+    _, _, _, c2 = ray.get(
+        worker_group.workers[2].execute_method.remote("get_recorded_data")
+    )
     assert c2 == 0
 
     # Worker 3 (dp1, tp1) - not called
-    _, _, _, c3 = ray.get(worker_group.workers[3].get_recorded_data.remote())
+    _, _, _, c3 = ray.get(
+        worker_group.workers[3].execute_method.remote("get_recorded_data")
+    )
     assert c3 == 0
 
 
@@ -803,7 +862,9 @@ def test_run_all_workers_sharded_data_2d_free_axis_dummy_calls(
 ):
     worker_group = worker_group_2d_sharding  # dp=2, tp=2
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     data_for_tp0 = SlicedDataDict({"tp_shard": 0})
     data_for_tp1 = SlicedDataDict({"tp_shard": 1})
@@ -827,25 +888,25 @@ def test_run_all_workers_sharded_data_2d_free_axis_dummy_calls(
     ]  # Only dp=0 workers results returned
 
     d0, _, _, c0 = ray.get(
-        worker_group.workers[0].get_recorded_data.remote()
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
     )  # dp0, tp0
     assert c0 == 1
     assert d0 == data_for_tp0
 
     d1, _, _, c1 = ray.get(
-        worker_group.workers[1].get_recorded_data.remote()
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
     )  # dp0, tp1
     assert c1 == 1
     assert d1 == data_for_tp1
 
     d2, _, _, c2 = ray.get(
-        worker_group.workers[2].get_recorded_data.remote()
+        worker_group.workers[2].execute_method.remote("get_recorded_data")
     )  # dp1, tp0 (dummy)
     assert c2 == 1
     assert d2 is None  # Dummy call
 
     d3, _, _, c3 = ray.get(
-        worker_group.workers[3].get_recorded_data.remote()
+        worker_group.workers[3].execute_method.remote("get_recorded_data")
     )  # dp1, tp1 (dummy)
     assert c3 == 1
     assert d3 is None  # Dummy call
@@ -854,7 +915,9 @@ def test_run_all_workers_sharded_data_2d_free_axis_dummy_calls(
 def test_run_all_workers_sharded_data_2d_output_replicated(worker_group_2d_sharding):
     worker_group = worker_group_2d_sharding  # dp=2, tp=2. layout=[[0,1],[2,3]]
     assert len(worker_group.workers) == 4
-    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+    ray.get(
+        [w.execute_method.remote("reset_call_records") for w in worker_group.workers]
+    )
 
     # Data sharded on dp, replicated on tp. Output is also replicated on tp.
     data_dp0 = SlicedDataDict({"dp": 0})
@@ -876,22 +939,22 @@ def test_run_all_workers_sharded_data_2d_output_replicated(worker_group_2d_shard
 
     # Check calls
     d0, _, _, c0 = ray.get(
-        worker_group.workers[0].get_recorded_data.remote()
+        worker_group.workers[0].execute_method.remote("get_recorded_data")
     )  # dp0,tp0
     assert c0 == 1
     assert d0 == data_dp0
     d1, _, _, c1 = ray.get(
-        worker_group.workers[1].get_recorded_data.remote()
+        worker_group.workers[1].execute_method.remote("get_recorded_data")
     )  # dp0,tp1
     assert c1 == 1
     assert d1 == data_dp0
     d2, _, _, c2 = ray.get(
-        worker_group.workers[2].get_recorded_data.remote()
+        worker_group.workers[2].execute_method.remote("get_recorded_data")
     )  # dp1,tp0
     assert c2 == 1
     assert d2 == data_dp1
     d3, _, _, c3 = ray.get(
-        worker_group.workers[3].get_recorded_data.remote()
+        worker_group.workers[3].execute_method.remote("get_recorded_data")
     )  # dp1,tp1
     assert c3 == 1
     assert d3 == data_dp1
@@ -943,11 +1006,11 @@ def test_nsight_configuration_forwarding(register_test_actor, virtual_cluster):
         worker = worker_group.workers[0]
 
         # Verify the actor can be created and responds
-        status = ray.get(worker.get_status.remote())
+        status = ray.get(worker.execute_method.remote("get_status"))
         assert status == "ready"
 
         # Check if nsight configuration was applied
-        nsight_info = ray.get(worker.check_nsight_config.remote())
+        nsight_info = ray.get(worker.execute_method.remote("check_nsight_config"))
 
         # The exact environment variables set by nsight profiling may vary,
         # but we can verify that the worker was created successfully
@@ -1164,23 +1227,28 @@ def test_environment_variable_precedence_full(
 
         # Verify configure_worker has highest precedence
         assert (
-            ray.get(worker.get_env_var.remote("TEST_VAR_1")) == "configure_worker_value"
+            ray.get(worker.execute_method.remote("get_env_var", "TEST_VAR_1"))
+            == "configure_worker_value"
         )  # configure_worker overrides all
         assert (
-            ray.get(worker.get_env_var.remote("TEST_VAR_2"))
+            ray.get(worker.execute_method.remote("get_env_var", "TEST_VAR_2"))
             == "yaml_worker_group_value"
         )  # RayWorkerGroup value preserved
         assert (
-            ray.get(worker.get_env_var.remote("TEST_VAR_3")) == "system_value"
+            ray.get(worker.execute_method.remote("get_env_var", "TEST_VAR_3"))
+            == "system_value"
         )  # system value takes precedence over worker env vars
         assert (
-            ray.get(worker.get_env_var.remote("TEST_VAR_4")) == "system_value"
+            ray.get(worker.execute_method.remote("get_env_var", "TEST_VAR_4"))
+            == "system_value"
         )  # system value preserved
         assert (
-            ray.get(worker.get_env_var.remote("WORKER_VAR")) == "worker_only"
+            ray.get(worker.execute_method.remote("get_env_var", "WORKER_VAR"))
+            == "worker_only"
         )  # configure_worker value set
         assert (
-            ray.get(worker.get_env_var.remote("RAY_REMOTE_VAR")) == "ray_remote_only"
+            ray.get(worker.execute_method.remote("get_env_var", "RAY_REMOTE_VAR"))
+            == "ray_remote_only"
         )  # ray.remote runtime_env value preserved
 
         worker_group.shutdown(force=True)

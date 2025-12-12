@@ -21,7 +21,6 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar, cast
 
-import ray
 import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
@@ -420,10 +419,14 @@ def destroy_parallel_state():
         pass
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
+# NOTE: @ray.remote is NOT applied here. The NeMoRayWorkerWrapper gets @ray.remote applied instead.
+# This allows the wrapper to instantiate this class directly: worker_class(*args, **kwargs)
 class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+    # Default options to use when applying ray.remote() at runtime
+    _default_options = {
+        "runtime_env": get_runtime_env_for_policy_worker("megatron_policy_worker")
+    }
+
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 

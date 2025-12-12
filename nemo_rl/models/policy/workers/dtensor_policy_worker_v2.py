@@ -20,7 +20,6 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
-import ray
 import torch
 from accelerate import init_empty_weights
 from nemo_automodel import (
@@ -93,10 +92,14 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
+# NOTE: @ray.remote decorator removed to fix Ray bug #26283 with compiled graphs.
+# Ray.remote() is now applied at runtime in RayWorkerBuilder (like vLLM does).
 class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
+    # Runtime environment to use when applying ray.remote() at runtime
+    _ray_remote_runtime_env = get_runtime_env_for_policy_worker(
+        "dtensor_policy_worker_v2"
+    )
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 

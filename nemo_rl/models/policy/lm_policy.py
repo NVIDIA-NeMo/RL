@@ -30,6 +30,11 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_compiled_graph import (
+    CompiledGraphWorkerGroup,
+    get_compiled_graph_config,
+    should_use_compiled_graph,
+)
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
@@ -178,7 +183,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
             ]
 
-            self.worker_group = RayWorkerGroup(
+            worker_group = RayWorkerGroup(
                 cluster,
                 worker_builder,
                 name_prefix=name_prefix,
@@ -188,7 +193,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         else:
-            self.worker_group = RayWorkerGroup(
+            worker_group = RayWorkerGroup(
                 cluster,
                 worker_builder,
                 name_prefix=name_prefix,
@@ -196,6 +201,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars or {},
             )
+
+        # Wrap worker group with Ray Compiled Graph if enabled
+        rcg_config = config.get("ray_compiled_graph", None)
+        if should_use_compiled_graph(rcg_config):
+            compiled_graph_config = get_compiled_graph_config(rcg_config)
+            self.worker_group = CompiledGraphWorkerGroup(
+                worker_group=worker_group,
+                compiled_graph_config=compiled_graph_config,
+            )
+            print(
+                f"🚀 Ray Compiled Graph ENABLED: overlap_comm={compiled_graph_config['overlap_communication']}"
+            )
+        else:
+            self.worker_group = worker_group
+            print("Using standard Ray remote calls (compiled graph disabled)")
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -831,7 +851,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         user calls worker_group.shutdown().
         """
         if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+            try:
+                self.worker_group.shutdown(cleanup_method="shutdown")
+            except Exception:
+                # Suppress errors if workers are already dead (e.g., from compiled DAG teardown)
+                # This is expected during program exit when cleanup order is unpredictable
+                pass
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

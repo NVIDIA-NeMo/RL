@@ -21,7 +21,6 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
-import ray
 import torch
 from accelerate import init_empty_weights
 from torch import nn
@@ -132,10 +131,14 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
-)  # pragma: no cover
+# NOTE: @ray.remote is NOT applied here. The NeMoRayWorkerWrapper gets @ray.remote applied instead.
+# This allows the wrapper to instantiate this class directly: worker_class(*args, **kwargs)
 class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+    # Default options to use when applying ray.remote() at runtime
+    _default_options = {
+        "runtime_env": get_runtime_env_for_policy_worker("dtensor_policy_worker")
+    }
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -514,6 +517,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        import time
+
+        worker_start_time = time.time()
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:

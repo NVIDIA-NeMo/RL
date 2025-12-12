@@ -128,6 +128,83 @@ class MultiWorkerFuture:
         return all_results
 
 
+class NeMoRayWorkerWrapper:
+    """Simple wrapper for NeMo workers (vLLM-style architecture).
+
+    This wrapper is what gets ray.remote() applied to it.
+    Having a simple wrapper class allows Ray's compiled graph to properly inspect method signatures.
+
+    NOTE: Ray's ActorHandle doesn't forward unknown methods to __getattr__, so we provide
+    an explicit execute_method() for calling arbitrary methods on the wrapped worker.
+    """
+
+    def __init__(self, worker_class, *init_args, **init_kwargs):
+        """Initialize the wrapper and create the actual worker."""
+        # Suppress Ray's verbose compiled DAG teardown logging on this worker
+        import logging
+
+        logging.getLogger("ray.dag.compiled_dag_node").setLevel(logging.WARNING)
+
+        # If worker_class is already decorated with @ray.remote, extract the underlying class
+        if hasattr(worker_class, "_ray_actor_class"):
+            # This is a Ray remote class, get the actual Python class
+            actual_class = worker_class._ray_actor_class
+        elif hasattr(worker_class, "__ray_metadata__"):
+            # Alternative way Ray might wrap classes
+            actual_class = worker_class.__ray_metadata__.modified_class
+        else:
+            # It's a plain Python class
+            actual_class = worker_class
+
+        self.worker = actual_class(*init_args, **init_kwargs)
+
+    def train_compiled(
+        self,
+        train_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Wrapper for train() for Ray Compiled Graph.
+
+        This method is defined on the simple wrapper class (not the complex worker),
+        matching vLLM's execute_model_ray pattern. This allows Ray's compiled graph
+        to properly inspect the signature.
+
+        Args:
+            train_input: Dict containing training parameters
+
+        Returns:
+            Training outputs from worker.train()
+        """
+        result = self.worker.train(
+            data=train_input["data"],
+            loss_fn=train_input["loss_fn"],
+            eval_mode=train_input.get("eval_mode", False),
+            gbs=train_input.get("gbs"),
+            mbs=train_input.get("mbs"),
+        )
+        return result
+
+    def execute_method(self, method_name: str, *args, **kwargs):
+        """Execute an arbitrary method on the wrapped worker.
+
+        This is needed because Ray's ActorHandle doesn't forward unknown methods
+        to __getattr__. Similar to vLLM's execute_method pattern.
+
+        Args:
+            method_name: Name of the method to call on the wrapped worker
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+
+        Returns:
+            Result of the method call
+        """
+        method = getattr(self.worker, method_name)
+        return method(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Delegate attribute access to the wrapped worker (for local access only)."""
+        return getattr(self.worker, name)
+
+
 class RayWorkerBuilder:
     @ray.remote
     class IsolatedWorkerInitializer:
@@ -204,8 +281,11 @@ class RayWorkerBuilder:
                 placement_group_capture_child_tasks=True,
             )
             options["num_gpus"] = num_gpus
-            worker = worker_class.options(**options).remote(
-                *self.init_args, **worker_kwargs
+
+            # Apply ray.remote() to the wrapper class (vLLM-style architecture)
+            # This allows Ray's compiled graph to properly inspect method signatures
+            worker = ray.remote(**options)(NeMoRayWorkerWrapper).remote(
+                worker_class, *self.init_args, **worker_kwargs
             )
             return worker
 
@@ -652,8 +732,8 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
-        return method.remote(*args, **kwargs)
+        # All Ray workers are now wrapped in NeMoRayWorkerWrapper, so use execute_method
+        return worker.execute_method.remote(method_name, *args, **kwargs)
 
     def run_all_workers_multiple_data(
         self,
@@ -737,11 +817,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                # All Ray workers are wrapped, so use execute_method
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
+                worker_kwargs.update(common_kwargs)
                 futures.append(
-                    method.remote(*worker_args, **worker_kwargs, **common_kwargs)
+                    worker.execute_method.remote(
+                        method_name, *worker_args, **worker_kwargs
+                    )
                 )
                 data_idx += 1
 
@@ -793,8 +876,10 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
-                futures.append(method.remote(*args, **kwargs))
+                # All Ray workers are wrapped, so use execute_method
+                futures.append(
+                    worker.execute_method.remote(method_name, *args, **kwargs)
+                )
 
         return futures
 
@@ -899,6 +984,8 @@ class RayWorkerGroup:
                 # Find the appropriate data slice for this worker
                 worker_args = args
                 worker_kwargs = kwargs
+
+                # Determine which shard this worker needs (based on sharded axes)
                 for axis in in_sharded_axes:
                     if axis in worker_coords:
                         # Select the appropriate slice for this axis
@@ -907,10 +994,11 @@ class RayWorkerGroup:
                             key: value[worker_coords[axis]]
                             for key, value in worker_kwargs.items()
                         }
+                        break
 
                 # Call the method on the worker with its data slice
-                future = getattr(worker, method_name).remote(
-                    *worker_args, **worker_kwargs, **common_kwargs
+                future = worker.execute_method.remote(
+                    method_name, *worker_args, **worker_kwargs, **common_kwargs
                 )
                 futures.append(future)
                 called_workers.append(worker_idx)
@@ -920,8 +1008,8 @@ class RayWorkerGroup:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
                     worker_args = [None] * len(args)
                     worker_kwargs = {key: None for key in kwargs.keys()}
-                    future = getattr(worker, method_name).remote(
-                        *worker_args, **worker_kwargs, **common_kwargs
+                    future = worker.execute_method.remote(
+                        method_name, *worker_args, **worker_kwargs, **common_kwargs
                     )
                     futures.append(future)
                     called_workers.append(worker_idx)
