@@ -496,8 +496,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-
-
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:

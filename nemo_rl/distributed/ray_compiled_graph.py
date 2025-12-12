@@ -750,9 +750,18 @@ class CompiledGraphWorkerGroup:
                         for tp_rank in range(tp_size):
                             # Only return from rank 0 of replicated axes
                             should_return = (
-                                ("context_parallel" not in output_is_replicated or cp_rank == 0)
-                                and ("tensor_parallel" not in output_is_replicated or tp_rank == 0)
-                                and ("pipeline_parallel" not in output_is_replicated or pp_rank == 0)
+                                (
+                                    "context_parallel" not in output_is_replicated
+                                    or cp_rank == 0
+                                )
+                                and (
+                                    "tensor_parallel" not in output_is_replicated
+                                    or tp_rank == 0
+                                )
+                                and (
+                                    "pipeline_parallel" not in output_is_replicated
+                                    or pp_rank == 0
+                                )
                             )
                             if should_return:
                                 return_from_workers.append(ref_idx)

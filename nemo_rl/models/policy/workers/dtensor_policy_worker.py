@@ -518,6 +518,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         import time
+
         worker_start_time = time.time()
 
         if gbs is None:
@@ -870,7 +871,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for m in all_mb_metrics:
                 for k, v in m.items():
                     mb_metrics[k].append(v)
-
 
             metrics = {
                 "global_loss": global_loss.cpu(),

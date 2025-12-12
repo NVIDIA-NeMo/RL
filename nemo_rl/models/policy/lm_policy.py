@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import time
 import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union

@@ -155,9 +155,9 @@ class NeMoRayWorkerWrapper:
         else:
             # It's a plain Python class
             actual_class = worker_class
-        
+
         self.worker = actual_class(*init_args, **init_kwargs)
-    
+
     def train_compiled(
         self,
         train_input: dict[str, Any],
