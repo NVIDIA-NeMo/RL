@@ -90,12 +90,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader,
+    Optional[StatefulDataLoader],
     NLLLoss,
     Logger,
     CheckpointManager,
@@ -149,14 +149,17 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    val_dataloader = StatefulDataLoader(
-        val_dataset,
-        batch_size=sft_config["val_global_batch_size"],
-        shuffle=False,
-        collate_fn=rl_collate_fn,
-        drop_last=False,
-        num_workers=data_config["num_workers"],
-    )
+    if val_dataset is not None:
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=sft_config["val_global_batch_size"],
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            drop_last=False,
+            num_workers=data_config["num_workers"],
+        )
+    else:
+        val_dataloader = None
 
     # ==========================
     #          Cluster
@@ -230,7 +233,7 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
@@ -242,11 +245,11 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert master_config["sft"]["val_period"] <= 0, (
+            "val_dataloader is None, so sft.val_period must be <= 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
-        return
+        return {}, {}
 
     timer = Timer()
 
@@ -496,7 +499,7 @@ def sft_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing
                 sft_save_state["consumed_samples"] += master_config["policy"][
@@ -610,9 +613,12 @@ def sft_train(
                 master_config["cluster"]["num_nodes"]
                 * master_config["cluster"]["gpus_per_node"]
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
+            if total_time > 0:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
+                )
+            else:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
