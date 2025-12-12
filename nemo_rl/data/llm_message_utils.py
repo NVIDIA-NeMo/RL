@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+import decord
 from PIL import Image
 from collections import defaultdict
 from typing import Any, Optional, Union, cast
