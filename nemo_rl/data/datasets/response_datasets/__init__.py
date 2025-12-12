@@ -67,6 +67,23 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
         dataset = dataset_class(
             **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
+    elif dataset_name == "GeneralConversationsJsonlDataset":
+        if "train_data_path" not in data_config:
+            raise ValueError(
+                "train_data_path is required when dataset_name is not one of the built-ins."
+            )
+        extra_kwargs = get_extra_kwargs(
+            data_config,
+            [
+                "val_data_path",
+                "train_split",
+                "val_split",
+            ],
+        )
+        base_dataset = GeneralConversationsJsonlDataset(
+            train_data_path=data_config["train_data_path"],
+            **extra_kwargs,
+        )
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
