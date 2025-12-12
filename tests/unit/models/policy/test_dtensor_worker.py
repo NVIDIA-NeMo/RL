@@ -601,7 +601,7 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
     )
 
     # Verify that the model is parallelized as expected
-    state_dict = ray.get(policy.worker_group.workers[0].return_state_dict.remote())
+    state_dict = ray.get(policy.worker_group.workers[0].execute_method.remote("return_state_dict"))
     total_shape = state_dict["lm_head.weight"].shape
     sharded_shape = state_dict["lm_head.weight"].to_local().shape
     assert total_shape[0] == sharded_shape[0], (

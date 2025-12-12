@@ -203,7 +203,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     )
 
     model_config_v1 = ray.get(
-        policy_v1.worker_group.workers[0].return_model_config.remote()
+        policy_v1.worker_group.workers[0].execute_method.remote("return_model_config")
     )
     policy_v1.shutdown()
 
@@ -227,7 +227,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     )
 
     model_config_v2 = ray.get(
-        policy_v2.worker_group.workers[0].return_model_config.remote()
+        policy_v2.worker_group.workers[0].execute_method.remote("return_model_config")
     )
     policy_v2.shutdown()
 

@@ -131,7 +131,7 @@ class MultiWorkerFuture:
 class NeMoRayWorkerWrapper:
     """Simple wrapper for NeMo workers (vLLM-style architecture).
 
-    This wrapper is what gets ray.remote() applied to it, similar to vLLM's RayWorkerWrapper.
+    This wrapper is what gets ray.remote() applied to it.
     Having a simple wrapper class allows Ray's compiled graph to properly inspect method signatures.
 
     NOTE: Ray's ActorHandle doesn't forward unknown methods to __getattr__, so we provide
@@ -145,8 +145,19 @@ class NeMoRayWorkerWrapper:
 
         logging.getLogger("ray.dag.compiled_dag_node").setLevel(logging.WARNING)
 
-        self.worker = worker_class(*init_args, **init_kwargs)
-
+        # If worker_class is already decorated with @ray.remote, extract the underlying class
+        if hasattr(worker_class, "_ray_actor_class"):
+            # This is a Ray remote class, get the actual Python class
+            actual_class = worker_class._ray_actor_class
+        elif hasattr(worker_class, "__ray_metadata__"):
+            # Alternative way Ray might wrap classes
+            actual_class = worker_class.__ray_metadata__.modified_class
+        else:
+            # It's a plain Python class
+            actual_class = worker_class
+        
+        self.worker = actual_class(*init_args, **init_kwargs)
+    
     def train_compiled(
         self,
         train_input: dict[str, Any],
