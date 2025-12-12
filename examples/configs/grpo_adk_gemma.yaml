@@ -23,9 +23,13 @@ checkpointing:
 env:
   unique_numbers:
     cfg:
+      # Maximum number of conversation turns before episode terminates
       max_turns: 15
+      # Minimum length of the randomly generated number list
       min_length: 5
+      # Maximum length of the randomly generated number list
       max_length: 10
+      # Maximum value for integers in the list (range: 0 to max_integer)
       max_integer: 15
 
 logger:

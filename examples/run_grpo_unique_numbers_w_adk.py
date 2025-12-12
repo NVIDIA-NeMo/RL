@@ -99,7 +99,7 @@ def generate_datum(
     formatted_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": starting_user_prompt}],
         tokenize=False,
-        # add_system_prompt=add_system_prompt,
+        add_system_prompt=add_system_prompt,
         add_bos_token=True,
         add_generation_prompt=True,
         add_special_tokens=False,
