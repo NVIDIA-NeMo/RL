@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+import time
 import decord
 from PIL import Image
 from collections import defaultdict
@@ -439,7 +440,7 @@ def get_media_from_message(message: dict[str, Any]) -> list[Any]:
     if isinstance(message["content"], str):
         return []
     # iterate over the content list
-    media = defaultdict(dict)
+    media = defaultdict(list)
     for item in message["content"]:
         tag = item["type"]
         if tag in media_tags:
@@ -628,6 +629,7 @@ def get_formatted_message_log(
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
             media_kwargs = defaultdict(list)
             use_audio_in_video = False
+            start = time.time()
             if "image" in media_cur_message:
                 media_kwargs["images"] += [Image.open(img) if isinstance(img, str) else img for img in media_cur_message["image"]]
             if "audio" in media_cur_message:
@@ -645,10 +647,12 @@ def get_formatted_message_log(
                 for vid in media_cur_message["video"]:
                     if isinstance(vid, str):
                         # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
-                        media_kwargs["video"].append(load_video(vid, backend="decord", **multimodal_load_kwargs["video"]))
+                        print(f"multimodal_load_kwargs: {multimodal_load_kwargs}")
+                        media_kwargs["videos"].append(load_video(vid, backend="decord", **multimodal_load_kwargs["video"])[0])
                     else:
-                        media_kwargs["video"].append(vid)
+                        media_kwargs["videos"].append(vid)
 
+            print(f"Media loading took {time.time() - start} seconds")
             processed_chunk = tokenizer(
                 text=[message_chunk],
                 return_tensors="pt",
