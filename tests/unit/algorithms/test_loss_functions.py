@@ -41,6 +41,7 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "truncated_importance_sampling_ratio": None,  # Disable TIS
     "sequence_level_importance_ratios": False,
     "token_level_loss": True,
+    "force_on_policy_ratio": False,
 }
 
 
@@ -560,6 +561,61 @@ def test_clipped_pg_loss_reinforce_mode():
         ),
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+def test_clipped_pg_loss_force_on_policy_ratio():
+    """Tests that force_on_policy_ratio forces ratios to 1.0 while keeping gradients."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["force_on_policy_ratio"] = True
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Use same logprob pattern as PPO clipping test to ensure
+    # that without the flag, ratios would be [0.5, 1.0, 1.5]
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.59453]], device=device
+    )  # approx log(0.5)-1, log(1)-1, log(1.5)-1
+
+    # Fill full tensors (only need first dim for B=1)
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # Hand-calculated expected loss when ratios are forced to 1.0
+    ratios = torch.ones_like(adv_masked, device=device)
+    loss_per_token = -adv_masked * ratios  # [-1.0, 1.0, -2.0]
+    expected_loss = torch.mean(loss_per_token)  # (-1 + 1 - 2) / 3 = -0.6666...
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+
+    actual_loss, metrics = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Loss should match the on-policy expectation
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
+
+    # Ratios and their metrics should all be exactly 1.0
+    assert metrics["probs_ratio"] == 1.0
+    assert metrics["probs_ratio_clamped"] == 1.0
+    assert metrics["probs_ratio_min"] == 1.0
+    assert metrics["probs_ratio_max"] == 1.0
+    assert metrics["probs_ratio_clamped_min"] == 1.0
+    assert metrics["probs_ratio_clamped_max"] == 1.0
 
 
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])

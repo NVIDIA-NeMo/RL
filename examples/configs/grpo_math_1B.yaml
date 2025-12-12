@@ -53,6 +53,7 @@ loss_fn:
   truncated_importance_sampling_ratio: null
   sequence_level_importance_ratios: false
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 
 checkpointing:
   enabled: true
@@ -114,6 +115,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
 
     optimizer:
       optimizer: "adam"
@@ -217,6 +219,7 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -229,6 +232,8 @@ policy:
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs

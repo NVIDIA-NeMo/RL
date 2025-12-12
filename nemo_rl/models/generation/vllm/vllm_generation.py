@@ -819,6 +819,63 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            future = self.worker_group.run_single_worker_single_data(
+                "get_vllm_logger_metrics",
+                worker_idx=worker_idx,
+            )
+            futures.append(future)
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+            "inflight_batch_sizes": {},  # dp_idx -> list[int]
+            "num_pending_samples": {},  # dp_idx -> list[int]
+            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
+            "generation_tokens": {},  # dp_idx -> list[int]
+        }
+
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight_batch_sizes = stats.get("inflight_batch_sizes")
+            if inflight_batch_sizes:
+                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
+                    inflight_batch_sizes
+                )
+            num_pending_samples = stats.get("num_pending_samples")
+            if num_pending_samples:
+                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
+            if kv_cache_usage_perc:
+                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
+            generation_tokens = stats.get("generation_tokens")
+            if generation_tokens:
+                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+
+        return vllm_logger_metrics
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_vllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
@@ -849,3 +906,13 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Check if KV cache scales should be synchronized during refit.
+
+        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        """
+        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
+            "kv_cache_dtype"
+        ].startswith("fp8")

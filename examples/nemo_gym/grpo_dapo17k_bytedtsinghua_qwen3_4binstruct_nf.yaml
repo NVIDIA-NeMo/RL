@@ -41,6 +41,7 @@ loss_fn:
   truncated_importance_sampling_ratio: null
   use_importance_sampling_correction: false
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 
 checkpointing:
   enabled: true
@@ -100,6 +101,7 @@ policy:
     defer_fp32_logits: true
     moe_permute_fusion: false
     bias_activation_fusion: True
+    moe_per_layer_logging: False
 
     optimizer:
       optimizer: "adam"
@@ -230,15 +232,15 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/bytedtsinghua_dapo17k/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/bytedtsinghua_dapo17k/validation.jsonl
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/validation.jsonl
   shuffle: true
   num_workers: 0
 
 env:
-  should_use_penguin: true
-  should_log_penguin_responses: true  # If you have low logging storage, set this to false
-  penguin:  # This is passed into Penguin as the initial_global_config_dict
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/library_judge_math/configs/library_judge_math.yaml

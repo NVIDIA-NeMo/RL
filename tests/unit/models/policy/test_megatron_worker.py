@@ -50,6 +50,7 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "truncated_importance_sampling_ratio": None,
     "sequence_level_importance_ratios": False,
     "token_level_loss": True,
+    "force_on_policy_ratio": False,
 }
 
 
@@ -85,6 +86,12 @@ def create_megatron_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
+            "mcore_generation_config": {
+                "buffer_size_gb": 20,
+                "buffer_guaranteed_fraction": 0.1,
+                "num_cuda_graphs": 16,
+                "max_tokens": 16384,
+            },
             "colocated": {
                 "enabled": True,
                 "resources": {
@@ -123,6 +130,7 @@ def create_megatron_test_config(
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
@@ -472,6 +480,7 @@ def generation_setup(request, tiny_llama_model_path):
             tiny_llama_model_path,
             tp=tp,
             pp=pp,
+            precision="bfloat16",  # FlashAttention requires fp16 or bf16
             generation_backend=generation_backend,
         )
 
@@ -538,7 +547,6 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping megatron generation tests for now")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",

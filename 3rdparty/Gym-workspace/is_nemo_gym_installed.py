@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 try:
-    from penguin import config_types  # noqa: F401
+    from nemo_gym import config_types  # noqa: F401
 
     INSTALLED = True
 except Exception:
     INSTALLED = False
 
-print(f"PENGUIN {INSTALLED=}")
+print(f"NEMO_GYM {INSTALLED=}")
