@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+import decord
 from PIL import Image
 from collections import defaultdict
 from typing import Any, Optional, Union, cast
@@ -632,14 +633,19 @@ def get_formatted_message_log(
             if "audio" in media_cur_message:
                 for aud in media_cur_message["audio"]:
                     if isinstance(aud, str):
-                        # TODO: load_audio may not work if the file is video
-                        media_kwargs["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
+                        try:
+                            media_kwargs["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
+                        except:
+                            # use decord
+                            loaded_audio = decord.AudioReader(aud, sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"], mono=True)
+                            media_kwargs["audio"].append(loaded_audio[:].asnumpy()[get_dim_to_pack_along(tokenizer, key)])
                     else:
                         media_kwargs["audio"].append(aud)
             if "video" in media_cur_message:
                 for vid in media_cur_message["video"]:
                     if isinstance(vid, str):
-                        media_kwargs["video"].append(load_audio(vid, **multimodal_load_kwargs["video"]))
+                        # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
+                        media_kwargs["video"].append(load_video(vid, backend="decord", **multimodal_load_kwargs["video"]))
                     else:
                         media_kwargs["video"].append(vid)
 
