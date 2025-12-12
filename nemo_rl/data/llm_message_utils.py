@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from PIL import Image
 from collections import defaultdict
 from typing import Any, Optional, Union, cast
 
 import torch
 from datasets import Dataset
+from transformers.audio_utils import load_audio
+from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
