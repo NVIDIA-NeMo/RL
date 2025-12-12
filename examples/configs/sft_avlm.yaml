@@ -1,0 +1,6 @@
+defaults:
+  - sft_vlm_3B.yaml
+
+data:
+  dataset_name: GeneralConversationsJsonlDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
