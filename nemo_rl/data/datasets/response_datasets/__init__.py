@@ -26,7 +26,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 )
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
-from nemo_rl.data.datasets.response_datasets.response_dataset import GeneralConversationsJsonlDataset
+from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import GeneralConversationsJsonlDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
