@@ -44,8 +44,6 @@ vs. Previous (broken) approach:
 ray.remote()(MegatronPolicyWorker).remote(*args, **kwargs)
     └─> train_compiled() ← Hidden by ActorMethod wrapper ❌
 ```
-
-For full details, see: docs/ray_compiled_graph.md
 """
 
 import logging
@@ -69,13 +67,15 @@ class CompiledGraphExecutor:
 
     This class creates and executes a compiled DAG for distributed training:
     - Organizes workers into PP (pipeline parallel) and TP (tensor parallel) groups
-    - Constructs a static DAG with data flow between PP stages
-    - Compiles the DAG for optimized execution
-    - Executes the DAG with sub-millisecond overhead
+    - Constructs a static DAG that includes all PP stages as nodes
+    - Note: Megatron handles inter-stage PP communication internally via send/recv,
+      while Ray orchestrates when each stage executes
 
     Example DAG structure (PP=2, TP=4):
-        Input -> [W0, W1, W2, W3] -> [W4, W5, W6, W7] -> Outputs
+        Ray DAG: Input -> [W0, W1, W2, W3] (PP stage 0)
+                       -> [W4, W5, W6, W7] (PP stage 1) -> Outputs
         Where each PP stage has TP workers executing in SPMD fashion.
+        Inter-stage tensors are communicated by Megatron, not through Ray DAG edges.
     """
 
     def __init__(
@@ -171,10 +171,11 @@ class CompiledGraphExecutor:
 
         Creates a DAG for efficient distributed training:
         1. Input node receives data (as dict with 'data' and 'common_kwargs')
-        2. First PP stage workers process input in SPMD fashion
-        3. Intermediate outputs flow to next PP stage
-        4. Final PP stage produces outputs
-        5. DAG is compiled for optimized execution
+        2. All PP stage workers are included as DAG nodes
+        3. Each PP stage processes inputs in SPMD fashion (TP workers)
+        4. Megatron handles inter-stage PP communication internally (not Ray)
+        5. Final PP stage produces outputs that Ray collects
+        6. DAG is compiled for optimized execution
 
         Returns:
             Compiled Ray DAG ready for execution
@@ -184,31 +185,23 @@ class CompiledGraphExecutor:
         # We apply ray.remote() to NeMoRayWorkerWrapper (simple class) instead of
         # the complex worker classes. The train_compiled() method is defined on the
         # wrapper, allowing Ray's compiled graph to properly inspect its signature.
-        #
-        # For PP>1: Megatron handles inter-stage communication internally via send/recv.
-        # We include all PP stages in the DAG, and Megatron's train_step handles the rest.
 
         logger.info(f"Attempting DAG compilation (PP={self.pp_size})...")
 
         with InputNode() as input_dict:
             # NeMo-RL's train() method expects keyword arguments:
             #   train(data=..., loss_fn=..., eval_mode=..., gbs=..., mbs=...)
-            #
-            # For PP>1: Megatron handles inter-stage communication internally via send/recv.
-
             outputs = []
 
             # Loop through all PP stages
             for pp_stage_idx in range(self.pp_size):
                 tp_cp_workers = self.pp_tp_workers[pp_stage_idx]
 
-                # All workers in TP×CP group get the SAME input (replicated)
-                # They execute in SPMD fashion - same code, different tensor slices
-
+                # All workers (across all PP stages and TP×CP groups) get the SAME input_dict from Ray.
+                # TP/CP workers execute in SPMD fashion - same code, different tensor slices.
+                # PP stages also get the same Ray input because Megatron handles inter-stage flow internally.
                 for idx, worker in enumerate(tp_cp_workers):
                     if self.method_name == "train":
-                        # All workers get the same input_dict
-                        # For PP>1, Megatron handles inter-stage communication internally
                         dag_node = worker.train_compiled.bind(input_dict)
                     elif self.method_name == "get_logprobs":
                         # TODO: Add get_logprobs_compiled wrapper if needed
@@ -246,9 +239,6 @@ class CompiledGraphExecutor:
 
     def execute(self, *args, **kwargs) -> Any:
         """Execute the compiled DAG with the given inputs.
-
-        This provides sub-millisecond task orchestration overhead (<50us)
-        compared to ~1ms for regular Ray remote calls.
 
         Args:
             *args: Positional arguments to pass to the DAG input
@@ -354,7 +344,7 @@ class MultiDPCompiledGraphExecutor:
         )
 
     def execute(self, sharded_data: dict[int, Any]) -> list[Any]:
-        """Execute all DP shards' DAGs in parallel with their respective data.
+        """Execute all DP shards' DAGs with their respective data.
 
         Args:
             sharded_data: Dictionary mapping dp_rank -> input_dict for that shard
@@ -363,15 +353,11 @@ class MultiDPCompiledGraphExecutor:
         Returns:
             Flattened list of results from all DP shards' workers
         """
-        # Execute each DP shard's DAG with its data in parallel
-        # Each executor.execute() returns a list of refs (one per worker in that DP shard)
         all_refs = []
         for dp_rank, executor in enumerate(self.dp_executors):
             input_dict = sharded_data[dp_rank]
             refs_for_this_dp = executor.execute(input_dict)
-
-            # refs_for_this_dp is a list (from MultiOutputNode in the DAG)
-            # Flatten into the all_refs list
+            # MultiOutputNode typically returns a list, but handle both cases defensively
             if isinstance(refs_for_this_dp, list):
                 all_refs.extend(refs_for_this_dp)
             else:
@@ -536,11 +522,11 @@ class CompiledGraphWorkerGroup:
 
         This method uses compiled graphs when:
         1. Compiled graphs are enabled
-        2. PP > 1 (maximum benefit with pipeline parallelism)
-        3. Data is sharded on DP axis
+        2. Sharding annotations are available (works with any PP/TP/CP/DP configuration)
 
         Implementation:
-        - Create compiled DAG for PP×TP×CP pipeline
+        - Creates a compiled DAG that includes all PP×TP×CP workers
+        - Ray orchestrates execution; Megatron handles inter-stage PP communication
         - For DP>1: Each DP group gets different data and executes independently
         - TP/CP execute in SPMD fashion (same input, different tensor slices)
 
@@ -601,7 +587,7 @@ class CompiledGraphWorkerGroup:
 
         # ========================================
         # USE RAY COMPILED GRAPH!
-        # CP/TP communication happens INSIDE workers, we just orchestrate the calls
+        # TP/CP/PP communication happens inside workers (Megatron), Ray orchestrates execution
         # ========================================
 
         # Build compiled DAG on first call
@@ -620,9 +606,7 @@ class CompiledGraphWorkerGroup:
                         overlap_communication=self.config["overlap_communication"],
                     )
                 else:
-                    # Multiple DP shards: create one DAG per DP shard
-                    # Each DP shard gets its own PP×TP×CP sub-grid
-                    # Each DP replica runs the same DAG with different data
+                    # DP>1: Create one DAG per DP shard (each with its own PP×TP×CP sub-grid)
                     logger.info(
                         f"Creating {dp_size} independent DAGs (one per DP shard)..."
                     )
@@ -651,9 +635,6 @@ class CompiledGraphWorkerGroup:
 
         executor = self.compiled_executors[executor_key]
 
-        # Execute the compiled DAG
-        # RCG has built-in zero-copy optimizations.
-
         # Extract sharded data from kwargs
         if "data" not in kwargs:
             logger.error("No 'data' argument found for compiled graph execution")
@@ -675,7 +656,6 @@ class CompiledGraphWorkerGroup:
             if isinstance(sharded_data_dict, dict) and 0 in sharded_data_dict:
                 data_for_workers = sharded_data_dict[0]
             elif isinstance(sharded_data_dict, list):
-                # Data is a list with one element (for single DP)
                 data_for_workers = (
                     sharded_data_dict[0]
                     if len(sharded_data_dict) == 1
@@ -687,14 +667,13 @@ class CompiledGraphWorkerGroup:
                 )
                 data_for_workers = sharded_data_dict
 
-            # All workers get same data
+            # All workers (PP/TP/CP) get same input; Megatron handles PP inter-stage flow
             input_dict = {"data": data_for_workers}
             if common_kwargs:
                 input_dict.update(common_kwargs)
             refs = executor.execute(input_dict)
 
-            # Compute return_from_workers based on output_is_replicated
-            # This is critical for proper result deduplication!
+            # Compute return_from_workers for result deduplication based on output_is_replicated
             if output_is_replicated is None:
                 output_is_replicated = []
 
@@ -720,10 +699,8 @@ class CompiledGraphWorkerGroup:
                 called_workers=list(range(len(refs))),  # All workers were called
             )
         else:
-            # Multiple DP shards: execute one DAG per DP shard with different data
-            # Handle data format: could be dict {dp_rank: data} or list [data0, data1, ...]
+            # DP>1: Execute one DAG per DP shard with shard-specific data
             if isinstance(sharded_data_dict, list):
-                # Convert list to dict
                 if len(sharded_data_dict) != dp_size:
                     logger.error(
                         f"Data list size {len(sharded_data_dict)} doesn't match DP size {dp_size}"
@@ -733,7 +710,7 @@ class CompiledGraphWorkerGroup:
                     )
                 sharded_data_dict = {i: sharded_data_dict[i] for i in range(dp_size)}
 
-            # Prepare uniform data for each DP shard
+            # Build input dict for each DP shard
             input_dicts_per_dp = {}
             for dp_rank in range(dp_size):
                 if dp_rank not in sharded_data_dict:
@@ -749,17 +726,13 @@ class CompiledGraphWorkerGroup:
 
             refs = executor.execute(input_dicts_per_dp)
 
-            # Compute return_from_workers based on output_is_replicated
-            # This is critical for proper result deduplication!
-            # NOTE: With MultiDPCompiledGraphExecutor, refs are ordered by:
-            #       [DP0_workers..., DP1_workers..., DP2_workers..., etc.]
-            #       within each DP shard, workers are ordered by PP->CP->TP
+            # Compute return_from_workers for result deduplication
+            # Refs are ordered by DP (major) then PP->CP->TP within each DP shard
             if output_is_replicated is None:
                 output_is_replicated = []
 
             return_from_workers = []
-            # Since MultiDPCompiledGraphExecutor returns refs in DP-major order,
-            # we need to compute which ref indices to return, not which worker indices
+            # Compute which ref indices to return (refs are in DP-major order)
             pp_size = self.worker_group.sharding_annotations.get_axis_size(
                 "pipeline_parallel"
             )
@@ -775,24 +748,12 @@ class CompiledGraphWorkerGroup:
                 for pp_rank in range(pp_size):
                     for cp_rank in range(cp_size):
                         for tp_rank in range(tp_size):
-                            # Check if this coordinate should return results
-                            should_return = True
-                            if (
-                                "context_parallel" in output_is_replicated
-                                and cp_rank != 0
-                            ):
-                                should_return = False
-                            if (
-                                "tensor_parallel" in output_is_replicated
-                                and tp_rank != 0
-                            ):
-                                should_return = False
-                            if (
-                                "pipeline_parallel" in output_is_replicated
-                                and pp_rank != 0
-                            ):
-                                should_return = False
-
+                            # Only return from rank 0 of replicated axes
+                            should_return = (
+                                ("context_parallel" not in output_is_replicated or cp_rank == 0)
+                                and ("tensor_parallel" not in output_is_replicated or tp_rank == 0)
+                                and ("pipeline_parallel" not in output_is_replicated or pp_rank == 0)
+                            )
                             if should_return:
                                 return_from_workers.append(ref_idx)
                             ref_idx += 1
