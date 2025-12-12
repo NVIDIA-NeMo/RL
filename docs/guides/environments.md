@@ -42,13 +42,13 @@ code_env = CodeEnvironment.remote(env_config)
 - `num_workers`: Number of parallel workers for code execution
 - `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn)
 
-We’re tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
+We are tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
 
 ## Code Jaccard Environment
 
 The Code Jaccard Environment evaluates code (or text) responses by measuring Jaccard-based similarity against ground-truth answers. This is a lightweight, text-similarity reward useful when an execution sandbox is unnecessary or unavailable.
 
-### How it works
+### How It Works
 - Extracts the assistant’s response text from each conversation.
 - Computes a Jaccard similarity score between the response and ground truth:
   - Tokenizes both texts (whitespace), computes intersection/union, then applies a length ratio penalty.
@@ -76,7 +76,7 @@ code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
 - `num_workers` (int): Number of parallel verification workers.
 - `stop_strings` (list[str] | None): Optional default stop strings (propagated downstream; not required for scoring).
 
-### Sample GRPO config
+### Sample GRPO Config
 ```yaml
 env:
   code_jaccard:
@@ -152,7 +152,7 @@ NeMo RL provides a flexible environment registration mechanism that allows you t
 
 You can use the `register_env` function to dynamically register new environments without modifying NeMo RL's internal code.
 
-**Function Signature:**
+**Function Signature**
 
 ```python
 from nemo_rl.environments.utils import register_env

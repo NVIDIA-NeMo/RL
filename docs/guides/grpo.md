@@ -1,10 +1,10 @@
 # An in-depth Walkthrough of GRPO in NeMo RL
 
-This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We'll walk through essential aspects including data handling, policy model training, fast generation, and the specifics of the GRPO loss function and its enhancements.
+This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We walk through data handling, policy model training, fast generation, and the GRPO loss function.
 
 ## Quickstart: Launch a GRPO Run
 
-To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or via Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
+To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
 We recommend launching the job using `uv`:
 
@@ -14,7 +14,7 @@ uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
-**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 In this guide, we'll walk through how we handle:
 
@@ -75,7 +75,7 @@ For each task, you should provide a data processor that reads from your dataset 
 
 ```python
 def my_data_processor(
-    datum_dict: dict[str, Any], # loaded directly from your dataset (i.e. single line of jsonl data)
+    datum_dict: dict[str, Any], # loaded directly from your dataset (that is, a single line of JSONL data)
     task_data_spec: TaskDataSpec,
     tokenizer,
     max_seq_length: int,
@@ -94,7 +94,7 @@ We have an example of this as `math_data_processor` in [processors.py](../../nem
   - Specifies per-task system prompt and prompt (with defaults applied from a global spec when unspecified).
 - task_data_processors:
   - Dict mapping: task_name -> (task_spec, processor_fn).
-  - Typical flow: provide a default mapping via defaultdict, then explicitly register the dataset-provided processor under the resolved task_name.
+  - Typical flow: provide a default mapping using defaultdict, then explicitly register the dataset-provided processor under the resolved task_name.
 
 Example (simplified):
 
@@ -144,7 +144,7 @@ task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] 
     lambda: (default_task_spec, math_hf_data_processor)
 )
 
-# 4) Load dataset via helper (built-ins or local/HF datasets)
+# 4) Load dataset using the helper (built-ins or local/HF datasets)
 data = load_response_dataset(data_config, seed)
 
 # 5) Resolve task spec/name and ensure dataset provides a processor
@@ -185,7 +185,7 @@ For more information about environments, see the [Environments Guide](environmen
 ### Env–Task Mapping
 
 - env:
-  - The environment actor for reward/evaluation, constructed via `create_env(env_name=..., env_configs=...)`.
+  - The environment actor for reward/evaluation, constructed using `create_env(env_name=..., env_configs=...)`.
   - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
 - task_to_env:
   - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
@@ -203,7 +203,7 @@ val_task_to_env = task_to_env  # validation usually mirrors training mapping
 
 ## Policy Model
 
-We define a {py:class}`PolicyInterface]() <nemo_rl.models.interfaces>` that contains everything you need to train a Policy model.
+We define a {py:class}`~nemo_rl.models.policy.interfaces.PolicyInterface` that contains everything you need to train a Policy model.
 
 This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
@@ -233,7 +233,7 @@ where:
 - $\beta$ is the KL penalty coefficient
 - $\pi_{\text{ref}}$ is the reference policy
 
-It also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
+It also supports "Dual-Clipping" from [Ye et al. (2019)](https://arxiv.org/pdf/1912.09729), which
 imposes an additional upper bound on the probability ratio when advantages are negative.
 This prevents excessive policy updates. $rA \ll 0$ -> $cA$(clipped).
 The loss function is modified to the following when A_t < 0:
