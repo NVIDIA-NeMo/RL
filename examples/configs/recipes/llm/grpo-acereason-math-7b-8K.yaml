@@ -1,0 +1,85 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_epochs: 30
+  num_prompts_per_step: 128
+  use_leave_one_out_baseline: false
+  val_period: 0
+loss_fn:
+  ratio_clip_c: 3
+  reference_policy_kl_penalty: 0.0
+checkpointing:
+  keep_top_k: 10
+  model_save_format: null
+policy:
+  activation_checkpointing_enabled: false
+  dtensor_cfg:
+    activation_checkpointing: true
+    context_parallel_size: 2
+  dynamic_batching:
+    logprob_mb_tokens: 16384
+    train_mb_tokens: 8192
+  fsdp_offload_enabled: false
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+    max_new_tokens: 8192
+    model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    pad_token_id: 151643
+    stop_token_ids:
+    - 151643
+    vllm_cfg:
+      enable_expert_parallel: false
+      enforce_eager: true
+      load_format: dummy
+      max_model_len: 8192
+      precision: bfloat16
+      skip_tokenizer_init: true
+      tensor_parallel_size: 4
+  logprob_batch_size: 2
+  lr: 1.0e-06
+  make_sequence_length_divisible_by: 4
+  max_total_sequence_length: 8192
+  min_lr: 1.0e-06
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+  pipeline_model_parallel_size: 1
+  refit_buffer_size_gb: 4
+  scheduler:
+  - kwargs:
+      end_factor: 1.0
+      start_factor: 1.0
+      total_iters: 1
+    name: torch.optim.lr_scheduler.LinearLR
+  - kwargs:
+      T_max: 1000000
+      eta_min: 1.0e-06
+    name: torch.optim.lr_scheduler.CosineAnnealingLR
+  - milestones:
+    - 0
+  sequence_packing:
+    enabled: false
+    logprob_mb_tokens: 16384
+    train_mb_tokens: 8192
+  tensor_model_parallel_size: 1
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  weight_decay: 0.01
+data:
+  dataset_name: nvidia/AceReason-Math
+  max_input_seq_length: 8192
+  prompt_file: examples/prompts/acemath_qwen_cot.txt
+  shuffle: false
+  num_workers: 16
+env:
+  math:
+    env_cls: nemo_skills.training.nemo_rl.environments.math_environment.MathEnvironment
+    num_workers: 16
+logger:
+  monitor_gpus: false
+cluster:
+  gpus_per_node: 8
