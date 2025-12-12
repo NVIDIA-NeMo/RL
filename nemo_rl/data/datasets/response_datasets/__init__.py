@@ -125,6 +125,8 @@ def load_response_dataset(data_config, seed: int = 42):
                 "val_data_path",
                 "train_split",
                 "val_split",
+                "train_media_data_dir",
+                "val_media_data_dir",
             ],
         )
         base_dataset = GeneralConversationsJsonlDataset(
