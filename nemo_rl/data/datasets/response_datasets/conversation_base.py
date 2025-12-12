@@ -75,7 +75,7 @@ def conversation_process_message(
     allow_empty_text: bool = False,
     check_if_media_file_exist: bool = True,
     tried_default_extensions: set = set(),
-    tags_mapping_sample_to_allowed: Dict[str, str] = conversation_tags_mapping_sample_to_allowed,
+    tags_mapping_sample_to_allowed: Dict[str, str] = multimodal_utils.media_tags_to_allowed,
     process_message_fragment: Callable = lambda tag, fragment: [{tag: fragment}],
 ) -> list[Dict[str, Any]]:
     """
