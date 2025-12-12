@@ -1,7 +1,21 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Fail on errors
 set -e
 
-uv sync --group={build,docs,dev,test} --extra penguin
+uv sync --all-groups --extra nemo_gym
 
 # Stop pesky previous Ray servers that may have not been able to spin down from previous users.
 uv run ray stop --force
@@ -27,7 +41,7 @@ uv run python -c "import ray; ray.shutdown()"
 ./tests/run_unit.sh unit/environments/test_math_environment.py::test_math_env_step_basic
 
 # NeMo Gym integrates directly into NeMo RL as an Environment since that is the cleanest way. This tests the NeMo Gym integration logic and correctness.
-./tests/run_unit.sh unit/environments/test_penguin.py::test_penguin_sanity
+./tests/run_unit.sh unit/environments/test_nemo_gym.py::test_nemo_gym_sanity
 
 # NeMo Gym uses a separate rollout loop inside grpo_train in NeMo RL. This tests the e2e rollout functionality and correctness.
-./tests/run_unit.sh unit/experience/test_rollouts.py::test_run_async_penguin_rollout
+./tests/run_unit.sh unit/experience/test_rollouts.py::test_run_async_nemo_gym_rollout

@@ -23,7 +23,7 @@ from yaml import safe_load
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_config
+from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -32,35 +32,37 @@ from tests.unit.models.generation.test_vllm_generation import (
     cluster,  # noqa: F401
 )
 from tests.unit.models.generation.test_vllm_generation import (
-    tokenizer as penguin_tokenizer,  # noqa: F401
+    tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
 
 try:
-    from penguin import config_types  # noqa: F401
+    from nemo_gym import config_types  # noqa: F401
 
-    PENGUIN_INSTALLED = True
+    NEMO_GYM_INSTALLED = True
 except ImportError:
-    penguin = None
-    PENGUIN_INSTALLED = False
+    nemo_gym = None
+    NEMO_GYM_INSTALLED = False
 
 
 @pytest.mark.skipif(
-    not PENGUIN_INSTALLED,
-    reason="Skipping Penguin test since Penguin is not installed!",
+    not NEMO_GYM_INSTALLED,
+    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
 )
-def test_penguin_stub_module():
-    print(f"Penguin test successfully run! Penguin config_types module: {config_types}")
+def test_nemo_gym_stub_module():
+    print(
+        f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
+    )
 
 
 @pytest.fixture(scope="function")
-def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
+def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = {
         "policy": {
             "generation": generation_config,
         },
     }
-    setup_penguin_config(master_config, penguin_tokenizer)
+    setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
     # This is the tool parser for Qwen/Qwen3-0.6B. This needs to be changed for other models.
@@ -77,8 +79,8 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
 
 
 @pytest.fixture(scope="function")
-def penguin(penguin_vllm_generation):
-    """Create a Penguin actor for testing."""
+def nemo_gym(nemo_gym_vllm_generation):
+    """Create a NeMo-Gym actor for testing."""
 
     yaml_str = r"""example_multi_step_resources_server:
   resources_servers:
@@ -106,20 +108,20 @@ openai_model:
       uses_reasoning_parser: true
 """
 
-    config = PenguinConfig(
-        model_name=penguin_vllm_generation.cfg["model_name"],
-        base_urls=penguin_vllm_generation.dp_openai_server_base_urls,
+    config = NemoGymConfig(
+        model_name=nemo_gym_vllm_generation.cfg["model_name"],
+        base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
     )
-    env = Penguin.options(
+    env = NemoGym.options(
         runtime_env={
             "py_executable": get_actor_python_env(
-                "nemo_rl.environments.penguin.Penguin"
+                "nemo_rl.environments.nemo_gym.NemoGym"
             ),
         }
     ).remote(config)
 
-    # Blocking wait for penguin to spin up
+    # Blocking wait for NeMo-Gym to spin up
     ray.get(env.health_check.remote())
 
     yield env
@@ -131,28 +133,28 @@ openai_model:
 
 
 @pytest.fixture(scope="function")
-def penguin_sanity_test_data():
-    fpath = Path(__file__).parent / "penguin_test_data/test_penguin_sanity.json"
+def nemo_gym_sanity_test_data():
+    fpath = Path(__file__).parent / "nemo_gym_test_data/test_nemo_gym_sanity.json"
     with open(fpath) as f:
         data = json.load(f)
     return data
 
 
 @pytest.mark.skipif(
-    not PENGUIN_INSTALLED,
-    reason="Skipping Penguin test since Penguin is not installed!",
+    not NEMO_GYM_INSTALLED,
+    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
 )
-def test_penguin_sanity(
-    penguin,
-    penguin_sanity_test_data,
-    penguin_vllm_generation,
-    penguin_tokenizer,  # noqa: F811
+def test_nemo_gym_sanity(
+    nemo_gym,
+    nemo_gym_sanity_test_data,
+    nemo_gym_vllm_generation,
+    nemo_gym_tokenizer,  # noqa: F811
 ):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
-    # We need to match NeMo RL generation config params before sending to Penguin
-    generation_config = penguin_vllm_generation.cfg
-    examples = penguin_sanity_test_data["input"]
+    # We need to match NeMo RL generation config params before sending to NeMo-Gym
+    generation_config = nemo_gym_vllm_generation.cfg
+    examples = nemo_gym_sanity_test_data["input"]
     for example in examples:
         example["responses_create_params"]["temperature"] = generation_config[
             "temperature"
@@ -160,11 +162,11 @@ def test_penguin_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
     actual_result, _ = ray.get(
-        penguin.run_rollouts.remote(
-            penguin_sanity_test_data["input"], penguin_tokenizer, ""
+        nemo_gym.run_rollouts.remote(
+            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
         )
     )
-    expected_result = penguin_sanity_test_data["expected_output"]
+    expected_result = nemo_gym_sanity_test_data["expected_output"]
 
     # These are tensors originally and we swap them back to a list for comparison below
     for d in actual_result:
@@ -193,6 +195,11 @@ def test_penguin_sanity(
         return d
 
     def _standardize(l: list[dict]):
-        return list(map(_standardize_single_result, l))
+        # Sort by input_message_log token_ids to ensure deterministic ordering
+        # since NeMo-Gym returns results in completion order, not input order
+        standardized = list(map(_standardize_single_result, l))
+        return sorted(
+            standardized, key=lambda d: tuple(d["input_message_log"][0]["token_ids"])
+        )
 
     assert _standardize(expected_result) == _standardize(actual_result)

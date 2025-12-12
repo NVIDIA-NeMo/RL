@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
+import numpy as np
 import ray
 import requests
 import swanlab
@@ -107,6 +108,11 @@ class LoggerInterface(ABC):
         """Log dictionary of hyperparameters."""
         pass
 
+    @abstractmethod
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics."""
+        pass
+
 
 class TensorboardLogger(LoggerInterface):
     """Tensorboard logger backend."""
@@ -131,7 +137,7 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
-            # Penguin will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
+            # NeMo-Gym will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
             # This logic catches non-compatible objects being logged.
             if not isinstance(value, (int, float, bool, str)):
                 continue
@@ -151,6 +157,10 @@ class TensorboardLogger(LoggerInterface):
             except Exception as e:
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to Tensorboard."""
+        return
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
@@ -349,6 +359,16 @@ class WandbLogger(LoggerInterface):
         """
         self.run.log({name: figure}, step=step)
 
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to wandb.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+
 
 class SwanlabLogger(LoggerInterface):
     """SwanLab logger backend."""
@@ -417,6 +437,10 @@ class SwanlabLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to swanlab."""
+        return
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -792,6 +816,10 @@ class MLflowLogger(LoggerInterface):
             figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
             mlflow.log_artifact(tmp_file.name, f"plots/{name}")
 
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to MLflow."""
+        return
+
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
         try:
@@ -934,6 +962,98 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_plot_per_worker_timeline_metrics(
+        self,
+        metrics: dict[int, list[Any]],
+        step: int,
+        prefix: str,
+        name: str,
+        timeline_interval: float,
+    ) -> None:
+        """Log a plot of per-worker timeline metrics.
+
+        Args:
+            metrics: Dictionary of metrics to log, where the keys are the worker IDs and the values are the lists of metric values
+            - metrics: dict[str, list[Any]] = {worker_id: [metric_value_1, metric_value_2, ...]}
+            - metric values are time series values over time, the timing gap between the values is the timeline_interval
+            step: Global step value
+            name: Name of the plot
+            timeline_interval: Interval between timeline points (in seconds)
+        """
+        if not metrics:
+            print(
+                f"Skipping {name} per-worker timeline logging because no metrics were provided."
+            )
+            return
+
+        if timeline_interval <= 0:
+            raise ValueError(
+                f"timeline_interval must be positive; received {timeline_interval}"
+            )
+
+        # Plot the per-worker timeline metrics
+        x_series: list[list[float]] = []
+        y_series: list[list[float]] = []
+        series_labels: list[str] = []
+
+        if not any(metrics.values()):
+            print(
+                f"Skipping {name} per-worker timeline logging because all series were empty."
+            )
+            return
+
+        for worker_id in sorted(metrics.keys()):
+            metric_values = metrics[worker_id]
+            if not metric_values:
+                continue
+
+            x_series.append([i * timeline_interval for i in range(len(metric_values))])
+            y_series.append([float(v) for v in metric_values])
+            series_labels.append(f"worker_{worker_id}")
+
+        fig, ax = plt.subplots()
+        for label, xs, ys in zip(series_labels, x_series, y_series):
+            ax.plot(xs, ys, label=label)
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (per worker)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        plt.close(fig)
+
+        # Plot the average of the metrics
+        min_length = min(len(v) for v in metrics.values())
+        x_series = [i * timeline_interval for i in range(min_length)]
+        truncated_y_serise = [v[:min_length] for v in y_series]
+
+        avg_y_serise = np.mean(truncated_y_serise, axis=0)
+
+        fig, ax = plt.subplots()
+        ax.plot(x_series, avg_y_serise, label="average")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (average)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/average_{name}")
+        plt.close(fig)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to all backends if available.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        for logger in self.loggers:
+            logger.log_histogram(histogram, step, name)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

@@ -46,7 +46,7 @@ ensure-docs-env:
 	@if [ ! -x "$(PYTHON)" ]; then \
 		echo "📦 Creating isolated docs environment..."; \
 		uv venv .venv; \
-		uv sync --no-config; \
+		uv sync --project ../pyproject.toml --group docs; \
 		echo "✅ Docs environment ready."; \
 		echo "📝 To activate it: $(ACTIVATE_CMD)"; \
 	fi

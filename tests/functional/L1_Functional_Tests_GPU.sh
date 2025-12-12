@@ -19,10 +19,15 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
+# This test is intentionally not run with uv run --no-sync to verify that the frozen environment is working correctly.
+time bash ./tests/functional/grpo_frozen_env.sh
+time bash ./tests/functional/test_frozen_env.sh
+
 time uv run --no-sync bash ./tests/functional/sft.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
+time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 time uv run --no-sync bash ./tests/functional/dpo.sh
@@ -34,6 +39,14 @@ time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_cor
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 time uv run --no-sync bash ./tests/functional/distillation.sh
 time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+
+# Research functional tests (self-discovery)
+for test_script in research/*/tests/functional/*.sh; do
+    project_dir=$(echo $test_script | cut -d/ -f1-2)
+    pushd $project_dir
+    time uv run --no-sync bash $(echo $test_script | cut -d/ -f3-)
+    popd
+done
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*

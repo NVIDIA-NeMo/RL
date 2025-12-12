@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "penguin"
+name = "nemo_gym"
 dynamic = ["dependencies", "version"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
-description = "Standalone packaging for the Penguin sub-module."
+description = "Standalone packaging for the Gym sub-module."
 requires-python = ">=3.10"

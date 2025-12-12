@@ -23,7 +23,6 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
-import zmq
 from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
@@ -66,18 +65,17 @@ from nemo_rl.models.huggingface.common import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
     LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
-    sliding_window_overwrite,
 )
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -137,7 +135,7 @@ def get_cpu_state_dict(
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
 )  # pragma: no cover
-class DTensorPolicyWorker:
+class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -218,9 +216,6 @@ class DTensorPolicyWorker:
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             torch_dtype=torch.float32,
             trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
@@ -508,29 +503,6 @@ class DTensorPolicyWorker:
                 stack.enter_context(cp_context)
 
             yield
-
-    def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
-    ) -> None:
-        """Initialize the collective communication."""
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
-        )
-        device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
-
-    def is_alive(self) -> bool:
-        return True
-
-    def reset_peak_memory_stats(self) -> None:
-        torch.cuda.reset_peak_memory_stats()
-
-    def get_gpu_info(self) -> dict[str, Any]:
-        """Return information about the GPU being used by this worker."""
-        return get_gpu_info(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker/train")
     def train(
@@ -1660,24 +1632,6 @@ class DTensorPolicyWorker:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
-    def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """Get the logprobs from the reference policy for a batch of data.
-
-        Returns:
-          a BatchedDataDict with key "reference_logprobs" and shape [batch_size, sequence_length].
-          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
-          The logprob of input token i is specified at position i in the output logprobs tensor.
-        """
-        with self.use_reference_model():
-            reference_logprobs = self.get_logprobs(data, micro_batch_size)
-
-        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
-        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
-        return return_data
-
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
         noise_std = 0.01  # Standard deviation for the noise
@@ -1698,37 +1652,6 @@ class DTensorPolicyWorker:
         """
         return self.model.config
 
-    def report_device_id(self) -> str:
-        """Report the UUID of the current CUDA device using NVML.
-
-        Returns:
-            str: UUID of the device in the format "GPU-xxxxx"
-        """
-        from nemo_rl.utils.nvml import get_device_uuid
-
-        # Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        # Get device UUID using NVML
-        return get_device_uuid(device_idx)
-
-    def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
-
-    def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
-        if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
-
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
@@ -1739,17 +1662,33 @@ class DTensorPolicyWorker:
 
         return state_dict_info
 
-    def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
-        from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        device_idx = torch.cuda.current_device()
-        return get_free_memory_bytes(device_idx)
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorker."""
+        raise NotImplementedError(
+            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorker"
+        )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1782,8 +1721,15 @@ class DTensorPolicyWorker:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
@@ -1942,24 +1888,3 @@ class DTensorPolicyWorker:
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
-
-    def shutdown(self) -> None:
-        """Shutdown the policy."""
-        # Clean up extension resources like ZMQ sockets
-        if hasattr(self, "zmq_socket"):
-            self.zmq_socket.close()
-            self.zmq_context.term()
-
-    def start_gpu_profiling(self) -> None:
-        """Start GPU profiling."""
-        torch.cuda.profiler.start()
-
-    def stop_gpu_profiling(self) -> None:
-        """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
-
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
-        """Report the node IP and GPU ID of the current worker."""
-        ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
-        return (ip, gpu_id)

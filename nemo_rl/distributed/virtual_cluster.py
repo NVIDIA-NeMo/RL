@@ -44,19 +44,19 @@ class PY_EXECUTABLES:
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
-    BASE = "uv run --locked"
+    BASE = f"uv run --locked --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = "uv run --locked --extra vllm"
+    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = "uv run --locked --extra automodel"
+    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
-    MCORE = "uv run --locked --extra mcore"
+    MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
-    # Use Penguin dependencies
-    PENGUIN = "uv run --locked --extra penguin"
+    # Use NeMo-Gym dependencies
+    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

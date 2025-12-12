@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
 import warnings
 from collections import defaultdict
@@ -88,9 +87,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
         if megatron_enable:
-            worker_builder_cls = (
-                "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
-            )
+            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -113,11 +110,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-                )
+                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
@@ -235,16 +230,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sequence_length_pad_multiple = (
                 cp_size * 2 * tp_size if cp_size > 1 else tp_size
             )
-            if (
-                config["megatron_cfg"]["enabled"]
-                and config["megatron_cfg"].get("fp8_cfg", None) is not None
-                and config["megatron_cfg"]["fp8_cfg"].get("enabled", False)
-            ):
-                # if fp8 is enabled, ensure the sequence is padded to multiples of 16
-                # Ref: https://github.com/NVIDIA/TransformerEngine/blob/5b3092a0e40654436bec5ea0a0b0f7ad2887b20d/transformer_engine/pytorch/utils.py#L437-L441
-                sequence_length_pad_multiple = math.lcm(
-                    16, sequence_length_pad_multiple
-                )
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
@@ -541,6 +526,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
         }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -675,10 +662,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        # Placeholder implementation
-        pass
-
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
@@ -690,6 +673,73 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        # Placeholder implementation
+        pass
+
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
+
+        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements
+        distributed reduction, returning results merged across ranks. Therefore, we shard the
+        input by DP and call in parallel, then take the result from the first worker.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "calibrate_qkv_fp8_scales",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "micro_batch_size": micro_batch_size,
+                "percentile": percentile,
+                "margin": margin,
+                "include_q": include_q,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        return results[0]
+
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
         futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
@@ -697,17 +747,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
 
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int) -> list[ray.ObjectRef]:
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes
+            "stream_weights_via_ipc_zmq",
+            buffer_size_bytes=buffer_size_bytes,
+            kv_scales=kv_scales,
         )
         return futures
 
-    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
-            "broadcast_weights_for_collective"
+            "broadcast_weights_for_collective",
+            kv_scales=kv_scales,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures

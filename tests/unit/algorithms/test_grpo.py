@@ -897,6 +897,7 @@ def mock_grpo_components():
             "truncated_importance_sampling_ratio": None,
             "sequence_level_importance_ratios": False,
             "token_level_loss": True,
+            "force_on_policy_ratio": False,
         }
     )
     logger = MagicMock()

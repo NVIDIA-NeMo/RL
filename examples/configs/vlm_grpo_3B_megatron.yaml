@@ -42,6 +42,7 @@ loss_fn:
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 checkpointing:
   enabled: true
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
@@ -106,6 +107,7 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -143,6 +145,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
     optimizer:
       optimizer: adam
       lr: 2.0e-07

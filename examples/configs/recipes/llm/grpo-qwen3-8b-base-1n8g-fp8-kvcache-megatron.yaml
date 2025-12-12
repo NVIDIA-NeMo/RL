@@ -1,0 +1,49 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: 20
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo_qwen3_8b_fp8_kvcache
+loss_fn:
+  use_importance_sampling_correction: true
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3ForCausalLM
+    tensor_model_parallel_size: 4
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    2}
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8
+      use_deep_gemm: true
+data:
+  max_input_seq_length: 2048
+  prompt_file: null
+  dataset_name: DAPOMath17K
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+cluster:
+  gpus_per_node: 8

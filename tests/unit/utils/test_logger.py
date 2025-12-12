@@ -14,7 +14,7 @@
 
 import shutil
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -1740,6 +1740,97 @@ class TestLogger:
         mock_tb_instance.log_hyperparams.assert_called_once_with(params)
         mock_mlflow_instance.log_hyperparams.assert_called_once_with(params)
         mock_swanlab_instance.log_hyperparams.assert_called_once_with(params)
+
+    def test_log_plot_per_worker_timeline_metrics_logs_expected_series(self):
+        """Ensure per-worker and average plots are produced and logged."""
+        logger = Logger.__new__(Logger)
+        backend_logger = MagicMock()
+        logger.loggers = [backend_logger]
+
+        metrics = {
+            0: [1, 2, 3],
+            1: [2, 3, 4],
+        }
+
+        mock_fig_worker, mock_ax_worker = MagicMock(), MagicMock()
+        mock_fig_avg, mock_ax_avg = MagicMock(), MagicMock()
+
+        with (
+            patch(
+                "nemo_rl.utils.logger.plt.subplots",
+                side_effect=[
+                    (mock_fig_worker, mock_ax_worker),
+                    (mock_fig_avg, mock_ax_avg),
+                ],
+            ) as mock_subplots,
+            patch("nemo_rl.utils.logger.plt.close") as mock_close,
+        ):
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics,
+                step=1,
+                prefix="vllm",
+                name="kv_cache",
+                timeline_interval=0.5,
+            )
+
+        assert mock_subplots.call_count == 2
+        expected_x = [0.0, 0.5, 1.0]
+        mock_ax_worker.plot.assert_has_calls(
+            [
+                call(expected_x, [1.0, 2.0, 3.0], label="worker_0"),
+                call(expected_x, [2.0, 3.0, 4.0], label="worker_1"),
+            ],
+            any_order=False,
+        )
+
+        avg_call = mock_ax_avg.plot.call_args_list[0]
+        assert avg_call.args[0] == expected_x
+        assert avg_call.args[1].tolist() == [1.5, 2.5, 3.5]
+        assert avg_call.kwargs["label"] == "average"
+
+        backend_logger.log_plot.assert_has_calls(
+            [
+                call(mock_fig_worker, 1, "vllm/per_worker_kv_cache"),
+                call(mock_fig_avg, 1, "vllm/average_kv_cache"),
+            ],
+            any_order=False,
+        )
+        assert mock_close.call_args_list == [
+            call(mock_fig_worker),
+            call(mock_fig_avg),
+        ]
+
+    def test_log_plot_per_worker_timeline_metrics_requires_positive_interval(self):
+        """timeline_interval must be positive."""
+        logger = Logger.__new__(Logger)
+        logger.loggers = [MagicMock()]
+
+        with pytest.raises(ValueError):
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics={0: [1, 2]},
+                step=1,
+                prefix="train",
+                name="pending",
+                timeline_interval=0.0,
+            )
+
+    def test_log_plot_per_worker_timeline_metrics_skips_when_no_data(self):
+        """No plots should be produced when metrics are empty."""
+        logger = Logger.__new__(Logger)
+        backend_logger = MagicMock()
+        logger.loggers = [backend_logger]
+
+        with patch("nemo_rl.utils.logger.plt.subplots") as mock_subplots:
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics={},
+                step=1,
+                prefix="train",
+                name="pending",
+                timeline_interval=1.0,
+            )
+
+        mock_subplots.assert_not_called()
+        backend_logger.log_plot.assert_not_called()
 
 
 def test_print_message_log_samples(capsys):

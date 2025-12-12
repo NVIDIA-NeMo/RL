@@ -134,8 +134,8 @@ jobs:
           echo "Checking if dtensor policy worker files are synchronized..."
 
           # Define the dtensor policy worker file paths
-          DTENSOR_POLICY_WORKER_FILE="nemo_rl/models/policy/dtensor_policy_worker.py"
-          DTENSOR_POLICY_WORKER_V2_FILE="nemo_rl/models/policy/dtensor_policy_worker_v2.py"
+          DTENSOR_POLICY_WORKER_FILE="nemo_rl/models/policy/workers/dtensor_policy_worker.py"
+          DTENSOR_POLICY_WORKER_V2_FILE="nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py"
 
           # Check if dtensor_policy_worker.py was modified in this PR
           if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${DTENSOR_POLICY_WORKER_FILE}$"; then
