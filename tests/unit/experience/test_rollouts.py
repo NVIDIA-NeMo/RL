@@ -34,6 +34,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.environments.penguin import penguin_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
+    format_and_tokenize_env_observation,
     run_async_multi_turn_rollout,
     run_async_penguin_rollout,
     run_multi_turn_rollout,
@@ -875,3 +876,373 @@ def test_run_async_penguin_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_penguin_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+# ============================================================================
+# Unit tests for format_and_tokenize_env_observation
+# Tests use chat templates from config files via parametrized fixture:
+# - Default template
+# - Llama 3 template (from grpo_adk_llama8b.yaml)
+# - Gemma template (from grpo_adk_gemma.yaml)
+# ============================================================================
+
+# Llama 3 chat template from examples/configs/grpo_adk_llama8b.yaml
+LLAMA3_CHAT_TEMPLATE = (
+    "{%- if add_bos_token|default(false) %}{{ bos_token }}{% endif %}"
+    "{% for message in messages %}"
+    '{{ "<|start_header_id|>" + message.role + "<|end_header_id|>\\n\\n" '
+    '+ message.content | trim + "<|eot_id|>" }}'
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    '{{ "<|start_header_id|>assistant<|end_header_id|>\\n\\n" }}'
+    "{% endif %}"
+)
+
+# Gemma template from examples/configs/grpo_adk_gemma.yaml
+GEMMA_CHAT_TEMPLATE = (
+    "{%- if add_bos_token|default(false) %}{{ bos_token }}{% endif %}"
+    "{% for message in messages %}"
+    "{% set role = 'model' if message['role'] == 'assistant' else message['role'] %}"
+    "{{ '<start_of_turn>' + role + '\\n' + message['content'] | trim + '<end_of_turn>\\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{ '<start_of_turn>model\\n' }}"
+    "{% endif %}"
+)
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        ("default", None, None),
+        (
+            "llama3",
+            LLAMA3_CHAT_TEMPLATE,
+            ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+        ),
+        ("gemma", GEMMA_CHAT_TEMPLATE, ["<start_of_turn>", "<end_of_turn>"]),
+    ],
+    ids=["default", "llama3", "gemma"],
+)
+def configured_tokenizer(request, rollout_tokenizer):
+    """Parametrized fixture providing tokenizers with different chat templates.
+
+    Returns: tuple of (template_name, tokenizer, expected_markers)
+    """
+    template_name, chat_template, expected_markers = request.param
+    if chat_template is not None:
+        rollout_tokenizer.chat_template = chat_template
+    return template_name, rollout_tokenizer, expected_markers
+
+
+class TestFormatAndTokenizeEnvObservation:
+    """Comprehensive tests for format_and_tokenize_env_observation.
+
+    All tests automatically run with 3 different chat templates via the
+    configured_tokenizer fixture:
+    - Default template
+    - Llama 3 template (from grpo_adk_llama8b.yaml)
+    - Gemma template (from grpo_adk_gemma.yaml)
+    """
+
+    @pytest.mark.parametrize(
+        "env_role,env_content",
+        [
+            ("user", "What is number 5?"),
+            ("assistant", "The number at position 5 is 42"),
+            ("system", "You are playing a guessing game"),
+            ("User", "Case insensitive test"),  # Test case insensitivity
+        ],
+    )
+    def test_standard_roles(self, configured_tokenizer, env_role, env_content):
+        """Test standard roles produce properly formatted output."""
+        template_name, tokenizer, expected_markers = configured_tokenizer
+
+        formatted_obs, tokenized_obs = format_and_tokenize_env_observation(
+            tokenizer, env_role, env_content
+        )
+
+        # Verify template-specific markers are present (if applicable)
+        if expected_markers:
+            for marker in expected_markers:
+                assert marker in formatted_obs, (
+                    f"Expected {marker} in {template_name} template output"
+                )
+
+        # Verify template was applied (output should be longer than raw content)
+        assert len(formatted_obs) > len(env_content.strip()), (
+            f"Template should add markers/formatting for {template_name}"
+        )
+
+        # Verify tokenization
+        assert isinstance(tokenized_obs, torch.Tensor)
+        assert tokenized_obs.dtype == torch.int64
+        assert len(tokenized_obs) > 0
+
+        # Verify BOS token removed
+        if hasattr(tokenizer, "bos_token_id") and len(tokenized_obs) > 0:
+            assert tokenized_obs[0] != tokenizer.bos_token_id, (
+                f"BOS token should be removed for {template_name} template"
+            )
+
+        # Verify content is present in decoded output
+        decoded = tokenizer.decode(tokenized_obs, skip_special_tokens=False)
+        assert env_content.strip() in decoded, (
+            f"Original content should be present in decoded output for {template_name}"
+        )
+
+    @pytest.mark.parametrize(
+        "env_role,env_content",
+        [
+            ("environment", "Action accepted. Next turn."),
+            ("tool", "Result: 10 unique numbers"),
+            ("game", "Current board state: ..."),
+            ("feedback", "Good job!"),
+            ("Environment", "Mixed case non-standard role"),  # Test case insensitivity
+            ("TOOL", "Uppercase non-standard role"),
+            (
+                "",
+                "Content with empty role",
+            ),  # Test empty role (treated as non-standard)
+        ],
+    )
+    def test_nonstandard_roles(self, configured_tokenizer, env_role, env_content):
+        """Test non-standard roles use raw content (no template).
+
+        Includes test for empty role string, which should also be treated
+        as non-standard (no template applied).
+        """
+        template_name, tokenizer, expected_markers = configured_tokenizer
+
+        formatted_obs, tokenized_obs = format_and_tokenize_env_observation(
+            tokenizer, env_role, env_content
+        )
+
+        # Should NOT have template markers
+        if expected_markers:
+            for marker in expected_markers:
+                assert marker not in formatted_obs, (
+                    f"Non-standard role should not have {marker} from {template_name} template"
+                )
+
+        # Should be raw stripped content
+        assert formatted_obs == env_content.strip()
+        assert isinstance(tokenized_obs, torch.Tensor)
+        assert tokenized_obs.dtype == torch.int64
+        assert len(tokenized_obs) > 0
+
+        # Verify the tokenization matches the raw content
+        decoded = tokenizer.decode(tokenized_obs, skip_special_tokens=True)
+        assert decoded.strip() == env_content.strip()
+
+    def test_tokenizer_without_bos_token_id(self, configured_tokenizer):
+        """Test that BOS removal logic is correctly skipped when bos_token_id is None.
+
+        Some tokenizers may have bos_token_id=None (like Qwen). This verifies that:
+        1. The function doesn't crash
+        2. BOS removal logic is skipped (no token is incorrectly removed)
+        3. Output tokens match expected tokenization
+        """
+        template_name, tokenizer, _ = configured_tokenizer
+        env_content = "Test message"
+
+        # Check if tokenizer has a usable bos_token_id
+        has_bos = (
+            hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None
+        )
+
+        if has_bos:
+            # Tokenizer has a real bos_token_id, temporarily set it to None to test edge case
+            original_bos_token_id = tokenizer.bos_token_id
+            tokenizer.bos_token_id = None
+        else:
+            # Tokenizer already has no bos_token_id or it's None (e.g., Qwen)
+            original_bos_token_id = None
+
+        try:
+            # Get formatted output first (to compare tokenization)
+            formatted_obs, tokenized_obs = format_and_tokenize_env_observation(
+                tokenizer, "user", env_content
+            )
+
+            # Verify basic functionality still works
+            assert isinstance(formatted_obs, str)
+            assert isinstance(tokenized_obs, torch.Tensor)
+            assert tokenized_obs.dtype == torch.int64
+            assert len(tokenized_obs) > 0
+
+            # CRITICAL: Verify no incorrect token removal happened
+            # Re-tokenize the formatted output to get expected tokens
+            expected_tokens = tokenizer(
+                formatted_obs, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
+
+            # When bos_token_id is None, NO tokens should be removed
+            # So output should match expected tokenization exactly
+            assert len(tokenized_obs) == len(expected_tokens), (
+                f"When bos_token_id=None, no tokens should be removed. "
+                f"Expected {len(expected_tokens)} tokens, got {len(tokenized_obs)} "
+                f"for {template_name}"
+            )
+
+            # Verify token IDs match
+            assert torch.equal(tokenized_obs, expected_tokens), (
+                f"Token IDs should match when bos_token_id=None for {template_name}"
+            )
+
+        finally:
+            # Restore bos_token_id if we changed it
+            if has_bos and original_bos_token_id is not None:
+                tokenizer.bos_token_id = original_bos_token_id
+
+    @pytest.mark.parametrize(
+        "env_role,env_content",
+        [
+            ("user", ""),
+            ("assistant", ""),
+            ("environment", ""),
+            ("user", "   "),  # Whitespace only
+            ("environment", "\n\n"),  # Newlines only
+        ],
+    )
+    def test_empty_and_whitespace_content(
+        self, configured_tokenizer, env_role, env_content
+    ):
+        """Test handling of empty or whitespace-only content.
+
+        Empty content should:
+        - Not crash the function
+        - Return valid (possibly empty) tensors
+        - Have int64 dtype
+        """
+        template_name, tokenizer, _ = configured_tokenizer
+
+        formatted_obs, tokenized_obs = format_and_tokenize_env_observation(
+            tokenizer, env_role, env_content
+        )
+
+        # Verify types and dtype
+        assert isinstance(formatted_obs, str)
+        assert isinstance(tokenized_obs, torch.Tensor)
+        assert tokenized_obs.dtype == torch.int64, (
+            f"Expected int64 dtype for {template_name} template with empty content"
+        )
+
+    def test_whitespace_stripping(self, configured_tokenizer):
+        """Test whitespace stripping works correctly."""
+        template_name, tokenizer, _ = configured_tokenizer
+        env_content_with_whitespace = "  \n  Test content  \n  "
+        expected_stripped = "Test content"
+
+        # Test with standard role
+        formatted_obs_std, _ = format_and_tokenize_env_observation(
+            tokenizer, "user", env_content_with_whitespace
+        )
+        # For standard roles, content should be in the formatted output
+        decoded_std = tokenizer.decode(
+            tokenizer(formatted_obs_std, add_special_tokens=False).input_ids,
+            skip_special_tokens=True,
+        )
+        assert expected_stripped in decoded_std, (
+            f"Whitespace should be stripped for {template_name} standard role"
+        )
+
+        # Test with non-standard role
+        formatted_obs_nonstd, _ = format_and_tokenize_env_observation(
+            tokenizer, "environment", env_content_with_whitespace
+        )
+        # For non-standard roles, formatted_obs should be stripped raw content
+        assert formatted_obs_nonstd == expected_stripped, (
+            f"Whitespace should be stripped for {template_name} non-standard role"
+        )
+
+    def test_message_log_structure(self, configured_tokenizer):
+        """Test that message log structure is correct for mixed role types.
+
+        Verifies that a realistic message log with both standard and non-standard
+        roles produces correctly formatted output with proper template application.
+        """
+        template_name, tokenizer, expected_markers = configured_tokenizer
+
+        message_log = []
+
+        # User message (standard role)
+        user_formatted, user_tokens = format_and_tokenize_env_observation(
+            tokenizer, "user", "What is number 3?"
+        )
+        message_log.append(
+            {"role": "user", "content": user_formatted, "token_ids": user_tokens}
+        )
+
+        # Assistant message (standard role)
+        asst_formatted, asst_tokens = format_and_tokenize_env_observation(
+            tokenizer, "assistant", "The number at position 3 is 7"
+        )
+        message_log.append(
+            {"role": "assistant", "content": asst_formatted, "token_ids": asst_tokens}
+        )
+
+        # Environment message (non-standard role)
+        env_formatted, env_tokens = format_and_tokenize_env_observation(
+            tokenizer, "environment", "Correct! Continue guessing."
+        )
+        message_log.append(
+            {"role": "environment", "content": env_formatted, "token_ids": env_tokens}
+        )
+
+        # Verify message log structure
+        assert len(message_log) == 3, "Message log should contain 3 messages"
+
+        # Verify all messages have required fields
+        for i, msg in enumerate(message_log):
+            assert "role" in msg, f"Message {i} missing 'role' field"
+            assert "content" in msg, f"Message {i} missing 'content' field"
+            assert "token_ids" in msg, f"Message {i} missing 'token_ids' field"
+            assert isinstance(msg["content"], str), (
+                f"Message {i} content should be string"
+            )
+            assert isinstance(msg["token_ids"], torch.Tensor), (
+                f"Message {i} token_ids should be tensor"
+            )
+            assert msg["token_ids"].dtype == torch.int64, (
+                f"Message {i} token_ids should be int64"
+            )
+
+        # Standard roles (user, assistant) should have template markers (if applicable)
+        if expected_markers:
+            assert any(m in message_log[0]["content"] for m in expected_markers), (
+                f"User message should have {template_name} template markers"
+            )
+            assert any(m in message_log[1]["content"] for m in expected_markers), (
+                f"Assistant message should have {template_name} template markers"
+            )
+            # Non-standard role (environment) should NOT have markers
+            assert not any(m in message_log[2]["content"] for m in expected_markers), (
+                f"Environment message should NOT have {template_name} template markers"
+            )
+
+        # Verify content is properly embedded in formatted output
+        assert "What is number 3?" in tokenizer.decode(
+            message_log[0]["token_ids"], skip_special_tokens=True
+        )
+        assert "number at position 3 is 7" in tokenizer.decode(
+            message_log[1]["token_ids"], skip_special_tokens=True
+        )
+        assert message_log[2]["content"] == "Correct! Continue guessing.", (
+            "Non-standard role should have raw content"
+        )
+
+        # Print formatted strings for inspection
+        print(f"\n{'=' * 80}")
+        print(f"{template_name.upper()} Template - Message Log Formatted Strings")
+        print(f"{'=' * 80}")
+        print("\n[USER MESSAGE - Standard Role]")
+        print(f"Formatted: {message_log[0]['content']!r}")
+        print(f"Token count: {len(message_log[0]['token_ids'])}")
+        print("\n[ASSISTANT MESSAGE - Standard Role]")
+        print(f"Formatted: {message_log[1]['content']!r}")
+        print(f"Token count: {len(message_log[1]['token_ids'])}")
+        print("\n[ENVIRONMENT MESSAGE - Non-Standard Role]")
+        print(f"Formatted: {message_log[2]['content']!r}")
+        print(f"Token count: {len(message_log[2]['token_ids'])}")
+        print(f"{'=' * 80}\n")
