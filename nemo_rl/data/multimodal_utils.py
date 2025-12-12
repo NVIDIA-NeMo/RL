@@ -12,10 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Optional, Union
 
 import torch
 from transformers import PreTrainedTokenizerBase
+
+
+# List of allowed placeholder strings for different media types in the dataset string
+# e.g. "This is an example of <image>"
+media_tags = {
+    'image': '<image>',
+    'video': '<video>',
+    'audio': '<audio>',
+    'video-audio': '<video-audio>',
+}
+media_tags_reversed = {v: k for k, v in media_tags.items()}
+
+default_media_extensions = {
+    'image': ['png','jpeg','jpg', 'img'],
+    'video': ['mp4'],
+    'video-audio': ['mp4'],
+    'audio': ['wav', 'flac', "mp3"],
+}
+
+
+# different media namings maybe used in the raw dataset,
+# in which case, they need to be mapped to the allowed ones
+# WARNING: values cannot be used as the keys in the same dict to avoid cyclic graph
+media_tags_to_allowed = {
+    'speech': 'audio',
+    'speeches': 'audio',
+    'sound': 'audio',
+    'audios': 'audio',
+    'images': 'image',
+    'videos': 'video',
+}
+
+
+# Build a pattern like: <image>|<video>|<audio>|<video-audio>
+media_tag_pattern = re.compile(
+    r"(" + "|".join(re.escape(tag) for tag in media_tags.values()) + ")"
+)
 
 
 class PackedTensor:

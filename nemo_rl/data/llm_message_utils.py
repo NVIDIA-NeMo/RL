@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from collections import defaultdict
 from typing import Any, Optional, Union, cast
 
 import torch
@@ -25,6 +26,7 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    media_tags,
     get_multimodal_keys_from_processor,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -422,7 +424,7 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
-def get_images_from_message(message: dict[str, Any]) -> list[Any]:
+def get_media_from_message(message: dict[str, Any]) -> list[Any]:
     """Get all images from a message log item."""
     # Handle None or missing content (e.g., assistant messages with only tool_calls)
     if message.get("content") is None:
@@ -431,13 +433,14 @@ def get_images_from_message(message: dict[str, Any]) -> list[Any]:
     if isinstance(message["content"], str):
         return []
     # iterate over the content list
-    images = []
+    media = defaultdict(list)
     for item in message["content"]:
-        if item["type"] == "image":
-            images.extend(list(item["image"])) if isinstance(
-                item["image"], (list, tuple)
-            ) else images.append(item["image"])
-    return images
+        tag = item["type"]
+        if tag in media_tags:
+            media[tag].extend(list(item[tag])) if isinstance(
+                item[tag], (list, tuple)
+            ) else media[tag].append(item[tag])
+    return media
 
 
 def get_formatted_message_log(
@@ -606,21 +609,32 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        images_cur_message = get_images_from_message(message)
+        media_cur_message = get_media_from_message(message)
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
-        if len(images_cur_message) == 0:
+        if len(media_cur_message) == 0:
             new_message["token_ids"] = tokenizer(
                 text=message_chunk, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            media_kwargs = defaultdict(list)
+            use_audio_in_video = False
+            if "image" in media_cur_message:
+                media_kwargs["images"] += media_cur_message["image"]
+            if "video" in media_cur_message:
+                media_kwargs["videos"] += media_cur_message["video"]
+            if "video-sound" in media_cur_message:
+                media_kwargs["videos"] += media_cur_message["video-sound"]
+            if "audio" in media_cur_message:
+                media_kwargs["audio"] += media_cur_message["audio"]
+
             processed_chunk = tokenizer(
                 text=[message_chunk],
-                images=images_cur_message,
                 return_tensors="pt",
                 add_special_tokens=False,
+                **media_kwargs,
             )
             new_message["token_ids"] = processed_chunk["input_ids"][0]
 
