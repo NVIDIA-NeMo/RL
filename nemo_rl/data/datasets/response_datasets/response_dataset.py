@@ -56,9 +56,10 @@ class ResponseDataset:
         else:
             val_ds = None
 
-        # format the dataset
-        train_ds = train_ds.map(self.add_messages_key)
-        if val_ds:
+        # Only apply add_messages_key if 'messages' column doesn't exist
+        if "messages" not in train_ds.column_names:
+            train_ds = train_ds.map(self.add_messages_key)
+        if val_ds is not None and "messages" not in val_ds.column_names:
             val_ds = val_ds.map(self.add_messages_key)
 
         # store the formatted dataset

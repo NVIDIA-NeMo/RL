@@ -17,7 +17,7 @@ import os
 from typing import Optional, Union
 
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import DatasetDict, load_dataset, load_from_disk
 from PIL import Image
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -62,7 +62,7 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
 
 
 def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
-    """Load a dataset from a json or huggingface dataset.
+    """Load a dataset from a json, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
     Args:
         data_path: The path to the dataset.
@@ -72,7 +72,13 @@ def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
     if suffix in [".json", ".jsonl"]:
         raw_dataset = load_dataset("json", data_files=data_path)
     else:
-        raw_dataset = load_dataset(data_path)
+        try:
+            raw_dataset = load_dataset(data_path)
+        except ValueError as e:
+            if "load_from_disk" in str(e):
+                raw_dataset = load_from_disk(data_path)
+            else:
+                raise e
 
     if data_split:
         raw_dataset = raw_dataset[data_split]
