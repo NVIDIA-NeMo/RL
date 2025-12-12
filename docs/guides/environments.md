@@ -1,6 +1,6 @@
 # Environments for GRPO Training
 
-GRPO supports several examples of environments for different tasks. Each environment provides a standardized interface for reward computation and evaluation.
+GRPO includes multiple environments, each offering a standard interface for reward computation and evaluation.
 
 ## Math Environment
 
@@ -40,7 +40,7 @@ code_env = CodeEnvironment.remote(env_config)
 
 ### Configuration
 - `num_workers`: Number of parallel workers for code execution
-- `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn)
+- `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn).
 
 We are tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
 
@@ -51,13 +51,13 @@ The Code Jaccard Environment evaluates code (or text) responses by measuring Jac
 ### How It Works
 - Extracts the assistant’s response text from each conversation.
 - Computes a Jaccard similarity score between the response and ground truth:
-  - Tokenizes both texts (whitespace), computes intersection/union, then applies a length ratio penalty.
+  - Tokenizes both texts by whitespace, computes intersection/union, then applies a length ratio penalty.
   - Scores are in [0, 1]. Observations label responses as “aligned/misaligned” using a 0.5 threshold.
 - Returns:
-  - observations: environment feedback strings
-  - rewards: tensor of similarity scores
-  - terminateds: all ones (single-step episodes)
-  - answers: optional, the response text when requested
+  - observations: Environment feedback strings.
+  - rewards: Tensor of similarity scores.
+  - terminateds: All ones (single-step episodes).
+  - answers: The response text when requested (optional).
 
 ### Usage
 ```python
@@ -114,9 +114,9 @@ reward_env = RewardModelEnvironment.remote(env_config)
 
 In GRPO training, resources are allocated across three main components:
 
-- **Policy Actor**: The trained model
+- **Policy Actor**: The trained model.
 - **Generation Actor**: Used for generating responses during rollouts (can be colocated with policy or on separate nodes/GPUs).
-- **Reward Model Environment Actor**: Evaluates generated responses and computes rewards
+- **Reward Model Environment Actor**: Evaluates generated responses and computes rewards.
 
 The resource allocation logic works as follows:
 
@@ -128,10 +128,10 @@ The resource allocation logic works as follows:
     2. Policy and generation non-colocated: 8 GPUs total = 2 for policy + 2 for generation + 4 for reward model
 
 #### Multi-Node Setup (`num_nodes > 1`)
-- Policy training, generation, and reward model environment can be distributed across different nodes
-- Reward model gets dedicated resources as specified in `env.reward_model.resources`
-- Generation gets dedicated resources as specified in `policy.generation.colocated.resources`
-- Remaining nodes are allocated to policy training
+- Policy training, generation, and reward model environment can be distributed across different nodes.
+- Reward model gets dedicated resources as specified in `env.reward_model.resources`.
+- Generation gets dedicated resources as specified in `policy.generation.colocated.resources`.
+- Remaining nodes are allocated to policy training.
 
 In the future, the resource control part will be refactored to enable fine-grained resource configuration for each actor. For detailed resource management and optimization strategies, see [#1100](https://github.com/NVIDIA-NeMo/RL/issues/1100).
 

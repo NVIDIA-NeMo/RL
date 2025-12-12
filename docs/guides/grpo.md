@@ -1,4 +1,4 @@
-# An in-depth Walkthrough of GRPO in NeMo RL
+# An In-depth Walkthrough of GRPO in NeMo RL
 
 This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We walk through data handling, policy model training, fast generation, and the GRPO loss function.
 
@@ -21,7 +21,7 @@ In this guide, we'll walk through how we handle:
 * Data
 * Model training
 * Fast generation
-* Overall Resource Flow
+* Overall resource flow
 * Loss
 
 ### Data
@@ -40,7 +40,7 @@ To support this, we need to know:
 
 By default, NeMo RL has support for [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) and [DeepScaler](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
   dataset_name: ResponseDataset
@@ -89,7 +89,7 @@ We have an example of this as `math_data_processor` in [processors.py](../../nem
 
 - task_name (unique task identifier):
   - Determines which processor, env, prompts, and dataset to use for this task.
-  - Currently we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in config (i.e., config.data.dataset_name).
+  - Currently, we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in config (i.e., config.data.dataset_name).
 - task_spec (TaskDataSpec):
   - Specifies per-task system prompt and prompt (with defaults applied from a global spec when unspecified).
 - task_data_processors:
@@ -205,7 +205,7 @@ val_task_to_env = task_to_env  # validation usually mirrors training mapping
 
 We define a {py:class}`~nemo_rl.models.policy.interfaces.PolicyInterface` that contains everything you need to train a Policy model.
 
-This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
+This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
 ## Fast Generation
 
@@ -243,8 +243,8 @@ L(\theta) = E_t \Big[ \max \Big( \min \big(r_t(\theta) A_t, \text{clip}(r_t(\the
 $$
 
 where:
-- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set as 3 empirically
-- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed
+- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
+- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
 
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
@@ -346,7 +346,7 @@ This feature is controlled by the following metrics:
 * `js_divergence_error` or (Jensen–Shannon divergence): $(D_{\text{KL}}(P_{policy} || P_{m}) + D_{\text{KL}}(P_{gen} || P_{m})) / 2$, where $P_{m} = (P_{policy} + P_{gen}) / 2$
   - uses the mean mixture distribution as reference
 
-According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is bigger for low-probability tokens as predicted by the generation inference engine (like vLLM).
+According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is larger for low-probability tokens as predicted by the generation inference engine (like vLLM).
 
 The three divergence metrics provide complementary perspectives on distribution mismatch. For example:
 
@@ -382,9 +382,9 @@ $$
 E_{s \sim \pi_{\text{inference}}(x)}[-\frac{\pi_{\text{training}}(x)}{\pi_{\text{inference}}(x)}log(\pi_{\text{training}}(x))]
 $$
 
-This expectation is estimated using the rollouts in each global training batch as Monte Carlo samples. The ratio of $\pi$ values in the formula serves to importance-correct for the mismatch between the training policy during a single GRPO step and the inference-time policy used to sample states.
+This expectation is estimated using the rollouts in each global training batch as Monte Carlo samples. The ratio of $\pi$ values in the formula serves to apply importance correction for the mismatch between the training policy during a single GRPO step and the inference-time policy used to sample states.
 
-We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo RL).
+We use this to track if our models are experiencing entropy collapse too quickly during training (as is quite common). This is a fairly rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (work-in-progress efficient calculation in NeMo RL).
 
 
 
