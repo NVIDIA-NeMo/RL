@@ -22,7 +22,7 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class GeneralConversationsJsonlDataset:
-	"""Loads general conversation datasets that have the json (manifest) files and media files in separate files (jsonl datasets).
+    """Loads general conversation datasets that have the json (manifest) files and media files in separate files (jsonl datasets).
     Each sample can be single/multi-turn converstaions with multiple modalities.
     Each modality can have one or more number of media objects.
     There is no requiement of where the media tag (e.g. '<sound>') should appear in the conversations.
