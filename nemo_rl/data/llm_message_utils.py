@@ -17,8 +17,6 @@ from typing import Any, Optional, Union, cast
 
 import torch
 from datasets import Dataset
-from transformers.audio_utils import load_audio
-from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
@@ -31,7 +29,7 @@ from nemo_rl.data.multimodal_utils import (
     get_dim_to_pack_along,
     load_media_from_message,
     get_multimodal_keys_from_processor,
-    get_multimodal_default_settings_from_processor,s
+    get_multimodal_default_settings_from_processor,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
