@@ -203,11 +203,11 @@ policy:
       kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
+      tool_parser_plugin: ???
       http_server_serving_chat_kwargs:
         # Workplace assistant uses 26 tools, so we enable auto_tools.
         # For Nemotron Nano v2, we use the dedicated `nemotron_json` tool parser
         enable_auto_tools: true
-        tool_parser_plugin: ???
         tool_parser: nemotron_json
     vllm_kwargs:
       compilation_config:
