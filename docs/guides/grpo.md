@@ -1,10 +1,10 @@
-# An in-depth Walkthrough of GRPO in NeMo RL
+# An In-depth Walkthrough of GRPO in NeMo RL
 
-This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We'll walk through essential aspects including data handling, policy model training, fast generation, and the specifics of the GRPO loss function and its enhancements.
+This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We walk through data handling, policy model training, fast generation, and the GRPO loss function.
 
 ## Quickstart: Launch a GRPO Run
 
-To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or via Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
+To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
 We recommend launching the job using `uv`:
 
@@ -12,16 +12,16 @@ We recommend launching the job using `uv`:
 uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
 ```
 
-If not specified, `config` will default to [examples/configs/grpo.yaml](../../examples/configs/grpo_math_1B.yaml).
+If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
-**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 In this guide, we'll walk through how we handle:
 
 * Data
 * Model training
 * Fast generation
-* Overall Resource Flow
+* Overall resource flow
 * Loss
 
 ### Data
@@ -40,7 +40,7 @@ To support this, we need to know:
 
 By default, NeMo RL has support for [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) and [DeepScaler](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
   dataset_name: ResponseDataset
@@ -75,7 +75,7 @@ For each task, you should provide a data processor that reads from your dataset 
 
 ```python
 def my_data_processor(
-    datum_dict: dict[str, Any], # loaded directly from your dataset (i.e. single line of jsonl data)
+    datum_dict: dict[str, Any], # loaded directly from your dataset (that is, a single line of JSONL data)
     task_data_spec: TaskDataSpec,
     tokenizer,
     max_seq_length: int,
@@ -84,6 +84,37 @@ def my_data_processor(
 ```
 
 We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py).
+
+### Task–Dataset Mapping
+
+- task_name (unique task identifier):
+  - Determines which processor, env, prompts, and dataset to use for this task.
+  - Currently, we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in config (i.e., config.data.dataset_name).
+- task_spec (TaskDataSpec):
+  - Specifies per-task system prompt and prompt (with defaults applied from a global spec when unspecified).
+- task_data_processors:
+  - Dict mapping: task_name -> (task_spec, processor_fn).
+  - Typical flow: provide a default mapping using defaultdict, then explicitly register the dataset-provided processor under the resolved task_name.
+
+Example (simplified):
+
+```python
+default_task_spec = TaskDataSpec(
+    task_name="math_default",
+    prompt_file=data_config["prompt_file"],
+    system_prompt_file=data_config["system_prompt_file"],
+)
+
+task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
+    lambda: (default_task_spec, math_hf_data_processor)
+)
+
+# Resolve task_name from dataset or spec
+task_spec = data.task_spec
+task_name = data.task_name
+assert hasattr(data, "processor"), "Dataset must have a processor attribute"
+task_data_processors[task_name] = (task_spec, data.processor)
+```
 
 #### Putting It All Together
 
@@ -96,20 +127,50 @@ GRPO expects datasets to have the following form:
 Then, you can set the data up as follows:
 
 ```python
-base_dataset = load_dataset("json", data_files=data_config["dataset_name"])["train"]
-tokenizer = get_tokenizer(tokenizer_config)
 
-task_data_processors = defaultdict(lambda: (math_task_spec, math_data_processor))
-task_data_processors["math"] = (math_task_spec, math_data_processor)
+# 1) Select environment from data config
+env_name = data_config["env_name"]
+env = create_env(env_name=env_name, env_configs=env_configs)
 
-math_env = MathEnvironment.remote(env_configs["math"]) # ray remote actor
+# 2) Build default TaskDataSpec from config (prompts loaded from files if present)
+default_task_spec = TaskDataSpec(
+    task_name="math_default",
+    prompt_file=data_config["prompt_file"],
+    system_prompt_file=data_config["system_prompt_file"],
+)
 
+# 3) Define default processor mapping
+task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
+    lambda: (default_task_spec, math_hf_data_processor)
+)
+
+# 4) Load dataset using the helper (built-ins or local/HF datasets)
+data = load_response_dataset(data_config, seed)
+
+# 5) Resolve task spec/name and ensure dataset provides a processor
+task_spec = data.task_spec
+task_name = data.task_name
+assert hasattr(data, "processor"), "Dataset must have a processor attribute"
+task_data_processors[task_name] = (task_spec, data.processor)
+
+# 6) Construct processed datasets (train and optional validation)
 dataset = AllTaskProcessedDataset(
-    base_dataset,
+    data.formatted_ds["train"],
     tokenizer,
-    math_task_spec,
+    default_task_spec,
     task_data_processors,
     max_seq_length=data_config["max_input_seq_length"],
+)
+val_dataset = (
+    AllTaskProcessedDataset(
+        data.formatted_ds["validation"],
+        tokenizer,
+        default_task_spec,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+    if data.formatted_ds["validation"]
+    else None
 )
 ```
 
@@ -121,11 +182,30 @@ GRPO supports various types of environments for different tasks, including **[Ma
 
 For more information about environments, see the [Environments Guide](environments.md).
 
+### Env–Task Mapping
+
+- env:
+  - The environment actor for reward/evaluation, constructed using `create_env(env_name=..., env_configs=...)`.
+  - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
+- task_to_env:
+  - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
+
+Example (simplified):
+
+```python
+env_name = data_config["env_name"]  # declared under config.data
+env = create_env(env_name=env_name, env_configs=env_configs)
+
+task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: env)
+task_to_env[task_name] = env
+val_task_to_env = task_to_env  # validation usually mirrors training mapping
+```
+
 ## Policy Model
 
-We define a {py:class}`PolicyInterface]() <nemo_rl.models.interfaces>` that contains everything you need to train a Policy model.
+We define a {py:class}`~nemo_rl.models.policy.interfaces.PolicyInterface` that contains everything you need to train a Policy model.
 
-This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
+This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
 ## Fast Generation
 
@@ -153,7 +233,7 @@ where:
 - $\beta$ is the KL penalty coefficient
 - $\pi_{\text{ref}}$ is the reference policy
 
-It also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
+It also supports "Dual-Clipping" from [Ye et al. (2019)](https://arxiv.org/pdf/1912.09729), which
 imposes an additional upper bound on the probability ratio when advantages are negative.
 This prevents excessive policy updates. $rA \ll 0$ -> $cA$(clipped).
 The loss function is modified to the following when A_t < 0:
@@ -163,8 +243,8 @@ L(\theta) = E_t \Big[ \max \Big( \min \big(r_t(\theta) A_t, \text{clip}(r_t(\the
 $$
 
 where:
-- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set as 3 empirically
-- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed
+- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
+- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
 
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
@@ -266,7 +346,7 @@ This feature is controlled by the following metrics:
 * `js_divergence_error` or (Jensen–Shannon divergence): $(D_{\text{KL}}(P_{policy} || P_{m}) + D_{\text{KL}}(P_{gen} || P_{m})) / 2$, where $P_{m} = (P_{policy} + P_{gen}) / 2$
   - uses the mean mixture distribution as reference
 
-According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is bigger for low-probability tokens as predicted by the generation inference engine (like vLLM).
+According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is larger for low-probability tokens as predicted by the generation inference engine (like vLLM).
 
 The three divergence metrics provide complementary perspectives on distribution mismatch. For example:
 
@@ -302,9 +382,9 @@ $$
 E_{s \sim \pi_{\text{inference}}(x)}[-\frac{\pi_{\text{training}}(x)}{\pi_{\text{inference}}(x)}log(\pi_{\text{training}}(x))]
 $$
 
-This expectation is estimated using the rollouts in each global training batch as Monte Carlo samples. The ratio of $\pi$ values in the formula serves to importance-correct for the mismatch between the training policy during a single GRPO step and the inference-time policy used to sample states.
+This expectation is estimated using the rollouts in each global training batch as Monte Carlo samples. The ratio of $\pi$ values in the formula serves to apply importance correction for the mismatch between the training policy during a single GRPO step and the inference-time policy used to sample states.
 
-We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo RL).
+We use this to track if our models are experiencing entropy collapse too quickly during training (as is quite common). This is a fairly rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (work-in-progress efficient calculation in NeMo RL).
 
 
 
