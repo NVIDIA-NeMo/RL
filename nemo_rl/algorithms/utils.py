@@ -330,7 +330,7 @@ def get_tokenizer(
                 processor.feature_extractor.sampling_rate = new_sampling_rate
         if hasattr(processor, "video_processor") and "video" in tokenizer_config:
             if "fps" in tokenizer_config["video"] and \
-                tokenizer_config["video"]["fps"] is != processor.video_processor.fps:
+                tokenizer_config["video"]["fps"] != processor.video_processor.fps:
                 # override the video loading fps
                 new_fps = tokenizer_config["video"]["fps"]
                 warnings.warn(
@@ -339,7 +339,7 @@ def get_tokenizer(
                 processor.video_processor.fps = new_fps
             # fps and num_frames cannot co-exist, but let it crash later
             if "num_frames" in tokenizer_config["video"] and \
-                tokenizer_config["video"]["num_frames"] != tokenizer_config["num_frames"]:
+                tokenizer_config["video"]["num_frames"] != processor.video_processor.num_frames:
                 new_num_frames = tokenizer_config["video"]["num_frames"]
                 warnings.warn(
                     f"Overriding video num_frames from {processor.video_processor.num_frames} to {new_num_frames}"

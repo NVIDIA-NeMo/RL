@@ -277,10 +277,11 @@ def load_media_from_message(
         multimodal_load_kwargs = get_multimodal_default_settings_from_processor(processor)
 
     if "image" in media_in_message:
-        loaded_media["images"] += [Image.open(img) if isinstance(img, str) else img for img in media_in_message["image"]]
+        loaded_media["image"] += [Image.open(img) if isinstance(img, str) else img for img in media_in_message["image"]]
     if "audio" in media_in_message:
         for aud in media_in_message["audio"]:
             if isinstance(aud, str):
+                print(multimodal_load_kwargs)
                 assert "audio" in multimodal_load_kwargs and "sampling_rate"  in multimodal_load_kwargs["audio"]
                 try:
                     loaded_media["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
@@ -295,8 +296,8 @@ def load_media_from_message(
             if isinstance(vid, str):
                 load_video_kwargs = multimodal_load_kwargs["video"] if "video" in multimodal_load_kwargs else {}
                 # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
-                loaded_media["videos"].append(load_video(vid, backend="decord", **load_video_kwargs)[0])
+                loaded_media["video"].append(load_video(vid, backend="decord", **load_video_kwargs)[0])
             else:
-                loaded_media["videos"].append(vid)
+                loaded_media["video"].append(vid)
 
     return loaded_media
