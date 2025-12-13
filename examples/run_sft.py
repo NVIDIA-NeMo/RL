@@ -110,13 +110,17 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     )
 
     # add preprocessor if needed
-    datum_preprocessor = None
+    datum_preprocessor_train = None
+    datum_preprocessor_val = None
     if "dataset_name" in data_config and data_config["dataset_name"] == "clevr_cogent":
         from nemo_rl.data.datasets.response_datasets.clevr import (
             format_clevr_cogent_dataset,
         )
 
-        datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
+        datum_preprocessor_train = datum_preprocessor_val = partial(format_clevr_cogent_dataset, return_pil=True)
+    elif hasattr(data, "datum_preprocessor"):
+        datum_preprocessor_train = data.datum_preprocessor["train"]
+        datum_preprocessor_val = data.datum_preprocessor["val"]
 
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
@@ -127,7 +131,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor,
+            datum_preprocessor=datum_preprocessor_train,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -141,7 +145,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
             add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor,
+            datum_preprocessor=datum_preprocessor_val,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
