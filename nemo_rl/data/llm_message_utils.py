@@ -13,9 +13,6 @@
 # limitations under the License.
 import warnings
 import time
-import decord
-from PIL import Image
-from collections import defaultdict
 from typing import Any, Optional, Union, cast
 
 import torch
@@ -31,10 +28,10 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
-    media_tags,
     get_dim_to_pack_along,
+    load_media_from_message,
     get_multimodal_keys_from_processor,
-    get_multimodal_default_settings_from_processor,
+    get_multimodal_default_settings_from_processor,s
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -431,25 +428,6 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
-def get_media_from_message(message: dict[str, Any]) -> list[Any]:
-    """Get all media from a message log item."""
-    # Handle None or missing content (e.g., assistant messages with only tool_calls)
-    if message.get("content") is None:
-        return []
-    # Handle string content (no images)
-    if isinstance(message["content"], str):
-        return []
-    # iterate over the content list
-    media = defaultdict(list)
-    for item in message["content"]:
-        tag = item["type"]
-        if tag in media_tags:
-            media[tag].extend(list(item[tag])) if isinstance(
-                item[tag], (list, tuple)
-            ) else media[tag].append(item[tag])
-    return media
-
-
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -617,7 +595,9 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        media_cur_message = get_media_from_message(message)
+        start = time.time()
+        media_cur_message = load_media_from_message(message, multimodal_load_kwargs=multimodal_load_kwargs)
+        print(f"Media loading took {time.time() - start} seconds")
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
@@ -627,32 +607,14 @@ def get_formatted_message_log(
             )["input_ids"][0]
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
-            media_kwargs = defaultdict(list)
-            use_audio_in_video = False
-            start = time.time()
+            media_kwargs = {}
             if "image" in media_cur_message:
-                media_kwargs["images"] += [Image.open(img) if isinstance(img, str) else img for img in media_cur_message["image"]]
+                media_kwargs["images"] = media_cur_message["image"]
             if "audio" in media_cur_message:
-                for aud in media_cur_message["audio"]:
-                    if isinstance(aud, str):
-                        try:
-                            media_kwargs["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
-                        except:
-                            # use decord
-                            loaded_audio = decord.AudioReader(aud, sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"], mono=True)
-                            media_kwargs["audio"].append(loaded_audio[:].asnumpy()[get_dim_to_pack_along(tokenizer, key)])
-                    else:
-                        media_kwargs["audio"].append(aud)
+                media_kwargs["audio"] = media_cur_message["audio"]
             if "video" in media_cur_message:
-                for vid in media_cur_message["video"]:
-                    if isinstance(vid, str):
-                        # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
-                        print(f"multimodal_load_kwargs: {multimodal_load_kwargs}")
-                        media_kwargs["videos"].append(load_video(vid, backend="decord", **multimodal_load_kwargs["video"])[0])
-                    else:
-                        media_kwargs["videos"].append(vid)
+                media_kwargs["videos"] = media_cur_message["video"]
 
-            print(f"Media loading took {time.time() - start} seconds")
             processed_chunk = tokenizer(
                 text=[message_chunk],
                 return_tensors="pt",
