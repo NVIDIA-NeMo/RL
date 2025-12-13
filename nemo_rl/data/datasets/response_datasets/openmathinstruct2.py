@@ -17,11 +17,13 @@ from typing import Any, Optional
 
 from datasets import Dataset, load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 def format_math(
-    data: dict[str, str | float | int], output_key: str = "expected_answer"
+    data: dict[str, str | float | int],
+    output_key: str = "expected_answer",
+    task_name: str = "OpenMathInstruct-2",
 ) -> dict[str, list[Any] | str]:
     return {
         "messages": [
@@ -34,8 +36,7 @@ def format_math(
                 "content": data[output_key],
             },
         ],
-        # For v0.1 release, nemo rl datasets require a task_name key such that user can map a task processor per unique task.
-        "task_name": "math",
+        "task_name": task_name,
     }
 
 
@@ -44,6 +45,7 @@ def prepare_openinstructmath2_dataset(
     seed: int = 42,
     test_size: float = 0.05,
     output_key: str = "expected_answer",
+    task_name: str = "OpenMathInstruct-2",
 ) -> dict[str, Dataset | None]:
     """Load and split the OpenMathInstruct-2 dataset into train and validation sets using HF's train_test_split."""
     print(
@@ -60,12 +62,12 @@ def prepare_openinstructmath2_dataset(
     train_formatted = split_ds["train"].map(
         format_math,
         remove_columns=split_ds["train"].column_names,
-        fn_kwargs={"output_key": output_key},
+        fn_kwargs={"output_key": output_key, "task_name": task_name},
     )
     val_formatted = split_ds["test"].map(
         format_math,
         remove_columns=split_ds["test"].column_names,
-        fn_kwargs={"output_key": output_key},
+        fn_kwargs={"output_key": output_key, "task_name": task_name},
     )
 
     return {
@@ -74,7 +76,7 @@ def prepare_openinstructmath2_dataset(
     }
 
 
-class OpenMathInstruct2Dataset:
+class OpenMathInstruct2Dataset(RawDataset):
     def __init__(
         self,
         split: str = "train_1M",
@@ -95,11 +97,11 @@ class OpenMathInstruct2Dataset:
                 f"Invalid split: {split}. Please use 'train', 'train_1M', 'train_2M', or 'train_5M'."
             )
 
+        self.task_name = "OpenMathInstruct-2"
         self.formatted_ds = prepare_openinstructmath2_dataset(
-            split=split, seed=seed, test_size=test_size, output_key=output_key
-        )
-
-        self.task_spec = TaskDataSpec(
-            task_name="OpenMathInstruct-2",
-            prompt_file=prompt_file,
+            split=split,
+            seed=seed,
+            test_size=test_size,
+            output_key=output_key,
+            task_name=self.task_name,
         )

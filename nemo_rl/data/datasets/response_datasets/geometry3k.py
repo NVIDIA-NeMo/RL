@@ -15,8 +15,8 @@ from typing import Any, Optional
 
 from datasets import load_dataset
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import pil_to_base64
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
 def format_geometry3k_dataset(
@@ -75,7 +75,7 @@ def prepare_geometry3k_dataset(split: str = "train", task_name: str = "geometry3
     }
 
 
-class Geometry3KDataset:
+class Geometry3KDataset(RawDataset):
     def __init__(
         self,
         split: str = "train",
@@ -94,8 +94,4 @@ class Geometry3KDataset:
 
         self.formatted_ds = prepare_geometry3k_dataset(
             split=split, task_name=self.task_name
-        )
-        self.task_spec = TaskDataSpec(
-            task_name="Geometry3K",
-            prompt_file=prompt_file,
         )

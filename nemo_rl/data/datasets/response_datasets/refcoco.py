@@ -23,8 +23,8 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm  # Using tqdm for progress bar, install with: pip install tqdm
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import pil_to_base64
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
 def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
@@ -231,7 +231,7 @@ def prepare_refcoco_dataset(
     }
 
 
-class RefCOCODataset:
+class RefCOCODataset(RawDataset):
     def __init__(
         self,
         split: str = "default",
@@ -255,8 +255,4 @@ class RefCOCODataset:
             split=split,
             task_name=self.task_name,
             path_to_coco_images=download_dir,
-        )
-        self.task_spec = TaskDataSpec(
-            task_name="RefCOCO",
-            prompt_file=prompt_file,
         )

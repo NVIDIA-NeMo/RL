@@ -20,7 +20,7 @@ import random
 
 import requests
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 SYSTEM_PROMPT = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n"
 
@@ -67,7 +67,7 @@ def parse_conversations(tree_obj, first: bool = False):
     return all_conversations
 
 
-def get_data_records(objs):
+def get_data_records(objs, task_name: str = "OASST"):
     ## TODO: old format was multi-conversation per example, but ours is single conversation
     ## is this just because of the input data format?
     output = []
@@ -81,6 +81,7 @@ def get_data_records(objs):
 
             conversation_obj = {
                 "messages": conversations,
+                "task_name": task_name,
             }
             output.append(conversation_obj)
     return output
@@ -89,6 +90,7 @@ def get_data_records(objs):
 def download_and_process_oasst(
     output_directory: str = ".",
     seed: int = 42,
+    task_name: str = "OASST",
     split_ratio: float = 0.95,
 ) -> dict[str, list]:
     os.makedirs(output_directory, exist_ok=True)
@@ -111,8 +113,8 @@ def download_and_process_oasst(
     train_num = int(len(all_objs) * split_ratio)
     train_objs = all_objs[:train_num]
     val_objs = all_objs[train_num:]
-    train_records = get_data_records(train_objs)
-    val_records = get_data_records(val_objs)
+    train_records = get_data_records(train_objs, task_name=task_name)
+    val_records = get_data_records(val_objs, task_name=task_name)
 
     formatted_ds = {
         "train": train_records,
@@ -122,9 +124,9 @@ def download_and_process_oasst(
     return formatted_ds
 
 
-class OasstDataset:
+class OasstDataset(RawDataset):
     def __init__(self, output_dir: str = ".", seed: int = 42) -> None:
-        self.formatted_ds = download_and_process_oasst(output_dir, seed)
-        self.task_spec = TaskDataSpec(
-            task_name="OASST",
+        self.task_name = "OASST"
+        self.formatted_ds = download_and_process_oasst(
+            output_dir, seed, task_name=self.task_name
         )

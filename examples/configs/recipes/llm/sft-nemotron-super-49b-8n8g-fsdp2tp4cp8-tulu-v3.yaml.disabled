@@ -1,0 +1,64 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 50
+  val_period: 5
+  val_global_batch_size: 128
+
+checkpointing:
+  checkpoint_dir: results/sft_nemotron_super_49b
+  metric_name: val:loss
+  keep_top_k: 100
+  save_period: 500
+
+policy:
+  model_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 
+  max_total_sequence_length: 32768
+  train_global_batch_size: 128
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: true
+    context_parallel_size: 8
+    tensor_parallel_size: 4
+    custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
+  dynamic_batching:
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 8192
+  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size},
+    2}, ${policy.max_total_sequence_length}}
+  max_grad_norm: null
+  optimizer:
+    kwargs:
+      lr: 1.0e-05
+      weight_decay: 0.01
+      eps: 1.0e-08
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.CosineAnnealingLR
+    kwargs:
+      T_max: 40
+      eta_min: 2.0e-06
+  - milestones:
+    - 10
+data:
+  dataset_name: tulu3_sft_mixture
+  num_workers: 20
+  test_size: 0.05
+logger:
+  tensorboard_enabled: false
+  monitor_gpus: false
+  num_val_samples_to_print: 0
+  wandb:
+    project: nemotron-tulu-3-sft
+    name: nemotron-tulu-3
+  tensorboard:
+    log_dir: tb_logs-nemotron-tulu-3-sft
+  mlflow:
+    experiment_name: nemotron-tulu-3-sft
+    run_name: nemotron-tulu-3-sft
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

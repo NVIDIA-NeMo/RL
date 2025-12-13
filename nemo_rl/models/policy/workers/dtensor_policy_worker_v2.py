@@ -25,6 +25,7 @@ import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 from accelerate import init_empty_weights
+from hydra.utils import get_class
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
@@ -86,7 +87,6 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
-    import_class_from_path,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -443,7 +443,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         if init_optimizer:
-            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
                 self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
             )
@@ -452,9 +452,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         if "scheduler" in self.cfg and self.optimizer is not None:
             if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = import_class_from_path(
-                    cast(str, self.cfg["scheduler"]["name"])
-                )
+                scheduler_cls = get_class(cast(str, self.cfg["scheduler"]["name"]))
                 self.scheduler = scheduler_cls(
                     self.optimizer, **self.cfg["scheduler"]["kwargs"]
                 )
@@ -463,7 +461,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for scheduler_cfg in self.cfg["scheduler"]:
                     if "name" in scheduler_cfg:
                         schedulers.append(
-                            import_class_from_path(scheduler_cfg["name"])(
+                            get_class(scheduler_cfg["name"])(
                                 self.optimizer, **scheduler_cfg["kwargs"]
                             )
                         )
