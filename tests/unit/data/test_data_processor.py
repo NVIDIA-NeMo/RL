@@ -37,7 +37,11 @@ from nemo_rl.data.datasets.response_datasets import (
     OpenMathInstruct2Dataset,
 )
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
-from nemo_rl.data.processors import math_data_processor, math_hf_data_processor
+from nemo_rl.data.processors import (
+    helpsteer3_data_processor,
+    math_data_processor,
+    math_hf_data_processor,
+)
 from nemo_rl.models.policy import TokenizerConfig
 
 
@@ -120,7 +124,7 @@ def test_math_data_processor():
 def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     # Initialize dataset
     data = dataset_cls()
-
+    task_name = data.task_name
     # Setup tokenizer
     tokenizer = get_tokenizer(
         TokenizerConfig(
@@ -131,7 +135,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
 
     # Configure task specification
     math_task_spec = TaskDataSpec(
-        task_name="math",
+        task_name=task_name,
         prompt_file=f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
         system_prompt_file=None,
     )
@@ -139,7 +143,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
+    task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         dataset=data.formatted_ds["train"],
@@ -251,3 +255,56 @@ def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_
     assert first_item is not None
     assert "message_log" in first_item
     assert len(first_item["message_log"]) > 0
+
+
+def test_helpsteer3_data_processor():
+    tokenizer = DummyTokenizer()
+    task_data_spec = TaskDataSpec(
+        task_name="helpsteer3",
+        prompt_file=None,
+        system_prompt_file=None,
+    )
+    datum_dict = {
+        "context": [
+            {"role": "user", "content": "Hello"},
+        ],
+        "response": [
+            {"role": "assistant", "content": "Hi"},
+            {"role": "assistant", "content": "there"},
+        ],
+        "task_name": "helpsteer3",
+    }
+
+    out = helpsteer3_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=task_data_spec,
+        tokenizer=tokenizer,
+        max_seq_length=4096,
+        idx=7,
+    )
+
+    # Basic structure
+    assert isinstance(out, dict)
+    assert out["idx"] == 7
+    assert out.get("task_name") == "helpsteer3"
+    assert "message_log" in out and isinstance(out["message_log"], list)
+    assert "extra_env_info" in out and "ground_truth" in out["extra_env_info"]
+    assert isinstance(out["length"], int)
+    assert out["loss_multiplier"] == 1.0
+
+    # Ground truth should be space-joined assistant responses
+    assert out["extra_env_info"]["ground_truth"] == "Hi there"
+
+    # Tokenization behavior: only first message has non-empty token_ids
+    msg_log = out["message_log"]
+    assert len(msg_log) >= 1
+    assert "token_ids" in msg_log[0] and isinstance(
+        msg_log[0]["token_ids"], torch.Tensor
+    )
+
+    for m in msg_log[1:]:
+        assert "token_ids" in m and isinstance(m["token_ids"], torch.Tensor)
+        assert int(m["token_ids"].numel()) == 0
+
+    # Length equals sum of token lengths
+    assert out["length"] == sum(int(m["token_ids"].numel()) for m in msg_log)

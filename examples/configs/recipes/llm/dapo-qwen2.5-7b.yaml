@@ -85,8 +85,6 @@ data:
   prompt_file: null
   dataset_name: DAPOMath17K
 env:
-  dapo:
-    num_workers: 16
   math:
     num_workers: 16
     math_verify_impl: "dapo_math_verify"

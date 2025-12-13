@@ -1,9 +1,12 @@
 # GRPO Algorithm Configuration
 defaults: "grpo_math_1B.yaml"
 
+data:
+  env_name: "reward_model"
+
 env:
   reward_model:  
-    enabled: true
+    processor: "math_hf_data_processor"
     model_name: "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
     tokenizer:
       name: ${env.reward_model.model_name}
@@ -11,6 +14,7 @@ env:
     batch_size: ${policy.train_micro_batch_size}
     checkpoint_path: null
     max_model_len: 2048
+    offload_optimizer_for_logprob: false
     resources:
       gpus_per_node: 1
       num_nodes: 1
