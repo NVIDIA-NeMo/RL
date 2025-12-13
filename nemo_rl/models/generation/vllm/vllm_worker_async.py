@@ -112,9 +112,9 @@ Template prefix token IDs (everything before the final assistant message): {temp
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
 
-Template prefix (detokenized): {tokenizer.decode(template_prefix_token_ids)}
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
 
-Template (detokenized): {tokenizer.decode(template_token_ids)}
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
 """
 
     # We take everything starting with the EOS token ID.
