@@ -111,22 +111,30 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
+        nemo_gym_num_rows = len(nemo_gym_examples)
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
 
         timer.start("_run_rollouts_total")
+        nemo_rl_rowidxs = []
         nemo_rl_results = []
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
-                nemo_gym_result = await task
+                nemo_gym_row, nemo_gym_result = await task
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                     nemo_gym_result, tokenizer
                 )
 
+            nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
             nemo_rl_results.append(nemo_rl_result)
+
+        nemo_rl_sort_results = [None] * nemo_gym_num_rows
+        for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
+            nemo_rl_sort_results[rowidx] = result
+        nemo_rl_results = nemo_rl_sort_results
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
