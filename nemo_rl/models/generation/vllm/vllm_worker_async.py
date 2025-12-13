@@ -106,6 +106,17 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
+    # Assert here to prepare for the logic below
+    assert len(template_token_ids) > len(template_prefix_token_ids), f"""Found possibly non-monotonically increasing trajectory!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix (detokenized): {tokenizer.decode(template_prefix_token_ids)}
+
+Template (detokenized): {tokenizer.decode(template_token_ids)}
+"""
+
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
     for pos in reversed(range(len(template_prefix_token_ids))):
