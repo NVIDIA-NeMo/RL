@@ -207,6 +207,9 @@ logger:
   wandb:
     project: "dpo-dev"
     name: "dpo"
+  swanlab:
+    project: "dpo-dev"
+    name: "dpo"
   tensorboard:
     log_dir: "tb_logs-dpo-dev"
   mlflow:
