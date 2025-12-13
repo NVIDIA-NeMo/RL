@@ -67,6 +67,21 @@ class PackedTensor:
         # this is the number of tensors in this data wrapper
         return len(self.tensors)
 
+    def get_sizes_along_pack_dim(self) -> list[int]:
+        """Return the size of each tensor along the pack dimension.
+        
+        This is useful for VLM models that need to know how many image tiles
+        correspond to each sample in a batch (e.g., Nemotron VL's `num_image_tiles`).
+        
+        Returns:
+            List of integers, where each entry is the size of the corresponding
+            tensor along `dim_to_pack`. Returns 0 for None entries.
+        """
+        return [
+            t.shape[self.dim_to_pack] if t is not None else 0
+            for t in self.tensors
+        ]
+
     def to(self, device: str | torch.device) -> "PackedTensor":
         self.tensors = [
             item.to(device) if item is not None else None for item in self.tensors
