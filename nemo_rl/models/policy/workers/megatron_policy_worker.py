@@ -1351,16 +1351,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     num_image_tiles, dtype=torch.int32, device=input_ids.device
                 )
 
-            # Detect image token ID from input for VLM models
+            # Get image_token_index from the model for VLM models
             image_token_index = None
-            for candidate_idx in [131072, 151655, 151859, -200]:  # Common image token IDs
-                img_mask = (input_ids == candidate_idx)
-                img_count = img_mask.sum().item()
-                if img_count > 0:
-                    image_token_index = candidate_idx
-                    break
+            try:
+                inner_model = model
+                while hasattr(inner_model, 'module'):
+                    inner_model = inner_model.module
+                if hasattr(inner_model, 'llava_model'):
+                    inner_model = inner_model.llava_model
+                if hasattr(inner_model, 'image_token_index'):
+                    image_token_index = inner_model.image_token_index
+            except Exception:
+                pass  # Model doesn't have image_token_index attribute
 
-            if image_token_index is not None:
+            if image_token_index is not None and (input_ids == image_token_index).sum().item() > 0:
                 # Pass the correct image_token_index to the model
                 multimodal_data["image_token_index"] = image_token_index
 
@@ -1379,7 +1383,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 **multimodal_data,
                 **additional_kwargs,
             )
-
             if type(output_tensor) == tuple:
                 output_tensor = output_tensor[0]
 
