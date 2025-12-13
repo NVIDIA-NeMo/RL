@@ -26,6 +26,7 @@ bridge_src_dir = "Megatron-Bridge/src/megatron/bridge"
 bridge_package_name = "megatron.bridge"
 
 CACHED_DEPENDENCIES = [
+    "transformers>=4.57.1",
     "datasets",
     "omegaconf>=2.3.0",
     "tensorboard>=2.19.0",
@@ -37,12 +38,15 @@ CACHED_DEPENDENCIES = [
     "pyyaml>=6.0.2",
     "tqdm>=4.67.1",
     "hydra-core>1.3,<=1.3.2",
-    "megatron-core[dev,mlm]>=0.15.0a0,<0.16.0",
+    "megatron-core[dev,mlm]>=0.15.0a0,<0.17.0",
     "qwen-vl-utils",
     "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
     "mamba-ssm",
     "nvidia-resiliency-ext",
     "causal-conv1d",
+    "flash-linear-attention",
+    "timm",
+    "open-clip-torch>=3.2.0",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject

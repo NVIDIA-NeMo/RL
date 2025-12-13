@@ -3,3 +3,5 @@ checkpointing:
   checkpoint_dir: results/clevr_grpo
 policy:
   max_total_sequence_length: 3072
+cluster:
+  gpus_per_node: 8
