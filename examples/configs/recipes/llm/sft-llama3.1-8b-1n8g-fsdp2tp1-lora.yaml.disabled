@@ -1,0 +1,41 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 350
+  val_period: 20
+  val_global_batch_size: 128
+  val_micro_batch_size: 2
+checkpointing:
+  checkpoint_dir: results/sft-tmblog-llama3.1-8b
+  save_period: 20
+policy:
+  model_name: meta-llama/Llama-3.1-8B
+  tokenizer:
+    name: meta-llama/Llama-3.1-8B-Instruct
+    chat_template: default
+  dtensor_cfg:
+    lora_cfg:
+      enabled: true
+      dim: 128
+      alpha: 128
+  train_global_batch_size: 128
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 2
+  optimizer:
+    kwargs:
+      lr: 2.0e-05
+      weight_decay: 0.01
+      eps: 1.0e-08
+data:
+  dataset_name: tulu3
+  add_generation_prompt: true
+  seed: 42
+logger:
+  log_dir: logs/sft-tmblog-llama3.1-8b
+  tensorboard_enabled: false
+  wandb:
+    project: nemo-rl
+    name: sft-tmblog-llama3.1-8b
+  tensorboard:
+    log_dir: tb_logs-sft-dev-tulu3
+cluster:
+  gpus_per_node: 8
