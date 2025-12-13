@@ -101,6 +101,7 @@ class MegatronConfigDisabled(TypedDict):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
+    converter_type: NotRequired[str | None]
     env_vars: NotRequired[dict[str, str] | None]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.

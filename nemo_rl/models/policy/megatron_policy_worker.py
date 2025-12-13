@@ -552,6 +552,29 @@ class MegatronPolicyWorker:
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
 
+        ######################################################################################################
+        # TODO(ahmadki): remove block once https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/1694 is merged
+        # Validation: Qwen3-Next checkpoints must have TP=1 due to megatron-bridge conversion bug
+        if (
+            "converter_type" in self.cfg["megatron_cfg"]
+            and self.cfg["megatron_cfg"]["converter_type"] == "Qwen3NextForCausalLM"
+        ):
+            checkpoint_tp_size = model_cfg.tensor_model_parallel_size
+            if checkpoint_tp_size != 1:
+                raise ValueError(
+                    f"megatron-bridge has a known bug when converting Qwen3-Next models with\n"
+                    f"tensor_model_parallel_size > 1. https://github.com/NVIDIA/Megatron-LM/issues/2624\n"
+                    f"While we try to convert Qwen3-Next models with TP=1, the loaded checkpoint has has\n"
+                    f"TP={checkpoint_tp_size}.\n"
+                    f"This usually happens when the checkpoint was manually converted with TP > 1.\n"
+                    f"To fix this issue delete the checkpoint directory: {pretrained_path} and\n"
+                    f"rerun your training script. The checkpoint will be automatically regenerated with TP=1.\n"
+                    f"Or convert the checkpoint manually with TP=1.\n"
+                    f"Note: Your model will still train with TP={self.cfg['megatron_cfg']['tensor_model_parallel_size']}.\n"
+                    f"      Only the checkpoint conversion is forced to TP=1.\n"
+                )
+        ######################################################################################################
+
         model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
             "tensor_model_parallel_size"
         ]

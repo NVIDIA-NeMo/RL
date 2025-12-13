@@ -37,6 +37,33 @@ def import_model_from_hf_name(
         hf_model_name, trust_remote_code=True, **config_overrides
     )
 
+    ######################################################################################################
+    # TODO(ahmadki): remove block once https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/1694 is merged
+    # megatron-bridge has a bug when converting Qwen3-Next models
+    # with tensor_model_parallel_size > 1. Force TP=1 during conversion.
+    if (
+        megatron_config is not None
+        and "converter_type" in megatron_config
+        and megatron_config["converter_type"] == "Qwen3NextForCausalLM"
+    ):
+        original_tp_size = megatron_config.get("tensor_model_parallel_size", 1)
+        if original_tp_size > 1:
+            print(
+                f"\n{'=' * 80}\n"
+                f"WARNING: megatron-bridge has a known bug when converting Qwen3-Next models with\n"
+                f"tensor_model_parallel_size > 1. https://github.com/NVIDIA/Megatron-LM/issues/2624\n"
+                f"The conversion will be forced to use TP=1.\n"
+                f"  Original TP setting: {original_tp_size}\n"
+                f"  Conversion TP (forced): 1\n"
+                f"  Training TP (will be used): {original_tp_size}\n"
+                f"Your model will train normally with TP={original_tp_size}.\n"
+                f"{'=' * 80}\n"
+            )
+            # Create a modified copy of megatron_config for conversion only
+            megatron_config = megatron_config.copy()
+            megatron_config["tensor_model_parallel_size"] = 1
+    ##################################################################################
+
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
     # Keep track of defaults so can restore them to the config after loading the model
