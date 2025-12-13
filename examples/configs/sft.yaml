@@ -203,6 +203,9 @@ logger:
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"
+  swanlab:
+    project: "sft-dev"
+    name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
   mlflow:

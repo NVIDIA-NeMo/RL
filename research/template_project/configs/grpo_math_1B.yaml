@@ -242,6 +242,9 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+  swanlab:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

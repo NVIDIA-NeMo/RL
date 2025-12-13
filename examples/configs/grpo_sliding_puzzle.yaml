@@ -68,6 +68,9 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-sliding_puzzle"
+  swanlab:
+    project: "grpo-dev"
+    name: "grpo-dev-sliding_puzzle"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

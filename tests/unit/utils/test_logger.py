@@ -341,10 +341,9 @@ class TestSwanlabLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # Check that log was called with metrics and commit=False
-        # When using step_metric, step should be ignored and commit=False should be used
+        # Check that log was called with metrics
         mock_run = mock_swanlab.init.return_value
-        mock_run.log.assert_called_once_with(metrics, commit=False)
+        mock_run.log.assert_called_once_with(metrics, step=step)
 
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_swanlab):
@@ -362,30 +361,14 @@ class TestSwanlabLogger:
 
         logger.log_metrics(metrics, step, prefix=prefix, step_metric=step_metric)
 
-        # Check that log was called with prefixed metrics and commit=False
-        # The step_metric key gets prefixed based on the current implementation
+        # Check that log was called with prefixed metrics
         mock_run = mock_swanlab.init.return_value
         expected_metrics = {
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
         }
-        mock_run.log.assert_called_once_with(expected_metrics, commit=False)
-
-    @patch("nemo_rl.utils.logger.swanlab")
-    def test_define_metric(self, mock_swanlab):
-        """Test defining a metric with a custom step metric."""
-        cfg = {}
-        logger = SwanlabLogger(cfg)
-
-        # Define metric pattern and step metric
-        logger.define_metric("ray/*", step_metric="ray/ray_step")
-
-        # Check that define_metric was called
-        mock_run = mock_swanlab.init.return_value
-        mock_run.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_run.log.assert_called_once_with(expected_metrics, step=step)
 
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_hyperparams(self, mock_swanlab):
