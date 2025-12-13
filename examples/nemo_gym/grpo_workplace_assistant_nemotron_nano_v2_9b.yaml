@@ -246,6 +246,12 @@ env:
       responses_api_agents:
         simple_agent:
           max_steps: 6  # Workplace assistant allows up to 6 tool-calling steps per task
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
 
 logger:
   log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b"  # Base directory for all logs
