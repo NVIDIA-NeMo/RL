@@ -1343,7 +1343,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 torch.bfloat16
             )
             del multimodal_data["pixel_values"]
-            
+
             # Add num_image_tiles for Nemotron VL model (must be a tensor for .split() in LLaVA model)
             # Use int32 to match image_token_mask_lens dtype in LLaVA model
             if num_image_tiles is not None:
@@ -1351,119 +1351,27 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     num_image_tiles, dtype=torch.int32, device=input_ids.device
                 )
 
-            # ========== DEBUG & FIX: Check and set image_token_index ==========
-            # For Nemotron VL, the image token ID is typically 131072, not -200
-            print(f"\n{'='*50}")
-            print(f"IMAGE TOKEN DEBUG (microbatch)")
-            print(f"{'='*50}")
-            
-            # Check model's stored image_token_index (this is critical!)
-            model_image_token_idx = None
-            try:
-                inner_model = model
-                while hasattr(inner_model, 'module'):
-                    inner_model = inner_model.module
-                if hasattr(inner_model, 'llava_model'):
-                    inner_model = inner_model.llava_model
-                if hasattr(inner_model, 'image_token_index'):
-                    model_image_token_idx = inner_model.image_token_index
-                    print(f"  Model's stored image_token_index = {model_image_token_idx}")
-                else:
-                    print(f"  WARNING: Model has no image_token_index attribute!")
-                    print(f"  Model type: {type(inner_model)}")
-            except Exception as e:
-                print(f"  Could not get model's image_token_index: {e}")
-            
-            # Detect image token ID from input
+            # Detect image token ID from input for VLM models
             image_token_index = None
             for candidate_idx in [131072, 151655, 151859, -200]:  # Common image token IDs
                 img_mask = (input_ids == candidate_idx)
                 img_count = img_mask.sum().item()
-                print(f"  Checking token id={candidate_idx}: found {img_count} occurrences")
                 if img_count > 0:
                     image_token_index = candidate_idx
-                    per_sample = img_mask.sum(dim=-1).tolist()
-                    print(f"  >>> USING image_token_index={candidate_idx}, per_sample: {per_sample[:4]}...")
                     break
-            
-            if image_token_index is None:
-                print(f"  ERROR: No image tokens found in input_ids!")
-                # Print some unique token IDs to debug
-                unique_ids = input_ids.unique()
-                print(f"  Unique token IDs (first 20): {unique_ids[:20].tolist()}")
-                # Also check if model's image_token_index is in input
-                if model_image_token_idx is not None:
-                    count = (input_ids == model_image_token_idx).sum().item()
-                    print(f"  Model's image_token_index ({model_image_token_idx}) count in input: {count}")
-            else:
-                # CRITICAL CHECK: Model's stored image_token_index must match input
-                if model_image_token_idx is not None and model_image_token_idx != image_token_index:
-                    print(f"  !!!! CRITICAL MISMATCH !!!!")
-                    print(f"  Model's stored image_token_index = {model_image_token_idx}")
-                    print(f"  Detected in input = {image_token_index}")
-                    print(f"  The model uses self.image_token_index in forward() which won't match!")
-                
+
+            if image_token_index is not None:
                 # Pass the correct image_token_index to the model
                 multimodal_data["image_token_index"] = image_token_index
-                
-                # Verify num_image_tiles matches
+
+                # Verify and adjust num_image_tiles if needed
                 total_img_tokens = (input_ids == image_token_index).sum().item()
                 if num_image_tiles is not None and total_img_tokens != len(num_image_tiles):
-                    print(f"  MISMATCH: Image tokens ({total_img_tokens}) != num_image_tiles ({len(num_image_tiles)})")
-                    print(f"  Adjusting num_image_tiles...")
                     num_image_tiles = [1] * total_img_tokens
                     multimodal_data["num_image_tiles"] = torch.tensor(
                         num_image_tiles, dtype=torch.int32, device=input_ids.device
                     )
-                else:
-                    print(f"  OK: Image tokens ({total_img_tokens}) matches num_image_tiles ({len(num_image_tiles) if num_image_tiles else 'None'})")
-            
-            print(f"{'='*50}\n")
-            # ========== END DEBUG & FIX ==========
 
-            # Print final multimodal_data keys being passed to model
-            print(f"  Final multimodal_data keys: {list(multimodal_data.keys())}")
-            if "num_image_tiles" in multimodal_data:
-                nit = multimodal_data["num_image_tiles"]
-                print(f"  num_image_tiles: shape={nit.shape}, dtype={nit.dtype}, sum={nit.sum().item()}")
-            if "image_token_index" in multimodal_data:
-                print(f"  image_token_index: {multimodal_data['image_token_index']}")
-            
-            # Check images tensor (pixel values)
-            if "images" in multimodal_data:
-                imgs = multimodal_data["images"]
-                print(f"  images (pixel_values): shape={imgs.shape}, dtype={imgs.dtype}")
-                print(f"  images stats: min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, mean={imgs.mean().item():.4f}, std={imgs.std().item():.4f}")
-                # Check if images are zeros (would indicate loading issue)
-                if imgs.abs().max().item() < 1e-6:
-                    print(f"  !!!! WARNING: Images are all zeros! Vision encoder will produce garbage!")
-                # Check if images look normalized (typical range is around -2 to 2 for normalized images)
-                if imgs.abs().max().item() > 10:
-                    print(f"  NOTE: Images have large values - might not be normalized")
-                elif imgs.abs().max().item() < 0.1:
-                    print(f"  WARNING: Images have very small values - might be mostly zeros")
-            
-            # Add hook to capture vision model output (for debugging)
-            vision_output_captured = [None]
-            def capture_vision_output(module, input, output):
-                if output is not None:
-                    if isinstance(output, torch.Tensor):
-                        vision_output_captured[0] = output.detach()
-                    elif isinstance(output, tuple) and len(output) > 0:
-                        vision_output_captured[0] = output[0].detach() if isinstance(output[0], torch.Tensor) else None
-            
-            # Try to find and hook the vision model
-            hook_handle = None
-            try:
-                inner = model
-                while hasattr(inner, 'module'):
-                    inner = inner.module
-                if hasattr(inner, 'llava_model') and hasattr(inner.llava_model, 'vision_model'):
-                    hook_handle = inner.llava_model.vision_model.register_forward_hook(capture_vision_output)
-                    print(f"  Registered hook on vision_model")
-            except Exception as e:
-                print(f"  Could not register vision hook: {e}")
-            
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
@@ -1471,27 +1379,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 **multimodal_data,
                 **additional_kwargs,
             )
-            
-            # Remove hook
-            if hook_handle is not None:
-                hook_handle.remove()
-            
-            # Check vision model output
-            if vision_output_captured[0] is not None:
-                vo = vision_output_captured[0]
-                print(f"  Vision model output: shape={vo.shape}, dtype={vo.dtype}")
-                print(f"  Vision output stats: min={vo.min().item():.4f}, max={vo.max().item():.4f}, mean={vo.mean().item():.4f}, std={vo.std().item():.4f}")
-                if vo.abs().max().item() < 1e-6:
-                    print(f"  !!!! CRITICAL: Vision model output is all zeros! Weights not loaded?")
-            else:
-                print(f"  Vision model output: NOT captured (hook may have failed)")
-            
+
             if type(output_tensor) == tuple:
                 output_tensor = output_tensor[0]
-            
-            # Debug output tensor
-            print(f"  Model output tensor shape: {output_tensor.shape}")
-            print(f"  Output tensor stats: min={output_tensor.min().item():.4f}, max={output_tensor.max().item():.4f}, mean={output_tensor.mean().item():.4f}")
 
             # Apply temperature scaling to logits for training
             # This matches the dtensor worker's _apply_temperature_scaling in the train method
@@ -1503,161 +1393,61 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-                
+
                 # Check for VLM sequence expansion mismatch
                 is_vlm_expanded = output_tensor.shape[1] != unpacked_input_ids.shape[1]
-                
+
                 if is_vlm_expanded:
                     # VLM model expanded the sequence by replacing image tokens with image embeddings
                     # We need to extract logits at the correct text positions in the expanded sequence
-                    print(f"  VLM EXPANSION DETECTED: output_seq_len={output_tensor.shape[1]}, input_seq_len={unpacked_input_ids.shape[1]}")
-                    
                     batch_size, input_seq_len = unpacked_input_ids.shape
                     output_seq_len = output_tensor.shape[1]
-                    
+
                     # Find image token positions (using the detected image_token_index)
-                    # Note: image_token_index is captured from outer scope
                     image_token_mask = (unpacked_input_ids == image_token_index)
-                    num_image_tokens_per_sample = image_token_mask.sum(dim=-1)  # [batch_size]
-                    total_image_tokens = num_image_tokens_per_sample.sum().item()
-                    
+                    total_image_tokens = image_token_mask.sum().item()
+
                     # Compute img_seq_len (number of positions each image token expands to)
                     # Formula: expanded_seq_len = input_seq_len + num_img_tokens * (img_seq_len - 1)
                     # So: img_seq_len = (expanded_seq_len - input_seq_len) / num_img_tokens + 1
                     if total_image_tokens > 0:
                         expansion = output_seq_len - input_seq_len
-                        # Use average image tokens per sample (all samples have same expanded length due to padding)
                         avg_img_tokens_per_sample = total_image_tokens / batch_size
                         img_seq_len = int(expansion / avg_img_tokens_per_sample) + 1
-                        print(f"  Computed img_seq_len = {img_seq_len} (expansion={expansion}, avg_img_tokens={avg_img_tokens_per_sample})")
                     else:
                         img_seq_len = 1
-                    
-                    # Compute text position mapping for each sample
-                    # For each non-image token at original position p:
-                    #   - Count how many image tokens are before p
-                    #   - expanded_p = p - num_image_before + num_image_before * img_seq_len
-                    #                = p + num_image_before * (img_seq_len - 1)
-                    
-                    # Create non-image token mask
-                    non_image_mask = ~image_token_mask  # [batch_size, input_seq_len]
-                    
+
                     # For each position, count cumulative image tokens before it
                     cumsum_images = image_token_mask.int().cumsum(dim=-1)  # [batch_size, input_seq_len]
-                    
-                    # Compute expanded positions for all positions (including image tokens)
-                    # Even for image token positions, we need the correct expanded position
-                    # because pred_positions[t] = expanded_positions[t+1] - 1
+
+                    # Compute expanded positions for all positions
+                    # expanded_p = p + num_image_before * (img_seq_len - 1)
                     positions = torch.arange(input_seq_len, device=unpacked_input_ids.device).unsqueeze(0).expand(batch_size, -1)
                     expanded_positions = positions + cumsum_images * (img_seq_len - 1)
-                    
-                    # Ensure expanded_positions don't exceed output_seq_len
                     expanded_positions = expanded_positions.clamp(max=output_seq_len - 1)
-                    
-                    print(f"  Sample 0 first 20 expanded positions: {expanded_positions[0, :20].tolist()}")
-                    print(f"  Sample 0 last 5 expanded positions: {expanded_positions[0, -5:].tolist()}")
-                    
-                    # Debug: Show the mapping around position 150 (first response token)
-                    print(f"  Sample 0 positions 145-155: orig -> expanded:")
-                    for p in range(145, min(156, input_seq_len)):
-                        orig_token = unpacked_input_ids[0, p].item()
-                        exp_pos = expanded_positions[0, p].item()
-                        is_img = image_token_mask[0, p].item()
-                        print(f"    {p} -> {exp_pos} (token={orig_token}, is_image={is_img})")
-                    
-                    # Extract logits at expanded text positions
-                    # from_parallel_logits_to_logprobs internally shifts: logits[t] predicts target[t+1]
-                    # So we should extract logits at expanded_positions[t] to predict target[t+1]
-                    # 
-                    # But we want logprob[t] = log P(target[t] | context), which means:
-                    # - logprob[t] is computed from logits[t-1]
-                    # - In expanded space: logits at expanded_positions[t] - 1
-                    #
-                    # The cleanest approach: extract logits at expanded_positions, then the function
-                    # will use logits[t] to predict target[t+1], giving us logprob[t+1] (shifted back by 1)
-                    
-                    # Gather logits at the expanded text positions
-                    batch_indices = torch.arange(batch_size, device=output_tensor.device).unsqueeze(1).expand(-1, input_seq_len)
-                    
-                    # Clamp to valid range
-                    valid_expanded_positions = expanded_positions.clamp(max=output_seq_len - 1)
-                    extracted_logits = output_tensor[batch_indices, valid_expanded_positions]  # [batch, input_seq_len, vocab_shard]
-                    
-                    print(f"  Extracted logits shape: {extracted_logits.shape}")
-                    
-                    # Debug: Check the logits at position 150 (first response token)
-                    if input_seq_len > 150:
-                        exp_pos_150 = valid_expanded_positions[0, 150].item()
-                        print(f"  Position 150: expanded_pos={exp_pos_150}")
-                        print(f"  Logits at expanded_pos {exp_pos_150}: min={output_tensor[0, exp_pos_150].min().item():.4f}, max={output_tensor[0, exp_pos_150].max().item():.4f}")
-                    
-                    # VLM logprob computation:
-                    # - from_parallel_logits_to_logprobs computes: returned[t] = log P(target[t+1] | logits[t])
-                    # - We want: logprob for target[t] = log P(target[t] | logits at expanded_pos[t] - 1)
-                    # 
-                    # So we need to provide logits[t] = output[expanded_positions[t+1] - 1]
-                    # Then returned[t] = log P(target[t+1] | output[expanded_positions[t+1] - 1])
-                    # Which is exactly the logprob for target[t+1]
-                    
+
                     # Shift expanded_positions to get positions for predicting the NEXT token
                     # pred_positions[t] = expanded_positions[t+1] - 1 (position that predicts token t+1)
                     shifted_expanded = torch.cat([expanded_positions[:, 1:], expanded_positions[:, -1:]], dim=1)
                     pred_positions = (shifted_expanded - 1).clamp(min=0, max=output_seq_len - 1)
-                    
+
                     # Extract logits at pred_positions
+                    batch_indices = torch.arange(batch_size, device=output_tensor.device).unsqueeze(1).expand(-1, input_seq_len)
                     extracted_logits = output_tensor[batch_indices, pred_positions]  # [batch, input_seq_len, vocab_shard]
-                    
-                    print(f"  Extracted logits shape: {extracted_logits.shape}")
-                    
-                    # Debug: Check the mapping for key positions
-                    if input_seq_len > 152:
-                        print(f"  Position mapping (original -> expanded -> pred_position):")
-                        for p in [7, 8, 14, 15, 125, 126, 127, 128, 129, 130, 131, 132]:
-                            if p < input_seq_len:
-                                exp_p = expanded_positions[0, p].item()
-                                pred_p = pred_positions[0, p].item()
-                                is_img = image_token_mask[0, p].item()
-                                marker = " (IMAGE)" if is_img else ""
-                                # Get the actual logits at this pred_position
-                                logit_min = output_tensor[0, pred_p].min().item()
-                                logit_max = output_tensor[0, pred_p].max().item()
-                                print(f"    {p} -> exp={exp_p} -> pred_pos={pred_p}{marker}, logits_range=[{logit_min:.2f}, {logit_max:.2f}]")
-                    
-                    # Compute logprobs
-                    vocab_start = tp_rank * output_tensor.shape[-1]
-                    vocab_end = (tp_rank + 1) * output_tensor.shape[-1]
-                    
-                    # Debug: Check a few target tokens and if they're in this shard
-                    print(f"  TP shard: vocab_range=[{vocab_start}, {vocab_end})")
-                    for p in [125, 126, 127, 128, 129, 130]:
-                        if p < input_seq_len:
-                            token_id = unpacked_input_ids[0, p].item()
-                            in_shard = vocab_start <= token_id < vocab_end
-                            print(f"    target[{p}]={token_id}, in_shard={in_shard}")
-                    
+
                     token_logprobs = from_parallel_logits_to_logprobs(
                         extracted_logits,
                         target=unpacked_input_ids,
-                        vocab_start_index=vocab_start,
-                        vocab_end_index=vocab_end,
+                        vocab_start_index=tp_rank * output_tensor.shape[-1],
+                        vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                         tp_group=tp_grp,
                         inference_only=True,
                         chunk_size=logprob_chunk_size,
                     )
-                    
-                    # Debug: Check the raw logprobs before masking
-                    print(f"  Raw logprobs shape: {token_logprobs.shape}")
-                    print(f"  Raw logprobs at positions 124-130 (predicting 125-131):")
-                    for p in range(124, min(131, token_logprobs.shape[1])):
-                        lp = token_logprobs[0, p].item()
-                        target_token = unpacked_input_ids[0, p+1].item()
-                        print(f"    logprobs[{p}] = {lp:.6f} (predicts target[{p+1}]={target_token})")
-                    
-                    # The function returns logprobs for target[t+1] using logits[t]
-                    # So returned length is input_seq_len - 1
-                    # Image token positions in target should be masked (logprob = 0)
+
+                    # Mask out image token positions (logprob = 0)
                     token_logprobs = token_logprobs.masked_fill(image_token_mask[:, 1:], 0)
-                
+
                 elif self.cfg["sequence_packing"]["enabled"]:
                     token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                         output_tensor,
