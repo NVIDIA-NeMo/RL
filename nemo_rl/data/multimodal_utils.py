@@ -14,7 +14,10 @@
 
 import re
 import inspect
-from typing import Optional, Union
+import decord
+from PIL import Image
+from collections import defaultdict
+from typing import Any, Optional, Union
 
 import torch
 from transformers.audio_utils import load_audio
@@ -214,7 +217,7 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     return list(all_keys)
 
 
-def get_multimodal_default_settings_from_processor(processor):
+def get_multimodal_default_settings_from_processor(processor) -> dict[str, dict[str, Any]]:
     if isinstance(processor, PreTrainedTokenizerBase):
         return []
 
@@ -241,3 +244,59 @@ def get_dim_to_pack_along(processor, key: str) -> int:
         return 1
     # return zero by default
     return 0
+
+
+def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
+    """Get all media from a message log item."""
+    # Handle None or missing content (e.g., assistant messages with only tool_calls)
+    if message.get("content") is None:
+        return []
+    # Handle string content (no images)
+    if isinstance(message["content"], str):
+        return []
+    # iterate over the content list
+    media = defaultdict(list)
+    for item in message["content"]:
+        tag = item["type"]
+        if tag in media_tags:
+            media[tag].extend(list(item[tag])) if isinstance(
+                item[tag], (list, tuple)
+            ) else media[tag].append(item[tag])
+    return media
+
+
+def load_media_from_message(
+    message: dict[str, Any], 
+    processor = None, 
+    multimodal_load_kwargs: dict[str, dict[str, Any]] = {},
+) -> dict[list[Any]]:
+    loaded_media = defaultdict(list)
+    media_in_message = get_media_from_message(message)
+
+    if not multimodal_load_kwargs and processor is not None:
+        multimodal_load_kwargs = get_multimodal_default_settings_from_processor(processor)
+
+    if "image" in media_in_message:
+        loaded_media["images"] += [Image.open(img) if isinstance(img, str) else img for img in media_in_message["image"]]
+    if "audio" in media_in_message:
+        for aud in media_in_message["audio"]:
+            if isinstance(aud, str):
+                assert "audio" in multimodal_load_kwargs and "sampling_rate"  in multimodal_load_kwargs["audio"]
+                try:
+                    loaded_media["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
+                except:
+                    # use decord
+                    loaded_audio = decord.AudioReader(aud, sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"], mono=True)
+                    loaded_media["audio"].append(loaded_audio[:].asnumpy()[get_dim_to_pack_along(tokenizer, key)])
+            else:
+                loaded_media["audio"].append(aud)
+    if "video" in media_in_message:
+        for vid in media_in_message["video"]:
+            if isinstance(vid, str):
+                load_video_kwargs = multimodal_load_kwargs["video"] if "video" in multimodal_load_kwargs else {}
+                # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
+                loaded_media["videos"].append(load_video(vid, backend="decord", **load_video_kwargs)[0])
+            else:
+                loaded_media["videos"].append(vid)
+
+    return loaded_media
