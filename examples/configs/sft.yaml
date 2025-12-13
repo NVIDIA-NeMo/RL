@@ -36,7 +36,7 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    enabled: true
+    enabled: false
     env_vars: {}
     cpu_offload: False
     sequence_parallel: false
@@ -75,7 +75,7 @@ policy:
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
-    enabled: false
+    enabled: true
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -99,6 +99,19 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+
+    peft:
+      enabled: true
+      target_modules: []
+      dim: 32
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "pre"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+
 
     optimizer:
       optimizer: "adam"
