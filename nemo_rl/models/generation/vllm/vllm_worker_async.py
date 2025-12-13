@@ -283,7 +283,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+
+        maybe_tool_parser_plugin = self.cfg["vllm_cfg"]["tool_parser_plugin"]
+        if maybe_tool_parser_plugin:
+            ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
