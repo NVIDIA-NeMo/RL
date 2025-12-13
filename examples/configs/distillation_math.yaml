@@ -226,6 +226,9 @@ logger:
     wandb:
         project: "nemo-distillation"
         name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    swanlab:
+        project: "nemo-distillation"
+        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
         log_dir: "tb_logs-distillation-${data.dataset_name}"
     mlflow:

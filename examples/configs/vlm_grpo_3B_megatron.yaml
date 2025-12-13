@@ -221,6 +221,9 @@ logger:
   wandb:
     project: grpo-dev
     name: vlm-grpo-3b-megatron
+  swanlab:
+    project: grpo-dev
+    name: vlm-grpo-3b-megatron
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10

@@ -374,23 +374,16 @@ class SwanlabLogger(LoggerInterface):
     """SwanLab logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
+        """Initialize the SwanlabLogger by starting a Swanlab run and storing the resulting run on self.run.
+
+        Parameters:
+            cfg (SwanlabConfig): Configuration for the Swanlab run (e.g., project and name).
+            log_dir (Optional[str]): Optional offline log directory passed to Swanlab's init.
+        """
         self.run = swanlab.init(**cfg, logdir=log_dir)
         print(
             f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
         )
-
-    def define_metric(
-        self,
-        name: str,
-        step_metric: Optional[str] = None,
-    ) -> None:
-        """Define a metric with custom step metric.
-
-        Args:
-            name: Name of the metric or pattern (e.g. 'ray/*')
-            step_metric: Optional name of the step metric to use
-        """
-        self.run.define_metric(name, step_metric=step_metric)
 
     def log_metrics(
         self,
@@ -399,14 +392,13 @@ class SwanlabLogger(LoggerInterface):
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
     ) -> None:
-        """Log metrics to swanlab.
+        """Log metrics to the associated Swanlab run.
 
-        Args:
-            metrics: Dict of metrics to log
-            step: Global step value
-            prefix: Optional prefix for metric names
-            step_metric: Optional name of a field in metrics to use as step instead
-                         of the provided step value
+        Parameters:
+            metrics (dict[str, Any]): Mapping of metric names to metric values.
+            step (int): Global step value to associate with all logged metrics.
+            prefix (Optional[str]): Optional prefix applied to metric names; metric names equal to `step_metric` are not prefixed.
+            step_metric (Optional[str]): Name of a metric that should be excluded from prefixing.
         """
         if prefix:
             metrics = {
@@ -414,18 +406,13 @@ class SwanlabLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # If step_metric is provided, use the corresponding value from metrics as step
-        if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
-        else:
-            self.run.log(metrics, step=step)
+        self.run.log(metrics, step=step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
-        """Log hyperparameters to swanlab.
+        """Update the Swanlab run configuration with the provided hyperparameters.
 
-        Args:
-            params: Dict of hyperparameters to log
+        Parameters:
+            params (Mapping[str, Any]): Mapping of hyperparameter names to values to store in the run configuration.
         """
         self.run.config.update(params)
 
@@ -436,7 +423,7 @@ class SwanlabLogger(LoggerInterface):
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        self.run.log({name: swanlab.Image(figure)}, step=step)
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to swanlab."""
@@ -833,19 +820,15 @@ class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
     def __init__(self, cfg: LoggerConfig):
-        """Initialize the logger.
+        """Create and configure enabled logging backends and optionally start GPU monitoring.
 
-        Args:
-            cfg: Config dict with the following keys:
-                - wandb_enabled
-                - tensorboard_enabled
-                - mlflow_enabled
-                - wandb
-                - tensorboard
-                - mlflow
-                - monitor_gpus
-                - gpu_collection_interval
-                - gpu_flush_interval
+        Parameters:
+            cfg (LoggerConfig): Configuration mapping. Expected keys include:
+                - "log_dir": base directory for backend logs.
+                - "wandb_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled": booleans to enable backends.
+                - "wandb", "swanlab", "tensorboard", "mlflow": per-backend configuration dicts.
+                - "monitor_gpus": boolean to enable Ray GPU monitoring.
+                - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
@@ -889,11 +872,6 @@ class Logger(LoggerInterface):
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
                 self.wandb_logger.define_metric(
-                    f"{metric_prefix}/*", step_metric=step_metric
-                )
-
-            if cfg["swanlab_enabled"] and self.swanlab_logger:
-                self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
