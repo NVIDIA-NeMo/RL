@@ -26,6 +26,11 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+from nemo_automodel.components._peft.lora import (
+    PeftConfig,
+    apply_lora_to_linear_modules,
+)
+
 from nemo_rl.utils.automodel_checkpoint import (
     detect_checkpoint_format,
     load_checkpoint,
@@ -52,6 +57,9 @@ class TestModel(torch.nn.Module):
             x = layer(x)
         return x
 
+    def apply_lora(self, lora_config: PeftConfig):
+        apply_lora_to_linear_modules(self, lora_config)
+
 
 @pytest.fixture
 def mock_model():
@@ -64,6 +72,42 @@ def mock_optimizer():
     """Create a simple mock optimizer for testing."""
     model = torch.nn.Linear(4, 1)
     return torch.optim.Adam(model.parameters())
+
+
+@pytest.fixture
+def mock_lora_config():
+    """Create a simple mock LORA configuration for testing."""
+    return PeftConfig(
+        target_modules=[],
+        match_all_linear=True,
+        dim=2,
+        alpha=2,
+        dropout=0.1,
+        dropout_position="post",
+        lora_A_init="xavier",
+        use_triton=False,
+    )
+
+
+@pytest.fixture
+def init_distributed():
+    """Initialize a single-process distributed environment for testing."""
+
+    # Only initialize if not already initialized
+    if not torch.distributed.is_initialized():
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"  # Free port
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+
+        # Use gloo backend for CPU-only tests
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+
+    yield
+
+    # Cleanup
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 @pytest.mark.automodel
@@ -418,3 +462,80 @@ class TestSaveLoadIntegration:
             check_dict_equality(new_model.state_dict(), original_model_state)
             check_dict_equality(new_optimizer.state_dict(), original_optimizer_state)
             assert new_scheduler.state_dict() == original_scheduler_state
+
+    def test_save_and_load_model_with_lora(
+        self, mock_experiment, mock_lora_config, init_distributed
+    ):
+        """Test saving and loading both model and optimizer with LORA."""
+        test_model, _, _ = mock_experiment
+        lora_config = mock_lora_config
+
+        test_model.apply_lora(lora_config)
+        lora_state_dict = test_model.state_dict()
+
+        # Assert LoRA weights exist for layers.0 (Linear 4->4)
+        assert "layers.0.lora_A.weight" in lora_state_dict, (
+            "layers.0.lora_A.weight not found"
+        )
+        assert "layers.0.lora_B.weight" in lora_state_dict, (
+            "layers.0.lora_B.weight not found"
+        )
+
+        # Assert LoRA weights exist for layers.3 (Linear 4->1)
+        assert "layers.3.lora_A.weight" in lora_state_dict, (
+            "layers.3.lora_A.weight not found"
+        )
+        assert "layers.3.lora_B.weight" in lora_state_dict, (
+            "layers.3.lora_B.weight not found"
+        )
+
+        assert lora_state_dict["layers.0.lora_A.weight"].shape == (2, 4), (
+            f"Expected layers.0.lora_A.weight shape (2, 4), got {lora_state_dict['layers.0.lora_A.weight'].shape}"
+        )
+        assert lora_state_dict["layers.0.lora_B.weight"].shape == (4, 2), (
+            f"Expected layers.0.lora_B.weight shape (4, 2), got {lora_state_dict['layers.0.lora_B.weight'].shape}"
+        )
+
+        # For layers.3: Linear(4, 1) with dim=2
+        # lora_A: (dim, in_features) = (2, 4)
+        # lora_B: (out_features, dim) = (1, 2)
+        assert lora_state_dict["layers.3.lora_A.weight"].shape == (2, 4), (
+            f"Expected layers.3.lora_A.weight shape (2, 4), got {lora_state_dict['layers.3.lora_A.weight'].shape}"
+        )
+        assert lora_state_dict["layers.3.lora_B.weight"].shape == (1, 2), (
+            f"Expected layers.3.lora_B.weight shape (1, 2), got {lora_state_dict['layers.3.lora_B.weight'].shape}"
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            weights_path = os.path.join(tmp_dir, "test_model")
+            save_checkpoint(
+                model=test_model,
+                weights_path=weights_path,
+                model_save_format="safetensors",
+                is_peft=True,
+                peft_config=lora_config,
+            )
+
+            # Verify files are created
+            assert os.path.exists(weights_path)
+            files = os.listdir(os.path.join(weights_path, "model"))
+            assert any(f.endswith(".safetensors") for f in files)
+
+            # Create a new model with different weights
+            new_model = TestModel()
+            new_model.apply_lora(lora_config)
+            # Initialize with different values
+            for param in new_model.parameters():
+                param.data.fill_(999.0)
+
+            # Load the checkpoint for peft need distributed(refer to nemo_automodel/components/checkpoint/stateful_wrappers.py:load_state_dict)
+            load_checkpoint(model=new_model, weights_path=weights_path)
+            # peft only save lora weights, so we need to filter out the non-lora weights
+            lora_params_original = {
+                k: v for k, v in lora_state_dict.items() if "lora" in k
+            }
+            lora_params_loaded = {
+                k: v for k, v in new_model.state_dict().items() if "lora" in k
+            }
+            # Verify the weights match the original
+            check_dict_equality(lora_params_loaded, lora_params_original)
