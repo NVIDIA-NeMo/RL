@@ -14,7 +14,7 @@
 
 import os
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 from collections import defaultdict
 
 from nemo_rl.data import multimodal_utils
@@ -71,6 +71,8 @@ class GeneralConversationsJsonlDataset:
     ```
     """
 
+    task_name = "general-conversation-jsonl"
+
     def __init__(
         self,
         train_data_path: str,
@@ -80,17 +82,13 @@ class GeneralConversationsJsonlDataset:
         train_media_data_dir: Optional[str] = None,
         val_media_data_dir: Optional[str] = None,
     ):
-        self.task_name = "general-conversation-jsonl"
+        self.train_media_data_dir = train_media_data_dir
+        self.val_media_data_dir = val_media_data_dir
         train_ds = load_dataset_from_path(train_data_path, train_split)
         if val_data_path:
             val_ds = load_dataset_from_path(val_data_path, val_split)
         else:
             val_ds = None
-
-        # format the dataset
-        train_ds = train_ds.map(partial(self.add_messages_key, media_directory=train_media_data_dir), keep_in_memory=True if _DEBUG else False)
-        if val_ds:
-            val_ds = val_ds.map(partial(self.add_messages_key, media_directory=val_media_data_dir), keep_in_memory=True if _DEBUG else False)
 
         # store the formatted dataset
         self.formatted_ds = {
@@ -98,6 +96,11 @@ class GeneralConversationsJsonlDataset:
             "validation": val_ds,
         }
 
+        self.datum_preprocessor = {
+            "train": partial(self._datum_preprocessor, media_directory=train_media_data_dir),
+            "val": partial(self._datum_preprocessor, media_directory=val_media_data_dir)
+        }
+        
         self.task_spec = TaskDataSpec(task_name="GeneralConversationsJsonlDataset")
 
     @classmethod
@@ -114,8 +117,9 @@ class GeneralConversationsJsonlDataset:
             ret.append({"type": t, t: fragment})
         return ret
 
-    def add_messages_key(
-        self, example: dict[str, Any],
+    @classmethod
+    def _datum_preprocessor(
+        cls, example: dict[str, Any],
         media_directory: Optional[str] = None
     ) -> dict[str, list[dict[str, Any]]]:
         """
@@ -123,7 +127,7 @@ class GeneralConversationsJsonlDataset:
         """
         processed_example = {
             "messages": [],
-            "task_name": self.task_name,
+            "task_name": cls.task_name,
         }
 
         if "conversations" in example:
@@ -142,7 +146,7 @@ class GeneralConversationsJsonlDataset:
                     allow_empty_text=True,
                     check_if_media_file_exist=False,
                     tried_default_extensions=tried_default_extensions,
-                    process_message_fragment=partial(self.process_message_fragment, media_directory=media_directory),
+                    process_message_fragment=partial(cls.process_message_fragment, media_directory=media_directory),
                 )
 
                 processed_example["messages"].append({"role": role, "content": content})
