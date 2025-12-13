@@ -296,7 +296,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         openai_serving_models = OpenAIServingModels(
             engine_client=engine_client,
-            model_config=model_config,
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
@@ -437,7 +436,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
         openai_serving_chat = NeMoRLOpenAIServingChat(
             engine_client,
-            model_config,
             openai_serving_models,
             return_tokens_as_token_ids=True,
             **serving_chat_kwargs,
@@ -498,7 +496,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             engine_client,
-            model_config,
             openai_serving_models,
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
