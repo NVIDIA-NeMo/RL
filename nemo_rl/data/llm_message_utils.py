@@ -13,9 +13,6 @@
 # limitations under the License.
 import warnings
 import time
-import decord
-from PIL import Image
-from collections import defaultdict
 from typing import Any, Optional, Union, cast
 
 import torch
@@ -34,7 +31,7 @@ from nemo_rl.data.multimodal_utils import (
     get_dim_to_pack_along,
     load_media_from_message,
     get_multimodal_keys_from_processor,
-    get_multimodal_default_settings_from_processor,
+    get_multimodal_default_settings_from_processor,s
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
