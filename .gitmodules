@@ -18,3 +18,6 @@
 	url = https://github.com/NVIDIA-NeMo/Gym.git
 	branch = main
 	shallow = true
+[submodule "3rdparty/NV-One-Logger-workspace/nv-one-logger"]
+	path = 3rdparty/NV-One-Logger-workspace/nv-one-logger
+	url = git@github.com:NVIDIA/nv-one-logger.git

@@ -206,6 +206,10 @@ logger:
   swanlab:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"
+  one_logger_enabled: false
+  one_logger:
+    project: "sft-dev"
+    name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
   mlflow:
