@@ -249,6 +249,8 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
+          # Disable reasoning!
+          uses_reasoning_parser: false
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
