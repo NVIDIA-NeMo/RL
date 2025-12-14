@@ -39,6 +39,7 @@ def create_test_config(
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
     dtensor_v2: bool = False,
+    enable_loras: bool = False,
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
@@ -75,6 +76,18 @@ def create_test_config(
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
+            "lora": {
+                "enabled": enable_loras,
+                "target_modules": [],
+                "exclude_modules": [],
+                "match_all_linear": True,
+                "dim": 32,
+                "alpha": 32,
+                "dropout": 0.0,
+                "dropout_position": "post",
+                "lora_A_init": "xavier",
+                "use_triton": True,
+            },
         },
         "dynamic_batching": {
             "enabled": True,
@@ -106,6 +119,118 @@ def create_test_config(
     }
 
 
+def update_lora_config(
+    config: PolicyConfig,
+    enabled: bool = True,
+    target_modules: list[str] = [],
+    exclude_modules: list[str] = [],
+    match_all_linear: bool = True,
+    dim: int = 32,
+    alpha: int = 32,
+    dropout: float = 0.0,
+    dropout_position: str = "post",
+    lora_A_init: str = "xavier",
+    use_triton: bool = True,
+):
+    if enabled:
+        config["dtensor_cfg"]["_v2"] = True
+
+    config["dtensor_cfg"]["lora"].update(
+        {
+            "enabled": enabled,
+            "target_modules": target_modules,
+            "exclude_modules": exclude_modules,
+            "match_all_linear": match_all_linear,
+            "dim": dim,
+            "alpha": alpha,
+            "dropout": dropout,
+            "dropout_position": dropout_position,
+            "lora_A_init": lora_A_init,
+            "use_triton": use_triton,
+        }
+    )
+
+
+def _get_use_v2(request) -> bool:
+    # Get the use_v2 parameter from the test function
+    marks = getattr(request.function, "pytestmark", [])
+    for mark in marks:
+        if (
+            hasattr(mark, "args")
+            and len(mark.args) > 1
+            and "use_v2" in str(mark.args[0])
+        ):
+            for p in mark.args[1]:
+                if isinstance(p, bool):
+                    return p
+
+    # If multiple parametrize decorators, we need to check the node id
+    if hasattr(request, "node") and hasattr(request.node, "callspec"):
+        return request.node.callspec.params.get("use_v2", False)
+
+    return False
+
+
+def create_test_batch(
+    batch_size: int = 8,
+    seq_len: int = 128,
+    vocab_size: int = 32000,
+    mode: str = "train",
+) -> BatchedDataDict:
+    # set random seed
+    torch.manual_seed(66)
+    # Create test input_ids and attention_mask
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    # Calculate input_lengths (all sequences are full length in this test)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            **(
+                {
+                    "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                    "sample_mask": torch.ones(batch_size).cuda(),
+                }
+                if mode == "train"
+                else {}
+            ),
+        }
+    )
+    data = data.to("cpu")
+    return data
+
+
+def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
+    data = data.to("cuda")
+    input_ids = data["input_ids"]
+
+    with torch.no_grad():
+        # run the log prob of regular hf model here
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="cuda", torch_dtype=torch.float32
+        )
+        hf_model.eval()
+        outputs = hf_model(**data)
+
+    log_probs = torch.nn.functional.log_softmax(
+        outputs.logits.to(torch.float32), dim=-1
+    )
+    next_tokens = input_ids[:, 1:]
+    log_probs = log_probs[:, :-1]
+    token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(
+        -1
+    )
+    token_logprobs = torch.cat(
+        [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+    ).cpu()
+
+    data = data.to("cpu")
+    return token_logprobs
+
+
 @pytest.fixture(scope="module")
 def two_gpu_virtual_cluster():
     cluster_name = "test"
@@ -122,20 +247,67 @@ def two_gpu_virtual_cluster():
     cluster.shutdown()
 
 
-@pytest.fixture(scope="function")
-def gc_collect():
-    """Helper function to force garbage collection after a test"""
-    import gc
+@pytest.fixture
+def base_setup(request, two_gpu_virtual_cluster):
+    params = request.param if hasattr(request, "param") else None
+    assert params is not None, "params is not set"
 
-    yield
-    gc.collect()
+    mode = params["mode"]
+    model_fixture_name = params["model_fixture_name"]
+    specified_config = params["specified_config"]
+    enable_loras = params["enable_loras"]
+    lora_config = params["lora_config"]
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    data = None
+    loss_fn = None
+
+    try:
+        use_v2 = _get_use_v2(request)
+        config = create_test_config(model_name, dtensor_v2=use_v2, **specified_config)
+
+        if enable_loras:
+            update_lora_config(config, **lora_config)
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        print(f"Creating {mode} Policy with {specified_config}...")
+        policy = Policy(
+            cluster=two_gpu_virtual_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        print("Creating test batch...")
+        data = create_test_batch(mode=mode)
+
+        if mode == "train":
+            # Create loss function
+            loss_fn: LossFunction = SimpleLoss()
+            yield policy, data, loss_fn
+        elif mode == "logprob":
+            token_logprobs = calculate_token_logprobs(model_name, data)
+            yield policy, data, token_logprobs
+
+    except Exception as e:
+        print(f"Error during setup: {e}")
+        pytest.skip(f"Setup failed: {e}")
+    finally:
+        print("Cleaning up resources for test")
+        if policy:
+            policy.shutdown()
 
 
 @pytest.fixture
 def policy_setup(request, two_gpu_virtual_cluster, tiny_llama_model_path):
     """Setup and teardown for policy tests - creates a virtual cluster and policy."""
-    use_v2 = request.param if hasattr(request, "param") else False
-    config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
+    params = request.param if hasattr(request, "param") else {}
+    use_v2 = params.get("dtensor_v2", False)
+    enable_loras = params.get("enable_loras", False)
+
+    config = create_test_config(
+        tiny_llama_model_path, dtensor_v2=use_v2, enable_loras=enable_loras
+    )
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
@@ -148,9 +320,221 @@ def policy_setup(request, two_gpu_virtual_cluster, tiny_llama_model_path):
     policy.shutdown()
 
 
+@pytest.fixture(
+    params=[
+        # model_fixture_name        tp cp  sp     cpu    act
+        ("tiny_llama_model_path", 1, 1, False, False, False),
+        ("tiny_llama_model_path", 1, 1, True, False, False),
+        ("tiny_llama_model_path", 1, 1, False, True, False),
+        ("tiny_llama_model_path", 1, 1, False, False, True),
+        ("tiny_llama_model_path", 1, 2, False, False, False),
+        ("tiny_qwen2_model_path", 1, 1, True, True, False),
+        ("tiny_qwen2_model_path", 1, 1, True, False, True),
+        ("tiny_qwen2_model_path", 1, 1, False, True, True),
+        ("tiny_qwen2_model_path", 1, 1, True, True, True),
+        ("tiny_qwen2_model_path", 1, 2, False, False, False),
+        ("tiny_qwen3_model_path", 1, 1, True, True, False),
+        ("tiny_qwen3_model_path", 1, 1, True, False, True),
+        ("tiny_qwen3_model_path", 1, 1, False, True, True),
+        ("tiny_qwen3_model_path", 1, 1, True, True, True),
+        ("tiny_qwen3_model_path", 1, 2, False, False, False),
+        (
+            "tiny_gemma3_model_path",
+            1,
+            1,
+            True,
+            True,
+            False,
+        ),  # gemma3 doesn't support spda
+        ("tiny_gemma3_model_path", 1, 1, True, False, True),
+        ("tiny_gemma3_model_path", 1, 1, False, True, True),
+        ("tiny_gemma3_model_path", 1, 1, True, True, True),
+        # CP doesn't support gemma3 due to spda input has attent_mask != None.
+        # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+        # nemotron5_h doesn't support cp
+    ]
+)
+def training_setup(request, two_gpu_virtual_cluster):
+    """Setup and teardown specifically for training tests."""
+    request.param = {
+        "mode": "train",
+        "enable_loras": False,
+        "lora_config": None,
+        "model_fixture_name": request.param[0],
+        "specified_config": {
+            "tp": request.param[1],
+            "cp": request.param[2],
+            "sp": request.param[3],
+            "cpu_offload": request.param[4],
+            "activation_checkpointing": request.param[5],
+        },
+    }
+    yield from base_setup.__wrapped__(request, two_gpu_virtual_cluster)
+
+
+@pytest.fixture(
+    params=[
+        # TP=2, CP=1
+        ("tiny_qwen2_model_path", 2, 1, False, True, False),
+        ("tiny_qwen2_model_path", 2, 1, False, False, False),
+        ("tiny_llama_model_path", 2, 1, False, False, False),
+        ("tiny_llama_model_path", 2, 1, False, True, False),
+        ("tiny_llama_model_path", 2, 1, False, True, True),
+        ("tiny_qwen3_model_path", 2, 1, False, True, False),
+        ("tiny_qwen3_model_path", 2, 1, False, False, False),
+        ("tiny_gemma3_model_path", 2, 1, False, True, False),
+        ("tiny_gemma3_model_path", 2, 1, False, False, False),
+        # TP=1, CP=2
+        ("tiny_qwen2_model_path", 1, 2, False, True, False),
+        ("tiny_qwen2_model_path", 1, 2, False, False, False),
+        ("tiny_llama_model_path", 1, 2, False, False, False),
+        ("tiny_llama_model_path", 1, 2, False, True, False),
+        ("tiny_llama_model_path", 1, 2, False, True, True),
+        ("tiny_qwen3_model_path", 1, 2, False, True, False),
+        ("tiny_qwen3_model_path", 1, 2, False, False, False),
+    ]
+)
+def logprob_setup(request, two_gpu_virtual_cluster):
+    """Setup and teardown specifically for logprob tests."""
+    request.param = {
+        "mode": "logprob",
+        "enable_loras": False,
+        "lora_config": None,
+        "model_fixture_name": request.param[0],
+        "specified_config": {
+            "tp": request.param[1],
+            "cp": request.param[2],
+            "sp": request.param[3],
+            "cpu_offload": request.param[4],
+            "activation_checkpointing": request.param[5],
+        },
+    }
+    yield from base_setup.__wrapped__(request, two_gpu_virtual_cluster)
+
+
+@pytest.fixture(
+    params=[
+        # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
+        ("tiny_llama_model_path", [], [], True, 16, 32, 0.0, "post", "xavier", True),
+        ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
+        (
+            "tiny_qwen2_model_path",
+            ["q_proj", "k_proj", "*gate_proj*", "*up_proj*", "*down_proj*"],
+            [],
+            False,
+            32,
+            16,
+            0.0,
+            "post",
+            "uniform",
+            True,
+        ),
+        (
+            "tiny_qwen2_model_path",
+            [],
+            ["q_proj", "k_proj"],
+            False,
+            32,
+            16,
+            0.0,
+            "post",
+            "uniform",
+            True,
+        ),
+    ]
+)
+def training_with_lora_setup(request, two_gpu_virtual_cluster):
+    """Setup and teardown specifically for training with lora tests."""
+    request.param = {
+        "mode": "train",
+        "enable_loras": True,
+        "model_fixture_name": request.param[0],
+        "specified_config": {},
+        "lora_config": {
+            "target_modules": request.param[1],
+            "exclude_modules": request.param[2],
+            "match_all_linear": request.param[3],
+            "dim": request.param[4],
+            "alpha": request.param[5],
+            "dropout": request.param[6],
+            "dropout_position": request.param[7],
+            "lora_A_init": request.param[8],
+            "use_triton": request.param[9],
+        },
+    }
+    yield from base_setup.__wrapped__(request, two_gpu_virtual_cluster)
+
+
+@pytest.fixture(
+    params=[
+        # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
+        ("tiny_llama_model_path", [], [], True, 16, 32, 0.0, "post", "xavier", True),
+        ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
+        (
+            "tiny_qwen2_model_path",
+            ["q_proj", "k_proj", "*gate_proj*", "*up_proj*", "*down_proj*"],
+            [],
+            False,
+            32,
+            16,
+            0.0,
+            "post",
+            "uniform",
+            True,
+        ),
+        (
+            "tiny_qwen2_model_path",
+            [],
+            ["q_proj", "k_proj"],
+            False,
+            32,
+            16,
+            0.0,
+            "post",
+            "uniform",
+            True,
+        ),
+    ]
+)
+def logprob_with_lora_setup(request, two_gpu_virtual_cluster):
+    """Setup and teardown specifically for logprob with lora tests."""
+    request.param = {
+        "mode": "logprob",
+        "enable_loras": True,
+        "model_fixture_name": request.param[0],
+        "specified_config": {},
+        "lora_config": {
+            "target_modules": request.param[1],
+            "exclude_modules": request.param[2],
+            "match_all_linear": request.param[3],
+            "dim": request.param[4],
+            "alpha": request.param[5],
+            "dropout": request.param[6],
+            "dropout_position": request.param[7],
+            "lora_A_init": request.param[8],
+            "use_triton": request.param[9],
+        },
+    }
+    yield from base_setup.__wrapped__(request, two_gpu_virtual_cluster)
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(360)
-@pytest.mark.parametrize("policy_setup", [True, False], indirect=True)
+# @pytest.mark.parametrize("policy_setup", [True, False], indirect=True)
+@pytest.mark.parametrize(
+    "policy_setup",
+    [
+        {"dtensor_v2": True, "enable_loras": False},
+        {"dtensor_v2": True, "enable_loras": True},
+        {"dtensor_v2": False, "enable_loras": False},
+    ],
+    indirect=True,
+)
 def test_lm_policy_init(policy_setup):
     policy = policy_setup
 
@@ -227,152 +611,11 @@ def test_lm_policy_init(policy_setup):
         )
 
 
-@pytest.fixture
-def training_setup(request, two_gpu_virtual_cluster):
-    """Setup and teardown specifically for training tests."""
-    # Get the use_v2 parameter from the test function
-    use_v2 = getattr(request.function, "pytestmark", [])
-    use_v2_value = False
-    for mark in use_v2:
-        if (
-            hasattr(mark, "args")
-            and len(mark.args) > 1
-            and "use_v2" in str(mark.args[0])
-        ):
-            for param_set in mark.args[1]:
-                if isinstance(param_set, bool):
-                    use_v2_value = param_set
-                    break
-
-    # If multiple parametrize decorators, we need to check the node id
-    if hasattr(request, "node") and hasattr(request.node, "callspec"):
-        if "use_v2" in request.node.callspec.params:
-            use_v2_value = request.node.callspec.params["use_v2"]
-
-    (
-        model_fixture_name,
-        tp,
-        cp,
-        sp,
-        cpu_offload,
-        activation_checkpointing,
-    ) = request.param
-
-    # Get the actual model path from the requested fixture
-    model_name = request.getfixturevalue(model_fixture_name)
-    policy = None
-    data = None
-    loss_fn = None
-
-    try:
-        config = create_test_config(
-            model_name,
-            tp,
-            cp,
-            sp,
-            cpu_offload,
-            activation_checkpointing,
-            dtensor_v2=use_v2_value,
-        )
-        tokenizer = get_tokenizer(config["tokenizer"])
-        print(
-            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
-        )
-        policy = Policy(
-            cluster=two_gpu_virtual_cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
-
-        # Create a test batch
-        print("Creating test batch...")
-        # set random seed
-        torch.manual_seed(42)
-
-        # Create test input_ids and attention_mask
-        input_ids = torch.randint(0, 32000, (8, 128))  # 8 sequences, each of length 128
-        attention_mask = torch.ones(8, 128)
-
-        # Calculate input_lengths (all sequences are full length in this test)
-        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
-
-        data = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "attention_mask": attention_mask,  # Keep for compatibility with loss functions
-                "labels": torch.randint(0, 32000, (8, 128)),
-                "sample_mask": torch.ones(8),
-            }
-        )
-
-        # Create loss function
-        loss_fn: LossFunction = SimpleLoss()
-
-        # Provide the resources to the test
-        yield policy, data, loss_fn
-
-    except Exception as e:
-        print(f"Error during training setup: {e}")
-        pytest.skip(f"Training setup failed: {e}")
-    finally:
-        # Clean up after the test
-        print("Cleaning up resources for test")
-        policy.shutdown()
-
-
-@pytest.mark.hf_gated
-@pytest.mark.timeout(360)
-@pytest.mark.parametrize("use_v2", [True, False])
-@pytest.mark.parametrize(
-    "training_setup",
-    [
-        # model_fixture_name        tp cp  sp     cpu    act
-        ("tiny_llama_model_path", 1, 1, False, False, False),
-        ("tiny_llama_model_path", 1, 1, True, False, False),
-        ("tiny_llama_model_path", 1, 1, False, True, False),
-        ("tiny_llama_model_path", 1, 1, False, False, True),
-        ("tiny_llama_model_path", 1, 2, False, False, False),
-        ("tiny_qwen2_model_path", 1, 1, True, True, False),
-        ("tiny_qwen2_model_path", 1, 1, True, False, True),
-        ("tiny_qwen2_model_path", 1, 1, False, True, True),
-        ("tiny_qwen2_model_path", 1, 1, True, True, True),
-        ("tiny_qwen2_model_path", 1, 2, False, False, False),
-        ("tiny_qwen3_model_path", 1, 1, True, True, False),
-        ("tiny_qwen3_model_path", 1, 1, True, False, True),
-        ("tiny_qwen3_model_path", 1, 1, False, True, True),
-        ("tiny_qwen3_model_path", 1, 1, True, True, True),
-        ("tiny_qwen3_model_path", 1, 2, False, False, False),
-        (
-            "tiny_gemma3_model_path",
-            1,
-            1,
-            True,
-            True,
-            False,
-        ),  # gemma3 doesn't support spda
-        ("tiny_gemma3_model_path", 1, 1, True, False, True),
-        ("tiny_gemma3_model_path", 1, 1, False, True, True),
-        ("tiny_gemma3_model_path", 1, 1, True, True, True),
-        # CP doesn't support gemma3 due to spda input has attent_mask != None.
-        # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
-        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
-        # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
-        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
-        ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
-        ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
-        # nemotron5_h doesn't support cp
-    ],
-    indirect=True,
-)
-def test_dtensor_worker_training(use_v2, training_setup):
+def _test_dtensor_worker_training(policy, data, loss_fn):
     def verify_loss_tensor(loss_tensor):
         assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
         assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
         return loss_tensor
-
-    policy, data, loss_fn = training_setup
 
     # Verify resources were created properly
     assert policy is not None, "Training policy was not created properly"
@@ -423,136 +666,22 @@ def test_dtensor_worker_training(use_v2, training_setup):
             )
 
 
-@pytest.fixture
-def logprob_setup(request, two_gpu_virtual_cluster):
-    """Setup and teardown specifically for training tests."""
-    # Get the use_v2 parameter from the test function
-    use_v2_value = False
-    if hasattr(request, "node") and hasattr(request.node, "callspec"):
-        if "use_v2" in request.node.callspec.params:
-            use_v2_value = request.node.callspec.params["use_v2"]
-
-    (
-        model_fixture_name,
-        tp,
-        cp,
-        sp,
-        cpu_offload,
-        activation_checkpointing,
-    ) = request.param
-
-    # Get the actual model path from the requested fixture
-    model_name = request.getfixturevalue(model_fixture_name)
-    policy = None
-    data = None
-
-    try:
-        config = create_test_config(
-            model_name,
-            tp,
-            cp,
-            sp,
-            cpu_offload,
-            activation_checkpointing,
-            dtensor_v2=use_v2_value,
-        )
-        tokenizer = get_tokenizer(config["tokenizer"])
-        print(
-            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
-        )
-        policy = Policy(
-            cluster=two_gpu_virtual_cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
-
-        # Create a test batch
-        print("Creating test batch...")
-        # set random seed
-        torch.manual_seed(66)
-
-        # Create test input_ids and attention_mask
-        input_ids = torch.randint(
-            0, 32000, (8, 128)
-        ).cuda()  # 8 sequences, each of length 128
-        attention_mask = torch.ones(8, 128).cuda()
-
-        # Calculate input_lengths (all sequences are full length in this test)
-        input_lengths = attention_mask.sum(dim=1).to(torch.int32).cuda()
-
-        data = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "attention_mask": attention_mask,  # Keep for compatibility with loss functions
-            }
-        )
-
-        with torch.no_grad():
-            # run the log prob of regular hf model here
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name, device_map="cuda", torch_dtype=torch.float32
-            )
-            hf_model.eval()
-            outputs = hf_model(**data)
-
-        log_probs = torch.nn.functional.log_softmax(
-            outputs.logits.to(torch.float32), dim=-1
-        )
-        next_tokens = input_ids[:, 1:]
-        log_probs = log_probs[:, :-1]
-        token_logprobs = log_probs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
-        token_logprobs = torch.cat(
-            [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-        ).cpu()
-
-        data = data.to("cpu")
-
-        # Provide the resources to the test
-        yield policy, data, token_logprobs
-
-    except Exception as e:
-        print(f"Error during training setup: {e}")
-        pytest.skip(f"Training setup failed: {e}")
-    finally:
-        # Clean up after the test
-        print("Cleaning up resources for test")
-        policy.shutdown()
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_worker_training(use_v2, training_setup):
+    policy, data, loss_fn = training_setup
+    _test_dtensor_worker_training(policy, data, loss_fn)
 
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(360)
-@pytest.mark.parametrize("use_v2", [True, False])
-@pytest.mark.parametrize(
-    "logprob_setup",
-    [
-        # TP=2, CP=1
-        ("tiny_qwen2_model_path", 2, 1, False, True, False),
-        ("tiny_qwen2_model_path", 2, 1, False, False, False),
-        ("tiny_llama_model_path", 2, 1, False, False, False),
-        ("tiny_llama_model_path", 2, 1, False, True, False),
-        ("tiny_llama_model_path", 2, 1, False, True, True),
-        ("tiny_qwen3_model_path", 2, 1, False, True, False),
-        ("tiny_qwen3_model_path", 2, 1, False, False, False),
-        ("tiny_gemma3_model_path", 2, 1, False, True, False),
-        ("tiny_gemma3_model_path", 2, 1, False, False, False),
-        # TP=1, CP=2
-        ("tiny_qwen2_model_path", 1, 2, False, True, False),
-        ("tiny_qwen2_model_path", 1, 2, False, False, False),
-        ("tiny_llama_model_path", 1, 2, False, False, False),
-        ("tiny_llama_model_path", 1, 2, False, True, False),
-        ("tiny_llama_model_path", 1, 2, False, True, True),
-        ("tiny_qwen3_model_path", 1, 2, False, True, False),
-        ("tiny_qwen3_model_path", 1, 2, False, False, False),
-    ],
-    indirect=True,
-)
-def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_setup):
-    policy, data, logprobs = logprob_setup
+def test_dtensor_worker_training_with_lora(training_with_lora_setup):
+    policy, data, loss_fn = training_with_lora_setup
+    _test_dtensor_worker_training(policy, data, loss_fn)
 
+
+def _test_dtensor_worker_logprob(policy, data, logprobs):
     # Verify resources were created properly assert policy is not None, "Policy was not created properly"
     assert data is not None, "Test data was not created properly"
 
@@ -565,6 +694,21 @@ def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_set
     assert torch.allclose(policy_logprobs, logprobs), (
         f"max diff {torch.max(torch.abs(policy_logprobs - logprobs))}"
     )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_setup):
+    policy, data, logprobs = logprob_setup
+    _test_dtensor_worker_logprob(policy, data, logprobs)
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+def test_dtensor_worker_logprob_with_lora(logprob_with_lora_setup):
+    policy, data, logprobs = logprob_with_lora_setup
+    _test_dtensor_worker_logprob(policy, data, logprobs)
 
 
 @pytest.mark.hf_gated
