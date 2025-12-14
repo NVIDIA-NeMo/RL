@@ -1,8 +1,5 @@
 # ----- PARAMETERS -----
-# WANDB_API_KEY, EXP_NAME, NUM_ACTOR_NODES, REPO_LOCATION
-
-# ----- CONSTANTS -----
-CONTAINER_IMAGE_PATH=/path/to/nemo-rl/container
+# WANDB_API_KEY, EXP_NAME, NUM_ACTOR_NODES, REPO_LOCATION, CONTAINER_IMAGE_PATH
 
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
@@ -25,7 +22,7 @@ echo -e "Running command:\n$COMMAND"
 cd $REPO_LOCATION
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
-MOUNTS="/shared/filesystem:/shared/filesystem" \
+MOUNTS=$PWD:$PWD \
 sbatch \
     --nodes=$NUM_ACTOR_NODES \
     --time=4:0:0 \
