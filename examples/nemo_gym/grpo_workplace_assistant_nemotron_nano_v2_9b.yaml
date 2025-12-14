@@ -78,7 +78,7 @@ policy:
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 4
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true
