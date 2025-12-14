@@ -1850,9 +1850,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "tensor_model_parallel_size"
             ],
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
-            use_flashinfer_fused_rope=None,
             unified_memory_level=unified_memory_level,
             max_tokens_override=max_tokens,
+            use_flashinfer_fused_rope=False,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
