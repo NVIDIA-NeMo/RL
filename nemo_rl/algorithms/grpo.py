@@ -80,6 +80,16 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+# ANSI color codes
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 
 class RewardScalingConfig(TypedDict):
     """Configure linear reward scaling with clamping.
@@ -459,6 +469,12 @@ def setup(
             grpo_config["max_num_epochs"] * len(dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    if policy_config.get("dtensor_cfg", {}).get("enabled", False):
+        lora_cfg = policy_config.get("dtensor_cfg", {}).get("lora_cfg", {})
+        if lora_cfg.get("enabled", False):
+            # Override the vLLM lora config with the DTensor lora config
+            generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
 
     # Define initialization functions that will be used in all paths
     def init_policy():
@@ -908,6 +924,8 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    refit_base_model_weights: Optional[bool] = True,
+    refit_lora_weights: Optional[bool] = False,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -920,18 +938,13 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
+    assert refit_base_model_weights or refit_lora_weights, (
+        "refit_base_model_weights and refit_lora_weights cannot be both False"
     )
-    with timer_context:
-        # update weights
+
+    def _perform_refit_weights(
+        refit_base_model_weights: bool, refit_lora_weights: bool
+    ):
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
@@ -946,9 +959,15 @@ def refit_policy_generation(
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
             )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            futures_inference = policy_generation.update_weights_via_ipc_zmq(
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -971,6 +990,31 @@ def refit_policy_generation(
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
             raise RuntimeError(error_message)
+        return update_success
+
+    if colocated_inference:
+        policy.offload_before_refit()
+        policy_generation.prepare_for_generation(tags=["weights"])
+
+    # Create a context manager that does nothing when timer is None
+    timer_context = (
+        timer.time("prepare_for_generation/transfer_and_update_weights")
+        if timer is not None
+        else nullcontext()
+    )
+    with timer_context:
+        update_success = False
+        if refit_base_model_weights:
+            update_success = _perform_refit_weights(
+                refit_base_model_weights=True, refit_lora_weights=False
+            )
+        if refit_lora_weights:
+            update_success = (
+                _perform_refit_weights(
+                    refit_base_model_weights=False, refit_lora_weights=True
+                )
+                and update_success
+            )
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -1013,6 +1057,8 @@ def grpo_train(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
+    REFIT_BASE_MODEL_WEIGHTS = True
+    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None  # for mypy type check
 
     # Check if we need to sync KV cache scales
@@ -1044,8 +1090,16 @@ def grpo_train(
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                refit_lora_weights=REFIT_LORA_WEIGHTS,
+            )
             POLICY_GENERATION_STALE = False
+            # Disable base model weights refit after first refit if enable lora weights refit
+            REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -1139,8 +1193,11 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
@@ -1377,8 +1434,11 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation

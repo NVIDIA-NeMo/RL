@@ -139,6 +139,7 @@ class BaseVllmGenerationWorker:
         self.enable_expert_parallel = self.expert_parallel_size > 1
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
         self.precision = self.cfg["vllm_cfg"]["precision"]
+        self.lora_cfg = self.cfg["vllm_cfg"].get("lora_cfg", None)
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -388,6 +389,14 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+        # Lora is enabled, add it to the vllm kwargs
+        if self.lora_cfg is not None and self.lora_cfg["enabled"]:
+            from nemo_rl.models.generation.lora import apply_lora_patches
+
+            apply_lora_patches()
+            vllm_kwargs["enable_lora"] = True
+            vllm_kwargs["max_loras"] = 1  # only support one lora adapter
+            vllm_kwargs["max_lora_rank"] = self.lora_cfg["dim"]
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -719,7 +728,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
@@ -733,7 +744,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=tuple(),
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
             worker_result = result_or_coro[0]
 
@@ -780,6 +791,40 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             traceback.print_exc()
             return False
+
+    def get_lora_layers(self) -> list[dict[str, Any]]:
+        """Get the LoRA layers from the vLLM engine."""
+
+        def _get_lora_layers(self):
+            model = self.get_model()
+            if model is None:
+                return []
+
+            from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+
+            details = []
+            for name, module in model.named_modules():
+                if isinstance(module, BaseLinearLayerWithLoRA):
+                    a_shapes = [tuple(t.shape) for t in module.lora_a_stacked]
+                    b_shapes = [tuple(t.shape) for t in module.lora_b_stacked]
+                    a_weights = [t for t in module.lora_a_stacked]
+                    b_weights = [t for t in module.lora_b_stacked]
+                    details.append(
+                        {
+                            "name": name,  # layer name
+                            "a_weights": a_weights,
+                            "b_weights": b_weights,
+                        }
+                    )
+            return details
+
+        results = self.llm.collective_rpc(_get_lora_layers)
+        return results
+
+    def get_lora_counts(self) -> int:
+        """Get the number of LoRA layers from the vLLM engine."""
+        results = self.llm.collective_rpc("get_lora_counts")
+        return results
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""

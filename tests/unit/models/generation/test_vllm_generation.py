@@ -35,7 +35,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _replace_prefix_tokens,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -125,6 +125,19 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_grad_norm": 1.0,
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
+}
+
+basic_lora_test_config: LoRAConfig = {
+    "enabled": True,
+    "target_modules": [],
+    "exclude_modules": [],
+    "match_all_linear": True,
+    "dim": 8,
+    "alpha": 32,
+    "dropout": 0.0,
+    "dropout_position": "post",
+    "lora_A_init": "xavier",
+    "use_triton": True,
 }
 
 
@@ -2518,3 +2531,100 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+# ANSI color codes
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def test_vllm_lora_refit_sync_colocated(cluster, tokenizer):
+    """Test vLLM LoRA refit with sync engine and colocated setup."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = True
+    vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["dtensor_cfg"]["_v2"] = True
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = True
+
+    print(f"\n{CYAN}{BOLD}{'=' * 80}\n>>> CREATING DTENSOR POLICY\n{'=' * 80}{RESET}")
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    print(f"\n{CYAN}{BOLD}{'=' * 80}\n>>> CREATING VLLM POLICY\n{'=' * 80}{RESET}")
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy.finish_generation()
+
+    print(f"\n{YELLOW}{BOLD}{'=' * 80}\n>>> PREPARING REFIT INFO\n{'=' * 80}{RESET}")
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+    # take it outside statistics to get clean peak memory during refit
+    lm_policy.offload_before_refit()
+
+    print(
+        f"\n{YELLOW}{BOLD}{'=' * 80}\n>>> STARTING VLLM POLICY REFIT BASE MODEL WEIGHTS\n{'=' * 80}{RESET}"
+    )
+    refit_policy_generation(
+        lm_policy,
+        vllm_policy,
+        vllm_config["colocated"]["enabled"],
+        _refit_buffer_size_gb=1.5,
+        refit_base_model_weights=True,
+        refit_lora_weights=True,
+    )
+
+    print(f"\n{YELLOW}{BOLD}{'=' * 80}\n>>> GETTING LORA LAYERS\n{'=' * 80}{RESET}")
+    lora_layers = vllm_policy.get_lora_layers()[0][0]
+    for layer in lora_layers:
+        for a_weight in layer["a_weights"]:
+            assert torch.all(a_weight == 1)
+        for b_weight in layer["b_weights"]:
+            assert torch.all(b_weight == 0)
+
+
+def test_vllm_lora_generation(cluster, tokenizer):
+    """Test vLLM LoRA refit with sync engine and colocated setup."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = True
+    vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+
+    print(f"\n{CYAN}{BOLD}{'=' * 80}\n>>> CREATING VLLM POLICY\n{'=' * 80}{RESET}")
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy.prepare_for_generation()
+
+    print(f"\n{CYAN}{BOLD}{'=' * 80}\n>>> GENERATING TEXT\n{'=' * 80}{RESET}")
+    prompts = [
+        "What is the largest number, all of whose digits are 1 or 4, and whose digits add up to 12?"
+    ]
+    test_tokenizer = get_tokenizer({"name": model_name})
+    tokenized = test_tokenizer(
+        prompts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+        padding_side="right",
+    )
+    test_input_data = BatchedDataDict(
+        {
+            "input_ids": tokenized["input_ids"],
+            "input_lengths": tokenized["attention_mask"].sum(dim=1).to(torch.int32),
+        }
+    )
+    outputs = vllm_policy.generate(test_input_data, greedy=True)
+    output_ids = outputs["output_ids"]
+    generated_texts = test_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    print(
+        f"\n{CYAN}{BOLD}{'=' * 80}\n>>> GENERATED TEXT:\n{generated_texts}\n{'=' * 80}{RESET}"
+    )

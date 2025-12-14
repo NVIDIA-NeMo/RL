@@ -456,3 +456,29 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         assert worker_info is not None, "Should get worker info"
     finally:
         policy.shutdown()
+
+
+def test_dtensor_worker_v2_generate_lora_weights(two_gpu_virtual_cluster):
+    """Test that dtensor worker v2 can generate with LoRA weights."""
+    config = create_test_config(
+        model_name="Qwen/Qwen3-0.6B",
+        dtensor_v2=True,
+    )
+    lora_config = {
+        "enabled": True,
+        "target_modules": [],
+        "exclude_modules": [],
+        "match_all_linear": True,
+        "dim": 8,
+        "alpha": 32,
+        "dropout": 0.0,
+        "dropout_position": "post",
+        "lora_A_init": "xavier",
+    }
+    config["dtensor_cfg"]["lora_cfg"] = lora_config
+    lm_policy = Policy(
+        cluster=two_gpu_virtual_cluster,
+        config=config,
+        tokenizer=get_tokenizer(config["tokenizer"]),
+    )
+    lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=1024**3, kv_scales=None)
