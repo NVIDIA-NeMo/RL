@@ -16,6 +16,8 @@ replace-imports-with-any = [
   "numpy.*",
   "sphinx.*",
   "docutils.*",
+  "google.adk.*",
+  "google.genai.*",
 ]
 project-includes = [
   # TODO: enable these once we have 100 correctness
@@ -90,6 +92,10 @@ project-includes = [
   "nemo_rl/environments/rewards.py",
   "nemo_rl/environments/utils.py",
   "nemo_rl/environments/vlm_environment.py",
+  "nemo_rl/environments/simulated_user/__init__.py",
+  "nemo_rl/environments/simulated_user/adk_utils.py",
+  "nemo_rl/environments/simulated_user/prompt.py",
+  "nemo_rl/environments/simulated_user/unique_numbers.py",
   "nemo_rl/evals/__init__.py",
   "nemo_rl/evals/answer_parsing.py",
   "nemo_rl/experience/__init__.py",

@@ -46,7 +46,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
     terminateds: Tensor
-    answers: list[str | None] | None
+    answers: list[str | None] | None = None
 
 
 class EnvironmentInterface(abc.ABC, Generic[MetadataT]):

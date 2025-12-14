@@ -1,0 +1,49 @@
+# GRPO configuration for unique numbers environment
+defaults: "grpo_math_8B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 20
+  max_num_steps: 100
+  val_at_start: false
+
+data:
+  add_system_prompt: false
+  shuffle: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-adk"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+
+env:
+  unique_numbers:
+    cfg:
+      # Maximum number of conversation turns before episode terminates
+      max_turns: 15
+      # Minimum length of the randomly generated number list
+      min_length: 5
+      # Maximum length of the randomly generated number list
+      max_length: 10
+      # Maximum value for integers in the list (range: 0 to max_integer)
+      max_integer: 15
+
+logger:
+  wandb_enabled: True
+  wandb:
+    project: "grpo-simulated-adk"
+    name: "llama-8b-__NOW__"
+
+policy:
+  train_global_batch_size: 512
+  dynamic_batching:
+    enabled: False
+  tokenizer:
+    chat_template: '{%- if add_bos_token|default(false) %}{{ bos_token }}{% endif %}{% for message in messages %}{{ "<|start_header_id|>" + message.role + "<|end_header_id|>\n\n" + message.content | trim + "<|eot_id|>" }}{% endfor %}{% if add_generation_prompt %}{{ "<|start_header_id|>assistant<|end_header_id|>\n\n" }}{% endif %}'
+
+cluster:
+  gpus_per_node: 8
