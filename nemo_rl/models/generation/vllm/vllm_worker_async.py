@@ -552,6 +552,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
 
+                # TODO remove
+                if "strict" in msg or "The following fields" in msg:
+                    print(repr(msg))
+
                 # vLLM does not accept `strict` tool definitions and reporting it to the user is not useful either.
                 return "Added request" not in msg and "The following fields were present in the request but ignored: {'strict'}" not in msg
 
