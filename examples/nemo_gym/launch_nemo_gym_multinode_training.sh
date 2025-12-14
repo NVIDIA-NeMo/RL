@@ -22,9 +22,11 @@ EOF
 
 echo -e "Running command:\n$COMMAND"
 
+mount=$(findmnt -n -o TARGET --target .)
+
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
-MOUNTS=$PWD:$PWD \
+MOUNTS=$mount:$mount \
 sbatch \
     --nodes=$NUM_ACTOR_NODES \
     --account=$SLURM_ACCOUNT \
