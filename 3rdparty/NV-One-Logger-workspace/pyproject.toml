@@ -1,0 +1,9 @@
+[build-system]
+requires = ["setuptools", "wheel", "toml"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nv-one-logger-core"
+description = "Wrapper for nv-one-logger-core"
+requires-python = ">=3.8"
+dynamic = ["version", "dependencies"]

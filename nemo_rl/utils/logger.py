@@ -41,8 +41,31 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
+# Add 3rdparty to path to support vendored nv-one-logger
+import sys
+_3rd_party_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../3rdparty/nv-one-logger/nv_one_logger"))
+if os.path.isdir(_3rd_party_root):
+    # We need to add the src directories of the individual packages to sys.path
+    _core_src = os.path.join(_3rd_party_root, "one_logger_core/src")
+    _otel_src = os.path.join(_3rd_party_root, "one_logger_otel/src")
+    
+    if os.path.isdir(_core_src) and _core_src not in sys.path:
+        sys.path.append(_core_src)
+    if os.path.isdir(_otel_src) and _otel_src not in sys.path:
+        sys.path.append(_otel_src)
+
+from nv_one_logger.api.config import OneLoggerConfig as BaseOneLoggerConfig
+from nv_one_logger.api.one_logger_provider import OneLoggerProvider
+from nv_one_logger.core.attributes import Attributes
+from nv_one_logger.core.event import Event
+from nv_one_logger.core.span import StandardSpanName
+from nv_one_logger.otel.exporter.otel_exporter import OTelExporter
+from nv_one_logger.recorder.default_recorder import DefaultRecorder
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+HAVE_ONE_LOGGER = True
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -69,6 +92,12 @@ class MLflowConfig(TypedDict):
     artifact_location: NotRequired[str | None]
 
 
+class OneLoggerConfigDict(TypedDict):
+    project: str
+    name: str
+    enable_for_current_rank: NotRequired[bool]
+
+
 class GPUMonitoringConfig(TypedDict):
     collection_interval: int | float
     flush_interval: int | float
@@ -80,10 +109,12 @@ class LoggerConfig(TypedDict):
     swanlab_enabled: bool
     tensorboard_enabled: bool
     mlflow_enabled: bool
+    one_logger_enabled: bool
     wandb: WandbConfig
     tensorboard: NotRequired[TensorboardConfig]
     swanlab: NotRequired[SwanlabConfig]
     mlflow: NotRequired[MLflowConfig]
+    one_logger: NotRequired[OneLoggerConfigDict]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
@@ -428,6 +459,101 @@ class SwanlabLogger(LoggerInterface):
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to swanlab."""
         return
+
+
+class OneLogger(LoggerInterface):
+    """OneLogger backend."""
+
+    def __init__(self, cfg: OneLoggerConfigDict, log_dir: Optional[str] = None):
+        if not HAVE_ONE_LOGGER:
+            print("Warning: nv_one_logger not installed. OneLogger will be disabled.")
+            return
+
+        self.provider = OneLoggerProvider.instance()
+        project = cfg.get("project", "nemo_rl")
+        name = cfg.get("name", "nemo_rl_run")
+
+        if not self.provider.one_logger_ready:
+            # Configure OneLogger
+            one_logger_config = BaseOneLoggerConfig(
+                application_name=project,
+                session_tag_or_fn=name,
+                world_size_or_fn=lambda: int(os.environ.get("WORLD_SIZE", 1)),
+                enable_for_current_rank=cfg.get("enable_for_current_rank", True),
+            )
+
+            # Setup OTLP exporter
+            otel_endpoint = os.environ.get(
+                "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces"
+            )
+            os.environ["OTEL_SERVICE_NAME"] = project
+            otel_exporter = OTelExporter(
+                otel_span_exporter=OTLPSpanExporter(endpoint=otel_endpoint)
+            )
+
+            recorder = DefaultRecorder(exporters=[otel_exporter])
+            self.provider.configure(one_logger_config, recorder)
+            print(f"Initialized OneLogger for project {project}, run {name}")
+
+        self.recorder = self.provider.recorder
+
+        # Ensure we have an active application span
+        app_spans = self.recorder.get_active_spans_by_name(StandardSpanName.APPLICATION)
+        if app_spans:
+            self.app_span = app_spans[0]
+        else:
+            self.app_span = self.recorder.start(StandardSpanName.APPLICATION)
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        if not HAVE_ONE_LOGGER or not self.app_span:
+            return
+
+        attributes_dict = {"step": step}
+
+        for name, value in metrics.items():
+            if prefix:
+                name = f"{prefix}/{name}"
+            # OneLogger attributes support basic types.
+            if isinstance(value, (int, float, str, bool)):
+                attributes_dict[name] = value
+            elif isinstance(value, torch.Tensor) and value.numel() == 1:
+                attributes_dict[name] = value.item()
+
+        # Record as an event
+        self.recorder.event(
+            span=self.app_span,
+            event=Event.create(
+                name="metrics_update",
+                attributes=Attributes(attributes_dict),
+            ),
+        )
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        if not HAVE_ONE_LOGGER or not self.app_span:
+            return
+
+        flat_params = flatten_dict(params)
+        # Convert to supported types
+        valid_params = {}
+        for k, v in flat_params.items():
+            if isinstance(v, (int, float, str, bool)):
+                valid_params[k] = v
+            else:
+                valid_params[k] = str(v)
+
+        self.app_span.attributes.add_attributes(Attributes(valid_params))
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        pass
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        pass
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -825,14 +951,16 @@ class Logger(LoggerInterface):
         Parameters:
             cfg (LoggerConfig): Configuration mapping. Expected keys include:
                 - "log_dir": base directory for backend logs.
-                - "wandb_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled": booleans to enable backends.
-                - "wandb", "swanlab", "tensorboard", "mlflow": per-backend configuration dicts.
+                - "log_dir": base directory for backend logs.
+                - "wandb_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled", "one_logger_enabled": booleans to enable backends.
+                - "wandb", "swanlab", "tensorboard", "mlflow", "one_logger": per-backend configuration dicts.
                 - "monitor_gpus": boolean to enable Ray GPU monitoring.
                 - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
         self.swanlab_logger = None
+        self.one_logger = None
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -842,6 +970,11 @@ class Logger(LoggerInterface):
             os.makedirs(wandb_log_dir, exist_ok=True)
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
+
+        if cfg["one_logger_enabled"]:
+            # OneLogger needs no log dir setup
+            self.one_logger = OneLogger(cfg.get("one_logger", {}), log_dir=self.base_log_dir)
+            self.loggers.append(self.one_logger)
 
         if cfg["swanlab_enabled"]:
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
@@ -1457,6 +1590,10 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     new_log_dir = os.path.join(base_log_dir, f"exp_{next_exp_id:03d}")
 
     # Create the new log directory
+    os.makedirs(new_log_dir, exist_ok=True)
+
+    return new_log_dir
+
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir

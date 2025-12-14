@@ -283,6 +283,10 @@ logger:
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+  one_logger_enabled: false
+  one_logger:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"
