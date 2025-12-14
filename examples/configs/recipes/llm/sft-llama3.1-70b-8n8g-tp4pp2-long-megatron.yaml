@@ -29,7 +29,6 @@ policy:
       lr: 2.0e-05
       min_lr: 2.0e-05
       weight_decay: 0.01
-      bf16: true
       adam_beta2: 0.999
       adam_eps: 1.0e-08
       clip_grad: 0.0
