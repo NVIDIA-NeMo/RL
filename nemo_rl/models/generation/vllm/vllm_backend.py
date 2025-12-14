@@ -125,8 +125,27 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    def _apply_weight_name_mapping(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Apply weight name mapping if LoRA is enabled."""
+        new_weights = []
+        for name, w in weights:
+            new_name = name
+            if ".self_attn." in name and name.endswith("_proj.weight"):
+                new_name = name.replace("_proj.weight", "_proj.base_layer.weight")
+            if ".mlp." in name and name.endswith("_proj.weight"):
+                new_name = name.replace("_proj.weight", "_proj.base_layer.weight")
+            new_weights.append((new_name, w))
+        return new_weights
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self,
+        lora_config: dict[str, Any] = {},
+        refit_base_model_weights: bool = False,
+        refit_lora_weights: bool = True,
+    ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -183,7 +202,52 @@ class VllmInternalWorkerExtension:
                     # the fp8 load_weights additionally casts bf16 weights into fp8
                     fp8.load_weights(weights, self.model_runner)
                 else:
-                    self.model_runner.model.load_weights(weights=weights)
+                    if refit_base_model_weights:
+                        # Apply weight name mapping if LoRA is enabled
+                        if (
+                            lora_config
+                            and "enabled" in lora_config
+                            and lora_config["enabled"]
+                        ):
+                            weights = self._apply_weight_name_mapping(weights)
+                        self.model_runner.model.load_weights(weights=weights)
+                    elif refit_lora_weights:
+                        assert lora_config, (
+                            "lora_config is not provided, can not refit lora weights"
+                        )
+                        from nemo_rl.models.generation.lora import (
+                            LoRARequestWithCfgAndWeights,
+                            get_vllm_lora_metadata,
+                        )
+
+                        # Convert vLLM LoRAConfig object to dict for PEFTHelper
+                        # LoRAConfig(max_lora_rank=8, max_loras=1, fully_sharded_loras=False, max_cpu_loras=1, lora_dtype=torch.bfloat16, lora_extra_vocab_size=256, default_mm_loras=None, bias_enabled=False)
+
+                        lora_cfg_dict = dict(
+                            {
+                                "r": lora_config["dim"],
+                                "lora_alpha": lora_config["alpha"],
+                                "target_modules": lora_config["target_modules"],
+                            }
+                        )
+                        lora_metadata = get_vllm_lora_metadata()
+                        # Note: We don't need to remove the lora if it is already set max_loras = 1
+                        self.remove_lora(lora_id=lora_metadata["lora_int_id"])
+                        lora_request = LoRARequestWithCfgAndWeights(
+                            **lora_metadata,
+                            lora_cfg=lora_cfg_dict,
+                            lora_weights=dict(
+                                {
+                                    name_weight[0]: name_weight[1]
+                                    for name_weight in weights
+                                }
+                            ),
+                        )
+                        self.add_lora(lora_request=lora_request)
+                    else:
+                        raise ValueError(
+                            "refit_base_model_weights and refit_lora_weights cannot be both False"
+                        )
 
                 torch.cuda.current_stream().synchronize()
 
@@ -273,3 +337,9 @@ class VllmInternalWorkerExtension:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def get_lora_counts(self) -> int:
+        """Get the number of LoRA layers from the vLLM engine."""
+        results = self.list_loras()
+        print(f"Results: {results}")
+        return results
