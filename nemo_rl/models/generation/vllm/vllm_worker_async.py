@@ -125,9 +125,14 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    assert template_cut_start >= 0, (
-        "No EOS token ID found in the chat-templated messages!"
-    )
+    assert template_cut_start >= 0, f"""No EOS token ID found in the chat-templated messages!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
+
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
