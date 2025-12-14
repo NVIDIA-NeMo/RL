@@ -22,3 +22,5 @@ policy:
 logger:
   wandb:
     name: vlm-grpo-3b-megatron
+cluster:
+  gpus_per_node: 8

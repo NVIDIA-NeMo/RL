@@ -27,7 +27,6 @@ policy:
       lr: 2.0e-05
       min_lr: 1.99999e-05
       weight_decay: 0.01
-      bf16: true
     scheduler:
       lr_warmup_init: 1.9999e-65
 data:
