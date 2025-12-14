@@ -86,6 +86,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        # Default to False, will be overridden if LoRA is enabled
+        self.lora_enabled = False
+
         if megatron_enable:
             worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
@@ -109,6 +112,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
+            lora_cfg = config.get("dtensor_cfg", {}).get("lora_cfg", {})
+            self.lora_enabled = lora_cfg.get("enabled", False)
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
 
@@ -118,10 +123,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                     )
             else:
-                assert (
-                    config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
-                    is False
-                ), "LoRA is not supported for DTensorPolicyWorker V1"
+                assert not self.lora_enabled, (
+                    "LoRA is not supported for DTensorPolicyWorker V1"
+                )
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
@@ -758,13 +762,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = True,
     ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_ipc_zmq",
             buffer_size_bytes=buffer_size_bytes,
             kv_scales=kv_scales,
+            refit_base_model_weights=refit_base_model_weights,
+            refit_lora_weights=refit_lora_weights,
         )
         return futures
 

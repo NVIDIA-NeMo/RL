@@ -1689,6 +1689,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         return self.model.config
 
+    def _is_lora_weight(self, name: str) -> bool:
+        """Check if the weight is a lora weight."""
+        return (
+            name.endswith(".lora_A.weight")
+            or name.endswith(".lora_B.weight")
+            or name.endswith(".lora_scaling.weight")
+        )
+
+    def _is_base_model_weight(self, name: str) -> bool:
+        """Check if the weight is a base model weight."""
+        return not self._is_lora_weight(name)
+
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
@@ -1719,6 +1731,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
@@ -1734,8 +1748,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
+
+            Only yields LoRA weights when LoRA is enabled, otherwise yields all weights.
+            """
             for name, tensor in self.model.state_dict().items():
+                # Skip base model weights if skip_base_model_weights is True
+                if self._is_base_model_weight(name) and not refit_base_model_weights:
+                    continue
+
+                if self._is_lora_weight(name) and not refit_lora_weights:
+                    continue
+
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -1759,7 +1783,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication."""
         if kv_scales is not None:
@@ -1784,8 +1811,19 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
 
+        # Filter state dict to only include base model weights if skip_base_model_weights is True
+        def _filtered_state_dict_iterator():
+            """Iterator that yields only base model weights when skip_base_model_weights is True."""
+            for name, tensor in self.model.state_dict().items():
+                # Skip base model weights if skip_base_model_weights is True
+                if self._is_base_model_weight(name) and not refit_base_model_weights:
+                    continue
+                if self._is_lora_weight(name) and not refit_lora_weights:
+                    continue
+                yield (name, tensor)
+
         packed_broadcast_producer(
-            iterator=iter(self.model.state_dict().items()),
+            iterator=_filtered_state_dict_iterator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
