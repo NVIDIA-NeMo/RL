@@ -25,6 +25,8 @@ CONTAINER=$CONTAINER_IMAGE_PATH \
 MOUNTS=$PWD:$PWD \
 sbatch \
     --nodes=$NUM_ACTOR_NODES \
+    --account=$SLURM_ACCOUNT \
+    --partition=$SLURM_PARTITION \
     --time=4:0:0 \
     --job-name=$EXP_NAME \
     --gres=gpu:8 \
