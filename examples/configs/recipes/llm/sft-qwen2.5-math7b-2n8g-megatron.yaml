@@ -21,7 +21,6 @@ policy:
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
-      bf16: true
       adam_beta2: 0.999
       adam_eps: 1.0e-08
       use_distributed_optimizer: false
