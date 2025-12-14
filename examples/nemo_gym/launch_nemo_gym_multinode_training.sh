@@ -8,6 +8,8 @@ cd $REPO_LOCATION
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
+uv run nemo_rl/utils/prefetch_venvs.py
+
 HF_HOME=$PWD/.cache/ \
 HF_HUB_OFFLINE=1 \
 WANDB_API_KEY=$WANDB_API_KEY \
