@@ -545,15 +545,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # Logging
         ########################################
         print(
-            "Adding a vLLM logging filter so that the logs aren't spammed with `Added request ...` messages. This is to help errors pop up better and filter out noise."
+            "Adding a vLLM logging filter so that the logs aren't spammed with not useful messages like `Added request ...`. This is to help errors pop up better and filter out noise."
         )
 
-        class NoAddedRequestFilter(LoggingFilter):
+        class CleanLoggingFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
-                return "Added request" not in msg
 
-        vllm_async_llm_logger.addFilter(NoAddedRequestFilter())
+                # vLLM does not accept `strict` tool definitions and reporting it to the user is not useful either.
+                return "Added request" not in msg and "The following fields were present in the request but ignored: {'strict'}" not in msg
+
+        vllm_async_llm_logger.addFilter(CleanLoggingFilter())
 
         return app
 
