@@ -1,6 +1,10 @@
 # ----- PARAMETERS -----
 # WANDB_API_KEY, EXP_NAME, NUM_ACTOR_NODES, REPO_LOCATION, CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
 
+# ray.sub needs to be launched from the NeMo-RL root directory
+cd $REPO_LOCATION
+
+# Construct the command
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
@@ -18,8 +22,6 @@ EOF
 
 echo -e "Running command:\n$COMMAND"
 
-# ray.sub needs to be launched from the NeMo-RL root directory
-cd $REPO_LOCATION
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
 MOUNTS=$PWD:$PWD \
