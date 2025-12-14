@@ -165,6 +165,11 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_sort_results[rowidx] = result
         nemo_rl_results = nemo_rl_sort_results
 
+        nemo_rl_sort_results = [None] * nemo_gym_num_rows
+        for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
+            nemo_rl_sort_results[rowidx] = result
+        nemo_rl_results = nemo_rl_sort_results
+
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
         total_time = timing_metrics.pop("_run_rollouts_total")
