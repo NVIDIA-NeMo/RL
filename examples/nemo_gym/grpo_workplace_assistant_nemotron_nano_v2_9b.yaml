@@ -1,12 +1,12 @@
 grpo:
   max_num_epochs: 1
-  num_prompts_per_step: 8
-  num_generations_per_prompt: 4
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
-  max_num_steps: 36 
+  max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 6
+  val_period: 10
   val_at_start: true
   overlong_filtering: false
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
@@ -44,7 +44,6 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo-workplace-assistant-nemotron-nano-v2-9b"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
