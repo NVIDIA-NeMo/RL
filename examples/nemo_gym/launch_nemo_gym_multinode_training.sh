@@ -8,12 +8,9 @@ cd $REPO_LOCATION
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
-source /opt/nemo_rl_venv/bin/activate
-uv sync --group={build,docs,dev,test} --extra nemo_gym
-uv run nemo_rl/utils/prefetch_venvs.py
-
 HF_HOME=$PWD/.cache/ \
 WANDB_API_KEY=$WANDB_API_KEY \
+NRL_FORCE_REBUILD_VENVS=true \
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++cluster.num_nodes=$NUM_ACTOR_NODES \
     ++logger.wandb.name=$EXP_NAME \
