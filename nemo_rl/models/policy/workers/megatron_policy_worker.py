@@ -103,10 +103,6 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.fp8 import (
-    convert_calibration_to_vllm_format,
-    get_vllm_qkv_scale_names,
-)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -2139,6 +2135,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
         """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import get_vllm_qkv_scale_names
+
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
@@ -2544,6 +2542,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             { "format": "fp8", "percentile": float, "margin": float,
               "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
         """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import convert_calibration_to_vllm_format
 
         # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
         # Defaults align with FP8 e4m3 max magnitude.
