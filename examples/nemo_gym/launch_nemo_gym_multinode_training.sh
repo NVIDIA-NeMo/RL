@@ -22,6 +22,8 @@ cd $REPO_LOCATION
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
+rm -rf /opt/ray_venvs/*
+
 HF_HOME=$PWD/.cache/ \
 WANDB_API_KEY=$WANDB_API_KEY \
 NRL_FORCE_REBUILD_VENVS=true \
