@@ -97,7 +97,6 @@ def load_response_dataset(data_config, seed: int = 42):
             split=data_config["split"],
         )
     elif dataset_name == "tulu3_sft_mixture":
-        print("Loading allenai/tulu-3-sft-mixture for training and validation")
         base_dataset: Any = Tulu3SftMixtureDataset(
             test_size=data_config.get("test_size", 0.05),
             prompt_file=data_config.get("prompt_file", None),
