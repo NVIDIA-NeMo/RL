@@ -1850,7 +1850,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "tensor_model_parallel_size"
             ],
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
-            use_flashinfer_fused_rope=None,
+            use_flashinfer_fused_rope=False,
             unified_memory_level=unified_memory_level,
             max_tokens_override=max_tokens,
         )
