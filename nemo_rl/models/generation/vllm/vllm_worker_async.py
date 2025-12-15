@@ -529,16 +529,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             pass
 
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            request_logger=serving_chat_kwargs["request_logger"],
-            chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs[
-                "chat_template_content_format"
-            ],
-        )
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(**serving_chat_kwargs)
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
