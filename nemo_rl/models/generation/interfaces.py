@@ -223,20 +223,6 @@ class GenerationInterface(ABC):
         pass
 
     @abstractmethod
-    def set_p2p_comm_group_address_and_port(
-        self, comm_group_address_and_port: list[tuple[str, int]]
-    ) -> None:
-        """Set the p2p communication group address and port."""
-        pass
-
-    @abstractmethod
-    def init_p2p(
-        self, total_rounds: int, init_p2p_round: int
-    ) -> list[ray.ObjectRef]:
-        """Initialize the p2p communication."""
-        pass
-
-    @abstractmethod
     def generate(
         self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
     ) -> BatchedDataDict["GenerationOutputSpec"]:
@@ -267,10 +253,6 @@ class GenerationInterface(ABC):
         """Update the model weights from collective communication."""
         raise NotImplementedError
     
-    def update_weights_via_p2p(self) -> list[ray.ObjectRef]:
-        """Update the model weights from p2p communication."""
-        raise NotImplementedError
-
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:

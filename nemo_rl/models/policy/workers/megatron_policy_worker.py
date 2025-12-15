@@ -130,7 +130,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_comm_producer, packed_broadcast_producer
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 try:
     from megatron.core.distributed import (
@@ -889,54 +889,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
-
-    def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
-    ) -> None:
-        """Initialize the collective communication."""
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-
-        # world_size = train_world_size + inference_world_size
-        # variable train_world_size is used in inference cluster
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
-        )
-        device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
-
-    def set_p2p_comm_group_address_and_port(
-        self, comm_group_address_and_port: tuple[str, int]
-    ) -> None:
-        """Set the p2p communication group address and port."""
-        self.p2p_comm_group_address_and_port = comm_group_address_and_port
-
-    def init_p2p(
-        self, total_rounds: int, init_p2p_round: int
-    ) -> None:
-        """Initialize the p2p communication."""
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-
-        if self.rank % total_rounds != init_p2p_round:
-            return
-        self.p2p_dst = (self.rank % 2) ^ 1
-        ip, port = self.p2p_comm_group_address_and_port
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=(self.rank % 2), world_size=2
-        )
-        device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
-
-    def is_alive(self):
-        return True
-
-    def reset_peak_memory_stats(self) -> None:
-        torch.cuda.reset_peak_memory_stats()
-
-    def get_gpu_info(self):
-        """Return information about the GPU being used by this worker."""
-        return get_gpu_info(self.model)
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -2139,24 +2091,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_iter_func=lambda x: x[1],
         )
 
-    @torch.no_grad()
-    def stream_weights_via_p2p(self) -> None:
-        """Send the weights for p2p communication."""
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-        
-        # param_iterator will return (name, tensor), we only need tensor
-        packed_comm_producer(
-            iterator=hf_params_generator,
-            group=self.model_update_group,
-            collective_type="p2p",
-            collective_arg=self.p2p_dst,
-            post_iter_func=lambda x: x[1],
-        )
-
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -2411,21 +2345,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         raise NotImplementedError(
             "Loading checkpoints outside of the init function is not yet implemented for Megatron policy."
         )
-
-    def shutdown(self):
-        """Shutdown the policy."""
-        # Clean up extension resources like ZMQ sockets
-        if hasattr(self, "zmq_socket"):
-            self.zmq_socket.close()
-            self.zmq_context.term()
-
-    def start_gpu_profiling(self) -> None:
-        """Start GPU profiling."""
-        torch.cuda.profiler.start()
-
-    def stop_gpu_profiling(self) -> None:
-        """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
 
     def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Report the node IP and GPU ID of the current worker."""

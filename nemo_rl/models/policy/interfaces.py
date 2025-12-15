@@ -165,18 +165,6 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def set_p2p_comm_group_address_and_port(
-        self, comm_group_address_and_port: list[tuple[str, int]]
-    ) -> None:
-        pass
-
-    @abstractmethod
-    def init_p2p(
-        self, init_p2p_round: int
-    ) -> list[ray.ObjectRef]:
-        pass
-
-    @abstractmethod
     def offload_before_refit(self) -> None:
         pass
 
@@ -202,10 +190,6 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
-        pass
-
-    @abstractmethod
-    def stream_weights_via_p2p(self) -> list[ray.ObjectRef]:
         pass
 
     @abstractmethod

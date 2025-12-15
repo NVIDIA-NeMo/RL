@@ -372,63 +372,6 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
-    
-    def set_p2p_comm_group_address_and_port(
-        self, comm_group_address_and_port: list[tuple[str, int]]
-    ) -> None:
-        """Set the p2p communication group address and port."""
-        data_splitted = []
-        total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_group = total_workers // self.dp_size
-        for i in range(self.dp_size):
-            data_splitted.append(
-                comm_group_address_and_port[i * workers_per_group : (i + 1) * workers_per_group]
-            )
-        
-        method_name = (
-            "set_p2p_comm_group_address_and_port_async" if self.cfg["vllm_cfg"]["async_engine"] else "set_p2p_comm_group_address_and_port"
-        )
-
-        futures = self.worker_group.run_all_workers_multiple_data(
-            method_name,
-            comm_group_address_and_port=data_splitted,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        return futures
-
-    def init_p2p(
-        self, total_rounds: int, init_p2p_round: int
-    ) -> list[ray.ObjectRef]:
-        """Initialize the p2p communication."""
-        # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "init_p2p_async" if self.cfg["vllm_cfg"]["async_engine"] else "init_p2p"
-        )
-        # Prepare rank
-        total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
-
-        # Send world_size and rank for init p2p to all workers
-        futures = self.worker_group.run_all_workers_multiple_data(
-            method_name,
-            rank_prefix=rank_prefix_list,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={
-                "total_rounds": total_rounds,
-                "init_p2p_round": init_p2p_round,
-            },
-        )
-        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
-        return futures
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -819,23 +762,6 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
     
-    def update_weights_via_p2p(self) -> list[ray.ObjectRef]:
-        """Update weights of the policy using p2p communication."""
-        print(f"Update weights via p2p, worker group: {self.worker_group}")
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-
-        # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "update_weights_via_p2p_async" if self.cfg["vllm_cfg"]["async_engine"] else "update_weights_via_p2p"
-        )
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name, 
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
-        return futures
-
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")

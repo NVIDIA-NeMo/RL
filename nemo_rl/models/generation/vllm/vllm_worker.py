@@ -424,23 +424,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 train_world_size,
             ),
         )
-    
-    def set_p2p_comm_group_address_and_port(
-        self, comm_group_address_and_port: list[tuple[str, int]]
-    ) -> None:
-        """Set the p2p communication group address and port."""
-        self.llm.collective_rpc(
-            "set_p2p_comm_group_address_and_port",
-            args=(comm_group_address_and_port,),
-        )
-
-    def init_p2p(
-        self, rank_prefix: int, total_rounds: int, init_p2p_round: int
-    ) -> None:
-        self.llm.collective_rpc(
-            "init_p2p",
-            args=(rank_prefix, total_rounds, init_p2p_round),
-        )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
@@ -650,38 +633,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
-
-    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
-        """Update weights from IPC handles via ZMQ socket."""
-        try:
-            assert self.llm is not None, (
-                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
-            )
-
-            if self.cfg["vllm_cfg"]["async_engine"]:
-                raise RuntimeError(
-                    "update_weights_via_ipc_zmq cannot be used with async_engine=True. Use update_weights_via_ipc_zmq_async instead."
-                )
-
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq",
-                args=tuple(),
-            )
-            worker_result = result_or_coro[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
-                )
-                return False
-            return True
-        except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:

@@ -603,23 +603,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
-    async def set_p2p_comm_group_address_and_port_async(
-        self, comm_group_address_and_port: list[tuple[str, int]]
-    ) -> None:
-        """Set the p2p communication group address and port."""
-        await self.llm.collective_rpc(
-            "set_p2p_comm_group_address_and_port",
-            args=(comm_group_address_and_port,),
-        )
-
-    async def init_p2p_async(
-        self, rank_prefix: int, total_rounds: int, init_p2p_round: int
-    ) -> None:
-        await self.llm.collective_rpc(
-            "init_p2p",
-            args=(rank_prefix, total_rounds, init_p2p_round),
-        )
-
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1018,42 +1001,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
-            )
-
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
-
-            worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
-                )
-                return False
-            return True
-        except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    async def update_weights_via_p2p_async(self) -> bool:
-        """Async version of update_weights_via_p2p."""
-        try:
-            assert self.llm is not None, (
-                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
-            )
-
-            if not self.cfg["vllm_cfg"]["async_engine"]:
-                raise RuntimeError(
-                    "update_weights_via_p2p_async can only be used with async_engine=True. Use update_weights_via_p2p instead."
-                )
-
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_p2p", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):

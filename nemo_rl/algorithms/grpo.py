@@ -595,15 +595,6 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-    elif grpo_config["refit_via_p2p"]:
-        assert colocated_inference, "P2P communication is only supported for colocated inference"
-        assert cluster.world_size() >= 2, "World size must be at least 2 for p2p communication"
-        t0 = time.perf_counter()
-        if policy_generation is not None:
-            init_p2p_between_policy_and_generation(
-                cluster, policy, policy_generation,
-            )
-        worker_init_timing_metrics["p2p_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -916,7 +907,6 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
-    refit_via_p2p: bool,
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
@@ -946,33 +936,25 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
-            if refit_via_p2p:
-                futures_train = policy.stream_weights_via_p2p()
-                futures_inference = policy_generation.update_weights_via_p2p()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # get model param keys, which is grouped by size
+            if _refit_buffer_size_gb is not None:
+                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
             else:
-                # get model param keys, which is grouped by size
-                if _refit_buffer_size_gb is not None:
-                    buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-                else:
-                    # Empirically sets ratio as 30% to maximize efficiency.
-                    # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                    buffer_size_bytes = int(
-                        policy.get_free_memory_bytes() * float(memory_ratio)
-                    )
-
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+                # Empirically sets ratio as 30% to maximize efficiency.
+                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+                buffer_size_bytes = int(
+                    policy.get_free_memory_bytes() * float(memory_ratio)
                 )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
@@ -1058,14 +1040,13 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
-    refit_via_p2p = master_config["grpo"]["refit_via_p2p"]
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference, refit_via_p2p)
+            refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1158,7 +1139,6 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            refit_via_p2p,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -1398,7 +1378,6 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            refit_via_p2p,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False

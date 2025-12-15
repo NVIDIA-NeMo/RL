@@ -17,7 +17,6 @@ import random
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
-import ray
 
 import numpy as np
 import torch
@@ -31,7 +30,6 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.utils.logger import Logger
 
 
@@ -784,59 +782,6 @@ def print_ip_and_gpu_id_of_workers(policy: ColocatablePolicyInterface, policy_ge
     if policy_generation is not None:
         policy_generation_results = policy_generation.report_node_ip_and_gpu_id()
         _print_in_table(policy_generation_results, "Generation workers mapping to Nodes and GPUs")
-
-
-def init_p2p_between_policy_and_generation(
-    colocated_cluster: RayVirtualCluster, 
-    policy: ColocatablePolicyInterface, 
-    policy_generation: GenerationInterface,
-) -> None:
-    """Initialize the p2p communication between the policy and the generation."""
-
-    def _find_peer(
-        train_worker_id: int, 
-        policy_node_and_gpu_id_list: list[tuple[str, int]], 
-        generation_node_and_gpu_id_to_worker_map: list[tuple[str, int]]
-    ) -> int:
-        train_node_ip, train_gpu_id = policy_node_and_gpu_id_list[train_worker_id]
-        gen_node_ip, gen_gpu_id = train_node_ip, (train_gpu_id ^ 1)
-        gen_worker_id = generation_node_and_gpu_id_to_worker_map[(gen_node_ip, gen_gpu_id)]
-        return gen_worker_id
-
-    world_size = colocated_cluster.world_size()
-    if world_size < 2:
-        raise ValueError("World size must be at least 2 for p2p communication")
-    
-    policy_node_and_gpu_id_list = policy.report_node_ip_and_gpu_id()
-    generation_node_and_gpu_id_list = policy_generation.report_node_ip_and_gpu_id()
-    generation_node_and_gpu_id_to_worker_map = { tup: idx for idx, tup in enumerate(generation_node_and_gpu_id_list)}
-
-    train_comm_group_address_and_port = []
-    for worker_id in range(world_size):
-        if colocated_cluster._sorted_bundle_indices is not None:
-            train_pg_idx = 0
-            train_bundle_idx = colocated_cluster._sorted_bundle_indices[worker_id]
-        else:
-            train_pg_idx = worker_id // colocated_cluster.num_gpus_per_node
-            train_bundle_idx = 0
-        ip, port = colocated_cluster.get_available_address_and_port(train_pg_idx, train_bundle_idx)
-        train_comm_group_address_and_port.append((ip, port))
-    ray.get(
-        policy.set_p2p_comm_group_address_and_port(train_comm_group_address_and_port)
-    )
-
-    gen_comm_group_address_and_port = []
-    for i in range(world_size):
-        gen_comm_group_address_and_port.append(train_comm_group_address_and_port[i ^ 1])
-    ray.get(
-        policy_generation.set_p2p_comm_group_address_and_port(gen_comm_group_address_and_port)
-    )
-
-    split = 1
-    for init_p2p_round in range(split):
-        futures_train = policy.init_p2p(split, init_p2p_round)
-        futures_inference = policy_generation.init_p2p(split, init_p2p_round)
-        ray.get(futures_train + futures_inference)
 
 
 def log_generation_metrics_to_wandb(
