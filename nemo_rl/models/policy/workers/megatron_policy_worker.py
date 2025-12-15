@@ -74,9 +74,9 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
-    LossCollection,
-    LogprobsCollection,
-    TopkLogitsCollection,
+    LossPostProcessor,
+    LogprobsPostProcessor,
+    TopkLogitsPostProcessor,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -306,11 +306,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(data_iterator_len)
 
-                loss_fn_wrapped = LossCollection(
+                loss_fn_wrapped = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
                 )
 
                 seqlen_key = "input_lengths" if self.cfg["sequence_packing"]["enabled"] else None
@@ -333,9 +331,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         num_microbatches=data_iterator_len,
                         seq_length=seq_dim_size,
                         mbs=mbs,
-                        collection_fn=loss_fn_wrapped,
+                        post_processing_fn=loss_fn_wrapped,
                         forward_only=eval_mode,
                         defer_fp32_logits=self.defer_fp32_logits,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
                     )
 
                 # Empty unused memory.
@@ -493,7 +493,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             seq_length=pp_seq_dim_size,
             mbs=mbs,
             num_microbatches=data_iterator_len,
-            collection_fn=LogprobsCollection(cfg=self.cfg),
+            post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
         )
@@ -619,7 +619,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             seq_length=pp_seq_dim_size,
             mbs=mbs,
             num_microbatches=data_iterator_len,
-            collection_fn=TopkLogitsCollection(cfg=self.cfg, k=k),
+            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
         )

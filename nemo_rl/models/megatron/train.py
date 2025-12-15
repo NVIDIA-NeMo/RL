@@ -25,11 +25,11 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.megatron.data import process_microbatch
 
 
-# Union type for any collection function (defined after classes below)
-CollectionFunction = Union[
-    "LossCollection",
-    "LogprobsCollection",
-    "TopkLogitsCollection",
+# Union type for any post-processing function (defined after classes below)
+PostProcessingFunction = Union[
+    "LossPostProcessor",
+    "LogprobsPostProcessor",
+    "TopkLogitsPostProcessor",
 ]
 
 
@@ -90,22 +90,24 @@ def model_forward(
         
     return output_tensor
 
-def forward_with_collection_fn(
+def forward_with_post_processing_fn(
     data_iterator: Iterator[BatchedDataDict[Any]],
     model: GPTModel,
     cfg: Dict[str, Any],
-    collection_fn: CollectionFunction,
+    post_processing_fn: PostProcessingFunction,
     seq_length_key: Optional[str] = None,
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = True,
+    global_valid_seqs: Optional[torch.Tensor] = None,
+    global_valid_toks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """
-    Perform forward pass with data processing and return output tensor and collection function.
+    Perform forward pass with data processing and return output tensor and post-processing function.
     
     This function handles data preprocessing (including sequence packing if enabled),
-    runs the forward step through the model, and prepares a collection function for
+    runs the forward step through the model, and prepares a post-processing function for
     post-processing the outputs.
     
     Args:
@@ -115,12 +117,12 @@ def forward_with_collection_fn(
         seq_length_key: Key for sequence length in data dict (optional)
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
-        collection_fn: Collection function to post-process the logits
+        post_processing_fn: Post-processing function to post-process the logits
         
     Returns:
-        tuple: (output_tensor, collection_fn_wrapped)
+        tuple: (output_tensor, post_processing_fn_wrapped)
             - output_tensor: Raw model outputs (logits)
-            - collection_fn_wrapped: Function to create output collection function when called
+            - post_processing_fn_wrapped: Function to create output post-processing function when called
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
     data_dict = next(data_iterator).to("cuda")
@@ -151,28 +153,30 @@ def forward_with_collection_fn(
         defer_fp32_logits,
     )
 
-    ## calling collection_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
-    # Use type checking to dispatch to the correct collection method
-    if isinstance(collection_fn, LossCollection):
-        collection_fn_wrapped = collection_fn(
+    ## calling post_processing_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
+    # Use type checking to dispatch to the correct post-processing method
+    if isinstance(post_processing_fn, LossPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             packed_seq_params=packed_seq_params,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
         )
-    elif isinstance(collection_fn, LogprobsCollection):
-        collection_fn_wrapped = collection_fn(
+    elif isinstance(post_processing_fn, LogprobsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
         )
-    elif isinstance(collection_fn, TopkLogitsCollection):
-        collection_fn_wrapped = collection_fn(
+    elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
         )
     else:
-        raise TypeError(f"Unknown collection function type: {type(collection_fn)}")
+        raise TypeError(f"Unknown post-processing function type: {type(post_processing_fn)}")
 
-    return output_tensor, collection_fn_wrapped
+    return output_tensor, post_processing_fn_wrapped
 
 def megatron_forward_backward(
     model: GPTModel,
@@ -185,9 +189,11 @@ def megatron_forward_backward(
     num_microbatches: int,
     seq_length: int,
     mbs: int,
-    collection_fn: CollectionFunction,
+    post_processing_fn: PostProcessingFunction,
     forward_only: bool = False,
     defer_fp32_logits: Optional[bool] = None,
+    global_valid_seqs: Optional[torch.Tensor] = None,
+    global_valid_toks: Optional[torch.Tensor] = None,
 ) -> Any:
     """
     Execute forward and backward passes using Megatron's utilities.
@@ -206,7 +212,7 @@ def megatron_forward_backward(
         num_microbatches (int): Number of microbatches to process
         seq_length (int): Sequence length
         mbs (int): Micro batch size
-        collection_fn: Collection function to post-process the logits
+        post_processing_fn: Post-processing function to post-process the logits
         forward_only (bool): If True, skip backward pass
         defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         
@@ -214,14 +220,16 @@ def megatron_forward_backward(
         BatchedDataDict: Results from the forward/backward execution
     """
     forward_step = partial(
-        forward_with_collection_fn,
+        forward_with_post_processing_fn,
         cfg=cfg,
         seq_length_key=seq_length_key,
         pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
         pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
-        collection_fn=collection_fn,
+        post_processing_fn=post_processing_fn,
         defer_fp32_logits=defer_fp32_logits,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -235,25 +243,26 @@ def megatron_forward_backward(
         forward_only=forward_only,
     )
 
-class LossCollection:
+class LossPostProcessor:
 
     def __init__(
         self,
         loss_fn: LossFunction,
         cfg: Dict[str, Any],
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
         cp_normalize: bool = True,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
-        self.global_valid_seqs = global_valid_seqs
-        self.global_valid_toks = global_valid_toks
         self.cp_normalize = cp_normalize
     
-    def __call__(self, data_dict: BatchedDataDict[Any], packed_seq_params: Optional[PackedSeqParams] = None) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
+    def __call__(self,
+        data_dict: BatchedDataDict[Any],
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        global_valid_seqs: Optional[torch.Tensor] = None,
+        global_valid_toks: Optional[torch.Tensor] = None,
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """
-        Create a loss collection function for training.
+        Create a loss post-processing function for training.
         
         This function wraps a loss function with the necessary context and parameters
         to compute loss and metrics from model outputs. It handles sequence packing
@@ -262,8 +271,6 @@ class LossCollection:
         Args:
             loss_fn: The base loss function to wrap
             cfg (dict): Configuration dictionary
-            global_valid_seqs: Global count of valid sequences
-            global_valid_toks: Global count of valid tokens
             data_dict: Batched data dictionary
             packed_seq_params: Parameters for packed sequences (optional)
             cp_normalize (bool): Whether to normalize by context parallel size
@@ -285,8 +292,8 @@ class LossCollection:
         loss_fn_wrapped = partial(
             loss_fn,
             data=data_dict,
-            global_valid_seqs=self.global_valid_seqs,
-            global_valid_toks=self.global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
             vocab_parallel_rank=get_tensor_model_parallel_rank(),
             vocab_parallel_group=get_tensor_model_parallel_group(),
             context_parallel_group=get_context_parallel_group(),
@@ -304,7 +311,7 @@ class LossCollection:
 
         return loss_fn_wrapped
 
-class LogprobsCollection:
+class LogprobsPostProcessor:
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
@@ -316,7 +323,7 @@ class LogprobsCollection:
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
-        Create a processor function that computes token log probabilities.
+        Create a post-processing function that computes token log probabilities.
 
         This function returns a processor that takes model logits and converts them
         to token-level log probabilities, handling both packed and unpacked sequences.
@@ -370,7 +377,7 @@ class LogprobsCollection:
         return processor_fn_inner
 
 
-class TopkLogitsCollection:
+class TopkLogitsPostProcessor:
 
     def __init__(self, cfg: Dict[str, Any], k: int):
         self.cfg = cfg
@@ -382,7 +389,7 @@ class TopkLogitsCollection:
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
-        Create a processor function that computes top-k logits and indices.
+        Create a post-processing function that computes top-k logits and indices.
 
         This function returns a processor that extracts the top-k highest logits
         and their corresponding vocabulary indices from model outputs. It handles
