@@ -321,6 +321,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         openai_serving_models = OpenAIServingModels(
             engine_client=engine_client,
+            model_config=model_config,
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
