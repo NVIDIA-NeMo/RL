@@ -165,6 +165,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             ],
         )
 
+        # Temporary workaround for the coupled train backend and vLLM.
+        # This will be removed once https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved.
+        if "generation" in config and not config["generation"]["colocated"]["enabled"]:
+            backend = config["generation"]["backend"]
+            worker_builder_cls += f"-{backend}"
+
         pre_init_queue = RayQueue()
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
