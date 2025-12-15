@@ -553,9 +553,6 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(
-    reason="Skipping mcore generation test to unblock mcore bump. Current issue summarized in https://github.com/NVIDIA-NeMo/RL/issues/1633"
-)
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",
