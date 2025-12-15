@@ -529,9 +529,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             pass
 
-        serving_tokenization_kwargs = serving_chat_kwargs.copy()
-        serving_tokenization_kwargs.pop("response_role")
-        serving_tokenization_kwargs.pop("return_tokens_as_token_ids")
+        serving_tokenization_kwargs = dict(
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
+            engine_client=serving_chat_kwargs["engine_client"],
+            models=serving_chat_kwargs["models"],
+        )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            serving_tokenization_kwargs["model_config"] = model_config
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(**serving_tokenization_kwargs)
 
         @app.post("/tokenize")
