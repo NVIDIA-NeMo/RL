@@ -289,6 +289,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm import __version__ as vllm_version
         from vllm.entrypoints.openai.api_server import (
             BaseModelPath,
             OpenAIServingChat,
@@ -319,12 +320,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
-        openai_serving_models = OpenAIServingModels(
+        openai_serving_models_kwargs = dict(
             engine_client=engine_client,
-            model_config=model_config,
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            openai_serving_models_kwargs["model_config"] = model_config
+        openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
