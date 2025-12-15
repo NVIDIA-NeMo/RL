@@ -1369,6 +1369,9 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
 
+        def decode(self, *args, **kwargs):
+            pass
+
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
