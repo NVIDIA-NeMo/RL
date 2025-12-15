@@ -107,7 +107,9 @@ def _replace_prefix_tokens(
             model_cut_end -= 1
 
     # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(template_prefix_token_ids), f"""Found possibly non-monotonically increasing trajectory!
+    assert len(template_token_ids) > len(
+        template_prefix_token_ids
+    ), f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -125,7 +127,9 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    assert template_cut_start >= 0, f"""No EOS token ID found in the chat-templated messages!
+    assert (
+        template_cut_start >= 0
+    ), f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -552,7 +556,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 msg = record.getMessage()
 
                 # vLLM does not accept `strict` tool definitions and reporting it to the user is not useful either.
-                return "Added request" not in msg and "The following fields were present in the request but ignored: {'strict'}" not in msg
+                return (
+                    "Added request" not in msg
+                    and "The following fields were present in the request but ignored: {'strict'}"
+                    not in msg
+                )
 
         vllm_async_llm_logger.addFilter(CleanLoggingFilter())
 
