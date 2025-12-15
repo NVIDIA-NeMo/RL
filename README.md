@@ -623,7 +623,7 @@ note = {GitHub repository},
 
 NeMo RL would like to acknowledge the adoption and contribution by the following community partners - Google, Argonne National Labs, Atlassian, Camfer, Domyn, Future House, Inflection AI, Lila, Paypal, Pegatron, PyTorch, Radical AI, Samsung, SB Instituition, Shanghai AI Lab, Speakleash, Sword Health, TII, NVIDIA Nemotron team, and many others.
 
-NeMo RL is the re-architected repo of [NeMo Aligner](https://github.com/NVIDIA/NeMo-Aligner), which was one of the earliest LLM Reinforcement Learning libraries, and has inspired other open source libraries such as [VeRL](https://github.com/volcengine/verl) and [ROLL](https://github.com/alibaba/ROLL).
+NeMo RL is the re-architected repo of [NeMo Aligner](https://github.com/NVIDIA/NeMo-Aligner), which was one of the earliest LLM Reinforcement Learning libraries, and has inspired other open-source libraries such as [VeRL](https://github.com/volcengine/verl), [SkyRL](https://github.com/NovaSky-AI/SkyRL) and [ROLL](https://github.com/alibaba/ROLL).
 
 We welcome contributions to NeMo RL! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
 
