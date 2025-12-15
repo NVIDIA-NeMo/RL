@@ -464,13 +464,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        openai_serving_chat = NeMoRLOpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            return_tokens_as_token_ids=True,
-            **serving_chat_kwargs,
+        serving_chat_kwargs.update(
+            dict(
+                engine_client=engine_client,
+                models=openai_serving_models,
+                return_tokens_as_token_ids=True,
+            )
         )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            serving_chat_kwargs["model_config"] = model_config
+        openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
 
