@@ -52,11 +52,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fsdp = [
-  "flash-attn==2.8.1",
-  "mamba-ssm",
-  "causal-conv1d",
-]
+fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
 automodel = [
   "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -80,9 +76,7 @@ vllm = [
   "num2words>=0.5.14",
 ]
 # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-vllm_for_train = [
-  "vllm==0.11.2",
-]
+vllm_for_train = ["vllm==0.11.0"]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
