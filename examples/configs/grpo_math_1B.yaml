@@ -82,7 +82,6 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
-  pin_memory_for_optim_offload: false
 
   dtensor_cfg:
     _v2: true

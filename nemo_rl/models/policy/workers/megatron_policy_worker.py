@@ -2174,7 +2174,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_logprob
         ):
-            self.move_optimizer("cpu", pin_memory=self.cfg["pin_memory_for_optim_offload"])
+            self.move_optimizer("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -2218,7 +2218,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
         ):
-            self.move_optimizer("cpu", pin_memory=self.cfg["pin_memory_for_optim_offload"])
+            self.move_optimizer("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -2298,7 +2298,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     model.load_state_dict(new_state_dict)
         return model
 
-    def move_optimizer(self, device: str, pin_memory: bool = False):
+    def move_optimizer(self, device: str):
         # Iterate through the state dictionaries for each parameter group
         if isinstance(self.optimizer, ChainedOptimizer):
             optimizer_state = self.optimizer.state
@@ -2312,10 +2312,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Move the tensor to device and update the state dictionary
                     if device == "cpu":
                         if v.is_cuda:
-                            if pin_memory:
-                                state[k] = v.cpu().pin_memory()
-                            else:
-                                state[k] = v.to("cpu")
+                            state[k] = v.to("cpu")
                     elif device == "cuda":
                         if not v.is_cuda:
                             state[k] = v.to("cuda")
