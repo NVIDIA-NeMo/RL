@@ -9,7 +9,6 @@ read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
 HF_HOME=$PWD/.cache/ \
-HF_HUB_OFFLINE=1 \
 WANDB_API_KEY=$WANDB_API_KEY \
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++cluster.num_nodes=$NUM_ACTOR_NODES \
