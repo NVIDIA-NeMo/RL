@@ -466,7 +466,6 @@ def setup(
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
-        train_cluster._init_placement_groups(strategy="PACK", use_unified_pg=True)
         p = Policy(
             cluster=train_cluster,
             config=policy_config,
@@ -538,8 +537,11 @@ def setup(
 
             # Execute both initializations in parallel
             parallel_start_time = time.perf_counter()
-            init_vllm()
-            init_policy()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                vllm_future = executor.submit(init_vllm)
+                policy_future = executor.submit(init_policy)
+                policy_generation, vllm_time = vllm_future.result()
+                policy, policy_time = policy_future.result()
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
