@@ -1164,6 +1164,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
