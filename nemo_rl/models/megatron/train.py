@@ -22,7 +22,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
-from nemo_rl.models.megatron.data import process_microbatch
+from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
 
 # Union type for any post-processing function (defined after classes below)
@@ -91,56 +91,46 @@ def model_forward(
     return output_tensor
 
 def forward_with_post_processing_fn(
-    data_iterator: Iterator[BatchedDataDict[Any]],
+    data_iterator: Iterator[ProcessedMicrobatch],
     model: GPTModel,
     cfg: Dict[str, Any],
     post_processing_fn: PostProcessingFunction,
-    seq_length_key: Optional[str] = None,
-    pad_individual_seqs_to_multiple_of: int = 1,
-    pad_packed_seq_to_multiple_of: int = 1,
-    pad_full_seq_to: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """
-    Perform forward pass with data processing and return output tensor and post-processing function.
+    Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
     
-    This function handles data preprocessing (including sequence packing if enabled),
+    This function takes a pre-processed microbatch (with sequence packing already handled),
     runs the forward step through the model, and prepares a post-processing function for
     post-processing the outputs.
     
     Args:
-        data_iterator: Iterator yielding batched data dictionaries
+        data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         model: The model to run forward pass on  
         cfg (dict): Configuration dictionary
-        seq_length_key: Key for sequence length in data dict (optional)
-        pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
-        pad_full_seq_to: Target length for full sequence padding (optional)
         post_processing_fn: Post-processing function to post-process the logits
+        defer_fp32_logits: Whether to defer FP32 conversion of logits
+        global_valid_seqs: Global valid sequence count for loss normalization
+        global_valid_toks: Global valid token count for loss normalization
         
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
             - output_tensor: Raw model outputs (logits)
             - post_processing_fn_wrapped: Function to create output post-processing function when called
     """
-    pack_sequences = cfg["sequence_packing"]["enabled"]
-    data_dict = next(data_iterator).to("cuda")
-    (
-        input_ids,
-        input_ids_cp_sharded,
-        attention_mask,
-        position_ids,
-        packed_seq_params,
-        cu_seqlens_padded,
-    ) = process_microbatch(
-        data_dict,
-        seq_length_key,
-        pad_individual_seqs_to_multiple_of,
-        pad_packed_seq_to_multiple_of,
-        pad_full_seq_to,
-        pack_sequences=pack_sequences,
-    )
+    # Get the pre-processed microbatch from the iterator
+    processed_mb = next(data_iterator)
+
+    # Extract the processed components
+    data_dict = processed_mb.data_dict
+    input_ids = processed_mb.input_ids
+    input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
+    attention_mask = processed_mb.attention_mask
+    position_ids = processed_mb.position_ids
+    packed_seq_params = processed_mb.packed_seq_params
+    cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
     output_tensor = model_forward(
         model,
@@ -181,11 +171,7 @@ def forward_with_post_processing_fn(
 def megatron_forward_backward(
     model: GPTModel,
     cfg: Dict[str, Any],
-    data_iterator: Iterator[BatchedDataDict[Any]],
-    seq_length_key: Optional[str],
-    pad_individual_seqs_to_multiple_of: int,
-    pad_packed_seq_to_multiple_of: int,
-    pad_full_seq_to: Optional[int],
+    data_iterator: Iterator[ProcessedMicrobatch],
     num_microbatches: int,
     seq_length: int,
     mbs: int,
@@ -205,16 +191,15 @@ def megatron_forward_backward(
     Args:
         model: The model to train
         cfg (dict): Configuration dictionary
-        data_iterator: Iterator providing training data batches
-        seq_length_key: Key for sequence length in data
-        pad_individual_seqs_to_multiple_of (int): Pad individual sequences to a multiple of this value
-        pad_full_seq_to (Optional[int]): Pad packed sequences to this value
+        data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         num_microbatches (int): Number of microbatches to process
         seq_length (int): Sequence length
         mbs (int): Micro batch size
         post_processing_fn: Post-processing function to post-process the logits
         forward_only (bool): If True, skip backward pass
         defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
+        global_valid_seqs: Global valid sequence count for loss normalization
+        global_valid_toks: Global valid token count for loss normalization
         
     Returns:
         BatchedDataDict: Results from the forward/backward execution
@@ -222,10 +207,6 @@ def megatron_forward_backward(
     forward_step = partial(
         forward_with_post_processing_fn,
         cfg=cfg,
-        seq_length_key=seq_length_key,
-        pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
-        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-        pad_full_seq_to=pad_full_seq_to,
         post_processing_fn=post_processing_fn,
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,

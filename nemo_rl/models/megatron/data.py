@@ -1,4 +1,5 @@
-from typing import Any, Iterator, Optional
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
 
@@ -14,20 +15,130 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 
 
+@dataclass
+class ProcessedMicrobatch:
+    """Container for a processed microbatch ready for model forward pass.
+
+    This dataclass holds both the original data dictionary and the processed
+    tensors needed for the Megatron model forward pass.
+
+    Attributes:
+        data_dict: The original BatchedDataDict containing raw batch data
+        input_ids: Processed input token IDs (may be packed for sequence packing)
+        input_ids_cp_sharded: Context-parallel sharded input token IDs
+        attention_mask: Attention mask tensor (None for packed sequences)
+        position_ids: Position IDs tensor (None for packed sequences)
+        packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
+        cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
+    """
+    data_dict: BatchedDataDict[Any]
+    input_ids: torch.Tensor
+    input_ids_cp_sharded: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    position_ids: Optional[torch.Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+    cu_seqlens_padded: Optional[torch.Tensor]
+
+
+def make_processed_microbatch_iterator(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    cfg: dict[str, Any],
+    seq_length_key: Optional[str],
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+) -> Iterator[ProcessedMicrobatch]:
+    """Wrap a raw microbatch iterator to yield processed microbatches.
+
+    This function takes a raw iterator that yields BatchedDataDict objects and
+    wraps it to yield ProcessedMicrobatch objects that contain both the original
+    data and the processed tensors ready for model forward pass.
+
+    Args:
+        raw_iterator: Iterator yielding raw BatchedDataDict microbatches
+        cfg: Configuration dictionary containing sequence_packing settings
+        seq_length_key: Key for sequence length in data dict (required for packing)
+        pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
+        pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
+        pad_full_seq_to: Target length for full sequence padding (optional)
+
+    Yields:
+        ProcessedMicrobatch objects containing processed tensors ready for model forward
+    """
+    pack_sequences = cfg["sequence_packing"]["enabled"]
+
+    for data_dict in raw_iterator:
+        # Move to GPU
+        data_dict = data_dict.to("cuda")
+
+        # Process the microbatch
+        (
+            input_ids,
+            input_ids_cp_sharded,
+            attention_mask,
+            position_ids,
+            packed_seq_params,
+            cu_seqlens_padded,
+        ) = process_microbatch(
+            data_dict,
+            seq_length_key,
+            pad_individual_seqs_to_multiple_of,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+            pack_sequences=pack_sequences,
+        )
+
+        yield ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids_cp_sharded,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+
+
 def get_microbatch_iterator(
     data: BatchedDataDict[Any],
     cfg: dict[str, Any],
     mbs: int,
-) -> tuple[Iterator, int, int, int, int, int, int]:
+    seq_length_key: Optional[str] = None,
+) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
+    """Create a processed microbatch iterator from a batch of data.
+
+    This function creates an iterator that yields ProcessedMicrobatch objects,
+    which contain both the original data dictionary and the processed tensors
+    ready for model forward pass.
+
+    Args:
+        data: The batch data to create microbatches from
+        cfg: Configuration dictionary
+        mbs: Microbatch size
+        seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+
+    Returns:
+        Tuple containing the iterator and metadata
+        - iterator: Iterator yielding ProcessedMicrobatch objects
+        - data_iterator_len: Number of microbatches in the iterator
+        - micro_batch_size: Size of each microbatch
+        - seq_dim_size: Sequence length dimension size
+        - padded_seq_length: Padded sequence length for pipeline parallelism (may differ from seq_length)
+    """
     micro_batch_size = mbs
     pad_factor = 1
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
+
+    # Auto-detect seq_length_key if not provided
+    if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
+        seq_length_key = "input_lengths"
+
     if cfg["dynamic_batching"]["enabled"]:
-        mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+        raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
-        mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+        raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
         )
@@ -41,18 +152,30 @@ def get_microbatch_iterator(
         )
         micro_batch_size = 1
     else:
-        mb_iterator = data.make_microbatch_iterator(mbs)
+        raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
 
     _, seq_dim_size = check_sequence_dim(data)
+
+    # Wrap the raw iterator with processing
+    processed_iterator = make_processed_microbatch_iterator(
+        raw_iterator=raw_iterator,
+        cfg=cfg,
+        seq_length_key=seq_length_key,
+        pad_individual_seqs_to_multiple_of=pad_factor,
+        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+        pad_full_seq_to=pad_full_seq_to,
+    )
+
+    # Compute padded sequence length for pipeline parallelism
+    padded_seq_length = pad_full_seq_to if pad_full_seq_to is not None else seq_dim_size
+
     return (
-        mb_iterator,
+        processed_iterator,
         data_iterator_len,
         micro_batch_size,
-        pad_factor,
-        pad_packed_seq_to_multiple_of,
-        pad_full_seq_to,
         seq_dim_size,
+        padded_seq_length,
     )
 
 def process_microbatch(

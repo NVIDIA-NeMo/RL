@@ -295,26 +295,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 )
 
                 (
-                    data_iterator,
-                    data_iterator_len,
-                    mbs,
-                    pad_factor,
-                    pad_packed_seq_to_multiple_of,
-                    pad_full_seq_to,
-                    seq_dim_size,
+                    iterator,
+                    num_microbatches,
+                    micro_batch_size,
+                    seq_length,
+                    padded_seq_length,
                 ) = get_microbatch_iterator(batch, self.cfg, mbs)
                 # Track total microbatches for MoE aux-loss averaging
-                total_num_microbatches += int(data_iterator_len)
+                total_num_microbatches += int(num_microbatches)
 
                 loss_fn_wrapped = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                 )
 
-                seqlen_key = "input_lengths" if self.cfg["sequence_packing"]["enabled"] else None
-
                 rerun_state_machine = get_rerun_state_machine()
-                while rerun_state_machine.should_run_forward_backward(data_iterator):
+                while rerun_state_machine.should_run_forward_backward(iterator):
                     # Set grad to zero.
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
@@ -323,14 +319,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
                         cfg=self.cfg,
-                        data_iterator=data_iterator,
-                        seq_length_key=seqlen_key,
-                        pad_individual_seqs_to_multiple_of=pad_factor,
-                        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to=pad_full_seq_to,
-                        num_microbatches=data_iterator_len,
-                        seq_length=seq_dim_size,
-                        mbs=mbs,
+                        data_iterator=iterator,
+                        num_microbatches=num_microbatches,
+                        seq_length=padded_seq_length,
+                        mbs=micro_batch_size,
                         post_processing_fn=loss_fn_wrapped,
                         forward_only=eval_mode,
                         defer_fp32_logits=self.defer_fp32_logits,
@@ -471,28 +463,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pp_grp = get_pipeline_model_parallel_group()
         
         (
-            mb_iterator,
-            data_iterator_len,
-            mbs,
-            pad_factor,
-            pad_packed_seq_to_multiple_of,
-            pad_full_seq_to,
-            input_seq_dim_size,
+            iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
         ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
-        
-        pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
         list_of_logprobs = megatron_forward_backward(
             model=self.model,
             cfg=self.cfg,
-            data_iterator=mb_iterator,
-            seq_length_key="input_lengths",
-            pad_individual_seqs_to_multiple_of=pad_factor,
-            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-            pad_full_seq_to=pad_full_seq_to,
-            seq_length=pp_seq_dim_size,
-            mbs=mbs,
-            num_microbatches=data_iterator_len,
+            data_iterator=iterator,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
             post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
@@ -501,7 +485,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
             for lp in all_logprobs:
-                padding_needed = input_seq_dim_size - lp.shape[1]
+                padding_needed = seq_length - lp.shape[1]
                 if padding_needed > 0:
                     lp = torch.nn.functional.pad(
                         lp, (0, padding_needed), mode="constant", value=0.0
@@ -597,28 +581,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.model.eval()
 
         (
-            mb_iterator,
-            data_iterator_len,
-            mbs,
-            pad_factor,
-            pad_packed_seq_to_multiple_of,
-            pad_full_seq_to,
-            input_seq_dim_size,
+            iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
         ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
-
-        pp_seq_dim_size = pad_full_seq_to or input_seq_dim_size
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,
             cfg=self.cfg,
-            data_iterator=mb_iterator,
-            seq_length_key="input_lengths",
-            pad_individual_seqs_to_multiple_of=pad_factor,
-            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-            pad_full_seq_to=pad_full_seq_to,
-            seq_length=pp_seq_dim_size,
-            mbs=mbs,
-            num_microbatches=data_iterator_len,
+            data_iterator=iterator,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
             post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
@@ -630,7 +606,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
-                pad_len = input_seq_dim_size - tk.shape[1]
+                pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
