@@ -602,6 +602,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             app,
             host="0.0.0.0",
             port=free_port,
+            timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
         )
         server = uvicorn.Server(config=config)
 
