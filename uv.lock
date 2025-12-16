@@ -2899,7 +2899,7 @@ requires-dist = [
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
-    { name = "nv-grouped-gemm", specifier = "~=1.1" },
+    { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", specifier = ">=0.33.0a0,<0.34.0" },
     { name = "nvidia-resiliency-ext", specifier = ">=0.4.0a0,<0.5.0" },
     { name = "nvtx", specifier = "~=0.2" },
@@ -3849,7 +3849,7 @@ wheels = [
 [[package]]
 name = "nv-grouped-gemm"
 version = "1.1.4.post7"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7#6dfaf60e6112166b8b82e9210b51c7f557956f0a" }
 dependencies = [
     { name = "numpy" },
     { name = "setuptools" },
@@ -3857,7 +3857,6 @@ dependencies = [
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
     { name = "wheel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/63/36/13d0a1e1af31c3b2a297c15b6e7da532b13361730b32d11d9698854bdbe3/nv_grouped_gemm-1.1.4.post7.tar.gz", hash = "sha256:bc9f7906c9b0bd7fefea5a776acbc277577c65b103181340fd26ca2b8460c6a5", size = 26520, upload-time = "2025-12-16T19:42:33.176Z" }
 
 [[package]]
 name = "nvidia-cublas-cu12"
