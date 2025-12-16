@@ -47,12 +47,8 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "squad":
         base_dataset = SquadDataset()
     elif dataset_name == "openmathinstruct2":
-        base_dataset = OpenMathInstruct2Dataset(
-            split=data_config["split"],
-            output_key=data_config["output_key"],
-            prompt_file=data_config["prompt_file"],
-            seed=seed,
-        )
+        # TODO: need test after SFT updated
+        base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "clevr_cogent":
         base_dataset = CLEVRCoGenTDataset(
             split=data_config["split"],
@@ -71,7 +67,7 @@ def load_response_dataset(data_config, seed: int = 42):
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
-        base_dataset: Any = OpenMathInstruct2Dataset(seed=seed)
+        base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
