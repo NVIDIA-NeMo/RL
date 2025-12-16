@@ -289,6 +289,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm import __version__ as vllm_version
         from vllm.entrypoints.openai.api_server import (
             BaseModelPath,
             OpenAIServingChat,
@@ -319,11 +320,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
-        openai_serving_models = OpenAIServingModels(
+        openai_serving_models_kwargs = dict(
             engine_client=engine_client,
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            openai_serving_models_kwargs["model_config"] = model_config
+        openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
@@ -459,13 +464,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        openai_serving_chat = NeMoRLOpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            return_tokens_as_token_ids=True,
-            **serving_chat_kwargs,
+        serving_chat_kwargs.update(
+            dict(
+                engine_client=engine_client,
+                models=openai_serving_models,
+                return_tokens_as_token_ids=True,
+            )
         )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            serving_chat_kwargs["model_config"] = model_config
+        openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
 
@@ -520,16 +529,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             pass
 
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
-            engine_client,
-            model_config,
-            openai_serving_models,
+        serving_tokenization_kwargs = dict(
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs[
-                "chat_template_content_format"
-            ],
+            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
+            engine_client=serving_chat_kwargs["engine_client"],
+            models=serving_chat_kwargs["models"],
         )
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        if vllm_version < "0.11.1":
+            serving_tokenization_kwargs["model_config"] = model_config
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(**serving_tokenization_kwargs)
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):

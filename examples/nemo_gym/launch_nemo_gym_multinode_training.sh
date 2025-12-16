@@ -24,7 +24,6 @@ cd ${REPO_LOCATION}
 
 HF_HOME=$PWD/.cache/ \
 WANDB_API_KEY=$WANDB_API_KEY \
-NRL_FORCE_REBUILD_VENVS=true \
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++cluster.num_nodes=$NUM_ACTOR_NODES \
     ++logger.wandb.name=$EXP_NAME \
