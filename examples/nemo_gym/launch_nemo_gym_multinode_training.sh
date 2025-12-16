@@ -22,8 +22,6 @@ cd $REPO_LOCATION
 read -r -d '' COMMAND <<EOF
 cd ${REPO_LOCATION}
 
-rm -rf /opt/ray_venvs/*
-
 HF_HOME=$PWD/.cache/ \
 WANDB_API_KEY=$WANDB_API_KEY \
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
