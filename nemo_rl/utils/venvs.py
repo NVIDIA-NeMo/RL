@@ -95,7 +95,28 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync"], env=env, check=True)
+    #
+    # IMPORTANT:
+    # This function can run inside Ray tasks, where the current working directory is NOT guaranteed
+    # to be the NeMo RL repo root. If we run `uv sync` without pinning the project, uv may fail with:
+    #   "No `pyproject.toml` found in current directory or any parent directory"
+    #
+    # We therefore pin the project root via (in priority order):
+    #   1) NEMO_RL_PROJECT_ROOT (recommended; set by ray.sub)
+    #   2) SLURM_SUBMIT_DIR (common in SLURM environments)
+    #   3) The directory containing this file (repo-local fallback for dev runs)
+    project_root = (
+        os.environ.get("NEMO_RL_PROJECT_ROOT")
+        or os.environ.get("SLURM_SUBMIT_DIR")
+        or str(Path(__file__).resolve().parents[2])
+    )
+    subprocess.run(["uv", "sync", "--project", project_root], env=env, check=True)
+    
+    # Also inject --project into exec_cmd if it starts with 'uv'
+    # This ensures that 'uv run --extra vllm ...' works correctly
+    if exec_cmd and exec_cmd[0] == "uv":
+        # Insert --project after 'uv' and before subcommand
+        exec_cmd = [exec_cmd[0], "--project", project_root] + exec_cmd[1:]
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
