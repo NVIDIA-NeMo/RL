@@ -112,6 +112,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
+                assert (
+                    config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+                    is False
+                ), "LoRA is not supported for DTensorPolicyWorker V1"
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]

@@ -171,6 +171,9 @@ logger:
   wandb:
     project: "rm-dev"
     name: "rm-dev-${data.dataset_name}"
+  swanlab:
+    project: "rm-dev"
+    name: "rm-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-rm-dev-${data.dataset_name}"
   gpu_monitoring:
