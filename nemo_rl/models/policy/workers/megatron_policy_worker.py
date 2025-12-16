@@ -591,6 +591,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
             "moe_router_bias_update_rate"
         ]
+        model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"][
+            "moe_enable_deepep"
+        ]
+        model_cfg.moe_token_dispatcher_type = self.cfg["megatron_cfg"][
+            "moe_token_dispatcher_type"
+        ]
+        model_cfg.moe_shared_expert_overlap = self.cfg["megatron_cfg"][
+            "moe_shared_expert_overlap"
+        ]
 
         model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
