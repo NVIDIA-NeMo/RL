@@ -91,7 +91,7 @@ class CompiledGraphExecutor:
         Args:
             workers: List of Ray actor handles for all workers
             sharding_annotations: NamedSharding describing worker organization (PP, TP, CP, DP)
-            method_name: Name of the method to call on workers (e.g., "train", "get_logprobs")
+            method_name: Name of the method to call on workers (e.g., "train")
             dp_rank: Which DP shard this executor handles (default 0 for DP=1 case)
             overlap_communication: Overlap GPU compute and communication (experimental)
         """
@@ -203,17 +203,10 @@ class CompiledGraphExecutor:
                 for idx, worker in enumerate(tp_cp_workers):
                     if self.method_name == "train":
                         dag_node = worker.train_compiled.bind(input_dict)
-                    elif self.method_name == "get_logprobs":
-                        # TODO: Add get_logprobs_compiled wrapper if needed
-                        dag_node = worker.get_logprobs.bind(
-                            data=input_dict["data"],
-                            micro_batch_size=input_dict.get("micro_batch_size"),
-                        )
                     else:
                         # For other methods, look for a _compiled variant
                         method = getattr(worker, f"{self.method_name}_compiled", None)
                         if method is not None:
-                            # Use positional binding
                             dag_node = method.bind(input_dict)
                         else:
                             raise NotImplementedError(
@@ -415,7 +408,9 @@ def should_use_compiled_graph(config: Optional[dict[str, Any]]) -> bool:
     return config.get("enabled", False)
 
 
-def get_compiled_graph_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+def get_compiled_graph_config(
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Get configuration for Ray Compiled Graph.
 
     Args:
@@ -458,11 +453,13 @@ class CompiledGraphWorkerGroup:
 
         Args:
             worker_group: The underlying RayWorkerGroup to wrap
-            compiled_graph_config: Configuration for compiled graph (or None to use env vars)
+            compiled_graph_config: Configuration for compiled graph (or None to use defaults)
         """
         self.worker_group = worker_group
-        self.config = compiled_graph_config or get_compiled_graph_config()
-        self.compiled_executors: dict[str, CompiledGraphExecutor] = {}
+        self.config = get_compiled_graph_config(compiled_graph_config)
+        self.compiled_executors: dict[
+            str, CompiledGraphExecutor | MultiDPCompiledGraphExecutor
+        ] = {}
 
         if self.config["enabled"]:
             logger.info("Ray Compiled Graph is ENABLED for this worker group")
@@ -473,14 +470,14 @@ class CompiledGraphWorkerGroup:
 
     def _get_or_create_executor(
         self, method_name: str
-    ) -> Optional[CompiledGraphExecutor]:
+    ) -> CompiledGraphExecutor | MultiDPCompiledGraphExecutor | None:
         """Get or create a compiled graph executor for a method.
 
         Args:
             method_name: Name of the method to execute
 
         Returns:
-            CompiledGraphExecutor if compiled graphs are enabled, None otherwise
+            CompiledGraphExecutor or MultiDPCompiledGraphExecutor if compiled graphs are enabled, None otherwise
         """
         if not self.config["enabled"]:
             return None
@@ -750,18 +747,9 @@ class CompiledGraphWorkerGroup:
                         for tp_rank in range(tp_size):
                             # Only return from rank 0 of replicated axes
                             should_return = (
-                                (
-                                    "context_parallel" not in output_is_replicated
-                                    or cp_rank == 0
-                                )
-                                and (
-                                    "tensor_parallel" not in output_is_replicated
-                                    or tp_rank == 0
-                                )
-                                and (
-                                    "pipeline_parallel" not in output_is_replicated
-                                    or pp_rank == 0
-                                )
+                                ("context_parallel" not in output_is_replicated or cp_rank == 0)
+                                and ("tensor_parallel" not in output_is_replicated or tp_rank == 0)
+                                and ("pipeline_parallel" not in output_is_replicated or pp_rank == 0)
                             )
                             if should_return:
                                 return_from_workers.append(ref_idx)
