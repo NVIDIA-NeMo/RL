@@ -18,15 +18,11 @@ import tempfile
 import pytest
 from transformers import AutoTokenizer
 
-from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
 
 
-@pytest.fixture
-def sample_data(request):
-    input_key = request.param[0]
-    output_key = request.param[1]
-
+def create_sample_data(input_key, output_key):
     train_data = [
         {input_key: "Hello", output_key: "Hi there!"},
         {input_key: "How are you?", output_key: "I'm good, thanks!"},
@@ -52,64 +48,42 @@ def sample_data(request):
     return train_path, val_path
 
 
-@pytest.mark.parametrize("sample_data", [("input", "output")], indirect=True)
-def test_dataset_initialization(sample_data):
+@pytest.fixture(scope="function")
+def tokenizer():
+    """Initialize tokenizer for the test model."""
+    tokenizer = get_tokenizer({"name": "Qwen/Qwen3-0.6B"})
+    return tokenizer
+
+
+@pytest.mark.parametrize(
+    "input_key,output_key", [("input", "output"), ("question", "answer")]
+)
+def test_response_dataset(input_key, output_key, tokenizer):
     # load the dataset
-    train_path, val_path = sample_data
+    train_path, val_path = create_sample_data(input_key, output_key)
     data_config = {
         "dataset_name": "ResponseDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
+        "input_key": input_key,
+        "output_key": output_key,
     }
     dataset = load_response_dataset(data_config)
 
-    assert dataset.input_key == "input"
-    assert dataset.output_key == "output"
-    assert "train" in dataset.formatted_ds
-    assert "validation" in dataset.formatted_ds
+    # check the input and output keys
+    assert dataset.input_key == input_key
+    assert dataset.output_key == output_key
 
-
-@pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
-def test_custom_keys(sample_data):
-    # load the dataset
-    train_path, val_path = sample_data
-    data_config = {
-        "dataset_name": "ResponseDataset",
-        "train_data_path": train_path,
-        "val_data_path": val_path,
-        "input_key": "question",
-        "output_key": "answer",
-    }
-    dataset = load_response_dataset(data_config)
-
-    assert dataset.input_key == "question"
-    assert dataset.output_key == "answer"
-
-
-@pytest.mark.hf_gated
-@pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
-def test_message_formatting(sample_data):
-    # load the dataset
-    train_path, val_path = sample_data
-    data_config = {
-        "dataset_name": "ResponseDataset",
-        "train_data_path": train_path,
-        "val_data_path": val_path,
-        "input_key": "question",
-        "output_key": "answer",
-    }
-    dataset = load_response_dataset(data_config)
-
+    # check the first example
     first_example = dataset.formatted_ds["train"][0]
 
-    assert first_example["messages"][0]["role"] == "user"
-    assert first_example["messages"][0]["content"] == "Hello"
-    assert first_example["messages"][1]["role"] == "assistant"
-    assert first_example["messages"][1]["content"] == "Hi there!"
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert first_example["task_name"] == "ResponseDataset"
 
-    chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
-    tokenizer = AutoTokenizer.from_pretrained("Meta-Llama/Meta-Llama-3-8B-Instruct")
-
+    # check the combined message
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
     combined_message = tokenizer.apply_chat_template(
         first_example["messages"],
         chat_template=chat_template,
@@ -117,10 +91,7 @@ def test_message_formatting(sample_data):
         add_generation_prompt=False,
         add_special_tokens=False,
     )
-
-    assert combined_message == "".join(
-        message["content"] for message in first_example["messages"]
-    )
+    assert combined_message == " Question: Hello Answer: Hi there!"
 
 
 @pytest.mark.hf_gated
