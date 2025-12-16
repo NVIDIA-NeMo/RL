@@ -1201,6 +1201,11 @@ def test_vllm_http_server(cluster, tokenizer):
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        message = d["choices"][0]["message"]
+        if "reasoning" in message:
+            message.pop("reasoning")
+
         return d
 
     assert _standardize(expected_result) == _standardize(actual_result)
