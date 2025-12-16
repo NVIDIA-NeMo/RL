@@ -49,7 +49,7 @@ class OpenMathInstruct2Dataset(RawDataset):
 
         # format the dataset
         self.dataset = self.dataset.map(
-            self.add_messages_key,
+            self.format_data,
             remove_columns=self.dataset.column_names,
         )
 
@@ -62,7 +62,7 @@ class OpenMathInstruct2Dataset(RawDataset):
             self.dataset = split_dataset["train"]
             self.val_dataset = split_dataset["test"]
 
-    def add_messages_key(self, data: dict[str, Any]) -> dict[str, Any]:
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "messages": [
                 {"role": "user", "content": data[self.input_key]},
