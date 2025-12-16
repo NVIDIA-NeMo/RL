@@ -23,7 +23,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.49.2",
-  "transformers>=4.57.1",
+  "transformers==4.57.1",
   "wandb",
   "numpy",
   "datasets>=4.0.0",
@@ -175,7 +175,7 @@ members = [
   "3rdparty/Megatron-Bridge-workspace",
   "3rdparty/Gym-workspace",
   # Research projects are also added here in order for them to share the global root level uv.lock.
-  # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly 
+  # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
   # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
@@ -220,7 +220,7 @@ link-mode = "copy"
 override-dependencies = [
   "transformer-engine[pytorch]==2.8.0",
   "opencv-python-headless>=4.11.0",
-  "transformers>=4.57.1",
+  "transformers==4.57.1",
   "timm<=1.0.22",
 ]
 
