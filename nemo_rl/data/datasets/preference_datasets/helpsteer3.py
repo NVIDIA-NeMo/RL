@@ -19,11 +19,7 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def to_preference_data_format(
-    data: dict[str, Any],
-) -> dict[
-    str, list[dict[str, int | list[dict[str, str | Any]]]] | list[dict[str, str]]
-]:
+def to_preference_data_format(data: dict[str, Any]) -> dict:
     response_1 = data["response1"]
     response_2 = data["response2"]
     overall_preference = data["overall_preference"]
@@ -43,10 +39,13 @@ def to_preference_data_format(
         chosen = response_2
         rejected = response_1
 
+    if isinstance(data["context"], str):
+        context = [{"role": "user", "content": data["context"]}]
+    else:
+        context = data["context"]
+
     return {
-        "context": [{"role": "user", "content": data["context"]}]
-        if isinstance(data["context"], str)
-        else data["context"],
+        "context": context,
         "completions": [
             {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
             {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},
@@ -59,8 +58,11 @@ class HelpSteer3Dataset:
 
     def __init__(self) -> None:
         ds = load_dataset("nvidia/HelpSteer3", "preference")
+        self.task_name = "HelpSteer3"
         self.formatted_ds = ds.map(to_preference_data_format)
-
+        self.formatted_ds = self.formatted_ds.map(
+            lambda _: {"task_name": self.task_name}
+        )
         self.task_spec = TaskDataSpec(
-            task_name="HelpSteer3",
+            task_name=self.task_name,
         )

@@ -35,6 +35,9 @@ pytestmark = pytest.mark.run_first
 if not OmegaConf.has_resolver("mul"):
     OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
+if not OmegaConf.has_resolver("max"):
+    OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
+
 
 def validate_config_section(
     section_config: Dict[str, Any],

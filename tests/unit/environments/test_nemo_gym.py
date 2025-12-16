@@ -155,11 +155,12 @@ def test_nemo_gym_sanity(
     # We need to match NeMo RL generation config params before sending to NeMo-Gym
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
-    for example in examples:
+    for idx, example in enumerate(examples):
         example["responses_create_params"]["temperature"] = generation_config[
             "temperature"
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["_rowidx"] = idx
 
     actual_result, _ = ray.get(
         nemo_gym.run_rollouts.remote(
@@ -195,11 +196,6 @@ def test_nemo_gym_sanity(
         return d
 
     def _standardize(l: list[dict]):
-        # Sort by input_message_log token_ids to ensure deterministic ordering
-        # since NeMo-Gym returns results in completion order, not input order
-        standardized = list(map(_standardize_single_result, l))
-        return sorted(
-            standardized, key=lambda d: tuple(d["input_message_log"][0]["token_ids"])
-        )
+        return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)

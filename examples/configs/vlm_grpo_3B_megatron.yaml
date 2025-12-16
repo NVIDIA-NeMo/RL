@@ -183,6 +183,7 @@ data:
   prompt_file: examples/prompts/clevr_cogent_cot.txt
   system_prompt_file: null
   dataset_name: clevr-cogent
+  env_name: "clevr-cogent"
   split: trainA
   shuffle: true
   num_workers: 1
@@ -219,6 +220,9 @@ logger:
   mlflow_enabled: false
   monitor_gpus: false
   wandb:
+    project: grpo-dev
+    name: vlm-grpo-3b-megatron
+  swanlab:
     project: grpo-dev
     name: vlm-grpo-3b-megatron
   tensorboard: {}

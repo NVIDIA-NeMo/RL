@@ -15,6 +15,8 @@
 
 import os
 import subprocess
+import sys
+import tomllib
 
 import setuptools
 from setuptools import Extension
@@ -35,8 +37,118 @@ megatron_core_python_package_source_dir = "Megatron-LM/megatron/core"
 megatron_core_package_name = "megatron.core"
 
 # Path for the C++ extension's source file, relative to setup.py
-# This path is taken from your original setup.py
 megatron_core_cpp_extension_source_file = "megatron/core/datasets/helpers.cpp"
+
+# Cached dependencies: default + dev from pyproject.toml
+# VCS dependencies use full "pkg @ git+URL@rev" format matching pyproject.toml [tool.uv.sources]
+CACHED_DEPENDENCIES = [
+    # Default dependencies from pyproject.toml
+    "torch",
+    "numpy<2.0.0",
+    "packaging>=24.2",
+    # Dev dependencies from pyproject.toml
+    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
+    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
+    "tqdm",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "multi-storage-client~=0.27",
+    "opentelemetry-api~=1.33.1",
+    "setuptools<80.0.0",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "nv-grouped-gemm~=1.1",
+    "megatron-energon[av_decode]~=6.0",
+    "av<16.0.0",
+    "flashinfer-python",
+    "wget",
+    "onnxscript",
+    "flash-linear-attention~=0.3.2",
+    # VCS dependency - must match pyproject.toml [tool.uv.sources]
+    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
+]
+
+
+def build_vcs_dependency(pkg_name: str, source_info: dict) -> str:
+    """Build a PEP 440 VCS dependency string from pyproject.toml [tool.uv.sources] entry."""
+    git_url = source_info.get("git")
+    rev = source_info.get("rev")
+    if not git_url:
+        raise ValueError(f"No git URL found for VCS dependency: {pkg_name}")
+    if not rev:
+        raise ValueError(f"No rev/commit found for VCS dependency: {pkg_name}")
+    return f"{pkg_name} @ git+{git_url}@{rev}"
+
+
+# Read pyproject.toml to validate dependencies
+pyproject_path = os.path.join("Megatron-LM", "pyproject.toml")
+
+if os.path.exists(megatron_core_python_package_source_dir):
+    if not os.path.exists(pyproject_path):
+        raise FileNotFoundError(
+            f"[megatron-core][setup] {pyproject_path} not found; skipping dependency consistency check."
+        )
+
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    # Extract [tool.uv.sources] for VCS dependencies
+    uv_sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+
+    # Combine default dependencies + dev optional-dependencies
+    project = data["project"]
+    default_deps = project.get("dependencies", [])
+    optional_deps = project.get("optional-dependencies", {})
+    dev_deps = optional_deps.get("dev", [])
+
+    submodule_deps = set(str(d).strip() for d in default_deps + dev_deps)
+
+    # Build expected dependencies, converting any in [tool.uv.sources] to full VCS strings
+    submodule_deps_with_vcs = set()
+    for dep in submodule_deps:
+        if dep in uv_sources:
+            # Replace with full VCS string constructed from [tool.uv.sources]
+            vcs_dep = build_vcs_dependency(dep, uv_sources[dep])
+            submodule_deps_with_vcs.add(vcs_dep)
+        else:
+            submodule_deps_with_vcs.add(dep)
+
+    cached_deps_set = set(CACHED_DEPENDENCIES)
+
+    missing_in_cached = submodule_deps_with_vcs - cached_deps_set
+    extra_in_cached = cached_deps_set - submodule_deps_with_vcs
+
+    if missing_in_cached or extra_in_cached:
+        print(
+            "[megatron-core][setup] Dependency mismatch between Megatron-LM-workspace/Megatron-LM/pyproject.toml vs Megatron-LM-workspace/setup.py::CACHED_DEPENDENCIES.",
+            file=sys.stderr,
+        )
+        if missing_in_cached:
+            print(
+                "  - Present in Megatron-LM/pyproject.toml (default+dev) but missing from CACHED_DEPENDENCIES:",
+                file=sys.stderr,
+            )
+            for dep in sorted(missing_in_cached):
+                print(f"    * {dep}", file=sys.stderr)
+        if extra_in_cached:
+            print(
+                "  - Present in CACHED_DEPENDENCIES but not in Megatron-LM/pyproject.toml (default+dev):",
+                file=sys.stderr,
+            )
+            for dep in sorted(extra_in_cached):
+                print(f"    * {dep}", file=sys.stderr)
+        print(
+            "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        print(
+            "[megatron-core][setup] Dependency sets are consistent with the submodule pyproject (default+dev).",
+            file=sys.stderr,
+        )
 
 # Check if the main directory for the megatron.core Python package exists
 if os.path.exists(megatron_core_python_package_source_dir):
@@ -74,25 +186,5 @@ setuptools.setup(
     ext_modules=final_ext_modules,
     # Add in any packaged data.
     include_package_data=True,
-    install_requires=[
-        # From requirements/pytorch_25.03/requirements.txt
-        "einops",
-        "flask-restful",
-        "nltk",
-        "pytest",
-        "pytest-cov",
-        "pytest_mock",
-        "pytest-random-order",
-        "sentencepiece",
-        "tiktoken",
-        "wrapt",
-        "zarr",
-        "wandb",
-        "tensorstore!=0.1.46,!=0.1.72",
-        "torch",
-        "nvidia-modelopt[torch]>=0.23.2; sys_platform != 'darwin'",
-        # From megatron/core/requirements.txt
-        "torch",  # Repeated with ^ just to make it easy to map back to the original requirements.txt
-        "packaging",
-    ],
+    install_requires=CACHED_DEPENDENCIES,
 )
