@@ -88,7 +88,7 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch]==2.8.0",
+  "transformer-engine[pytorch]==2.10.0",
   "megatron-core",
   "megatron-bridge",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -208,7 +208,7 @@ link-mode = "copy"
 # The TE override is needed because automodel/mbridge we are on is still on 2.5.0
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
 override-dependencies = [
-  "transformer-engine[pytorch]==2.8.0",
+  "transformer-engine[pytorch]==2.10.0",
   "opencv-python-headless>=4.11.0",
 ]
 
