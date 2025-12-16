@@ -34,6 +34,7 @@ class ResponseDataset(RawDataset):
         output_key: Key for the output text
         split: Split name for the training data, used for HuggingFace datasets, default is None
         split_validation_size: Size of the validation data, default is 0
+        seed: Seed for training/validation split when split_validation_size > 0, default is 42
     """
 
     def __init__(
@@ -56,7 +57,7 @@ class ResponseDataset(RawDataset):
         # format the dataset
         if "messages" not in self.dataset.column_names:
             self.dataset = self.dataset.map(
-                self.add_messages_key,
+                self.format_data,
                 remove_columns=self.dataset.column_names,
             )
         else:
@@ -73,7 +74,7 @@ class ResponseDataset(RawDataset):
             self.dataset = split_dataset["train"]
             self.val_dataset = split_dataset["test"]
 
-    def add_messages_key(self, data: dict[str, Any]) -> dict[str, Any]:
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "messages": [
                 {"role": "user", "content": data[self.input_key]},
