@@ -17,6 +17,7 @@ from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
+from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -27,9 +28,11 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
+# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
 def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
@@ -93,6 +96,15 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(
             split=data_config["split"],
         )
+    elif dataset_name == "tulu3_sft_mixture":
+        base_dataset: Any = Tulu3SftMixtureDataset(
+            test_size=data_config.get("test_size", 0.05),
+            prompt_file=data_config.get("prompt_file", None),
+            max_samples=data_config.get("max_samples", None),
+            seed=seed,
+        )
+    elif dataset_name == "HelpSteer3":
+        base_dataset: Any = HelpSteer3Dataset()
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
@@ -120,6 +132,19 @@ def load_response_dataset(data_config, seed: int = 42):
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
+    base_dataset.set_task_spec(data_config)
+    # Skip sft datasets, the run_sft.py has not been refactored yet.
+    # TODO: refactor run_sft.py to use the new processor interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
+    if dataset_name not in [
+        "open_assistant",
+        "squad",
+        "openmathinstruct2",
+        "clevr_cogent",
+        "openai_format",
+        "tulu3_sft_mixture",
+    ]:
+        base_dataset.set_processor()
+
     return base_dataset
 
 
@@ -134,4 +159,6 @@ __all__ = [
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
+    "Tulu3SftMixtureDataset",
+    "HelpSteer3Dataset",
 ]
