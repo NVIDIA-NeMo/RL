@@ -47,7 +47,7 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "squad":
         base_dataset = SquadDataset()
     elif dataset_name == "openmathinstruct2":
-        # TODO: need test after SFT updated
+        # TODO: test after SFT updated
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "clevr_cogent":
         base_dataset = CLEVRCoGenTDataset(
@@ -79,6 +79,7 @@ def load_response_dataset(data_config, seed: int = 42):
         )
         base_dataset: Any = DAPOMath17KDataset(seed=seed)
     # for vlm rl training
+    # TODO: test after GRPO-VLM updated
     elif dataset_name == "clevr-cogent":
         base_dataset: Any = CLEVRCoGenTDataset(
             split=data_config["split"],
