@@ -228,6 +228,7 @@ class AutomodelCheckpointManager:
         model_name: str,
         hf_cache_dir: Optional[str] = None,
         dequantize_base_checkpoint: bool = False,
+        peft_init_method: Optional[str] = None,
     ) -> None:
         """Load base model weights using the Automodel Checkpointer.
 
@@ -261,7 +262,7 @@ class AutomodelCheckpointManager:
             device=torch.cuda.current_device(),
             root_dir=hf_cache_dir or TRANSFORMERS_CACHE,
             model_name=model_name,
-            peft_init_method=None,
+            peft_init_method=peft_init_method,
             load_base_model=True,
         )
 

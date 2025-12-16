@@ -21,7 +21,6 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
-import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 from accelerate import init_empty_weights
@@ -249,8 +248,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         lora_cfg = self.cfg["dtensor_cfg"].get("lora_cfg", None)
         self.peft_config = None
         self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
-        # patch the init_lora_weights method to use the xavier initialization
-        _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
         if self.lora_enabled:
             if self.cfg["dtensor_cfg"]["tensor_parallel_size"] > 1:
                 assert not lora_cfg["use_triton"], (
@@ -418,6 +415,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "dequantize_base_checkpoint": self.cfg.get(
                     "dequantize_base_checkpoint", False
                 ),
+                "is_peft": self.lora_enabled,
             },
         )
         self.checkpoint_manager.set_model_state_dict_keys(self.model_state_dict_keys)
@@ -431,6 +429,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             dequantize_base_checkpoint=self.cfg.get(
                 "dequantize_base_checkpoint", False
             ),
+            peft_init_method=self.peft_config.lora_A_init
+            if self.peft_config is not None
+            else None,
         )
 
         # Handle tied word embeddings after loading the state dict
@@ -716,7 +717,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
 
                     with get_train_context(False, False, context_parallel_ctx)():
-                        with nullcontext():
+                        with torch.autocast(device_type="cuda", dtype=self.dtype):
                             model_args = dict(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
@@ -1056,7 +1057,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     )
 
                 with get_train_context(False, False, context_parallel_ctx)():
-                    with nullcontext():
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
