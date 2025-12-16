@@ -246,13 +246,21 @@ policy:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
   shuffle: true
   num_workers: 1
+  # dataset
+  prompt_file: "examples/prompts/cot.txt"
+  system_prompt_file: null
   processor: "math_hf_data_processor"
   env_name: "math"
-  dataset_name: "OpenMathInstruct-2"
+  train:
+    dataset_name: ResponseDataset
+    data_path: nvidia/OpenMathInstruct-2
+    input_key: "problem"
+    output_key: "expected_answer"
+    split: "train_1M"
+    split_validation_size: 0.05 # use 5% of the training data as validation data
+  validation: null # no external validation data
   # You can use custom response datasets for training and validation. For example:
   #   data:
   #     dataset_name: ResponseDataset
