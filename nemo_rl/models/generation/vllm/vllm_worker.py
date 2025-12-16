@@ -634,9 +634,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
-        """Update the model weights from collective communication."""
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
+    def update_weights_via_ipc_zmq(self) -> bool:
+        """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
@@ -644,11 +644,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
+                    "update_weights_via_ipc_zmq cannot be used with async_engine=True. Use update_weights_via_ipc_zmq_async instead."
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_via_ipc_zmq",
+                args=tuple(),
             )
             worker_result = result_or_coro[0]
 
@@ -665,8 +666,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_p2p")
-    def update_weights_via_p2p(self) -> bool:
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -675,11 +676,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_via_p2p can only be used with async_engine=False. Use update_weights_via_p2p_async instead."
+                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_via_p2p", args=tuple()
+                "update_weights_from_collective", args=tuple()
             )
             worker_result = result_or_coro[0]
 

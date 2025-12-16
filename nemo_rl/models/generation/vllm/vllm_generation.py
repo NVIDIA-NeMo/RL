@@ -761,7 +761,7 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
-    
+
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")

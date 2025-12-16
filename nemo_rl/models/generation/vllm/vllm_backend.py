@@ -248,6 +248,10 @@ class VllmInternalWorkerExtension:
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+
+            # Process weights after loading for FP8 KV cache
+            self._maybe_process_fp8_kv_cache()
+
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

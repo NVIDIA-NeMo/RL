@@ -42,7 +42,6 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
-    init_p2p_between_policy_and_generation,
     print_ip_and_gpu_id_of_workers,
 )
 from nemo_rl.data import DataConfig

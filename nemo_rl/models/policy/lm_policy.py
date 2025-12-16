@@ -767,13 +767,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
-    
-    def stream_weights_via_p2p(self) -> list[ray.ObjectRef]:
-        """Send the weights for p2p communication."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_p2p"
-        )
-        return futures
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
