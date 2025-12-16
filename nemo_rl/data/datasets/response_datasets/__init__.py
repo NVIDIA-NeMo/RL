@@ -107,24 +107,7 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = HelpSteer3Dataset()
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
-        if "train_data_path" not in data_config:
-            raise ValueError(
-                "train_data_path is required when dataset_name is not one of the built-ins."
-            )
-        extra_kwargs = get_extra_kwargs(
-            data_config,
-            [
-                "val_data_path",
-                "input_key",
-                "output_key",
-                "train_split",
-                "val_split",
-            ],
-        )
-        base_dataset = ResponseDataset(
-            train_data_path=data_config["train_data_path"],
-            **extra_kwargs,
-        )
+        base_dataset = ResponseDataset(**data_config, seed=seed)
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "

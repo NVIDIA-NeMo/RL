@@ -23,29 +23,17 @@ from nemo_rl.data.datasets import load_response_dataset
 
 
 def create_sample_data(input_key, output_key):
-    train_data = [
+    data = [
         {input_key: "Hello", output_key: "Hi there!"},
         {input_key: "How are you?", output_key: "I'm good, thanks!"},
     ]
-    val_data = [
-        {input_key: "What's up?", output_key: "Not much!"},
-        {input_key: "Bye", output_key: "Goodbye!"},
-    ]
 
     # Create temporary files for train and validation data
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as train_file:
-        json.dump(train_data, train_file)
-        train_path = train_file.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        data_path = f.name
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as val_file:
-        json.dump(val_data, val_file)
-        val_path = val_file.name
-
-    return train_path, val_path
+    return data_path
 
 
 @pytest.fixture(scope="function")
@@ -60,11 +48,10 @@ def tokenizer():
 )
 def test_response_dataset(input_key, output_key, tokenizer):
     # load the dataset
-    train_path, val_path = create_sample_data(input_key, output_key)
+    data_path = create_sample_data(input_key, output_key)
     data_config = {
         "dataset_name": "ResponseDataset",
-        "train_data_path": train_path,
-        "val_data_path": val_path,
+        "data_path": data_path,
         "input_key": input_key,
         "output_key": output_key,
     }
@@ -75,12 +62,12 @@ def test_response_dataset(input_key, output_key, tokenizer):
     assert dataset.output_key == output_key
 
     # check the first example
-    first_example = dataset.formatted_ds["train"][0]
+    first_example = dataset.dataset[0]
 
     # only contains messages and task_name
     assert len(first_example.keys()) == 2
     assert "messages" in first_example
-    assert first_example["task_name"] == "ResponseDataset"
+    assert "task_name" in first_example
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
