@@ -14,6 +14,7 @@
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from functools import lru_cache
@@ -71,8 +72,6 @@ def create_local_venv(
     # Force rebuild if requested
     if force_rebuild and os.path.exists(venv_path):
         logger.info(f"Force rebuilding venv at {venv_path}")
-        import shutil
-
         shutil.rmtree(venv_path)
 
     logger.info(f"Creating new venv at {venv_path}")
@@ -88,6 +87,10 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+
+    # Set TORCH_CUDA_ARCH_LIST for grouped_gemm & DeepEP installation. Hopper+ architectures are supported.
+    if "TORCH_CUDA_ARCH_LIST" not in env:
+        env["TORCH_CUDA_ARCH_LIST"] = "9.0 10.0 12.0"
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)

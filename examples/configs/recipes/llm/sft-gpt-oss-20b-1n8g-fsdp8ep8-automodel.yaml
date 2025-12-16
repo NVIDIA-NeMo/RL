@@ -1,0 +1,28 @@
+defaults: ../../sft.yaml
+policy:
+  model_name: openai/gpt-oss-20b
+  train_global_batch_size: 128
+  train_micro_batch_size: 8
+  max_total_sequence_length: 512
+  dequantize_base_checkpoint: true
+  automodel_model_kwargs:
+    backend:
+      _target_: nemo_automodel.components.moe.utils.BackendConfig
+      attn: te
+      linear: te
+      rms_norm: te
+      enable_deepep: true
+      fake_balanced_gate: false
+      enable_hf_state_dict_adapter: true
+  dtensor_cfg:
+    expert_parallel_size: 8
+    data_parallel_size: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      store_param_remainders: true
+      master_weights: true
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+checkpointing:
+  checkpoint_dir: results/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel
