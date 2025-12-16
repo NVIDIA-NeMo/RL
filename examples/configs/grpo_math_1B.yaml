@@ -248,28 +248,29 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   shuffle: true
   num_workers: 1
+
   # dataset
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   processor: "math_hf_data_processor"
   env_name: "math"
   train:
-    dataset_name: ResponseDataset
-    data_path: nvidia/OpenMathInstruct-2
-    input_key: "problem"
-    output_key: "expected_answer"
-    split: "train_1M"
+    dataset_name: OpenMathInstruct-2
     split_validation_size: 0.05 # use 5% of the training data as validation data
-  validation: null # no external validation data
+  validation: null
   # You can use custom response datasets for training and validation. For example:
-  #   data:
+  #   train:
   #     dataset_name: ResponseDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
+  #     data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
   #     input_key: <QuestionKey>, default is "input"
   #     output_key: <AnswerKey>, default is "output"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  #     split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  #   validation:
+  #     dataset_name: ResponseDataset
+  #     data_path: <PathToValidationDataset>
+  #     input_key: <QuestionKey>, default is "input"
+  #     output_key: <AnswerKey>, default is "output"
+  #     split: <ValidationSplit>, default is None  # used for HuggingFace datasets
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
 
 env:

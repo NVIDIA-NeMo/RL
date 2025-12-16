@@ -42,7 +42,7 @@ class ResponseDataset(RawDataset):
         input_key: str = "input",
         output_key: str = "output",
         split: Optional[str] = None,
-        split_validation_size: int = 0,
+        split_validation_size: float = 0,
         seed: int = 42,
         **kwargs,
     ):
@@ -59,7 +59,7 @@ class ResponseDataset(RawDataset):
             remove_columns=self.dataset.column_names,
         )
 
-        # used when current dataset both for training and validation
+        # use only when current dataset is used for both training and validation
         self.val_dataset = None
         if split_validation_size > 0:
             split_dataset = self.dataset.train_test_split(
