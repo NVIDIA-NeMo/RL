@@ -20,6 +20,7 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
+from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -304,6 +305,17 @@ class BaseVllmGenerationWorker:
         vllm_kwargs["hf_overrides"].update(
             self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
         )
+
+        # Override HF config for gpt-oss models to ensure compatibility with megatron
+        # The megatron --> hf export is done in bf16, so we disable quantization
+        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
+            if "quantization_config" in hf_config:
+                assert load_format == "dummy", (
+                    "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
+                )
+                # disable quantization
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
 
         llm_kwargs = dict(
             model=self.model_name,
