@@ -23,12 +23,17 @@ checkpointing:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "clevr_cogent"
   add_bos: true
   add_eos: true
   add_generation_prompt: false
-  split: trainA
+  # dataset
   prompt_file: null
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
 
 logger:
   log_dir: "logs"  # Base directory for all logs

@@ -112,7 +112,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
 
     # add preprocessor if needed
     datum_preprocessor = None
-    if "dataset_name" in data_config and data_config["dataset_name"] == "clevr_cogent":
+    if "dataset_name" in data_config and data_config["dataset_name"] == "clevr-cogent":
         from nemo_rl.data.datasets.response_datasets.clevr import (
             format_clevr_cogent_dataset,
         )
