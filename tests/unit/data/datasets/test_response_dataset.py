@@ -82,51 +82,6 @@ def test_response_dataset(input_key, output_key, tokenizer):
     assert combined_message == " Question: Hello Answer: Hi there!"
 
 
-@pytest.mark.parametrize("output_key", ["expected_answer", "generated_solution"])
-def test_openmathinstruct2_dataset(output_key, tokenizer):
-    # load the dataset
-    data_config = {
-        "dataset_name": "OpenMathInstruct-2",
-        "output_key": output_key,
-        "split_validation_size": 0.05,
-    }
-    dataset = load_response_dataset(data_config)
-
-    # check the first example
-    first_example = dataset.dataset[0]
-    first_val_example = dataset.val_dataset[0]
-
-    # only contains messages and task_name
-    assert len(first_example.keys()) == 2
-    assert "messages" in first_example
-    assert "task_name" in first_example
-
-    assert first_example["messages"][0]["content"][:20] == "An octahedron has ei"
-    if output_key == "expected_answer":
-        assert first_example["messages"][1]["content"][:20] == "\\frac{8\\sqrt{3}}{3}"
-    elif output_key == "generated_solution":
-        assert first_example["messages"][1]["content"][:20] == "Let's denote the poi"
-
-    # check the combined message
-    messages = [first_example["messages"], first_val_example["messages"]]
-    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
-    combined_message = tokenizer.apply_chat_template(
-        messages,
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=False,
-        add_special_tokens=False,
-    )
-
-    for i in range(2):
-        assert combined_message[i] == (
-            " Question: "
-            + messages[i][0]["content"]
-            + " Answer: "
-            + messages[i][1]["content"]
-        )
-
-
 def test_helpsteer3_dataset():
     # load the dataset
     data_config = {"dataset_name": "HelpSteer3"}
@@ -272,6 +227,62 @@ def test_build_in_dataset(dataset_name, tokenizer):
             + first_example["messages"][0]["content"]
             + " Answer: "
             + first_example["messages"][1]["content"]
+        )
+
+
+@pytest.mark.parametrize(
+    "dataset_name,output_key",
+    [
+        ("OpenMathInstruct-2", "expected_answer"),
+        ("OpenMathInstruct-2", "generated_solution"),
+        ("tulu3_sft_mixture", None),
+    ],
+)
+def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokenizer):
+    # load the dataset
+    data_config = {
+        "dataset_name": dataset_name,
+        "output_key": output_key,
+        "split_validation_size": 0.05,
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_val_example = dataset.val_dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    if dataset_name == "OpenMathInstruct-2":
+        if output_key == "expected_answer":
+            assert first_example["messages"][1]["content"] == "\\frac{8\\sqrt{3}}{3}"
+        elif output_key == "generated_solution":
+            assert (
+                first_example["messages"][1]["content"][:20] == "Let's denote the poi"
+            )
+    elif dataset_name == "tulu3_sft_mixture":
+        assert first_example["messages"][1]["content"][:20] == "I'm sorry, but I can"
+
+    # check the combined message
+    messages = [first_example["messages"], first_val_example["messages"]]
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    combined_message = tokenizer.apply_chat_template(
+        messages,
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+
+    for i in range(2):
+        assert combined_message[i] == (
+            " Question: "
+            + messages[i][0]["content"]
+            + " Answer: "
+            + messages[i][1]["content"]
         )
 
 
