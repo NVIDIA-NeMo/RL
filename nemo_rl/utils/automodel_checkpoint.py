@@ -126,7 +126,7 @@ class AutomodelCheckpointManager:
             dp_rank=dp_rank,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
-            moe_mesh=None,
+            moe_mesh=self.moe_mesh,
         )
 
     def update_checkpointer_config(

@@ -14,7 +14,6 @@
 
 import gc
 import itertools
-import math
 import os
 import warnings
 from collections import defaultdict
@@ -95,15 +94,6 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
-
-
-# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc (https://github.com/NVIDIA-NeMo/RL/issues/1586)
-def _patched_init_lora_weights(self, init_method: str):
-    if init_method == "xavier":
-        nn.init.xavier_normal_(self.lora_A.weight.data)
-    else:
-        nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
-    self.lora_B.weight.data.zero_()
 
 
 @ray.remote(
@@ -313,7 +303,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
-        tp_size = self.cfg["dtensor_cfg"].get("tensor_parallel_size", 1)
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         ep_size = self.cfg["dtensor_cfg"].get("expert_parallel_size", 1)
         dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
         if cp_size > 1 and self.enable_seq_packing:
@@ -728,7 +718,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             model_args = dict(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
-                                padding_mask=~attention_mask,
                                 position_ids=position_ids,
                                 use_cache=False,
                                 flash_attn_kwargs=flash_attn_kwargs,
@@ -757,11 +746,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         if isinstance(outputs, (torch.Tensor, DTensor)):
                             # custom models (e.g., those coming from AutoModel) can output logits directly
                             logits = outputs
+                        elif not hasattr(outputs, "logits"):
+                            logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
-                            if not hasattr(outputs, "logits"):
-                                logits = self.model.lm_head(outputs.last_hidden_state)
-                            else:
-                                logits = outputs.logits
+                            logits = outputs.logits
                         del outputs
 
                         # Apply temperature scaling
