@@ -20,21 +20,22 @@ from datasets import load_dataset
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class DeepScalerDataset(RawDataset):
-    def __init__(self, **kwargs) -> None:
-        """Initialize the DeepScaler dataset with train split."""
-        self.task_name = "DeepScaler"
+class AIME2024Dataset(RawDataset):
+    def __init__(self, repeat: int = 16, **kwargs) -> None:
+        """Initialize the AIME2024 dataset with train split."""
+        self.task_name = "AIME2024"
 
         # load from huggingface
-        self.dataset = load_dataset(
-            "agentica-org/DeepScaleR-Preview-Dataset", split="train"
-        )
+        self.dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
 
         # format the dataset
         self.dataset = self.dataset.map(
             self.format_data,
             remove_columns=self.dataset.column_names,
         )
+
+        # repeat the dataset
+        self.dataset = self.dataset.repeat(repeat)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
