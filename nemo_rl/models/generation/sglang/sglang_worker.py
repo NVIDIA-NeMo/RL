@@ -172,18 +172,18 @@ class SGLangGenerationWorker:
         
         # Build SGLang server arguments
         kwargs = {
-            "model_path": self.sglang_cfg.get("model_path", ""),
+            "model_path": self.sglang_cfg["model_path"],
             "trust_remote_code": True,
             "random_seed": seed if seed is not None else self.sglang_cfg.get("random_seed", 1),
             # Memory settings
-            "enable_memory_saver": self.sglang_cfg.get("enable_memory_saver", False),
+            "enable_memory_saver": self.sglang_cfg["enable_memory_saver"],
             "gpu_id_step": 1,
             "base_gpu_id": base_gpu_id,
             # Parallel settings
             "tp_size": tp_size,
-            "dp_size": self.sglang_cfg.get("dp_size", 1),
-            "pp_size": self.sglang_cfg.get("pp_size", 1),
-            "ep_size": self.sglang_cfg.get("ep_size", 1),
+            "dp_size": self.sglang_cfg["dp_size"],
+            "pp_size": self.sglang_cfg["pp_size"],
+            "ep_size": self.sglang_cfg["ep_size"],
             # Always skip warmup to prevent warmup timeout
             "skip_server_warmup": self.sglang_cfg.get("skip_server_warmup", True),
             # Server network settings - listen on all interfaces, use the free port we found
@@ -343,10 +343,10 @@ class SGLangGenerationWorker:
         """
         top_k_cfg = self.cfg.get("top_k")
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
-        temperature = 0.0 if greedy else self.cfg.get("temperature", 1.0)
+        temperature = 0.0 if greedy else self.cfg["temperature"]
         
         base_max_tokens = (
-            max_new_tokens if max_new_tokens is not None else self.cfg.get("max_new_tokens", 512)
+            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
         
         # TODO: check if this is needed
@@ -548,7 +548,7 @@ class SGLangGenerationWorker:
         batch_stop_strings = data.get("stop_strings", [None] * len(input_lengths))
         stop_strings = self._merge_stop_strings(batch_stop_strings)
         batch_size = len(input_lengths)
-        pad_token_id = self.cfg.get("_pad_token_id", 0)
+        pad_token_id = self.cfg["_pad_token_id"]
         
         # Verify inputs have correct padding
         verify_right_padding(data, pad_value=pad_token_id)

@@ -53,7 +53,7 @@ class PY_EXECUTABLES:
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
     # Use NeMo-RL direct dependencies, nemo-automodel, and SGLang.
-    AUTOMODEL_SGLANG = "uv run --locked --extra automodel --extra sglang"
+    AUTOMODEL_SGLANG = f"uv run --locked --extra automodel --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"

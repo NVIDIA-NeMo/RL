@@ -107,7 +107,7 @@ class SGLangGeneration(GenerationInterface):
         # Initialize placement groups
         # For SGLang, we use PACK strategy to keep bundles together
         # colocated is always at top level, not in sglang_cfg
-        strategy = None if self.cfg.get("colocated", {}).get("enabled", False) else "PACK"
+        strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
         cluster._init_placement_groups(
             strategy=strategy,
             use_unified_pg=False,  # SGLang servers don't need cross-node model parallelism
