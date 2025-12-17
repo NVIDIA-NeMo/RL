@@ -43,10 +43,7 @@ def load_response_dataset(data_config, seed: int = 42):
 
     # for sft training
     if dataset_name == "open_assistant":
-        base_dataset: Any = OasstDataset(
-            output_dir="/tmp/open_assistant",
-            seed=seed,
-        )
+        base_dataset: Any = OasstDataset(**data_config, seed=seed)
     elif dataset_name == "squad":
         base_dataset: Any = SquadDataset(**data_config)
     elif dataset_name == "tulu3_sft_mixture":

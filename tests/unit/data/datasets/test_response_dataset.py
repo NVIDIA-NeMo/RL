@@ -96,6 +96,7 @@ def test_helpsteer3_dataset():
     assert "response" in first_example
     assert "task_name" in first_example
 
+    # check the content
     assert len(first_example["context"]) == 7
     assert first_example["response"][0]["role"] == "assistant"
     assert first_example["response"][0]["content"][:20] == "Yes, you are correct"
@@ -173,6 +174,30 @@ def test_load_dataset_saved_with_save_to_disk():
         assert first_val_example["messages"][1]["content"] == "6"
 
 
+def test_open_assistant_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "open_assistant",
+        "split_validation_size": 0.05,
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_val_example = dataset.val_dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][-1]["content"][:20] == "```\n    def forward("
+    assert len(first_example["messages"]) == 7
+    assert first_val_example["messages"][-1]["content"][:20] == "The colors you shoul"
+    assert len(first_val_example["messages"]) == 5
+
+
 @pytest.mark.parametrize(
     "dataset_name",
     ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024", "squad"],
@@ -190,6 +215,7 @@ def test_build_in_dataset(dataset_name, tokenizer):
     assert "messages" in first_example
     assert "task_name" in first_example
 
+    # check the content
     if dataset_name == "DAPOMath17K":
         assert first_example["messages"][1]["content"] == "34"
     elif dataset_name == "DAPOMathAIME2024":
@@ -256,6 +282,7 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
     assert "messages" in first_example
     assert "task_name" in first_example
 
+    # check the content
     if dataset_name == "OpenMathInstruct-2":
         if output_key == "expected_answer":
             assert first_example["messages"][1]["content"] == "\\frac{8\\sqrt{3}}{3}"
@@ -309,7 +336,7 @@ def test_vlm_dataset(dataset_name, format_func):
     assert "messages" in first_example
     assert "task_name" in first_example
 
-    # check content
+    # check the content
     assert first_example["messages"][0]["role"] == "user"
     assert first_example["messages"][0]["content"][0]["type"] == "image"
     assert first_example["messages"][0]["content"][1]["type"] == "text"
