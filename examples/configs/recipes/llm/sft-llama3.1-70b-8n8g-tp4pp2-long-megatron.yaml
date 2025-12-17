@@ -43,12 +43,15 @@ policy:
       weight_decay: 0.01
       eps: 1.0e-08
 data:
-  dataset_name: openmathinstruct2
-  prompt_file: examples/prompts/math.txt
-  split: train_1M
   add_generation_prompt: true
-  output_key: generated_solution
-  seed: 42
+  prompt_file: examples/prompts/math.txt
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    seed: 42
+    split_validation_size: 0.05
+  validation: null
 logger:
   monitor_gpus: false
   wandb:

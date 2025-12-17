@@ -26,6 +26,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+
   # dataset
   prompt_file: null
   train:

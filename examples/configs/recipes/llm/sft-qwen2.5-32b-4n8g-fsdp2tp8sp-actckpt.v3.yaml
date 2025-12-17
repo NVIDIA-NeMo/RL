@@ -15,11 +15,14 @@ policy:
     tensor_parallel_size: 8
   make_sequence_length_divisible_by: 8
 data:
-  dataset_name: openmathinstruct2
-  prompt_file: examples/prompts/math.txt
-  split: train_1M
   add_generation_prompt: true
-  output_key: generated_solution
+  prompt_file: examples/prompts/math.txt
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+  validation: null
 logger:
   log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   wandb:
