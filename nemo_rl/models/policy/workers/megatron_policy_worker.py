@@ -916,15 +916,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model.train()
 
         with ctx:
-            # dim 1 is always assumed to be the sequence dim, sanity check this here
-            sequence_dim = 1
-            seq_dim_size = data["input_ids"].shape[sequence_dim]
-            for k, v in data.items():
-                if torch.is_tensor(v) and len(v.shape) > 1:
-                    assert v.shape[sequence_dim] == seq_dim_size, (
-                        f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                    )
-
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
