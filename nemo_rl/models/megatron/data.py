@@ -1,50 +1,291 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from functools import partial
-from typing import Any, Iterator, Optional
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
-import torch.distributed as dist
-from megatron.bridge.training.state import GlobalState
-from megatron.core.models.gpt import GPTModel
+
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.transformer.moe.moe_utils import (
-    clear_aux_losses_tracker,
-    get_moe_layer_wise_logging_tracker,
-    reduce_aux_losses_tracker_across_ranks,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 
 
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    return (
-        ((value + multiple - 1) // multiple * multiple)
-        if value % multiple != 0
-        else value
+@dataclass
+class ProcessedMicrobatch:
+    """Container for a processed microbatch ready for model forward pass.
+
+    This dataclass holds both the original data dictionary and the processed
+    tensors needed for the Megatron model forward pass.
+
+    Attributes:
+        data_dict: The original BatchedDataDict containing raw batch data
+        input_ids: Processed input token IDs (may be packed for sequence packing)
+        input_ids_cp_sharded: Context-parallel sharded input token IDs
+        attention_mask: Attention mask tensor (None for packed sequences)
+        position_ids: Position IDs tensor (None for packed sequences)
+        packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
+        cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
+    """
+    data_dict: BatchedDataDict[Any]
+    input_ids: torch.Tensor
+    input_ids_cp_sharded: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    position_ids: Optional[torch.Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+    cu_seqlens_padded: Optional[torch.Tensor]
+
+
+def make_processed_microbatch_iterator(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    cfg: dict[str, Any],
+    seq_length_key: Optional[str],
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+) -> Iterator[ProcessedMicrobatch]:
+    """Wrap a raw microbatch iterator to yield processed microbatches.
+
+    This function takes a raw iterator that yields BatchedDataDict objects and
+    wraps it to yield ProcessedMicrobatch objects that contain both the original
+    data and the processed tensors ready for model forward pass.
+
+    Args:
+        raw_iterator: Iterator yielding raw BatchedDataDict microbatches
+        cfg: Configuration dictionary containing sequence_packing settings
+        seq_length_key: Key for sequence length in data dict (required for packing)
+        pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
+        pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
+        pad_full_seq_to: Target length for full sequence padding (optional)
+
+    Yields:
+        ProcessedMicrobatch objects containing processed tensors ready for model forward
+    """
+    pack_sequences = cfg["sequence_packing"]["enabled"]
+
+    for data_dict in raw_iterator:
+        # Move to GPU
+        data_dict = data_dict.to("cuda")
+
+        # Process the microbatch
+        (
+            input_ids,
+            input_ids_cp_sharded,
+            attention_mask,
+            position_ids,
+            packed_seq_params,
+            cu_seqlens_padded,
+        ) = process_microbatch(
+            data_dict,
+            seq_length_key,
+            pad_individual_seqs_to_multiple_of,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+            pack_sequences=pack_sequences,
+        )
+
+        yield ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids_cp_sharded,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+
+
+def get_microbatch_iterator(
+    data: BatchedDataDict[Any],
+    cfg: dict[str, Any],
+    mbs: int,
+    seq_length_key: Optional[str] = None,
+) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
+    """Create a processed microbatch iterator from a batch of data.
+
+    This function creates an iterator that yields ProcessedMicrobatch objects,
+    which contain both the original data dictionary and the processed tensors
+    ready for model forward pass.
+
+    Args:
+        data: The batch data to create microbatches from
+        cfg: Configuration dictionary
+        mbs: Microbatch size
+        seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+
+    Returns:
+        Tuple containing the iterator and metadata
+        - iterator: Iterator yielding ProcessedMicrobatch objects
+        - data_iterator_len: Number of microbatches in the iterator
+        - micro_batch_size: Size of each microbatch
+        - seq_dim_size: Sequence length dimension size
+        - padded_seq_length: Padded sequence length for pipeline parallelism (may differ from seq_length)
+    """
+    micro_batch_size = mbs
+    pad_factor = 1
+    pad_full_seq_to = None
+    pad_packed_seq_to_multiple_of = 1
+
+    # Auto-detect seq_length_key if not provided
+    if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
+        seq_length_key = "input_lengths"
+
+    if cfg["dynamic_batching"]["enabled"]:
+        raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+        data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+    elif cfg["sequence_packing"]["enabled"]:
+        raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
+        data_iterator_len, pack_seq_dim_size = (
+            data.get_microbatch_iterator_for_packable_sequences_len()
+        )
+        (
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = _get_pack_sequence_parameters_for_megatron(
+            cfg["megatron_cfg"],
+            pack_seq_dim_size,
+        )
+        micro_batch_size = 1
+    else:
+        raw_iterator = data.make_microbatch_iterator(mbs)
+        data_iterator_len = data.size // mbs
+
+    _, seq_dim_size = check_sequence_dim(data)
+
+    # Wrap the raw iterator with processing
+    processed_iterator = make_processed_microbatch_iterator(
+        raw_iterator=raw_iterator,
+        cfg=cfg,
+        seq_length_key=seq_length_key,
+        pad_individual_seqs_to_multiple_of=pad_factor,
+        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+        pad_full_seq_to=pad_full_seq_to,
     )
 
+    # Compute padded sequence length for pipeline parallelism
+    padded_seq_length = pad_full_seq_to if pad_full_seq_to is not None else seq_dim_size
+
+    return (
+        processed_iterator,
+        data_iterator_len,
+        micro_batch_size,
+        seq_dim_size,
+        padded_seq_length,
+    )
+
+def process_microbatch(
+    data_dict: BatchedDataDict[Any],
+    seq_length_key: Optional[str] = None,
+    pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
+    pad_full_seq_to: Optional[int] = None,
+    pack_sequences: bool = False,
+):
+    #with straggler_timer(bdata=True):
+    input_ids = data_dict["input_ids"]
+    attention_mask = None
+    position_ids = None
+    packed_seq_params = None
+
+    original_batch_size = input_ids.shape[0]
+    original_seq_length = input_ids.shape[1]
+    seq_lengths = None  # Will be set if using packed sequences
+    cu_seqlens = None
+    cu_seqlens_padded = None
+
+    if pack_sequences:
+        # For packed sequences with padded input, we need sequence lengths
+        assert seq_length_key is not None, (
+            "seq_length_key must be provided for packed sequences"
+        )
+        assert seq_length_key in data_dict, (
+            f"{seq_length_key} not found in data_dict"
+        )
+
+        # Get sequence lengths and context parallel size
+        seq_lengths = data_dict[seq_length_key]
+
+        # Pack sequences
+        (
+            input_ids,
+            input_ids_cp_sharded,
+            packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _pack_sequences_for_megatron(
+            input_ids,
+            seq_lengths,
+            pad_individual_seqs_to_multiple_of,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+            cp_rank=get_context_parallel_rank(),
+            cp_size=get_context_parallel_world_size(),
+        )
+    
+        # For packed sequences, position_ids and attention_mask are typically None
+        # The PackedSeqParams handles all necessary sequence information
+        position_ids = None
+        attention_mask = None
+    else:
+        input_ids_cp_sharded = input_ids
+        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+            data=input_ids,
+            eod_token=0,  # used for loss_mask, which we don't use
+            pad_token=0,  # used for loss_mask, which we don't use
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            pad_mask_loss=False,
+        )
+    return (
+        input_ids,
+        input_ids_cp_sharded,
+        attention_mask,
+        position_ids,
+        packed_seq_params,
+        cu_seqlens_padded,
+    )
+
+def process_global_batch(
+    data: BatchedDataDict[Any],
+    batch_idx: int,
+    batch_size: int,
+    loss_fn: LossFunction,
+    dp_group: torch.distributed.ProcessGroup,
+) -> dict[str, Any]:
+    batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
+
+    assert "sample_mask" in batch, "sample_mask must be present in the data!"
+
+    # Get the normalization factor for the loss
+    local_valid_seqs = torch.sum(batch["sample_mask"])
+
+    if "token_mask" not in batch:
+        local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
+    else:
+        local_valid_toks = torch.sum(
+            batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
+        )
+
+    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    torch.distributed.all_reduce(to_reduce, group=dp_group)
+    global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+
+    if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
+        assert "token_mask" in batch, (
+            "token_mask must be present in the data when using token-level loss"
+        )
+
+    return (
+        batch,
+        global_valid_seqs,
+        global_valid_toks,
+    )
 
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
@@ -350,250 +591,13 @@ def _unpack_sequences_from_megatron(
 
     return unpacked_output
 
-
-def forward_step_arbitrary_loss(
-    state: GlobalState,
-    global_valid_seqs: torch.Tensor,
-    global_valid_toks: torch.Tensor,
-    data_iterator: Iterator[BatchedDataDict[Any]],
-    model: GPTModel,
-    loss_fn: LossFunction,
-    pack_sequences: bool = False,
-    defer_fp32_logits: Optional[bool] = None,
-    cp_normalize: bool = True,
-    policy_cfg: Optional[dict] = None,
-):
-    """Forward training step with support for packed sequences and context parallelism.
-
-    Args:
-        state (GlobalState): Global state for the run
-        global_valid_seqs: Global count of valid sequences
-        global_valid_toks: Global count of valid tokens
-        data_iterator: Input data iterator
-        model (GPTModel): The GPT Model
-        loss_fn (LossFunction): Loss function to apply
-        pack_sequences (bool): Whether to pack sequences for efficiency
-        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
-        cp_normalize (bool): Whether to normalize the loss by the cp_size
-        policy_cfg (Optional[dict]): Policy configuration containing generation parameters
-
-    Notes on packed sequences with context parallelism (CP):
-        - When CP > 1, each sequence is padded to a multiple of (cp_size * 2)
-        - The factor of 2 ensures load balancing for causal attention
-        - cu_seqlens tracks actual sequence boundaries
-        - cu_seqlens_padded tracks padded sequence boundaries for CP
-        - Requires TransformerEngine >= 1.10 for CP support
-    """
-    straggler_timer = state.straggler_timer
-
-    # Get the pre-processed microbatch from the iterator
-    processed_mb = next(data_iterator)
-
-    # Extract the processed components
-    data_dict = processed_mb.data_dict
-    input_ids = processed_mb.input_ids
-    input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
-    attention_mask = processed_mb.attention_mask
-    position_ids = processed_mb.position_ids
-    packed_seq_params = processed_mb.packed_seq_params
-    cu_seqlens_padded = processed_mb.cu_seqlens_padded
-
-    multimodal_data = data_dict.get_multimodal_dict(
-        as_tensors=True, device=input_ids_cp_sharded.device
-    )
-    if len(multimodal_data) > 0:
-        position_ids = None
-
-    additional_kwargs = {}
-    # Mamba models currently do not support packed_seq_params
-    if packed_seq_params is not None:
-        additional_kwargs["packed_seq_params"] = packed_seq_params
-
-    if defer_fp32_logits:
-        additional_kwargs["fp32_output"] = False
-
-    with straggler_timer:
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
-
-        # Apply temperature scaling to logits for training
-        # This matches the dtensor worker's _apply_temperature_scaling in the train method
-        if (
-            policy_cfg is not None
-            and "generation" in policy_cfg
-            and policy_cfg["generation"] is not None
-        ):
-            output_tensor.div_(policy_cfg["generation"]["temperature"])
-
-        # Unpack the output tensor if we did packed sequences
-        if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
-                loss_fn=loss_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+def check_sequence_dim(data: BatchedDataDict[Any]):
+    # dim 1 is always assumed to be the sequence dim, sanity check this here
+    sequence_dim = 1
+    seq_dim_size = data["input_ids"].shape[sequence_dim]
+    for k, v in data.items():
+        if torch.is_tensor(v) and len(v.shape) > 1:
+            assert v.shape[sequence_dim] == seq_dim_size, (
+                f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
             )
-
-        loss_data = data_dict
-
-    loss_fn_wrapped = partial(
-        loss_fn,
-        data=loss_data,
-        global_valid_seqs=global_valid_seqs,
-        global_valid_toks=global_valid_toks,
-        vocab_parallel_rank=get_tensor_model_parallel_rank(),
-        vocab_parallel_group=get_tensor_model_parallel_group(),
-        context_parallel_group=get_context_parallel_group(),
-    )
-
-    if cp_normalize:
-        cp_size = get_context_parallel_world_size()
-        orig_loss_fn_wrapped = loss_fn_wrapped
-
-        def _div_by_cp_size(*args, **kwargs):
-            loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
-            return loss / cp_size, metrics
-
-        loss_fn_wrapped = _div_by_cp_size
-
-    return output_tensor, loss_fn_wrapped
-
-
-def broadcast_tensor(
-    tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup
-) -> torch.Tensor:
-    """Broadcasts a tensor from src_rank to all ranks in the group using broadcast_object_list for metadata.
-
-    Handles the case where the input tensor might be None on non-source ranks.
-    If the input tensor is provided on non-source ranks, it must have the
-    correct shape and dtype matching the tensor on the source rank.
-
-    Args:
-        tensor: The tensor to broadcast on the source rank. Can be None on
-                non-source ranks (will be created with correct shape/dtype).
-                If not None on non-source ranks, it's used as the buffer
-                for the broadcast and must match the source tensor's metadata.
-        src_rank (int): The global rank of the source process.
-        group: The process group for communication.
-
-    Returns:
-        torch.Tensor: The broadcasted tensor. On non-source ranks, this will
-                      be the tensor received from the source.
-
-    Raises:
-        ValueError: If the tensor is None on the source rank, or if a tensor
-                    provided on a non-source rank has mismatched shape/dtype/device.
-        TypeError: If broadcasting metadata fails (e.g., due to pickling issues).
-    """
-    rank = dist.get_rank()
-    # Assume operations happen on the default CUDA device for the rank
-    # TODO: Consider making device explicit if needed, e.g., derive from tensor on src
-    device = torch.cuda.current_device()
-
-    # 1. Broadcast metadata (shape and dtype) using broadcast_object_list
-    if rank == src_rank:
-        if tensor is None:
-            raise ValueError(f"Rank {rank} is source ({src_rank}) but tensor is None.")
-        # Package metadata into a list containing shape and dtype
-        metadata = [tensor.shape, tensor.dtype]
-        object_list = [metadata]
-    else:
-        # Placeholder for receiving the object on non-source ranks
-        object_list = [None]
-
-    # Broadcast the list containing the metadata object
-    # This relies on the underlying distributed backend supporting object serialization (pickle)
-    try:
-        dist.broadcast_object_list(object_list, src=src_rank, group=group)
-    except Exception as e:
-        # Catch potential issues with pickling or backend support
-        raise TypeError(
-            f"Failed to broadcast tensor metadata using broadcast_object_list: {e}"
-        ) from e
-
-    # All ranks now have the metadata in object_list[0]
-    received_shape, received_dtype = object_list[0]
-
-    # 2. Prepare tensor buffer on non-source ranks
-    if rank != src_rank:
-        if tensor is None:
-            # Create tensor if it wasn't provided by the caller
-            tensor = torch.empty(received_shape, dtype=received_dtype, device=device)
-        else:
-            # Validate the tensor provided by the caller on the non-source rank
-            if tensor.shape != received_shape:
-                raise ValueError(
-                    f"Rank {rank}: Provided tensor has shape {tensor.shape}, "
-                    f"but source rank {src_rank} is broadcasting shape {received_shape}."
-                )
-            if tensor.dtype != received_dtype:
-                raise ValueError(
-                    f"Rank {rank}: Provided tensor has dtype {tensor.dtype}, "
-                    f"but source rank {src_rank} is broadcasting dtype {received_dtype}."
-                )
-            # Ensure the provided tensor is on the correct device
-            # Compare torch.device objects directly for accuracy
-            if tensor.device != torch.device(device):
-                raise ValueError(
-                    f"Rank {rank}: Provided tensor is on device {tensor.device}, "
-                    f"but expected broadcast device is {device}."
-                )
-
-    # 3. Broadcast the actual tensor data
-    # The tensor object (either original on src, newly created, or validated user-provided on non-src)
-    # must exist on all ranks before calling broadcast.
-    # `dist.broadcast` operates in-place on the provided tensor object.
-    dist.broadcast(tensor, src=src_rank, group=group)
-
-    return tensor
-
-
-def get_moe_metrics(
-    loss_scale: float,
-    total_loss_dict: Optional[dict] = None,
-    per_layer_logging: bool = False,
-) -> dict[str, Any]:
-    """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
-
-    This function reduces MoE auxiliary losses across ranks, aggregates them, and
-    returns a dictionary of metrics.
-
-    Args:
-        loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
-        total_loss_dict: If provided, accumulate means into this dict (by name).
-        per_layer_logging: If True, include per-layer values in the returned dict.
-
-    Returns:
-        dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
-        the mean value is returned under the same key (e.g., "load_balancing_loss").
-        If per_layer_logging is True, per-layer values are returned under keys of the
-        form "moe/{name}_layer_{i}".
-    """
-    reduce_aux_losses_tracker_across_ranks()
-    tracker = get_moe_layer_wise_logging_tracker()
-
-    metrics: dict[str, Any] = {}
-    if len(tracker) > 0:
-        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
-        for name, loss_list in aux_losses.items():
-            # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
-            num_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
-            aggregated_value = loss_list.sum() / num_layers
-            metrics[name] = float(aggregated_value.item())
-            if total_loss_dict is not None:
-                if name not in total_loss_dict:
-                    total_loss_dict[name] = aggregated_value
-                else:
-                    total_loss_dict[name] += aggregated_value
-
-            if per_layer_logging:
-                for i, loss in enumerate(loss_list.tolist()):
-                    metrics[f"moe/{name}_layer_{i}"] = float(loss)
-
-    clear_aux_losses_tracker()
-    return metrics
+    return sequence_dim, seq_dim_size
