@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional
+from typing import Any
 
 from datasets import load_dataset
 
@@ -24,11 +24,8 @@ def format_geometry3k_dataset(
 ) -> dict[str, Any]:
     """Format the Geometry3K dataset into an OpenAI-API-like message log."""
     # isolate single image
-    example["image"] = (
-        example["images"][0]
-        if isinstance(example["images"], list)
-        else example["images"]
-    )
+    if isinstance(example["images"], list):
+        example["image"] = example["images"][0]
 
     user_content = [
         {
@@ -48,50 +45,31 @@ def format_geometry3k_dataset(
     ret = {
         "messages": [
             {"role": "user", "content": user_content},
-            {
-                "role": "assistant",
-                "content": assistant_content,
-            },
+            {"role": "assistant", "content": assistant_content},
         ],
-        "task_name": "geometry3k",
+        "task_name": example["task_name"],
     }
     return ret
 
 
-def prepare_geometry3k_dataset(split: str = "train", task_name: str = "geometry3k"):
-    if split == "train":
-        tr_dataset = load_dataset("hiyouga/geometry3k")["train"]
-        val_dataset = load_dataset("hiyouga/geometry3k")["validation"]
-    else:
-        tr_dataset = load_dataset("hiyouga/geometry3k")[split]
-        val_dataset = load_dataset("hiyouga/geometry3k")[split]
-
-    # format - disable features to avoid schema conflicts
-    tr_dataset = tr_dataset.add_column("task_name", [task_name] * len(tr_dataset))
-    val_dataset = val_dataset.add_column("task_name", [task_name] * len(val_dataset))
-    return {
-        "train": tr_dataset,
-        "validation": val_dataset,
-    }
-
-
 class Geometry3KDataset(RawDataset):
-    def __init__(
-        self,
-        split: str = "train",
-        prompt_file: Optional[str] = None,
-    ):
+    def __init__(self, split: str = "train", **kwargs):
         """Simple wrapper around the Geometry3K dataset.
 
         Args:
             split: The split of the dataset to use.
-            prompt_file: The file containing the prompt for the dataset.
         """
+        # train, validation, and test are supported splits.
         assert split in ["train", "validation", "test"], (
             f"Invalid split: {split}. Please use 'train' or 'validation' or 'test'."
         )
+
         self.task_name = "geometry3k"
 
-        self.formatted_ds = prepare_geometry3k_dataset(
-            split=split, task_name=self.task_name
+        # this dataset will process the image during training using `format_geometry3k_dataset`
+        self.dataset = load_dataset("hiyouga/geometry3k")[split]
+
+        # format - disable features to avoid schema conflicts
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
         )

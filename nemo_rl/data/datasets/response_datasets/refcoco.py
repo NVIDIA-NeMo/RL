@@ -16,7 +16,7 @@ import os
 import random
 import zipfile
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import requests
 from datasets import load_dataset
@@ -98,7 +98,6 @@ def format_refcoco_dataset(
     width: int = 256,
     height: int = 256,
     caption_type: str = "random",
-    prompt_file: Optional[str] = None,
 ) -> dict[str, Any]:
     """Format the RefCOCO dataset from huggingface.
 
@@ -158,101 +157,65 @@ def format_refcoco_dataset(
     ret = {
         "messages": [
             {"role": "user", "content": user_content},
-            {
-                "role": "assistant",
-                "content": solution,
-            },
+            {"role": "assistant", "content": solution},
         ],
-        "task_name": "refcoco",
+        "task_name": example["task_name"],
     }
     return ret
-
-
-# contain different variants of the CLEVR dataset
-def prepare_refcoco_dataset(
-    split: str = "default",
-    task_name: Optional[str] = None,
-    path_to_coco_images: Optional[Union[str, Path]] = None,
-):
-    if task_name is None:
-        task_name = "refcoco"
-
-    tr_dataset = load_dataset("jxu124/refcoco")["train"]
-    val_dataset = load_dataset("jxu124/refcoco")["validation"]
-
-    # format - disable features to avoid schema conflicts
-    tr_dataset = tr_dataset.add_column("task_name", [task_name] * len(tr_dataset))
-    val_dataset = val_dataset.add_column("task_name", [task_name] * len(val_dataset))
-
-    if path_to_coco_images is None:
-        print("No path to coco images provided, downloading images to ./coco_images")
-        path_to_coco_images = Path("./coco_images")
-        os.makedirs(path_to_coco_images, exist_ok=True)
-    else:
-        path_to_coco_images = Path(path_to_coco_images)
-
-    # check for images
-    if not os.path.exists(str(path_to_coco_images / "train2014")):
-        print(f"Downloading train2014 images to {path_to_coco_images}")
-        download_and_unzip(
-            "http://images.cocodataset.org/zips/train2014.zip", str(path_to_coco_images)
-        )
-    if not os.path.exists(str(path_to_coco_images / "val2014")):
-        print(f"Downloading val2014 images to {path_to_coco_images}")
-        download_and_unzip(
-            "http://images.cocodataset.org/zips/val2014.zip", str(path_to_coco_images)
-        )
-
-    # add image column
-    tr_dataset = tr_dataset.map(
-        lambda example: {
-            **example,
-            "image_path": str(example["image_path"]).replace(
-                "coco/", str(path_to_coco_images) + "/"
-            )
-            if "image_path" in example
-            else example.get("image_path"),
-        }
-    )
-    val_dataset = val_dataset.map(
-        lambda example: {
-            **example,
-            "image_path": str(example["image_path"]).replace(
-                "coco/", str(path_to_coco_images) + "/"
-            )
-            if "image_path" in example
-            else example.get("image_path"),
-        }
-    )
-
-    return {
-        "train": tr_dataset,
-        "validation": val_dataset,
-    }
 
 
 class RefCOCODataset(RawDataset):
     def __init__(
         self,
-        split: str = "default",
-        prompt_file: Optional[str] = None,
+        split: str = "train",
         download_dir: Optional[str] = None,
+        **kwargs,
     ):
         """Simple wrapper around the RefCOCO dataset.
 
         Args:
-            split: The split of the dataset to use (currently only 'default' is supported)
-            prompt_file: The file containing the prompt for the dataset.
+            split: The split of the dataset to use.
+            download_dir: The directory to download the dataset to
         """
-        VALID_SPLITS = ["default"]
-        if split not in VALID_SPLITS:
+        # train and validation are supported splits.
+        SPLIT_TO_IMAGE_URL = {
+            "train": "http://images.cocodataset.org/zips/train2014.zip",
+            "validation": "http://images.cocodataset.org/zips/val2014.zip",
+        }
+        if split not in SPLIT_TO_IMAGE_URL:
             raise ValueError(
-                f"Invalid split: {split}. Please use one of {VALID_SPLITS}."
+                f"Invalid split: {split}. Please use 'train' or 'validation'."
             )
+
+        self.download_dir = download_dir
         self.task_name = "refcoco"
 
-        self.formatted_ds = prepare_refcoco_dataset(
-            split=split,
-            task_name=self.task_name,
-            path_to_coco_images=download_dir,
-        )
+        # check for images
+        if self.download_dir is None:
+            print("No path to coco images provided, set download_dir to ./coco_images")
+            self.download_dir = Path("./coco_images")
+            os.makedirs(self.download_dir, exist_ok=True)
+        else:
+            self.download_dir = Path(self.download_dir)
+
+        filename = SPLIT_TO_IMAGE_URL[split].split("/")[-1].split(".")[0]
+        if not os.path.exists(str(self.download_dir / filename)):
+            print(f"Downloading {filename} images to {self.download_dir}")
+            download_and_unzip(SPLIT_TO_IMAGE_URL[split], str(self.download_dir))
+
+        # this dataset will process the image during training using `format_refcoco_dataset`
+        self.dataset = load_dataset("jxu124/refcoco")[split]
+        self.dataset = self.dataset.map(self.format_data)
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        if "image_path" in data:
+            image_path = str(data["image_path"]).replace(
+                "coco/", str(self.download_dir) + "/"
+            )
+        else:
+            image_path = data["image_path"]
+
+        return {
+            "image_path": image_path,
+            "task_name": self.task_name,
+        }

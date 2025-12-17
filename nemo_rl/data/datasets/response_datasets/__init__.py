@@ -29,7 +29,6 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
-from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
 # TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
@@ -53,6 +52,13 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset = CLEVRCoGenTDataset(
             split=data_config["split"],
             prompt_file=data_config["prompt_file"],
+        )
+    elif dataset_name == "tulu3_sft_mixture":
+        base_dataset: Any = Tulu3SftMixtureDataset(
+            test_size=data_config.get("test_size", 0.05),
+            prompt_file=data_config.get("prompt_file", None),
+            max_samples=data_config.get("max_samples", None),
+            seed=seed,
         )
     elif dataset_name == "openai_format":
         base_dataset = OpenAIFormatDataset(
@@ -78,30 +84,16 @@ def load_response_dataset(data_config, seed: int = 42):
             "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
         )
         base_dataset: Any = DAPOMath17KDataset(seed=seed)
+    elif dataset_name == "HelpSteer3":
+        base_dataset: Any = HelpSteer3Dataset()
     # for vlm rl training
     # TODO: test after GRPO-VLM updated
     elif dataset_name == "clevr-cogent":
-        base_dataset: Any = CLEVRCoGenTDataset(
-            split=data_config["split"],
-        )
+        base_dataset: Any = CLEVRCoGenTDataset(**data_config)
     elif dataset_name == "refcoco":
-        base_dataset: Any = RefCOCODataset(
-            split=data_config["split"],
-            download_dir=data_config["download_dir"],
-        )
+        base_dataset: Any = RefCOCODataset(**data_config)
     elif dataset_name == "geometry3k":
-        base_dataset: Any = Geometry3KDataset(
-            split=data_config["split"],
-        )
-    elif dataset_name == "tulu3_sft_mixture":
-        base_dataset: Any = Tulu3SftMixtureDataset(
-            test_size=data_config.get("test_size", 0.05),
-            prompt_file=data_config.get("prompt_file", None),
-            max_samples=data_config.get("max_samples", None),
-            seed=seed,
-        )
-    elif dataset_name == "HelpSteer3":
-        base_dataset: Any = HelpSteer3Dataset()
+        base_dataset: Any = Geometry3KDataset(**data_config)
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         base_dataset = ResponseDataset(**data_config, seed=seed)
