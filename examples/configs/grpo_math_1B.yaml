@@ -250,7 +250,8 @@ data:
   system_prompt_file: null
   shuffle: true
   num_workers: 1
-
+  processor: "math_hf_data_processor"
+  env_name: "math"
   dataset_name: "OpenMathInstruct-2"
   # You can use custom response datasets for training and validation. For example:
   #   data:
@@ -267,10 +268,6 @@ env:
   math:
     num_workers: 8
     math_verify_impl: "hf_math_verify"
-  ## unused in this config but needed for DAPO recipe
-  dapo:
-    num_workers: 8
-    math_verify_impl: "dapo_math_verify"
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -281,6 +278,9 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
   tensorboard: {}

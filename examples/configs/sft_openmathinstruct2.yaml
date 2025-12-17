@@ -88,6 +88,9 @@ logger:
   wandb:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"
+  swanlab:
+    project: "sft-dev"
+    name: "openmathinstruct-nemorl-1M_train"
   tensorboard:
     log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
   mlflow:
