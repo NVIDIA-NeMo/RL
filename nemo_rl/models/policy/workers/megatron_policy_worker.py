@@ -1545,30 +1545,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             return output_tensor, collection_fn
 
-        if self.cfg["dynamic_batching"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-            data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            micro_batch = logprob_batch_size
-        elif self.cfg["sequence_packing"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-            data_iterator_len, _ = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
-            )
-            micro_batch = 1
-        else:
-            mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
-            data_iterator_len = max(1, data.size // logprob_batch_size)
-            micro_batch = logprob_batch_size
-
         forward_backward_func = get_forward_backward_func()
         list_of_outputs = forward_backward_func(
             forward_step_func=forward_step_fn,
             data_iterator=mb_iterator,
             model=self.model,
-            num_microbatches=data_iterator_len,
-            seq_length=pp_seq_dim_size,
-            micro_batch_size=micro_batch,
-            decoder_seq_length=pp_seq_dim_size,
+            num_microbatches=num_microbatches,
+            seq_length=padded_seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=padded_seq_length,
             forward_only=True,
         )
 
