@@ -111,8 +111,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
-    _get_pack_sequence_parameters_for_megatron,
-    _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
     get_moe_metrics,
