@@ -19,27 +19,34 @@ from datasets import load_dataset
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
-    return {
-        "messages": [
-            {
-                "role": "system",
-                "content": data["context"],
-            },
-            {
-                "role": "user",
-                "content": data["question"],
-            },
-            {
-                "role": "assistant",
-                "content": data["answers"]["text"][0],
-            },
-        ]
-    }
-
-
 class SquadDataset(RawDataset):
-    def __init__(self) -> None:
-        original_ds = load_dataset("rajpurkar/squad")
-        self.task_name = "SQuAD"
-        self.formatted_ds = original_ds.map(format_squad)
+    def __init__(self, split: str = "train", **kwargs) -> None:
+        self.task_name = "squad"
+
+        # load from huggingface
+        self.dataset = load_dataset("rajpurkar/squad")[split]
+
+        # format the dataset
+        self.dataset = self.dataset.map(
+            self.format_data,
+            remove_columns=self.dataset.column_names,
+        )
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": data["context"],
+                },
+                {
+                    "role": "user",
+                    "content": data["question"],
+                },
+                {
+                    "role": "assistant",
+                    "content": data["answers"]["text"][0],
+                },
+            ],
+            "task_name": self.task_name,
+        }
