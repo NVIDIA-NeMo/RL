@@ -20,6 +20,7 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
+from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -131,12 +132,6 @@ class BaseVllmGenerationWorker:
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
-        ## use the bf16 version of the model rather than the quantized version
-        ## megatron --> hf export is done in bf16 so this ensures the vllm
-        ## model is compatible with megatron
-        if self.model_name in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
-            size = self.model_name.split("-")[-1]
-            self.model_name = f"unsloth/gpt-oss-{size}-BF16"
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -310,6 +305,19 @@ class BaseVllmGenerationWorker:
         vllm_kwargs["hf_overrides"].update(
             self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
         )
+
+        # Override HF config for gpt-oss models to ensure compatibility with megatron
+        # The megatron --> hf export is done in bf16, so we disable quantization
+        hf_config = AutoConfig.from_pretrained(
+            self.model_name, trust_remote_code=True
+        )
+        if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
+            if "quantization_config" in hf_config:
+                assert load_format == "dummy", (
+                    "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
+                )
+                # disable quantization
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
 
         llm_kwargs = dict(
             model=self.model_name,
