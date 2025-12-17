@@ -49,15 +49,7 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "tulu3_sft_mixture":
         base_dataset: Any = Tulu3SftMixtureDataset(**data_config, seed=seed)
     elif dataset_name == "openai_format":
-        base_dataset: Any = OpenAIFormatDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["chat_key"],
-            data_config["system_key"],
-            data_config["system_prompt"],
-            data_config["tool_key"],
-            data_config["use_preserving_dataset"],
-        )
+        base_dataset: Any = OpenAIFormatDataset(**data_config)
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
         # TODO: also test after SFT updated
