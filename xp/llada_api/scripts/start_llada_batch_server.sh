@@ -13,7 +13,7 @@ PORT=8000
 MODEL_PATH=""
 DCP_PATH=""
 BASE_MODEL="GSAI-ML/LLaDA-8B-Instruct"
-TEMP_DIR="/tmp/llada_hf_converted"
+TEMP_DIR="/tmp/model_hf_converted"
 ENGINE=""  # Auto-detected based on model type (LLaDA→dinfer, Nemotron→nemotron)
 ALGORITHM=""  # Optional specific algorithm within engine
 
@@ -659,6 +659,8 @@ if [ \$? -ne 0 ]; then
     echo "Error: Failed to sync dependencies from uv.lock. Exiting."
     exit 1
 fi
+echo "Checking transformers version..."
+uv pip list | grep transformers
 
 # Server-specific deps not in uv.lock
 uv pip install fastapi uvicorn

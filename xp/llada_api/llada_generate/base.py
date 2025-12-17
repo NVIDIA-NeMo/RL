@@ -154,7 +154,7 @@ class GenerationAlgorithm(ABC):
             True if successful, False otherwise
         """
         try:
-            from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf
+            from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf, load_checkpoint
             NEMO_RL_AVAILABLE = True
         except ImportError:
             NEMO_RL_AVAILABLE = False
@@ -174,21 +174,47 @@ class GenerationAlgorithm(ABC):
         logger.info(f"Base model: {base_model}")
         logger.info(f"Temp HF path: {temp_dir}")
         
+        # Detect model type from base_model parameter
+        if "nemotron" in base_model.lower() or "Nemotron" in base_model:
+            model_type = "nemotron"
+            logger.info(f"Detected Nemotron model from base model: {base_model}")
+        else:
+            model_type = "llada"
+            logger.info(f"Detected LLaDA model from base model: {base_model}")
+        
         try:
             # Check if this is a structured checkpoint
             weights_dir = os.path.join(dcp_path, "weights")
             tokenizer_dir = os.path.join(dcp_path, "tokenizer")
             
             if os.path.exists(weights_dir) and os.path.exists(tokenizer_dir):
-                logger.info(f"Detected structured DCP checkpoint with weights/ and tokenizer/ directories")
-                hf_path = convert_structured_dcp_to_hf(
-                    dcp_root_path=dcp_path,
-                    hf_ckpt_path=temp_dir,
-                    model_name_or_path=base_model,
-                    overwrite=True
-                )
+                logger.info("Detected structured DCP checkpoint with weights/ and tokenizer/ directories")
+
+                try:
+                    logger.info("Attempting to load checkpoint without HF conversion...")
+                    res = self.load_model_from_hf(base_model, model_type=model_type)
+                    if res:
+                        load_checkpoint(
+                            model=self.model,
+                            weights_path=weights_dir,
+                            optimizer=None,
+                            scheduler=None,
+                            optimizer_path=None,
+                        )
+                        logger.info("Checkpoint successfully loaded WITHOUT HF conversion!")
+                        return True
+                    else:
+                        raise RuntimeError("Failed to load HF checkpoint")
+                except:
+                    logger.info("Direct checkpoint loading fail. Falling back to explicit HF conversion")
+                    hf_path = convert_structured_dcp_to_hf(
+                        dcp_root_path=dcp_path,
+                        hf_ckpt_path=temp_dir,
+                        model_name_or_path=base_model,
+                        overwrite=True
+                    )
             else:
-                logger.info(f"Using legacy DCP checkpoint format (direct weights path)")
+                logger.info("Using legacy DCP checkpoint format (direct weights path)")
                 hf_path = convert_dcp_to_hf(
                     dcp_ckpt_path=dcp_path,
                     hf_ckpt_path=temp_dir,
@@ -198,14 +224,6 @@ class GenerationAlgorithm(ABC):
                 )
             
             logger.info(f"Conversion completed. Loading from: {hf_path}")
-            
-            # Detect model type from base_model parameter
-            if "nemotron" in base_model.lower() or "Nemotron" in base_model:
-                model_type = "nemotron"
-                logger.info(f"Detected Nemotron model from base model: {base_model}")
-            else:
-                model_type = "llada"
-                logger.info(f"Detected LLaDA model from base model: {base_model}")
             
             # Load from converted HF format
             return self.load_model_from_hf(hf_path, model_type=model_type)

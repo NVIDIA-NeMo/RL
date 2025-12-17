@@ -607,10 +607,21 @@ class DTensorPolicyWorker:
                         local_valid_seqs * global_batch["input_ids"].shape[1]
                     )
                 else:
-                    local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
-                    )
+                    if self._is_dqwn:
+                        local_valid_toks = torch.sum(
+                            global_batch["token_mask"]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
+                    elif self._is_mdlm and "noise_mask" in global_batch:
+                        local_valid_toks = torch.sum(
+                            global_batch["noise_mask"]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
+                    else:
+                        local_valid_toks = torch.sum(
+                            global_batch["token_mask"][:, 1:]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
 
                 to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
                 torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())

@@ -337,9 +337,10 @@ def convert_structured_dcp_to_hf(
 
     # Load and save model config
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    for k in config.auto_map.keys():
-        if "--" not in config.auto_map[k]:
-            config.auto_map[k] = model_name_or_path + "--" + config.auto_map[k]
+    if "auto_map" in config:
+        for k in config.auto_map.keys():
+            if "--" not in config.auto_map[k]:
+                config.auto_map[k] = model_name_or_path + "--" + config.auto_map[k]
     config.save_pretrained(hf_ckpt_path)
 
     # Copy tokenizer from the tokenizer directory

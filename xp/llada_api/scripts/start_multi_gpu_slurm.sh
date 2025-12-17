@@ -12,7 +12,7 @@ LOAD_BALANCER_PORT=8000
 MODEL_PATH=""
 DCP_PATH=""
 BASE_MODEL="GSAI-ML/LLaDA-8B-Instruct"
-TEMP_DIR="/tmp/llada_hf_converted"
+TEMP_DIR="/tmp/model_hf_converted"
 ENGINE=""
 ALGORITHM=""
 BATCH_SIZE=8
@@ -394,7 +394,7 @@ if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
     echo "Converting DCP checkpoint to HuggingFace format (shared by all workers)..."
     
     # Use a single shared temp directory for all workers
-    SHARED_TEMP_DIR="/tmp/llada_hf_converted_shared_$$"
+    SHARED_TEMP_DIR="/tmp/model_hf_converted_shared_$$"
     mkdir -p "$SHARED_TEMP_DIR"
     
     # Run the conversion using Python

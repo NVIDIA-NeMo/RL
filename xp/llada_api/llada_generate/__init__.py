@@ -99,7 +99,7 @@ class GenerationRegistry:
             'fast-dllm': 'dual_cache',
             'dinfer': 'dinfer_blockwise',
             'nemotron': 'nemotron',
-            'hf': None
+            'hf': 'hf'
         }
         default_name = engine_defaults.get(engine)
         if default_name and self.get(default_name):
@@ -213,6 +213,13 @@ def _register_builtin_algorithms():
         logger.debug("Registered dInfer Credit generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register dInfer Credit generation: {e}")
+
+    try:
+        from .huggingface import HuggingFaceGeneration
+        register_algorithm(HuggingFaceGeneration(), aliases=['hf', 'huggingface', 'hugging_face', 'AR', 'ar'])
+        logger.debug("Registered HuggingFace generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register HuggingFace generation: {e}")
 
 
 # Register built-in algorithms on import

@@ -235,10 +235,10 @@ def detect_model_type(model_path: str = None, base_model: str = None) -> str:
     model_identifier = model_path or base_model or ""
     base_identifier = base_model or ""
     
-    if "nemotron" in model_identifier.lower() or "nemotron" in base_identifier.lower():
-        return "nemotron"
-    else:
+    if "llada" in model_identifier.lower() or "llada" in base_identifier.lower():
         return "llada"
+    else:
+        return "nemotron"
 
 
 def validate_engine_for_model_type(model_type: str, engine: str) -> None:
@@ -256,7 +256,7 @@ def validate_engine_for_model_type(model_type: str, engine: str) -> None:
     # Define valid engine combinations
     valid_engines = {
         'llada': ['fast-dllm', 'dinfer'],
-        'nemotron': ['nemotron']
+        'nemotron': ['nemotron', 'hf']
     }
     
     allowed = valid_engines.get(model_type, [])
@@ -858,7 +858,7 @@ Examples:
     parser.add_argument("--temp-dir", default="/tmp/model_hf_converted",
                        help="Temporary directory for DCP conversion")
     parser.add_argument("--engine", default=None,
-                       choices=['fast-dllm', 'dinfer', 'nemotron'],
+                       choices=['fast-dllm', 'dinfer', 'nemotron', 'hf'],
                        help="Inference engine to use (default: auto-detected based on model type)")
     parser.add_argument("--algorithm", default=None,
                        help="Specific algorithm within engine (optional, uses engine default if not specified)")
