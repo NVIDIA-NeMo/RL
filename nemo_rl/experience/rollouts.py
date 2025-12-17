@@ -1009,7 +1009,7 @@ def run_async_nemo_gym_rollout(
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
-    for row in nemo_gym_rows:
+    for rowidx, row in enumerate(nemo_gym_rows):
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
         # row["max_tokens"] = max_seq_len
@@ -1020,6 +1020,8 @@ def run_async_nemo_gym_rollout(
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
+
+        row["_rowidx"] = rowidx
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]

@@ -78,16 +78,17 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
-    task_name = "math"
+    # load dataset
+    data: Any = load_response_dataset(data_config, seed)
+    task_name = (
+        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
+    )
+
     reward_model_task_spec = TaskDataSpec(
         task_name=task_name,
         prompt_file=data_config["prompt_file"],
         system_prompt_file=data_config["system_prompt_file"],
     )
-
-    # load dataset
-    data: Any = load_response_dataset(data_config, seed)
-
     # data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (reward_model_task_spec, math_hf_data_processor))
