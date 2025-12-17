@@ -52,10 +52,7 @@ def format_clevr_cogent_dataset(
     ret = {
         "messages": [
             {"role": "user", "content": user_content},
-            {
-                "role": "assistant",
-                "content": assistant_content,
-            },
+            {"role": "assistant", "content": assistant_content},
         ],
         "task_name": example["task_name"],
     }
@@ -63,7 +60,7 @@ def format_clevr_cogent_dataset(
 
 
 class CLEVRCoGenTDataset(RawDataset):
-    def __init__(self, split: str = "train"):
+    def __init__(self, split: str = "train", **kwargs):
         """Simple wrapper around the CLEVR-CoGenT dataset.
 
         Args:
@@ -82,7 +79,7 @@ class CLEVRCoGenTDataset(RawDataset):
 
         self.task_name = "clevr-cogent"
 
-        # this dataset will be formatted during training using `format_clevr_cogent_dataset``
+        # this dataset will process the image during training using `format_clevr_cogent_dataset`
         self.dataset = load_dataset(SPLIT_TO_HF_NAME[split])["train"]
 
         # format - disable features to avoid schema conflicts

@@ -20,6 +20,9 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
+from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
+from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
+from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
 
 
 def create_sample_data(input_key, output_key):
@@ -240,3 +243,40 @@ def test_load_dataset_saved_with_save_to_disk():
         first_val_example = dataset.formatted_ds["validation"][0]
         assert first_val_example["messages"][0]["content"] == "What is 3+3?"
         assert first_val_example["messages"][1]["content"] == "6"
+
+
+@pytest.mark.parametrize(
+    "dataset_name,format_func",
+    [
+        ("clevr-cogent", format_clevr_cogent_dataset),
+        ("geometry3k", format_geometry3k_dataset),
+        # this needs download 13.5G image
+        # ("refcoco", format_refcoco_dataset),
+    ],
+)
+def test_vlm_dataset(dataset_name, format_func):
+    # load the dataset
+    data_config = {"dataset_name": dataset_name}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_example = format_func(first_example)
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][0]["type"] == "image"
+    assert first_example["messages"][0]["content"][1]["type"] == "text"
+    assert first_example["messages"][1]["role"] == "assistant"
+
+    if dataset_name == "clevr-cogent":
+        assert first_example["messages"][1]["content"] == "3"
+    elif dataset_name == "geometry3k":
+        assert first_example["messages"][1]["content"] == "3"
+    elif dataset_name == "refcoco":
+        assert first_example["messages"][1]["content"] == "[243, 469, 558, 746]"
