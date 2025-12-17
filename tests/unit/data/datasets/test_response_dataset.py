@@ -128,43 +128,6 @@ def test_openmathinstruct2_dataset(output_key, tokenizer):
         )
 
 
-@pytest.mark.parametrize("dataset_name", ["DAPOMath17K", "DAPOMathAIME2024"])
-def test_dapo_math_dataset(dataset_name, tokenizer):
-    # load the dataset
-    data_config = {"dataset_name": dataset_name}
-    dataset = load_response_dataset(data_config)
-
-    # check the first example
-    first_example = dataset.dataset[0]
-
-    # only contains messages and task_name
-    assert len(first_example.keys()) == 2
-    assert "messages" in first_example
-    assert "task_name" in first_example
-
-    if dataset_name == "DAPOMath17K":
-        assert first_example["messages"][1]["content"] == "34"
-    elif dataset_name == "DAPOMathAIME2024":
-        assert first_example["messages"][1]["content"] == "540"
-
-    # check the combined message
-    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
-    combined_message = tokenizer.apply_chat_template(
-        first_example["messages"],
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=False,
-        add_special_tokens=False,
-    )
-
-    assert combined_message == (
-        " Question: "
-        + first_example["messages"][0]["content"]
-        + " Answer: "
-        + first_example["messages"][1]["content"]
-    )
-
-
 @pytest.mark.hf_gated
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_squad_dataset():
@@ -279,6 +242,50 @@ def test_load_dataset_saved_with_save_to_disk():
         first_val_example = dataset.formatted_ds["validation"][0]
         assert first_val_example["messages"][0]["content"] == "What is 3+3?"
         assert first_val_example["messages"][1]["content"] == "6"
+
+
+@pytest.mark.parametrize(
+    "dataset_name", ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024"]
+)
+def test_build_in_dataset(dataset_name, tokenizer):
+    # load the dataset
+    data_config = {"dataset_name": dataset_name}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    if dataset_name == "DAPOMath17K":
+        assert first_example["messages"][1]["content"] == "34"
+    elif dataset_name == "DAPOMathAIME2024":
+        assert first_example["messages"][1]["content"] == "540"
+    elif dataset_name == "DeepScaler":
+        assert first_example["messages"][1]["content"] == "-\\frac{2}{3}"
+    elif dataset_name == "AIME2024":
+        assert first_example["messages"][1]["content"] == "204"
+        assert len(dataset.dataset) == 480
+
+    # check the combined message
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    combined_message = tokenizer.apply_chat_template(
+        first_example["messages"],
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+
+    assert combined_message == (
+        " Question: "
+        + first_example["messages"][0]["content"]
+        + " Answer: "
+        + first_example["messages"][1]["content"]
+    )
 
 
 @pytest.mark.parametrize(

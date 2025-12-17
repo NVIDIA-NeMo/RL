@@ -206,10 +206,16 @@ teacher:
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+    shuffle: true
+
+    # dataset
     prompt_file: "examples/prompts/cot.txt"
     system_prompt_file: null
-    dataset_name: "DeepScaler"
-    shuffle: true
+    train:
+        dataset_name: DeepScaler
+    validation:
+        dataset_name: AIME2024
+        repeat: 16
 
 env:
     math:

@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import Any
 
+from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMath17KDataset,
@@ -70,16 +71,15 @@ def load_response_dataset(data_config, seed: int = 42):
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
-        print(
-            "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
-        )
-        base_dataset: Any = DeepScalerDataset(seed=seed)
+        base_dataset: Any = DeepScalerDataset(**data_config)
     elif dataset_name == "DAPOMath17K":
         base_dataset: Any = DAPOMath17KDataset(**data_config)
-    elif dataset_name == "DAPOMathAIME2024":
-        base_dataset: Any = DAPOMathAIME2024Dataset(**data_config)
     elif dataset_name == "HelpSteer3":
         base_dataset: Any = HelpSteer3Dataset()
+    elif dataset_name == "AIME2024":
+        base_dataset: Any = AIME2024Dataset(**data_config)
+    elif dataset_name == "DAPOMathAIME2024":
+        base_dataset: Any = DAPOMathAIME2024Dataset(**data_config)
     # for vlm training
     # TODO: test after GRPO-VLM updated
     elif dataset_name == "clevr-cogent":
@@ -106,6 +106,7 @@ def load_response_dataset(data_config, seed: int = 42):
 
 
 __all__ = [
+    "AIME2024Dataset",
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
     "DAPOMath17KDataset",
