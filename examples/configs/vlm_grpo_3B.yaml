@@ -230,6 +230,7 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   shuffle: true
   num_workers: 1
+
   # dataset
   prompt_file: "examples/prompts/clevr_cogent_cot.txt"
   system_prompt_file: null
