@@ -1163,6 +1163,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "audio": None,
                     "function_call": None,
                     "tool_calls": [],
+                    "reasoning": None,
                     "reasoning_content": None,
                 },
                 "logprobs": {
