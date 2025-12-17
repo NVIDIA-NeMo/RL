@@ -275,6 +275,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             automodel_model_kwargs["backend"] = backend
 
+        if "use_liger_kernel" not in automodel_model_kwargs:
+            automodel_model_kwargs["use_liger_kernel"] = False
+
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
@@ -371,6 +374,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             ],
             custom_tp_plan=self.cfg["dtensor_cfg"].get("custom_parallel_plan", None),
         )
+
+        # Force setup distributed for world size 1 as FSDP2Manager skips it.
+        if world_size == 1:
+            manager._setup_distributed()
 
         # Store mesh references for downstream usage
         self.device_mesh = manager.device_mesh

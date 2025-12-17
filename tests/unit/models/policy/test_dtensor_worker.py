@@ -247,6 +247,22 @@ def two_gpu_virtual_cluster():
     cluster.shutdown()
 
 
+@pytest.fixture(scope="module")
+def single_gpu_virtual_cluster():
+    cluster_name = "test_single_gpu"
+    print(f"Creating single GPU virtual cluster '{cluster_name}'...")
+    cluster = RayVirtualCluster(
+        name=cluster_name,
+        bundle_ct_per_node_list=[1],  # Single GPU bundle
+        use_gpus=True,
+        num_gpus_per_node=1,  # Using 1 GPU
+        max_colocated_worker_groups=1,  # Only one worker group
+    )
+    yield cluster
+    print("Shutting down single GPU virtual cluster...")
+    cluster.shutdown()
+
+
 @pytest.fixture
 def base_setup(request, two_gpu_virtual_cluster):
     params = request.param if hasattr(request, "param") else None
@@ -971,6 +987,130 @@ def test_dtensor_v1_policy_flops_range_check(
         else:
             print("FLOPS tracker not available, skipping FLOPS range check")
             pytest.skip("FLOPS tracker not supported for this model configuration")
+
+    finally:
+        policy.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_single_gpu_training(
+    use_v2, single_gpu_virtual_cluster, tiny_llama_model_path
+):
+    """Test DTensor training with a single GPU cluster (no parallelism)."""
+    config = create_test_config(
+        tiny_llama_model_path,
+        tp=1,
+        cp=1,
+        sp=False,
+        cpu_offload=False,
+        activation_checkpointing=False,
+        dtensor_v2=use_v2,
+    )
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    print("Creating Policy with single GPU cluster...")
+    policy = Policy(
+        cluster=single_gpu_virtual_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    try:
+        # Verify we have one worker
+        assert len(policy.worker_group.workers) == 1, (
+            "Should have 1 worker for single GPU"
+        )
+
+        # Check worker is alive
+        worker_alive = ray.get(
+            [w.is_alive.remote() for w in policy.worker_group.workers]
+        )
+        assert all(worker_alive), f"Worker is not alive: {worker_alive}"
+
+        # Get GPU info to verify setup
+        gpu_infos = ray.get(
+            [w.get_gpu_info.remote() for w in policy.worker_group.workers]
+        )
+        assert len(gpu_infos) == 1, "Should have 1 GPU info"
+        assert gpu_infos[0]["world_size"] == 1, "World size should be 1 for single GPU"
+        assert gpu_infos[0]["rank"] == 0, "Rank should be 0 for single GPU"
+
+        # Create test batch
+        data = create_test_batch(mode="train")
+        loss_fn = SimpleLoss()
+
+        # Test training
+        policy.prepare_for_training()
+
+        losses = []
+        for step in range(2):
+            results = policy.train(data, loss_fn)
+            assert "loss" in results, "Training results should contain 'loss'"
+            loss_tensor = results["loss"]
+            assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+            assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+            losses.append(loss_tensor[-1].item())
+            print(f"Step {step} - Training loss: {results['loss']}")
+
+        policy.finish_training()
+
+        # Verify loss changed (model was updated)
+        assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    finally:
+        policy.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_single_gpu_logprob(
+    use_v2, single_gpu_virtual_cluster, tiny_llama_model_path
+):
+    """Test DTensor logprob computation with a single GPU cluster (no parallelism)."""
+    config = create_test_config(
+        tiny_llama_model_path,
+        tp=1,
+        cp=1,
+        sp=False,
+        cpu_offload=False,
+        activation_checkpointing=False,
+        dtensor_v2=use_v2,
+    )
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    print("Creating Policy with single GPU cluster for logprob...")
+    policy = Policy(
+        cluster=single_gpu_virtual_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    try:
+        # Verify we have one worker
+        assert len(policy.worker_group.workers) == 1, (
+            "Should have 1 worker for single GPU"
+        )
+
+        # Create test batch and compute reference logprobs
+        data = create_test_batch(mode="logprob")
+        expected_logprobs = calculate_token_logprobs(tiny_llama_model_path, data)
+
+        # Test logprob computation
+        policy.prepare_for_lp_inference()
+        policy_logprobs = policy.get_logprobs(data)["logprobs"]
+
+        max_diff = torch.max(torch.abs(policy_logprobs - expected_logprobs))
+        print(f"Max logprob diff: {max_diff}")
+        assert torch.allclose(policy_logprobs, expected_logprobs), (
+            f"Logprobs should match reference. Max diff: {max_diff}"
+        )
 
     finally:
         policy.shutdown()
