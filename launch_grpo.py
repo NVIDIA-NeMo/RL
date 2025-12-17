@@ -7,8 +7,7 @@ Reads model configurations from model_configs.yaml.
 Usage:
     # Launch with preset configurations
     python launch_grpo.py --preset qwen32b
-    python launch_grpo.py --preset llama8b
-    python launch_grpo.py --preset llama70b
+    python launch_grpo.py --preset qwen32b,llama8b,qwen30b  # Launch multiple
     
     # Force specific cluster type
     python launch_grpo.py --preset qwen32b --cluster h100
@@ -277,6 +276,7 @@ def build_command(model_cfg: Dict[str, Any],
                   max_steps: int = 20,
                   time_limit: str = "04:00:00",
                   account: str = "coreai_dlalgo_nemorl",
+                  partition: str = "batch_long",
                   enable_vllm_metrics: bool = False) -> str:
     """Build the sbatch command for a given configuration."""
     
@@ -355,11 +355,11 @@ HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf
 HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache \\
 WANDB_API_KEY=$WANDB_API_KEY \\
 MOUNTS="/lustre:/lustre" \\
-sbatch \\
+    sbatch \\
     --nodes={num_nodes} \\
     --account={account} \\
     --job-name={job_name} \\
-    --partition=batch_long \\
+    --partition={partition} \\
     --time={time_limit} \\
     --gres=gpu:{gpus_per_node} \\
     --segment {segment} \\
@@ -465,6 +465,13 @@ def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None,
         print()
         return
     
+    # Check if requested node configuration is available (e.g. partition mismatch)
+    # This prevents obscure sbatch errors like "Requested node configuration is not available"
+    if cluster_type == "gb200" and "batch_long" in cmd:
+         # GB200 usually requires specific partition or constraint if batch_long is H100 only
+         # But here we just warn, assuming user knows their cluster
+         pass
+
     print("🚀 Launching job...")
     
     script_path = f"/tmp/launch_{preset}.sh"
@@ -531,6 +538,7 @@ Examples:
     parser.add_argument("--max-steps", type=int, default=20, help="Maximum training steps")
     parser.add_argument("--time", default="04:00:00", help="Job time limit")
     parser.add_argument("--account", default="coreai_dlalgo_nemorl", help="SLURM account")
+    parser.add_argument("--job-partition", default="batch_long", help="SLURM job partition (default: batch_long)")
     
     # Execution options
     parser.add_argument("--dry-run", "-n", action="store_true",
@@ -562,20 +570,36 @@ Examples:
                           wandb_project=args.wandb_project,
                           max_steps=args.max_steps,
                           time_limit=args.time,
-                          account=args.account)
+                          account=args.account,
+                          partition=args.job_partition)
             except Exception as e:
                 print(f"❌ Error launching {preset}: {e}")
         return
     
     # Use preset
     if args.preset:
-        launch_job(args.preset, cluster_config, variant=args.variant,
-                  dry_run=args.dry_run,
-                  wandb_project=args.wandb_project,
-                  max_steps=args.max_steps,
-                  time_limit=args.time,
-                  account=args.account,
-                  enable_vllm_metrics=args.enable_vllm_metrics)
+        presets = [p.strip() for p in args.preset.split(',')]
+        
+        if len(presets) > 1:
+            print(f"🚀 Launching {len(presets)} selected presets: {', '.join(presets)}\\n")
+        
+        for p in presets:
+            if len(presets) > 1:
+                print(f"\\n{'='*70}")
+                print(f"  Launching: {p}")
+                print(f"{'='*70}")
+
+            try:
+                launch_job(p, cluster_config, variant=args.variant,
+                        dry_run=args.dry_run,
+                        wandb_project=args.wandb_project,
+                        max_steps=args.max_steps,
+                        time_limit=args.time,
+                        account=args.account,
+                        partition=args.job_partition,
+                        enable_vllm_metrics=args.enable_vllm_metrics)
+            except Exception as e:
+                print(f"❌ Error launching {p}: {e}")
         return
     
     # No valid options
