@@ -75,9 +75,8 @@ Key parameters you might want to change:
 * **`sft.max_num_epochs`**: How many times to iterate over the dataset.
 * **`policy.optimizer.kwargs.lr`**: The step size for the optimizer.
 
-:::{tip}
-You don't need to edit the YAML file directly. You can override any parameter from the command line (shown in Step 3).
-:::
+> [!TIP]
+> You don't need to edit the YAML file directly. You can override any parameter from the command line (shown in Step 3).
 
 ---
 

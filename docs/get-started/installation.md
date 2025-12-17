@@ -38,9 +38,8 @@ Use this guide if you are setting up on a bare-metal system, need specific backe
 
 Before installing the Python package, ensure your operating system has the required libraries for your chosen backend.
 
-:::{note}
-If you are using a pre-built NVIDIA container (e.g., from NGC), most of these dependencies are likely pre-installed. These steps are critical for **bare-metal** installations (e.g., a fresh Ubuntu server).
-:::
+> [!NOTE]
+> If you are using a pre-built NVIDIA container (e.g., from NGC), most of these dependencies are likely pre-installed. These steps are critical for **bare-metal** installations (e.g., a fresh Ubuntu server).
 
 ::::{tab-set}
 
@@ -103,14 +102,14 @@ NeMo RL relies on several third-party libraries included as git submodules. You 
    git submodule update --init --recursive
    ```
 
-:::{tip} Keep Submodules in Sync
-Different branches may pin different versions of submodules. To ensure they update automatically when you switch branches or pull, configure git:
-
-```sh
-git config submodule.recurse true
-```
-*Note: This will not remove old submodules or download new ones if the directory structure changes significantly; in those cases, run the full update command above.*
-:::
+> [!TIP]
+> **Keep Submodules in Sync**
+> Different branches may pin different versions of submodules. To ensure they update automatically when you switch branches or pull, configure git:
+>
+> ```sh
+> git config submodule.recurse true
+> ```
+> *Note: This will not remove old submodules or download new ones if the directory structure changes significantly; in those cases, run the full update command above.*
 
 ---
 
@@ -140,9 +139,8 @@ Initialize the project-specific virtual environment. NeMo RL uses a `.python-ver
    uv venv
    ```
 
-   :::{important}
-   Do **not** specify a python version manually (e.g., `-p python3.10`). Let `uv` read the correct version from the configuration file to ensure compatibility.
-   :::
+   > [!IMPORTANT]
+   > Do **not** specify a python version manually (e.g., `-p python3.10`). Let `uv` read the correct version from the configuration file to ensure compatibility.
 
 2. **(Optional) Rebuilding Environments**:
    If you change branches or modify `pyproject.toml` significantly, you may need to force a rebuild of the environment variables and dependencies:
@@ -168,9 +166,8 @@ In NeMo RL, we recommend using `uv run` to execute scripts rather than manually 
     uv run python examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml
     ```
 
-:::{tip}
-If you prefer to run without `uv`, you can use [frozen environments](https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md#frozen-environments) to manage dependencies manually.
-:::
+> [!TIP]
+> If you prefer to run without `uv`, you can use [frozen environments](https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md#frozen-environments) to manage dependencies manually.
 
 ---
 
@@ -194,9 +191,8 @@ huggingface-cli login
 export WANDB_API_KEY=your_key_here
 ```
 
-:::{tip}
-Add these exports to your `~/.bashrc` or `~/.zshrc` so they persist across sessions.
-:::
+> [!TIP]
+> Add these exports to your `~/.bashrc` or `~/.zshrc` so they persist across sessions.
 
 ---
 

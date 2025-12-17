@@ -79,9 +79,8 @@ Key parameters to tune:
 * **`dpo.reference_policy_kl_penalty`**: Controls how much the model stays close to the original behavior (preventing "reward hacking").
 * **`dpo.preference_loss_weight`**: The strength of the preference signal.
 
-:::{tip}
-For a local test, stick to small models like `meta-llama/Llama-3.2-1B-Instruct` to avoid OOM errors.
-:::
+> [!TIP]
+> For a local test, stick to small models like `meta-llama/Llama-3.2-1B-Instruct` to avoid OOM errors.
 
 ---
 

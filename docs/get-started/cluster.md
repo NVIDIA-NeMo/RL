@@ -93,10 +93,9 @@ Interactive mode launches the cluster and gives you a shell on the **Head Node**
    > [!TIP]
    > The `nvcr.io/nvidia/nemo:latest` image may not always be up to date. If you encounter issues, see the [Docker build instructions](../docker.md) to build a fresh container from source.
 
-   :::{tip}
-   - Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
-   - Depending on your Slurm cluster configuration, you may need `--gres=gpu:8` or `--gpus-per-node=8`. Check with your cluster admin if jobs don't receive GPUs.
-   :::
+   > [!TIP]
+   > - Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
+   > - Depending on your Slurm cluster configuration, you may need `--gres=gpu:8` or `--gpus-per-node=8`. Check with your cluster admin if jobs don't receive GPUs.
 
 2. Attach to the Cluster.
 
@@ -197,9 +196,8 @@ You can pass these variables to `sbatch` to configure the environment:
 | **`WANDB_API_KEY`** | Weights & Biases key (for logging). |
 | **`GPUS_PER_NODE`** | Number of GPUs per node (default: 8). |
 
-:::{tip}
-Export secrets like `HF_TOKEN` in your shell profile (`~/.bashrc`) so you don't have to type them every time.
-:::
+> [!TIP]
+> Export secrets like `HF_TOKEN` in your shell profile (`~/.bashrc`) so you don't have to type them every time.
 
 :::{dropdown} Advanced Environment Configuration
 The following variables allow for deeper customization of the Ray cluster. Most users will not need to change these defaults.
