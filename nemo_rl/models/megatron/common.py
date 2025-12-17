@@ -18,10 +18,8 @@ import torch
 import torch.distributed as dist
 from megatron.bridge.training.state import GlobalState
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -31,11 +29,8 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
-from megatron.training.utils import get_ltor_masks_and_position_ids
-
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
