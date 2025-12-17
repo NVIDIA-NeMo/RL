@@ -43,21 +43,16 @@ def load_response_dataset(data_config, seed: int = 42):
 
     # for sft training
     if dataset_name == "open_assistant":
-        base_dataset = OasstDataset(
+        base_dataset: Any = OasstDataset(
             output_dir="/tmp/open_assistant",
             seed=seed,
         )
     elif dataset_name == "squad":
-        base_dataset = SquadDataset(**data_config)
+        base_dataset: Any = SquadDataset(**data_config)
     elif dataset_name == "tulu3_sft_mixture":
-        base_dataset: Any = Tulu3SftMixtureDataset(
-            test_size=data_config.get("test_size", 0.05),
-            prompt_file=data_config.get("prompt_file", None),
-            max_samples=data_config.get("max_samples", None),
-            seed=seed,
-        )
+        base_dataset: Any = Tulu3SftMixtureDataset(**data_config, seed=seed)
     elif dataset_name == "openai_format":
-        base_dataset = OpenAIFormatDataset(
+        base_dataset: Any = OpenAIFormatDataset(
             data_config["train_data_path"],
             data_config["val_data_path"],
             data_config["chat_key"],
@@ -92,7 +87,7 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(**data_config)
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
-        base_dataset = ResponseDataset(**data_config, seed=seed)
+        base_dataset: Any = ResponseDataset(**data_config, seed=seed)
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
