@@ -97,8 +97,7 @@ class OpenAIFormatDataset(RawDataset):
     }
 
     Args:
-        train_ds_path: Path to the training dataset JSON file
-        val_ds_path: Path to the validation dataset JSON file
+        data_path: Path to the dataset JSON file
         chat_key: Key for the messages list in the dataset (default: "messages")
         system_key: Optional key for system prompt in the dataset
         system_prompt: Optional system prompt to add if not in the dataset
@@ -121,36 +120,33 @@ class OpenAIFormatDataset(RawDataset):
 
     def __init__(
         self,
-        train_ds_path: str,
-        val_ds_path: str,
+        data_path: str,
         chat_key: str = "messages",
         system_key: str | None = None,
         system_prompt: str | None = None,
         tool_key: str | None = "tools",
         use_preserving_dataset: bool = False,
+        **kwargs,
     ):
         self.chat_key = chat_key
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
-        self.task_name = "json_dataset"
+        self.task_name = data_path.split("/")[-1].split(".")[0]
+
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
-            train_original_dataset = load_dataset("json", data_files=train_ds_path)[
-                "train"
-            ]
-            val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
-
-            formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-            formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+            original_dataset = load_dataset("json", data_files=data_path)["train"]
+            # Format the dataset
+            self.dataset = original_dataset.map(self.format_data)
 
             print(
-                f"Loaded dataset using standard approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+                f"Loaded dataset using standard approach: {len(self.dataset)} samples."
             )
 
             # Warn if tools are present in the dataset
             if self.tool_key and any(
-                self.tool_key in sample for sample in formatted_train_dataset
+                self.tool_key in sample for sample in self.dataset
             ):
                 warnings.warn(
                     "Tools detected in dataset. Set use_preserving_dataset=True to preserve heterogeneous tool schemas. "
@@ -173,46 +169,28 @@ class OpenAIFormatDataset(RawDataset):
             )
 
             # Load JSON files directly
-            with open(train_ds_path, "r") as f:
-                train_data = [json.loads(line) for line in f]
-
-            with open(val_ds_path, "r") as f:
-                val_data = [json.loads(line) for line in f]
-
-            # Apply transformations
-            formatted_train_data = [self.add_messages_key(item) for item in train_data]
-            formatted_val_data = [self.add_messages_key(item) for item in val_data]
-
+            with open(data_path, "r") as f:
+                original_dataset = [json.loads(line) for line in f]
+            # Format the dataset
+            formatted_data = [self.format_data(item) for item in original_dataset]
             # Use PreservingDataset to maintain exact structure
-            formatted_train_dataset = PreservingDataset(formatted_train_data)
-            formatted_val_dataset = PreservingDataset(formatted_val_data)
+            self.dataset = PreservingDataset(formatted_data)
 
             print(
-                f"Loaded dataset using PreservingDataset (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+                f"Loaded dataset using PreservingDataset: {len(self.dataset)} samples."
             )
 
-        self.formatted_ds = {
-            "train": formatted_train_dataset,
-            "validation": formatted_val_dataset,
-        }
-        self.task_name = "json_dataset"
-
-    def add_messages_key(
-        self,
-        example: dict[str, Any],
-    ) -> dict[str, list[dict[str, Any]]]:
-        messages = [message for message in example[self.chat_key]]
-        if self.system_key is not None and self.system_key in example:
-            messages = [
-                {"role": "system", "content": example[self.system_key]}
-            ] + messages
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        messages = [message for message in data[self.chat_key]]
+        if self.system_key is not None and self.system_key in data:
+            messages = [{"role": "system", "content": data[self.system_key]}] + messages
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
         assert messages[-1]["role"] == "assistant"
 
         # Preserve tools if they exist in the data
         result = {"messages": messages}
-        if self.tool_key and self.tool_key in example:
-            result["tools"] = example[self.tool_key]
+        if self.tool_key and self.tool_key in data:
+            result["tools"] = data[self.tool_key]
 
         return result
