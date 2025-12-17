@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from typing import Any
 
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
@@ -75,7 +76,7 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "DAPOMath17K":
         base_dataset: Any = DAPOMath17KDataset(**data_config)
     elif dataset_name == "HelpSteer3":
-        base_dataset: Any = HelpSteer3Dataset()
+        base_dataset: Any = HelpSteer3Dataset(**data_config)
     elif dataset_name == "AIME2024":
         base_dataset: Any = AIME2024Dataset(**data_config)
     elif dataset_name == "DAPOMathAIME2024":

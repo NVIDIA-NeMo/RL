@@ -128,6 +128,25 @@ def test_openmathinstruct2_dataset(output_key, tokenizer):
         )
 
 
+def test_helpsteer3_dataset():
+    # load the dataset
+    data_config = {"dataset_name": "HelpSteer3"}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 3
+    assert "context" in first_example
+    assert "response" in first_example
+    assert "task_name" in first_example
+
+    assert len(first_example["context"]) == 7
+    assert first_example["response"][0]["role"] == "assistant"
+    assert first_example["response"][0]["content"][:20] == "Yes, you are correct"
+
+
 @pytest.mark.hf_gated
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_squad_dataset():
