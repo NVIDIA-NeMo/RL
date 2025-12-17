@@ -43,6 +43,6 @@ logger:
     project: nemo-rl
     name: sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
   tensorboard:
-    log_dir: tb_logs-sft-dev-squad
+    log_dir: tb_logs-sft-dev-openmathinstruct2
 cluster:
   gpus_per_node: 8

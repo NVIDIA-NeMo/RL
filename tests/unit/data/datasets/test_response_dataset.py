@@ -16,7 +16,6 @@ import json
 import tempfile
 
 import pytest
-from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
@@ -147,50 +146,6 @@ def test_helpsteer3_dataset():
     assert first_example["response"][0]["content"][:20] == "Yes, you are correct"
 
 
-@pytest.mark.hf_gated
-@pytest.mark.skip(reason="dataset download is flaky")
-def test_squad_dataset():
-    # load the dataset
-    data_config = {
-        "dataset_name": "squad",
-        "prompt_file": None,
-        "system_prompt_file": None,
-    }
-    squad_dataset = load_response_dataset(data_config)
-
-    # load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-
-    # check that the dataset is formatted correctly
-    for example in squad_dataset.formatted_ds["train"].take(5):
-        assert "messages" in example
-        assert len(example["messages"]) == 3
-
-        assert example["messages"][0]["role"] == "system"
-        assert example["messages"][1]["role"] == "user"
-        assert example["messages"][2]["role"] == "assistant"
-
-        template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
-
-        ## check that applying chat template works as expected
-        default_templated = tokenizer.apply_chat_template(
-            example["messages"],
-            chat_template=template,
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-
-        assert default_templated == (
-            "Context: "
-            + example["messages"][0]["content"]
-            + " Question: "
-            + example["messages"][1]["content"]
-            + " Answer: "
-            + example["messages"][2]["content"]
-        )
-
-
 def test_load_dataset_saved_with_save_to_disk():
     """Test loading a dataset that was saved using HuggingFace's save_to_disk().
 
@@ -264,7 +219,8 @@ def test_load_dataset_saved_with_save_to_disk():
 
 
 @pytest.mark.parametrize(
-    "dataset_name", ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024"]
+    "dataset_name",
+    ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024", "squad"],
 )
 def test_build_in_dataset(dataset_name, tokenizer):
     # load the dataset
@@ -288,6 +244,8 @@ def test_build_in_dataset(dataset_name, tokenizer):
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
         assert len(dataset.dataset) == 480
+    elif dataset_name == "squad":
+        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
@@ -299,12 +257,22 @@ def test_build_in_dataset(dataset_name, tokenizer):
         add_special_tokens=False,
     )
 
-    assert combined_message == (
-        " Question: "
-        + first_example["messages"][0]["content"]
-        + " Answer: "
-        + first_example["messages"][1]["content"]
-    )
+    if dataset_name == "squad":
+        assert combined_message == (
+            "Context: "
+            + first_example["messages"][0]["content"]
+            + " Question: "
+            + first_example["messages"][1]["content"]
+            + " Answer: "
+            + first_example["messages"][2]["content"]
+        )
+    else:
+        assert combined_message == (
+            " Question: "
+            + first_example["messages"][0]["content"]
+            + " Answer: "
+            + first_example["messages"][1]["content"]
+        )
 
 
 @pytest.mark.parametrize(

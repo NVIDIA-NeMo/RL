@@ -48,7 +48,7 @@ def load_response_dataset(data_config, seed: int = 42):
             seed=seed,
         )
     elif dataset_name == "squad":
-        base_dataset = SquadDataset()
+        base_dataset = SquadDataset(**data_config)
     elif dataset_name == "tulu3_sft_mixture":
         base_dataset: Any = Tulu3SftMixtureDataset(
             test_size=data_config.get("test_size", 0.05),
