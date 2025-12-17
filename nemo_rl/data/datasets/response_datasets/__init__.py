@@ -36,7 +36,7 @@ def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
-    # TODO @yukih: remove duplicated dataset_name (openmathinstruct2, clevr_cogent)
+    # TODO @yukih: remove duplicated dataset_name (openmathinstruct2)
     # for sft training
     if dataset_name == "open_assistant":
         base_dataset = OasstDataset(
@@ -48,11 +48,6 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "openmathinstruct2":
         # TODO: test after SFT updated
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
-    elif dataset_name == "clevr_cogent":
-        base_dataset = CLEVRCoGenTDataset(
-            split=data_config["split"],
-            prompt_file=data_config["prompt_file"],
-        )
     elif dataset_name == "tulu3_sft_mixture":
         base_dataset: Any = Tulu3SftMixtureDataset(
             test_size=data_config.get("test_size", 0.05),
@@ -86,9 +81,10 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = DAPOMath17KDataset(seed=seed)
     elif dataset_name == "HelpSteer3":
         base_dataset: Any = HelpSteer3Dataset()
-    # for vlm rl training
+    # for vlm training
     # TODO: test after GRPO-VLM updated
     elif dataset_name == "clevr-cogent":
+        # TODO: also test after SFT updated
         base_dataset: Any = CLEVRCoGenTDataset(**data_config)
     elif dataset_name == "refcoco":
         base_dataset: Any = RefCOCODataset(**data_config)
@@ -105,17 +101,7 @@ def load_response_dataset(data_config, seed: int = 42):
         )
 
     base_dataset.set_task_spec(data_config)
-    # Skip sft datasets, the run_sft.py has not been refactored yet.
-    # TODO: refactor run_sft.py to use the new processor interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-    if dataset_name not in [
-        "open_assistant",
-        "squad",
-        "openmathinstruct2",
-        "clevr_cogent",
-        "openai_format",
-        "tulu3_sft_mixture",
-    ]:
-        base_dataset.set_processor()
+    base_dataset.set_processor()
 
     return base_dataset
 
