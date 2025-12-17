@@ -84,13 +84,13 @@ class VllmGeneration(GenerationInterface):
         top_k: int | None = self.cfg.get("top_k", None)
         if top_k is not None and top_k != -1 and top_k < 1:
             raise ValueError(
-                "top_k valid values: i) None or -1: no filtering. ii) >= 1: top-k filtering. Got top_k={top_k}."
+                f"top_k valid values: i) None or -1: no filtering. ii) >= 1: top-k filtering. Got top_k={top_k}."
             )
 
         top_p: float = self.cfg.get("top_p", 1.0)
         if top_p <= 0:
             raise ValueError(
-                "top_p valid values: i) 1.0: no filtering. ii) (0, 1]: top-p filtering. Got top_p={top_p}."
+                f"top_p valid values: i) 1.0: no filtering. ii) (0, 1]: top-p filtering. Got top_p={top_p}."
             )
 
         # Ensure all required VllmConfig fields are present
