@@ -14,7 +14,10 @@
 from typing import Any
 
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
-from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
+from nemo_rl.data.datasets.response_datasets.dapo_math import (
+    DAPOMath17KDataset,
+    DAPOMathAIME2024Dataset,
+)
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
@@ -72,10 +75,9 @@ def load_response_dataset(data_config, seed: int = 42):
         )
         base_dataset: Any = DeepScalerDataset(seed=seed)
     elif dataset_name == "DAPOMath17K":
-        print(
-            "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
-        )
-        base_dataset: Any = DAPOMath17KDataset(seed=seed)
+        base_dataset: Any = DAPOMath17KDataset(**data_config)
+    elif dataset_name == "DAPOMathAIME2024":
+        base_dataset: Any = DAPOMathAIME2024Dataset(**data_config)
     elif dataset_name == "HelpSteer3":
         base_dataset: Any = HelpSteer3Dataset()
     # for vlm training
@@ -107,6 +109,7 @@ __all__ = [
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
     "DAPOMath17KDataset",
+    "DAPOMathAIME2024Dataset",
     "Geometry3KDataset",
     "OpenAIFormatDataset",
     "OasstDataset",
