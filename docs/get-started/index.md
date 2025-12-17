@@ -29,13 +29,13 @@ Welcome to NeMo RL!
 
 ## Prerequisites
 
-* **OS**: Linux (Ubuntu 22.04/20.04 recommended)
+* **OS**: Linux (Ubuntu 24.04 recommended)
 * **Hardware**: 
   * NVIDIA GPU (Volta/Compute Capability 7.0+ required)
   * Sufficient VRAM for the model and batch sizes configured in the example (memory requirements vary by configuration; reduce batch sizes if you encounter out-of-memory errors)
 * **Software**: 
-  * Python 3.12+
-  * CUDA 12+
+  * Python 3.12 (see [`.python-version`](https://github.com/NVIDIA-NeMo/RL/blob/main/.python-version) for the prescribed version)
+  * CUDA 12.9 (see [`docker/Dockerfile`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L8) for the currently prescribed version)
   * Git
 
 ## 1. Installation
@@ -50,7 +50,6 @@ We use `uv` for fast, reliable package management.
 
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
-   source $HOME/.local/bin/env
    ```
 
 2. **Clone NeMo RL**:
@@ -64,10 +63,9 @@ We use `uv` for fast, reliable package management.
    # git submodule update --init --recursive
    ```
 
-   :::{warning}
-   If you cloned without the `--recursive` flag, you may need to rebuild virtual environments:
-   `NRL_FORCE_REBUILD_VENVS=true uv sync`
-   :::
+   > [!WARNING]
+   > If you cloned without the `--recursive` flag, you may need to rebuild virtual environments:
+   > `uv run nemo_rl/utils/prefetch_venvs.py`
 
 3. **Initialize Environment**:
    Create the virtual environment.
@@ -76,9 +74,8 @@ We use `uv` for fast, reliable package management.
    uv venv
    ```
 
-   ```{note}
-   Do not use `-p/--python`. `uv` will automatically read the correct Python version from `.python-version`.
-   ```
+   > [!NOTE]
+   > Do not use `-p/--python`. `uv` will automatically read the correct Python version from `.python-version`.
 
 ## 2. Run Your First Job (Local)
 
@@ -116,18 +113,25 @@ Let's verify your installation by running a **Group Relative Policy Optimization
    **What to expect**:
    * NeMo RL will automatically start a local Ray cluster on your machine.
    * It will download a small model (`Qwen/Qwen2.5-1.5B-Instruct` or similar) and dataset.
-   * You should see training logs indicating "Training started" and loss metrics streaming.
+   * You should see training logs with step metrics including loss, reward, and timing information.
    * The Ray dashboard URL will appear in the logs (typically `http://127.0.0.1:8265`).
 
    **Example output**:
    ```
-   Initializing Ray cluster...
-   Ray dashboard available at http://127.0.0.1:8265
-   Loading model: Qwen/Qwen2.5-1.5B-Instruct
-   Training started...
-   Step 1: reward=0.25, policy_kl_error=0.001
-   Step 2: reward=0.31, policy_kl_error=0.002
-   ...
+   ========================= Step 1/29687 =========================
+   ▶ Preparing batch...
+   ▶ Generating responses for batch of size 512...
+
+   📊 Training Results:
+     • Loss: 1.03
+     • Avg Reward: 0.0000
+     • Mean Generation Length: 368.7812
+
+   ⏱️  Timing:
+     • Total step time: 132.26s
+     • policy_training: 74.31s (56.2%)
+     • generation: 18.28s (13.8%)
+     ...
    ```
 
 ### Local Development Tips
@@ -201,9 +205,9 @@ You generally do **not** need to start Ray manually.
 NeMo RL uses a distributed architecture built on **Ray** to coordinate multiple components (RL Actors) during training:
 
 * **Policy Model**: The model being trained (e.g., Qwen, Llama)
+  * **Training Backend**: PyTorch DTensor or Megatron Core for efficient distributed training
 * **Generation Backend**: Fast inference engine (vLLM) that generates responses
 * **Environment**: Reward evaluator (e.g., Math verifier) that scores outputs
-* **Training Backend**: PyTorch DTensor or Megatron Core for efficient distributed training
 
 Ray manages resource allocation, process isolation, and communication between these components, allowing NeMo RL to scale seamlessly from a single GPU to multi-node clusters.
 
@@ -233,10 +237,10 @@ Now that you have a working setup, choose the workflow that matches your goal.
 **Start here** if you have preference data (chosen vs rejected pairs) and want to align your model to human preferences. DPO learns directly from preference comparisons without needing a separate reward model.
 :::
 
-:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Reinforce (GRPO)
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Reinforcement Learning (GRPO)
 :link: gs-grpo
 :link-type: ref
-**Start here** for reasoning tasks (math, coding) where you can verify correctness programmatically. GRPO is efficient for on-policy RL without requiring a separate critic model—perfect for tasks with deterministic rewards.
+**Start here** for reasoning tasks (math, coding) where you can verify correctness programmatically. GRPO is efficient for on-policy RL without requiring a separate critic model—perfect for tasks with verifiable rewards.
 :::
 
 ::::

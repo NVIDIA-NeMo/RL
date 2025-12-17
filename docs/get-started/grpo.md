@@ -75,7 +75,6 @@ Key parameters for GRPO:
 * **`grpo.num_generations_per_prompt`**: The group size ($G$). The model generates this many outputs for *each* prompt (e.g., 16).
 * **`grpo.num_prompts_per_step`**: How many unique prompts to process in one batch.
 * **`policy.model_name`**: The model being trained.
-* **`policy.generation.temperature`**: Controls diversity. GRPO needs diverse outputs to find the correct answer, so `1.0` is common.
 
 ---
 
@@ -114,11 +113,9 @@ uv run python examples/run_grpo_math.py \
 
 ## 4. Monitor and Verify
 
-GRPO training logs specific metrics that tell you if "Reasoning" is emerging:
+Monitor the `reward` metric to see if the model is improving. Note that some models may plateau early if they have already been fine-tuned or RL-trained for the task.
 
-1.  **`reward`**: The average accuracy of the group (mean reward). This should steadily increase.
-2.  **`policy_kl_error`**: How far the model has drifted from the original behavior (KL divergence).
-3.  **`advantages/mean`**: The average relative score of an output compared to its group peers.
+Training can destabilize over time, so also monitor `policy_kl_error` and `token_mult_prob_error` to detect instability. For detailed information about these metrics, see the [GRPO Guide](../guides/grpo.md#metrics).
 
 ### Output Artifacts
 
@@ -131,7 +128,7 @@ Results are saved to `results/grpo`:
 
 ### Multi-GPU Training
 
-GRPO involves heavy generation (inference) and training. For larger models (7B+), you almost certainly need multiple GPUs.
+GRPO involves heavy generation (inference) and training. For larger models (8B+), you almost certainly need multiple GPUs.
 
 Use the Megatron backend for efficient scaling:
 

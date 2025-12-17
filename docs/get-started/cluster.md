@@ -76,7 +76,7 @@ Interactive mode launches the cluster and gives you a shell on the **Head Node**
 
    ```bash
    # Run from the root of NeMo RL repo
-   NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+   NUM_ACTOR_NODES=1
 
    CONTAINER=nvcr.io/nvidia/nemo:latest \
    MOUNTS="$PWD:$PWD" \
@@ -89,6 +89,9 @@ Interactive mode launches the cluster and gives you a shell on the **Head Node**
        --job-name=YOUR_JOBNAME \
        ray.sub
    ```
+
+   > [!TIP]
+   > The `nvcr.io/nvidia/nemo:latest` image may not always be up to date. If you encounter issues, see the [Docker build instructions](../docker.md) to build a fresh container from source.
 
    :::{tip}
    - Replace `YOUR_ACCOUNT` and `YOUR_PARTITION` with values from your cluster. Run `sacctmgr show associations user=$USER` to find your account.
@@ -105,7 +108,7 @@ Interactive mode launches the cluster and gives you a shell on the **Head Node**
 
 3. Run Your Training.
 
-   You are now inside the container on the head node. Run your command (see Cheatsheet above):
+   You are now inside the container on the head node. Run your command (see [Command Cheatsheet](#command-cheatsheet) above):
 
    ```bash
    uv run examples/run_grpo_math.py
@@ -122,7 +125,7 @@ Batch mode is "fire and forget." You specify the command upfront, and the cluste
 
    ```bash
    # Run from the root of NeMo RL repo
-   NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
+   NUM_ACTOR_NODES=1
 
    COMMAND="uv run examples/run_grpo_math.py" \
    CONTAINER=nvcr.io/nvidia/nemo:latest \
@@ -136,6 +139,9 @@ Batch mode is "fire and forget." You specify the command upfront, and the cluste
        --job-name=YOUR_JOBNAME \
        ray.sub
    ```
+
+   > [!TIP]
+   > The `nvcr.io/nvidia/nemo:latest` image may not always be up to date. If you encounter issues, see the [Docker build instructions](../docker.md) to build a fresh container from source.
 
 2. Check Status.
 

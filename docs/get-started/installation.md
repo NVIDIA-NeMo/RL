@@ -73,8 +73,8 @@ Find the correct version for your system at the [NVIDIA cuDNN Downloads page](ht
    ```
 :::
 
-:::{tab-item} vLLM / DeepSpeed
-For the **vLLM** inference backend (often used with DeepSpeed), `libibverbs-dev` is required on bare metal to avoid build errors.
+:::{tab-item} vLLM
+For the **vLLM** inference backend, `libibverbs-dev` is required on bare metal to avoid build errors (needed for [deep_ep](https://github.com/NVIDIA-NeMo/RL/blob/363165a87fcf9dc42accc590ff4e92ca4da8a505/pyproject.toml#L69C1-L71C40)).
 
 **Install libibverbs:**
 ```sh
@@ -147,7 +147,7 @@ Initialize the project-specific virtual environment. NeMo RL uses a `.python-ver
 2. **(Optional) Rebuilding Environments**:
    If you change branches or modify `pyproject.toml` significantly, you may need to force a rebuild of the environment variables and dependencies:
    ```sh
-   NRL_FORCE_REBUILD_VENVS=true uv sync
+   uv run nemo_rl/utils/prefetch_venvs.py
    ```
 
 ---
@@ -167,6 +167,10 @@ In NeMo RL, we recommend using `uv run` to execute scripts rather than manually 
     ```sh
     uv run python examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml
     ```
+
+:::{tip}
+If you prefer to run without `uv`, you can use [frozen environments](https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md#frozen-environments) to manage dependencies manually.
+:::
 
 ---
 

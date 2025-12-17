@@ -11,7 +11,7 @@ content_type: "tutorial"
 
 # Get Started with SFT
 
-**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models.
+**Supervised Fine-Tuning (SFT)** is the standard first step in aligning language models. It is also used to teach models how to call tools, which is a prerequisite to agentic RL.
 
 :::{card}
 **Goal**: Train a basic model (Llama-3.2-1B) on a sample dataset using your local machine.
