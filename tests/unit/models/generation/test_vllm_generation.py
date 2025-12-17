@@ -1164,6 +1164,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
@@ -1199,6 +1200,11 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("created")
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        message = d["choices"][0]["message"]
+        if "reasoning" in message:
+            message.pop("reasoning")
 
         return d
 
@@ -1368,6 +1374,9 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
 def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
+
+        def decode(self, *args, **kwargs):
+            pass
 
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]

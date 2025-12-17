@@ -3465,6 +3465,7 @@ name = "nemo-gym"
 source = { editable = "3rdparty/Gym-workspace" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "datasets" },
     { name = "devtools" },
     { name = "fastapi" },
     { name = "gradio" },
@@ -3486,6 +3487,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp" },
+    { name = "datasets" },
     { name = "devtools" },
     { name = "fastapi" },
     { name = "gradio" },
