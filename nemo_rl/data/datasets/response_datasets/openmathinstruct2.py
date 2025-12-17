@@ -44,7 +44,7 @@ class OpenMathInstruct2Dataset(RawDataset):
         self.output_key = output_key
         self.task_name = "OpenMathInstruct-2"
 
-        # load from local or huggingface
+        # load from huggingface
         self.dataset = load_dataset("nvidia/OpenMathInstruct-2", split=split)
 
         # format the dataset
