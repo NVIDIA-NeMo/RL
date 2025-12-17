@@ -11,28 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import partial
-from typing import Any, Iterator, Optional
+
+from typing import Optional, Any
 
 import torch
 import torch.distributed as dist
-from megatron.bridge.training.state import GlobalState
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_context_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
+
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
-
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return (
@@ -40,120 +29,6 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
         if value % multiple != 0
         else value
     )
-
-
-def forward_step_arbitrary_loss(
-    state: GlobalState,
-    global_valid_seqs: torch.Tensor,
-    global_valid_toks: torch.Tensor,
-    data_iterator: Iterator[BatchedDataDict[Any]],
-    model: GPTModel,
-    loss_fn: LossFunction,
-    pack_sequences: bool = False,
-    defer_fp32_logits: Optional[bool] = None,
-    cp_normalize: bool = True,
-    policy_cfg: Optional[dict] = None,
-):
-    """Forward training step with support for packed sequences and context parallelism.
-
-    Args:
-        state (GlobalState): Global state for the run
-        global_valid_seqs: Global count of valid sequences
-        global_valid_toks: Global count of valid tokens
-        data_iterator: Input data iterator
-        model (GPTModel): The GPT Model
-        loss_fn (LossFunction): Loss function to apply
-        pack_sequences (bool): Whether to pack sequences for efficiency
-        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
-        cp_normalize (bool): Whether to normalize the loss by the cp_size
-        policy_cfg (Optional[dict]): Policy configuration containing generation parameters
-
-    Notes on packed sequences with context parallelism (CP):
-        - When CP > 1, each sequence is padded to a multiple of (cp_size * 2)
-        - The factor of 2 ensures load balancing for causal attention
-        - cu_seqlens tracks actual sequence boundaries
-        - cu_seqlens_padded tracks padded sequence boundaries for CP
-        - Requires TransformerEngine >= 1.10 for CP support
-    """
-    straggler_timer = state.straggler_timer
-
-    # Get the pre-processed microbatch from the iterator
-    processed_mb = next(data_iterator)
-
-    # Extract the processed components
-    data_dict = processed_mb.data_dict
-    input_ids = processed_mb.input_ids
-    input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
-    attention_mask = processed_mb.attention_mask
-    position_ids = processed_mb.position_ids
-    packed_seq_params = processed_mb.packed_seq_params
-    cu_seqlens_padded = processed_mb.cu_seqlens_padded
-
-    multimodal_data = data_dict.get_multimodal_dict(
-        as_tensors=True, device=input_ids_cp_sharded.device
-    )
-    if len(multimodal_data) > 0:
-        position_ids = None
-
-    additional_kwargs = {}
-    # Mamba models currently do not support packed_seq_params
-    if packed_seq_params is not None:
-        additional_kwargs["packed_seq_params"] = packed_seq_params
-
-    if defer_fp32_logits:
-        additional_kwargs["fp32_output"] = False
-
-    with straggler_timer:
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
-
-        # Apply temperature scaling to logits for training
-        # This matches the dtensor worker's _apply_temperature_scaling in the train method
-        if (
-            policy_cfg is not None
-            and "generation" in policy_cfg
-            and policy_cfg["generation"] is not None
-        ):
-            output_tensor.div_(policy_cfg["generation"]["temperature"])
-
-        # Unpack the output tensor if we did packed sequences
-        if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
-                loss_fn=loss_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-            )
-
-        loss_data = data_dict
-
-    loss_fn_wrapped = partial(
-        loss_fn,
-        data=loss_data,
-        global_valid_seqs=global_valid_seqs,
-        global_valid_toks=global_valid_toks,
-        vocab_parallel_rank=get_tensor_model_parallel_rank(),
-        vocab_parallel_group=get_tensor_model_parallel_group(),
-        context_parallel_group=get_context_parallel_group(),
-    )
-
-    if cp_normalize:
-        cp_size = get_context_parallel_world_size()
-        orig_loss_fn_wrapped = loss_fn_wrapped
-
-        def _div_by_cp_size(*args, **kwargs):
-            loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
-            return loss / cp_size, metrics
-
-        loss_fn_wrapped = _div_by_cp_size
-
-    return output_tensor, loss_fn_wrapped
-
 
 def broadcast_tensor(
     tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup
