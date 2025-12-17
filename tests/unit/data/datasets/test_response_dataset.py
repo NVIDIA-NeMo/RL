@@ -22,7 +22,6 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
 from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
-from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
 
 
 def create_sample_data(input_key, output_key):

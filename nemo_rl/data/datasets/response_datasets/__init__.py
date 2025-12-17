@@ -36,7 +36,6 @@ def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
-    # TODO @yukih: remove duplicated dataset_name (openmathinstruct2)
     # for sft training
     if dataset_name == "open_assistant":
         base_dataset = OasstDataset(
@@ -45,9 +44,6 @@ def load_response_dataset(data_config, seed: int = 42):
         )
     elif dataset_name == "squad":
         base_dataset = SquadDataset()
-    elif dataset_name == "openmathinstruct2":
-        # TODO: test after SFT updated
-        base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "tulu3_sft_mixture":
         base_dataset: Any = Tulu3SftMixtureDataset(
             test_size=data_config.get("test_size", 0.05),
@@ -67,6 +63,7 @@ def load_response_dataset(data_config, seed: int = 42):
         )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
+        # TODO: also test after SFT updated
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
