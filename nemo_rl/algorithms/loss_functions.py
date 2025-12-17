@@ -24,15 +24,12 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
-    apply_top_k_top_p,
-    from_parallel_logits_to_logprobs,
+    compute_logprobs_from_logits,
     gather_logits_at_global_indices,
-    get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.policy.utils import (
     TrainingSamplingParams,
-    need_top_k_filtering,
-    need_top_p_filtering,
+    need_top_k_or_top_p_filtering,
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -169,28 +166,25 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        # sampling mask mismatch handling
-        # vllm samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
-        # during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
-        # token X may fall outside the training policy's top-k/p set -> prev_logprobs[X] = -inf
-        # Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
-        neginf_positions = torch.isinf(prev_logprobs) | torch.isinf(
-            reference_policy_logprobs
-        )
-        neginf_count = (neginf_positions & mask.bool()).sum().item()
-        total_valid_tokens = mask.sum().item()
-        if neginf_count > 0:
-            print(
-                f"[WARNING]: {neginf_count}/{int(total_valid_tokens)} valid tokens have -inf logprobs (top-k/top-p mismatch). "
-                "Masking out these positions from loss/metrics calculation."
-            )
+        if sampling_params is not None and need_top_k_or_top_p_filtering(
+            sampling_params.top_k, sampling_params.top_p
+        ):
+            # sampling mask mismatch handling
+            # vllm samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+            # during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+            # token X may fall outside the training policy's top-k/p set -> prev_logprobs[X] = -inf
+            # Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+            prev_neginf_positions = torch.isinf(prev_logprobs)
+            prev_neginf_count = (prev_neginf_positions & mask.bool()).sum().item()
+            if prev_neginf_count > 0:
+                print(
+                    f"[WARNING]: {prev_neginf_count}/{int(mask.sum().item())} valid tokens have -inf in prev_logprobs "
+                    "(policy top-k/top-p mismatch). Masking out these positions."
+                )
 
-        # mask out -inf positions
-        mask = mask * (~neginf_positions).float()
-        prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
-        reference_policy_logprobs = torch.where(
-            mask.bool(), reference_policy_logprobs, 0.0
-        )
+            # Update mask for actor loss (only based on prev_logprobs)
+            mask = mask * (~prev_neginf_positions).float()
+            prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -256,78 +250,73 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        next_token_logits = next_token_logits.to(torch.float32)
+        curr_logprobs = compute_logprobs_from_logits(
+            next_token_logits,
+            data["input_ids"],
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            seq_index=seq_index,
+            sampling_params=sampling_params,
+        )
 
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-                sampling_params=sampling_params,
-            )
-            # slice off to the correct length to remove potential CP padding
-            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits,
-                data["input_ids"],
-                seq_index=seq_index,
-                sampling_params=sampling_params,
-            )
-        else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            # Apply top-k and top-p filtering
-            next_token_logits_wo_last, _ = apply_top_k_top_p(
-                next_token_logits_wo_last,
-                top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
-            )
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        if sampling_params is not None and need_top_k_or_top_p_filtering(
+            sampling_params.top_k, sampling_params.top_p
+        ):
+            # Handle -inf in curr_logprobs as well (same top-k/top-p mismatch issue)
+            curr_is_neginf = torch.isinf(curr_logprobs)
+            curr_neginf_count = (curr_is_neginf & mask.bool()).sum().item()
+            if curr_neginf_count > 0:
+                print(
+                    f"[WARNING]: {curr_neginf_count} additional -inf positions detected in curr_logprobs, masking out."
+                )
 
-        # Handle -inf in curr_logprobs as well (same top-k/top-p mismatch issue)
-        curr_is_neginf = torch.isinf(curr_logprobs)
-        curr_neginf_count = (curr_is_neginf & mask.bool()).sum().item()
-        if curr_neginf_count > 0:
-            print(
-                f"[WARNING]: {curr_neginf_count} additional -inf positions detected in curr_logprobs, masking out."
-            )
-
-        # mask out -inf positions in curr_logprobs
-        mask = mask * (~curr_is_neginf).float()
-        curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
+            # mask out -inf positions in curr_logprobs
+            mask = mask * (~curr_is_neginf).float()
+            curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
+            # When top-k/top-p filtering is enabled, we need special handling for KL:
+            # - reference_policy_logprobs is computed **without** filtering (see use_reference_model)
+            # - curr_logprobs is computed **with** filtering (for actor loss compatibility)
+            # - For KL, we need curr_logprobs **without** filtering to be consistent with ref logprobs
+            # - For importance weights, we also use unfiltered curr_logprobs_for_kl since we're
+            #   reweighting samples from π_gen_filtered to π_curr_unfiltered
+            if sampling_params is not None and need_top_k_or_top_p_filtering(
+                sampling_params.top_k, sampling_params.top_p
+            ):
+                # Compute unfiltered logprobs for KL calculation
+                curr_logprobs_for_kl = compute_logprobs_from_logits(
+                    next_token_logits,
+                    data["input_ids"],
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    seq_index=seq_index,
+                    sampling_params=None,  # No filtering for KL
+                )
+            else:
+                curr_logprobs_for_kl = curr_logprobs
+
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
+                # Use curr_logprobs_for_kl (unfiltered when filtering is enabled) for importance weights
+                # This correctly reweights samples from π_gen to π_curr (unfiltered)
                 kl_importance_weights = torch.exp(
-                    curr_logprobs - generation_logprobs
+                    curr_logprobs_for_kl - generation_logprobs
                 ).detach()
                 kl_importance_weights = torch.nan_to_num(
                     kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs)
+                kl_importance_weights = torch.ones_like(curr_logprobs_for_kl)
+
             kl = (
                 kl_importance_weights
                 * self.reference_policy_kl_penalty
                 * calculate_kl(
-                    logprobs=curr_logprobs,
+                    logprobs=curr_logprobs_for_kl,
                     logprobs_reference=reference_policy_logprobs,
                     kl_type=self.reference_policy_kl_type,
                     input_clamp_value=self.kl_input_clamp_value,
@@ -517,47 +506,15 @@ class NLLLoss(LossFunction):
         mask = token_mask * sample_mask.unsqueeze(-1)
         seq_index = data.get("seq_index", None)
 
-        next_token_logits = next_token_logits.to(torch.float32)
-
-        # Gather the logprobs for the actual next tokens
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            token_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-                sampling_params=sampling_params,
-            )
-            # slice off to the correct length to remove potential CP padding
-            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits,
-                data["input_ids"],
-                seq_index=seq_index,
-                sampling_params=sampling_params,
-            )
-        else:
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            # Apply top-k and top-p filtering
-            next_token_logits, _ = apply_top_k_top_p(
-                next_token_logits,
-                top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
-            )
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
-            )
-            logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
-            token_logprobs = logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        token_logprobs = compute_logprobs_from_logits(
+            next_token_logits,
+            data["input_ids"],
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            seq_index=seq_index,
+            sampling_params=sampling_params,
+        )
 
         # Apply masking to avoid NaN when logprobs are -inf at masked positions
         token_logprobs = torch.where(mask.bool(), token_logprobs, 0.0)
@@ -790,45 +747,15 @@ class DPOLossFn(PreferenceLoss):
         sample_mask = data["sample_mask"]
         seq_index = data.get("seq_index", None)
 
-        next_token_logits = next_token_logits.to(torch.float32)
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            token_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-                sampling_params=sampling_params,
-            )
-            # slice off to the correct length to remove potential CP padding
-            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits,
-                data["input_ids"],
-                seq_index=seq_index,
-                sampling_params=sampling_params,
-            )
-        else:
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            # Apply top-k and top-p filtering
-            next_token_logits, _ = apply_top_k_top_p(
-                next_token_logits,
-                top_k=sampling_params.top_k if sampling_params is not None else None,
-                top_p=sampling_params.top_p if sampling_params is not None else 1.0,
-            )
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
-            )
-            logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
-            token_logprobs = logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        token_logprobs = compute_logprobs_from_logits(
+            next_token_logits,
+            data["input_ids"],
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            seq_index=seq_index,
+            sampling_params=sampling_params,
+        )
 
         # Apply masking to avoid NaN when logprobs are -inf at masked positions
         token_logprobs = torch.where(token_mask.bool(), token_logprobs, 0.0)
@@ -1040,9 +967,8 @@ class DistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
         # The generation sampling params top-k and top-p are not supported yet for distillation loss
-        if sampling_params is not None and (
-            need_top_k_filtering(sampling_params.top_k)
-            or need_top_p_filtering(sampling_params.top_p)
+        if sampling_params is not None and need_top_k_or_top_p_filtering(
+            sampling_params.top_k, sampling_params.top_p
         ):
             raise ValueError(
                 "Generation sampling params top-k and top-p are not supported yet for distillation loss"

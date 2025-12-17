@@ -85,8 +85,7 @@ from nemo_rl.models.policy.utils import (
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    need_top_k_filtering,
-    need_top_p_filtering,
+    need_top_k_or_top_p_filtering,
     resolve_model_class,
 )
 from nemo_rl.utils.automodel_checkpoint import (
@@ -477,14 +476,14 @@ class DTensorPolicyWorkerV2:
 
     def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
-        if self.sampling_params is not None and (
-            need_top_k_filtering(self.sampling_params.top_k)
-            or need_top_p_filtering(self.sampling_params.top_p)
+        sampling_params = self.sampling_params
+        if sampling_params is not None and need_top_k_or_top_p_filtering(
+            sampling_params.top_k, sampling_params.top_p
         ):
             logits, _ = apply_top_k_top_p(
                 logits,
-                top_k=self.sampling_params.top_k,
-                top_p=self.sampling_params.top_p,
+                top_k=sampling_params.top_k,
+                top_p=sampling_params.top_p,
             )
         return logits
 
@@ -1631,8 +1630,10 @@ class DTensorPolicyWorkerV2:
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
             try:
@@ -1646,11 +1647,21 @@ class DTensorPolicyWorkerV2:
                     val = to_local_if_dtensor(v)
                     val.copy_(self.reference_model_state_dict[k])
 
+                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+                # The reference policy has different weights, so its top-k/top-p set is
+                # inherently different from the current policy. Using filtered logprobs
+                # would cause -inf mismatches that cannot be resolved by masking.
+                saved_sampling_params = self.sampling_params
+                self.sampling_params = None
+
                 # - self.model is the original reference_model, now on CUDA
                 # - curr_state_dict is the train model, now on CPU
                 yield
 
             finally:
+                # Restore sampling_params
+                self.sampling_params = saved_sampling_params
+
                 # Restore train model state_dict
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
