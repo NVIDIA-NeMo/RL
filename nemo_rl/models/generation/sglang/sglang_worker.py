@@ -131,7 +131,7 @@ class SGLangGenerationWorker:
                           The length of this list determines tp_size (number of GPUs per server).
                           Only needed for the first worker in each server group (model owner).
             fraction_of_gpus: Fraction of GPUs to use for this worker
-            seed: Random seed for initialization
+            seed: Random seed for initialization, if None, then defaults to the config's seed
         """
         self.cfg = config
         self.is_model_owner = bundle_indices is not None
