@@ -1,0 +1,75 @@
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-16n8g
+
+policy:
+  model_name: Qwen/Qwen3-235B-A22B
+  tokenizer:
+    name: Qwen/Qwen3-235B-A22B
+  train_micro_batch_size: 1
+  train_global_batch_size: 512
+  logprob_batch_size: 2
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+  make_sequence_length_divisible_by: 1
+  
+  dtensor_cfg:
+    enabled: false
+  
+  optimizer: null # remove default FSDP optimizer
+
+  scheduler: null # remove default FSDP scheduler
+  
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 2
+    sequence_parallel: false
+    pipeline_model_parallel_size: 8
+    context_parallel_size: 1
+    expert_model_parallel_size: 8
+    activation_checkpointing: true
+    num_layers_in_first_pipeline_stage: 11
+    num_layers_in_last_pipeline_stage: 11
+    moe_permute_fusion: true
+    
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-7
+      min_lr: 3.0e-8
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+    
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+    fp8_cfg:
+      enabled: false
+  
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
