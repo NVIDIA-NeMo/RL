@@ -18,7 +18,6 @@ import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from functools import partial
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
