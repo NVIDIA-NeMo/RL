@@ -568,10 +568,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         mbs=micro_batch_size,
                         post_processing_fn=loss_fn_wrapped,
                         forward_only=eval_mode,
-                        #do_not_average_loss=True, ## TODO!
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        do_not_average_loss=True,
                     )
 
                 # Empty unused memory.
