@@ -4,7 +4,7 @@ This guide explains how to use the Muon optimizer with NeMo RL for training larg
 
 ## What is Muon?
 
-**Muon** (MomentUm Orthogonalized by Newton-schulz) is an optimizer from [Moonshot AI](https://arxiv.org/abs/2502.16982) that achieves ~2× sample efficiency over AdamW. It applies Newton-Schulz orthogonalization to momentum-based updates, which helps prevent weight matrices from becoming poorly conditioned during training. Muon is used for linear layers while Adam handles non-linear parameters (embeddings, layer norms).
+[**Muon** (MomentUm Orthogonalized by Newton-schulz)](https://arxiv.org/abs/2502.16982) is an optimizer from Moonshot AI that achieves ~2× sample efficiency over AdamW. It applies Newton-Schulz orthogonalization to momentum-based updates, which helps prevent weight matrices from becoming poorly conditioned during training. Muon is used for linear layers while Adam handles non-linear parameters (embeddings, layer norms).
 
 ## Requirements
 
