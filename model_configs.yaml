@@ -340,6 +340,45 @@ qwen30b_ep4:
       ep: 4
       pp: 1
 
+# Qwen3-30B-A3B with EP=16 (max expert distribution across all GPUs)
+qwen30b_ep16:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
+  
+  h100:
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 16
+      pp: 1
+  
+  gb200:
+    # GB200 EP=16: 128 experts / 16 GPUs = 8 experts/GPU
+    # More cross-node All-to-All but minimal memory per GPU
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 16
+      pp: 1
+
 # ============================================
 # Qwen3-235B-A22B (Large MoE)
 # ============================================
