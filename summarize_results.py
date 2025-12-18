@@ -136,8 +136,8 @@ def parse_wandb_name(name: str) -> dict:
         result['gpus_per_node'] = int(nxg_underscore_match.group(2))
         result['total_gpus'] = result['num_nodes'] * result['gpus_per_node']
         
-        # Extract model name (everything before _N)
-        model_match = re.match(r'^([^_]+)', name)
+        # Extract model name (everything before _N, e.g., "Qwen3_32B" from "Qwen3_32B_N4xG4_...")
+        model_match = re.match(r'^(.+?)_N\d+xG\d+', name)
         if model_match:
             result['model'] = model_match.group(1)
         
@@ -1208,13 +1208,43 @@ def filter_results(results: list, filters: dict) -> list:
     if not filters:
         return results
     
+    def normalize_for_match(s: str) -> str:
+        """Normalize string for flexible matching (remove hyphens, dots, lowercase)."""
+        return s.lower().replace('-', '').replace('.', '').replace('_', '')
+    
+    def flexible_model_match(filter_val: str, model_name: str) -> bool:
+        """Flexible model name matching that handles version numbers.
+        
+        Examples that should match:
+        - "qwen32b" matches "Qwen3_32B" (ignores version "3")
+        - "llama8b" matches "Llama_3_1_8B_Instruct"
+        - "30ba3b" matches "Qwen3_30B_A3B"
+        """
+        norm_filter = normalize_for_match(filter_val)
+        norm_model = normalize_for_match(model_name)
+        
+        # Direct substring match
+        if norm_filter in norm_model:
+            return True
+        
+        # Try matching by extracting key parts (model size like "32b", "8b", "30ba3b")
+        # Extract size pattern from filter (e.g., "32b", "8b", "30ba3b", "235b")
+        import re
+        size_pattern = re.search(r'(\d+b(?:a\d+b)?)', norm_filter)
+        if size_pattern:
+            size = size_pattern.group(1)
+            if size in norm_model:
+                return True
+        
+        return False
+    
     filtered = []
     for r in results:
         match = True
         for key, value in filters.items():
             if key == 'model':
-                # Partial match for model name (case-insensitive)
-                if value.lower() not in r.get('model', '').lower():
+                # Flexible partial match for model name (ignore hyphens, dots, case)
+                if not flexible_model_match(value, r.get('model', '')):
                     match = False
                     break
             else:

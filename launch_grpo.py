@@ -212,10 +212,22 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 4}
             },
             "gb200": {
-                "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
                 "num_prompts": 64, "num_generations": 32,
-                "generation": {"tp": 4, "pp": 1},
-                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 4}
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 1}
+            },
+            "gb200_tp2": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 2, "cp": 1, "ep": 1, "pp": 1}
+            },
+            "gb200_tp1": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 1, "pp": 1}
             }
         },
         "qwen30b": {
@@ -683,8 +695,20 @@ Examples:
     
     args = parser.parse_args()
     
+    # Infer cluster type from variant name if not explicitly specified
+    cluster_type = args.cluster
+    if cluster_type is None and args.variant:
+        # Parse variant name to infer cluster type (e.g., "gb200_tp1" -> "gb200")
+        variant_lower = args.variant.lower()
+        if variant_lower.startswith("gb200"):
+            cluster_type = "gb200"
+            print(f"[INFO] Inferred cluster type 'gb200' from variant '{args.variant}'")
+        elif variant_lower.startswith("h100"):
+            cluster_type = "h100"
+            print(f"[INFO] Inferred cluster type 'h100' from variant '{args.variant}'")
+    
     # Get cluster configuration
-    cluster_config = get_cluster_config(args.cluster, args.partition)
+    cluster_config = get_cluster_config(cluster_type, args.partition)
     print(f"[INFO] Cluster: {cluster_config['cluster_type'].upper()} ({cluster_config['gpus_per_node']} GPUs/node)")
     print(f"[INFO] Container: {cluster_config['container']}")
     

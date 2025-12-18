@@ -220,6 +220,42 @@ qwen32b:
       cp: 1
       ep: 1
       pp: 1
+  
+  gb200_tp2:
+    # GB200: Training TP=2 variant (more data parallelism)
+    # DP = 16 / (2×1×1) = 8
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 2
+      cp: 1
+      ep: 1
+      pp: 1
+  
+  gb200_tp1:
+    # GB200: Training TP=1 variant (maximum data parallelism)
+    # DP = 16 / (1×1×1) = 16
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 1
+      pp: 1
 
 # ============================================
 # Qwen3-30B-A3B (MoE)
