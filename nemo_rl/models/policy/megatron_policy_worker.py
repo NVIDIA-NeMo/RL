@@ -1445,8 +1445,16 @@ class MegatronPolicyWorker:
                 # The reference policy has different weights, so its top-k/top-p set is
                 # inherently different from the current policy. Using filtered logprobs
                 # would cause -inf mismatches that cannot be resolved by masking.
+                # Note: We keep temperature scaling since it was applied to prev_logprobs.
                 saved_sampling_params = self.sampling_params
-                self.sampling_params = None
+                if saved_sampling_params is not None:
+                    self.sampling_params = TrainingSamplingParams(
+                        top_k=None,  # Disable top-k
+                        top_p=1.0,  # Disable top-p
+                        temperature=saved_sampling_params.temperature,  # Keep temperature
+                    )
+                else:
+                    self.sampling_params = None
 
                 # - self.model is the original reference_model, now on CUDA
                 # - self.reference_model is the original model, now on CPU
