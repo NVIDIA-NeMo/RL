@@ -52,7 +52,7 @@ CLUSTER_CONFIGS = {
     },
     "gb200": {
         "gpus_per_node": 4,
-        "container_name": "nemo_rl.sqsh",  # Container filename (path set dynamically)
+        "container_name": "nemo_rl_nightly.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "gb200",
         "default_partition": "batch",
         "use_gres": True,  # GB200 also needs GRES
@@ -61,12 +61,11 @@ CLUSTER_CONFIGS = {
 
 
 def detect_cluster_type(partition: str = "batch") -> str:
-    """Detect cluster type from hostname, SLURM partition names, or GRES configuration."""
+    """Detect cluster type from GRES configuration, hostname, or partition names."""
     import re
     import socket
     
     # Method 1: Check hostname for GB200-only clusters (lyris, theia)
-    # Note: hsg clusters can have both H100 and GB200, so we use partition-based detection
     try:
         hostname = socket.gethostname().lower()
         if "lyris" in hostname or "theia" in hostname:
@@ -75,33 +74,7 @@ def detect_cluster_type(partition: str = "batch") -> str:
     except Exception as e:
         print(f"[DEBUG] Could not detect from hostname: {e}")
     
-    # Method 2: Check available partitions for gb200/gb300 naming
-    try:
-        result = subprocess.run(
-            ["sinfo", "-h", "-o", "%P"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            partitions = result.stdout.strip().lower()
-            has_gb200 = "gb200" in partitions or "gb300" in partitions
-            has_batch = "batch" in partitions
-            
-            if has_gb200 and not has_batch:
-                # GB200-only cluster (like lyris)
-                print(f"[DEBUG] Detected GB200/GB300 cluster from partition names (no batch)")
-                return "gb200"
-            elif has_batch and not has_gb200:
-                # H100-only cluster
-                print(f"[DEBUG] Detected H100 cluster from partition names (batch only)")
-                return "h100"
-            elif has_gb200 and has_batch:
-                # Mixed cluster (like hsg) - default to H100, user can override with --cluster
-                print(f"[DEBUG] Mixed cluster detected (has both batch and gb200). Defaulting to H100. Use --cluster gb200 to override.")
-                return "h100"
-    except Exception as e:
-        print(f"[DEBUG] Could not detect from partition names: {e}")
-    
-    # Method 3: Try GRES-based detection
+    # Method 2: GRES-based detection (most reliable - check actual GPU count)
     try:
         result = subprocess.run(
             ["sinfo", "-p", partition, "-h", "-o", "%G"],
@@ -117,6 +90,26 @@ def detect_cluster_type(partition: str = "batch") -> str:
                     return "h100"
                 elif gpus == 4:
                     return "gb200"
+    except Exception as e:
+        print(f"[DEBUG] Could not detect from GRES: {e}")
+    
+    # Method 3: Check available partitions for gb200/gb300 naming (fallback)
+    try:
+        result = subprocess.run(
+            ["sinfo", "-h", "-o", "%P"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            partitions = result.stdout.strip().lower()
+            has_gb200 = "gb200" in partitions or "gb300" in partitions
+            has_batch = "batch" in partitions
+            
+            if has_gb200:
+                print(f"[DEBUG] Detected GB200/GB300 cluster from partition names")
+                return "gb200"
+            elif has_batch:
+                print(f"[DEBUG] Detected H100 cluster from partition names (batch only)")
+                return "h100"
     except Exception as e:
         print(f"[WARNING] Could not auto-detect cluster type: {e}")
     
@@ -495,6 +488,7 @@ sbatch \\
     --job-name={job_name} \\
     --partition={partition} \\
     --time={time_limit} \\
+    --output={base_log_dir}/%j-logs/slurm-%j.out \\
     {gres_line}--segment {segment} \\
     ray.sub"""
     
