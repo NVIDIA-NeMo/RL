@@ -206,20 +206,20 @@ qwen32b:
   
   gb200:
     # Scaled from H100: 32 GPUs (8 nodes)
-    num_gpus: 32
+    num_gpus: 16
     max_seqlen: 4096
     rollout_gbs: 2048
     train_gbs: 512
     num_prompts: 64
     num_generations: 32
     generation:
-      tp: 4
+      tp: 1
       pp: 1
     training:
       tp: 4
       cp: 1
       ep: 1
-      pp: 4
+      pp: 1
 
 # ============================================
 # Qwen3-30B-A3B (MoE)
@@ -248,8 +248,29 @@ qwen30b:
       # dp: 4
   
   gb200:
-    # Scaled from H100: 16 GPUs (4 nodes)
+    # GB200 default: EP=4 (optimized for 192GB memory, node-local All-to-All)
     num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 4
+      pp: 1
+
+# Qwen3-30B-A3B with EP=8 (for comparison)
+qwen30b_ep8:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
+  
+  h100:
+    num_gpus: 32
     max_seqlen: 4096
     rollout_gbs: 2048
     train_gbs: 512
@@ -262,6 +283,61 @@ qwen30b:
       tp: 1
       cp: 1
       ep: 8
+      pp: 1
+  
+  gb200:
+    # GB200 EP=8: For comparison with EP=4
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 8
+      pp: 1
+
+# Qwen3-30B-A3B with EP=4 (optimized for GB200)
+qwen30b_ep4:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  config_file: "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml"
+  
+  h100:
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 4
+      pp: 1
+  
+  gb200:
+    # GB200 EP=4: Optimized for 192GB memory, node-local All-to-All
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 4
       pp: 1
 
 # ============================================

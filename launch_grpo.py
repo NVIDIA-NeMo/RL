@@ -264,9 +264,13 @@ def get_preset_variants(preset: str) -> list:
 # Job Building and Launching
 # ============================================
 
-def calculate_dp(total_gpus: int, tp: int, pp: int, ep: int = 1) -> int:
-    """Calculate Data Parallelism degree."""
-    model_parallel = tp * pp * ep
+def calculate_dp(total_gpus: int, tp: int, pp: int, cp: int = 1) -> int:
+    """Calculate Data Parallelism degree (Megatron-compatible).
+    
+    DP = world_size / (TP × PP × CP)
+    Note: EP is NOT included as it operates within the DP group.
+    """
+    model_parallel = tp * pp * cp
     return max(1, total_gpus // model_parallel)
 
 
@@ -302,8 +306,26 @@ def build_command(model_cfg: Dict[str, Any],
     # Sequence parallel (enabled if TP > 1)
     t_sp = "True" if t_tp > 1 else "False"
     
-    # Segment for sbatch
-    segment = min(16, num_nodes) if num_nodes >= 16 else num_nodes
+    # Segment for sbatch (GB200 NVLink topology aware)
+    # - num_nodes <= 16: use num_nodes as segment
+    # - num_nodes > 16 and divisible by 16: use 16
+    # - otherwise: find largest divisor from 18 down to 1
+    if num_nodes <= 16:
+        segment = num_nodes
+    elif num_nodes % 16 == 0:
+        segment = 16
+    else:
+        # Find largest divisor starting from 18
+        segment = num_nodes  # fallback
+        for seg in range(18, 0, -1):
+            if num_nodes % seg == 0:
+                segment = seg
+                break
+    
+    # Calculate Data Parallelism (Megatron-compatible: DP = world_size / (TP × PP × CP))
+    # Note: EP is NOT included as it operates within the DP group
+    t_dp = num_gpus // (t_tp * t_cp * t_pp) if (t_tp * t_cp * t_pp) > 0 else 1
+    g_dp = num_gpus // (g_tp * g_pp) if (g_tp * g_pp) > 0 else 1
     
     # WandB settings - format: sync-grpo-{cluster}-benchmark
     if wandb_project == "sync-grpo-benchmark":
@@ -311,10 +333,11 @@ def build_command(model_cfg: Dict[str, Any],
     else:
         full_wandb_project = wandb_project
     model_short = model_cfg["model_name"].split("/")[-1].replace("-", "_").replace(".", "_")
-    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}pp{t_pp}ep{t_ep}cp{t_cp}_Gtp{g_tp}pp{g_pp}"
+    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}"
     
-    # Job name
-    job_name = f"{model_short.lower()[:20]}-N{num_nodes}xG{gpus_per_node}-T.tp{t_tp}.pp{t_pp}-G.tp{g_tp}.pp{g_pp}"
+    # Job name (SLURM squeue display)
+    # Format: Model-NxG-T(tp.cp.ep.pp.dp)-G(tp.pp.dp)
+    job_name = f"{model_short.lower()[:12]}_{num_nodes}x{gpus_per_node}_T{t_tp}.{t_cp}.{t_ep}.{t_pp}.{t_dp}_G{g_tp}.{g_pp}.{g_dp}"
     
     # Build command
     command = f"""NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo_math.py \\
@@ -351,11 +374,12 @@ policy.generation.vllm_cfg.vllm_metrics_logger_interval=0.5"""
     
     sbatch_cmd = f"""COMMAND="{command}" \\
 CONTAINER={container} \\
+GPUS_PER_NODE={gpus_per_node} \\
 HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home \\
 HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache \\
 WANDB_API_KEY=$WANDB_API_KEY \\
 MOUNTS="/lustre:/lustre" \\
-    sbatch \\
+sbatch \\
     --nodes={num_nodes} \\
     --account={account} \\
     --job-name={job_name} \\
