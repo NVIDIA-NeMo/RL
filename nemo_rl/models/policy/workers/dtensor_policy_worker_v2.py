@@ -1848,7 +1848,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> nn.Module:
         # FSDP modules do not move buffers to the device automatically
         for v in model.buffers():
-            v.data = v.data.to(device)
+            v = v.to(device)
 
         return model
 
