@@ -1554,7 +1554,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
-                pad_len = input_seq_dim_size - tk.shape[1]
+                pad_len = padded_seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
