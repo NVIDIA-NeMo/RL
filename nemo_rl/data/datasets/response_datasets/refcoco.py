@@ -15,8 +15,7 @@
 import os
 import random
 import zipfile
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import requests
 from datasets import load_dataset
@@ -168,7 +167,7 @@ class RefCOCODataset(RawDataset):
     def __init__(
         self,
         split: str = "train",
-        download_dir: Optional[str] = None,
+        download_dir: str = "./coco_images",
         **kwargs,
     ):
         """Simple wrapper around the RefCOCO dataset.
@@ -191,29 +190,19 @@ class RefCOCODataset(RawDataset):
         self.task_name = "refcoco"
 
         # check for images
-        if self.download_dir is None:
-            print("No path to coco images provided, set download_dir to ./coco_images")
-            self.download_dir = Path("./coco_images")
-            os.makedirs(self.download_dir, exist_ok=True)
-        else:
-            self.download_dir = Path(self.download_dir)
-
         filename = SPLIT_TO_IMAGE_URL[split].split("/")[-1].split(".")[0]
-        if not os.path.exists(str(self.download_dir / filename)):
-            print(f"Downloading {filename} images to {self.download_dir}")
-            download_and_unzip(SPLIT_TO_IMAGE_URL[split], str(self.download_dir))
+        if not os.path.exists(f"{download_dir}/{filename}"):
+            print(f"Downloading {filename} images to {download_dir}")
+            download_and_unzip(SPLIT_TO_IMAGE_URL[split], download_dir)
 
         # this dataset will process the image during training using `format_refcoco_dataset`
         self.dataset = load_dataset("jxu124/refcoco")[split]
         self.dataset = self.dataset.map(self.format_data)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        image_path = None
         if "image_path" in data:
-            image_path = str(data["image_path"]).replace(
-                "coco/", str(self.download_dir) + "/"
-            )
-        else:
-            image_path = data["image_path"]
+            image_path = data["image_path"].replace("coco/", self.download_dir + "/")
 
         return {
             "image_path": image_path,
