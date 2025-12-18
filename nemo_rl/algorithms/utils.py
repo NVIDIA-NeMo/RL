@@ -27,9 +27,9 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.logger import Logger
 
 
@@ -749,8 +749,11 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def print_ip_and_gpu_id_of_workers(policy: ColocatablePolicyInterface, policy_generation: Optional[GenerationInterface]) -> None:
+def print_ip_and_gpu_id_of_workers(
+    policy: ColocatablePolicyInterface, policy_generation: Optional[GenerationInterface]
+) -> None:
     """Print the node IP and GPU ID of the policy and generation workers."""
+
     def _print_in_table(results: list[tuple[str, int]], table_title: str) -> None:
         all_node_ips = sorted(set([result[0] for result in results]))
         all_gpu_ids = sorted(set([result[1] for result in results]))
@@ -764,13 +767,14 @@ def print_ip_and_gpu_id_of_workers(policy: ColocatablePolicyInterface, policy_ge
             worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
 
         from prettytable import PrettyTable
+
         table = PrettyTable()
         table.title = table_title
         table.field_names = ["Node_IP"] + [
             "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
         ]
         for i, node_idx in enumerate(all_node_ips):
-            row = [node_idx]
+            row: list[Any] = [node_idx]
             for j in range(len(all_gpu_ids)):
                 row.append(tuple(worker_id_list[i][j]))
             table.add_row(row)
@@ -781,7 +785,9 @@ def print_ip_and_gpu_id_of_workers(policy: ColocatablePolicyInterface, policy_ge
     _print_in_table(policy_results, "Policy workers mapping to Nodes and GPUs")
     if policy_generation is not None:
         policy_generation_results = policy_generation.report_node_ip_and_gpu_id()
-        _print_in_table(policy_generation_results, "Generation workers mapping to Nodes and GPUs")
+        _print_in_table(
+            policy_generation_results, "Generation workers mapping to Nodes and GPUs"
+        )
 
 
 def log_generation_metrics_to_wandb(

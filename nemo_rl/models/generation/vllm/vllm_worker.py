@@ -782,5 +782,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "report_node_ip_and_gpu_id cannot be used with async_engine=True. Use report_node_ip_and_gpu_id_async instead."
             )
 
-        result_or_coro = self.llm.collective_rpc("report_node_ip_and_gpu_id", args=tuple())
+        result_or_coro = self.llm.collective_rpc(
+            "report_node_ip_and_gpu_id", args=tuple()
+        )
         return cast(list[tuple[str, int]], result_or_coro)

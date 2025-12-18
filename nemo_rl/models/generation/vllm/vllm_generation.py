@@ -14,7 +14,6 @@
 
 import asyncio
 import os
-from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
@@ -24,7 +23,6 @@ from typing import (
 
 import numpy as np
 import ray
-from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -142,9 +140,7 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Determine if we need cross-node model parallelism
-        needs_cross_node_parallelism = (
-            self.model_parallel_size > workers_per_node
-        )
+        needs_cross_node_parallelism = self.model_parallel_size > workers_per_node
 
         # Initialize placement groups with the appropriate mode
         cluster._init_placement_group()
@@ -781,16 +777,19 @@ class VllmGeneration(GenerationInterface):
 
     def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Print the node IP and GPU ID of the current worker."""
-        method_name = "report_node_ip_and_gpu_id_async" if self.cfg["vllm_cfg"]["async_engine"] else "report_node_ip_and_gpu_id"
+        method_name = (
+            "report_node_ip_and_gpu_id_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "report_node_ip_and_gpu_id"
+        )
         results = ray.get(
             self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
         )
-        results = [ tup for result in results for tup in result ]
+        results = [tup for result in results for tup in result]
         return results
-
 
     @property
     def requires_kv_scale_sync(self) -> bool:

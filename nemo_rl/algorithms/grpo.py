@@ -15,7 +15,6 @@ import gc
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -40,9 +39,9 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     log_generation_metrics_to_wandb,
+    print_ip_and_gpu_id_of_workers,
     print_performance_metrics,
     set_seed,
-    print_ip_and_gpu_id_of_workers,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -349,17 +348,28 @@ def setup(
                 )
                 grpo_gpus_per_node = total_gpus_per_node
 
-        if generation_resources is None: # Co-located
+        if generation_resources is None:  # Co-located
             policy_nodes, policy_gpus_per_node = grpo_nodes, grpo_gpus_per_node
             inference_nodes, inference_gpus_per_node = grpo_nodes, grpo_gpus_per_node
-            policy_node_offset, policy_gpu_offset, inference_node_offset, inference_gpu_offset = 0, 0, 0, 0
-        else: # Non-colocated
+            (
+                policy_node_offset,
+                policy_gpu_offset,
+                inference_node_offset,
+                inference_gpu_offset,
+            ) = 0, 0, 0, 0
+        else:  # Non-colocated
             if grpo_nodes == 1:
                 assert generation_resources["num_nodes"] == 1, (
                     "When grpo_nodes = 1, inference must be on the same node as the policy"
                 )
-                inference_nodes, inference_gpus_per_node = 1, generation_resources["gpus_per_node"]
-                policy_nodes, policy_gpus_per_node = 1, total_gpus_per_node - generation_resources["gpus_per_node"]
+                inference_nodes, inference_gpus_per_node = (
+                    1,
+                    generation_resources["gpus_per_node"],
+                )
+                policy_nodes, policy_gpus_per_node = (
+                    1,
+                    total_gpus_per_node - generation_resources["gpus_per_node"],
+                )
                 assert policy_gpus_per_node > 0, (
                     "policy.generation.colocated.resources.gpus_per_node must be > 0 "
                     "when grpo_nodes = 1, "
@@ -368,8 +378,13 @@ def setup(
                 policy_node_offset, inference_node_offset = 0, 0
                 policy_gpu_offset, inference_gpu_offset = 0, policy_gpus_per_node
             else:
-                inference_nodes, inference_gpus_per_node = generation_resources["num_nodes"], generation_resources["gpus_per_node"]
-                assert inference_gpus_per_node == generation_resources["gpus_per_node"], (
+                inference_nodes, inference_gpus_per_node = (
+                    generation_resources["num_nodes"],
+                    generation_resources["gpus_per_node"],
+                )
+                assert (
+                    inference_gpus_per_node == generation_resources["gpus_per_node"]
+                ), (
                     "When grpo_nodes > 1, inference.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node"
                     f"but got {inference_gpus_per_node} and {generation_resources['gpus_per_node']}."
                 )
@@ -394,7 +409,7 @@ def setup(
             inference_node_offset,
             inference_gpu_offset,
         )
-    
+
     (
         grpo_nodes,
         grpo_gpus_per_node,
@@ -409,7 +424,9 @@ def setup(
     ) = _calculate_resource_allocation(
         cluster_config,
         env_configs["reward_model"]["resources"] if reward_model_enabled else None,
-        generation_config["colocated"]["resources"] if not colocated_inference else None,
+        generation_config["colocated"]["resources"]
+        if not colocated_inference
+        else None,
     )
 
     cluster = RayVirtualCluster(
@@ -417,7 +434,9 @@ def setup(
         bundle_ct_per_node_list=[grpo_gpus_per_node] * grpo_nodes,
         use_gpus=True,
         num_gpus_per_node=grpo_gpus_per_node,
-        max_colocated_worker_groups=2 if colocated_inference and generation_config["backend"] != "megatron" else 1,
+        max_colocated_worker_groups=2
+        if colocated_inference and generation_config["backend"] != "megatron"
+        else 1,
     )
     print(
         f"  ✓ Ray cluster for GRPO initialized with {grpo_nodes} nodes",

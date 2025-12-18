@@ -15,9 +15,9 @@ import gc
 import traceback
 from typing import Any
 
+import ray
 import torch
 import zmq
-import ray
 
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -275,7 +275,7 @@ class VllmInternalWorkerExtension:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
 
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+    def report_node_ip_and_gpu_id(self) -> tuple[str, int | str]:
         """Report the node IP and GPU ID of the current worker."""
         ip = ray._private.services.get_node_ip_address()
         try:
