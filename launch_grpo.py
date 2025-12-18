@@ -252,7 +252,7 @@ def get_fallback_configs() -> Dict[str, Any]:
         },
         "deepseek_v3": {
             "model_name": "deepseek-ai/DeepSeek-V3",
-            "config_file": "examples/configs/recipes/llm/performance/grpo-deepseek-v3.yaml",
+            "config_file": "examples/configs/recipes/llm/performance/grpo-deepseek-v3-32n8g.yaml",
             "h100": {
                 "num_gpus": 256, "max_seqlen": 1536, "rollout_gbs": 2048, "train_gbs": 2048,
                 "num_prompts": 64, "num_generations": 32,
