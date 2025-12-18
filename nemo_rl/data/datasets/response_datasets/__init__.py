@@ -14,6 +14,7 @@
 
 from typing import Any
 
+from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
@@ -37,7 +38,7 @@ from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
 
 # TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-def load_response_dataset(data_config, seed: int = 42):
+def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
@@ -49,7 +50,9 @@ def load_response_dataset(data_config, seed: int = 42):
     elif dataset_name == "tulu3_sft_mixture":
         base_dataset: Any = Tulu3SftMixtureDataset(**data_config, seed=seed)
     elif dataset_name == "openai_format":
-        base_dataset: Any = OpenAIFormatDataset(**data_config)
+        base_dataset: Any = OpenAIFormatDataset(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for this class
+        )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
         # TODO: also test after SFT updated
@@ -76,7 +79,10 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(**data_config)
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
-        base_dataset: Any = ResponseDataset(**data_config, seed=seed)
+        base_dataset: Any = ResponseDataset(
+            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` is required for this class
+            seed=seed,
+        )
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
