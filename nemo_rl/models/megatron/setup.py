@@ -328,6 +328,8 @@ def setup_model_config(
     megatron_cfg = _create_megatron_config(
         model_cfg, checkpoint_config, config, hf_model_name, dtype
     )
+
+    _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
     
     return megatron_cfg, model_cfg
 
@@ -489,6 +491,42 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
         "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
     )
 
+
+def _validate_dtype_config(dtype: torch.dtype, model_cfg: Any, optimizer_cfg: Any) -> None:
+    # TODO: this validation should happen inside mbridge: https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/1665
+    if dtype == torch.bfloat16:
+        assert model_cfg.bf16 == True, (
+            "policy.megatron_cfg.model.bf16=True must be set if policy.precision=bfloat16. This is handled by nemo-rl so this indicates something is misconfigured."
+        )
+        assert (
+            optimizer_cfg.use_precision_aware_optimizer == False
+            or optimizer_cfg.bf16 == True
+        ), (
+            "policy.megatron_cfg.optimizer.bf16=True must be set if policy.precision=bfloat16 when using use_precision_aware_optimizer=True"
+        )
+    elif dtype == torch.float16:
+        assert model_cfg.fp16 == True, (
+            "policy.megatron_cfg.model.fp16=True must be set if policy.precision=float16. This is handled by nemo-rl so this indicates something is misconfigured."
+        )
+        assert (
+            optimizer_cfg.use_precision_aware_optimizer == False
+            or optimizer_cfg.fp16 == True
+        ), (
+            "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16 when using use_precision_aware_optimizer=True"
+        )
+    elif dtype == torch.float32:
+        assert (
+            model_cfg.bf16 == False
+            and model_cfg.fp16 == False
+        ), (
+            "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
+        )
+        assert (
+            optimizer_cfg.bf16 == False
+            and optimizer_cfg.fp16 == False
+        ), (
+            "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
+        )
 
 def _create_megatron_config(
     model_cfg: Any,
