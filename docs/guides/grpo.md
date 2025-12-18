@@ -43,13 +43,19 @@ By default, NeMo RL has support for [OpenMathInstruct-2](../../nemo_rl/data/data
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: ResponseDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  val_data_path: <PathToValidationDataset>
-  input_key: <QuestionKey>, default is "input"
-  output_key: <AnswerKey>, default is "output"
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  train:
+    dataset_name: ResponseDataset
+    data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+    input_key: <QuestionKey>, default is "input"
+    output_key: <AnswerKey>, default is "output"
+    split: <TrainSplit>, default is None  # used for HuggingFace datasets
+    split_validation_size: 0.05 # use 5% of the training data as validation data
+  validation:
+    dataset_name: ResponseDataset
+    data_path: <PathToValidationDataset>
+    input_key: <QuestionKey>, default is "input"
+    output_key: <AnswerKey>, default is "output"
+    split: <ValidationSplit>, default is None  # used for HuggingFace datasets
 ```
 
 #### Common Data Format
@@ -99,21 +105,15 @@ We have an example of this as `math_data_processor` in [processors.py](../../nem
 Example (simplified):
 
 ```python
+# task_spec
 default_task_spec = TaskDataSpec(
     task_name="math_default",
     prompt_file=data_config["prompt_file"],
     system_prompt_file=data_config["system_prompt_file"],
 )
 
-task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
-    lambda: (default_task_spec, math_hf_data_processor)
-)
-
-# Resolve task_name from dataset or spec
-task_spec = data.task_spec
-task_name = data.task_name
-assert hasattr(data, "processor"), "Dataset must have a processor attribute"
-task_data_processors[task_name] = (task_spec, data.processor)
+# task_data_processors
+task_data_processors = {data.task_name: (data.task_spec, data.processor)}
 ```
 
 #### Putting It All Together
@@ -139,39 +139,34 @@ default_task_spec = TaskDataSpec(
     system_prompt_file=data_config["system_prompt_file"],
 )
 
-# 3) Define default processor mapping
-task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = defaultdict(
-    lambda: (default_task_spec, math_hf_data_processor)
-)
+# 3) Load dataset using the helper (built-ins or local/HF datasets)
+data = load_response_dataset(data_config["train"], seed)
 
-# 4) Load dataset using the helper (built-ins or local/HF datasets)
-data = load_response_dataset(data_config, seed)
+# 4) Build task_data_processors mapping
+task_data_processors = {data.task_name: (data.task_spec, data.processor)}
 
-# 5) Resolve task spec/name and ensure dataset provides a processor
-task_spec = data.task_spec
-task_name = data.task_name
-assert hasattr(data, "processor"), "Dataset must have a processor attribute"
-task_data_processors[task_name] = (task_spec, data.processor)
-
-# 6) Construct processed datasets (train and optional validation)
+# 5) Construct processed dataset
 dataset = AllTaskProcessedDataset(
-    data.formatted_ds["train"],
+    data.dataset,
     tokenizer,
     default_task_spec,
     task_data_processors,
     max_seq_length=data_config["max_input_seq_length"],
 )
-val_dataset = (
-    AllTaskProcessedDataset(
-        data.formatted_ds["validation"],
+
+# 6) Do the same thing for validation dataset if it exists
+if data_config["validation"] is not None:
+    val_data = load_response_dataset(data_config["validation"], seed)
+
+    val_task_data_processors = {val_data.task_name: (val_data.task_spec, val_data.processor)}
+
+    val_dataset = AllTaskProcessedDataset(
+        val_data.dataset,
         tokenizer,
         default_task_spec,
-        task_data_processors,
+        val_task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
-    if data.formatted_ds["validation"]
-    else None
-)
 ```
 
 Ensure you provide a mapping of tasks to their processors so the dataset knows which processor to use when handling samples.
