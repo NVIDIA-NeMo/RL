@@ -318,8 +318,7 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
     [
         ("clevr-cogent", format_clevr_cogent_dataset),
         ("geometry3k", format_geometry3k_dataset),
-        # this needs download 13.5G image
-        # ("refcoco", format_refcoco_dataset),
+        # ("refcoco", format_refcoco_dataset), # this needs download 13.5G image
     ],
 )
 def test_vlm_dataset(dataset_name, format_func):

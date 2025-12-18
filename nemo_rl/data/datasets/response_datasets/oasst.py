@@ -66,7 +66,7 @@ def parse_conversations(tree_obj, first: bool = False):
     return all_conversations
 
 
-def get_data_records(objs, task_name: str = "OASST"):
+def get_data_records(objs, task_name: str = "oasst"):
     ## TODO: old format was multi-conversation per example, but ours is single conversation
     ## is this just because of the input data format?
     output = []

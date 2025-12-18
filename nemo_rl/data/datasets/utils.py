@@ -109,7 +109,7 @@ def get_extra_kwargs(data_config: dict, keys: list[str]) -> dict:
     return extra_kwargs
 
 
-def update_single_dataset_config(data_config: dict, default_data_config: dict) -> dict:
+def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
     """Fill the single dataset config with default dataset config."""
     fill_keys = [
         "prompt_file",
