@@ -45,19 +45,63 @@ except ImportError:
 CLUSTER_CONFIGS = {
     "h100": {
         "gpus_per_node": 8,
-        "container": "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/RL/nemo_rl_v0.4.sqsh",
+        "container_name": "nemo_rl_v0.4.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "h100",
+        "default_partition": "batch_long",
+        "use_gres": True,
     },
     "gb200": {
         "gpus_per_node": 4,
-        "container": "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl.sqsh",
+        "container_name": "nemo_rl.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "gb200",
+        "default_partition": "batch",
+        "use_gres": True,  # GB200 also needs GRES
     },
 }
 
 
 def detect_cluster_type(partition: str = "batch") -> str:
-    """Detect cluster type from SLURM GRES configuration."""
+    """Detect cluster type from hostname, SLURM partition names, or GRES configuration."""
+    import re
+    import socket
+    
+    # Method 1: Check hostname for GB200-only clusters (lyris, theia)
+    # Note: hsg clusters can have both H100 and GB200, so we use partition-based detection
+    try:
+        hostname = socket.gethostname().lower()
+        if "lyris" in hostname or "theia" in hostname:
+            print(f"[DEBUG] Detected GB200/GB300 cluster from hostname: {hostname}")
+            return "gb200"
+    except Exception as e:
+        print(f"[DEBUG] Could not detect from hostname: {e}")
+    
+    # Method 2: Check available partitions for gb200/gb300 naming
+    try:
+        result = subprocess.run(
+            ["sinfo", "-h", "-o", "%P"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            partitions = result.stdout.strip().lower()
+            has_gb200 = "gb200" in partitions or "gb300" in partitions
+            has_batch = "batch" in partitions
+            
+            if has_gb200 and not has_batch:
+                # GB200-only cluster (like lyris)
+                print(f"[DEBUG] Detected GB200/GB300 cluster from partition names (no batch)")
+                return "gb200"
+            elif has_batch and not has_gb200:
+                # H100-only cluster
+                print(f"[DEBUG] Detected H100 cluster from partition names (batch only)")
+                return "h100"
+            elif has_gb200 and has_batch:
+                # Mixed cluster (like hsg) - default to H100, user can override with --cluster
+                print(f"[DEBUG] Mixed cluster detected (has both batch and gb200). Defaulting to H100. Use --cluster gb200 to override.")
+                return "h100"
+    except Exception as e:
+        print(f"[DEBUG] Could not detect from partition names: {e}")
+    
+    # Method 3: Try GRES-based detection
     try:
         result = subprocess.run(
             ["sinfo", "-p", partition, "-h", "-o", "%G"],
@@ -65,8 +109,6 @@ def detect_cluster_type(partition: str = "batch") -> str:
         )
         if result.returncode == 0:
             output = result.stdout.strip()
-            import re
-            # Match gpu:N or gpu:type:N format (e.g., "gpu:4(S:0-1)" or "gpu:h100:8")
             match = re.search(r'gpu:(\d+)', output)
             if match:
                 gpus = int(match.group(1))
@@ -83,11 +125,30 @@ def detect_cluster_type(partition: str = "batch") -> str:
 
 def get_cluster_config(cluster_type: Optional[str] = None, partition: str = "batch") -> dict:
     """Get cluster configuration, auto-detecting if not specified."""
+    import socket
+    
     if cluster_type is None:
         cluster_type = detect_cluster_type(partition)
     
     config = CLUSTER_CONFIGS.get(cluster_type.lower(), CLUSTER_CONFIGS["h100"]).copy()
     config["cluster_type"] = cluster_type.lower()
+    
+    # Set container path: current directory + container_name
+    container_name = config.get("container_name", "nemo_rl.sqsh")
+    config["container"] = str(Path.cwd() / container_name)
+    
+    # Override settings for GB200 on lyris/theia nodes (no GRES, use gb200 partition, different account)
+    if cluster_type.lower() == "gb200":
+        try:
+            hostname = socket.gethostname().lower()
+            if "lyris" in hostname or "theia" in hostname:
+                config["default_partition"] = "gb200"
+                config["use_gres"] = False  # lyris/theia don't use GRES
+                config["default_account"] = "coreai_dlalgo_llm"  # lyris/theia use different account
+                print(f"[DEBUG] Using 'gb200' partition (no GRES, account=coreai_dlalgo_llm) for lyris/theia node")
+        except Exception:
+            pass
+    
     return config
 
 
@@ -279,14 +340,23 @@ def build_command(model_cfg: Dict[str, Any],
                   wandb_project: str = "sync-grpo-benchmark",
                   max_steps: int = 20,
                   time_limit: str = "04:00:00",
-                  account: str = "coreai_dlalgo_nemorl",
-                  partition: str = "batch_long",
+                  account: Optional[str] = None,
+                  partition: Optional[str] = None,
                   enable_vllm_metrics: bool = False) -> str:
     """Build the sbatch command for a given configuration."""
     
     gpus_per_node = cluster_config["gpus_per_node"]
     container = cluster_config["container"]
     cluster_type = cluster_config["cluster_type"]
+    use_gres = cluster_config.get("use_gres", True)
+    
+    # Use cluster-specific default partition if not specified
+    if partition is None:
+        partition = cluster_config.get("default_partition", "batch_long")
+    
+    # Use cluster-specific default account if not specified
+    if account is None:
+        account = cluster_config.get("default_account", "coreai_dlalgo_nemorl")
     
     num_gpus = model_cfg["num_gpus"]
     num_nodes = num_gpus // gpus_per_node
@@ -337,7 +407,22 @@ def build_command(model_cfg: Dict[str, Any],
     
     # Job name (SLURM squeue display)
     # Format: Model_NxG_T.tp#.cp#.ep#.pp#.dp#_G.tp#.pp#.dp#
-    job_name = f"{model_short.lower()[:10]}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}"
+    # Extract a clean short model name (e.g., "llama8b", "qwen32b")
+    model_name_lower = model_short.lower()
+    # Try to extract model size (e.g., "8b", "70b", "32b") and combine with model family
+    import re
+    size_match = re.search(r'(\d+b)', model_name_lower)
+    if "llama" in model_name_lower:
+        short_name = f"llama{size_match.group(1)}" if size_match else "llama"
+    elif "qwen" in model_name_lower:
+        short_name = f"qwen{size_match.group(1)}" if size_match else "qwen"
+    elif "deepseek" in model_name_lower:
+        short_name = "deepseek"
+    else:
+        # Fallback: use first 10 chars, strip trailing underscores
+        short_name = model_name_lower[:10].rstrip("_")
+    
+    job_name = f"{short_name}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}"
     
     # Build command
     command = f"""NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo_math.py \\
@@ -372,11 +457,36 @@ policy.generation.vllm_cfg.async_engine=true \\
 policy.generation.vllm_cfg.enable_vllm_metrics_logger=true \\
 policy.generation.vllm_cfg.vllm_metrics_logger_interval=0.5"""
     
+    # Build GRES option only for clusters that use it (H100 uses GRES, GB200 doesn't)
+    gres_line = f"--gres=gpu:{gpus_per_node} \\\n    " if use_gres else ""
+    
+    # Check required environment variables
+    env_warnings = []
+    hf_home = os.environ.get("HF_HOME", "")
+    hf_cache = os.environ.get("HF_DATASETS_CACHE", "")
+    wandb_key = os.environ.get("WANDB_API_KEY", "")
+    
+    if not hf_home:
+        env_warnings.append("⚠️  HF_HOME is not set. Add 'export HF_HOME=/path/to/hf_home' to ~/.bashrc")
+    if not hf_cache:
+        env_warnings.append("⚠️  HF_DATASETS_CACHE is not set. Add 'export HF_DATASETS_CACHE=/path/to/cache' to ~/.bashrc")
+    if not wandb_key:
+        env_warnings.append("⚠️  WANDB_API_KEY is not set. Add 'export WANDB_API_KEY=your_key' to ~/.bashrc")
+    
+    if env_warnings:
+        print("\n" + "\n".join(env_warnings) + "\n")
+    
+    # Build log directory structure: exp_logs/{model}/{parallelism_config}/
+    rollout_gbs = model_cfg['num_prompts'] * model_cfg['num_generations']
+    log_subdir = f"T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}_G.tp{g_tp}.pp{g_pp}_R{rollout_gbs}_T{model_cfg['train_gbs']}_S{model_cfg['max_seqlen']}"
+    base_log_dir = str(Path.cwd() / "exp_logs" / short_name / log_subdir)
+    
     sbatch_cmd = f"""COMMAND="{command}" \\
 CONTAINER={container} \\
 GPUS_PER_NODE={gpus_per_node} \\
-HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home \\
-HF_DATASETS_CACHE=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/cache \\
+BASE_LOG_DIR={base_log_dir} \\
+HF_HOME=$HF_HOME \\
+HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
 WANDB_API_KEY=$WANDB_API_KEY \\
 MOUNTS="/lustre:/lustre" \\
 sbatch \\
@@ -385,8 +495,7 @@ sbatch \\
     --job-name={job_name} \\
     --partition={partition} \\
     --time={time_limit} \\
-    --gres=gpu:{gpus_per_node} \\
-    --segment {segment} \\
+    {gres_line}--segment {segment} \\
     ray.sub"""
     
     return sbatch_cmd
@@ -497,6 +606,11 @@ def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None,
          pass
 
     print("🚀 Launching job...")
+    print("\n📝 Command to be executed:")
+    print("-" * 60)
+    print(cmd)
+    print("-" * 60)
+    print()
     
     script_path = f"/tmp/launch_{preset}.sh"
     with open(script_path, 'w') as f:
@@ -561,8 +675,8 @@ Examples:
                         help="WandB project name (cluster type appended)")
     parser.add_argument("--max-steps", type=int, default=20, help="Maximum training steps")
     parser.add_argument("--time", default="04:00:00", help="Job time limit")
-    parser.add_argument("--account", default="coreai_dlalgo_nemorl", help="SLURM account")
-    parser.add_argument("--job-partition", default="batch_long", help="SLURM job partition (default: batch_long)")
+    parser.add_argument("--account", default=None, help="SLURM account (default: auto based on cluster)")
+    parser.add_argument("--job-partition", default=None, help="SLURM job partition (default: auto based on cluster)")
     
     # Execution options
     parser.add_argument("--dry-run", "-n", action="store_true",
