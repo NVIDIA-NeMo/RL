@@ -471,9 +471,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return_tokens_as_token_ids=True,
             )
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
-        if vllm_version < "0.11.1":
-            serving_chat_kwargs["model_config"] = model_config
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
@@ -538,9 +535,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
-        if vllm_version < "0.11.1":
-            serving_tokenization_kwargs["model_config"] = model_config
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
         )
