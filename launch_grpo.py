@@ -336,8 +336,8 @@ def build_command(model_cfg: Dict[str, Any],
     wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}"
     
     # Job name (SLURM squeue display)
-    # Format: Model-NxG-T(tp.cp.ep.pp.dp)-G(tp.pp.dp)
-    job_name = f"{model_short.lower()[:12]}_{num_nodes}x{gpus_per_node}_T{t_tp}.{t_cp}.{t_ep}.{t_pp}.{t_dp}_G{g_tp}.{g_pp}.{g_dp}"
+    # Format: Model_NxG_T.tp#.cp#.ep#.pp#.dp#_G.tp#.pp#.dp#
+    job_name = f"{model_short.lower()[:10]}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}"
     
     # Build command
     command = f"""NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo_math.py \\
