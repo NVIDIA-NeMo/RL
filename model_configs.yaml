@@ -444,7 +444,7 @@ qwen235b:
 # ============================================
 deepseek_v3:
   model_name: "deepseek-ai/DeepSeek-V3"
-  config_file: "examples/configs/recipes/llm/performance/grpo-deepseek-v3.yaml"
+  config_file: "examples/configs/recipes/llm/performance/grpo-deepseek-v3-32n8g.yaml"
   
   h100:
     # NeMo-RL 0.4: 256 GPUs (32 nodes), best config
