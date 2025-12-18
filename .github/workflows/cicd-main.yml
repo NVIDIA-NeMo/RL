@@ -208,7 +208,7 @@ jobs:
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
-        MAX_JOBS=32
+        MAX_JOBS=4
         NEMO_RL_COMMIT=${{ github.sha }}
 
   cicd-doc-tests:
