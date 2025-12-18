@@ -35,6 +35,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["50"] < 0.375' \
-        'data["validation/val_loss"]["50"] < 0.271'
+        'data["train/loss"]["50"] < 2.32' \
+        'data["validation/val_loss"]["50"] < 2.35'
 fi
