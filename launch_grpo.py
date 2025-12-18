@@ -407,7 +407,7 @@ def print_config_summary(model_cfg: Dict[str, Any], cluster_config: dict, preset
     t_tp, t_cp = train_cfg.get("tp", 1), train_cfg.get("cp", 1)
     t_ep, t_pp = train_cfg.get("ep", 1), train_cfg.get("pp", 1)
     
-    t_dp = calculate_dp(num_gpus, t_tp, t_pp, t_ep)
+    t_dp = calculate_dp(num_gpus, t_tp, t_pp, t_cp)  # Megatron-compatible: DP = world_size / (TP × PP × CP)
     g_dp = calculate_dp(num_gpus, g_tp, g_pp)
     rollout_gbs = model_cfg['num_prompts'] * model_cfg['num_generations']
     
