@@ -180,6 +180,7 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = None,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    do_not_average_loss: bool = False,
 ) -> Any:
     """
     Execute forward and backward passes using Megatron's utilities.
@@ -222,6 +223,7 @@ def megatron_forward_backward(
         micro_batch_size=mbs,
         decoder_seq_length=seq_length,
         forward_only=forward_only,
+        do_not_average_loss=do_not_average_loss,
     )
 
 class LossPostProcessor:
