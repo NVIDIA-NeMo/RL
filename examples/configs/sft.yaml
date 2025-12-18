@@ -167,15 +167,15 @@ data:
 
   prompt_file: null
   system_prompt_file: null
+  processor: "sft_processor"
 
   train:
     dataset_name: "squad"
     split: "train"
-    processor: "sft_processor"
+    split_validation_size: 0 # Not use training data as validation data
   validation:
     dataset_name: "squad"
     split: "validation"
-    processor: "sft_processor"
   # You can use custom response datasets for training and validation. For example:
   #   train:
   #     dataset_name: ResponseDataset
