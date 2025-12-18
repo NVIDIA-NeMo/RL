@@ -52,7 +52,7 @@ CLUSTER_CONFIGS = {
     },
     "gb200": {
         "gpus_per_node": 4,
-        "container_name": "nemo_rl_nightly.sqsh",  # Container filename (path set dynamically)
+        "container_name": "nemo_rl.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "gb200",
         "default_partition": "batch",
         "use_gres": True,  # GB200 also needs GRES
@@ -335,7 +335,8 @@ def build_command(model_cfg: Dict[str, Any],
                   time_limit: str = "04:00:00",
                   account: Optional[str] = None,
                   partition: Optional[str] = None,
-                  enable_vllm_metrics: bool = False) -> str:
+                  enable_vllm_metrics: bool = False,
+                  vllm_metrics_interval: float = 0.5) -> str:
     """Build the sbatch command for a given configuration."""
     
     gpus_per_node = cluster_config["gpus_per_node"]
@@ -445,10 +446,10 @@ logger.wandb.name='{wandb_name}'"""
 
     # Add vLLM metrics logging if enabled
     if enable_vllm_metrics:
-        command += """ \\
+        command += f""" \\
 policy.generation.vllm_cfg.async_engine=true \\
 policy.generation.vllm_cfg.enable_vllm_metrics_logger=true \\
-policy.generation.vllm_cfg.vllm_metrics_logger_interval=0.5"""
+policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"""
     
     # Build GRES option only for clusters that use it (H100 uses GRES, GB200 doesn't)
     gres_line = f"--gres=gpu:{gpus_per_node} \\\n    " if use_gres else ""
@@ -677,6 +678,8 @@ Examples:
                         help="Show command without executing")
     parser.add_argument("--enable-vllm-metrics", action="store_true",
                         help="Enable vLLM metrics logging (requires async_engine=true)")
+    parser.add_argument("--vllm-metrics-interval", type=float, default=0.5,
+                        help="vLLM metrics logging interval in seconds (default: 0.5)")
     
     args = parser.parse_args()
     
@@ -729,7 +732,8 @@ Examples:
                         time_limit=args.time,
                         account=args.account,
                         partition=args.job_partition,
-                        enable_vllm_metrics=args.enable_vllm_metrics)
+                        enable_vllm_metrics=args.enable_vllm_metrics,
+                        vllm_metrics_interval=args.vllm_metrics_interval)
             except Exception as e:
                 print(f"❌ Error launching {p}: {e}")
         return
