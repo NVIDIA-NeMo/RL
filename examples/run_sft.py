@@ -16,7 +16,6 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any, Callable, Optional
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -24,9 +23,12 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
-from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
-from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_response_dataset,
+    update_single_dataset_config,
+)
+from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -51,64 +53,27 @@ def parse_args():
 # =======================================================
 # Data Processing
 # =======================================================
-def sft_preprocessor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer,
-    max_seq_length: int,
-    idx: int,
-    add_bos: bool = True,
-    add_eos: bool = True,
-    add_generation_prompt: bool = False,
-    datum_preprocessor: Optional[Callable] = None,
-) -> DatumSpec:
-    """Process a datum dictionary for SFT training."""
-    # optional preprocessor
-    if datum_preprocessor is not None:
-        datum_dict = datum_preprocessor(datum_dict)
-
-    message_log = get_formatted_message_log(
-        datum_dict["messages"],
-        tokenizer,
-        task_data_spec,
-        add_bos_token=add_bos,
-        add_eos_token=add_eos,
-        add_generation_prompt=add_generation_prompt,
-        tools=datum_dict.get("tools", None),  # Pass tools from data if present
-    )
-
-    length = sum(len(m["token_ids"]) for m in message_log)
-
-    loss_multiplier = 1.0
-    if length > max_seq_length:
-        # make smaller and mask out
-        for message in message_log:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    output = {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": None,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
-    return output
 
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
 
     # load dataset
-    data = load_response_dataset(data_config, seed)
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
-    sft_task_spec = data.task_spec
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+    update_single_dataset_config(data_config["train"], data_config)
+    train_data = load_response_dataset(data_config["train"], seed)
+    val_data = load_response_dataset(data_config["validation"], seed)
+    # REVIEW: Not sure use data_config.get("prompt_file", None) or train_data.task_spec
+    default_task_spec = TaskDataSpec(
+        task_name="sft_default",
+        prompt_file=data_config.get("prompt_file", None),
+        system_prompt_file=data_config.get("system_prompt_file", None),
     )
+    # train_dataset = data.formatted_ds["train"]
+    # val_dataset = data.formatted_ds["validation"]
+    # sft_task_spec = data.task_spec
+    # print(
+    #     f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+    # )
 
     # add preprocessor if needed
     datum_preprocessor = None
@@ -120,11 +85,11 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
         datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
 
     train_dataset = AllTaskProcessedDataset(
-        train_dataset,
+        train_data.dataset,
         tokenizer,
-        sft_task_spec,
+        default_task_spec,
         partial(
-            sft_preprocessor,
+            train_data.processor,
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
@@ -134,11 +99,11 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     )
 
     val_dataset = AllTaskProcessedDataset(
-        val_dataset,
+        val_data.dataset,
         tokenizer,
-        sft_task_spec,
+        default_task_spec,
         partial(
-            sft_preprocessor,
+            val_data.processor,
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
             add_generation_prompt=data_config["add_generation_prompt"],
@@ -147,7 +112,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    return train_dataset, val_dataset, sft_task_spec
+    return train_dataset, val_dataset, default_task_spec
 
 
 def main(is_vlm: bool = False):

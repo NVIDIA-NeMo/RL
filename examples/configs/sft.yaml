@@ -168,9 +168,11 @@ data:
   train:
     dataset_name: "squad"
     split: "train"
+    processor: "sft_processor"
   validation:
     dataset_name: "squad"
     split: "validation"
+    processor: "sft_processor"
   # You can use custom response datasets for training and validation. For example:
   #   train:
   #     dataset_name: ResponseDataset

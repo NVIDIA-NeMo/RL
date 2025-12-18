@@ -14,7 +14,7 @@
 
 """Contains data processors for evaluation."""
 
-from typing import Any, Dict, cast
+from typing import Any, Callable, Dict, Optional, cast
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -25,6 +25,7 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
+from nemo_rl.data.llm_message_utils import get_formatted_message_log
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -129,6 +130,53 @@ def helpsteer3_data_processor(
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+def sft_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+    add_bos: bool = True,
+    add_eos: bool = True,
+    add_generation_prompt: bool = False,
+    datum_preprocessor: Optional[Callable] = None,
+) -> DatumSpec:
+    """Process a datum dictionary for SFT training."""
+    # optional preprocessor
+    if datum_preprocessor is not None:
+        datum_dict = datum_preprocessor(datum_dict)
+
+    message_log = get_formatted_message_log(
+        datum_dict["messages"],
+        tokenizer,
+        task_data_spec,
+        add_bos_token=add_bos,
+        add_eos_token=add_eos,
+        add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
+    )
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # make smaller and mask out
+        for message in message_log:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
     return output
 
 
@@ -355,6 +403,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "multichoice_qa_processor": multichoice_qa_processor,
         "math_data_processor": math_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "sft_processor": sft_processor,
     },
 )
 
