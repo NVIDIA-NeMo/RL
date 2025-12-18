@@ -51,6 +51,9 @@ class VllmGeneration(GenerationInterface):
         config: VllmConfig,
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        num_nodes: Optional[int] = None,
+        cluster_node_offset: int = 0,
+        cluster_gpu_offset_each_node: int = 0,
     ):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
@@ -60,11 +63,14 @@ class VllmGeneration(GenerationInterface):
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.model_parallel_size = self.tp_size * self.pp_size
 
-        assert cluster.world_size() % self.model_parallel_size == 0, (
+        num_nodes = num_nodes or cluster.node_count()
+        workers_per_node = workers_per_node or cluster.workers_per_node()
+        world_size = num_nodes * workers_per_node
+        assert world_size % self.model_parallel_size == 0, (
             "World size must be a multiple of model parallel size. "
-            f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
+            f"Got world size {world_size} and model parallel size (TP * PP) {self.model_parallel_size}."
         )
-        self.dp_size = cluster.world_size() // self.model_parallel_size
+        self.dp_size = world_size // self.model_parallel_size
         self.vllm_dp_size = self.ep_size // self.tp_size
 
         if self.pp_size > 1:
@@ -129,27 +135,19 @@ class VllmGeneration(GenerationInterface):
         )
 
         self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
+            layout=np.arange(world_size).reshape(
                 self.dp_size, self.pp_size, self.tp_size
             ),
             names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
         )
 
-        # non-colocated needs to use PACK strategy to avoid uneven node_bundles
-        # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
-        # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
-        strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
-
         # Determine if we need cross-node model parallelism
         needs_cross_node_parallelism = (
-            self.model_parallel_size > cluster.num_gpus_per_node
+            self.model_parallel_size > workers_per_node
         )
 
         # Initialize placement groups with the appropriate mode
-        cluster._init_placement_groups(
-            strategy=strategy,
-            use_unified_pg=needs_cross_node_parallelism,
-        )
+        cluster._init_placement_group()
 
         # Create worker builder for VllmGenerationWorker
         if self.cfg["vllm_cfg"]["async_engine"]:
@@ -181,29 +179,18 @@ class VllmGeneration(GenerationInterface):
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
-        # Check if we need parallelism-aware worker group creation
-        if self.model_parallel_size > 1:
-            # For parallelism, create node-aware worker groups
-            node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
-
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                bundle_indices_list=node_bundle_indices,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars,
-            )
-        else:
-            # Use standard worker group creation for non-parallel case
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                workers_per_node=workers_per_node,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars,
-            )
+        self.worker_group = RayWorkerGroup(
+            cluster,
+            worker_builder,
+            num_nodes=num_nodes,
+            workers_per_node=workers_per_node,
+            tied_worker_group_size=self.model_parallel_size,
+            cluster_node_offset=cluster_node_offset,
+            cluster_gpu_offset_each_node=cluster_gpu_offset_each_node,
+            name_prefix=name_prefix,
+            sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars,
+        )
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
@@ -222,74 +209,6 @@ class VllmGeneration(GenerationInterface):
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
-
-    def _get_tied_worker_bundle_indices(
-        self, cluster: RayVirtualCluster
-    ) -> list[tuple[int, list[int]]]:
-        """Calculate bundle indices for tensor and pipeline parallel workers.
-
-        Handles both unified placement groups (for cross-node model parallelism) and
-        per-node placement groups (for node-local model parallelism).
-        """
-        # Get the placement groups from the cluster
-        placement_groups = cluster.get_placement_groups()
-
-        if not placement_groups:
-            raise ValueError("No placement groups available in the cluster")
-
-        # Total parallel sizes
-        tp_size = self.sharding_annotations.get_axis_size("tensor_parallel")
-        pp_size = self.sharding_annotations.get_axis_size("pipeline_parallel")
-        model_parallel_size = tp_size * pp_size
-
-        if len(placement_groups) == 1:
-            # Single unified placement group used when we need multiple nodes for model parallelism
-            unified_pg = placement_groups[0]
-
-            def allocate_worker_groups(
-                pg: PlacementGroup, tp_size: int, pp_size: int
-            ) -> list[tuple[int, list[int]]]:
-                # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
-
-                # Retrieve both bundle mapping and per-node bundles
-                pg_table = ray.util.placement_group_table(pg)
-                total = len(pg_table["bundles"])
-                model_parallel_size = tp_size * pp_size
-                num_groups = total // model_parallel_size
-
-                groups: list[tuple[int, list[int]]] = []
-                for i in range(num_groups):
-                    slice_ = cluster._nid_and_bundle_id_sorted_by_ip_and_gpu[i * model_parallel_size : (i + 1) * model_parallel_size]
-                    first_node = slice_[0][0]
-                    bundle_indices = [ x[1] for x in slice_ ]
-                    groups.append((first_node, bundle_indices))
-                return groups
-
-            tied_groups = allocate_worker_groups(unified_pg, tp_size, pp_size)
-        else:
-            tied_groups = []
-            # For per-node PGs, each PG represents a node
-            for pg_idx, pg in enumerate(placement_groups):
-                if pg.bundle_count == 0:
-                    continue
-
-                # Check if this PG has enough bundles for at least one group
-                num_groups_in_pg = pg.bundle_count // model_parallel_size
-
-                # Create groups within this PG
-                for group_idx in range(num_groups_in_pg):
-                    start_idx = group_idx * model_parallel_size
-                    end_idx = start_idx + model_parallel_size
-                    bundle_indices = list(range(start_idx, end_idx))
-                    # Use pg_idx as the node identifier
-                    tied_groups.append((pg_idx, bundle_indices))
-
-        if not tied_groups:
-            raise ValueError(
-                "Unable to allocate any worker groups with the available resources."
-            )
-
-        return tied_groups
 
     def _report_device_id(self) -> list[list[str]]:
         """Report the device ID of vllm workers."""

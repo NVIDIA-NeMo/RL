@@ -278,5 +278,8 @@ class VllmInternalWorkerExtension:
     def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Report the node IP and GPU ID of the current worker."""
         ip = ray._private.services.get_node_ip_address()
-        gpu_id = int(ray.get_gpu_ids()[0])
+        try:
+            gpu_id = int(ray.get_gpu_ids()[0])
+        except:
+            gpu_id = "Unknown"
         return (ip, gpu_id)

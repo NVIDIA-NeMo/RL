@@ -318,120 +318,111 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if colocated_inference:
-        if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-            assert policy_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-                "when cluster.num_nodes = 1, "
-                f"but got {policy_gpus_per_node}."
-            )
+    def _calculate_resource_allocation(
+        cluster_resources, rm_resources, generation_resources
+    ):
+        total_nodes = cluster_resources["num_nodes"]
+        total_gpus_per_node = cluster_resources["gpus_per_node"]
+        if rm_resources is None:
+            grpo_nodes, grpo_gpus_per_node = total_nodes, total_gpus_per_node
         else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
-
-        cluster = RayVirtualCluster(
-            name="grpo_policy_cluster",
-            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-            use_gpus=True,
-            num_gpus_per_node=policy_gpus_per_node,
-            max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
-            else 2,
-        )
-        train_cluster = cluster
-        inference_cluster = cluster
-        print(
-            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-            flush=True,
-        )
-
-    else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
-
-        # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = policy_nodes
-
-        inference_resources = generation_config["colocated"]["resources"]
-        inference_gpus_per_node = inference_resources["gpus_per_node"]
-        inference_nodes = inference_resources["num_nodes"]
-
-        # validate and configure resources
-        if policy_nodes == 1:
-            # When policy_nodes == 1, train and inference are on the same node
-            assert (
-                inference_gpus_per_node is not None and inference_gpus_per_node > 0
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
-            )
-            assert inference_nodes is None or inference_nodes == 1, (
-                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-
-            inference_nodes = 1
-            # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
-            reward_gpus_to_subtract = (
-                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
-            )
-            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
-            assert train_gpus_per_node > 0, (
-                "No enough GPUs for training, "
-                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
-                + (
-                    f" - rm_gpus_per_node:{rm_gpus_per_node}"
-                    if total_nodes == 1 and reward_model_enabled
-                    else ""
+            if total_nodes == 1:
+                assert rm_resources["num_nodes"] == 1, (
+                    "When cluster.num_nodes = 1, reward model must be on the same node as the policy"
                 )
-            )
-        else:
-            # train, inference, and reward model are all on different nodes
-            assert inference_nodes > 0, (
-                "policy.generation.colocated.resources.num_nodes must be > 0 "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-            assert (
-                inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
-            )
-            train_nodes -= inference_nodes
+                grpo_nodes = 1
+                grpo_gpus_per_node = total_gpus_per_node - rm_resources["gpus_per_node"]
+                assert grpo_gpus_per_node > 0, (
+                    "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                    "when cluster.num_nodes = 1, "
+                    f"but got {grpo_gpus_per_node}."
+                )
+            else:
+                grpo_nodes = total_nodes - rm_resources["num_nodes"]
+                assert grpo_nodes > 0, (
+                    "grpo_nodes must be > 0, but got "
+                    f"grpo_nodes:{grpo_nodes} + rm_resources['num_nodes']:{rm_resources['num_nodes']} = total_nodes:{total_nodes}"
+                )
+                assert total_gpus_per_node == rm_resources["gpus_per_node"], (
+                    "When cluster.num_nodes > 1, policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node"
+                    f"but got {total_gpus_per_node} and {rm_resources['gpus_per_node']}."
+                )
+                grpo_gpus_per_node = total_gpus_per_node
 
-        # initialize train cluster
-        train_cluster = RayVirtualCluster(
-            name="grpo_train_cluster",
-            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
-            use_gpus=True,
-            num_gpus_per_node=train_gpus_per_node,
-            max_colocated_worker_groups=1,
+        if generation_resources is None: # Co-located
+            policy_nodes, policy_gpus_per_node = grpo_nodes, grpo_gpus_per_node
+            inference_nodes, inference_gpus_per_node = grpo_nodes, grpo_gpus_per_node
+            policy_node_offset, policy_gpu_offset, inference_node_offset, inference_gpu_offset = 0, 0, 0, 0
+        else: # Non-colocated
+            if grpo_nodes == 1:
+                assert generation_resources["num_nodes"] == 1, (
+                    "When grpo_nodes = 1, inference must be on the same node as the policy"
+                )
+                inference_nodes, inference_gpus_per_node = 1, generation_resources["gpus_per_node"]
+                policy_nodes, policy_gpus_per_node = 1, total_gpus_per_node - generation_resources["gpus_per_node"]
+                assert policy_gpus_per_node > 0, (
+                    "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                    "when grpo_nodes = 1, "
+                    f"but got {policy_gpus_per_node}."
+                )
+                policy_node_offset, inference_node_offset = 0, 0
+                policy_gpu_offset, inference_gpu_offset = 0, policy_gpus_per_node
+            else:
+                inference_nodes, inference_gpus_per_node = generation_resources["num_nodes"], generation_resources["gpus_per_node"]
+                assert inference_gpus_per_node == generation_resources["gpus_per_node"], (
+                    "When grpo_nodes > 1, inference.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node"
+                    f"but got {inference_gpus_per_node} and {generation_resources['gpus_per_node']}."
+                )
+                policy_nodes = grpo_nodes - inference_nodes
+                policy_gpus_per_node = grpo_gpus_per_node
+                assert policy_gpus_per_node > 0, (
+                    "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                    "when grpo_nodes > 1, "
+                    f"but got {policy_gpus_per_node}."
+                )
+                policy_gpu_offset, inference_gpu_offset = 0, 0
+                policy_node_offset, inference_node_offset = 0, policy_nodes
+        return (
+            grpo_nodes,
+            grpo_gpus_per_node,
+            policy_nodes,
+            policy_gpus_per_node,
+            policy_node_offset,
+            policy_gpu_offset,
+            inference_nodes,
+            inference_gpus_per_node,
+            inference_node_offset,
+            inference_gpu_offset,
         )
-        print(
-            f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+    
+    (
+        grpo_nodes,
+        grpo_gpus_per_node,
+        policy_nodes,
+        policy_gpus_per_node,
+        policy_node_offset,
+        policy_gpu_offset,
+        inference_nodes,
+        inference_gpus_per_node,
+        inference_node_offset,
+        inference_gpu_offset,
+    ) = _calculate_resource_allocation(
+        cluster_config,
+        env_configs["reward_model"]["resources"] if reward_model_enabled else None,
+        generation_config["colocated"]["resources"] if not colocated_inference else None,
+    )
 
-        # initialize inference cluster
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+    cluster = RayVirtualCluster(
+        name="grpo_cluster",
+        bundle_ct_per_node_list=[grpo_gpus_per_node] * grpo_nodes,
+        use_gpus=True,
+        num_gpus_per_node=grpo_gpus_per_node,
+        max_colocated_worker_groups=2 if colocated_inference and generation_config["backend"] != "megatron" else 1,
+    )
+    print(
+        f"  ✓ Ray cluster for GRPO initialized with {grpo_nodes} nodes",
+        flush=True,
+    )
 
     # ==========================
     #   Training and Inference
@@ -466,20 +457,31 @@ def setup(
         """Initialize policy training workers."""
         t0 = time.perf_counter()
         p = Policy(
-            cluster=train_cluster,
+            cluster=cluster,
             config=policy_config,
             tokenizer=tokenizer,
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            num_nodes=policy_nodes,
+            workers_per_node=policy_gpus_per_node,
+            cluster_node_offset=policy_node_offset,
+            cluster_gpu_offset_each_node=policy_gpu_offset,
         )
         return p, time.perf_counter() - t0
 
     def init_vllm():
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        pg = VllmGeneration(
+            cluster=cluster,
+            config=generation_config,
+            num_nodes=inference_nodes,
+            workers_per_node=inference_gpus_per_node,
+            cluster_node_offset=inference_node_offset,
+            cluster_gpu_offset_each_node=inference_gpu_offset,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -524,45 +526,18 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
+        print(
+            "  ⚙️  Using sequential worker initialization (colocated mode)",
+            flush=True,
+        )
 
-        if use_parallel_init:
-            # Parallel initialization: vLLM and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
+        # Initialize vLLM first (clean GPU memory), then policy
+        policy_generation, vllm_time = init_vllm()
+        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
 
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                vllm_future = executor.submit(init_vllm)
-                policy_future = executor.submit(init_policy)
-                policy_generation, vllm_time = vllm_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires vLLM first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize vLLM first (clean GPU memory), then policy
-            policy_generation, vllm_time = init_vllm()
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+        policy, policy_time = init_policy()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -578,10 +553,10 @@ def setup(
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
         t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
+        ip, port = cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
+        train_world_size = policy_nodes * policy_gpus_per_node
         inference_world_size = inference_nodes * inference_gpus_per_node
         world_size = train_world_size + inference_world_size
         # init collective
@@ -649,7 +624,7 @@ def setup(
     return (
         policy,
         policy_generation,
-        (train_cluster, inference_cluster),
+        cluster,
         dataloader,
         val_dataloader,
         loss_fn,

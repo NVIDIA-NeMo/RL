@@ -36,10 +36,10 @@ def create_mock_cluster(world_size: int):
     # Mock get_master_address_and_port method to return valid address and port
     cluster.get_master_address_and_port.return_value = ("127.0.0.1", 29500)
 
-    # Mock get_placement_groups method to return a list of mock placement groups
+    # Mock get_unified_placement_group method to return a mock placement group
     mock_pg = MagicMock()
     mock_pg.bundle_count = world_size  # Each placement group has world_size bundles
-    cluster.get_placement_groups.return_value = [mock_pg]
+    cluster.get_unified_placement_group.return_value = mock_pg
 
     # Mock get_available_address_and_port method
     cluster.get_available_address_and_port.return_value = ("127.0.0.1", 29501)
