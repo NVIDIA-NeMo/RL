@@ -721,9 +721,13 @@ def fetch_wandb_results(project: str, entity: Optional[str] = None) -> list:
                     # No ray-driver.log - job likely crashed early
                     actual_status = 'crashed'
             
+            # Construct WandB URL
+            wandb_url = run.url if hasattr(run, 'url') else f"https://wandb.ai/{run.entity}/{run.project}/runs/{run.id}"
+            
             result = {
                 'run_id': run.id,
                 'run_name': run.name,
+                'wandb_url': wandb_url,
                 'status': actual_status,
                 'wandb_status': run.state,
                 'slurm_job_id': slurm_job_id,
@@ -997,15 +1001,20 @@ def print_results_table(results: list, show_all: bool = False, detailed: bool = 
                     f"{status_str}"
                 )
             print(row)
-            # Print log directory on next line for easy reference
+            # Print log directory and WandB URL on next lines for easy reference
+            wandb_url = r.get('wandb_url', '')
             slurm_log_dir = r.get('slurm_log_dir', '')
+            
+            if wandb_url:
+                print(f"{DIM}    ├─ WandB: {wandb_url}{RESET}")
+            
             if slurm_log_dir:
                 # Show SLURM ray-driver.log path
                 ray_driver_path = os.path.join(slurm_log_dir, 'ray-driver.log')
-                print(f"{DIM}    └─ {ray_driver_path}{RESET}")
+                print(f"{DIM}    └─ Log: {ray_driver_path}{RESET}")
             elif log_dir:
                 # Fallback to WandB log dir
-                print(f"{DIM}    └─ WandB: {log_dir}{RESET}")
+                print(f"{DIM}    └─ Log: {log_dir}{RESET}")
             total_runs += 1
         
         # Print model group summary
@@ -1047,7 +1056,7 @@ def save_csv(results: list, output_path: str):
         return
     
     columns = [
-        'run_name', 'model', 'is_async', 'num_nodes', 'gpus_per_node', 'total_gpus',
+        'run_name', 'run_id', 'wandb_url', 'model', 'is_async', 'num_nodes', 'gpus_per_node', 'total_gpus',
         # Training parallelism
         't_tp', 't_pp', 't_ep', 't_cp', 't_vpp', 't_dp',
         # Generation parallelism
@@ -1066,7 +1075,7 @@ def save_csv(results: list, output_path: str):
         'policy_training_tokens_per_sec_per_gpu', 'logprobs_tokens_per_sec_per_gpu',
         # Training metrics
         'train_loss', 'train_accuracy', 
-        'status', 'created_at'
+        'status', 'slurm_job_id', 'slurm_log_dir', 'created_at'
     ]
     
     with open(output_path, 'w', newline='') as f:
