@@ -165,3 +165,75 @@ def test_squad_dataset():
             + " Answer: "
             + example["messages"][2]["content"]
         )
+
+
+def test_load_dataset_saved_with_save_to_disk():
+    """Test loading a dataset that was saved using HuggingFace's save_to_disk().
+
+    This tests the fix for datasets that already have a 'messages' column,
+    which should be preserved without applying add_messages_key again.
+    """
+    from datasets import Dataset
+
+    # Create a dataset with 'messages' column already present
+    train_data = [
+        {
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "Paris"},
+            ]
+        },
+    ]
+    val_data = [
+        {
+            "messages": [
+                {"role": "user", "content": "What is 3+3?"},
+                {"role": "assistant", "content": "6"},
+            ]
+        },
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create HF datasets and save using save_to_disk
+        train_dataset = Dataset.from_list(train_data)
+        val_dataset = Dataset.from_list(val_data)
+
+        train_path = f"{tmpdir}/train"
+        val_path = f"{tmpdir}/val"
+
+        train_dataset.save_to_disk(train_path)
+        val_dataset.save_to_disk(val_path)
+
+        # Load using load_response_dataset
+        data_config = {
+            "dataset_name": "ResponseDataset",
+            "train_data_path": train_path,
+            "val_data_path": val_path,
+        }
+        dataset = load_response_dataset(data_config)
+
+        # Verify the dataset loaded correctly
+        assert "train" in dataset.formatted_ds
+        assert "validation" in dataset.formatted_ds
+        assert len(dataset.formatted_ds["train"]) == 2
+        assert len(dataset.formatted_ds["validation"]) == 1
+
+        # Verify messages are preserved correctly
+        first_train_example = dataset.formatted_ds["train"][0]
+        assert "messages" in first_train_example
+        assert len(first_train_example["messages"]) == 2
+        assert first_train_example["messages"][0]["role"] == "user"
+        assert first_train_example["messages"][0]["content"] == "What is 2+2?"
+        assert first_train_example["messages"][1]["role"] == "assistant"
+        assert first_train_example["messages"][1]["content"] == "4"
+
+        # Verify validation data
+        first_val_example = dataset.formatted_ds["validation"][0]
+        assert first_val_example["messages"][0]["content"] == "What is 3+3?"
+        assert first_val_example["messages"][1]["content"] == "6"
