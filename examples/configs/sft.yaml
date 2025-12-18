@@ -165,6 +165,9 @@ data:
   shuffle: true
   num_workers: 1
 
+  prompt_file: null
+  system_prompt_file: null
+
   train:
     dataset_name: "squad"
     split: "train"

@@ -57,23 +57,19 @@ def parse_args():
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
+    default_task_spec = TaskDataSpec(
+        task_name="sft_default",
+        prompt_file=data_config["prompt_file"],
+        system_prompt_file=data_config["system_prompt_file"],
+    )
 
     # load dataset
     update_single_dataset_config(data_config["train"], data_config)
     train_data = load_response_dataset(data_config["train"], seed)
     val_data = load_response_dataset(data_config["validation"], seed)
-    # REVIEW: Not sure use data_config.get("prompt_file", None) or train_data.task_spec
-    default_task_spec = TaskDataSpec(
-        task_name="sft_default",
-        prompt_file=data_config.get("prompt_file", None),
-        system_prompt_file=data_config.get("system_prompt_file", None),
+    print(
+        f"  ✓ Training and validation datasets loaded with {len(train_data.dataset)} and {len(val_data.dataset)} samples, respectively."
     )
-    # train_dataset = data.formatted_ds["train"]
-    # val_dataset = data.formatted_ds["validation"]
-    # sft_task_spec = data.task_spec
-    # print(
-    #     f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
-    # )
 
     # add preprocessor if needed
     datum_preprocessor = None
