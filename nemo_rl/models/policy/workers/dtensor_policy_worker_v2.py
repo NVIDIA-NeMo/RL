@@ -46,6 +46,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
 from nemo_automodel.components.moe.parallelizer import (
     parallelize_model as moe_parallelize_model,
 )
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
@@ -84,6 +85,7 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -122,6 +124,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
+        # Apply TE patch until TE is upgraded to 2.10.0
+        apply_transformer_engine_patch()
+
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -837,10 +842,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             ## NOTE: invalid samples should be multiplied
                             ## by zero in the loss function to prevent them
                             ## from affecting the gradient calculation
-
-                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                            # but we want to sum them so we cancel out the average here
-                            # loss *= self.dp_size * self.cp_size
                             loss.backward()
 
                     if num_valid_samples > 0:
@@ -849,10 +850,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    from nemo_automodel.components.training.utils import (
-                        scale_grads_and_clip_grad_norm,
-                    )
-
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -867,6 +864,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         pp_axis_name=None,
                         foreach=True,
                         num_label_tokens=1,
+                        # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+                        # but we want to sum them so we rescale the gradients by self.dp_size * self.cp_size
                         dp_group_size=self.dp_size * self.cp_size,
                     )
                     grad_norm = torch.tensor(
