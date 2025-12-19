@@ -32,7 +32,7 @@ TokenizerType = PreTrainedTokenizerBase
 class DatumSpec(TypedDict):
     message_log: LLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
-    extra_env_info: dict[str, Any]
+    extra_env_info: Optional[dict[str, Any]]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
     task_name: NotRequired[str]
