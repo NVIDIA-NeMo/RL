@@ -16,10 +16,12 @@ import copy
 import gc
 import os
 import sys
+from importlib.util import find_spec
 from typing import Any, Optional, cast
 
 import ray
 import torch
+from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -156,63 +158,134 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
-        # Monkey patch for vLLM to ensure RAY_ADDRESS is set in Ray actors.
-        try:
-            from vllm.logger import init_logger
+        # Monkey patches for vLLM behavior. We avoid importing vllm modules
+        # here to prevent side effects during initialization and instead
+        # locate the files via importlib metadata.
 
-            logger = init_logger("vllm_patch")
+        from vllm.logger import init_logger
 
-            def _patch_vllm_init_workers_ray():
-                """Patch the vLLM ray_distributed_executor.py file.
+        logger = init_logger("vllm_patch")
 
-                1. Pass custom runtime_env in _init_workers_ray call.
-                    - This allows passing custom py_executable to worker initialization.
-                2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
-                    - This is a workaround to fix async vllm in some scenarios.
-                    - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
-                """
-                try:
-                    import vllm.executor.ray_distributed_executor as ray_executor_module
+        def _get_vllm_file(relative_path: str) -> str:
+            """Return absolute path to a vLLM file or raise if it cannot be found.
 
-                    file_to_patch = ray_executor_module.__file__
+            The relative_path should be a POSIX-style path under the vllm
+            package root, e.g. "v1/executor/ray_executor.py" or
+            "attention/layer.py".
+            """
+            spec = find_spec("vllm")
+            if spec is None or not spec.submodule_search_locations:
+                raise RuntimeError(
+                    "vLLM package not found while attempting to patch "
+                    f"'{relative_path}'. Ensure vLLM is installed and "
+                    "available in this environment."
+                )
 
-                    with open(file_to_patch, "r") as f:
-                        content = f.read()
+            base_dir = next(iter(spec.submodule_search_locations))
+            file_path = os.path.join(base_dir, *relative_path.split("/"))
 
-                    old_lines = [
-                        "self._init_workers_ray(placement_group)",
-                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-                    ]
+            if not os.path.exists(file_path):
+                raise RuntimeError(
+                    "Failed to locate expected vLLM file to patch. "
+                    f"Looked for '{relative_path}' at '{file_path}'. "
+                    "This likely indicates an unexpected vLLM installation "
+                    "layout or version mismatch."
+                )
 
-                    new_lines = [
-                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
-                    ]
+            return file_path
 
-                    need_replace = False
-                    for old_line, new_line in zip(old_lines, new_lines):
-                        if new_line in content or old_line not in content:
-                            continue
-                        content = content.replace(old_line, new_line)
-                        need_replace = True
+        def _patch_vllm_init_workers_ray():
+            """Patch the vLLM ray_distributed_executor.py file.
 
-                    if not need_replace:
-                        return
+            1. Pass custom runtime_env in _init_workers_ray call.
+                - This allows passing custom py_executable to worker initialization.
+            2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
+                - This is a workaround to fix async vllm in some scenarios.
+                - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+            """
+            file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
 
-                    # Write back the patched content
-                    with open(file_to_patch, "w") as f:
-                        f.write(content)
+            with open(file_to_patch, "r") as f:
+                content = f.read()
 
-                except (ImportError, FileNotFoundError, PermissionError):
-                    # Allow failures gracefully
-                    pass
+            old_lines = [
+                "self._init_workers_ray(placement_group)",
+                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+            ]
 
-            _patch_vllm_init_workers_ray()
-            logger.info("Successfully patched vllm _init_workers_ray.")
+            new_lines = [
+                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+            ]
 
-        except (ImportError, AttributeError):
-            # vllm not installed or has a different structure, skipping patch.
-            pass
+            need_replace = False
+            for old_line, new_line in zip(old_lines, new_lines):
+                if new_line in content or old_line not in content:
+                    continue
+                content = content.replace(old_line, new_line)
+                need_replace = True
+
+            if not need_replace:
+                return
+
+            # Write back the patched content
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+        def _patch_vllm_vit_flash_attn_backend():
+            """Patch vLLM vision attention backend selection logic.
+
+            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
+            vllm.attention.layer to avoid overriding the backend when it
+            is already set to XFORMERS. This avoids flash attention related
+            errors when the ViT head dimension is not a multiple of 32.
+
+            Related issues:
+            - https://github.com/vllm-project/vllm/issues/27562
+            - https://github.com/vllm-project/vllm/issues/26989
+
+            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
+            """
+            file_to_patch = _get_vllm_file("attention/layer.py")
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            old_snippet = (
+                "    elif current_platform.is_cuda():\n"
+                "        if (\n"
+                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
+                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
+                "        ):\n"
+                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
+                "            use_upstream_fa = True\n"
+            )
+
+            new_snippet = (
+                "    elif current_platform.is_cuda():\n"
+                "        if (\n"
+                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
+                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
+                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
+                "        ):\n"
+                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
+                "            use_upstream_fa = True\n"
+            )
+
+            # Only patch if the file still has the old snippet and
+            # hasn't been patched already.
+            if new_snippet in content or old_snippet not in content:
+                return
+
+            content = content.replace(old_snippet, new_snippet)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+        _patch_vllm_init_workers_ray()
+        logger.info("Successfully patched vllm _init_workers_ray.")
+
+        _patch_vllm_vit_flash_attn_backend()
+        logger.info("Successfully patched vllm vit flash attention backend.")
 
         try:
             import vllm
@@ -304,6 +377,17 @@ class BaseVllmGenerationWorker:
         vllm_kwargs["hf_overrides"].update(
             self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
         )
+
+        # Override HF config for gpt-oss models to ensure compatibility with megatron
+        # The megatron --> hf export is done in bf16, so we disable quantization
+        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
+            if "quantization_config" in hf_config:
+                assert load_format == "dummy", (
+                    "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
+                )
+                # disable quantization
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
 
         llm_kwargs = dict(
             model=self.model_name,
