@@ -719,20 +719,38 @@ Examples:
     
     # Launch all presets
     if args.all:
-        print("🚀 Launching all preset configurations...\n")
+        variant_msg = f" with variant '{args.variant}'" if args.variant else ""
+        print(f"🚀 Launching all preset configurations{variant_msg}...\n")
+        
+        launched = 0
+        skipped = 0
         for preset in get_available_presets():
+            # If variant is specified, check if this preset has that variant
+            if args.variant:
+                available_variants = get_preset_variants(preset)
+                if args.variant not in available_variants:
+                    print(f"⏭️  Skipping {preset}: variant '{args.variant}' not available (has: {available_variants})")
+                    skipped += 1
+                    continue
+            
             print(f"\n{'='*70}")
-            print(f"  Launching: {preset}")
+            print(f"  Launching: {preset}" + (f" ({args.variant})" if args.variant else ""))
             print(f"{'='*70}")
             try:
-                launch_job(preset, cluster_config, dry_run=args.dry_run,
+                launch_job(preset, cluster_config, variant=args.variant,
+                          dry_run=args.dry_run,
                           wandb_project=args.wandb_project,
                           max_steps=args.max_steps,
                           time_limit=args.time,
                           account=args.account,
-                          partition=args.job_partition)
+                          partition=args.job_partition,
+                          enable_vllm_metrics=args.enable_vllm_metrics,
+                          vllm_metrics_interval=args.vllm_metrics_interval)
+                launched += 1
             except Exception as e:
                 print(f"❌ Error launching {preset}: {e}")
+        
+        print(f"\n✅ Launched: {launched}, Skipped: {skipped}")
         return
     
     # Use preset

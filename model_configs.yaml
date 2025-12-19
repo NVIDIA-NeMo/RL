@@ -54,6 +54,24 @@ llama8b:
       cp: 1
       ep: 1
       pp: 1
+  
+  gb200_matched:
+    # Same GPU count as H100: 16 GPUs (4 nodes × 4 GPUs)
+    # For fair H100 vs GB200 comparison
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 1
+      pp: 1  # GB200 has enough memory, no PP needed
 
 # ============================================
 # Llama-3.1-70B-Instruct
@@ -177,6 +195,24 @@ llama70b:
       cp: 1
       ep: 1
       pp: 2
+  
+  gb200_matched:
+    # Same GPU count as H100: 32 GPUs (8 nodes × 4 GPUs)
+    # For fair H100 vs GB200 comparison
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 4
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 4  # 8 nodes, TP=4 within node, PP=4 across nodes
 
 # ============================================
 # Qwen3-32B
@@ -256,6 +292,25 @@ qwen32b:
       cp: 1
       ep: 1
       pp: 1
+  
+  gb200_matched:
+    # Same GPU count as H100: 32 GPUs (8 nodes × 4 GPUs)
+    # For fair H100 vs GB200 comparison
+    # TP=2 shows better performance than TP=4
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 2
+      cp: 1
+      ep: 1
+      pp: 1  # TP=2 is optimal for GB200
 
 # ============================================
 # Qwen3-30B-A3B (MoE)
@@ -298,6 +353,25 @@ qwen30b:
       tp: 1
       cp: 1
       ep: 4
+      pp: 1
+  
+  gb200_matched:
+    # Same GPU count as H100: 32 GPUs (8 nodes × 4 GPUs)
+    # For fair H100 vs GB200 comparison
+    # EP=16 for maximum expert distribution across all GPUs
+    num_gpus: 32
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 16  # 128 experts / 16 = 8 experts per GPU
       pp: 1
 
 # Qwen3-30B-A3B with EP=8 (for comparison)
