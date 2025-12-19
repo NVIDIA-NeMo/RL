@@ -19,8 +19,8 @@ grpo:
     target_max: 1.0
   reward_shaping:
     enabled: true
-    overlong_buffer_length: 2048
-    max_response_length: 6144
+    overlong_buffer_length: 512
+    max_response_length: 1024
 loss_fn:
   reference_policy_kl_penalty: 0.0  # Corresponds to actor_rollout_ref.actor.kl_loss_coef
   ratio_clip_max: 0.28  # clip_ratio_high
@@ -32,10 +32,10 @@ checkpointing:
 policy:
   model_name: /path/to/dsv3-bf16-checkpoint
   hf_config_overrides:
-    max_position_embeddings: 8192
+    max_position_embeddings: 1536
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 1536
   dtensor_cfg:
     enabled: false
   make_sequence_length_divisible_by: ${mul:${policy.dtensor_cfg.tensor_parallel_size},
@@ -61,13 +61,13 @@ policy:
   sequence_packing:
     enabled: true
   generation:
-    max_new_tokens: 8192
+    max_new_tokens: 1536
     vllm_cfg:
       async_engine: false
       tensor_parallel_size: 64
       enforce_eager: true
 data:
-  max_input_seq_length: 2048  # max_prompt_length
+  max_input_seq_length: 512  # max_prompt_length
   prompt_file: null
   dataset_name: DAPOMath17K
 env:
