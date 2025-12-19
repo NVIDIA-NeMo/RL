@@ -180,6 +180,7 @@ def get_basic_megatron_test_config(
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -1163,6 +1164,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
@@ -1198,6 +1200,11 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("created")
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        message = d["choices"][0]["message"]
+        if "reasoning" in message:
+            message.pop("reasoning")
 
         return d
 
@@ -1367,6 +1374,9 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
 def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
+
+        def decode(self, *args, **kwargs):
+            pass
 
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
@@ -1934,13 +1944,18 @@ async def test_vllm_refit_non_colocated_update_weights(
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
+@pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size, vllm_precision
+    cluster, tokenizer, tensor_parallel_size, vllm_precision, kv_cache_dtype
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
     This test validates that vLLM and Megatron policies can work together.
     """
+
+    # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
+    if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
+        pytest.skip("kv_cache_dtype='fp8' requires precision='fp8'")
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -1965,6 +1980,8 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    if kv_cache_dtype is not None:
+        vllm_config["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model

@@ -41,6 +41,8 @@ class FP8Config:
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
     model_parallel_size: int = None
+    kv_cache_dtype: str = "auto"
+    use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
 
 
 @dataclass()
@@ -105,36 +107,130 @@ def monkey_patch_vllm_ray_executor(fp8_config):
         fp8_patches_applied = True
 
 
+def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
+    """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
+
+    This function centralizes the naming convention for Q/K/V scale parameters
+    that vLLM expects. These names must match vLLM's internal parameter structure.
+
+    Args:
+        layer_idx: The transformer layer index (0-based)
+
+    Returns:
+        Dictionary mapping scale types to vLLM parameter names:
+        - 'q_scale': Q activation scale name
+        - 'k_scale': K activation scale name
+        - 'v_scale': V activation scale name
+
+    Note:
+        The q_scale has an extra '.attn.' component compared to k_scale/v_scale.
+        This matches vLLM's parameter remapping logic in:
+        vllm.model_executor.model_loader.weight_utils.maybe_remap_kv_scale_name
+
+    Example:
+        >>> get_vllm_qkv_scale_names(0)
+        {
+            'q_scale': 'model.layers.0.self_attn.attn.q_scale',
+            'k_scale': 'model.layers.0.self_attn.k_scale',
+            'v_scale': 'model.layers.0.self_attn.v_scale'
+        }
+    """
+    return {
+        "q_scale": f"model.layers.{layer_idx}.self_attn.attn.q_scale",
+        "k_scale": f"model.layers.{layer_idx}.self_attn.k_scale",
+        "v_scale": f"model.layers.{layer_idx}.self_attn.v_scale",
+    }
+
+
+def convert_calibration_to_vllm_format(
+    calibration_results: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Convert NeMo-RL calibration results to vLLM parameter format.
+
+    Currently only used by megatron policy worker.
+    After FP8 KV cache is supported by DTensor path, this function can be reused.
+
+    This function transforms the calibration output format (with layer_N keys)
+    into the flat dictionary format that vLLM expects for parameter loading.
+
+    Args:
+        calibration_results: Dict with keys like "layer_0", "layer_1", etc.
+            Each value is a dict with keys: "q_scale", "k_scale", "v_scale"
+            and corresponding float scale values.
+
+    Returns:
+        Flat dictionary mapping vLLM parameter names to scale values.
+        Keys follow vLLM's naming convention as defined in get_vllm_qkv_scale_names.
+
+    Example:
+        >>> calib = {
+        ...     "layer_0": {"q_scale": 1.0, "k_scale": 2.0, "v_scale": 3.0},
+        ...     "layer_1": {"q_scale": 1.5, "k_scale": 2.5, "v_scale": 3.5}
+        ... }
+        >>> convert_calibration_to_vllm_format(calib)
+        {
+            'model.layers.0.self_attn.attn.q_scale': 1.0,
+            'model.layers.0.self_attn.k_scale': 2.0,
+            'model.layers.0.self_attn.v_scale': 3.0,
+            'model.layers.1.self_attn.attn.q_scale': 1.5,
+            'model.layers.1.self_attn.k_scale': 2.5,
+            'model.layers.1.self_attn.v_scale': 3.5
+        }
+    """
+    vllm_scales = {}
+    for layer_key, scales in calibration_results.items():
+        # Extract layer index from "layer_N" format
+        layer_idx = int(layer_key.split("_")[1])
+        param_names = get_vllm_qkv_scale_names(layer_idx)
+
+        vllm_scales[param_names["q_scale"]] = scales["q_scale"]
+        vllm_scales[param_names["k_scale"]] = scales["k_scale"]
+        vllm_scales[param_names["v_scale"]] = scales["v_scale"]
+
+    return vllm_scales
+
+
 def apply_fp8_patches(self, fp8_config):
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
 
     global_fp8_config = fp8_config
 
-    # This patch is used to support torch.compile with vllm parameter subclasses, such as
-    # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
-    # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
-    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
-    # which this patch can be removed.
-    func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
-    patcher1 = patch(func1_path, process_weights_after_loading)
-    fp8_state.vllm_patches.append(patcher1)
-    func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
-    patcher2 = patch(func2_path, process_weights_after_loading_moe)
-    fp8_state.vllm_patches.append(patcher2)
-    func3_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-    patcher3 = patch(func3_path, process_weights_after_loading_kv)
-    fp8_state.vllm_patches.append(patcher3)
-    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
-    # SNR compared to plain fp32 scaling factors. This feature is still under active research.
-    if global_fp8_config.use_activation_pow2_scale:
-        func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
-        func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
-        func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
-        patcher2 = patch(func2_path, per_token_group_quant_fp8)
-        patcher3 = patch(func3_path, _per_token_group_quant_fp8)
-        patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-        fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
+    # Apply patches conditionally based on configuration
+    # Only apply weight patches if using FP8 weights
+    # Only apply KV cache patches if using FP8 KV cache
+
+    # Apply weight-related patches only when using FP8 weights (precision=fp8)
+    if global_fp8_config.use_fp8_weights:
+        # This patch is used to support torch.compile with vllm parameter subclasses, such as
+        # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
+        # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
+        # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
+        # which this patch can be removed.
+        func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
+        patcher1 = patch(func1_path, process_weights_after_loading)
+        fp8_state.vllm_patches.append(patcher1)
+        func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+        patcher2 = patch(func2_path, process_weights_after_loading_moe)
+        fp8_state.vllm_patches.append(patcher2)
+
+        # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
+        # SNR compared to plain fp32 scaling factors. This feature is still under active research.
+        if global_fp8_config.use_activation_pow2_scale:
+            func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
+            func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
+            func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
+            patcher2 = patch(func2_path, per_token_group_quant_fp8)
+            patcher3 = patch(func3_path, _per_token_group_quant_fp8)
+            patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
+            fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
+
+    # Apply KV cache patches only when using FP8 KV cache (kv_cache_dtype=fp8)
+    if global_fp8_config.kv_cache_dtype == "fp8":
+        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
+        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+        patcher5 = patch(func5_path, process_weights_after_loading_kv)
+        fp8_state.vllm_patches.append(patcher5)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -145,6 +241,23 @@ def apply_fp8_patches(self, fp8_config):
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     config = AutoConfig.from_pretrained(model_name)
     global global_fp8_config
+    # Determine if we're using FP8 weights based on precision setting
+    use_fp8_weights = vllm_cfg.get("precision") == "fp8"
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+
+    # Validate configuration: kv_cache_dtype
+    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+        raise ValueError(
+            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+        )
+
+    # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
+    if kv_cache_dtype.startswith("fp8") and not use_fp8_weights:
+        raise ValueError(
+            f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
+            "FP8 KV cache can only be used together with FP8 model weights."
+        )
+
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale=vllm_cfg.get(
@@ -153,10 +266,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
+        kv_cache_dtype=kv_cache_dtype,
+        use_fp8_weights=use_fp8_weights,
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -212,10 +328,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
 
+    # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {
         "quantization": "fp8",
+        "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
+
     return vllm_kwargs
 
 
@@ -423,6 +542,39 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
+# Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
+# Patches this method to not create new torch.nn.Parameter for layer weights
+# to maintain weight loaders.
+def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
+    assert layer.weight_block_size is not None
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import (
+        is_deep_gemm_e8m0_used,
+        should_use_deepgemm_for_fp8_linear,
+    )
+
+    # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
+    # requantize the weight and input to the specific scale
+    # at the same time.
+    should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
+        layer.orig_dtype, layer.weight
+    )
+    if should_use_deepgemm:
+        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=layer.weight.data,
+            ws=layer.weight_scale.data,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
+        )
+        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
+        # Instead of creating new torch.nn.Parameter, we update the data in place.
+        layer.weight.data.copy_(dg_weight)
+        layer.weight_scale.data.copy_(dg_weight_scale)
+
+
 def process_weights_after_loading(self, layer) -> None:
     """This function is used to process the weights after loading for a Linear layer.
 
@@ -430,7 +582,6 @@ def process_weights_after_loading(self, layer) -> None:
     new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
     """
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        maybe_post_process_fp8_weight_block,
         process_fp8_weight_block_strategy,
     )
 
@@ -448,7 +599,7 @@ def process_weights_after_loading(self, layer) -> None:
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
         layer.update_param_tp_status()
 
-    maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+    maybe_post_process_fp8_weight_block(layer)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
@@ -523,6 +674,11 @@ def process_weights_after_loading_moe(self, layer) -> None:
 
 
 def process_weights_after_loading_kv(self, layer) -> None:
+    """Modified version of BaseKVCacheMethod.process_weights_after_loading.
+
+    Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
+    for dynamic updates during refit.
+    """
     # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
     # regardless whether the kv-scale is available in the checkpoint.
     # No need to process kv scales after loading if we are going to
@@ -599,6 +755,9 @@ def process_weights_after_loading_kv(self, layer) -> None:
     )
 
     layer._prob_scale.copy_(prob_scale)
+
+    # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
+    # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
 
 
 @triton.jit

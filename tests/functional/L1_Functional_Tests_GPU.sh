@@ -19,10 +19,16 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
+# This test is intentionally not run with uv run --no-sync to verify that the frozen environment is working correctly.
+time bash ./tests/functional/grpo_frozen_env.sh
+time bash ./tests/functional/test_frozen_env.sh
+
 time uv run --no-sync bash ./tests/functional/sft.sh
+time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
+time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 time uv run --no-sync bash ./tests/functional/dpo.sh
