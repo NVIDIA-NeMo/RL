@@ -24,6 +24,7 @@ class ResponseDatasetConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
     download_dir: NotRequired[str]
     split_validation_size: NotRequired[float]
 
@@ -47,6 +48,7 @@ class DataConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
     # TODO: remove NotRequired once preference dataset is refactored
     train: NotRequired[ResponseDatasetConfig]
     validation: NotRequired[ResponseDatasetConfig | None]
