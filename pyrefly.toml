@@ -109,6 +109,8 @@ project-includes = [
   "nemo_rl/models/policy/__init__.py",
   "nemo_rl/models/policy/interfaces.py",
   "nemo_rl/models/policy/utils.py",
+  "nemo_rl/models/policy/workers/__init__.py",
+  "nemo_rl/models/policy/workers/patches.py",
   "nemo_rl/utils/__init__.py",
   "nemo_rl/utils/automodel_checkpoint.py",
   "nemo_rl/utils/checkpoint.py",
