@@ -107,7 +107,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     val_dataset = data.formatted_ds["validation"]
     sft_task_spec = data.task_spec
     print(
-        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset) if val_dataset else 0} samples, respectively."
     )
 
     # add preprocessor if needed
