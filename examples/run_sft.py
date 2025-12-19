@@ -141,19 +141,20 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = AllTaskProcessedDataset(
-        val_dataset,
-        tokenizer,
-        sft_task_spec,
-        partial(
-            sft_preprocessor,
-            add_bos=data_config.get("add_bos", True),
-            add_eos=data_config.get("add_eos", True),
-            add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor_val,
-        ),
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    if val_dataset is not None:
+        val_dataset = AllTaskProcessedDataset(
+            val_dataset,
+            tokenizer,
+            sft_task_spec,
+            partial(
+                sft_preprocessor,
+                add_bos=data_config.get("add_bos", True),
+                add_eos=data_config.get("add_eos", True),
+                add_generation_prompt=data_config["add_generation_prompt"],
+                datum_preprocessor=datum_preprocessor_val,
+            ),
+            max_seq_length=data_config["max_input_seq_length"],
+        )
 
     val_dataset = None
     if len(val_data_list) > 0:
