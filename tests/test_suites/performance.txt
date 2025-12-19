@@ -2,6 +2,7 @@
 # GRPO #
 ########
 
+# H100 (8 GPUs/node)
 tests/test_suites/llm/performance/grpo-llama3.1-8b-instruct-2n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n8g.sh
 tests/test_suites/llm/performance/grpo-deepseek-v3-32n8g.sh
@@ -14,4 +15,12 @@ tests/test_suites/llm/performance/grpo-qwen3-32b-8n8g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-32n8g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n8g-async-1off.sh
 
+<<<<<<< HEAD
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-24n8g-async-8off.sh
+=======
+
+# GB200 (4 GPUs/node)
+tests/test_suites/llm/performance/grpo-llama3.1-8b-instruct-2n4g.sh
+tests/test_suites/llm/performance/grpo-qwen3-32b-4n4g.sh
+tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g.sh
+>>>>>>> 878206e8 (feat: Add GB200 perf recipes for llama3-8b, qwen3-30ba3,qwen3-32b)
