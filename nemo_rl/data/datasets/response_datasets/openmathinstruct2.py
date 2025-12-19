@@ -53,14 +53,9 @@ class OpenMathInstruct2Dataset(RawDataset):
             remove_columns=self.dataset.column_names,
         )
 
-        # use only when current dataset is used for both training and validation
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
         self.val_dataset = None
-        if split_validation_size > 0:
-            split_dataset = self.dataset.train_test_split(
-                test_size=split_validation_size, seed=seed
-            )
-            self.dataset = split_dataset["train"]
-            self.val_dataset = split_dataset["test"]
+        self.split_train_validation(split_validation_size, seed)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {

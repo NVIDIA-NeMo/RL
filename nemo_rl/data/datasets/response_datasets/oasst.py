@@ -109,11 +109,6 @@ class OasstDataset(RawDataset):
         self.dataset = get_data_records(all_objs, task_name=self.task_name)
         self.dataset = Dataset.from_list(self.dataset)
 
-        # use only when current dataset is used for both training and validation
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
         self.val_dataset = None
-        if split_validation_size > 0:
-            split_dataset = self.dataset.train_test_split(
-                test_size=split_validation_size, seed=seed
-            )
-            self.dataset = split_dataset["train"]
-            self.val_dataset = split_dataset["test"]
+        self.split_train_validation(split_validation_size, seed)
