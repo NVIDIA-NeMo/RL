@@ -14,7 +14,7 @@
 
 """Contains data processors for evaluation."""
 
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Dict, cast
 
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
@@ -143,12 +143,15 @@ def sft_processor(
     add_bos: bool = True,
     add_eos: bool = True,
     add_generation_prompt: bool = False,
-    datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
     # optional preprocessor
-    if datum_preprocessor is not None:
-        datum_dict = datum_preprocessor(datum_dict)
+    if datum_dict["task_name"] == "clevr-cogent":
+        from nemo_rl.data.datasets.response_datasets.clevr import (
+            format_clevr_cogent_dataset,
+        )
+
+        datum_dict = format_clevr_cogent_dataset(datum_dict)
 
     message_log = get_formatted_message_log(
         datum_dict["messages"],

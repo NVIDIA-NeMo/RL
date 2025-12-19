@@ -189,7 +189,6 @@ data:
   train:
     dataset_name: "squad"
     split: "train"
-    split_validation_size: 0 # Not use training data as validation data
   validation:
     dataset_name: "squad"
     split: "validation"
