@@ -448,6 +448,7 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    debug: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -459,6 +460,7 @@ def get_formatted_message_log(
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
+        debug: Whether to print debug information showing each message turn. Default: False
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
@@ -551,8 +553,8 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
-        # Debug: Print each message turn separately (only once for the first sample)
-        if not hasattr(get_formatted_message_log, "_debug_printed"):
+        # Debug: Print each message turn separately
+        if debug:
             if i == 0:
                 # Print header only at the start of first message
                 print("\n" + "=" * 80)
@@ -568,8 +570,6 @@ def get_formatted_message_log(
             print("-" * 40)
 
             if i == len(message_log_strs) - 1:
-                # Mark as printed after processing all turns of the first sample
-                get_formatted_message_log._debug_printed = True
                 print("\n" + "=" * 80)
                 print("DEBUG: Complete formatted conversation:")
                 print("-" * 80)

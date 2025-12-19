@@ -792,3 +792,41 @@ def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
         isinstance(out[1]["token_ids"], torch.Tensor)
         and out[1]["token_ids"].numel() > 0
     )
+
+
+def test_get_formatted_message_log_debug_off_by_default(
+    raw_chat_message_log: LLMMessageLogType,
+    capsys,
+) -> None:
+    """Verify debug output is disabled by default."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    task_data_spec = TaskDataSpec(task_name="test")
+
+    get_formatted_message_log(
+        raw_chat_message_log,
+        tokenizer,
+        task_data_spec,
+    )
+
+    captured = capsys.readouterr()
+    assert "DEBUG: Individual message turns" not in captured.out
+
+
+def test_get_formatted_message_log_debug_enabled(
+    raw_chat_message_log: LLMMessageLogType,
+    capsys,
+) -> None:
+    """Verify debug output is printed when debug=True."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    task_data_spec = TaskDataSpec(task_name="test")
+
+    get_formatted_message_log(
+        raw_chat_message_log,
+        tokenizer,
+        task_data_spec,
+        debug=True,
+    )
+
+    captured = capsys.readouterr()
+    assert "DEBUG: Individual message turns from apply_chat_template" in captured.out
+    assert "DEBUG: Complete formatted conversation:" in captured.out
