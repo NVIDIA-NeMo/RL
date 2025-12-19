@@ -84,27 +84,28 @@ def setup_data(
         system_prompt_file=data_config["system_prompt_file"],
     )
 
-    # load dataset
+    # setup train dataset
     update_single_dataset_config(data_config["train"], data_config)
-    data: Any = load_response_dataset(data_config["train"], seed)
+    data = load_response_dataset(data_config["train"], seed)
     task_data_processors = {data.task_name: (data.task_spec, data.processor)}
     task_to_env = {data.task_name: env}
 
     dataset = AllTaskProcessedDataset(
         data.dataset,
         tokenizer,
-        default_task_spec,
+        default_task_spec,  # default task data spec to process any values not specified in the task-specific specs
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
     val_task_to_env = {}
     val_data_list = []
 
-    # validation dataset from train dataset
-    if data_config["train"]["split_validation_size"] > 0:
+    # validation dataset from train dataset (when train dataset's split_validation_size > 0)
+    if hasattr(data, "val_dataset") and data.val_dataset is not None:
         val_data_list.append(data.val_dataset)
         val_task_data_processors = task_data_processors.copy()
         val_task_to_env = task_to_env.copy()
@@ -120,16 +121,17 @@ def setup_data(
         )
         val_task_to_env[val_data.task_name] = env
 
-    val_dataset: Optional[AllTaskProcessedDataset] = None
+    val_dataset = None
     if len(val_data_list) > 0:
-        val_dataset = concatenate_datasets(val_data_list)
+        merged_val_data = concatenate_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
-            val_dataset,
+            merged_val_data,
             tokenizer,
             default_task_spec,
             val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
     return dataset, val_dataset, task_to_env, val_task_to_env
 

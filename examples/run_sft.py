@@ -64,97 +64,64 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
         system_prompt_file=data_config["system_prompt_file"],
     )
 
-    # load dataset
+    # setup train dataset
     update_single_dataset_config(data_config["train"], data_config)
-    train_data = load_response_dataset(data_config["train"], seed)
-    val_data = load_response_dataset(data_config["validation"], seed)
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(train_data.dataset)} and {len(val_data.dataset)} samples, respectively."
+    data = load_response_dataset(data_config["train"], seed)
+    data_processor = partial(
+        data.processor,
+        add_bos=data_config["add_bos"],
+        add_eos=data_config["add_eos"],
+        add_generation_prompt=data_config["add_generation_prompt"],
     )
+    task_data_processors = {data.task_name: (data.task_spec, data_processor)}
 
-    # add preprocessor if needed
-    train_datum_preprocessor = None
-    if (
-        "dataset_name" in data_config["train"]
-        and data_config["train"]["dataset_name"] == "clevr-cogent"
-    ):
-        from nemo_rl.data.datasets.response_datasets.clevr import (
-            format_clevr_cogent_dataset,
-        )
-
-        train_datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
-
-    val_datum_preprocessor = None
-    if (
-        "dataset_name" in data_config["validation"]
-        and data_config["validation"]["dataset_name"] == "clevr-cogent"
-    ):
-        from nemo_rl.data.datasets.response_datasets.clevr import (
-            format_clevr_cogent_dataset,
-        )
-
-        val_datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
-
-    train_dataset = AllTaskProcessedDataset(
-        train_data.dataset,
+    dataset = AllTaskProcessedDataset(
+        data.dataset,
         tokenizer,
         default_task_spec,
-        partial(
-            train_data.processor,
-            add_bos=data_config["add_bos"],
-            add_eos=data_config["add_eos"],
-            add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=train_datum_preprocessor,
-        ),
+        task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
     val_data_list = []
 
-    # validation dataset from train dataset
-    if data_config["train"]["split_validation_size"] > 0:
-        val_data_list.append(train_data.val_dataset)
-        val_task_data_processors[train_data.task_name] = (
-            train_data.task_spec,
-            partial(
-                train_data.processor,
-                add_bos=data_config.get("add_bos", True),
-                add_eos=data_config.get("add_eos", True),
-                add_generation_prompt=data_config["add_generation_prompt"],
-                datum_preprocessor=train_datum_preprocessor,
-            ),
-        )
+    # validation dataset from train dataset (when train dataset's split_validation_size > 0)
+    if hasattr(data, "val_dataset") and data.val_dataset is not None:
+        val_data_list.append(data.val_dataset)
+        val_task_data_processors = task_data_processors.copy()
 
     # validation dataset from config
     if data_config["validation"] is not None:
         update_single_dataset_config(data_config["validation"], data_config)
         val_data = load_response_dataset(data_config["validation"], seed)
         val_data_list.append(val_data.dataset)
+        val_data_processor = partial(
+            val_data.processor,
+            add_bos=data_config["add_bos"],
+            add_eos=data_config["add_eos"],
+            add_generation_prompt=data_config["add_generation_prompt"],
+        )
         val_task_data_processors[val_data.task_name] = (
             val_data.task_spec,
-            partial(
-                val_data.processor,
-                add_bos=data_config.get("add_bos", True),
-                add_eos=data_config.get("add_eos", True),
-                add_generation_prompt=data_config["add_generation_prompt"],
-                datum_preprocessor=val_datum_preprocessor,
-            ),
+            val_data_processor,
         )
 
     val_dataset = None
     if len(val_data_list) > 0:
-        val_dataset = concatenate_datasets(val_data_list)
+        merged_val_data = concatenate_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
-            val_data.dataset,
+            merged_val_data,
             tokenizer,
             default_task_spec,
             val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
-    return train_dataset, val_dataset, default_task_spec
+    return dataset, val_dataset, default_task_spec
 
 
 def main(is_vlm: bool = False):

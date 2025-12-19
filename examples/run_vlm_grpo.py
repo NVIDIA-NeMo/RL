@@ -99,6 +99,7 @@ def setup_data(
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
@@ -132,6 +133,7 @@ def setup_data(
             val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
     return dataset, val_dataset, task_to_env, val_task_to_env
 
