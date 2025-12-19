@@ -218,6 +218,7 @@ override-dependencies = [
   "transformer-engine[pytorch]==2.8.0",
   "opencv-python-headless>=4.11.0",
   "nvidia-modelopt[torch]>=0.39.0",
+  "timm<=1.0.22",
 ]
 # CVE fxies
 constraint-dependencies = [
