@@ -205,3 +205,51 @@ def test_exit_on_timeout(mock_components, capsys):
             assert "Epoch" not in line or "Epoch 1/10" in line, (
                 f"Training continued to next epoch after timeout: {line}"
             )
+
+
+def test_training_with_disabled_validation(mock_components):
+    """Test that training works when validation is disabled (val_dataloader=None, val_period<=0)"""
+    mock_components["master_config"]["sft"]["val_period"] = 0
+    mock_components["master_config"]["sft"]["max_num_steps"] = 5
+    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+
+    sft_save_state = _default_sft_save_state()
+
+    sft_train(
+        mock_components["policy"],
+        mock_components["train_dataloader"],
+        None,  # val_dataloader is None
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["master_config"],
+        mock_components["logger"],
+        mock_components["sft_task_spec"],
+        mock_components["checkpointer"],
+        sft_save_state,
+    )
+
+    assert mock_components["policy"].train.call_count == 5
+
+
+def test_training_with_negative_val_period(mock_components):
+    """Test that training works when val_period is negative (validation disabled)"""
+    mock_components["master_config"]["sft"]["val_period"] = -1
+    mock_components["master_config"]["sft"]["max_num_steps"] = 3
+    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+
+    sft_save_state = _default_sft_save_state()
+
+    sft_train(
+        mock_components["policy"],
+        mock_components["train_dataloader"],
+        None,  # val_dataloader is None
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["master_config"],
+        mock_components["logger"],
+        mock_components["sft_task_spec"],
+        mock_components["checkpointer"],
+        sft_save_state,
+    )
+
+    assert mock_components["policy"].train.call_count == 3
