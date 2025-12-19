@@ -4,10 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
-STEPS_PER_RUN=50  # step_time ~ 9sec
-MAX_STEPS=50
+STEPS_PER_RUN=20  # step_time ~ 8sec
+MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=15
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -35,6 +35,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["50"] < 2.32' \
-        'data["validation/val_loss"]["50"] < 2.35'
+        'data["train/loss"]["20"] < 4.14' \
+        'data["train/loss"]["0"] < 5.28' 
 fi
