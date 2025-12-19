@@ -29,9 +29,7 @@ from nemo_rl.data.datasets import (
     load_response_dataset,
     update_single_dataset_config,
 )
-from nemo_rl.data.interfaces import (
-    TaskDataSpec,
-)
+from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
@@ -102,8 +100,8 @@ def setup_data(
     val_task_to_env = {}
     val_data_list = []
 
-    # validation dataset from train dataset
-    if data_config["train"]["split_validation_size"] > 0:
+    # validation dataset from train dataset (when train dataset's split_validation_size > 0)
+    if hasattr(data, "val_dataset") and data.val_dataset is not None:
         val_data_list.append(data.val_dataset)
         val_task_data_processors = task_data_processors.copy()
         val_task_to_env = task_to_env.copy()
@@ -121,9 +119,9 @@ def setup_data(
 
     val_dataset = None
     if len(val_data_list) > 0:
-        val_dataset = concatenate_datasets(val_data_list)
+        merged_val_data = concatenate_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
-            val_dataset,
+            merged_val_data,
             tokenizer,
             default_task_spec,
             val_task_data_processors,
