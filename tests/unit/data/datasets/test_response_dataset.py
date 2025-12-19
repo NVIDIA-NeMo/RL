@@ -16,6 +16,7 @@ import json
 import tempfile
 
 import pytest
+from datasets import Dataset
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
@@ -23,16 +24,21 @@ from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_da
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
 
 
-def create_sample_data(input_key, output_key):
+def create_sample_data(input_key, output_key, is_save_to_disk=False):
     data = [
         {input_key: "Hello", output_key: "Hi there!"},
         {input_key: "How are you?", output_key: "I'm good, thanks!"},
     ]
 
-    # Create temporary files for train and validation data
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(data, f)
-        data_path = f.name
+    # Create temporary dataset file
+    if is_save_to_disk:
+        data_path = tempfile.mktemp()
+        dataset = Dataset.from_list(data)
+        dataset.save_to_disk(data_path)
+    else:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            data_path = f.name
 
     return data_path
 
@@ -47,9 +53,10 @@ def tokenizer():
 @pytest.mark.parametrize(
     "input_key,output_key", [("input", "output"), ("question", "answer")]
 )
-def test_response_dataset(input_key, output_key, tokenizer):
+@pytest.mark.parametrize("is_save_to_disk", [True, False])
+def test_response_dataset(input_key, output_key, is_save_to_disk, tokenizer):
     # load the dataset
-    data_path = create_sample_data(input_key, output_key)
+    data_path = create_sample_data(input_key, output_key, is_save_to_disk)
     data_config = {
         "dataset_name": "ResponseDataset",
         "data_path": data_path,
@@ -100,78 +107,6 @@ def test_helpsteer3_dataset():
     assert len(first_example["context"]) == 7
     assert first_example["response"][0]["role"] == "assistant"
     assert first_example["response"][0]["content"][:20] == "Yes, you are correct"
-
-
-def test_load_dataset_saved_with_save_to_disk():
-    """Test loading a dataset that was saved using HuggingFace's save_to_disk().
-
-    This tests the fix for datasets that already have a 'messages' column,
-    which should be preserved without applying add_messages_key again.
-    """
-    from datasets import Dataset
-
-    # Create a dataset with 'messages' column already present
-    train_data = [
-        {
-            "messages": [
-                {"role": "user", "content": "What is 2+2?"},
-                {"role": "assistant", "content": "4"},
-            ]
-        },
-        {
-            "messages": [
-                {"role": "user", "content": "What is the capital of France?"},
-                {"role": "assistant", "content": "Paris"},
-            ]
-        },
-    ]
-    val_data = [
-        {
-            "messages": [
-                {"role": "user", "content": "What is 3+3?"},
-                {"role": "assistant", "content": "6"},
-            ]
-        },
-    ]
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create HF datasets and save using save_to_disk
-        train_dataset = Dataset.from_list(train_data)
-        val_dataset = Dataset.from_list(val_data)
-
-        train_path = f"{tmpdir}/train"
-        val_path = f"{tmpdir}/val"
-
-        train_dataset.save_to_disk(train_path)
-        val_dataset.save_to_disk(val_path)
-
-        # Load using load_response_dataset
-        data_config = {
-            "dataset_name": "ResponseDataset",
-            "train_data_path": train_path,
-            "val_data_path": val_path,
-        }
-        dataset = load_response_dataset(data_config)
-
-        # Verify the dataset loaded correctly
-        assert "train" in dataset.formatted_ds
-        assert "validation" in dataset.formatted_ds
-        assert len(dataset.formatted_ds["train"]) == 2
-        assert len(dataset.formatted_ds["validation"]) == 1
-
-        # Verify messages are preserved correctly
-        first_train_example = dataset.formatted_ds["train"][0]
-        assert "messages" in first_train_example
-        assert len(first_train_example["messages"]) == 2
-        assert first_train_example["messages"][0]["role"] == "user"
-        assert first_train_example["messages"][0]["content"] == "What is 2+2?"
-        assert first_train_example["messages"][1]["role"] == "assistant"
-        assert first_train_example["messages"][1]["content"] == "4"
-
-        # Verify validation data
-        first_val_example = dataset.formatted_ds["validation"][0]
-        assert first_val_example["messages"][0]["content"] == "What is 3+3?"
-        assert first_val_example["messages"][1]["content"] == "6"
 
 
 def test_open_assistant_dataset():
