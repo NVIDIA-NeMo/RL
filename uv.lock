@@ -29,7 +29,7 @@ constraints = [
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
 overrides = [
-    { name = "nvidia-modelopt", extras = ["torch"], editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
+    { name = "nvidia-modelopt", extras = ["torch"], specifier = ">=0.39.0" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
     { name = "timm", specifier = "<=1.0.22" },
     { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
@@ -3222,7 +3222,7 @@ requires-dist = [
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
     { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", specifier = ">=0.33.0a0,<0.34.0" },
     { name = "nvidia-resiliency-ext", specifier = ">=0.4.0a0,<0.5.0" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
@@ -3953,9 +3953,6 @@ mcore = [
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
-modelopt = [
-    { name = "nvidia-modelopt" },
-]
 nemo-gym = [
     { name = "nemo-gym" },
 ]
@@ -4039,7 +4036,6 @@ requires-dist = [
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
@@ -4067,7 +4063,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.2" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore", "modelopt", "nemo-gym"]
+provides-extras = ["automodel", "vllm", "mcore", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
@@ -4367,8 +4363,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.41.0.dev10+g6cec9e2ec.d20251220"
-source = { editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" }
+version = "0.40.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy" },
@@ -4385,131 +4381,9 @@ dependencies = [
     { name = "torchprofile" },
     { name = "tqdm" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", marker = "extra == 'all'", specifier = ">=1.0.0" },
-    { name = "accelerate", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "accelerate", marker = "extra == 'hf'", specifier = ">=1.0.0" },
-    { name = "autodoc-pydantic", marker = "extra == 'dev'", specifier = ">=2.1.0" },
-    { name = "autodoc-pydantic", marker = "extra == 'dev-docs'", specifier = ">=2.1.0" },
-    { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = "==1.7.9" },
-    { name = "bandit", extras = ["toml"], marker = "extra == 'dev-lint'", specifier = "==1.7.9" },
-    { name = "coverage", marker = "extra == 'dev'" },
-    { name = "coverage", marker = "extra == 'dev-test'" },
-    { name = "cppimport", marker = "extra == 'all'" },
-    { name = "cppimport", marker = "extra == 'dev'" },
-    { name = "cppimport", marker = "extra == 'onnx'" },
-    { name = "cupy-cuda12x", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and extra == 'all'" },
-    { name = "cupy-cuda12x", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "cupy-cuda12x", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and extra == 'onnx'" },
-    { name = "cython", marker = "extra == 'dev'" },
-    { name = "cython", marker = "extra == 'dev-build'" },
-    { name = "datasets", marker = "extra == 'all'", specifier = ">=3.0.0" },
-    { name = "datasets", marker = "extra == 'dev'", specifier = ">=3.0.0" },
-    { name = "datasets", marker = "extra == 'hf'", specifier = ">=3.0.0" },
-    { name = "deepspeed", marker = "sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'all'", specifier = ">=0.9.6" },
-    { name = "deepspeed", marker = "sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'dev'", specifier = ">=0.9.6" },
-    { name = "deepspeed", marker = "sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'hf'", specifier = ">=0.9.6" },
-    { name = "diffusers", marker = "extra == 'all'", specifier = ">=0.32.2" },
-    { name = "diffusers", marker = "extra == 'dev'", specifier = ">=0.32.2" },
-    { name = "diffusers", marker = "extra == 'hf'", specifier = ">=0.32.2" },
-    { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.24.0" },
-    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=0.24.0" },
-    { name = "huggingface-hub", marker = "extra == 'hf'", specifier = ">=0.24.0" },
-    { name = "ml-dtypes", marker = "extra == 'all'" },
-    { name = "ml-dtypes", marker = "extra == 'dev'" },
-    { name = "ml-dtypes", marker = "extra == 'onnx'" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = "==1.17.1" },
-    { name = "mypy", marker = "extra == 'dev-lint'", specifier = "==1.17.1" },
-    { name = "ninja" },
-    { name = "numpy" },
-    { name = "nvidia-ml-py", specifier = ">=12" },
-    { name = "onnx", marker = "extra == 'all'", specifier = "~=1.19.0" },
-    { name = "onnx", marker = "extra == 'dev'", specifier = "~=1.19.0" },
-    { name = "onnx", marker = "extra == 'onnx'", specifier = "~=1.19.0" },
-    { name = "onnx-graphsurgeon", marker = "extra == 'all'" },
-    { name = "onnx-graphsurgeon", marker = "extra == 'dev'" },
-    { name = "onnx-graphsurgeon", marker = "extra == 'onnx'" },
-    { name = "onnxconverter-common", marker = "extra == 'all'", specifier = "~=1.16.0" },
-    { name = "onnxconverter-common", marker = "extra == 'dev'", specifier = "~=1.16.0" },
-    { name = "onnxconverter-common", marker = "extra == 'onnx'", specifier = "~=1.16.0" },
-    { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'all') or (sys_platform == 'darwin' and extra == 'all')", specifier = "~=1.22.0" },
-    { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'dev') or (sys_platform == 'darwin' and extra == 'dev')", specifier = "~=1.22.0" },
-    { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'onnx') or (sys_platform == 'darwin' and extra == 'onnx')", specifier = "~=1.22.0" },
-    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'all'", specifier = "==1.20.0" },
-    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'dev'", specifier = "==1.20.0" },
-    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'onnx'", specifier = "==1.20.0" },
-    { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'all'", specifier = "~=1.22.0" },
-    { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'dev'", specifier = "~=1.22.0" },
-    { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'onnx'", specifier = "~=1.22.0" },
-    { name = "onnxscript", marker = "extra == 'all'" },
-    { name = "onnxscript", marker = "extra == 'dev'" },
-    { name = "onnxscript", marker = "extra == 'onnx'" },
-    { name = "onnxslim", marker = "extra == 'all'", specifier = ">=0.1.76" },
-    { name = "onnxslim", marker = "extra == 'dev'", specifier = ">=0.1.76" },
-    { name = "onnxslim", marker = "extra == 'onnx'", specifier = ">=0.1.76" },
-    { name = "packaging" },
-    { name = "peft", marker = "extra == 'all'", specifier = ">=0.17.0" },
-    { name = "peft", marker = "extra == 'dev'", specifier = ">=0.17.0" },
-    { name = "peft", marker = "extra == 'hf'", specifier = ">=0.17.0" },
-    { name = "polygraphy", marker = "extra == 'all'", specifier = ">=0.49.22" },
-    { name = "polygraphy", marker = "extra == 'dev'", specifier = ">=0.49.22" },
-    { name = "polygraphy", marker = "extra == 'onnx'", specifier = ">=0.49.22" },
-    { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.3.0" },
-    { name = "pre-commit", marker = "extra == 'dev-lint'", specifier = "==4.3.0" },
-    { name = "pulp" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev-test'" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "pytest-cov", marker = "extra == 'dev-test'" },
-    { name = "pytest-instafail", marker = "extra == 'dev'" },
-    { name = "pytest-instafail", marker = "extra == 'dev-test'" },
-    { name = "pytest-timeout", marker = "extra == 'dev'" },
-    { name = "pytest-timeout", marker = "extra == 'dev-test'" },
-    { name = "regex" },
-    { name = "rich" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.12.11" },
-    { name = "ruff", marker = "extra == 'dev-lint'", specifier = "==0.12.11" },
-    { name = "safetensors" },
-    { name = "scipy" },
-    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=80" },
-    { name = "setuptools", marker = "extra == 'dev-build'", specifier = ">=80" },
-    { name = "setuptools-scm", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "setuptools-scm", marker = "extra == 'dev-build'", specifier = ">=8" },
-    { name = "sphinx", marker = "extra == 'dev'", specifier = "~=8.1.0" },
-    { name = "sphinx", marker = "extra == 'dev-docs'", specifier = "~=8.1.0" },
-    { name = "sphinx-argparse", marker = "extra == 'dev'", specifier = ">=0.5.2" },
-    { name = "sphinx-argparse", marker = "extra == 'dev-docs'", specifier = ">=0.5.2" },
-    { name = "sphinx-autobuild", marker = "extra == 'dev'", specifier = ">=2024.10.3" },
-    { name = "sphinx-autobuild", marker = "extra == 'dev-docs'", specifier = ">=2024.10.3" },
-    { name = "sphinx-copybutton", marker = "extra == 'dev'", specifier = ">=0.5.2" },
-    { name = "sphinx-copybutton", marker = "extra == 'dev-docs'", specifier = ">=0.5.2" },
-    { name = "sphinx-inline-tabs", marker = "extra == 'dev'", specifier = ">=2023.4.21" },
-    { name = "sphinx-inline-tabs", marker = "extra == 'dev-docs'", specifier = ">=2023.4.21" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'dev'", specifier = "~=3.0.0" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'dev-docs'", specifier = "~=3.0.0" },
-    { name = "sphinx-togglebutton", marker = "extra == 'dev'", specifier = ">=0.3.2" },
-    { name = "sphinx-togglebutton", marker = "extra == 'dev-docs'", specifier = ">=0.3.2" },
-    { name = "timm", marker = "extra == 'dev'" },
-    { name = "timm", marker = "extra == 'dev-test'" },
-    { name = "torch", specifier = ">=2.6" },
-    { name = "torch-geometric", marker = "extra == 'dev'" },
-    { name = "torch-geometric", marker = "extra == 'dev-test'" },
-    { name = "torchprofile", specifier = ">=0.0.4" },
-    { name = "torchvision", marker = "extra == 'dev'" },
-    { name = "torchvision", marker = "extra == 'dev-test'" },
-    { name = "tox", marker = "extra == 'dev'", specifier = ">4.18" },
-    { name = "tox", marker = "extra == 'dev-test'", specifier = ">4.18" },
-    { name = "tox-current-env", marker = "extra == 'dev'", specifier = ">=0.0.12" },
-    { name = "tox-current-env", marker = "extra == 'dev-test'", specifier = ">=0.0.12" },
-    { name = "tqdm" },
-    { name = "transformers", marker = "extra == 'all'", specifier = ">=4.53,<5.0" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = ">=4.53,<5.0" },
-    { name = "transformers", marker = "extra == 'hf'", specifier = ">=4.53,<5.0" },
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/4a/4b4c339637fdbd54bc98b92c87c8b22f5efee05ca9e31e40a8d49ee66187/nvidia_modelopt-0.40.0-py3-none-any.whl", hash = "sha256:0315f53aef014b902866e427038db5803e3c6787a8e1f09c3650031550885051", size = 901421, upload-time = "2025-12-12T10:35:28.506Z" },
 ]
-provides-extras = ["onnx", "hf", "dev-lint", "dev-test", "dev-docs", "dev-build", "all", "dev"]
 
 [[package]]
 name = "nvidia-nccl-cu12"
