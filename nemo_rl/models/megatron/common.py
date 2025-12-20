@@ -89,8 +89,8 @@ def _pack_sequences_for_megatron(
 
     # Round up the pad_packed_seq_to to the nearest multiple of pad_packed_seq_to_multiple_of
     if pad_packed_seq_to is not None:
-        pad_packed_seq_to = _round_up_to_multiple(
-            pad_packed_seq_to, pad_packed_seq_to_multiple_of
+        assert pad_packed_seq_to % pad_packed_seq_to_multiple_of == 0, (
+            f"pad_packed_seq_to ({pad_packed_seq_to}) is not a multiple of pad_packed_seq_to_multiple_of ({pad_packed_seq_to_multiple_of})."
         )
 
     pad_factor = pad_individual_seqs_to_multiple_of
@@ -279,6 +279,12 @@ def _get_pack_sequence_parameters_for_megatron(
         pad_packed_seq_to = max_seq_len_in_batch
     else:
         pad_packed_seq_to = None
+
+    # make sure the pad_packed_seq_to is a multiple of the pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to is not None:
+        pad_packed_seq_to = _round_up_to_multiple(
+            pad_packed_seq_to, pad_packed_seq_to_multiple_of
+        )
 
     return (
         pad_individual_seqs_to_multiple_of,
