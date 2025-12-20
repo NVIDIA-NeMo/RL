@@ -94,6 +94,7 @@ def test_message_formatting(sample_data, tokenizer):
     # check the first example
     first_example = dataset.dataset[0]
 
+    assert "task_name" in first_example
     assert first_example["messages"][0]["role"] == "system"
     assert first_example["messages"][0]["content"] == "You are a helpful assistant."
     assert first_example["messages"][1]["role"] == "user"
