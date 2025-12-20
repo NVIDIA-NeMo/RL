@@ -20,6 +20,12 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class SquadDataset(RawDataset):
+    """Simple wrapper around the squad dataset.
+
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
+
     def __init__(self, split: str = "train", **kwargs) -> None:
         self.task_name = "squad"
 

@@ -21,8 +21,13 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class HelpSteer3Dataset(RawDataset):
+    """Simple wrapper around the HelpSteer3 dataset with preference subset.
+
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
+
     def __init__(self, split: str = "train", **kwargs):
-        """Initialize the HelpSteer3 dataset with preference split."""
         self.task_name = "HelpSteer3"
 
         # load from huggingface

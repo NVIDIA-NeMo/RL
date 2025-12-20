@@ -20,8 +20,9 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class DAPOMath17KDataset(RawDataset):
+    """Simple wrapper around the DAPO Math 17K dataset with train split."""
+
     def __init__(self, **kwargs) -> None:
-        """Initialize the DAPO Math 17K dataset with train split."""
         self.task_name = "DAPOMath17K"
 
         # load from huggingface

@@ -23,6 +23,7 @@ class RawDataset:
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig
     dataset: Dataset
+    # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
     task_spec: TaskDataSpec

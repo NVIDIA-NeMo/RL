@@ -20,6 +20,14 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class Tulu3SftMixtureDataset(RawDataset):
+    """Simple wrapper around the Tulu3 SFT mixture dataset with train split.
+
+    Args:
+        split_validation_size: Size of the validation data, default is 0.05
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
+        max_samples: Optional maximum number of samples to use from the dataset
+    """
+
     def __init__(
         self,
         split_validation_size: float = 0.05,
@@ -27,13 +35,6 @@ class Tulu3SftMixtureDataset(RawDataset):
         max_samples: int | None = None,
         **kwargs,
     ) -> None:
-        """Initialize the Tulu3 SFT mixture dataset.
-
-        Args:
-            seed: Random seed for train/validation split
-            test_size: Proportion of data to use for validation (0.0-1.0)
-            max_samples: Optional maximum number of samples to use from the dataset
-        """
         print(
             "WARNING: For reproducible experiments, preprocess the dataset once and define your own HfDataset subclass that directly uses the preprocessed datasets."
         )
