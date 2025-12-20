@@ -189,7 +189,7 @@ class OpenAIFormatDataset(RawDataset):
         assert messages[-1]["role"] == "assistant"
 
         # Preserve tools if they exist in the data
-        result = {"messages": messages}
+        result = {"messages": messages, "task_name": self.task_name}
         if self.tool_key and self.tool_key in data:
             result["tools"] = data[self.tool_key]
 
