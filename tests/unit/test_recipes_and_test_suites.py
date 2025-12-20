@@ -29,7 +29,9 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
 h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance_h100.txt")
-gb200_performance_test_suite_path = os.path.join(test_suites_dir, "performance_gb200.txt")
+gb200_performance_test_suite_path = os.path.join(
+    test_suites_dir, "performance_gb200.txt"
+)
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
