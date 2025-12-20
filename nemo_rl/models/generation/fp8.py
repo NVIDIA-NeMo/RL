@@ -612,7 +612,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
         swap_w13_to_w31,
     )
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        deepgemm_post_process_fp8_weight_block
+        deepgemm_post_process_fp8_weight_block,
     )
     from vllm.utils.deep_gemm import (
         is_deep_gemm_e8m0_used,
@@ -625,9 +625,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
 
     if self.flashinfer_moe_backend is not None:
         w13_weight = swap_w13_to_w31(layer.w13_weight.data)
-        w13_weight_scale_inv = swap_w13_to_w31(
-            layer.w13_weight_scale_inv.data
-        )
+        w13_weight_scale_inv = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
     else:
         w13_weight = layer.w13_weight.data
         w13_weight_scale_inv = layer.w13_weight_scale_inv.data
@@ -637,26 +635,23 @@ def process_weights_after_loading_moe(self, layer) -> None:
     # DeepGemm scales need to be transposed and aligned. We try to do
     # it ahead of time for performance reasons.
     if self.allow_deep_gemm:
-        w13_weight, w13_weight_scale_inv = (
-            deepgemm_post_process_fp8_weight_block(
-                wq=w13_weight,
-                ws=w13_weight_scale_inv,
-                quant_block_shape=tuple(layer.weight_block_size),
-                use_e8m0=is_deep_gemm_e8m0_used(),
-            )
+        w13_weight, w13_weight_scale_inv = deepgemm_post_process_fp8_weight_block(
+            wq=w13_weight,
+            ws=w13_weight_scale_inv,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
         )
-        w2_weight, w2_weight_scale_inv = (
-            deepgemm_post_process_fp8_weight_block(
-                wq=w2_weight,
-                ws=w2_weight_scale_inv,
-                quant_block_shape=tuple(layer.weight_block_size),
-                use_e8m0=is_deep_gemm_e8m0_used(),
-            )
+        w2_weight, w2_weight_scale_inv = deepgemm_post_process_fp8_weight_block(
+            wq=w2_weight,
+            ws=w2_weight_scale_inv,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
         )
     layer.w13_weight.copy_(w13_weight)
     layer.w13_weight_scale_inv.copy_(w13_weight_scale_inv)
     layer.w2_weight.copy_(w2_weight)
     layer.w2_weight_scale_inv.copy_(w2_weight_scale_inv)
+
 
 def process_weights_after_loading_kv(self, layer) -> None:
     """Modified version of BaseKVCacheMethod.process_weights_after_loading.
