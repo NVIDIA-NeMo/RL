@@ -301,9 +301,11 @@ case "${1:-help}" in
         
         # Throughput benchmark parameters (vllm bench throughput)
         # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/benchmarks/throughput.py
-        INPUT_LENS=${INPUT_LENS:-"128 256 512 1024"}
-        OUTPUT_LENS=${OUTPUT_LENS:-"128 256 512 1024 2048"}
-        THROUGHPUT_NUM_PROMPTS=${THROUGHPUT_NUM_PROMPTS:-1000}
+        INPUT_LENS=${INPUT_LENS:-"64 100 150"}
+        OUTPUT_LENS=${OUTPUT_LENS:-"2048 4096"}
+        THROUGHPUT_NUM_PROMPTS=${THROUGHPUT_NUM_PROMPTS:-64}
+        # NeMo-RL: num_generations_per_prompt (n parameter for vLLM)
+        THROUGHPUT_NUM_GENERATIONS=${THROUGHPUT_NUM_GENERATIONS:-32}
         # RANDOM_RANGE_RATIO: Input length variance (0.0 = exact length)
         # Note: ignore_eos=True is HARDCODED in vLLM, output is always exact
         RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.0}
@@ -341,6 +343,7 @@ case "${1:-help}" in
         INPUT_LENS="$INPUT_LENS" \
         OUTPUT_LENS="$OUTPUT_LENS" \
         NUM_PROMPTS=$THROUGHPUT_NUM_PROMPTS \
+        NUM_GENERATIONS_PER_PROMPT=$THROUGHPUT_NUM_GENERATIONS \
         RANDOM_RANGE_RATIO=$RANDOM_RANGE_RATIO \
         MAX_MODEL_LEN=$MAX_MODEL_LEN \
         sbatch \

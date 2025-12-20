@@ -66,13 +66,17 @@ ENABLE_EXPERT_PARALLEL=${ENABLE_EXPERT_PARALLEL:-0}
 
 # ISL (Input Sequence Length) - space-separated list
 # Each prompt will have EXACTLY this many input tokens (RandomDataset)
-INPUT_LENS=${INPUT_LENS:-"128 256 512 1024"}
+INPUT_LENS=${INPUT_LENS:-"64 100 150"}
 
 # OSL (Output Sequence Length) - space-separated list  
-OUTPUT_LENS=${OUTPUT_LENS:-"128 256 512 1024 2048"}
+OUTPUT_LENS=${OUTPUT_LENS:-"2048 4096"}
 
 # Number of prompts to generate per ISL/OSL combination
-NUM_PROMPTS=${NUM_PROMPTS:-1000}
+NUM_PROMPTS=${NUM_PROMPTS:-64}
+# NeMo-RL: num_generations_per_prompt (n parameter for vLLM)
+NUM_GENERATIONS_PER_PROMPT=${NUM_GENERATIONS_PER_PROMPT:-32}
+# Maximum concurrent sequences (batch size limit)
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-2048}
 
 # Input length variance ratio (default: 0.0 = exact length)
 # 0.0 = EXACT input-len tokens
@@ -80,13 +84,14 @@ NUM_PROMPTS=${NUM_PROMPTS:-1000}
 RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.0}
 
 # Model configuration
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 
 # Container and paths
 # Script directory and parent directory
 SCRIPT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_benchmark
 BASE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
+#CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl_nightly.sqsh}
+ONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
 CONTAINER_NAME=vllm-throughput-bench
 JOB_CACHE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache
 
@@ -264,6 +269,8 @@ VLLM_ARGS=\"\$VLLM_ARGS --tensor-parallel-size $TENSOR_PARALLEL_SIZE\"
 VLLM_ARGS=\"\$VLLM_ARGS --pipeline-parallel-size $PIPELINE_PARALLEL_SIZE\"
 VLLM_ARGS=\"\$VLLM_ARGS --max-model-len $MAX_MODEL_LEN\"
 VLLM_ARGS=\"\$VLLM_ARGS --num-prompts $NUM_PROMPTS\"
+VLLM_ARGS=\"\$VLLM_ARGS --n $NUM_GENERATIONS_PER_PROMPT\"
+VLLM_ARGS=\"\$VLLM_ARGS --max-num-seqs $MAX_NUM_SEQS\"
 VLLM_ARGS=\"\$VLLM_ARGS --trust-remote-code\"
 
 # Input length variance (0.0 = exact length)
