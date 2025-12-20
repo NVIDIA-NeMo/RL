@@ -1,0 +1,46 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 1000000
+  val_period: 50
+checkpointing:
+  checkpoint_dir: results/sft-qwen3-next-80ba3b-instruct-8n8g-megatron
+  save_period: 50
+policy:
+  model_name: Qwen/Qwen3-Next-80B-A3B-Instruct
+  tokenizer:
+    name: Qwen/Qwen3-Next-80B-A3B-Instruct
+    chat_template: default
+  train_global_batch_size: 512
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3NextForCausalLM
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    optimizer:
+      lr: 2.0e-05
+      min_lr: 1.99999e-05
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_init: 1.9999e-65
+data:
+  dataset_name: openmathinstruct2
+  prompt_file: examples/prompts/math.txt
+  split: train_1M
+  add_generation_prompt: true
+  output_key: generated_solution
+  seed: 42
+logger:
+  log_dir: logs/sft-qwen3-next-80ba3b-instruct-8n8g-megatron
+  wandb:
+    project: nemo-rl
+    name: sft-qwen3-next-80ba3b-instruct-8n8g-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-dev-openmathinstruct2
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8

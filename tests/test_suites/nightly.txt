@@ -59,6 +59,9 @@ tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
 tests/test_suites/llm/grpo-nano-v2-12b-1n8g-megatron.sh
 tests/test_suites/llm/grpo-nano-v2-12b-2n8g-fsdp2tp1.sh
 
+# Qwen3-next
+tests/test_suites/llm/grpo-qwen3-next-80ba3b-8n8g-megatron.sh
+
 #######
 # SFT #
 #######
@@ -86,6 +89,9 @@ tests/test_suites/llm/sft-qwen2.5-math7b-2n8g-megatron.sh
 # Nemotron Super 49B SFT tests
 # Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1571
 # tests/test_suites/llm/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
+
+# Qwen3-next
+tests/test_suites/llm/sft-qwen3-next-80ba3b-8n8g-megatron.sh
 
 #######
 # DPO #

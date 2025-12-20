@@ -49,6 +49,7 @@ dependencies = [
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "rwkv-fla>=0.7.202508221413",
 ]
 
 [project.optional-dependencies]
@@ -98,6 +99,7 @@ mcore = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  "rwkv-fla>=0.7.202508221413",
 ]
 nemo_gym = ["nemo_gym"]
 
