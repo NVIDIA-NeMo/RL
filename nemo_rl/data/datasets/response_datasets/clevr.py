@@ -60,12 +60,13 @@ def format_clevr_cogent_dataset(
 
 
 class CLEVRCoGenTDataset(RawDataset):
-    def __init__(self, split: str = "train", **kwargs):
-        """Simple wrapper around the CLEVR-CoGenT dataset.
+    """Simple wrapper around the CLEVR-CoGenT dataset.
 
-        Args:
-            split: The split of the dataset to use.
-        """
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
+
+    def __init__(self, split: str = "train", **kwargs):
         # train, valA, and valB are supported splits.
         SPLIT_TO_HF_NAME = {
             "train": "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex",

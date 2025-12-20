@@ -54,12 +54,13 @@ def format_geometry3k_dataset(
 
 
 class Geometry3KDataset(RawDataset):
-    def __init__(self, split: str = "train", **kwargs):
-        """Simple wrapper around the Geometry3K dataset.
+    """Simple wrapper around the Geometry3K dataset.
 
-        Args:
-            split: The split of the dataset to use.
-        """
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
+
+    def __init__(self, split: str = "train", **kwargs):
         # train, validation, and test are supported splits.
         assert split in ["train", "validation", "test"], (
             f"Invalid split: {split}. Please use 'train' or 'validation' or 'test'."

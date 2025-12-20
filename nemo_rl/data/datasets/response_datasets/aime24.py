@@ -20,8 +20,13 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class AIME2024Dataset(RawDataset):
+    """Simple wrapper around the AIME2024 dataset with train split.
+
+    Args:
+        repeat: Number of times to repeat the dataset, default is 16
+    """
+
     def __init__(self, repeat: int = 16, **kwargs) -> None:
-        """Initialize the AIME2024 dataset with train split."""
         self.task_name = "AIME2024"
 
         # load from huggingface

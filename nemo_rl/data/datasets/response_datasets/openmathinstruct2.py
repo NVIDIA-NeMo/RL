@@ -20,6 +20,15 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class OpenMathInstruct2Dataset(RawDataset):
+    """Simple wrapper around the OpenMathInstruct2 dataset.
+
+    Args:
+        output_key: Key for the output text, default is "expected_answer"
+        split: Split name for the dataset, default is "train_1M"
+        split_validation_size: Size of the validation data, default is 0.05
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
+    """
+
     def __init__(
         self,
         output_key: str = "expected_answer",
@@ -28,12 +37,6 @@ class OpenMathInstruct2Dataset(RawDataset):
         seed: int = 42,
         **kwargs,
     ):
-        """Initialize the OpenMathInstruct2 dataset with train/validation split.
-
-        Args:
-            seed: Random seed for reproducible splitting
-            test_size: Proportion of data to use for validation (0.0-1.0)
-        """
         # train, train_1M, train_2M, and train_5M are supported splits.
         if split not in ["train", "train_1M", "train_2M", "train_5M"]:
             raise ValueError(

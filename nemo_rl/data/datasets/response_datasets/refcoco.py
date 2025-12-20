@@ -164,18 +164,19 @@ def format_refcoco_dataset(
 
 
 class RefCOCODataset(RawDataset):
+    """Simple wrapper around the RefCOCO dataset.
+
+    Args:
+        split: Split name for the dataset, default is "train"
+        download_dir: Directory to download the dataset to, default is "./coco_images"
+    """
+
     def __init__(
         self,
         split: str = "train",
         download_dir: str = "./coco_images",
         **kwargs,
     ):
-        """Simple wrapper around the RefCOCO dataset.
-
-        Args:
-            split: The split of the dataset to use.
-            download_dir: The directory to download the dataset to
-        """
         # train and validation are supported splits.
         SPLIT_TO_IMAGE_URL = {
             "train": "http://images.cocodataset.org/zips/train2014.zip",

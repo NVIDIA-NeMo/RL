@@ -87,12 +87,14 @@ def get_data_records(objs, task_name: str = "oasst"):
 
 
 class OasstDataset(RawDataset):
-    def __init__(
-        self,
-        split_validation_size: float = 0.05,
-        seed: int = 42,
-        **kwargs,
-    ):
+    """Simple wrapper around the OASST dataset.
+
+    Args:
+        split_validation_size: Size of the validation data, default is 0.05
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
+    """
+
+    def __init__(self, split_validation_size: float = 0.05, seed: int = 42, **kwargs):
         self.task_name = "oasst"
 
         # load from huggingface

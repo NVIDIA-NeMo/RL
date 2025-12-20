@@ -29,12 +29,12 @@ class ResponseDataset(RawDataset):
     }
 
     Args:
-        data_path: Path to the JSON file containing training data
-        input_key: Key for the input text
-        output_key: Key for the output text
-        split: Split name for the training data, used for HuggingFace datasets, default is None
+        data_path: Path to the dataset JSON file
+        input_key: Key for the input text, default is "input"
+        output_key: Key for the output text, default is "output"
+        split: Optional split name for the dataset, used for HuggingFace datasets
         split_validation_size: Size of the validation data, default is 0
-        seed: Seed for training/validation split when split_validation_size > 0, default is 42
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
 
     def __init__(

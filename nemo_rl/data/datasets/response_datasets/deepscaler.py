@@ -20,8 +20,9 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class DeepScalerDataset(RawDataset):
+    """Simple wrapper around the DeepScaler dataset with train split."""
+
     def __init__(self, **kwargs) -> None:
-        """Initialize the DeepScaler dataset with train split."""
         self.task_name = "DeepScaler"
 
         # load from huggingface
