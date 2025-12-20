@@ -10,6 +10,9 @@ policy:
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
   generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
     vllm_cfg:
       tensor_parallel_size: 16
       gpu_memory_utilization: 0.8
