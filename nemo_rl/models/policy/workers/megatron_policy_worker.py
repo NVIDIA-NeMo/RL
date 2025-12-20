@@ -1156,6 +1156,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         self.cfg["megatron_cfg"],
                         seq_dim_size,
                     )
+                    # if pad_full_seq_to is not None, we need to use it as the sequence length
+                    seq_dim_size = pad_full_seq_to or seq_dim_size
                 else:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
