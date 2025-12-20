@@ -1,4 +1,4 @@
-defaults: ./grpo-llama3.1-8b-instruct-2n8g.yaml
+defaults: ./grpo-llama3.1-8b-instruct-2n4g.yaml
 grpo:
   async_grpo:
     enabled: true
@@ -7,23 +7,26 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-async-1off
 policy:
   megatron_cfg:
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
+    sequence_parallel: false
   generation:
     colocated:
       enabled: false
       resources:
         num_nodes: 1
-        gpus_per_node: 8
+        gpus_per_node: 4
     vllm_cfg:
       async_engine: true
+      tensor_parallel_size: 1
       gpu_memory_utilization: 0.8
 logger:
-  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-1T1G-async-1off
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-async-1off
   wandb:
-    name: grpo-llama3.1-8b-instruct-2n8g-1T1G-async-1off
+    name: grpo-llama3.1-8b-instruct-2n4g-async-1off
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
   num_nodes: 2
