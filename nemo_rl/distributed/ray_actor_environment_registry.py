@@ -23,15 +23,30 @@ VLLM_EXECUTABLE = (
 MCORE_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
 )
+MODELOPT_VLLM_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MODELOPT_VLLM
+)
+MODELOPT_AUTOMODEL_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM
+    if USE_SYSTEM_EXECUTABLE
+    else PY_EXECUTABLES.MODELOPT_AUTOMODEL
+)
+MODELOPT_MCORE_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MODELOPT_MCORE
+)
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
+    "nemo_rl.models.generation.vllm.vllm_quant_worker.VllmQuantGenerationWorker": MODELOPT_VLLM_EXECUTABLE,
+    "nemo_rl.models.generation.vllm.vllm_quant_worker_async.VllmQuantAsyncGenerationWorker": MODELOPT_VLLM_EXECUTABLE,
     # Temporary workaround for the coupled implementation of DTensorPolicyWorker and vLLM.
     # This will be reverted to PY_EXECUTABLES.BASE once https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved.
     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,
+    "nemo_rl.models.policy.workers.quantization.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2": MODELOPT_AUTOMODEL_EXECUTABLE,
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
+    "nemo_rl.models.policy.workers.quantization.megatron_quant_policy_worker.MegatronQuantPolicyWorker": MODELOPT_MCORE_EXECUTABLE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.code_environment.CodeEnvironment": PY_EXECUTABLES.SYSTEM,

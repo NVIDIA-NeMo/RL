@@ -203,6 +203,7 @@ def setup_megatron_model(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    pre_wrap_hook=[],
 ):
     state = GlobalState()
     state.cfg = cfg
@@ -253,7 +254,7 @@ def setup_megatron_model(
 
     torch.distributed.barrier()
 
-    pre_wrap_hook = []
+    # pre_wrap_hook = []
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
@@ -284,6 +285,13 @@ def setup_megatron_model(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
+    # model = cfg.model.provide_distributed_model(
+    #     ddp_config=cfg.ddp,
+    #     use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+    #     use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+    #     overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+    #     data_parallel_random_init=cfg.rng.data_parallel_random_init,
+    # )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=cfg.optimizer,
@@ -420,10 +428,7 @@ def destroy_parallel_state():
         pass
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
-class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -508,6 +513,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 hf_model_name,
                 pretrained_path,
                 self.cfg["megatron_cfg"],
+                model_post_wrap_hook=kwargs.get("import_model_post_wrap_hook", None),
+                transformer_layer_spec=kwargs.get(
+                    "import_model_transformer_layer_spec", None
+                ),
                 **hf_config_overrides,
             )
 
@@ -2584,6 +2593,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
+    pass
 
 
 class CustomFloat16Module(Float16Module):

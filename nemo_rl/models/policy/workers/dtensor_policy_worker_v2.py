@@ -93,10 +93,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
-class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
+class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -364,8 +361,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
         # This will broadcast the state dict from rank 0 to all other ranks
         # and load it into the FSDP model.
-        set_model_state_dict(
-            self.model,
+        self.set_model_state_dict(
             model_state_dict=full_state_dict,
             options=StateDictOptions(
                 full_state_dict=True,
@@ -1883,3 +1879,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
+
+    def set_model_state_dict(
+        self, model_state_dict: dict[str, Any], options: StateDictOptions
+    ) -> None:
+        """Set the model state dict."""
+        set_model_state_dict(
+            self.model,
+            model_state_dict=model_state_dict,
+            options=options,
+        )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+    pass

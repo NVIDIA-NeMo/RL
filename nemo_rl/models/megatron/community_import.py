@@ -13,9 +13,10 @@
 # limitations under the License.
 
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from megatron.bridge import AutoBridge
+from megatron.core.transformer import ModuleSpec
 
 from nemo_rl.models.policy import MegatronConfig
 
@@ -24,6 +25,8 @@ def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
     megatron_config: Optional[MegatronConfig] = None,
+    model_post_wrap_hook: Optional[Callable] = None,
+    transformer_layer_spec: Optional[ModuleSpec | Callable] = None,
     **config_overrides: Any,
 ):
     """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
@@ -75,9 +78,14 @@ def import_model_from_hf_name(
         ]
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
+    if transformer_layer_spec is not None:
+        model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
-    megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+    megatron_model = model_provider.provide_distributed_model(
+        wrap_with_ddp=False,
+        post_wrap_hook=model_post_wrap_hook,
+    )
 
     # The above parallelism settings are used to load the model in a distributed manner.
     # However, we do not want to save the parallelism settings to the checkpoint config

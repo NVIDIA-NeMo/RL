@@ -119,6 +119,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -184,10 +185,16 @@ class BaseVllmGenerationWorker:
                         'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
                     ]
 
+                    extra_env_str = ", ".join(
+                        [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+                    )
+                    print("extra_env_str: ", extra_env_str)
+
                     new_lines = [
                         f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                        f'ADDITIONAL_ENV_VARS = {{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", {extra_env_str}}}',
                     ]
+                    print("new_lines: ", new_lines)
 
                     need_replace = False
                     for old_line, new_line in zip(old_lines, new_lines):
@@ -394,10 +401,7 @@ class BaseVllmGenerationWorker:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
-class VllmGenerationWorker(BaseVllmGenerationWorker):
+class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -770,3 +774,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)  # pragma: no cover
+class VllmGenerationWorker(VllmGenerationWorkerImpl):
+    pass
