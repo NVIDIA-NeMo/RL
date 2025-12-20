@@ -31,6 +31,9 @@ policy:
       lr: 1.0e-06
     scheduler:
       lr_warmup_iters: 50
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: "flex"
+    moe_shared_expert_overlap: false
 logger:
   monitor_gpus: false
   wandb:
