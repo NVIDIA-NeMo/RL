@@ -16,8 +16,6 @@ policy:
   max_total_sequence_length: 8192
   dtensor_cfg:
     enabled: false
-  sequence_packing:
-    algorithm: modified_ffd
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   megatron_cfg:
@@ -45,7 +43,6 @@ policy:
       precision: fp8
       use_deep_gemm: true
       gpu_memory_utilization: 0.5
-      expert_parallel_size: 4
       quantization_ignored_layer_kws: [
         a_proj,
         b_proj
