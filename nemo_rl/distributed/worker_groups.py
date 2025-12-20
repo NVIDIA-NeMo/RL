@@ -166,9 +166,6 @@ class RayWorkerBuilder:
             """
             # Set up worker arguments and resources
             module_name, class_name = self.ray_actor_class_fqn.rsplit(".", 1)
-            # Temporary workaround for the coupled train backend and vLLM.
-            # This will be removed once https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved.
-            class_name = class_name.split("-")[0]
             module = importlib.import_module(module_name)
             worker_class = getattr(module, class_name)
             worker_kwargs = dict(self.init_kwargs)

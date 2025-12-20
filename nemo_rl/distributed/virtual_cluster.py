@@ -58,12 +58,6 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
-    # Temporary workaround for the coupled train backend and vLLM.
-    # These will be removed once https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved.
-    FSDP_VLLM = FSDP + " --extra vllm_for_train"
-    AUTOMODEL_VLLM = AUTOMODEL + " --extra vllm_for_train"
-    MCORE_VLLM = MCORE + " --extra vllm_for_train"
-
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 

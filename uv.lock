@@ -3793,17 +3793,20 @@ automodel = [
     { name = "nemo-automodel" },
     { name = "nv-grouped-gemm" },
     { name = "transformer-engine", extra = ["pytorch"] },
+    { name = "vllm" },
 ]
 fsdp = [
     { name = "causal-conv1d" },
     { name = "flash-attn" },
     { name = "mamba-ssm" },
+    { name = "vllm" },
 ]
 mcore = [
     { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "transformer-engine", extra = ["pytorch"] },
+    { name = "vllm" },
 ]
 nemo-gym = [
     { name = "nemo-gym" },
@@ -3813,9 +3816,6 @@ vllm = [
     { name = "deep-ep" },
     { name = "deep-gemm" },
     { name = "num2words" },
-    { name = "vllm" },
-]
-vllm-for-train = [
     { name = "vllm" },
 ]
 
@@ -3913,11 +3913,13 @@ requires-dist = [
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
     { name = "transformers", specifier = "==4.57.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.2" },
+    { name = "vllm", marker = "extra == 'fsdp'", specifier = "==0.11.2" },
+    { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.11.2" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.2" },
-    { name = "vllm", marker = "extra == 'vllm-for-train'", specifier = "==0.11.2" },
     { name = "wandb" },
 ]
-provides-extras = ["fsdp", "automodel", "vllm", "vllm-for-train", "mcore", "nemo-gym"]
+provides-extras = ["fsdp", "automodel", "vllm", "mcore", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
