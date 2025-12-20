@@ -296,7 +296,7 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     reward_model_enabled = (
-        "reward_model" in env_configs and env_configs["reward_model"]["enabled"]
+        "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
 
     total_nodes = cluster_config["num_nodes"]
@@ -1591,6 +1591,20 @@ def grpo_train(
                     logger,
                 )
 
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            if (
+                master_config["policy"]["generation"]
+                .get("vllm_cfg", {})
+                .get("async_engine", False)
+            ):
+                for metric_name in metrics.keys():
+                    if metric_name.startswith("histogram/"):
+                        logger.log_histogram(
+                            metrics[metric_name],
+                            total_steps + 1,
+                            f"generation_metrics/{metric_name}",
+                        )
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -1753,9 +1767,7 @@ def validate(
         num_samples = len(total_rewards)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            # Unscaled binary reward values range = {0.0, 1.0}
-            correct_response_reward = torch.tensor(1.0, dtype=torch.float32)
-            accuracy = (rewards_t == correct_response_reward).float().mean().item()
+            accuracy = rewards_t.mean().item()
         else:
             accuracy = 0.0
 
@@ -2527,6 +2539,20 @@ def async_grpo_train(
                     ],
                     logger,
                 )
+
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            if (
+                master_config["policy"]["generation"]
+                .get("vllm_cfg", {})
+                .get("async_engine", False)
+            ):
+                for metric_name in metrics.keys():
+                    if metric_name.startswith("histogram/"):
+                        logger.log_histogram(
+                            metrics[metric_name],
+                            step + 1,
+                            f"generation_metrics/{metric_name}",
+                        )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")

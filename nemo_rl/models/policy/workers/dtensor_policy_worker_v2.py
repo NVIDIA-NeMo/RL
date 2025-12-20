@@ -14,17 +14,24 @@
 
 import gc
 import itertools
+import math
 import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
+import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 from accelerate import init_empty_weights
+from hydra.utils import get_class
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
+)
+from nemo_automodel.components._peft.lora import (
+    PeftConfig,
+    apply_lora_to_linear_modules,
 )
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
@@ -80,7 +87,6 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
-    import_class_from_path,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -91,6 +97,15 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc (https://github.com/NVIDIA-NeMo/RL/issues/1586)
+def _patched_init_lora_weights(self, init_method: str):
+    if init_method == "xavier":
+        nn.init.xavier_normal_(self.lora_A.weight.data)
+    else:
+        nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
+    self.lora_B.weight.data.zero_()
 
 
 class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -219,6 +234,23 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         full_state_dict = None
         model_state_dict_keys = None
+
+        # lora config
+        lora_cfg = self.cfg["dtensor_cfg"].get("lora_cfg", None)
+        self.peft_config = None
+        self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
+        # patch the init_lora_weights method to use the xavier initialization
+        _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
+        if self.lora_enabled:
+            if self.cfg["dtensor_cfg"]["tensor_parallel_size"] > 1:
+                assert not lora_cfg["use_triton"], (
+                    "Triton is not supported when tensor_parallel_size > 1"
+                )
+            # Always use float32 since FSDP requires all parameters to be in the same dtype.
+            # autocast should cast the weights to the correct dtype during the forward pass.
+            cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
+            self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
+
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
@@ -230,6 +262,9 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 torch_dtype=str(model_config.torch_dtype),
             )
 
+            if self.lora_enabled:
+                apply_lora_to_linear_modules(model, self.peft_config)
+
             full_state_dict = model.state_dict()
             # Store the original model state dict keys before any parallelization
             model_state_dict_keys = list(full_state_dict.keys())
@@ -239,10 +274,24 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
 
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
+            if cp_size > 1:
+                # Match Automodel's `get_train_context` in `cp_utils.py` where only
+                # flash and efficient backends are supported
+                # Ref: https://github.com/NVIDIA-NeMo/Automodel/blob/81788d6f4848f5f066c4a6a2bece4689a6a83687/nemo_automodel/components/distributed/cp_utils.py#L57
+                from torch.nn.attention import SDPBackend
+
+                sdpa_method = [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                ]
+            else:
+                sdpa_method = None
+
             self.model = model_class.from_config(
                 model_config,
                 attn_implementation="flash_attention_2"
@@ -251,13 +300,15 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 use_liger_kernel=False,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
+                sdpa_method=sdpa_method,
             )
+            if self.lora_enabled:
+                apply_lora_to_linear_modules(self.model, self.peft_config)
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
@@ -402,7 +453,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             )
 
         if init_optimizer:
-            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
                 self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
             )
@@ -411,9 +462,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         if "scheduler" in self.cfg and self.optimizer is not None:
             if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = import_class_from_path(
-                    cast(str, self.cfg["scheduler"]["name"])
-                )
+                scheduler_cls = get_class(cast(str, self.cfg["scheduler"]["name"]))
                 self.scheduler = scheduler_cls(
                     self.optimizer, **self.cfg["scheduler"]["kwargs"]
                 )
@@ -422,7 +471,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 for scheduler_cfg in self.cfg["scheduler"]:
                     if "name" in scheduler_cfg:
                         schedulers.append(
-                            import_class_from_path(scheduler_cfg["name"])(
+                            get_class(scheduler_cfg["name"])(
                                 self.optimizer, **scheduler_cfg["kwargs"]
                             )
                         )
@@ -1809,7 +1858,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     ) -> nn.Module:
         # FSDP modules do not move buffers to the device automatically
         for v in model.buffers():
-            v.data = v.data.to(device)
+            v = v.to(device)
 
         return model
 
@@ -1853,6 +1902,9 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 "peft_config",
             }
         }
+        if self.lora_enabled:
+            checkpoint_kwargs["is_peft"] = True
+            checkpoint_kwargs["peft_config"] = self.peft_config
 
         save_checkpoint(
             model=self.model,

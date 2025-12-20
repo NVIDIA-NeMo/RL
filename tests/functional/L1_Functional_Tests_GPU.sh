@@ -24,6 +24,7 @@ time bash ./tests/functional/grpo_frozen_env.sh
 time bash ./tests/functional/test_frozen_env.sh
 
 time uv run --no-sync bash ./tests/functional/sft.sh
+time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
