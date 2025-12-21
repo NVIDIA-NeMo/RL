@@ -155,8 +155,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
 
-        # We initialize the AutoModel checkpoint manager here. This needs to be persistent because of async checkpointing support
-        # once NeMo-RL is >= torch 2.9.0
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
