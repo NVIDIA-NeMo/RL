@@ -88,10 +88,6 @@ def create_local_venv(
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
 
-    # Set TORCH_CUDA_ARCH_LIST for grouped_gemm & DeepEP installation. Hopper+ architectures are supported.
-    if "TORCH_CUDA_ARCH_LIST" not in env:
-        env["TORCH_CUDA_ARCH_LIST"] = "9.0 10.0 12.0"
-
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
     # Command doesn't matter, since `uv` syncs the environment no matter the command.

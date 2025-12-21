@@ -615,63 +615,6 @@ class TestAutomodelCheckpointManager:
 
         assert manager.checkpointer is None
 
-    @patch("torch.distributed.get_rank")
-    def test_ensure_checkpointer_calls_init_if_none(self, mock_get_rank, mock_meshes):
-        """Test that ensure_checkpointer calls init_checkpointer if none exists."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        with patch.object(manager, "init_checkpointer") as mock_init:
-            with patch.object(manager, "update_checkpointer_config") as mock_update:
-                manager.ensure_checkpointer(
-                    config_updates={"model_repo_id": "test"},
-                    checkpoint_root="/path",
-                )
-
-                mock_init.assert_called_once_with(
-                    config_updates={"model_repo_id": "test"},
-                    checkpoint_root="/path",
-                )
-                mock_update.assert_not_called()
-
-    @patch("torch.distributed.get_rank")
-    def test_ensure_checkpointer_calls_update_if_exists(
-        self, mock_get_rank, mock_meshes
-    ):
-        """Test that ensure_checkpointer calls update_checkpointer_config if exists."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        # Create a mock existing checkpointer
-        manager.checkpointer = MagicMock()
-
-        with patch.object(manager, "init_checkpointer") as mock_init:
-            with patch.object(manager, "update_checkpointer_config") as mock_update:
-                manager.ensure_checkpointer(
-                    config_updates={"model_repo_id": "test"},
-                    checkpoint_root="/path",
-                )
-
-                mock_init.assert_not_called()
-                mock_update.assert_called_once_with(
-                    config_updates={"model_repo_id": "test"},
-                    checkpoint_root="/path",
-                )
-
 
 @pytest.mark.automodel
 class TestSaveCheckpointFunctional:

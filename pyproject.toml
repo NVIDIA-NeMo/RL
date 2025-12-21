@@ -23,7 +23,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.49.2",
-  "transformers==4.57.3",
+  "transformers==4.57.1",
   "wandb",
   "numpy",
   "datasets>=4.0.0",

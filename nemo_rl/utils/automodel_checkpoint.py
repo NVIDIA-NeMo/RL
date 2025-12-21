@@ -189,29 +189,6 @@ class AutomodelCheckpointManager:
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
 
-    def ensure_checkpointer(
-        self,
-        config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
-    ) -> None:
-        """Create or update a persistent Automodel Checkpointer.
-
-        This is a convenience method that calls init_checkpointer if the checkpointer
-        doesn't exist, or update_checkpointer_config if it does.
-
-        Args:
-            config_updates: Dict of CheckpointingConfig fields to update.
-            checkpoint_root: Optional root directory for checkpoints.
-        """
-        if self.checkpointer is None:
-            self.init_checkpointer(
-                config_updates=config_updates, checkpoint_root=checkpoint_root
-            )
-        else:
-            self.update_checkpointer_config(
-                config_updates=config_updates, checkpoint_root=checkpoint_root
-            )
-
     def set_model_state_dict_keys(self, keys: list[str]) -> None:
         """Set the model state dict keys for checkpoint validation.
 
