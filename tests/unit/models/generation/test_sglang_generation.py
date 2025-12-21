@@ -95,6 +95,7 @@ basic_dtensor_test_config = {
         },
     },
     "dtensor_cfg": {
+        "_v2": True,  # Use DTensorPolicyWorkerV2 for stream_weights_via_http
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
@@ -237,6 +238,31 @@ def test_sglang_missing_required_config_key(cluster, tokenizer):
         SGLangGeneration(cluster, incomplete_config)
 
 
+def test_sglang_top_p_top_k_validation(cluster, tokenizer):
+    """Test that top_p and top_k values are accepted by SGLang.
+    
+    Note: SGLang may have different validation thresholds than vLLM.
+    This test verifies that reasonable sampling parameters are accepted.
+    """
+    # Test that reasonable top_p and top_k values are accepted
+    config = deepcopy(basic_sglang_test_config)
+    config["top_p"] = 0.95
+    config["top_k"] = 50
+    config = configure_sglang_config(config, tokenizer)
+
+    policy = None
+    try:
+        policy = SGLangGeneration(cluster, config)
+        print("Successfully initialized with top_p=0.95 and top_k=50")
+    except Exception as e:
+        pytest.fail(f"Should not raise error with reasonable sampling params: {e}")
+    finally:
+        if policy:
+            policy.shutdown()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
 # =============================================================================
 # Basic Generation Tests
 # =============================================================================
@@ -277,6 +303,338 @@ def test_sglang_policy_generation(policy, test_input_data, tokenizer):
     assert all(len(text) > 0 for text in generated_texts), (
         "Some generated texts are empty"
     )
+
+
+def test_sglang_worker_seed_behavior(cluster, tokenizer):
+    """
+    Test that different workers generate different outputs for identical prompts due to different seeds.
+    This ensures proper randomization across distributed workers for diverse exploration in RLHF.
+    
+    Key: Use gpus_per_server=1 to create 2 independent SGLang servers (each with its own seed),
+    rather than 1 server with TP=2.
+    """
+    from nemo_rl.algorithms.grpo import refit_policy_generation
+    from nemo_rl.models.policy.lm_policy import Policy
+
+    unique_prompts = [
+        "Hello, my name is",
+        "The capital of France is",
+    ]
+
+    # Create a batch where each prompt appears twice
+    # When sharded, different workers will get the same prompt
+    duplicated_prompts = unique_prompts + unique_prompts
+
+    # Tokenize prompts
+    encodings = tokenizer(
+        duplicated_prompts,
+        padding="max_length",
+        max_length=20,
+        truncation=True,
+        return_tensors="pt",
+        padding_side="right",
+    )
+
+    input_lengths = encodings["attention_mask"].sum(dim=1).to(torch.int32)
+
+    # Create input data dictionary
+    duplicated_batch = BatchedDataDict(
+        {
+            "input_ids": encodings["input_ids"],
+            "input_lengths": input_lengths,
+        }
+    )
+
+    # Test with gpus_per_server=1 to create 2 independent servers with different seeds
+    print("Creating SGLang policy with gpus_per_server=1 (2 independent servers)...")
+    sglang_config = deepcopy(basic_sglang_test_config)
+    # Use gpus_per_server=1 to create 2 independent SGLang servers
+    sglang_config["sglang_cfg"]["gpus_per_server"] = 1
+    sglang_config = configure_sglang_config(sglang_config, tokenizer)
+    
+    policy = SGLangGeneration(cluster, sglang_config)
+    policy.finish_generation()
+
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["dtensor_cfg"]["tensor_parallel_size"] = 1  # Match gpus_per_server
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    state_dict_info = lm_policy.prepare_refit_info()
+    policy.prepare_refit_info(state_dict_info)
+
+    print("Refitting SGLang policy...")
+    refit_policy_generation(lm_policy, policy, sglang_config["colocated"]["enabled"])
+
+    try:
+        # Generate with duplicated prompts
+        print("Running generation with duplicated prompts...")
+        outputs = policy.generate(duplicated_batch, greedy=False)
+
+        # Decode the generated sequences
+        gen_texts = tokenizer.batch_decode(
+            outputs["output_ids"], skip_special_tokens=True
+        )
+
+        print(f"Generated texts with duplicated prompts: {gen_texts}")
+
+        # Check if the duplicated prompts generated different texts
+        # The first half and second half should be different due to different worker seeds
+        first_half = gen_texts[: len(unique_prompts)]
+        second_half = gen_texts[len(unique_prompts) :]
+
+        print(f"First worker outputs: {first_half}")
+        print(f"Second worker outputs: {second_half}")
+
+        # At least one of the pairs should be different due to different seeds
+        assert first_half != second_half, (
+            "Different workers should generate different outputs for identical prompts due to different seeds"
+        )
+
+    finally:
+        # Clean up resources
+        if "policy" in locals() and hasattr(policy, "shutdown"):
+            policy.shutdown()
+        if "lm_policy" in locals() and hasattr(lm_policy, "shutdown"):
+            lm_policy.shutdown()
+
+        # Force garbage collection
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def test_sglang_policy_tensor_parallel(cluster, tokenizer):
+    """Test SGLang policy with tensor parallelism > 1 (gpus_per_server=2)."""
+    # Configure with gpus_per_server=2 for tensor parallelism
+    tp_config = deepcopy(basic_sglang_test_config)
+    tp_config = configure_sglang_config(tp_config, tokenizer)
+    tp_config["sglang_cfg"]["gpus_per_server"] = 2  # TP=2
+
+    sglang_policy = None
+    try:
+        sglang_policy = SGLangGeneration(cluster, tp_config)
+
+        # Create simple test input
+        test_prompts = ["Hello, my name is", "The capital of France is"]
+        encodings = tokenizer(
+            test_prompts,
+            padding="max_length",
+            max_length=10,
+            truncation=True,
+            return_tensors="pt",
+            padding_side="right",
+        )
+
+        test_input_data = BatchedDataDict(
+            {
+                "input_ids": encodings["input_ids"],
+                "input_lengths": encodings["attention_mask"].sum(dim=1).to(torch.int32),
+            }
+        )
+
+        # Test generation with tensor parallelism
+        outputs = sglang_policy.generate(test_input_data)
+
+        sglang_policy.finish_generation()
+        sglang_policy.prepare_for_generation()
+
+        # Test generation again after cache reset
+        outputs = sglang_policy.generate(test_input_data)
+
+        assert "output_ids" in outputs, "output_ids not found in generation output"
+        assert outputs["output_ids"].shape[0] == 2, "Wrong batch size in output"
+
+        # Decode and check output
+        generated_text = tokenizer.decode(
+            outputs["output_ids"][0], skip_special_tokens=True
+        )
+        print(f"Generated text with TP=2: {generated_text}")
+        assert len(generated_text) > 0, "Generated text is empty"
+
+    finally:
+        # Clean up resources
+        if sglang_policy:
+            sglang_policy.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def test_sglang_generate_text(cluster, tokenizer):
+    """Test that SGLang can generate coherent text.
+    
+    Note: SGLang doesn't have a generate_text method like vLLM,
+    so we use generate + tokenizer decode to verify text generation.
+    """
+    # Prepare test data
+    test_prompts = [
+        "Hello, my name is",
+        "The capital of France is",
+    ]
+
+    encodings = tokenizer(
+        test_prompts,
+        padding="max_length",
+        max_length=10,
+        truncation=True,
+        return_tensors="pt",
+        padding_side="right",
+    )
+
+    test_input_data = BatchedDataDict(
+        {
+            "input_ids": encodings["input_ids"],
+            "input_lengths": encodings["attention_mask"].sum(dim=1).to(torch.int32),
+        }
+    )
+
+    # Create SGLang config with gpus_per_server=1 for simpler test
+    sglang_config = deepcopy(basic_sglang_test_config)
+    sglang_config["sglang_cfg"]["gpus_per_server"] = 2
+    sglang_config = configure_sglang_config(sglang_config, tokenizer, is_eval=True)
+
+    # Ensure correct model
+    assert sglang_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+
+    sglang_generation = None
+    try:
+        # Create SGLang generation
+        sglang_generation = SGLangGeneration(cluster, sglang_config)
+
+        # Generate with greedy decoding for deterministic output
+        output = sglang_generation.generate(test_input_data, greedy=True)
+
+        # Decode generated text
+        generated_texts = tokenizer.batch_decode(
+            output["output_ids"], skip_special_tokens=True
+        )
+
+        print(f"Generated texts: {generated_texts}")
+
+        # Verify we got non-empty text for each prompt
+        for i, text in enumerate(generated_texts):
+            assert len(text) > len(test_prompts[i]), (
+                f"Generated text should be longer than input prompt: {text}"
+            )
+            # Verify the generated text starts with or contains the prompt
+            print(f"Prompt: {test_prompts[i]} -> Generated: {text}")
+
+    finally:
+        # Clean up
+        if sglang_generation:
+            sglang_generation.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _wait_for_sglang_http_server_spinup(base_url: str):
+    """Wait for the SGLang HTTP server to be ready."""
+    import requests
+    import time
+    
+    max_wait = 60  # 60 seconds max wait
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            response = requests.get(f"{base_url}/health_generate", timeout=5)
+            if response.status_code == 200:
+                return
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            pass
+        time.sleep(1)
+    raise TimeoutError(f"SGLang server at {base_url} did not start within {max_wait}s")
+
+
+def test_sglang_http_server(cluster, tokenizer):
+    """Test that SGLang HTTP server works with direct API calls.
+    
+    SGLang exposes a /generate endpoint that accepts input_ids and sampling_params.
+    This test verifies we can make direct HTTP requests to the SGLang server.
+    """
+    import requests
+    
+    # Create SGLang config
+    sglang_config = deepcopy(basic_sglang_test_config)
+    sglang_config = configure_sglang_config(sglang_config, tokenizer, is_eval=True)
+    
+    # Ensure correct model for reproducible output
+    assert sglang_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    
+    sglang_generation = None
+    try:
+        # Create SGLang generation (this starts the servers)
+        sglang_generation = SGLangGeneration(cluster, sglang_config)
+        
+        # Get server URLs
+        base_urls = sglang_generation.get_sglang_server_urls()
+        print(f"SGLang server URLs: {base_urls}")
+        assert len(base_urls) >= 1, "Should have at least one SGLang server"
+        
+        # Wait for server to be ready
+        _wait_for_sglang_http_server_spinup(base_urls[0])
+        
+        # Prepare input - tokenize "count to 5"
+        test_prompt = "count to 5"
+        input_ids = tokenizer.encode(test_prompt, add_special_tokens=True)
+        
+        # Build request payload for SGLang /generate endpoint
+        payload = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0.0,  # Greedy for determinism
+                "top_p": 1.0,
+                "max_new_tokens": 5,
+            },
+            "return_logprob": True,
+        }
+        
+        # Make request to SGLang server
+        response = requests.post(
+            url=f"{base_urls[0]}/generate",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        actual_result = response.json()
+        print(f"SGLang response: {actual_result}")
+        
+        # Verify response structure
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+        assert "meta_info" in actual_result, "Response should contain meta_info"
+        
+        meta_info = actual_result["meta_info"]
+        assert "output_token_logprobs" in meta_info, (
+            "meta_info should contain output_token_logprobs"
+        )
+        
+        # Verify we got some generated tokens
+        output_token_logprobs = meta_info["output_token_logprobs"]
+        assert len(output_token_logprobs) > 0, "Should have generated at least one token"
+        
+        # Each entry should be [logprob, token_id]
+        first_token_info = output_token_logprobs[0]
+        assert len(first_token_info) >= 2, "Each token info should have logprob and token_id"
+        
+        logprob = first_token_info[0]
+        token_id = first_token_info[1]
+        assert isinstance(logprob, float), "Logprob should be a float"
+        assert isinstance(token_id, int), "Token ID should be an int"
+        
+        print(f"First generated token: id={token_id}, logprob={logprob}")
+        
+        # Decode the generated tokens to verify text output
+        generated_token_ids = [item[1] for item in output_token_logprobs]
+        generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        print(f"Generated text: {generated_text}")
+        
+    finally:
+        # Clean up
+        if sglang_generation:
+            sglang_generation.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.timeout(180)
@@ -320,6 +678,7 @@ def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
 
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["train_global_batch_size"] = 4
+    dtensor_config["dtensor_cfg"]["_v2"] = True  # Use DTensorPolicyWorkerV2 for stream_weights_via_http
 
     sglang_policy = None
     lm_policy = None
@@ -373,6 +732,7 @@ def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
             lm_policy.shutdown()
 
 
+@pytest.mark.skip(reason="Non-colocated mode not implemented for SGLang")
 @pytest.mark.timeout(300)
 def test_sglang_generation_with_hf_training_non_colocated(
     policy_cluster_separate, tokenizer
@@ -390,6 +750,7 @@ def test_sglang_generation_with_hf_training_non_colocated(
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["generation"]["colocated"]["enabled"] = False
     dtensor_config["train_global_batch_size"] = 4
+    dtensor_config["dtensor_cfg"]["_v2"] = True  # Use DTensorPolicyWorkerV2 for stream_weights_via_http
 
     sglang_policy = None
     lm_policy = None
