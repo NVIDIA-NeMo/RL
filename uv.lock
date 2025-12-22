@@ -3612,6 +3612,7 @@ automodel = [
     { name = "vllm" },
 ]
 mcore = [
+    { name = "deep-ep" },
     { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
@@ -3681,6 +3682,7 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
+    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },

@@ -144,6 +144,16 @@ class MegatronConfig(TypedDict):
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
     moe_per_layer_logging: bool
+    # Set to true to enable DeepEP for expert parallel communication
+    # Must set moe_token_dispatcher_type to 'flex'
+    # Must set moe_shared_expert_overlap to False
+    moe_enable_deepep: NotRequired[bool]
+    # The type of token dispatcher to use. The default is 'allgather'.
+    # Options are 'allgather','alltoall' and 'flex'
+    # Use 'flex' when using DeepEP
+    moe_token_dispatcher_type: NotRequired[str]
+    # Can be used only with 'alltoall' token dispatcher
+    moe_shared_expert_overlap: NotRequired[bool]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
