@@ -52,7 +52,7 @@ CLUSTER_CONFIGS = {
     },
     "gb200": {
         "gpus_per_node": 4,
-        "container_name": "nemo_rl.sqsh",  # Container filename (path set dynamically)
+        "container_name": "nemo_rl_nightly.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "gb200",
         "default_partition": "batch",
         "use_gres": True,  # GB200 also needs GRES
