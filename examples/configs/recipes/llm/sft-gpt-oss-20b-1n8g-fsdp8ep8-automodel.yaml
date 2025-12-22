@@ -9,7 +9,6 @@ policy:
   dequantize_base_checkpoint: true
   dtensor_cfg:
     expert_parallel_size: 8
-    data_parallel_size: 8
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.moe.utils.BackendConfig

@@ -313,7 +313,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         ep_size = self.cfg["dtensor_cfg"].get("expert_parallel_size", 1)
-        dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
+        dp_size = None  # will be inferred
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
