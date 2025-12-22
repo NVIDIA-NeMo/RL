@@ -111,12 +111,6 @@ def get_extra_kwargs(data_config: dict, keys: list[str]) -> dict:
 
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
     """Fill the single dataset config with default dataset config."""
-    fill_keys = [
-        "prompt_file",
-        "system_prompt_file",
-        "processor",
-        "env_name",
-    ]
-    for key in fill_keys:
-        if key not in data_config and key in default_data_config:
+    for key in default_data_config.keys():
+        if key not in data_config:
             data_config[key] = default_data_config[key]

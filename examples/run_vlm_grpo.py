@@ -29,7 +29,6 @@ from nemo_rl.data.datasets import (
     load_response_dataset,
     update_single_dataset_config,
 )
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -84,14 +83,9 @@ def setup_data(
     ).remote(env_configs[env_name])
 
     print("\n▶ Setting up data...")
-    default_task_spec = TaskDataSpec(
-        task_name="vlm_default",
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-
     # setup train dataset
-    update_single_dataset_config(data_config["train"], data_config)
+    if "default" in data_config:
+        update_single_dataset_config(data_config["train"], data_config["default"])
     data = load_response_dataset(data_config["train"])
     task_data_processors = {data.task_name: (data.task_spec, data.processor)}
     task_to_env = {data.task_name: env}
@@ -99,7 +93,7 @@ def setup_data(
     dataset = AllTaskProcessedDataset(
         data.dataset,
         processor,
-        default_task_spec,  # default task data spec to process any values not specified in the task-specific specs
+        None,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -118,7 +112,8 @@ def setup_data(
 
     # validation dataset from config
     if data_config["validation"] is not None:
-        update_single_dataset_config(data_config["validation"], data_config)
+        if "default" in data_config:
+            update_single_dataset_config(data_config["validation"], data_config["default"])
         val_data = load_response_dataset(data_config["validation"])
         val_data_list.append(val_data.dataset)
         val_task_data_processors[val_data.task_name] = (
@@ -133,7 +128,7 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             processor,
-            default_task_spec,
+            None,
             val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
