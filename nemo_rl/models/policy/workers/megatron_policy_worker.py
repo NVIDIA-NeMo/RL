@@ -116,9 +116,9 @@ def _apply_transformer_engine_patch():
         print(f"Error checking/patching transformer_engine: {e}")
 
 
-from megatron.bridge.peft.lora import LoRA
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
+from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
@@ -143,8 +143,8 @@ from megatron.bridge.training.initialize import (
 )
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.setup import (
-    _update_model_config_funcs,
     _create_peft_pre_wrap_hook,
+    _update_model_config_funcs,
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
@@ -369,7 +369,7 @@ def setup_megatron_model(
 
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
-    
+
     if policy_cfg["megatron_cfg"].get("lora_cfg", {}).get("enabled", False):
         lora_cfg = policy_cfg["megatron_cfg"].get("lora_cfg", {})
         peft_cfg = LoRA(
@@ -382,7 +382,8 @@ def setup_megatron_model(
             lora_A_init_method=lora_cfg["lora_A_init_method"],
             lora_B_init_method=lora_cfg["lora_B_init_method"],
             a2a_experimental=lora_cfg["a2a_experimental"],
-            lora_dtype=lora_cfg["lora_dtype"])
+            lora_dtype=lora_cfg["lora_dtype"],
+        )
     else:
         peft_cfg = None
     cfg.lora_cfg = peft_cfg
@@ -390,9 +391,11 @@ def setup_megatron_model(
     if cfg.lora_cfg is not None:
         pre_peft_hook = _create_peft_pre_wrap_hook(cfg, state)
         cfg.model.register_pre_wrap_hook(pre_peft_hook)
+
         def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
             model = pre_peft_hook(model)
             return model
+
         peft_hook = composed_peft_hook
     else:
         peft_hook = []
@@ -407,7 +410,6 @@ def setup_megatron_model(
         pre_wrap_hook=peft_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
-    
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -423,13 +425,20 @@ def setup_megatron_model(
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
     if cfg.lora_cfg is not None:
-        should_load_checkpoint = (cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load))
+        should_load_checkpoint = cfg.checkpoint.load is not None and checkpoint_exists(
+            cfg.checkpoint.load
+        )
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
             # This is switched off here in order to load these states from the checkpoint
             cfg.checkpoint.finetune = False
     else:
-        should_load_checkpoint = (cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load)) or (cfg.checkpoint.pretrained_checkpoint is not None and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint))
+        should_load_checkpoint = (
+            cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load)
+        ) or (
+            cfg.checkpoint.pretrained_checkpoint is not None
+            and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
+        )
 
     if should_load_checkpoint:
         load_checkpoint(

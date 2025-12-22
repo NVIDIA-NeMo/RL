@@ -21,7 +21,6 @@ policy:
       dim: 128
       alpha: 128
     optimizer:
-      optimizer: "adam"
       lr: 2.0e-05
       min_lr: 2.0e-05
       weight_decay: 0.01 # When weight decay is set, it actually uses AdamW
