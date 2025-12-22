@@ -386,9 +386,9 @@ def setup_megatron_model(
         )
     else:
         peft_cfg = None
-    cfg.lora_cfg = peft_cfg
+    cfg.peft = peft_cfg
 
-    if cfg.lora_cfg is not None:
+    if cfg.peft is not None:
         pre_peft_hook = _create_peft_pre_wrap_hook(cfg, state)
         cfg.model.register_pre_wrap_hook(pre_peft_hook)
 
@@ -424,7 +424,7 @@ def setup_megatron_model(
 
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
-    if cfg.lora_cfg is not None:
+    if cfg.peft is not None:
         should_load_checkpoint = cfg.checkpoint.load is not None and checkpoint_exists(
             cfg.checkpoint.load
         )
