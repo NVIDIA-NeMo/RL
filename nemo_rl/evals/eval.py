@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import ray
 import torch
@@ -33,7 +33,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
 
 # ===============================================================================
@@ -149,6 +149,7 @@ def setup(
     # check backend
     backend = generation_config["backend"]
     assert backend == "vllm", "Only vLLM backend is supported for evaluation"
+    generation_config = cast(VllmConfig, generation_config)
 
     # initialize vllm generation
     vllm_generation = VllmGeneration(cluster=cluster, config=generation_config)
@@ -317,6 +318,9 @@ async def _run_env_eval_impl(
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
+        import time
+
+        start_time = time.time()
         # measure multiple samples
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
@@ -381,7 +385,8 @@ async def _run_env_eval_impl(
             )
         else:
             raise ValueError(f"Invalid metric: {metric}")
-
+        step_time = time.time() - start_time
+        print(f"Step time: {step_time:.2f}s")
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()
