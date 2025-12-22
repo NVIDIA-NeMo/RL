@@ -17,6 +17,23 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class LoRAConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class LoRAConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    match_all_linear: NotRequired[bool]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init: str
+    use_triton: NotRequired[bool]
+
+
 class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -32,6 +49,7 @@ class DTensorConfig(TypedDict):
     context_parallel_size: int
     custom_parallel_plan: str | None
     clear_cache_every_n_steps: NotRequired[int | None]
+    lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
 
 
 class SequencePackingConfigDisabled(TypedDict):

@@ -296,7 +296,7 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     reward_model_enabled = (
-        "reward_model" in env_configs and env_configs["reward_model"]["enabled"]
+        "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
 
     total_nodes = cluster_config["num_nodes"]
@@ -1767,9 +1767,7 @@ def validate(
         num_samples = len(total_rewards)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            # Unscaled binary reward values range = {0.0, 1.0}
-            correct_response_reward = torch.tensor(1.0, dtype=torch.float32)
-            accuracy = (rewards_t == correct_response_reward).float().mean().item()
+            accuracy = rewards_t.mean().item()
         else:
             accuracy = 0.0
 

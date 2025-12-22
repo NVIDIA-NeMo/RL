@@ -19,10 +19,103 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from importlib.util import find_spec
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
+
+
+def _get_transformer_engine_file(relative_path: str) -> str:
+    """Return absolute path to a Transformer Engine file or raise if it cannot be found.
+
+    The relative_path should be a POSIX-style path under the transformer_engine
+    package root, e.g. "pytorch/triton/permutation.py".
+    """
+    spec = find_spec("transformer_engine")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(
+            "Transformer Engine package not found while attempting to patch "
+            f"'{relative_path}'. Ensure `transformer-engine` is installed and "
+            "available in this environment."
+        )
+
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, *relative_path.split("/"))
+
+    if not os.path.exists(file_path):
+        raise RuntimeError(
+            "Failed to locate expected Transformer Engine file to patch. "
+            f"Looked for '{relative_path}' at '{file_path}'. "
+            "This likely indicates an unexpected Transformer Engine installation "
+            "layout or version mismatch."
+        )
+
+    return file_path
+
+
+def _apply_transformer_engine_patch():
+    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files.
+
+    This locates the target file via importlib metadata instead of importing
+    `transformer_engine`, to avoid side effects during initialization. If the
+    permutation module has already been imported, it will be reloaded so that
+    the patched source takes effect.
+    """
+    try:
+        perm_file = _get_transformer_engine_file("pytorch/triton/permutation.py")
+
+        with open(perm_file, "r") as f:
+            content = f.read()
+
+        if "get_int_dtype = triton.constexpr_function(get_int_dtype)" not in content:
+            print(f"Applying Triton fix to {perm_file}...")
+
+            # 1. Replace the usage
+            old_usage = "idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
+            new_usage = "idtype = get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
+
+            # 2. Insert the definition before the first @triton.jit
+            jit_anchor = "@triton.jit"
+
+            new_definition = (
+                "\n\n"
+                "get_int_dtype = core.get_int_dtype\n"
+                "get_int_dtype = triton.constexpr_function(get_int_dtype)\n"
+            )
+
+            new_content = None
+            if old_usage in content:
+                temp_content = content.replace(old_usage, new_usage)
+
+                if jit_anchor in temp_content:
+                    new_content = temp_content.replace(
+                        jit_anchor, new_definition + jit_anchor, 1
+                    )
+
+            if new_content:
+                try:
+                    with open(perm_file, "w") as f:
+                        f.write(new_content)
+                    print("Successfully patched transformer_engine permutation.py.")
+                except OSError as e:
+                    print(
+                        f"Could not write patch to transformer_engine (permission denied?): {e}"
+                    )
+
+        # If the permutation module is already imported in this process,
+        # reload it so that the patched source takes effect for subsequent use.
+        import importlib
+        import sys
+
+        perm_module_name = "transformer_engine.pytorch.triton.permutation"
+        if perm_module_name in sys.modules:
+            importlib.reload(sys.modules[perm_module_name])
+
+    except Exception as e:
+        print(f"Error checking/patching transformer_engine: {e}")
+
+
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.training import fault_tolerance
@@ -447,6 +540,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        _apply_transformer_engine_patch()
+
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
@@ -746,6 +841,40 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 tokenizer_model=hf_model_name,
             ),
         )
+        # TODO: this validation should happen inside mbridge: https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/1665
+        if self.dtype == torch.bfloat16:
+            assert self.megatron_cfg.model.bf16 == True, (
+                "policy.megatron_cfg.model.bf16=True must be set if policy.precision=bfloat16. This is handled by nemo-rl so this indicates something is misconfigured."
+            )
+            assert (
+                self.megatron_cfg.optimizer.use_precision_aware_optimizer == False
+                or self.megatron_cfg.optimizer.bf16 == True
+            ), (
+                "policy.megatron_cfg.optimizer.bf16=True must be set if policy.precision=bfloat16 when using use_precision_aware_optimizer=True"
+            )
+        elif self.dtype == torch.float16:
+            assert self.megatron_cfg.model.fp16 == True, (
+                "policy.megatron_cfg.model.fp16=True must be set if policy.precision=float16. This is handled by nemo-rl so this indicates something is misconfigured."
+            )
+            assert (
+                self.megatron_cfg.optimizer.use_precision_aware_optimizer == False
+                or self.megatron_cfg.optimizer.fp16 == True
+            ), (
+                "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16 when using use_precision_aware_optimizer=True"
+            )
+        elif self.dtype == torch.float32:
+            assert (
+                self.megatron_cfg.model.bf16 == False
+                and self.megatron_cfg.model.fp16 == False
+            ), (
+                "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
+            )
+            assert (
+                self.megatron_cfg.optimizer.bf16 == False
+                and self.megatron_cfg.optimizer.fp16 == False
+            ), (
+                "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
+            )
         self.megatron_cfg.validate()
         (
             self.mcore_state,
@@ -1018,6 +1147,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         self.cfg["megatron_cfg"],
                         seq_dim_size,
                     )
+                    # if pad_full_seq_to is not None, we need to use it as the sequence length
+                    seq_dim_size = pad_full_seq_to or seq_dim_size
                 else:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
@@ -1782,12 +1913,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         from megatron.core.inference.sampling_params import SamplingParams
 
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
-        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
-        buffer_guaranteed_fraction = mcore_generation_config[
-            "buffer_guaranteed_fraction"
-        ]
-        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
-        max_tokens = mcore_generation_config["max_tokens"]
+        buffer_size_gb = mcore_generation_config.get("buffer_size_gb", 20)
+
+        num_cuda_graphs = mcore_generation_config.get("num_cuda_graphs", 16)
+        block_size_tokens = mcore_generation_config.get("block_size_tokens", 256)
+        use_cuda_graphs_for_non_decode_steps = mcore_generation_config.get(
+            "use_cuda_graphs_for_non_decode_steps", True
+        )
+        enable_chunked_prefill = mcore_generation_config.get(
+            "enable_chunked_prefill", True
+        )
+        unified_memory_level = mcore_generation_config.get("unified_memory_level", 0)
+        buffer_guaranteed_fraction = mcore_generation_config.get(
+            "buffer_guaranteed_fraction", 0.1
+        )
+        max_tokens = mcore_generation_config.get("max_tokens", 16384)
+
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
 
@@ -1797,44 +1938,49 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_size_gb=buffer_size_gb,
             buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
-            max_requests_override=None,
             num_cuda_graphs=num_cuda_graphs,
-            use_flashinfer_fused_rope=None,
+            block_size_tokens=block_size_tokens,
+            tensor_model_parallel_size=self.cfg["megatron_cfg"][
+                "tensor_model_parallel_size"
+            ],
+            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+            use_flashinfer_fused_rope=False,
+            unified_memory_level=unified_memory_level,
             max_tokens_override=max_tokens,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
         )
+
         inference_wrapped_model.prep_model_for_inference()
+        # Set pipeline parallel flag
+        inference_wrapped_model.model_is_pipeline_parallel = (
+            self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        )
 
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
 
-        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
-
-        # Calculate seed based on step, node, and rank to ensure reproducibility across workers
-        # Similar to vllm_worker.py seed calculation but with added step information
-        # Formula: seed = (node_idx * 1024 * 10000) + (step * 1024) + local_rank
-        # This allows for:
-        # - Multiple nodes (node_idx multiplier is large enough)
-        # - Up to 10000 steps per node before potential overlap
-        # - Up to 1024 local ranks (GPUs per node)
+        # Calculate seed based on node and rank to ensure reproducibility across workers
         local_rank = torch.cuda.current_device()  # Local GPU index on the node
         num_gpus_per_node = torch.cuda.device_count()
         node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
         seed = (node_idx * 1024) + local_rank
 
+        # New API: DynamicInferenceEngine has additional parameters
         dynamic_engine = DynamicInferenceEngine(
-            controller=text_generation_controller,
-            random_seed=seed,
-            context=dynamic_context,
+            text_generation_controller,
+            dynamic_context,
             enable_cuda_graph=True,
-            termination_id=self.megatron_tokenizer.eod,
+            random_seed=seed,
+            track_paused_request_events=False,
+            enable_chunked_prefill=enable_chunked_prefill,
+            inference_logging_step_interval=0,
         )
 
         # Handle None values for top_k - convert to integer as required by Megatron
@@ -1845,35 +1991,41 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         top_p_val = (
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
+
+        # New API: SamplingParams now includes termination_id and uses num_tokens_total
         sampling_params = SamplingParams(
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
             top_p=top_p_val,
-            return_segments=False,
-            top_n_logprobs=0,
+            skip_prompt_log_probs=False,
             return_log_probs=True,
-            return_prompt_top_n_logprobs=False,
+            num_tokens_total=self.cfg["generation"]["max_new_tokens"],
+            num_tokens_to_generate=None,
+            termination_id=self.megatron_tokenizer.eod,
         )
+
         input_ids = data["input_ids"]
         prompt_tokens_tensor = input_ids.cuda()
         prompt_lengths_tensor = data["input_lengths"]
         request_id = 0
 
+        # New API: add_request now takes sampling_params as a parameter
         for p, prompt_len in zip(
             prompt_tokens_tensor, prompt_lengths_tensor, strict=True
         ):
             dynamic_engine.add_request(
                 request_id,
                 p[:prompt_len],
-                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
+                sampling_params=sampling_params,
             )
             request_id += 1
 
         result = []
         while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern(sampling_params, verbose=False)
-            if result_step["finished_requests"] is not None:
-                result.extend(result_step["finished_requests"])
+            result_step = dynamic_engine.step_modern(verbose=False)
+            finished_requests = result_step.get("finished_requests", [])
+            for finished_request in finished_requests:
+                result.append(finished_request)
 
         # Sort results by request_id to maintain original batch order
         result.sort(key=lambda x: x.request_id)
