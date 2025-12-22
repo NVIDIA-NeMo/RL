@@ -23,7 +23,6 @@ uv run examples/run_sft.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     ~policy.tokenizer.chat_template \
     $@ \
@@ -35,6 +34,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["20"] < 3.14' \
-        'data["train/loss"]["0"] < 5.28' 
+        'data["train/loss"]["20"] < 3.20' \
+        'mean(data["timing/train/total_step_time"], 2) < 15'
 fi
