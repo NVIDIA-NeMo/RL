@@ -1,13 +1,42 @@
 #!/bin/bash
-#SBATCH -A coreai_dlalgo_nemorl
-#SBATCH -J vllm-online-bench
-#SBATCH -p batch
-#SBATCH -t 02:00:00
+# Note: -A (account), -p (partition), and -J (job-name) are passed via command line
+# from run_vllm_benchmark.sh to support different clusters and descriptive job names
+#SBATCH -t 04:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/online/%j-logs/slurm-%j.out
-#SBATCH -e /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/online/%j-logs/slurm-%j.err
+# Note: stdout/stderr are redirected to LOGS_DIR after directory creation
 
 set -ex
+
+# ============================================================
+# Paths Configuration (passed from run_vllm_benchmark.sh)
+# ============================================================
+# SCRIPT_DIR, EXPERIMENT_DIR, MODEL_SHORT_NAME, PARALLELISM_DIR are passed as environment variables
+SCRIPT_DIR=${SCRIPT_DIR:-$(dirname "$(readlink -f "$0")")}
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-$SCRIPT_DIR/../vllm_standalone_perf_exp}
+
+# Model and parallelism info for directory structure
+MODEL_SHORT_NAME=${MODEL_SHORT_NAME:-unknown}
+PARALLELISM_DIR=${PARALLELISM_DIR:-1n4t1p}
+
+# Log directory structure: <benchmark_type>/<model>/<parallelism>/<job_id>-logs/
+LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/online/${MODEL_SHORT_NAME}/${PARALLELISM_DIR}/${SLURM_JOB_ID}-logs}
+
+# Create log directory and redirect all output there
+mkdir -p "$LOGS_DIR"
+exec > >(tee -a "$LOGS_DIR/slurm-${SLURM_JOB_ID}.out") 2>&1
+
+echo "============================================================"
+echo "SLURM Job Information"
+echo "============================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job Name: $SLURM_JOB_NAME"
+echo "Nodes: $SLURM_JOB_NUM_NODES"
+echo "Node List: $SLURM_JOB_NODELIST"
+echo "Partition: $SLURM_JOB_PARTITION"
+echo "Account: $SLURM_JOB_ACCOUNT"
+echo "Log Directory: $LOGS_DIR"
+echo "Start Time: $(date)"
+echo "============================================================"
 
 # ============================================================
 # HuggingFace Configuration
@@ -46,16 +75,13 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 
 # Container and paths
-# Script directory and parent directory
-SCRIPT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_benchmark
-BASE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl
+# Note: SCRIPT_DIR and EXPERIMENT_DIR are passed from run_vllm_benchmark.sh
+BASE_DIR=$(dirname "$SCRIPT_DIR")
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
 CONTAINER_NAME=vllm-online-bench
-JOB_CACHE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache
-
-# Log directory (separated by benchmark type)
-EXPERIMENT_DIR=${EXPERIMENT_DIR:-$BASE_DIR/vllm_standalone_perf_exp}
-LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/online/${SLURM_JOB_ID}-logs}
+# JOB_CACHE_DIR is passed from run_vllm_benchmark.sh (cluster-specific)
+# Fallback to a safe default if not set
+JOB_CACHE_DIR=${JOB_CACHE_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/job_cache}
 
 # Server startup time (seconds)
 SERVER_STARTUP_TIME=${SERVER_STARTUP_TIME:-120}
@@ -64,9 +90,9 @@ SERVER_STARTUP_TIME=${SERVER_STARTUP_TIME:-120}
 # Setup
 # ============================================================
 
-mkdir -p $EXPERIMENT_DIR
-mkdir -p $LOGS_DIR
-mkdir -p $JOB_CACHE_DIR
+mkdir -p "$EXPERIMENT_DIR"
+mkdir -p "$LOGS_DIR"
+mkdir -p "$JOB_CACHE_DIR"
 
 # GPUs per node (can be overridden via env var)
 NUM_GPUS_PER_NODE=${GPUS_PER_NODE:-4}
@@ -136,22 +162,59 @@ echo "Head node: $head_node ($head_ip)"
 # ============================================================
 # vLLM Environment Variables
 # ============================================================
+# Core vLLM settings
 export VLLM_USE_V1=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
+# NeMo-RL performance settings (always enabled)
+export VLLM_SKIP_P2P_CHECK=1              # Skip P2P check, rely on driver
+export VLLM_ENABLE_V1_MULTIPROCESSING=0   # Avoid Ray conflict
+export NCCL_CUMEM_ENABLE=1                # Fix PyNCCL P2P init error
+
+# Cross-node model parallelism NCCL settings
+if [ $NUM_NODES -gt 1 ]; then
+    GPUS_PER_INSTANCE=$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))
+    if [ $GPUS_PER_INSTANCE -gt $NUM_GPUS_PER_NODE ]; then
+        export NCCL_NVLS_ENABLE=0         # Fix NCCL error for cross-node MP
+        echo "Cross-node parallelism detected, NCCL_NVLS_ENABLE=0"
+    fi
+fi
+
 # MoE-specific environment variables
 if [ "$EXPERT_PARALLEL_SIZE" -gt 1 ]; then
     echo "MoE mode enabled (EP=$EXPERT_PARALLEL_SIZE)"
-    export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
+    # Choose MOE backend based on concurrency
+    if [ ${MAX_CONCURRENCY:-64} -lt 64 ]; then
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-latency}
+    else
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
+    fi
+    echo "VLLM_FLASHINFER_MOE_BACKEND=$VLLM_FLASHINFER_MOE_BACKEND"
+fi
+
+# Data Parallelism settings
+TOTAL_GPUS=$((NUM_NODES * NUM_GPUS_PER_NODE))
+DATA_PARALLEL_SIZE=$((TOTAL_GPUS / (TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE)))
+if [ $DATA_PARALLEL_SIZE -gt 1 ]; then
+    export VLLM_DP_MASTER_IP=$head_ip
+    export VLLM_DP_SIZE=$DATA_PARALLEL_SIZE
+    echo "Data Parallelism enabled: DP=$DATA_PARALLEL_SIZE"
 fi
 
 # ============================================================
 # Build vllm serve flags
 # ============================================================
+# Data parallelism: run DP instances across all GPUs
+DP_FLAG=""
+if [ $DATA_PARALLEL_SIZE -gt 1 ]; then
+    DP_FLAG="--data-parallel-size $DATA_PARALLEL_SIZE"
+    echo "Data Parallelism: DP=$DATA_PARALLEL_SIZE (Total GPUs = TP*PP*DP = $TENSOR_PARALLEL_SIZE*$PIPELINE_PARALLEL_SIZE*$DATA_PARALLEL_SIZE)"
+fi
+
 DISTRIBUTED_FLAG=""
-if [ $NUM_NODES -gt 1 ]; then
+if [ $NUM_NODES -gt 1 ] || [ $DATA_PARALLEL_SIZE -gt 1 ]; then
     DISTRIBUTED_FLAG="--distributed-executor-backend ray"
 fi
 
@@ -228,9 +291,9 @@ HF_FIX_DIR=/tmp/hf_fix_\$\$
 pip install --quiet --no-cache-dir --target=\$HF_FIX_DIR huggingface-hub==0.34
 export PYTHONPATH=\$HF_FIX_DIR:\$PYTHONPATH
 
-# Start Ray head if multi-node
-if [ $NUM_NODES -gt 1 ]; then
-    echo 'Starting Ray head...'
+# Start Ray head if multi-node OR data parallelism
+if [ $NUM_NODES -gt 1 ] || [ $DATA_PARALLEL_SIZE -gt 1 ]; then
+    echo 'Starting Ray head (NUM_NODES=$NUM_NODES, DP=$DATA_PARALLEL_SIZE)...'
     ray start --head --node-ip-address='$head_ip' --port=6379
     sleep 15
     ray status
@@ -275,6 +338,7 @@ vllm serve '$MODEL_PATH' \
     $DISTRIBUTED_FLAG \
     $TP_FLAG \
     $PP_FLAG \
+    $DP_FLAG \
     $EP_FLAG \
     --trust-remote-code \
     --disable-log-requests \
@@ -379,5 +443,26 @@ fi
 
 echo "============================================================"
 echo "Benchmark complete! Results in: $LOGS_DIR"
+echo "============================================================"
+
+# ============================================================
+# Upload to wandb (if enabled)
+# ============================================================
+WANDB_UPLOAD=${WANDB_UPLOAD:-1}
+WANDB_PROJECT=${WANDB_PROJECT:-vllm-benchmark}
+
+if [ "$WANDB_UPLOAD" == "1" ] && [ -f "$LOGS_DIR/results.json" ]; then
+    echo ""
+    echo "Uploading results to wandb (project: $WANDB_PROJECT)..."
+    
+    python3 $SCRIPT_DIR/upload_to_wandb.py \
+        "$LOGS_DIR/results.json" \
+        --project "$WANDB_PROJECT" \
+        --benchmark-type online \
+        --tags "online" "$GPU_MODEL" || echo "Warning: wandb upload failed (wandb may not be installed)"
+fi
+
+echo ""
+echo "End time: $(date)"
 echo "============================================================"
 

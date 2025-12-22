@@ -212,10 +212,22 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 4}
             },
             "gb200": {
-                "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
                 "num_prompts": 64, "num_generations": 32,
-                "generation": {"tp": 4, "pp": 1},
-                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 4}
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 1}
+            },
+            "gb200_tp2": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 2, "cp": 1, "ep": 1, "pp": 1}
+            },
+            "gb200_tp1": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 1, "pp": 1}
             }
         },
         "qwen30b": {
@@ -252,7 +264,7 @@ def get_fallback_configs() -> Dict[str, Any]:
         },
         "deepseek_v3": {
             "model_name": "deepseek-ai/DeepSeek-V3",
-            "config_file": "examples/configs/recipes/llm/performance/grpo-deepseek-v3.yaml",
+            "config_file": "examples/configs/recipes/llm/performance/grpo-deepseek-v3-32n8g.yaml",
             "h100": {
                 "num_gpus": 256, "max_seqlen": 1536, "rollout_gbs": 2048, "train_gbs": 2048,
                 "num_prompts": 64, "num_generations": 32,
@@ -335,7 +347,8 @@ def build_command(model_cfg: Dict[str, Any],
                   time_limit: str = "04:00:00",
                   account: Optional[str] = None,
                   partition: Optional[str] = None,
-                  enable_vllm_metrics: bool = False) -> str:
+                  enable_vllm_metrics: bool = False,
+                  vllm_metrics_interval: float = 0.5) -> str:
     """Build the sbatch command for a given configuration."""
     
     gpus_per_node = cluster_config["gpus_per_node"]
@@ -445,10 +458,10 @@ logger.wandb.name='{wandb_name}'"""
 
     # Add vLLM metrics logging if enabled
     if enable_vllm_metrics:
-        command += """ \\
+        command += f""" \\
 policy.generation.vllm_cfg.async_engine=true \\
 policy.generation.vllm_cfg.enable_vllm_metrics_logger=true \\
-policy.generation.vllm_cfg.vllm_metrics_logger_interval=0.5"""
+policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"""
     
     # Build GRES option only for clusters that use it (H100 uses GRES, GB200 doesn't)
     gres_line = f"--gres=gpu:{gpus_per_node} \\\n    " if use_gres else ""
@@ -677,11 +690,25 @@ Examples:
                         help="Show command without executing")
     parser.add_argument("--enable-vllm-metrics", action="store_true",
                         help="Enable vLLM metrics logging (requires async_engine=true)")
+    parser.add_argument("--vllm-metrics-interval", type=float, default=0.5,
+                        help="vLLM metrics logging interval in seconds (default: 0.5)")
     
     args = parser.parse_args()
     
+    # Infer cluster type from variant name if not explicitly specified
+    cluster_type = args.cluster
+    if cluster_type is None and args.variant:
+        # Parse variant name to infer cluster type (e.g., "gb200_tp1" -> "gb200")
+        variant_lower = args.variant.lower()
+        if variant_lower.startswith("gb200"):
+            cluster_type = "gb200"
+            print(f"[INFO] Inferred cluster type 'gb200' from variant '{args.variant}'")
+        elif variant_lower.startswith("h100"):
+            cluster_type = "h100"
+            print(f"[INFO] Inferred cluster type 'h100' from variant '{args.variant}'")
+    
     # Get cluster configuration
-    cluster_config = get_cluster_config(args.cluster, args.partition)
+    cluster_config = get_cluster_config(cluster_type, args.partition)
     print(f"[INFO] Cluster: {cluster_config['cluster_type'].upper()} ({cluster_config['gpus_per_node']} GPUs/node)")
     print(f"[INFO] Container: {cluster_config['container']}")
     
@@ -692,20 +719,38 @@ Examples:
     
     # Launch all presets
     if args.all:
-        print("🚀 Launching all preset configurations...\n")
+        variant_msg = f" with variant '{args.variant}'" if args.variant else ""
+        print(f"🚀 Launching all preset configurations{variant_msg}...\n")
+        
+        launched = 0
+        skipped = 0
         for preset in get_available_presets():
+            # If variant is specified, check if this preset has that variant
+            if args.variant:
+                available_variants = get_preset_variants(preset)
+                if args.variant not in available_variants:
+                    print(f"⏭️  Skipping {preset}: variant '{args.variant}' not available (has: {available_variants})")
+                    skipped += 1
+                    continue
+            
             print(f"\n{'='*70}")
-            print(f"  Launching: {preset}")
+            print(f"  Launching: {preset}" + (f" ({args.variant})" if args.variant else ""))
             print(f"{'='*70}")
             try:
-                launch_job(preset, cluster_config, dry_run=args.dry_run,
+                launch_job(preset, cluster_config, variant=args.variant,
+                          dry_run=args.dry_run,
                           wandb_project=args.wandb_project,
                           max_steps=args.max_steps,
                           time_limit=args.time,
                           account=args.account,
-                          partition=args.job_partition)
+                          partition=args.job_partition,
+                          enable_vllm_metrics=args.enable_vllm_metrics,
+                          vllm_metrics_interval=args.vllm_metrics_interval)
+                launched += 1
             except Exception as e:
                 print(f"❌ Error launching {preset}: {e}")
+        
+        print(f"\n✅ Launched: {launched}, Skipped: {skipped}")
         return
     
     # Use preset
@@ -729,7 +774,8 @@ Examples:
                         time_limit=args.time,
                         account=args.account,
                         partition=args.job_partition,
-                        enable_vllm_metrics=args.enable_vllm_metrics)
+                        enable_vllm_metrics=args.enable_vllm_metrics,
+                        vllm_metrics_interval=args.vllm_metrics_interval)
             except Exception as e:
                 print(f"❌ Error launching {p}: {e}")
         return

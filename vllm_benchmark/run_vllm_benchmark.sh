@@ -110,9 +110,80 @@ apply_model_preset() {
 }
 
 # ============================================================
+# Cluster Detection and Configuration
+# ============================================================
+# Automatically detect cluster based on hostname or use CLUSTER env var
+# Supported clusters:
+#   lyris   - GB200 cluster (partition=gb200, account=coreai_dlalgo_llm, no gres)
+#   oci-hsg - OCI HSG cluster (partition=batch, account=coreai_dlalgo_nemorl, gres=gpu:N)
+#
+# Override with: CLUSTER=lyris ./run_vllm_benchmark.sh run-random
+
+detect_cluster() {
+    if [ -n "${CLUSTER:-}" ]; then
+        echo "$CLUSTER"
+        return
+    fi
+    
+    local hostname=$(hostname)
+    
+    # Detect based on hostname patterns
+    if [[ "$hostname" == *"lyris"* ]] || [[ "$hostname" == *"gb200"* ]]; then
+        echo "lyris"
+    elif [[ "$hostname" == *"eos"* ]] || [[ "$hostname" == *"hsg"* ]]; then
+        echo "oci-hsg"
+    else
+        # Default to lyris if running on login node (check SLURM partition availability)
+        if sinfo -p gb200 &>/dev/null 2>&1; then
+            echo "lyris"
+        else
+            echo "oci-hsg"
+        fi
+    fi
+}
+
+apply_cluster_config() {
+    local cluster=$(detect_cluster)
+    
+    case "$cluster" in
+        lyris)
+            # Lyris GB200 cluster
+            : ${SLURM_PARTITION:=gb200}
+            : ${SLURM_ACCOUNT:=coreai_dlalgo_llm}
+            : ${USE_GRES:=0}  # No --gres option
+            : ${GPUS_PER_NODE:=4}
+            # Use Lyris-accessible path for cache
+            : ${JOB_CACHE_DIR:=/lustre/fsw/coreai_dlalgo_llm/users/sna/job_cache}
+            ;;
+        oci-hsg|*)
+            # OCI HSG cluster (default)
+            : ${SLURM_PARTITION:=batch}
+            : ${SLURM_ACCOUNT:=coreai_dlalgo_nemorl}
+            : ${USE_GRES:=1}  # Use --gres=gpu:N
+            : ${GPUS_PER_NODE:=4}
+            # OCI path for cache
+            : ${JOB_CACHE_DIR:=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache}
+            ;;
+    esac
+    
+    echo "Detected cluster: $cluster"
+}
+
+# Apply cluster configuration
+apply_cluster_config
+
+# Build GRES option (empty for Lyris, --gres=gpu:N for others)
+get_gres_option() {
+    if [ "${USE_GRES:-1}" == "1" ]; then
+        echo "--gres=gpu:$GPUS_PER_NODE"
+    else
+        echo ""
+    fi
+}
+
+# ============================================================
 # Configuration
 # ============================================================
-GPUS_PER_NODE=4
 
 # Apply model preset first (sets defaults)
 apply_model_preset
@@ -156,6 +227,76 @@ MAX_TOKENS=${MAX_TOKENS:-2048}
 TEMPERATURE=${TEMPERATURE:-1.0}
 
 # ============================================================
+# Experiment directory (for logs and results)
+# ============================================================
+# Results go to: $EXPERIMENT_DIR/<bench_type>/<job_id>-logs/
+# This is relative to SCRIPT_DIR so collect_vLLM_results.py can find them
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-$SCRIPT_DIR/../vllm_standalone_perf_exp}
+
+# ============================================================
+# Weights & Biases (wandb) Configuration
+# ============================================================
+# Set WANDB_UPLOAD=0 to disable automatic upload
+# Set WANDB_PROJECT to change the project name (default: vllm-benchmark)
+# Set WANDB_ENTITY to change the team/username
+WANDB_UPLOAD=${WANDB_UPLOAD:-1}
+WANDB_PROJECT=${WANDB_PROJECT:-vllm-benchmark}
+WANDB_ENTITY=${WANDB_ENTITY:-}
+
+# ============================================================
+# Job naming helpers
+# ============================================================
+get_model_short_name() {
+    local model_path="$1"
+    local short_name
+    
+    # Extract model name from path (e.g., "Qwen/Qwen3-32B" -> "Qwen3-32B")
+    short_name="${model_path##*/}"
+    
+    # Further shorten common patterns
+    short_name="${short_name//-Instruct/}"
+    short_name="${short_name//Llama-3.1-/Llama3-}"
+    short_name="${short_name//Llama-3-/Llama3-}"
+    short_name="${short_name//meta-llama/}"
+    
+    # Truncate to max 15 chars to leave room for parallelism info
+    if [ ${#short_name} -gt 15 ]; then
+        short_name="${short_name:0:15}"
+    fi
+    
+    echo "$short_name"
+}
+
+# Build job name with model and parallelism info
+# Format: <bench_type>-<model>-<nodes>n<tp>t<pp>p
+# Example: off-Qwen3-32B-4n1t1p (offline, Qwen3-32B, 4 nodes, TP=1, PP=1)
+build_job_name() {
+    local bench_type="$1"  # off, tput, online
+    local model_short="$2"
+    local nodes="$3"
+    local tp="$4"
+    local pp="$5"
+    
+    # Build parallelism suffix: <nodes>n<tp>t<pp>p
+    local para_suffix="${nodes}n${tp}t${pp}p"
+    
+    echo "${bench_type}-${model_short}-${para_suffix}"
+}
+
+# Build parallelism directory name
+# Format: <nodes>n<tp>t<pp>p (e.g., 4n1t1p)
+build_parallelism_dir() {
+    local nodes="$1"
+    local tp="$2"
+    local pp="$3"
+    
+    echo "${nodes}n${tp}t${pp}p"
+}
+
+# Get model short name for job naming
+MODEL_SHORT_NAME=$(get_model_short_name "$MODEL_PATH")
+
+# ============================================================
 # Commands
 # ============================================================
 
@@ -174,6 +315,7 @@ case "${1:-help}" in
         
         # Submit a short job to prepare prompts using NeMo-RL container
         # Use ray.sub style: pass env vars directly, not via export
+        GRES_OPT=$(get_gres_option)
         CONTAINER="$NEMO_RL_CONTAINER" \
         HF_HOME="$HF_HOME" \
         HF_DATASETS_CACHE="$HF_HOME/cache" \
@@ -184,10 +326,10 @@ case "${1:-help}" in
             --num-prompts $NUM_PROMPTS \
             --seed $SEED" \
         sbatch --nodes=1 \
-            --gres=gpu:4 \
+            $GRES_OPT \
             --time=00:30:00 \
-            --account=coreai_dlalgo_nemorl \
-            --partition=batch \
+            --account=$SLURM_ACCOUNT \
+            --partition=$SLURM_PARTITION \
             --job-name=prepare-prompts \
             --output="$SCRIPT_DIR/prepare_prompts_%j.log" \
             ray.sub
@@ -225,6 +367,9 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
+        JOB_NAME=$(build_job_name "off" "$MODEL_SHORT_NAME" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
+        PARALLELISM_DIR=$(build_parallelism_dir "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
@@ -237,16 +382,28 @@ case "${1:-help}" in
         MAX_TOKENS=$MAX_TOKENS \
         TEMPERATURE=$TEMPERATURE \
         PROMPTS_FILE="$PROMPTS_FILE" \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        MODEL_SHORT_NAME="$MODEL_SHORT_NAME" \
+        PARALLELISM_DIR="$PARALLELISM_DIR" \
+        WANDB_UPLOAD="$WANDB_UPLOAD" \
+        WANDB_PROJECT="$WANDB_PROJECT" \
+        WANDB_ENTITY="$WANDB_ENTITY" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=$NUM_NODES \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
+            --job-name="$JOB_NAME" \
+            -o /dev/null -e /dev/null \
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/offline/\$SLURM_JOB_ID-logs/"
-        echo "  - slurm-*.out    (main output)"
-        echo "  - slurm-*.err    (errors)"
-        echo "  - results.json   (benchmark results)"
+        echo "Logs will be in: $EXPERIMENT_DIR/offline/$MODEL_SHORT_NAME/$PARALLELISM_DIR/<JOB_ID>-logs/"
+        echo "  - slurm-<JOB_ID>.out  (SLURM + job output combined)"
+        echo "  - results.json        (benchmark results)"
+        [ "$WANDB_UPLOAD" == "1" ] && echo "  - wandb: $WANDB_PROJECT (auto-upload enabled)"
         ;;
     
     run-random)
@@ -271,6 +428,9 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
+        JOB_NAME=$(build_job_name "off" "$MODEL_SHORT_NAME" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
+        PARALLELISM_DIR=$(build_parallelism_dir "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
@@ -284,20 +444,45 @@ case "${1:-help}" in
         TEMPERATURE=$TEMPERATURE \
         PROMPTS_FILE="" \
         RANDOM_INPUT_LEN=150 \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        MODEL_SHORT_NAME="$MODEL_SHORT_NAME" \
+        PARALLELISM_DIR="$PARALLELISM_DIR" \
+        WANDB_UPLOAD="$WANDB_UPLOAD" \
+        WANDB_PROJECT="$WANDB_PROJECT" \
+        WANDB_ENTITY="$WANDB_ENTITY" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=$NUM_NODES \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
+            --job-name="$JOB_NAME" \
+            -o /dev/null -e /dev/null \
             benchmark_vllm_offline.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/offline/\$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: $EXPERIMENT_DIR/offline/$MODEL_SHORT_NAME/$PARALLELISM_DIR/<JOB_ID>-logs/"
+        [ "$WANDB_UPLOAD" == "1" ] && echo "  - wandb: $WANDB_PROJECT (auto-upload enabled)"
         ;;
     
     run-throughput)
-        # Calculate DP for display
+        # ============================================================
+        # AUTO-CALCULATE required nodes for throughput benchmark
+        # vllm bench throughput does NOT support DP, only TP*PP GPUs are used
+        # ============================================================
+        REQUIRED_GPUS=$((TP_SIZE * PP_SIZE))
+        REQUIRED_NODES=$(( (REQUIRED_GPUS + GPUS_PER_NODE - 1) / GPUS_PER_NODE ))  # ceil division
+        
+        if [ "$NUM_NODES" -gt "$REQUIRED_NODES" ]; then
+            echo "⚠️  WARNING: You requested $NUM_NODES nodes ($((NUM_NODES * GPUS_PER_NODE)) GPUs)"
+            echo "   But vllm bench throughput only uses TP×PP = $REQUIRED_GPUS GPUs"
+            echo "   Auto-adjusting to $REQUIRED_NODES node(s) to avoid GPU waste."
+            NUM_NODES=$REQUIRED_NODES
+        fi
+        
         TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
         GPUS_PER_INSTANCE=$((TP_SIZE * PP_SIZE))
-        DP_SIZE=$((TOTAL_GPUS / GPUS_PER_INSTANCE))
         
         # Throughput benchmark parameters (vllm bench throughput)
         # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/benchmarks/throughput.py
@@ -334,6 +519,9 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
+        JOB_NAME=$(build_job_name "tput" "$MODEL_SHORT_NAME" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
+        PARALLELISM_DIR=$(build_parallelism_dir "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
@@ -346,16 +534,29 @@ case "${1:-help}" in
         NUM_GENERATIONS_PER_PROMPT=$THROUGHPUT_NUM_GENERATIONS \
         RANDOM_RANGE_RATIO=$RANDOM_RANGE_RATIO \
         MAX_MODEL_LEN=$MAX_MODEL_LEN \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        MODEL_SHORT_NAME="$MODEL_SHORT_NAME" \
+        PARALLELISM_DIR="$PARALLELISM_DIR" \
+        WANDB_UPLOAD="$WANDB_UPLOAD" \
+        WANDB_PROJECT="$WANDB_PROJECT" \
+        WANDB_ENTITY="$WANDB_ENTITY" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=$NUM_NODES \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
+            --job-name="$JOB_NAME" \
+            -o /dev/null -e /dev/null \
             benchmark_vllm_throughput.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/throughput/\$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: $EXPERIMENT_DIR/throughput/$MODEL_SHORT_NAME/$PARALLELISM_DIR/<JOB_ID>-logs/"
         echo "  - result_ISL*_OSL*.txt   (per-config results)"
         echo "  - results_summary.txt    (summary CSV)"
         echo "  - results.json           (JSON results)"
+        [ "$WANDB_UPLOAD" == "1" ] && echo "  - wandb: $WANDB_PROJECT (auto-upload enabled)"
         ;;
     
     run-online)
@@ -388,6 +589,9 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
+        JOB_NAME=$(build_job_name "online" "$MODEL_SHORT_NAME" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
+        PARALLELISM_DIR=$(build_parallelism_dir "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
@@ -399,15 +603,28 @@ case "${1:-help}" in
         MAX_ISL="$MAX_ISL" \
         MAX_OSL="$MAX_OSL" \
         MAX_MODEL_LEN=$MAX_MODEL_LEN \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        MODEL_SHORT_NAME="$MODEL_SHORT_NAME" \
+        PARALLELISM_DIR="$PARALLELISM_DIR" \
+        WANDB_UPLOAD="$WANDB_UPLOAD" \
+        WANDB_PROJECT="$WANDB_PROJECT" \
+        WANDB_ENTITY="$WANDB_ENTITY" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=$NUM_NODES \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
+            --job-name="$JOB_NAME" \
+            -o /dev/null -e /dev/null \
             benchmark_vllm_online.sbatch
         
         echo ""
-        echo "Logs will be in: vllm_standalone_perf_exp/online/\$SLURM_JOB_ID-logs/"
+        echo "Logs will be in: $EXPERIMENT_DIR/online/$MODEL_SHORT_NAME/$PARALLELISM_DIR/<JOB_ID>-logs/"
         echo "  - result_ISL*_OSL*.txt   (per-config results)"
         echo "  - results_summary.txt    (summary CSV)"
+        [ "$WANDB_UPLOAD" == "1" ] && echo "  - wandb: $WANDB_PROJECT (auto-upload enabled)"
         ;;
     
     build)
@@ -419,15 +636,21 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
         DO_BUILD=1 \
         VLLM_INSTALL_FROM_SOURCE="${VLLM_INSTALL_FROM_SOURCE:-0}" \
         VLLM_GIT_REPO="${VLLM_GIT_REPO:-https://github.com/vllm-project/vllm.git}" \
         VLLM_GIT_BRANCH="${VLLM_GIT_BRANCH:-main}" \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=1 \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
             --time=01:00:00 \
             --job-name=vllm-build \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
             benchmark_vllm_offline.sbatch
         
         echo ""
@@ -444,15 +667,21 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
         DO_BUILD=1 \
         VLLM_INSTALL_FROM_SOURCE=1 \
         VLLM_GIT_REPO="${VLLM_GIT_REPO:-https://github.com/vllm-project/vllm.git}" \
         VLLM_GIT_BRANCH="${VLLM_GIT_BRANCH:-main}" \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=1 \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
             --time=01:00:00 \
             --job-name=vllm-build-custom \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
             benchmark_vllm_offline.sbatch
         
         echo ""
@@ -489,13 +718,19 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
         DO_BUILD=1 \
         VLLM_LOCAL_PATH="$VLLM_LOCAL_PATH" \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=1 \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
             --time=01:00:00 \
             --job-name=vllm-build-local \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
             benchmark_vllm_offline.sbatch
         
         echo ""
@@ -513,16 +748,28 @@ case "${1:-help}" in
         
         cd "$SCRIPT_DIR"
         
+        GRES_OPT=$(get_gres_option)
+        JOB_NAME=$(build_job_name "custom" "$MODEL_SHORT_NAME" "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
+        PARALLELISM_DIR=$(build_parallelism_dir "$NUM_NODES" "$TP_SIZE" "$PP_SIZE")
         MODEL_PATH="$MODEL_PATH" \
         TENSOR_PARALLEL_SIZE=$TP_SIZE \
         PIPELINE_PARALLEL_SIZE=$PP_SIZE \
         EXPERT_PARALLEL_SIZE=$EP_SIZE \
         NUM_PROMPTS=$NUM_PROMPTS \
         NUM_GENERATIONS=$NUM_GENERATIONS \
+        EXPERIMENT_DIR="$EXPERIMENT_DIR" \
+        SCRIPT_DIR="$SCRIPT_DIR" \
+        MODEL_SHORT_NAME="$MODEL_SHORT_NAME" \
+        PARALLELISM_DIR="$PARALLELISM_DIR" \
         PROMPTS_FILE="$PROMPTS_FILE" \
+        JOB_CACHE_DIR="$JOB_CACHE_DIR" \
         sbatch \
             --nodes=$NUM_NODES \
-            --gres=gpu:$GPUS_PER_NODE \
+            $GRES_OPT \
+            --partition=$SLURM_PARTITION \
+            --account=$SLURM_ACCOUNT \
+            --job-name="$JOB_NAME" \
+            -o /dev/null -e /dev/null \
             benchmark_vllm_offline.sbatch
         ;;
     
@@ -547,6 +794,12 @@ case "${1:-help}" in
         echo "  build-custom    Build venv with custom vLLM from GitHub"
         echo "  build-local     Build venv with local vLLM source (for development)"
         echo "  run-custom-vllm Run benchmark (after build-custom or build-local)"
+        echo ""
+        echo "Cluster configuration (auto-detected or set via CLUSTER env var):"
+        echo "  CLUSTER         Cluster name: lyris, oci-hsg (auto-detected from hostname)"
+        echo "  SLURM_PARTITION Partition name (lyris: gb200, oci-hsg: batch)"
+        echo "  SLURM_ACCOUNT   Account name (lyris: coreai_dlalgo_llm, oci-hsg: coreai_dlalgo_nemorl)"
+        echo "  USE_GRES        Use --gres option: 0=no, 1=yes (lyris: 0, oci-hsg: 1)"
         echo ""
         echo "Environment variables:"
         echo "  MODEL           Model preset name (qwen32b, qwen3-30b, etc.)"
@@ -578,6 +831,11 @@ case "${1:-help}" in
         echo "  MAX_CONCURRENCY Max concurrent requests (default: 64)"
         echo "  MAX_ISL         Input sequence length (default: 150)"
         echo "  MAX_OSL         Output sequence lengths, space-separated (default: '1000 2000')"
+        echo ""
+        echo "Weights & Biases (wandb) integration:"
+        echo "  WANDB_UPLOAD    Enable auto-upload: 1=yes (default), 0=no"
+        echo "  WANDB_PROJECT   wandb project name (default: vllm-benchmark)"
+        echo "  WANDB_ENTITY    wandb team/username (optional)"
         echo ""
         echo "Parallelism example (4 nodes × 4 GPUs = 16 GPUs):"
         echo "  TP=4, PP=1 → DP=4 (4 vLLM instances, each using 4 GPUs)"

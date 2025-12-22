@@ -203,22 +203,21 @@ def main():
     print(f"  ✓ Prepared {len(all_prompts)} requests ({num_unique} unique prompts)")
     
     if args.dp > 1:
-        # For DP > 1, warn and fall back to DP=1
-        # vLLM's data_parallel_size requires explicit multiprocessing which is complex in SLURM
-        print(f"\n▶ Initializing vLLM with DP={args.dp} requested (TP={args.tp}, PP={args.pp})...")
-        print(f"\n⚠️  WARNING: Multi-process DP is complex to set up in SLURM environment.")
-        print(f"   Falling back to DP=1 (using TP={args.tp} on {args.tp} GPUs)")
-        print(f"   For true DP, consider running {args.dp} separate jobs.\n")
+        # DP > 1: Use vLLM's data_parallel_size with Ray backend
+        print(f"\n▶ Initializing vLLM (TP={args.tp}, PP={args.pp}, DP={args.dp})...")
+        print(f"   Total GPUs = TP*PP*DP = {args.tp}*{args.pp}*{args.dp} = {total_gpus}")
         
         llm_kwargs = {
             "model": args.model,
             "tensor_parallel_size": args.tp,
             "pipeline_parallel_size": args.pp,
+            "data_parallel_size": args.dp,  # Enable actual data parallelism!
             "gpu_memory_utilization": args.gpu_utilization,
             "max_model_len": args.max_model_len,
             "trust_remote_code": args.trust_remote_code,
             "dtype": "bfloat16",
             "disable_log_stats": True,
+            "distributed_executor_backend": "ray",  # Ray required for DP
         }
         
         # Enable Expert Parallelism for MoE models
@@ -226,12 +225,8 @@ def main():
             llm_kwargs["enable_expert_parallel"] = True
             print(f"   Expert Parallelism enabled (EP={args.ep})")
         
-        # Use Ray only for multi-node
-        if args.num_nodes > 1:
-            llm_kwargs["distributed_executor_backend"] = "ray"
-        
         llm = LLM(**llm_kwargs)
-        print("  ✓ vLLM initialized (DP=1 fallback)")
+        print(f"  ✓ vLLM initialized with DP={args.dp}")
     else:
         # Single instance (DP=1)
         if is_moe:

@@ -1,13 +1,42 @@
 #!/bin/bash
-#SBATCH -A coreai_dlalgo_nemorl
-#SBATCH -J vllm-offline-bench
-#SBATCH -p batch
+# Note: -A (account), -p (partition), and -J (job-name) are passed via command line
+# from run_vllm_benchmark.sh to support different clusters and descriptive job names
 #SBATCH -t 02:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/offline/%j-logs/slurm-%j.out
-#SBATCH -e /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/offline/%j-logs/slurm-%j.err
+# Note: stdout/stderr are redirected to LOGS_DIR after directory creation
 
 set -ex
+
+# ============================================================
+# Paths Configuration (passed from run_vllm_benchmark.sh)
+# ============================================================
+# SCRIPT_DIR, EXPERIMENT_DIR, MODEL_SHORT_NAME, PARALLELISM_DIR are passed as environment variables
+SCRIPT_DIR=${SCRIPT_DIR:-$(dirname "$(readlink -f "$0")")}
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-$SCRIPT_DIR/../vllm_standalone_perf_exp}
+
+# Model and parallelism info for directory structure
+MODEL_SHORT_NAME=${MODEL_SHORT_NAME:-unknown}
+PARALLELISM_DIR=${PARALLELISM_DIR:-1n4t1p}
+
+# Log directory structure: <benchmark_type>/<model>/<parallelism>/<job_id>-logs/
+LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/offline/${MODEL_SHORT_NAME}/${PARALLELISM_DIR}/${SLURM_JOB_ID}-logs}
+
+# Create log directory and redirect all output there
+mkdir -p "$LOGS_DIR"
+exec > >(tee -a "$LOGS_DIR/slurm-${SLURM_JOB_ID}.out") 2>&1
+
+echo "============================================================"
+echo "SLURM Job Information"
+echo "============================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job Name: $SLURM_JOB_NAME"
+echo "Nodes: $SLURM_JOB_NUM_NODES"
+echo "Node List: $SLURM_JOB_NODELIST"
+echo "Partition: $SLURM_JOB_PARTITION"
+echo "Account: $SLURM_JOB_ACCOUNT"
+echo "Log Directory: $LOGS_DIR"
+echo "Start Time: $(date)"
+echo "============================================================"
 
 # ============================================================
 # HuggingFace Configuration
@@ -59,16 +88,13 @@ PROMPTS_FILE=${PROMPTS_FILE:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalg
 RANDOM_INPUT_LEN=${RANDOM_INPUT_LEN:-150}
 
 # Container and paths
-# Script directory and parent directory
-SCRIPT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_benchmark
-BASE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl
+# Note: SCRIPT_DIR and EXPERIMENT_DIR are passed from run_vllm_benchmark.sh
+BASE_DIR=$(dirname "$SCRIPT_DIR")
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
 CONTAINER_NAME=vllm-offline-bench
-JOB_CACHE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache
-
-# Log directory (separated by benchmark type)
-EXPERIMENT_DIR=${EXPERIMENT_DIR:-$BASE_DIR/vllm_standalone_perf_exp}
-LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/offline/${SLURM_JOB_ID}-logs}
+# JOB_CACHE_DIR is passed from run_vllm_benchmark.sh (cluster-specific)
+# Fallback to a safe default if not set
+JOB_CACHE_DIR=${JOB_CACHE_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/job_cache}
 
 # venv for custom installations (persisted across jobs)
 VLLM_VENV_DIR=${VLLM_VENV_DIR:-$BASE_DIR/vllm-benchmark-venv}
@@ -87,9 +113,9 @@ VLLM_GIT_BRANCH=${VLLM_GIT_BRANCH:-main}
 # Setup
 # ============================================================
 
-mkdir -p $EXPERIMENT_DIR
-mkdir -p $LOGS_DIR
-mkdir -p $JOB_CACHE_DIR
+mkdir -p "$EXPERIMENT_DIR"
+mkdir -p "$LOGS_DIR"
+mkdir -p "$JOB_CACHE_DIR"
 
 # ============================================================
 # Build venv (Duncan-style DO_BUILD)
@@ -207,19 +233,42 @@ echo "Head node: $head_node ($head_ip)"
 # ============================================================
 # vLLM Environment Variables 
 # ============================================================
+# Core vLLM settings
 export VLLM_USE_V1=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
+# NeMo-RL performance settings (always enabled)
+export VLLM_SKIP_P2P_CHECK=1              # Skip P2P check, rely on driver
+export VLLM_ENABLE_V1_MULTIPROCESSING=0   # Avoid Ray conflict
+export NCCL_CUMEM_ENABLE=1                # Fix PyNCCL P2P init error
+
+# Cross-node model parallelism NCCL settings
+if [ $NUM_NODES -gt 1 ]; then
+    if [ $GPUS_PER_INSTANCE -gt $NUM_GPUS_PER_NODE ]; then
+        export NCCL_NVLS_ENABLE=0         # Fix NCCL error for cross-node MP
+        echo "Cross-node parallelism detected, NCCL_NVLS_ENABLE=0"
+    fi
+fi
+
 # MoE-specific environment variables (for DeepSeek, Mixtral, Qwen3-MoE, etc.)
 if [ "$ENABLE_EXPERT_PARALLEL" == "1" ] || [ $EXPERT_PARALLEL_SIZE -gt 1 ]; then
     echo "MoE mode enabled (EP=$EXPERT_PARALLEL_SIZE)"
-    export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
-    # For FP8 MoE models
-    # export VLLM_USE_FLASHINFER_MOE_FP8=1
-    # For FP4 MoE models  
-    # export VLLM_USE_FLASHINFER_MOE_FP4=1
+    # Choose MOE backend based on concurrency
+    if [ ${MAX_NUM_SEQS:-256} -lt 64 ]; then
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-latency}
+    else
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
+    fi
+    echo "VLLM_FLASHINFER_MOE_BACKEND=$VLLM_FLASHINFER_MOE_BACKEND"
+fi
+
+# Data Parallelism settings (when DP > 1)
+if [ $DATA_PARALLEL_SIZE -gt 1 ]; then
+    export VLLM_DP_MASTER_IP=$head_ip
+    export VLLM_DP_SIZE=$DATA_PARALLEL_SIZE
+    echo "Data Parallelism enabled: DP=$DATA_PARALLEL_SIZE"
 fi
 
 # ============================================================
@@ -294,16 +343,16 @@ if [ -d '$VLLM_VENV_DIR' ]; then
     echo 'Using venv: $VLLM_VENV_DIR'
 fi
 
-# Start Ray head only for multi-node (like Duncan's script)
-# Single node: vLLM uses multiprocessing internally, no Ray needed
-if [ $NUM_NODES -gt 1 ]; then
-    echo 'Starting Ray head (NUM_NODES=$NUM_NODES)...'
+# Start Ray head for multi-node OR data parallelism (DP > 1)
+# Ray is required when using data_parallel_size in vLLM
+if [ $NUM_NODES -gt 1 ] || [ $DATA_PARALLEL_SIZE -gt 1 ]; then
+    echo 'Starting Ray head (NUM_NODES=$NUM_NODES, DP=$DATA_PARALLEL_SIZE)...'
     ray start --head --node-ip-address='$head_ip' --port=6379 \
         --min-worker-port=20000 --max-worker-port=29999
     sleep 15
     ray status
 else
-    echo 'Single node mode - skipping Ray (vLLM will use multiprocessing)'
+    echo 'Single node, single instance mode - skipping Ray (vLLM will use multiprocessing)'
     # Unset RAY_ADDRESS to prevent vLLM from trying to connect to Ray
     unset RAY_ADDRESS
 fi
@@ -376,5 +425,26 @@ fi
 
 echo "============================================================"
 echo "Benchmark complete! Results in: $LOGS_DIR"
+echo "============================================================"
+
+# ============================================================
+# Upload to wandb (if enabled)
+# ============================================================
+WANDB_UPLOAD=${WANDB_UPLOAD:-1}
+WANDB_PROJECT=${WANDB_PROJECT:-vllm-benchmark}
+
+if [ "$WANDB_UPLOAD" == "1" ] && [ -f "$LOGS_DIR/results.json" ]; then
+    echo ""
+    echo "Uploading results to wandb (project: $WANDB_PROJECT)..."
+    
+    python3 $SCRIPT_DIR/upload_to_wandb.py \
+        "$LOGS_DIR/results.json" \
+        --project "$WANDB_PROJECT" \
+        --benchmark-type offline \
+        --tags "offline" "$GPU_MODEL" || echo "Warning: wandb upload failed (wandb may not be installed)"
+fi
+
+echo ""
+echo "End time: $(date)"
 echo "============================================================"
 

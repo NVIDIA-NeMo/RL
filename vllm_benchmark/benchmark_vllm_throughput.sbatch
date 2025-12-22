@@ -1,11 +1,9 @@
 #!/bin/bash
-#SBATCH -A coreai_dlalgo_nemorl
-#SBATCH -J vllm-throughput-bench
-#SBATCH -p batch
+# Note: -A (account), -p (partition), and -J (job-name) are passed via command line
+# from run_vllm_benchmark.sh to support different clusters and descriptive job names
 #SBATCH -t 02:00:00
 #SBATCH --ntasks-per-node 1
-#SBATCH -o /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.out
-#SBATCH -e /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_standalone_perf_exp/throughput/%j-logs/slurm-%j.err
+# Note: stdout/stderr are redirected to LOGS_DIR after directory creation
 
 set -ex
 
@@ -21,6 +19,37 @@ set -ex
 # The benchmark sweeps through multiple ISL/OSL combinations
 # and reports tokens/sec for each configuration.
 # ============================================================
+
+# ============================================================
+# Paths Configuration (passed from run_vllm_benchmark.sh)
+# ============================================================
+# SCRIPT_DIR, EXPERIMENT_DIR, MODEL_SHORT_NAME, PARALLELISM_DIR are passed as environment variables
+SCRIPT_DIR=${SCRIPT_DIR:-$(dirname "$(readlink -f "$0")")}
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-$SCRIPT_DIR/../vllm_standalone_perf_exp}
+
+# Model and parallelism info for directory structure
+MODEL_SHORT_NAME=${MODEL_SHORT_NAME:-unknown}
+PARALLELISM_DIR=${PARALLELISM_DIR:-1n4t1p}
+
+# Log directory structure: <benchmark_type>/<model>/<parallelism>/<job_id>-logs/
+LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/throughput/${MODEL_SHORT_NAME}/${PARALLELISM_DIR}/${SLURM_JOB_ID}-logs}
+
+# Create log directory and redirect all output there
+mkdir -p "$LOGS_DIR"
+exec > >(tee -a "$LOGS_DIR/slurm-${SLURM_JOB_ID}.out") 2>&1
+
+echo "============================================================"
+echo "SLURM Job Information"
+echo "============================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job Name: $SLURM_JOB_NAME"
+echo "Nodes: $SLURM_JOB_NUM_NODES"
+echo "Node List: $SLURM_JOB_NODELIST"
+echo "Partition: $SLURM_JOB_PARTITION"
+echo "Account: $SLURM_JOB_ACCOUNT"
+echo "Log Directory: $LOGS_DIR"
+echo "Start Time: $(date)"
+echo "============================================================"
 
 # ============================================================
 # HuggingFace Configuration
@@ -87,17 +116,13 @@ RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.0}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 
 # Container and paths
-# Script directory and parent directory
-SCRIPT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/vllm_benchmark
-BASE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl
-#CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/nemo-rl/nemo_rl_nightly.sqsh}
-ONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
+# Note: SCRIPT_DIR and EXPERIMENT_DIR are passed from run_vllm_benchmark.sh
+BASE_DIR=$(dirname "$SCRIPT_DIR")
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-vllm/vllm-openai:nightly-aarch64}
 CONTAINER_NAME=vllm-throughput-bench
-JOB_CACHE_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/job_cache
-
-# Log directory
-EXPERIMENT_DIR=${EXPERIMENT_DIR:-$BASE_DIR/vllm_standalone_perf_exp}
-LOGS_DIR=${LOGS_DIR:-$EXPERIMENT_DIR/throughput/${SLURM_JOB_ID}-logs}
+# JOB_CACHE_DIR is passed from run_vllm_benchmark.sh (cluster-specific)
+# Fallback to a safe default if not set
+JOB_CACHE_DIR=${JOB_CACHE_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/job_cache}
 
 # venv for custom installations
 VLLM_VENV_DIR=${VLLM_VENV_DIR:-$BASE_DIR/vllm-benchmark-venv}
@@ -124,8 +149,10 @@ echo "============================================================"
 echo "Model: $MODEL_PATH"
 echo "Nodes: $NUM_NODES"
 echo "GPUs per node: $NUM_GPUS_PER_NODE"
-echo "Total GPUs: $NUM_GPUS"
+echo "Total GPUs allocated: $NUM_GPUS"
 echo "Parallelism: TP=$TENSOR_PARALLEL_SIZE, PP=$PIPELINE_PARALLEL_SIZE"
+echo "  → Actual GPUs used: TP×PP = $((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))"
+echo "  → Note: vllm bench throughput does NOT support DP"
 if [ $EXPERT_PARALLEL_SIZE -gt 1 ]; then
     echo "Expert Parallelism: EP=$EXPERT_PARALLEL_SIZE (MoE)"
 fi
@@ -164,16 +191,42 @@ echo "Head node: $head_node ($head_ip)"
 # ============================================================
 # vLLM Environment Variables 
 # ============================================================
+# Core vLLM settings
 export VLLM_USE_V1=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
+# NeMo-RL performance settings (always enabled)
+export VLLM_SKIP_P2P_CHECK=1              # Skip P2P check, rely on driver
+export VLLM_ENABLE_V1_MULTIPROCESSING=0   # Avoid Ray conflict
+export NCCL_CUMEM_ENABLE=1                # Fix PyNCCL P2P init error
+
+# Cross-node model parallelism NCCL settings
+if [ $NUM_NODES -gt 1 ]; then
+    GPUS_PER_INSTANCE=$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))
+    if [ $GPUS_PER_INSTANCE -gt $NUM_GPUS_PER_NODE ]; then
+        export NCCL_NVLS_ENABLE=0         # Fix NCCL error for cross-node MP
+        echo "Cross-node parallelism detected, NCCL_NVLS_ENABLE=0"
+    fi
+fi
+
 # MoE-specific environment variables
 if [ "$ENABLE_EXPERT_PARALLEL" == "1" ] || [ $EXPERT_PARALLEL_SIZE -gt 1 ]; then
     echo "MoE mode enabled (EP=$EXPERT_PARALLEL_SIZE)"
-    export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
+    # Choose MOE backend based on model and concurrency
+    # latency: better for low concurrency (< 64)
+    # throughput: better for high concurrency
+    if [ ${MAX_NUM_SEQS:-256} -lt 64 ]; then
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-latency}
+    else
+        export VLLM_FLASHINFER_MOE_BACKEND=${VLLM_FLASHINFER_MOE_BACKEND:-throughput}
+    fi
+    echo "VLLM_FLASHINFER_MOE_BACKEND=$VLLM_FLASHINFER_MOE_BACKEND"
 fi
+
+# Note: vllm bench throughput does NOT support Data Parallelism
+# Only TP*PP GPUs are used. For DP benchmarking, use run-offline or run-online.
 
 # ============================================================
 # Start Ray workers on non-head nodes
@@ -244,7 +297,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
-# Ray setup
+# Ray setup - needed for multi-node only (vllm bench throughput doesn't support DP)
 if [ $NUM_NODES -gt 1 ]; then
     echo 'Starting Ray head (NUM_NODES=$NUM_NODES)...'
     ray start --head --node-ip-address='$head_ip' --port=6379 \
@@ -282,7 +335,11 @@ if [ $EXPERT_PARALLEL_SIZE -gt 1 ]; then
     VLLM_ARGS=\"\$VLLM_ARGS --enable-expert-parallel\"
 fi
 
-# Add Ray backend for multi-GPU
+# vllm bench throughput uses TP*PP GPUs (no DP support)
+GPUS_USED=\$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))
+echo \"Using \$GPUS_USED GPUs (TP=$TENSOR_PARALLEL_SIZE × PP=$PIPELINE_PARALLEL_SIZE)\"
+
+# Add Ray backend for multi-GPU (multi-node requires Ray)
 if [ $NUM_NODES -gt 1 ]; then
     VLLM_ARGS=\"\$VLLM_ARGS --distributed-executor-backend ray\"
 fi
@@ -367,7 +424,10 @@ for ISL in $INPUT_LENS; do
         TOTAL_TIME=\${TOTAL_TIME:-0}
         
         # Calculate per-GPU throughput
-        PER_GPU_TOK=\$(awk "BEGIN {printf \"%.2f\", \$THROUGHPUT_TOK / $NUM_GPUS}")
+        # IMPORTANT: Use ACTUAL GPUs used (TP*PP), NOT total allocated GPUs!
+        # vllm bench throughput uses only TP*PP GPUs (no DP support)
+        ACTUAL_GPUS_USED=\$(($TENSOR_PARALLEL_SIZE * $PIPELINE_PARALLEL_SIZE))
+        PER_GPU_TOK=\$(THROUGHPUT_TOK=\$THROUGHPUT_TOK python3 $SCRIPT_DIR/calc_per_gpu.py \$ACTUAL_GPUS_USED 2>/dev/null || echo "0.00")
         
         echo \"Parsed: req/s=\$THROUGHPUT_REQ, tok/s=\$THROUGHPUT_TOK (\$PER_GPU_TOK tok/s/GPU), time=\$TOTAL_TIME\"
         
@@ -386,7 +446,8 @@ for ISL in $INPUT_LENS; do
   \"gpu_model\": \"\$GPU_MODEL\",
   \"num_nodes\": $NUM_NODES,
   \"gpus_per_node\": $NUM_GPUS_PER_NODE,
-  \"total_gpus\": $NUM_GPUS,
+  \"total_gpus_allocated\": $NUM_GPUS,
+  \"actual_gpus_used\": \$ACTUAL_GPUS_USED,
   \"tp_size\": $TENSOR_PARALLEL_SIZE,
   \"pp_size\": $PIPELINE_PARALLEL_SIZE,
   \"ep_size\": $EXPERT_PARALLEL_SIZE,
@@ -426,5 +487,27 @@ echo "Results:"
 echo "  - Summary: $LOGS_DIR/results_summary.txt"
 echo "  - JSON: $LOGS_DIR/results.json"
 echo "  - Individual results: $LOGS_DIR/result_ISL*_OSL*.txt"
+echo "============================================================"
+
+# ============================================================
+# Upload to wandb (if enabled)
+# ============================================================
+WANDB_UPLOAD=${WANDB_UPLOAD:-1}
+WANDB_PROJECT=${WANDB_PROJECT:-vllm-benchmark}
+
+if [ "$WANDB_UPLOAD" == "1" ] && [ -f "$LOGS_DIR/results.json" ]; then
+    echo ""
+    echo "Uploading results to wandb (project: $WANDB_PROJECT)..."
+    
+    # Try to upload with pip-installed wandb or skip if not available
+    python3 $SCRIPT_DIR/upload_to_wandb.py \
+        "$LOGS_DIR/results.json" \
+        --project "$WANDB_PROJECT" \
+        --benchmark-type throughput \
+        --tags "throughput" "$GPU_MODEL" || echo "Warning: wandb upload failed (wandb may not be installed)"
+fi
+
+echo ""
+echo "End time: $(date)"
 echo "============================================================"
 

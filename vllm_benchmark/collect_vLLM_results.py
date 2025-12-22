@@ -285,11 +285,18 @@ def find_all_job_dirs(job_ids=None, base_dir="."):
     if job_ids:
         dirs = []
         for job_id in job_ids:
-            job_dir = base_path / f"{job_id}-logs"
-            if job_dir.exists():
-                dirs.append(job_dir)
+            # Search recursively for job_id-logs directory
+            matches = list(base_path.glob(f"**/{job_id}-logs"))
+            if matches:
+                dirs.extend(matches)
+            else:
+                # Fallback to direct path
+                job_dir = base_path / f"{job_id}-logs"
+                if job_dir.exists():
+                    dirs.append(job_dir)
     else:
-        dirs = [d for d in base_path.glob("*-logs") if d.is_dir()]
+        # Search recursively for all *-logs directories
+        dirs = [d for d in base_path.glob("**/*-logs") if d.is_dir()]
     
     return sorted(dirs)
 
@@ -299,17 +306,18 @@ def find_result_files(job_ids=None, base_dir="."):
     base_path = Path(base_dir)
     
     if job_ids:
-        # Specific job IDs
+        # Specific job IDs - search recursively
         files = []
         for job_id in job_ids:
-            pattern = base_path / f"{job_id}-logs" / "results.json"
-            if pattern.exists():
-                files.append(pattern)
+            # Search recursively for job_id-logs/results.json
+            matches = list(base_path.glob(f"**/{job_id}-logs/results.json"))
+            if matches:
+                files.extend(matches)
             else:
-                print(f"Warning: {pattern} not found")
+                print(f"Warning: {job_id}-logs/results.json not found in {base_path}")
     else:
-        # Find all
-        files = list(base_path.glob("*-logs/results.json"))
+        # Find all recursively
+        files = list(base_path.glob("**/*-logs/results.json"))
     
     return sorted(files)
 
@@ -480,8 +488,8 @@ def print_table(results, group_by_config=False, bench_type="offline"):
         print_individual_table(results)
 
 
-def get_status_display(status):
-    """Get colored status display."""
+def get_status_display(status, width=18):
+    """Get colored status display with proper padding."""
     # ANSI color codes
     GREEN = '\033[92m'
     YELLOW = '\033[93m'
@@ -492,19 +500,25 @@ def get_status_display(status):
     RESET = '\033[0m'
     
     status_colors = {
-        'Completed': f'{GREEN}Completed{RESET}',
-        'Running': f'{YELLOW}Running{RESET}',
-        'Pending': f'{BLUE}Pending{RESET}',
-        'Failed': f'{RED}Failed{RESET}',
-        'Failed (OOM)': f'{RED}Failed (OOM){RESET}',
-        'Failed (Timeout)': f'{RED}Failed (Timeout){RESET}',
-        'Cancelled': f'{MAGENTA}Cancelled{RESET}',
-        'Unknown': f'{GRAY}Unknown{RESET}',
+        'Completed': GREEN,
+        'Running': YELLOW,
+        'Pending': BLUE,
+        'Failed': RED,
+        'Failed (OOM)': RED,
+        'Failed (Timeout)': RED,
+        'Cancelled': MAGENTA,
+        'Unknown': GRAY,
     }
+    
     # Handle Queued states
     if status.startswith('Queued'):
-        return f'{BLUE}{status}{RESET}'
-    return status_colors.get(status, f'{RED}{status}{RESET}')
+        color = BLUE
+    else:
+        color = status_colors.get(status, RED)
+    
+    # Pad the status text FIRST, then wrap with color codes
+    padded_status = f"{status:<{width}}"
+    return f'{color}{padded_status}{RESET}'
 
 
 def print_individual_table(results):
@@ -540,7 +554,7 @@ def print_individual_table(results):
         status = r.get('_status', 'Completed')
         
         print(f"{job_id:<10} "
-              f"{get_status_display(status):<27} "  # Extra space for ANSI codes
+              f"{get_status_display(status, 18)} "  # Padding handled inside function
               f"{gpu_model:<8} "
               f"{model:<20} "
               f"{r.get('num_nodes', 1):>2} "
@@ -645,9 +659,10 @@ def print_throughput_table(results):
             key = (r.get('input_len', 0), r.get('requested_output_len', r.get('output_len', 0)), r.get('actual_output_len', r.get('output_len', 0)), r.get('num_prompts', 0))
             isl_osl_groups[key].append(r)
         
-        # Table header
-        print(f"  {'ISL':>6} {'ReqOSL':>8} {'ActOSL':>8} {'Prompts':>8} {'Runs':>5} {'Req/s':>12} {'Tok/s (mean±std)':>22} {'Tok/s/GPU':>12}")
-        print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*8} {'-'*5} {'-'*12} {'-'*22} {'-'*12}")
+        # Table header - use fixed column widths
+        # ISL(6) ReqOSL(8) ActOSL(11 with indicator) Prompts(8) Runs(5) Req/s(10) Tok/s(14) +/-(8) Tok/s/GPU(14)
+        print(f"  {'ISL':>6}  {'ReqOSL':>8}  {'ActOSL':>11}  {'Prompts':>8}  {'Runs':>5}  {'Req/s':>10}  {'Tok/s':>14}  {'Std':>8}  {'Tok/s/GPU':>14}")
+        print(f"  {'-'*6}  {'-'*8}  {'-'*11}  {'-'*8}  {'-'*5}  {'-'*10}  {'-'*14}  {'-'*8}  {'-'*14}")
         
         total_gpus = nodes * gpn
         current_isl = None
@@ -672,14 +687,15 @@ def print_throughput_table(results):
                 print()
             current_isl = isl
             
-            if tok_std > 0:
-                tok_str = f"{tok_mean:>12,.0f} ± {tok_std:>6,.0f}"
-            else:
-                tok_str = f"{tok_mean:>12,.0f}         "
+            # Format tok/s and std as separate fixed-width columns
+            tok_str = f"{tok_mean:>14,.0f}"
+            std_str = f"+/-{tok_std:,.0f}" if tok_std > 0 else ""
             
-            # Show adjusted indicator if requested != actual
-            osl_indicator = "(*)" if req_osl != act_osl else ""
-            print(f"  {isl:>6} {req_osl:>8} {act_osl:>8}{osl_indicator} {prompts:>8} {len(runs):>5} {req_mean:>12.2f} {tok_str:>22} {tok_gpu:>12,.0f}")
+            # Format ActOSL with indicator as fixed width
+            osl_indicator = "*" if req_osl != act_osl else ""
+            act_osl_str = f"{act_osl}{osl_indicator}"
+            
+            print(f"  {isl:>6}  {req_osl:>8}  {act_osl_str:>11}  {prompts:>8}  {len(runs):>5}  {req_mean:>10.2f}  {tok_str}  {std_str:>8}  {tok_gpu:>14,.0f}")
     
     # Overall summary
     print(f"\n{BOLD}{'=' * 100}{RESET}")
