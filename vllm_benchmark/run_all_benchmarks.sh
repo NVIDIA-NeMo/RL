@@ -24,8 +24,16 @@
 #   - num_prompts: 64
 #   - num_generations: 32 (n parameter)
 #   - max_seqlen: 4096
-#   - Input lengths: 64, 100, 150 tokens
-#   - Output lengths: 2048, 4096 tokens
+#
+# Input/Output Length Configurations:
+#   All configurations maintain Total = Input + Output = 4096
+#   to match Megatron-Bridge training seq_length=4096
+#
+#   Default pairs (Input:Output):
+#     - 512:3584   (short input, long output - typical LLM generation)
+#     - 1024:3072  (balanced towards output)
+#     - 2048:2048  (equal split - fairest comparison)
+#     - 3072:1024  (long input, short output - summarization)
 #
 # wandb settings:
 #   WANDB_PROJECT=my-project ./run_all_benchmarks.sh
@@ -43,8 +51,51 @@ cd "$SCRIPT_DIR"
 NUM_PROMPTS=${NUM_PROMPTS:-64}
 NUM_GENERATIONS=${NUM_GENERATIONS:-32}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
-INPUT_LENS=${INPUT_LENS:-"64 100 150"}
-OUTPUT_LENS=${OUTPUT_LENS:-"2048 4096"}
+
+# ============================================================
+# Input/Output Length Pairs (Total = 4096 to match Megatron-Bridge)
+# ============================================================
+# Format: "input1:output1 input2:output2 ..."
+# Each pair sums to 4096 for fair comparison with:
+#   - Megatron-Bridge: seq_length=4096 (training)
+#   - NeMo-RL GRPO: input_length + output_length = 4096
+#
+# OpenMathInstruct-2 dataset characteristics (from HuggingFace):
+#   - problem: 13~13.6K chars, typically 50-150 tokens
+#   - generated_solution: 190~50.7K chars, typically 200-500+ tokens (CoT)
+#
+# Reference: https://huggingface.co/datasets/nvidia/OpenMathInstruct-2
+#
+# Default configuration (optimized for OpenMathInstruct-2):
+#   128:3968   - RECOMMENDED (realistic math problem length)
+#
+# Alternative configurations:
+#   64:4032    - Very short problems (simple arithmetic)
+#   128:3968   - Typical math problems (RECOMMENDED)
+#   256:3840   - Longer problems (word problems, complex equations)
+#   512:3584   - Complex multi-step problems
+#
+# Override with: IO_PAIRS="128:3968 256:3840" ./run_all_benchmarks.sh
+# ============================================================
+IO_PAIRS=${IO_PAIRS:-"128:3968"}
+
+# Legacy variables (kept for backward compatibility, but IO_PAIRS takes precedence)
+INPUT_LENS=${INPUT_LENS:-""}
+OUTPUT_LENS=${OUTPUT_LENS:-""}
+
+# Parse IO_PAIRS into INPUT_LENS and OUTPUT_LENS if not explicitly set
+if [[ -z "$INPUT_LENS" ]] && [[ -n "$IO_PAIRS" ]]; then
+    INPUT_LENS=""
+    OUTPUT_LENS=""
+    for pair in $IO_PAIRS; do
+        input_len="${pair%%:*}"
+        output_len="${pair##*:}"
+        INPUT_LENS="$INPUT_LENS $input_len"
+        OUTPUT_LENS="$OUTPUT_LENS $output_len"
+    done
+    INPUT_LENS="${INPUT_LENS# }"  # trim leading space
+    OUTPUT_LENS="${OUTPUT_LENS# }"
+fi
 
 # ============================================================
 # Weights & Biases settings
@@ -62,7 +113,10 @@ echo "Common settings:"
 echo "  NUM_PROMPTS: $NUM_PROMPTS"
 echo "  NUM_GENERATIONS (n): $NUM_GENERATIONS"
 echo "  MAX_MODEL_LEN: $MAX_MODEL_LEN"
-echo "  INPUT_LENS: $INPUT_LENS"
+echo ""
+echo "Input/Output Configurations (Total=4096 for Megatron-Bridge comparison):"
+echo "  IO_PAIRS: $IO_PAIRS"
+echo "  INPUT_LENS:  $INPUT_LENS"
 echo "  OUTPUT_LENS: $OUTPUT_LENS"
 echo ""
 echo "Weights & Biases:"

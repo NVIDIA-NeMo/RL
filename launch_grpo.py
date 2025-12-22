@@ -348,7 +348,11 @@ def build_command(model_cfg: Dict[str, Any],
                   account: Optional[str] = None,
                   partition: Optional[str] = None,
                   enable_vllm_metrics: bool = False,
-                  vllm_metrics_interval: float = 0.5) -> str:
+                  vllm_metrics_interval: float = 0.5,
+                  use_random_dataset: bool = False,
+                  input_length: Optional[int] = None,
+                  output_length: Optional[int] = None,
+                  disable_sequence_packing: bool = False) -> str:
     """Build the sbatch command for a given configuration."""
     
     gpus_per_node = cluster_config["gpus_per_node"]
@@ -409,10 +413,32 @@ def build_command(model_cfg: Dict[str, Any],
     else:
         full_wandb_project = wandb_project
     model_short = model_cfg["model_name"].split("/")[-1].replace("-", "_").replace(".", "_")
-    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}"
+    
+    # Build suffix for fixed input/output length (for benchmarking)
+    # Format: _I{input_len}O{output_len}[_nopack] (e.g., _I512O256_nopack)
+    io_suffix = ""
+    io_suffix_short = ""
+    if use_random_dataset and (input_length is not None or output_length is not None):
+        io_parts = []
+        io_parts_short = []
+        if input_length is not None:
+            io_parts.append(f"I{input_length}")
+            io_parts_short.append(f"I{input_length}")
+        if output_length is not None:
+            io_parts.append(f"O{output_length}")
+            io_parts_short.append(f"O{output_length}")
+        io_suffix = "_" + "".join(io_parts)
+        io_suffix_short = "_" + "".join(io_parts_short)
+    
+    # Add nopack suffix if sequence packing is disabled
+    if disable_sequence_packing:
+        io_suffix += "_nopack"
+        io_suffix_short += "_np"  # shorter for job name
+    
+    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}{io_suffix}"
     
     # Job name (SLURM squeue display)
-    # Format: Model_NxG_T.tp#.cp#.ep#.pp#.dp#_G.tp#.pp#.dp#
+    # Format: Model_NxG_T.tp#.cp#.ep#.pp#.dp#_G.tp#.pp#.dp#[_I#O#]
     # Extract a clean short model name (e.g., "llama8b", "qwen32b")
     model_name_lower = model_short.lower()
     # Try to extract model size (e.g., "8b", "70b", "32b") and combine with model family
@@ -428,10 +454,16 @@ def build_command(model_cfg: Dict[str, Any],
         # Fallback: use first 10 chars, strip trailing underscores
         short_name = model_name_lower[:10].rstrip("_")
     
-    job_name = f"{short_name}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}"
+    job_name = f"{short_name}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}{io_suffix_short}"
+    
+    # Choose script based on random_dataset flag
+    if use_random_dataset:
+        script_path = "./examples/run_grpo_random_dataset.py"
+    else:
+        script_path = "./examples/run_grpo_math.py"
     
     # Build command
-    command = f"""NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo_math.py \\
+    command = f"""NRL_FORCE_REBUILD_VENVS=true uv run {script_path} \\
 --config {model_cfg['config_file']} \\
 cluster.num_nodes={num_nodes} \\
 cluster.gpus_per_node={gpus_per_node} \\
@@ -449,12 +481,20 @@ grpo.val_period=1000 \\
 checkpointing.enabled=false \\
 grpo.num_prompts_per_step={model_cfg['num_prompts']} \\
 grpo.num_generations_per_prompt={model_cfg['num_generations']} \\
-policy.sequence_packing.enabled=True \\
+policy.sequence_packing.enabled={str(not disable_sequence_packing)} \\
 policy.train_global_batch_size={model_cfg['train_gbs']} \\
 grpo.max_num_steps={max_steps} \\
 logger.wandb_enabled=True \\
 logger.wandb.project='{full_wandb_project}' \\
 logger.wandb.name='{wandb_name}'"""
+
+    # Add fixed input/output length settings for performance benchmarking
+    if use_random_dataset:
+        if input_length is not None:
+            command += f" \\\ndata.input_len_or_input_len_generator={input_length}"
+        if output_length is not None:
+            command += f" \\\npolicy.generation.output_len_or_output_len_generator={output_length}"
+            command += " \\\npolicy.generation.ignore_eos=true"
 
     # Add vLLM metrics logging if enabled
     if enable_vllm_metrics:
@@ -484,7 +524,7 @@ policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"
     
     # Build log directory structure: exp_logs/{model}/{parallelism_config}/
     rollout_gbs = model_cfg['num_prompts'] * model_cfg['num_generations']
-    log_subdir = f"T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}_G.tp{g_tp}.pp{g_pp}_R{rollout_gbs}_T{model_cfg['train_gbs']}_S{model_cfg['max_seqlen']}"
+    log_subdir = f"T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}_G.tp{g_tp}.pp{g_pp}_R{rollout_gbs}_T{model_cfg['train_gbs']}_S{model_cfg['max_seqlen']}{io_suffix}"
     base_log_dir = str(Path.cwd() / "exp_logs" / short_name / log_subdir)
     
     sbatch_cmd = f"""COMMAND="{command}" \\
@@ -590,14 +630,21 @@ def list_presets(cluster_config: dict):
 
 
 def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None, 
-               dry_run: bool = False, **kwargs):
+               dry_run: bool = False, use_random_dataset: bool = False,
+               input_length: Optional[int] = None, output_length: Optional[int] = None,
+               disable_sequence_packing: bool = False, **kwargs):
     """Launch a job with the given configuration."""
     cluster_type = cluster_config["cluster_type"]
     model_cfg = get_model_config(preset, cluster_type, variant)
     
     print_config_summary(model_cfg, cluster_config, preset)
     
-    cmd = build_command(model_cfg, cluster_config, **kwargs)
+    cmd = build_command(model_cfg, cluster_config, 
+                        use_random_dataset=use_random_dataset,
+                        input_length=input_length,
+                        output_length=output_length,
+                        disable_sequence_packing=disable_sequence_packing,
+                        **kwargs)
     
     if dry_run:
         print("🔍 Dry run - Command that would be executed:\n")
@@ -693,6 +740,16 @@ Examples:
     parser.add_argument("--vllm-metrics-interval", type=float, default=0.5,
                         help="vLLM metrics logging interval in seconds (default: 0.5)")
     
+    # Performance benchmarking with fixed input/output lengths
+    parser.add_argument("--use-random-dataset", action="store_true",
+                        help="Use random synthetic dataset for performance benchmarking")
+    parser.add_argument("--input-length", type=int, default=None,
+                        help="Fixed input prompt length (requires --use-random-dataset)")
+    parser.add_argument("--output-length", type=int, default=None,
+                        help="Fixed output generation length (requires --use-random-dataset)")
+    parser.add_argument("--disable-sequence-packing", action="store_true",
+                        help="Disable sequence packing for fair throughput comparison with standalone systems")
+    
     args = parser.parse_args()
     
     # Infer cluster type from variant name if not explicitly specified
@@ -745,7 +802,11 @@ Examples:
                           account=args.account,
                           partition=args.job_partition,
                           enable_vllm_metrics=args.enable_vllm_metrics,
-                          vllm_metrics_interval=args.vllm_metrics_interval)
+                          vllm_metrics_interval=args.vllm_metrics_interval,
+                          use_random_dataset=args.use_random_dataset,
+                          input_length=args.input_length,
+                          output_length=args.output_length,
+                          disable_sequence_packing=args.disable_sequence_packing)
                 launched += 1
             except Exception as e:
                 print(f"❌ Error launching {preset}: {e}")
@@ -775,7 +836,11 @@ Examples:
                         account=args.account,
                         partition=args.job_partition,
                         enable_vllm_metrics=args.enable_vllm_metrics,
-                        vllm_metrics_interval=args.vllm_metrics_interval)
+                        vllm_metrics_interval=args.vllm_metrics_interval,
+                        use_random_dataset=args.use_random_dataset,
+                        input_length=args.input_length,
+                        output_length=args.output_length,
+                        disable_sequence_packing=args.disable_sequence_packing)
             except Exception as e:
                 print(f"❌ Error launching {p}: {e}")
         return
