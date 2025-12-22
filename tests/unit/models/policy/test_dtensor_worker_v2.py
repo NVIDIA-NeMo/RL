@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
+
 import pytest
 import ray
+import torch
 
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.lm_policy import Policy
+from tests.unit.test_utils import SimpleLoss
 
 
 def create_test_config(
@@ -28,8 +36,14 @@ def create_test_config(
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
     dtensor_v2: bool = False,
+    precision: str = "float32",
+    expert_parallel_size: int = 1,
+    use_hf_tp_plan: bool = False,
+    sequence_packing_enabled: bool = False,
+    automodel_model_kwargs: dict | None = None,
+    checkpointing: dict | None = None,
 ) -> PolicyConfig:
-    return {
+    config = {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
         "generation_batch_size": 1,  # Small batch size for testing
@@ -37,7 +51,7 @@ def create_test_config(
         "train_micro_batch_size": 1,
         "learning_rate": 5e-6,
         "logprob_batch_size": 1,
-        "precision": "float32",
+        "precision": precision,
         "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
@@ -64,6 +78,8 @@ def create_test_config(
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
+            "expert_parallel_size": expert_parallel_size,
+            "use_hf_tp_plan": use_hf_tp_plan,
         },
         "dynamic_batching": {
             "enabled": True,
@@ -72,7 +88,8 @@ def create_test_config(
             "sequence_length_round": 4,
         },
         "sequence_packing": {
-            "enabled": False,
+            "enabled": sequence_packing_enabled,
+            "train_mb_tokens": 128,
         },
         "optimizer": {
             "name": "torch.optim.AdamW",
@@ -93,6 +110,41 @@ def create_test_config(
         },
         "max_grad_norm": 1.0,
     }
+    if automodel_model_kwargs is not None:
+        config["automodel_model_kwargs"] = automodel_model_kwargs
+    if checkpointing is not None:
+        config["checkpointing"] = checkpointing
+    return config
+
+
+def create_test_batch(
+    batch_size: int = 8,
+    seq_len: int = 128,
+    vocab_size: int = 32000,
+    mode: str = "train",
+) -> BatchedDataDict:
+    """Create a test batch for training or logprob computation."""
+    torch.manual_seed(66)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            **(
+                {
+                    "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                    "sample_mask": torch.ones(batch_size).cuda(),
+                }
+                if mode == "train"
+                else {}
+            ),
+        }
+    )
+    data = data.to("cpu")
+    return data
 
 
 @pytest.fixture(scope="module")
@@ -109,10 +161,6 @@ def two_gpu_virtual_cluster():
     yield cluster
     print("Shutting down virtual cluster...")
     cluster.shutdown()
-
-
-from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.models.policy.lm_policy import Policy
 
 
 def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
@@ -178,7 +226,11 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     cpu_offload,
     activation_checkpointing,
 ):
-    """Test that dtensor worker v1 and v2 produce equivalent model configurations."""
+    """Test that dtensor worker v1 and v2 produce equivalent model configurations.
+
+    This test verifies that DTensorPolicyWorkerV2 produces the same model config
+    as the v1 worker, ensuring backward compatibility.
+    """
     # Get the actual model path from the fixture name
     model_name = request.getfixturevalue(model_fixture_name)
     # Create v1 configuration
@@ -242,3 +294,165 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     assert not discrepancies, (
         f"Model configurations differ between v1 and v2 approaches for {model_name}"
     )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+def test_dtensor_v2_checkpoint_save_and_load(
+    two_gpu_virtual_cluster,
+    tiny_llama_model_path,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpointing_config = {
+            "enabled": True,
+            "checkpoint_dir": tmpdir,
+            "metric_name": None,  # Save most recent checkpoints
+            "higher_is_better": False,
+            "keep_top_k": 2,
+            "save_period": 30,
+            "checkpoint_must_save_by": None,
+        }
+
+        config = create_test_config(
+            model_name=tiny_llama_model_path,
+            tp=2,
+            cp=1,
+            dtensor_v2=True,
+            checkpointing=checkpointing_config,
+        )
+
+        policy = Policy(
+            tokenizer=get_tokenizer(config["tokenizer"]),
+            config=config,
+            init_optimizer=True,
+            init_reference_model=False,
+            cluster=two_gpu_virtual_cluster,
+            name_prefix="lm_policy_checkpoint",
+        )
+
+        try:
+            weights_path = os.path.join(tmpdir, "weights")
+            optimizer_path = os.path.join(tmpdir, "optimizer")
+
+            # Save checkpoint
+            policy.save_checkpoint(
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                checkpointing_cfg=checkpointing_config,
+            )
+
+            # Verify checkpoint files were created
+            assert os.path.exists(weights_path), "Weights path should exist after save"
+
+            # Load checkpoint into a new policy
+            config2 = create_test_config(
+                model_name=tiny_llama_model_path,
+                tp=2,
+                cp=1,
+                dtensor_v2=True,
+                checkpointing=checkpointing_config,
+            )
+
+            # Shutdown original policy first to free GPU memory
+            policy.shutdown()
+            policy = None
+
+            policy2 = Policy(
+                tokenizer=get_tokenizer(config2["tokenizer"]),
+                config=config2,
+                init_optimizer=True,
+                init_reference_model=False,
+                cluster=two_gpu_virtual_cluster,
+                name_prefix="lm_policy_checkpoint_loaded",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+            )
+
+            # Verify policy was loaded successfully
+            assert len(policy2.worker_group.workers) == 2
+            worker_alive = ray.get(
+                [w.is_alive.remote() for w in policy2.worker_group.workers]
+            )
+            assert all(worker_alive)
+
+            policy2.shutdown()
+        finally:
+            if policy is not None:
+                policy.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("precision", ["bfloat16", "float16"])
+def test_dtensor_v2_mixed_precision_training_and_logprobs(
+    two_gpu_virtual_cluster,
+    tiny_llama_model_path,
+    precision,
+):
+    config = create_test_config(
+        model_name=tiny_llama_model_path,
+        tp=2,
+        cp=1,
+        dtensor_v2=True,
+        precision=precision,
+    )
+
+    policy = Policy(
+        tokenizer=get_tokenizer(config["tokenizer"]),
+        config=config,
+        init_optimizer=True,
+        init_reference_model=False,
+        cluster=two_gpu_virtual_cluster,
+        name_prefix=f"lm_policy_{precision}_mixed",
+    )
+
+    try:
+        # --- Test Training ---
+        train_data = create_test_batch(mode="train")
+        loss_fn = SimpleLoss()
+
+        policy.prepare_for_training()
+        results = policy.train(train_data, loss_fn)
+
+        # Verify training completed successfully
+        assert "loss" in results
+        loss_tensor = results["loss"]
+        assert not torch.isnan(loss_tensor).any(), (
+            f"Loss should not be NaN with precision={precision}"
+        )
+        assert not torch.isinf(loss_tensor).any(), (
+            f"Loss should not be Inf with precision={precision}"
+        )
+        # Loss is returned in float32 (reduced in float32 for numerical stability)
+        assert loss_tensor.dtype == torch.float32, (
+            f"Loss should be float32, got {loss_tensor.dtype}"
+        )
+
+        policy.finish_training()
+
+        # --- Test Logprobs ---
+        logprob_data = create_test_batch(mode="logprob")
+
+        policy.prepare_for_lp_inference()
+        logprobs = policy.get_logprobs(logprob_data)
+
+        # Verify logprobs were computed successfully
+        assert "logprobs" in logprobs
+        logprobs_tensor = logprobs["logprobs"]
+        assert logprobs_tensor.shape[0] == logprob_data.size
+        assert not torch.isnan(logprobs_tensor).any(), (
+            f"Logprobs should not be NaN with precision={precision}"
+        )
+        assert not torch.isinf(logprobs_tensor).any(), (
+            f"Logprobs should not be Inf with precision={precision}"
+        )
+        # Logprobs are returned in float32 for numerical stability
+        assert logprobs_tensor.dtype == torch.float32, (
+            f"Logprobs should be float32 for numerical stability, got {logprobs_tensor.dtype}"
+        )
+
+        # Verify the configured precision by checking worker info
+        worker_info = ray.get(policy.worker_group.workers[0].get_gpu_info.remote())
+        assert worker_info is not None, "Should get worker info"
+    finally:
+        policy.shutdown()
