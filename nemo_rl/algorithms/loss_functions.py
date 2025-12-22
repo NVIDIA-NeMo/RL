@@ -440,8 +440,8 @@ class NLLLoss(LossFunction):
 
 class PreferenceLossConfig(TypedDict):
     preference_loss: str
-    beta: float
-    eta: float
+    reference_policy_kl_penalty: float
+    gt_reward_scale: float
 
 
 class PreferenceLossDataDict(TypedDict):
@@ -478,7 +478,7 @@ class PreferenceLoss(LossFunction):
     L_pref(θ) = E[(Δ_r - (1/(2β))) ^ 2]
 
     For RPO with squared distance, the preference loss term is computed as:
-    L_pref(θ) = E[(Δ_r - Δ_gtr) ^ 2]
+    L_pref(θ) = E[(β * Δ_r - Δ_gtr) ^ 2]
 
     For RPO with forward KL divergence, the preference loss term is computed as:
     L_pref(θ) = E[σ(β * Δ_r) * log(σ(β * Δ_r)/σ(Δ_gtr)) + σ(-β * Δ_r) * log(σ(-β * Δ_r)/σ(Δ_gtr))]
@@ -498,8 +498,8 @@ class PreferenceLoss(LossFunction):
     Args:
     cfg (PreferenceLossConfig): Configuration dictionary containing:
         - preference_loss (str): Type of preference loss to use
-        - beta (float): Scaling factor (β)
-        - eta (float): Scale of the ground truth rewards (η)
+        - reference_policy_kl_penalty (float): Scaling factor (β)
+        - gt_reward_scale (float): Scale of the ground truth rewards (η)
 
     Returns:
         tuple[torch.Tensor, dict]: A tuple containing:
@@ -512,8 +512,8 @@ class PreferenceLoss(LossFunction):
     def __init__(self, cfg: PreferenceLossConfig):
         self.loss_type = LossType.SEQUENCE_LEVEL
         self.preference_loss = cfg["preference_loss"]
-        self.beta = cfg["beta"]
-        self.eta = cfg["eta"]
+        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
+        self.gt_reward_scale = cfg["gt_reward_scale"]
 
     def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
         # tensor is of shape (2*micro_batch_size,)
@@ -695,7 +695,7 @@ class DPOLossFn(LossFunction):
     L_pref(θ) = E[(Δ_r - (1/(2β))) ^ 2]
 
     For RPO with squared distance, the preference loss term is computed as:
-    L_pref(θ) = E[(Δ_r - Δ_gtr) ^ 2]
+    L_pref(θ) = E[(β * Δ_r - Δ_gtr) ^ 2]
 
     For RPO with forward KL divergence, the preference loss term is computed as:
     L_pref(θ) = E[σ(β * Δ_r) * log(σ(β * Δ_r)/σ(Δ_gtr)) + σ(-β * Δ_r) * log(σ(-β * Δ_r)/σ(Δ_gtr))]
@@ -752,8 +752,8 @@ class DPOLossFn(LossFunction):
 
         self.preference_loss_config = {
             "preference_loss": cfg["preference_loss"],
-            "beta": cfg["reference_policy_kl_penalty"],
-            "eta": cfg["gt_reward_scale"],
+            "reference_policy_kl_penalty": cfg["reference_policy_kl_penalty"],
+            "gt_reward_scale": cfg["gt_reward_scale"],
         }
         self.preference_loss = PreferenceLoss(self.preference_loss_config)
 

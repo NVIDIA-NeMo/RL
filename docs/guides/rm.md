@@ -128,9 +128,9 @@ Please note:
 
 The reward model training implementation in NeMo RL supports key parameters that can be adjusted:
 
-- `dpo.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl)
-- `dpo.beta`: Scaling parameter (ex: `reference_policy_kl_penalty` in DPO)
-- `dpo.eta`: Reward scale for ground-truth rewards, only used in RPO
+- `rm.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl)
+- `rm.reference_policy_kl_penalty`: Strength of the kl penalty term
+- `dpo.gt_reward_scale`: Reward scale for ground-truth rewards, only used in RPO
 
 ## Using Reward Models as Environments
 

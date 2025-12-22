@@ -169,7 +169,13 @@ def mock_dpo_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = PreferenceLoss(cfg={"preference_loss": "dpo", "beta": 1.0, "eta": 1.0})
+    loss_fn = PreferenceLoss(
+        cfg={
+            "preference_loss": "dpo",
+            "reference_policy_kl_penalty": 1.0,
+            "gt_reward_scale": 1.0,
+        }
+    )
     logger = MagicMock()
     checkpointer = MagicMock()
 
