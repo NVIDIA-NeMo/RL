@@ -28,13 +28,22 @@ export ENROOT_CACHE_PATH="${CONTAINER_DIR}/.enroot_cache"
 export ENROOT_DATA_PATH="${CONTAINER_DIR}/.enroot_data"
 mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH"
 
+OUTPUT_FILE="nemo_rl_nightly_${DATE}.sqsh"
+
 echo "📦 Downloading nemo-rl nightly container..."
 echo "   Directory: $CONTAINER_DIR"
 echo "   Date: $DATE"
+echo "   Output: $OUTPUT_FILE"
 echo "   Cache: $ENROOT_CACHE_PATH"
 
+# Remove existing file if it exists (for re-download)
+if [[ -f "$OUTPUT_FILE" ]]; then
+    echo "⚠️  Removing existing file: $OUTPUT_FILE"
+    rm -f "$OUTPUT_FILE"
+fi
+
 # Download latest nightly with explicit output path
-enroot import -o nemo_rl_nightly_${DATE}.sqsh docker://nvcr.io#nvidian/nemo-rl:nightly
+enroot import -o "$OUTPUT_FILE" docker://nvcr.io#nvidian/nemo-rl:nightly
 
 # Create symlink to latest
 ln -sf nemo_rl_nightly_${DATE}.sqsh nemo_rl_nightly.sqsh
