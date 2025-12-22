@@ -22,7 +22,7 @@ import torch
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLoss
 
@@ -40,7 +40,7 @@ def create_test_config(
     expert_parallel_size: int = 1,
     use_hf_tp_plan: bool = False,
     sequence_packing_enabled: bool = False,
-    automodel_model_kwargs: dict | None = None,
+    automodel_kwargs: AutomodelKwargs | None = None,
     checkpointing: dict | None = None,
 ) -> PolicyConfig:
     config = {
@@ -110,8 +110,8 @@ def create_test_config(
         },
         "max_grad_norm": 1.0,
     }
-    if automodel_model_kwargs is not None:
-        config["automodel_model_kwargs"] = automodel_model_kwargs
+    if automodel_kwargs is not None:
+        config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
     if checkpointing is not None:
         config["checkpointing"] = checkpointing
     return config

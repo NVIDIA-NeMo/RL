@@ -27,6 +27,7 @@ from hydra.utils import get_class
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
@@ -256,20 +257,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # The actual weights will be broadcast from rank 0.
 
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
-        automodel_model_kwargs = self.cfg.get("automodel_model_kwargs", {})
-        if automodel_model_kwargs.get("backend", None) is not None:
+        automodel_kwargs = self.cfg["dtensor_cfg"].get("automodel_kwargs", {})
+        if automodel_kwargs.get("backend", None) is not None:
             backend_class = _resolve_target(
-                automodel_model_kwargs.get("backend", None)["_target_"]
+                automodel_kwargs.get("backend", None)["_target_"]
             )
-            backend_kwargs = automodel_model_kwargs.get("backend")
+            backend_kwargs = automodel_kwargs.get("backend")
             backend_kwargs.pop("_target_")
             backend = backend_class(
                 **backend_kwargs,
             )
-            automodel_model_kwargs["backend"] = backend
+            automodel_kwargs["backend"] = backend
 
-        if "use_liger_kernel" not in automodel_model_kwargs:
-            automodel_model_kwargs["use_liger_kernel"] = False
+        if "use_liger_kernel" not in automodel_kwargs:
+            automodel_kwargs["use_liger_kernel"] = False
 
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
@@ -295,7 +296,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 trust_remote_code=True,
                 config=model_config,
                 sdpa_method=sdpa_method,
-                **automodel_model_kwargs,
+                **automodel_kwargs,
             )
             if self.lora_enabled:
                 apply_lora_to_linear_modules(self.model, self.peft_config)
@@ -386,7 +387,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Parallelize model
         is_moe_model = any(["expert" in key for key in self.model_state_dict_keys])
-        if not isinstance(self.model, PreTrainedModel) and is_moe_model:
+        is_hf_model = (
+            model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+        )
+        if (
+            not isinstance(self.model, PreTrainedModel)
+            and is_moe_model
+            and not is_hf_model
+        ):
+            assert self.tp_size == 1, (
+                "Using custom implementation {self.model.__class__.__name__} for MoE model {model_name} which doesn't support tp_size > 1. Please use expert_parallel_size > 1 for custom implementation or set force_hf=True in your config at policy->dtensor_cfg->automodel_kwargs to use the HuggingFace implementation."
+            )
+            assert self.cp_size == 1, (
+                "Using custom implementation {self.model.__class__.__name__} for MoE model {model_name} which doesn't support cp_size > 1. Please set force_hf=True in your config at policy->dtensor_cfg->automodel_kwargs to use the HuggingFace implementation."
+            )
             moe_parallelize_model(
                 model=self.model,
                 world_mesh=self.device_mesh,
