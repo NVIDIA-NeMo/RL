@@ -16,11 +16,11 @@ policy:
 logger:
   wandb:
     project: nemo-rl
-    name: sft-nanov3-30BA3B-2n8g-fsdp2
+    name: sft-nanov3-30BA3B-2n8g-fsdp2-lora
   tensorboard:
-    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-fsdp2
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-fsdp2-lora
   mlflow:
-    run_name: sft-nanov3-30BA3B-2n8g-fsdp2
+    run_name: sft-nanov3-30BA3B-2n8g-fsdp2-lora
 cluster:
   gpus_per_node: 8
   num_nodes: 2
