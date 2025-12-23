@@ -99,6 +99,7 @@ mcore = [
   "flash-attn==2.8.1",
 ]
 penguin = ["penguin"]
+resiliency = ["nvidia-resiliency-ext"]
 
 [dependency-groups]
 
