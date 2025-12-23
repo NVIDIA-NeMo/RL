@@ -45,13 +45,10 @@ class DataConfig(TypedDict):
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
     # dataset configs
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    env_name: NotRequired[str]
-    processor: NotRequired[str]  # remove once processor is refactored
     # TODO: remove NotRequired once preference dataset is refactored
     train: NotRequired[ResponseDatasetConfig]
     validation: NotRequired[ResponseDatasetConfig | None]
+    default: NotRequired[ResponseDatasetConfig | None]
     # TODO: remove once preference dataset is refactored
     dataset_name: NotRequired[str]
     val_dataset_name: NotRequired[str]
@@ -60,6 +57,10 @@ class DataConfig(TypedDict):
     split: NotRequired[str]
     train_data_path: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
 
 
 # ===============================================================================

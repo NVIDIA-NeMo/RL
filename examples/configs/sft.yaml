@@ -165,16 +165,18 @@ data:
   shuffle: true
   num_workers: 1
 
-  prompt_file: null
-  system_prompt_file: null
-  processor: "sft_processor"
-
+  # dataset
   train:
     dataset_name: "squad"
     split: "train"
   validation:
     dataset_name: "squad"
     split: "validation"
+  # default settings for all datasets
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "sft_processor"
   # You can use custom response datasets for training and validation. For example:
   #   train:
   #     dataset_name: ResponseDataset

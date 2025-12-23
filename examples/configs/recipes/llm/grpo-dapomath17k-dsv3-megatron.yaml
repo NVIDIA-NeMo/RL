@@ -39,11 +39,12 @@ policy:
       async_engine: true
       tensor_parallel_size: 32
 data:
-  prompt_file: null
   train:
     dataset_name: DAPOMath17K
   validation:
     dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
 logger:
   monitor_gpus: false
   wandb:

@@ -25,11 +25,9 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
+    extract_necessary_env_names,
     load_response_dataset,
     update_single_dataset_config,
-)
-from nemo_rl.data.interfaces import (
-    TaskDataSpec,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -74,26 +72,36 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up envs...")
-    env_name = data_config["env_name"]
-    env = create_env(env_name=env_name, env_configs=env_configs)
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+        for env_name in env_name_list
+    }
 
     print("\n▶ Setting up data...")
-    default_task_spec = TaskDataSpec(
-        task_name="math_default",
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-
     # setup train dataset
-    update_single_dataset_config(data_config["train"], data_config)
-    data = load_response_dataset(data_config["train"], seed)
-    task_data_processors = {data.task_name: (data.task_spec, data.processor)}
-    task_to_env = {data.task_name: env}
+    task_data_processors = {}
+    task_to_env = {}
+    data_list = []
 
+    if isinstance(data_config["train"], dict):
+        data_config["train"] = [data_config["train"]]
+
+    for cfg in data_config["train"]:
+        # load dataset
+        update_single_dataset_config(cfg, data_config["default"])
+        data = load_response_dataset(cfg, seed)
+        data_list.append(data)
+        # bind task_name to task_data_processors and task_to_env
+        task_name = data.task_name
+        task_data_processors[task_name] = (data.task_spec, data.processor)
+        task_to_env[task_name] = envs[cfg["env_name"]]
+
+    merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
-        data.dataset,
+        merged_data,
         tokenizer,
-        default_task_spec,  # default task data spec to process any values not specified in the task-specific specs
+        None,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -105,21 +113,31 @@ def setup_data(
     val_data_list = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
-    if hasattr(data, "val_dataset") and data.val_dataset is not None:
-        val_data_list.append(data.val_dataset)
-        val_task_data_processors = task_data_processors.copy()
-        val_task_to_env = task_to_env.copy()
+    for data in data_list:
+        if hasattr(data, "val_dataset") and data.val_dataset is not None:
+            val_data_list.append(data.val_dataset)
+            # bind task_name to task_data_processors and task_to_env
+            task_name = data.task_name
+            val_task_data_processors[task_name] = task_data_processors[task_name]
+            val_task_to_env[task_name] = task_to_env[task_name]
 
     # validation dataset from config
     if data_config["validation"] is not None:
-        update_single_dataset_config(data_config["validation"], data_config)
-        val_data = load_response_dataset(data_config["validation"], seed)
-        val_data_list.append(val_data.dataset)
-        val_task_data_processors[val_data.task_name] = (
-            val_data.task_spec,
-            val_data.processor,
-        )
-        val_task_to_env[val_data.task_name] = env
+        if isinstance(data_config["validation"], dict):
+            data_config["validation"] = [data_config["validation"]]
+
+        for cfg in data_config["validation"]:
+            # load dataset
+            update_single_dataset_config(cfg, data_config["default"])
+            val_data = load_response_dataset(cfg, seed)
+            val_data_list.append(val_data.dataset)
+            # bind task_name to task_data_processors and task_to_env
+            task_name = val_data.task_name
+            val_task_data_processors[task_name] = (
+                val_data.task_spec,
+                val_data.processor,
+            )
+            val_task_to_env[task_name] = envs[cfg["env_name"]]
 
     val_dataset = None
     if len(val_data_list) > 0:
@@ -127,7 +145,7 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,
-            default_task_spec,
+            None,
             val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )

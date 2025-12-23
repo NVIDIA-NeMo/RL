@@ -18,6 +18,7 @@ from nemo_rl.data.datasets.processed_dataset import AllTaskProcessedDataset
 from nemo_rl.data.datasets.response_datasets import load_response_dataset
 from nemo_rl.data.datasets.utils import (
     assert_no_double_bos,
+    extract_necessary_env_names,
     update_single_dataset_config,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "load_preference_dataset",
     "load_response_dataset",
     "assert_no_double_bos",
+    "extract_necessary_env_names",
     "update_single_dataset_config",
 ]

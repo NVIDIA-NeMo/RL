@@ -42,6 +42,11 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
+    if "data_path" in data_config:
+        print(f"  • Loading {dataset_name} dataset from {data_config['data_path']}")
+    else:
+        print(f"  • Loading {dataset_name} dataset")
+
     # for sft training
     if dataset_name == "open_assistant":
         base_dataset: Any = OasstDataset(**data_config, seed=seed)
@@ -56,7 +61,6 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
         # TODO: also test after SFT updated
-        print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
         base_dataset: Any = DeepScalerDataset(**data_config)
