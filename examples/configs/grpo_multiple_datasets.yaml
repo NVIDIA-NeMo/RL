@@ -1,0 +1,26 @@
+# GRPO Algorithm Configuration
+defaults: "grpo_math_1B.yaml"
+
+data:
+  _override_: true # override the data config instead of merging with it
+
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  shuffle: true
+  num_workers: 1
+
+  # dataset
+  train:
+    - dataset_name: OpenMathInstruct-2
+      split_validation_size: 0.05
+    - dataset_name: DeepScaler
+  validation:
+    - dataset_name: AIME2024
+      repeat: 16
+    - dataset_name: DAPOMathAIME2024
+
+  # default settings for all datasets
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
