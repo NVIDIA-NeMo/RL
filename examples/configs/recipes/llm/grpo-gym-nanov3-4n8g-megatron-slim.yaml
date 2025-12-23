@@ -1,0 +1,19 @@
+defaults: grpo-gym-nanov3-32n8g-megatron-long.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+policy:
+  train_global_batch_size: 256
+  max_total_sequence_length: 16384
+  megatron_cfg:
+    context_parallel_size: 1
+checkpointing:
+  checkpoint_dir: results/grpo-gym-nanov3-4n8g-megatron-slim
+logger:
+  log_dir: logs/grpo-gym-nanov3-32n8g-megatron-slim
+  wandb:
+    name: grpo-gym-nanov3-32n8g-megatron-slim
+  mlflow:
+    run_name: grpo-gym-nanov3-32n8g-megatron-slim
+cluster:
+  num_nodes: 4
