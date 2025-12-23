@@ -236,14 +236,14 @@ def get_fallback_configs() -> Dict[str, Any]:
             "h100": {
                 "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
                 "num_prompts": 64, "num_generations": 32,
-                "generation": {"tp": 2, "pp": 1},
+                "generation": {"tp": 4, "pp": 1},
                 "training": {"tp": 1, "cp": 1, "ep": 8, "pp": 1}
             },
             "gb200": {
                 "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
                 "num_prompts": 64, "num_generations": 32,
-                "generation": {"tp": 2, "pp": 1},
-                "training": {"tp": 1, "cp": 1, "ep": 8, "pp": 1}
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 16, "pp": 1}
             }
         },
         "qwen235b": {
@@ -489,11 +489,17 @@ logger.wandb.project='{full_wandb_project}' \\
 logger.wandb.name='{wandb_name}'"""
 
     # Add fixed input/output length settings for performance benchmarking
+    # Use '+' prefix to add new keys that don't exist in the base config
     if use_random_dataset:
+        # Disable validation since run_grpo_random_dataset.py doesn't provide val_dataset
+        command += " \\\ngrpo.val_period=0"
+        command += " \\\ngrpo.val_at_start=false"
         if input_length is not None:
-            command += f" \\\ndata.input_len_or_input_len_generator={input_length}"
+            command += f" \\\n+data.input_len_or_input_len_generator={input_length}"
         if output_length is not None:
-            command += f" \\\npolicy.generation.output_len_or_output_len_generator={output_length}"
+            command += f" \\\n+policy.generation.output_len_or_output_len_generator={output_length}"
+            # Also set max_new_tokens for sync mode (sync vllm worker doesn't use output_len_or_output_len_generator)
+            command += f" \\\npolicy.generation.max_new_tokens={output_length}"
             command += " \\\npolicy.generation.ignore_eos=true"
 
     # Add vLLM metrics logging if enabled

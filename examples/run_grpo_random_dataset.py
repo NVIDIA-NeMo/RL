@@ -113,6 +113,11 @@ def setup_data(
         random_task_spec,
         random_input_len_processor,
     )  # todo: fix original task name in dataset
+    # Add OpenMathInstruct-2 as it's the actual task name in the dataset
+    task_data_processors["OpenMathInstruct-2"] = (
+        random_task_spec,
+        random_input_len_processor,
+    )
 
     # setup dummy environment
     dummy_env = DummyEnvironment.options(  # type: ignore # it's wrapped with ray.remote

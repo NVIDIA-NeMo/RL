@@ -36,7 +36,7 @@ cd "$SCRIPT_DIR"
 INPUT_LEN=${INPUT_LEN:-128}
 OUTPUT_LEN=${OUTPUT_LEN:-3968}
 TOTAL_LEN=$((INPUT_LEN + OUTPUT_LEN))
-
+WANDB_PROJECT=${WANDB_PROJECT:-sync-grpo-gb200-benchmark-fixedRLconfig}
 # Models to benchmark (matching Megatron-Bridge configs)
 DEFAULT_PRESETS="llama8b llama70b qwen30b qwen32b"
 
@@ -181,11 +181,19 @@ for preset in $PRESETS; do
     echo "    Config: Input=${INPUT_LEN}, Output=${OUTPUT_LEN}, Total=${TOTAL_LEN}"
     echo "============================================================"
     
-    CMD="python launch_grpo.py --preset ${preset} \
+    # Set variant for specific models (optional)
+    VARIANT_ARG=""
+    if [[ "$preset" == "qwen32b" ]]; then
+        VARIANT_ARG="--variant gb200_tp2"
+    fi
+    
+    CMD="python3 launch_grpo.py --preset ${preset} \
+        ${VARIANT_ARG} \
         --use-random-dataset \
         --input-length ${INPUT_LEN} \
         --output-length ${OUTPUT_LEN} \
         --disable-sequence-packing \
+        --wandb-project ${WANDB_PROJECT} \
         ${DRY_RUN}"
     
     echo "Command: $CMD"
