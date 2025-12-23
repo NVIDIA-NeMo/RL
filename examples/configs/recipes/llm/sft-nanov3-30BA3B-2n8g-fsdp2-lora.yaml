@@ -4,7 +4,7 @@ sft:
 checkpointing:
   enabled: false
 policy:
-  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   train_global_batch_size: 16
   max_total_sequence_length: 2048
   dtensor_cfg:

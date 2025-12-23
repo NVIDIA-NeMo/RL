@@ -24,7 +24,6 @@ uv run examples/run_sft.py \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    ~policy.tokenizer.chat_template \
     $@ \
     2>&1 | tee $RUN_LOG
 
