@@ -291,6 +291,15 @@ mkdir -p \$HF_FIX_DIR
 pip install --quiet --no-cache-dir --target=\$HF_FIX_DIR huggingface-hub==0.34
 export PYTHONPATH=\$HF_FIX_DIR:\$PYTHONPATH
 
+# vLLM version check (important: NeMo-RL uses v0.11.0, nightly may differ)
+echo '============================================================'
+echo 'vLLM Version Information'
+echo '============================================================'
+VLLM_VERSION=\$(python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo 'unknown')
+echo \"vLLM version: \$VLLM_VERSION\"
+vllm --version 2>/dev/null || echo '(vllm CLI version not available)'
+echo '============================================================'
+
 # Set vLLM environment
 export VLLM_USE_V1=1
 export VLLM_USE_FLASHINFER_SAMPLER=1
@@ -313,8 +322,8 @@ fi
 RESULTS_FILE=$LOGS_DIR/results.json
 RESULTS_SUMMARY=$LOGS_DIR/results_summary.txt
 
-# Write header
-echo 'Model,GPU,Nodes,GPUs/Node,TP,PP,EP,InputLen,RequestedOSL,ActualOSL,NumPrompts,Throughput(req/s),Throughput(tok/s),Throughput(tok/s/GPU),TotalTime(s)' > \$RESULTS_SUMMARY
+# Write header (includes vLLM version for tracking)
+echo 'Model,GPU,vLLM_Version,Nodes,GPUs/Node,TP,PP,EP,InputLen,RequestedOSL,ActualOSL,NumPrompts,Throughput(req/s),Throughput(tok/s),Throughput(tok/s/GPU),TotalTime(s)' > \$RESULTS_SUMMARY
 
 # Build common vLLM args
 VLLM_ARGS=\"--model $MODEL_PATH\"
@@ -431,8 +440,8 @@ for ISL in $INPUT_LENS; do
         
         echo \"Parsed: req/s=\$THROUGHPUT_REQ, tok/s=\$THROUGHPUT_TOK (\$PER_GPU_TOK tok/s/GPU), time=\$TOTAL_TIME\"
         
-        # Append to CSV
-        echo \"\$MODEL_SHORT,\$GPU_MODEL,$NUM_NODES,$NUM_GPUS_PER_NODE,$TENSOR_PARALLEL_SIZE,$PIPELINE_PARALLEL_SIZE,$EXPERT_PARALLEL_SIZE,\$ISL,\$REQUESTED_OSL,\$EFFECTIVE_OSL,$NUM_PROMPTS,\$THROUGHPUT_REQ,\$THROUGHPUT_TOK,\$PER_GPU_TOK,\$TOTAL_TIME\" >> \$RESULTS_SUMMARY
+        # Append to CSV (includes vLLM version)
+        echo \"\$MODEL_SHORT,\$GPU_MODEL,\$VLLM_VERSION,$NUM_NODES,$NUM_GPUS_PER_NODE,$TENSOR_PARALLEL_SIZE,$PIPELINE_PARALLEL_SIZE,$EXPERT_PARALLEL_SIZE,\$ISL,\$REQUESTED_OSL,\$EFFECTIVE_OSL,$NUM_PROMPTS,\$THROUGHPUT_REQ,\$THROUGHPUT_TOK,\$PER_GPU_TOK,\$TOTAL_TIME\" >> \$RESULTS_SUMMARY
         
         # Append to JSON
         if [ \$FIRST_RESULT -eq 0 ]; then
@@ -444,6 +453,7 @@ for ISL in $INPUT_LENS; do
 {
   \"model\": \"$MODEL_PATH\",
   \"gpu_model\": \"\$GPU_MODEL\",
+  \"vllm_version\": \"\$VLLM_VERSION\",
   \"num_nodes\": $NUM_NODES,
   \"gpus_per_node\": $NUM_GPUS_PER_NODE,
   \"total_gpus_allocated\": $NUM_GPUS,
