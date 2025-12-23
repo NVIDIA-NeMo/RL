@@ -19,103 +19,10 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from importlib.util import find_spec
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
-
-
-def _get_transformer_engine_file(relative_path: str) -> str:
-    """Return absolute path to a Transformer Engine file or raise if it cannot be found.
-
-    The relative_path should be a POSIX-style path under the transformer_engine
-    package root, e.g. "pytorch/triton/permutation.py".
-    """
-    spec = find_spec("transformer_engine")
-    if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError(
-            "Transformer Engine package not found while attempting to patch "
-            f"'{relative_path}'. Ensure `transformer-engine` is installed and "
-            "available in this environment."
-        )
-
-    base_dir = next(iter(spec.submodule_search_locations))
-    file_path = os.path.join(base_dir, *relative_path.split("/"))
-
-    if not os.path.exists(file_path):
-        raise RuntimeError(
-            "Failed to locate expected Transformer Engine file to patch. "
-            f"Looked for '{relative_path}' at '{file_path}'. "
-            "This likely indicates an unexpected Transformer Engine installation "
-            "layout or version mismatch."
-        )
-
-    return file_path
-
-
-def _apply_transformer_engine_patch():
-    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files.
-
-    This locates the target file via importlib metadata instead of importing
-    `transformer_engine`, to avoid side effects during initialization. If the
-    permutation module has already been imported, it will be reloaded so that
-    the patched source takes effect.
-    """
-    try:
-        perm_file = _get_transformer_engine_file("pytorch/triton/permutation.py")
-
-        with open(perm_file, "r") as f:
-            content = f.read()
-
-        if "get_int_dtype = triton.constexpr_function(get_int_dtype)" not in content:
-            print(f"Applying Triton fix to {perm_file}...")
-
-            # 1. Replace the usage
-            old_usage = "idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
-            new_usage = "idtype = get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
-
-            # 2. Insert the definition before the first @triton.jit
-            jit_anchor = "@triton.jit"
-
-            new_definition = (
-                "\n\n"
-                "get_int_dtype = core.get_int_dtype\n"
-                "get_int_dtype = triton.constexpr_function(get_int_dtype)\n"
-            )
-
-            new_content = None
-            if old_usage in content:
-                temp_content = content.replace(old_usage, new_usage)
-
-                if jit_anchor in temp_content:
-                    new_content = temp_content.replace(
-                        jit_anchor, new_definition + jit_anchor, 1
-                    )
-
-            if new_content:
-                try:
-                    with open(perm_file, "w") as f:
-                        f.write(new_content)
-                    print("Successfully patched transformer_engine permutation.py.")
-                except OSError as e:
-                    print(
-                        f"Could not write patch to transformer_engine (permission denied?): {e}"
-                    )
-
-        # If the permutation module is already imported in this process,
-        # reload it so that the patched source takes effect for subsequent use.
-        import importlib
-        import sys
-
-        perm_module_name = "transformer_engine.pytorch.triton.permutation"
-        if perm_module_name in sys.modules:
-            importlib.reload(sys.modules[perm_module_name])
-
-    except Exception as e:
-        print(f"Error checking/patching transformer_engine: {e}")
-
-
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.training import fault_tolerance
@@ -222,6 +129,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -540,7 +448,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
-        _apply_transformer_engine_patch()
+        apply_transformer_engine_patch()
 
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
