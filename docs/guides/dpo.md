@@ -6,7 +6,7 @@ to increase the probability of the chosen response and decrease the probability 
 
 ## Launch a DPO Run
 
-The script [examples/run_dpo.py](../../examples/run_dpo.py) can be used to launch a DPO experiment. This script can either be launched locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
+The script [examples/run_dpo.py](../../examples/run_dpo.py) can be used to launch a DPO experiment. This script can either be launched locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../get-started/cluster.md).
 
 Be sure to launch the job using `uv`. The command to launch a DPO job is as follows:
 ```bash
