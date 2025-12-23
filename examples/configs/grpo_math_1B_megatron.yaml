@@ -157,13 +157,6 @@ policy:
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
-data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
-  dataset_name: "OpenMathInstruct-2"
-  shuffle: true
-
 env:
   math:
     num_workers: 8
