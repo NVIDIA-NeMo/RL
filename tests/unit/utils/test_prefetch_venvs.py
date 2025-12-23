@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 import pytest
 
+from nemo_rl.utils.prefetch_venvs import prefetch_venvs
+
 
 @pytest.fixture
 def mock_registry():
@@ -41,11 +43,8 @@ class TestPrefetchVenvs:
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
 
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
-
             prefetch_venvs(filters=None)
 
-            # Should create venvs for all uv-based actors (3 total)
             assert mock_create_venv.call_count == 3
 
             # Verify the actors that were called
@@ -75,8 +74,6 @@ class TestPrefetchVenvs:
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
 
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
-
             prefetch_venvs(filters=["vllm"])
 
             # Should only create venvs for actors containing "vllm" (1 actor)
@@ -97,8 +94,6 @@ class TestPrefetchVenvs:
             patch("nemo_rl.utils.prefetch_venvs.create_local_venv") as mock_create_venv,
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
-
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
 
             prefetch_venvs(filters=["vllm", "megatron"])
 
@@ -127,8 +122,6 @@ class TestPrefetchVenvs:
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
 
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
-
             prefetch_venvs(filters=["nonexistent"])
 
             # Should not create any venvs
@@ -143,8 +136,6 @@ class TestPrefetchVenvs:
             patch("nemo_rl.utils.prefetch_venvs.create_local_venv") as mock_create_venv,
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
-
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
 
             # Filter for "environment" which matches system python actors
             prefetch_venvs(filters=["environment"])
@@ -161,8 +152,6 @@ class TestPrefetchVenvs:
             patch("nemo_rl.utils.prefetch_venvs.create_local_venv") as mock_create_venv,
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
-
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
 
             # "policy" should match both dtensor_policy_worker and megatron_policy_worker
             prefetch_venvs(filters=["policy"])
@@ -191,8 +180,6 @@ class TestPrefetchVenvs:
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
 
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
-
             # Empty list should be falsy and prefetch all
             prefetch_venvs(filters=[])
 
@@ -214,8 +201,6 @@ class TestPrefetchVenvs:
                 "/path/to/venv/bin/python",
             ]
 
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
-
             # Should not raise, should continue with other venvs
             prefetch_venvs(filters=None)
 
@@ -231,8 +216,6 @@ class TestPrefetchVenvs:
             patch("nemo_rl.utils.prefetch_venvs.create_local_venv") as mock_create_venv,
         ):
             mock_create_venv.return_value = "/path/to/venv/bin/python"
-
-            from nemo_rl.utils.prefetch_venvs import prefetch_venvs
 
             # "VLLM" (uppercase) should not match "vllm" (lowercase)
             prefetch_venvs(filters=["VLLM"])
