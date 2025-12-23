@@ -87,6 +87,9 @@ tests/test_suites/llm/sft-qwen2.5-math7b-2n8g-megatron.sh
 # Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1571
 # tests/test_suites/llm/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
 
+# gpt-oss 20b DeepEP test
+tests/test_suites/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.sh
+
 #######
 # DPO #
 #######
