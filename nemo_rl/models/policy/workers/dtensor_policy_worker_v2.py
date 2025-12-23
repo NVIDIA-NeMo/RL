@@ -18,7 +18,6 @@ import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional
 
-import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 from nemo_automodel.components._peft.lora import LinearLoRA
@@ -38,6 +37,7 @@ from torch.distributed.tensor import DTensor
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedModel,
 )
 
 from nemo_rl.algorithms.interfaces import LossFunction
