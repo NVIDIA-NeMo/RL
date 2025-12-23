@@ -252,7 +252,7 @@ qwen32b:
       tp: 1
       pp: 1
     training:
-      tp: 4
+      tp: 2
       cp: 1
       ep: 1
       pp: 1
@@ -352,7 +352,7 @@ qwen30b:
     training:
       tp: 1
       cp: 1
-      ep: 4
+      ep: 16
       pp: 1
   
   gb200_matched:
