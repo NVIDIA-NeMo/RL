@@ -78,12 +78,18 @@ def prefetch_venvs(filters=None):
     print("\n" + "=" * 50)
     print("Venv prefetching complete! Summary:")
     print("=" * 50)
-    print(f"  Prefetched:            {len(prefetched)}")
+    print(f"  Prefetched: {len(prefetched)}")
+    for actor_fqn in prefetched:
+        print(f"    - {actor_fqn}")
     print(f"  Skipped (system Python): {len(skipped_system_python)}")
+    for actor_fqn in skipped_system_python:
+        print(f"    - {actor_fqn}")
     if filters:
-        print(f"  Skipped (filtered out):  {len(skipped_by_filter)}")
+        print(f"  Skipped (filtered out): {len(skipped_by_filter)}")
+        for actor_fqn in skipped_by_filter:
+            print(f"    - {actor_fqn}")
     if failed:
-        print(f"  Failed:                {len(failed)}")
+        print(f"  Failed: {len(failed)}")
         for actor_fqn in failed:
             print(f"    - {actor_fqn}")
 
