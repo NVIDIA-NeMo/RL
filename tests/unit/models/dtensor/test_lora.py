@@ -32,10 +32,6 @@ from nemo_automodel.components._peft.lora import (
     apply_lora_to_linear_modules,
 )
 
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    _patched_init_lora_weights,
-)
-
 
 class SimpleLoraMock(nn.Module):
     """Simple mock LoRA module for testing initialization."""
@@ -44,69 +40,6 @@ class SimpleLoraMock(nn.Module):
         super().__init__()
         self.lora_A = nn.Linear(in_features, lora_dim, bias=False)
         self.lora_B = nn.Linear(lora_dim, out_features, bias=False)
-
-
-@pytest.mark.parametrize("init_method", ["xavier"])
-def test_lora_init_differs_from_upstream_buggy_version(init_method):
-    """
-    Test that our patched LoRA initialization differs from the buggy upstream version.
-
-    Remove this test once Automodel is bumped to commit 2d20e33a19d5e53a271b1403b507475e68ad14dc or later.
-
-    Issue: https://github.com/NVIDIA-NeMo/RL/issues/1586
-    """
-    torch.manual_seed(42)
-
-    # Create two identical LoRA modules
-    lora_buggy = LinearLoRA(nn.Linear(16, 16))
-    lora_patched = LinearLoRA(nn.Linear(16, 16))
-
-    # Copy initial weights to ensure identical starting point
-    lora_patched.lora_A.weight.data.copy_(lora_buggy.lora_A.weight.data)
-    lora_patched.lora_B.weight.data.copy_(lora_buggy.lora_B.weight.data)
-
-    # Apply buggy upstream initialization
-    torch.manual_seed(42)
-    lora_buggy.init_lora_weights(init_method)
-
-    # Apply our patched initialization
-    torch.manual_seed(42)
-    _patched_init_lora_weights(lora_patched, init_method)
-
-    # For xavier method, they should differ (that's the bug)
-
-    # Assert that weights differ due to the upstream bug
-    are_equal_A = torch.allclose(
-        lora_buggy.lora_A.weight.data,
-        lora_patched.lora_A.weight.data,
-        atol=1e-6,
-        rtol=1e-6,
-    )
-
-    assert not are_equal_A, (
-        "LoRA A weights should differ for xavier initialization. "
-        "If this assertion fails, the upstream bug has been fixed in Automodel. "
-        "You can:\n"
-        "1. Remove the patch in nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py\n"
-        "2. Remove the patching call\n"
-        "3. Close issue: https://github.com/NVIDIA-NeMo/RL/issues/1586\n"
-        "4. Delete this test"
-    )
-
-    # LoRA B should always be zero-initialized (both implementations do this correctly)
-    are_equal_B = torch.allclose(
-        lora_buggy.lora_B.weight.data,
-        lora_patched.lora_B.weight.data,
-        atol=0,
-        rtol=0,
-    )
-    assert are_equal_B, "LoRA B weights should both be zero"
-    assert torch.all(lora_buggy.lora_B.weight.data == 0), (
-        "LoRA B should be zero-initialized"
-    )
-    assert torch.all(lora_patched.lora_B.weight.data == 0), (
-        "LoRA B should be zero-initialized"
-    )
 
 
 def test_lora_init_statistical_properties():
@@ -119,7 +52,7 @@ def test_lora_init_statistical_properties():
     lora = SimpleLoraMock(in_features=512, out_features=1024, lora_dim=32)
 
     # Test xavier initialization
-    _patched_init_lora_weights(lora, "xavier")
+    LinearLoRA.init_lora_weights(lora, "xavier")
 
     # Xavier normal should have mean ≈ 0 and specific std
     mean_A = lora.lora_A.weight.data.mean().item()
@@ -137,7 +70,7 @@ def test_lora_init_statistical_properties():
 
     # Test kaiming initialization
     lora2 = SimpleLoraMock(in_features=512, out_features=1024, lora_dim=32)
-    _patched_init_lora_weights(lora2, "kaiming")
+    LinearLoRA.init_lora_weights(lora2, "kaiming")
 
     mean_A2 = lora2.lora_A.weight.data.mean().item()
     assert abs(mean_A2) < 0.1, f"Kaiming should have mean ≈ 0, got {mean_A2}"
