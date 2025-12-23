@@ -11,8 +11,6 @@ policy:
     lora_cfg:
       enabled: true
       use_triton: false
-  optimizer:
-    name: torch.optim.Adam
 logger:
   wandb:
     project: nemo-rl
