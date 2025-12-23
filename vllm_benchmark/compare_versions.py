@@ -9,7 +9,7 @@ Usage:
     python compare_versions.py
     
     # Compare specific job IDs
-    python compare_versions.py --v0110-job 587395 --nightly-job 587399
+    python compare_versions.py --v0112-job 587395 --nightly-job 587399
     
     # Export to CSV
     python compare_versions.py --output comparison.csv
@@ -151,12 +151,12 @@ def print_comparison_table(comparisons: list[dict]):
         for comp in model_comps:
             config = f"I{comp['input_len']}_O{comp['output_len']}"
             
-            # v0.11.0 row
-            v0110_tok = comp.get("v0110_tok_s", 0)
-            v0110_gpu = comp.get("v0110_tok_s_gpu", 0)
-            v0110_time = comp.get("v0110_time", 0)
+            # v0.11.2 row
+            v0112_tok = comp.get("v0112_tok_s", 0)
+            v0112_gpu = comp.get("v0112_tok_s_gpu", 0)
+            v0112_time = comp.get("v0112_time", 0)
             
-            print(f"{config:<15} │ {'v0.11.0':<12} │ {format_number(v0110_tok):<20} │ {format_number(v0110_gpu):<15} │ {format_number(v0110_time):<10} │ {'baseline':<10}")
+            print(f"{config:<15} │ {'v0.11.2':<12} │ {format_number(v0112_tok):<20} │ {format_number(v0112_gpu):<15} │ {format_number(v0112_time):<10} │ {'baseline':<10}")
             
             # nightly row
             nightly_tok = comp.get("nightly_tok_s", 0)
@@ -164,8 +164,8 @@ def print_comparison_table(comparisons: list[dict]):
             nightly_time = comp.get("nightly_time", 0)
             
             # Calculate diff
-            if v0110_tok > 0:
-                diff_pct = ((nightly_tok - v0110_tok) / v0110_tok) * 100
+            if v0112_tok > 0:
+                diff_pct = ((nightly_tok - v0112_tok) / v0112_tok) * 100
                 diff_str = f"{diff_pct:+.1f}%"
                 if diff_pct > 5:
                     diff_str = f"🚀 {diff_str}"
@@ -186,19 +186,19 @@ def print_summary_table(comparisons: list[dict]):
     """Print a summary comparison table."""
     
     print("\n" + "=" * 80)
-    print("SUMMARY: v0.11.0 vs Nightly Performance")
+    print("SUMMARY: v0.11.2 vs Nightly Performance")
     print("=" * 80)
     
-    print(f"\n{'Model':<30} │ {'v0.11.0 (tok/s)':<18} │ {'Nightly (tok/s)':<18} │ {'Diff':<12}")
+    print(f"\n{'Model':<30} │ {'v0.11.2 (tok/s)':<18} │ {'Nightly (tok/s)':<18} │ {'Diff':<12}")
     print(f"{'─' * 30}─┼─{'─' * 18}─┼─{'─' * 18}─┼─{'─' * 12}")
     
     for comp in comparisons:
         model_short = comp["model"].split("/")[-1][:28]
-        v0110 = comp.get("v0110_tok_s", 0)
+        v0112 = comp.get("v0112_tok_s", 0)
         nightly = comp.get("nightly_tok_s", 0)
         
-        if v0110 > 0:
-            diff_pct = ((nightly - v0110) / v0110) * 100
+        if v0112 > 0:
+            diff_pct = ((nightly - v0112) / v0112) * 100
             diff_str = f"{diff_pct:+.1f}%"
             if diff_pct > 5:
                 diff_str = f"🚀 {diff_str}"
@@ -207,7 +207,7 @@ def print_summary_table(comparisons: list[dict]):
         else:
             diff_str = "N/A"
         
-        print(f"{model_short:<30} │ {format_number(v0110):<18} │ {format_number(nightly):<18} │ {diff_str:<12}")
+        print(f"{model_short:<30} │ {format_number(v0112):<18} │ {format_number(nightly):<18} │ {diff_str:<12}")
     
     print(f"{'─' * 30}─┴─{'─' * 18}─┴─{'─' * 18}─┴─{'─' * 12}")
     print()
@@ -221,15 +221,15 @@ def export_to_csv(comparisons: list[dict], output_file: str):
         writer = csv.writer(f)
         writer.writerow([
             "Model", "Input_Len", "Output_Len", "TP", "PP",
-            "v0.11.0_tok_s", "v0.11.0_tok_s_gpu", "v0.11.0_time",
+            "v0.11.2_tok_s", "v0.11.2_tok_s_gpu", "v0.11.2_time",
             "Nightly_tok_s", "Nightly_tok_s_gpu", "Nightly_time",
             "Diff_%"
         ])
         
         for comp in comparisons:
-            v0110 = comp.get("v0110_tok_s", 0)
+            v0112 = comp.get("v0112_tok_s", 0)
             nightly = comp.get("nightly_tok_s", 0)
-            diff_pct = ((nightly - v0110) / v0110 * 100) if v0110 > 0 else 0
+            diff_pct = ((nightly - v0112) / v0112 * 100) if v0112 > 0 else 0
             
             writer.writerow([
                 comp["model"],
@@ -237,9 +237,9 @@ def export_to_csv(comparisons: list[dict], output_file: str):
                 comp["output_len"],
                 comp.get("tp", 1),
                 comp.get("pp", 1),
-                comp.get("v0110_tok_s", 0),
-                comp.get("v0110_tok_s_gpu", 0),
-                comp.get("v0110_time", 0),
+                comp.get("v0112_tok_s", 0),
+                comp.get("v0112_tok_s_gpu", 0),
+                comp.get("v0112_time", 0),
                 comp.get("nightly_tok_s", 0),
                 comp.get("nightly_tok_s_gpu", 0),
                 comp.get("nightly_time", 0),
@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--base-dir", type=str, 
                        default=str(Path(__file__).parent / "vllm_standalone_perf_exp"),
                        help="Base directory for results")
-    parser.add_argument("--v0110-job", type=str, help="Specific job ID for v0.11.0")
+    parser.add_argument("--v0112-job", type=str, help="Specific job ID for v0.11.2")
     parser.add_argument("--nightly-job", type=str, help="Specific job ID for nightly")
     parser.add_argument("--output", type=str, help="Export to CSV file")
     parser.add_argument("--model", type=str, default="*", help="Filter by model name")
@@ -279,6 +279,13 @@ def main():
         print("No results found. Make sure benchmarks have completed.")
         return
     
+    # Print found results
+    print(f"\nFound {len(all_results)} result(s):")
+    for (model, version), result in all_results.items():
+        model_short = model.split("/")[-1]
+        print(f"  - {model_short}: v{version} ({result['job_dir'].split('/')[-1]})")
+    print()
+    
     # Group results by model for comparison
     by_model = {}
     for (model, version), result in all_results.items():
@@ -286,38 +293,43 @@ def main():
         if model_name not in by_model:
             by_model[model_name] = {}
         
-        # Categorize by version
-        if "0.11" in version:
-            by_model[model_name]["v0110"] = result
+        # Categorize by version (more specific matching)
+        if version == "0.11.2":
+            by_model[model_name]["v0112"] = result
+        elif version.startswith("0.11"):
+            # Skip older 0.11.x versions (e.g., 0.11.0)
+            print(f"  Skipping older version {version} for {model_name}")
+            continue
         else:
+            # Nightly versions (e.g., 0.14.0rc1.dev34+gbb80f69bc)
             by_model[model_name]["nightly"] = result
     
     # Build comparison data
     comparisons = []
     
     for model_name, versions in by_model.items():
-        v0110_data = versions.get("v0110", {}).get("data", [])
+        v0112_data = versions.get("v0112", {}).get("data", [])
         nightly_data = versions.get("nightly", {}).get("data", [])
         
-        v0110_metrics = extract_metrics(v0110_data) if v0110_data else {}
+        v0112_metrics = extract_metrics(v0112_data) if v0112_data else {}
         nightly_metrics = extract_metrics(nightly_data) if nightly_data else {}
         
         # Get all config keys
-        all_configs = set(v0110_metrics.keys()) | set(nightly_metrics.keys())
+        all_configs = set(v0112_metrics.keys()) | set(nightly_metrics.keys())
         
         for config in all_configs:
-            v0110 = v0110_metrics.get(config, {})
+            v0112 = v0112_metrics.get(config, {})
             nightly = nightly_metrics.get(config, {})
             
             comp = {
                 "model": model_name,
-                "input_len": v0110.get("input_len", nightly.get("input_len", 0)),
-                "output_len": v0110.get("output_len", nightly.get("output_len", 0)),
-                "tp": v0110.get("tp", nightly.get("tp", 1)),
-                "pp": v0110.get("pp", nightly.get("pp", 1)),
-                "v0110_tok_s": v0110.get("throughput_tok_s", 0),
-                "v0110_tok_s_gpu": v0110.get("throughput_tok_s_gpu", 0),
-                "v0110_time": v0110.get("total_time", 0),
+                "input_len": v0112.get("input_len", nightly.get("input_len", 0)),
+                "output_len": v0112.get("output_len", nightly.get("output_len", 0)),
+                "tp": v0112.get("tp", nightly.get("tp", 1)),
+                "pp": v0112.get("pp", nightly.get("pp", 1)),
+                "v0112_tok_s": v0112.get("throughput_tok_s", 0),
+                "v0112_tok_s_gpu": v0112.get("throughput_tok_s_gpu", 0),
+                "v0112_time": v0112.get("total_time", 0),
                 "nightly_tok_s": nightly.get("throughput_tok_s", 0),
                 "nightly_tok_s_gpu": nightly.get("throughput_tok_s_gpu", 0),
                 "nightly_time": nightly.get("total_time", 0),
