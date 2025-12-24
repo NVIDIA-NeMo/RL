@@ -114,6 +114,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             lora_cfg = config.get("dtensor_cfg", {}).get("lora_cfg", {})
             self.lora_enabled = lora_cfg.get("enabled", False)
+            from nemo_rl.utils.logger import print_colored
+
+            print_colored(f"LORA ENABLED in lm_policy: {self.lora_enabled}")
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
 

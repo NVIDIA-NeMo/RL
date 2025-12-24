@@ -927,8 +927,8 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def get_lora_counts(self):
-        """Get the number of LoRA from the vLLM engine."""
-        futures = self.worker_group.run_all_workers_single_data("get_lora_counts")
+    def get_model_state_dict(self) -> dict[str, Any]:
+        """Get the model state dict from the vLLM engine."""
+        futures = self.worker_group.run_all_workers_single_data("get_model_state_dict")
         results = ray.get(futures)
         return results

@@ -23,6 +23,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.utils.logger import RED, print_colored
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
@@ -95,6 +96,7 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        # self.vllm_state_dict_keys = self.model_runner.model.state_dict().keys()
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -125,17 +127,41 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    def map_param_name(self, param_name: str) -> str:
+        lora_mgr = self.model_runner.model.lora_manager
+        supported_modules = lora_mgr.supported_lora_modules
+        packed_modules_mapping = lora_mgr.packed_modules_mapping
+
+        parts = param_name.split(".")
+        if len(parts) < 2:
+            return param_name
+
+        base_name = ".".join(parts[:-2])  # prefix
+        module_name = parts[-2]  # e.g. q_proj/k_proj/v_proj/gate_proj/up_proj/...
+        field_name = parts[-1]  # weight/bias
+
+        resolved_module_name = module_name
+        for packed_name, member_names in packed_modules_mapping.items():
+            if module_name in member_names:
+                resolved_module_name = packed_name
+                break
+
+        # use resolved_module_name for checking, but return the original module_name
+        if resolved_module_name in supported_modules:
+            if base_name != "":
+                return f"{base_name}.{module_name}.base_layer.{field_name}"
+            else:
+                return f"{module_name}.base_layer.{field_name}"
+
+        return param_name
+
     def _apply_weight_name_mapping(
         self, weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
         """Apply weight name mapping if LoRA is enabled."""
         new_weights = []
         for name, w in weights:
-            new_name = name
-            if ".self_attn." in name and name.endswith("_proj.weight"):
-                new_name = name.replace("_proj.weight", "_proj.base_layer.weight")
-            if ".mlp." in name and name.endswith("_proj.weight"):
-                new_name = name.replace("_proj.weight", "_proj.base_layer.weight")
+            new_name = self.map_param_name(name)
             new_weights.append((new_name, w))
         return new_weights
 
@@ -154,6 +180,10 @@ class VllmInternalWorkerExtension:
         buffer = None
         weights = None
 
+        print_colored(
+            f"lora_config in update_weights_via_ipc_zmq: {self.model_runner.vllm_config.lora_config}",
+            RED,
+        )
         try:
             self.maybe_init_zmq()
             while True:
@@ -211,6 +241,7 @@ class VllmInternalWorkerExtension:
                         ):
                             weights = self._apply_weight_name_mapping(weights)
                         self.model_runner.model.load_weights(weights=weights)
+                        print_colored("updated base model weights", RED)
                     elif refit_lora_weights:
                         assert lora_config, (
                             "lora_config is not provided, can not refit lora weights"
@@ -244,6 +275,7 @@ class VllmInternalWorkerExtension:
                             ),
                         )
                         self.add_lora(lora_request=lora_request)
+                        print_colored("updated lora weights", RED)
                     else:
                         raise ValueError(
                             "refit_base_model_weights and refit_lora_weights cannot be both False"
@@ -337,9 +369,3 @@ class VllmInternalWorkerExtension:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
-
-    def get_lora_counts(self) -> int:
-        """Get the number of LoRA layers from the vLLM engine."""
-        results = self.list_loras()
-        print(f"Results: {results}")
-        return results
