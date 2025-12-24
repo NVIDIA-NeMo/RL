@@ -1460,3 +1460,21 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+# ANSI color codes
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def print_colored(text: str, color: str = YELLOW):
+    line = "=" * 80
+    print(f"\n{color}{BOLD}{line}{RESET}")
+    print(f"{color}{BOLD}{text}{RESET}")
+    print(f"{color}{BOLD}{line}{RESET}\n")

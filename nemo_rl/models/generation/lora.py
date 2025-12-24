@@ -15,7 +15,9 @@
 
 from typing import Any, Optional
 
+from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
+from vllm.lora.utils import get_adapter_absolute_path
 
 
 class LoRARequestWithCfgAndWeights(LoRARequest):
@@ -38,14 +40,18 @@ def patched_load_adapter(self, lora_request: LoRARequestWithCfgAndWeights):
         expected_lora_modules = set(expected_lora_lst)
         lora_weights = None
 
-        from vllm.lora.peft_helper import PEFTHelper
-
         if isinstance(lora_request, LoRARequestWithCfgAndWeights):
             lora_cfg = lora_request.lora_cfg
             lora_weights = lora_request.lora_weights
             peft_helper = PEFTHelper.from_dict(lora_cfg)
         else:
-            raise ValueError(f"Unsupported LoRA request type: {type(lora_request)}")
+            lora_path = get_adapter_absolute_path(lora_request.lora_path)
+
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                self.max_position_embeddings,
+                lora_request.tensorizer_config_dict,
+            )
 
         # Validates the LoRA configuration against requirements before
         # loading weights, throwing an exception if validation fails.
@@ -55,7 +61,6 @@ def patched_load_adapter(self, lora_request: LoRARequestWithCfgAndWeights):
         # to ensure correct loading of lora weights.
         model = self._adapter_manager.model
         hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
-        print(f"hf_to_vllm_mapper in lora.patched_load_adapter: {hf_to_vllm_mapper}")
         if isinstance(lora_request, LoRARequestWithCfgAndWeights):
             lora = self._lora_model_cls.from_lora_tensors(
                 lora_model_id=lora_request.lora_int_id,
@@ -70,9 +75,20 @@ def patched_load_adapter(self, lora_request: LoRARequestWithCfgAndWeights):
                 embedding_padding_modules=self.embedding_padding_modules,
                 weights_mapper=hf_to_vllm_mapper,
             )
-
         else:
-            raise ValueError(f"Unsupported LoRA request type: {type(lora_request)}")
+            lora = self._lora_model_cls.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",
+                dtype=self.lora_config.lora_dtype,
+                target_embedding_padding=self.vocab_size
+                + self.lora_config.lora_extra_vocab_size,
+                embedding_modules=self.embedding_modules,
+                embedding_padding_modules=self.embedding_padding_modules,
+                weights_mapper=hf_to_vllm_mapper,
+            )
 
     except FileNotFoundError as e:
         # FileNotFoundError should be raised if both
@@ -104,13 +120,9 @@ def apply_lora_patches():
     setattr(LRUCacheWorkerLoRAManager, "_load_adapter", patched_load_adapter)
 
 
-lora_int_id = 0
-
-
 # Note: Not sure put it here or in nemo_rl/models/generation/vllm/utils.py
 def get_vllm_lora_metadata() -> dict[str, Any]:
-    global lora_int_id
-    lora_int_id += 1  # Can be any unique id exclude 0
+    lora_int_id = 1  # Can be any unique id exclude 0
     lora_name = f"{lora_int_id}"
     lora_path = "dummy_lora_path"
     return {

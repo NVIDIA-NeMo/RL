@@ -34,6 +34,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.logger import print_colored
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -390,10 +391,12 @@ class BaseVllmGenerationWorker:
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
         # Lora is enabled, add it to the vllm kwargs
+        self.lora_enabled = False
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
             from nemo_rl.models.generation.lora import apply_lora_patches
 
             apply_lora_patches()
+            self.lora_enabled = True
             vllm_kwargs["enable_lora"] = True
             vllm_kwargs["max_loras"] = 1  # only support one lora adapter
             vllm_kwargs["max_lora_rank"] = self.lora_cfg["dim"]
@@ -569,7 +572,20 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            # print_colored(f"list_lora in generate: {self.llm.llm_engine.list_loras()}")
+            from vllm.lora.request import LoRARequest
+
+            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+            lora_metadata = get_vllm_lora_metadata()
+            lora_req = LoRARequest(
+                **lora_metadata,
+            )
+        print_colored(f"lora_req in generate: {lora_req}")
+        outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -804,6 +820,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             details = []
             for name, module in model.named_modules():
+                print_colored(f"name: {name}")
                 if isinstance(module, BaseLinearLayerWithLoRA):
                     a_shapes = [tuple(t.shape) for t in module.lora_a_stacked]
                     b_shapes = [tuple(t.shape) for t in module.lora_b_stacked]
@@ -821,9 +838,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         results = self.llm.collective_rpc(_get_lora_layers)
         return results
 
-    def get_lora_counts(self) -> int:
-        """Get the number of LoRA layers from the vLLM engine."""
-        results = self.llm.collective_rpc("get_lora_counts")
+    def get_model_state_dict(self) -> dict[str, torch.Tensor]:
+        """Get the model state dict from the vLLM engine."""
+
+        def _get_model_state_dict(self):
+            model = self.get_model()
+            if model is None:
+                return {}
+            return model.state_dict()
+
+        results = self.llm.collective_rpc(_get_model_state_dict)
         return results
 
     def reset_prefix_cache(self):
