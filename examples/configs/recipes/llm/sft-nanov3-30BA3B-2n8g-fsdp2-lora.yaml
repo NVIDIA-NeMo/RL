@@ -10,6 +10,8 @@ policy:
   dtensor_cfg:
     lora_cfg:
       enabled: true
+      dim: 128
+      alpha: 256
       use_triton: false
 logger:
   wandb:
