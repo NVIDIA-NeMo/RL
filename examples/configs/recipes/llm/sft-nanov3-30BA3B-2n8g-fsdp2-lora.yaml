@@ -1,0 +1,26 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 100
+checkpointing:
+  enabled: false
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  train_global_batch_size: 16
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    lora_cfg:
+      enabled: true
+      dim: 256
+      alpha: 512
+      use_triton: false
+logger:
+  wandb:
+    project: nemo-rl
+    name: sft-nanov3-30BA3B-2n8g-fsdp2-lora
+  tensorboard:
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-fsdp2-lora
+  mlflow:
+    run_name: sft-nanov3-30BA3B-2n8g-fsdp2-lora
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
