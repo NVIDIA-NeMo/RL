@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib
 from unittest.mock import patch
 
 import pytest
@@ -33,14 +32,10 @@ def mock_registry():
 
 @pytest.fixture
 def prefetch_venvs_func(mock_registry):
-    """Reload the module with mocked registry to ensure patches are applied."""
-    with patch.dict(
-        "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
-        mock_registry,
-        clear=True,
+    """Patch the registry directly in the prefetch_venvs module."""
+    with patch.object(
+        prefetch_venvs_module, "ACTOR_ENVIRONMENT_REGISTRY", mock_registry
     ):
-        # Reload the module so it picks up the patched registry
-        importlib.reload(prefetch_venvs_module)
         yield prefetch_venvs_module.prefetch_venvs
 
 
