@@ -130,6 +130,12 @@ def main() -> None:
                         f"{feature} is not supported with async GRPO"
                     )
 
+        # Async GRPO does not support multiple dataloaders
+        if config["data"]["use_multiple_dataloader"]:
+            raise NotImplementedError(
+                "use_multiple_dataloader is not supported with async GRPO"
+            )
+
         from nemo_rl.algorithms.grpo import async_grpo_train
 
         print("🚀 Running async GRPO training")
