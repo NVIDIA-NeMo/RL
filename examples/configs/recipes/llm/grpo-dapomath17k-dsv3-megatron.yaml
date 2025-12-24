@@ -40,7 +40,10 @@ policy:
       tensor_parallel_size: 32
 data:
   prompt_file: null
-  dataset_name: DAPOMath17K
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
 logger:
   monitor_gpus: false
   wandb:

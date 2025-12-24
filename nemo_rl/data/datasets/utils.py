@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import base64
 import io
 import os
@@ -106,3 +107,16 @@ def get_extra_kwargs(data_config: dict, keys: list[str]) -> dict:
         if key in data_config:
             extra_kwargs[key] = data_config[key]
     return extra_kwargs
+
+
+def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
+    """Fill the single dataset config with default dataset config."""
+    fill_keys = [
+        "prompt_file",
+        "system_prompt_file",
+        "processor",
+        "env_name",
+    ]
+    for key in fill_keys:
+        if key not in data_config and key in default_data_config:
+            data_config[key] = default_data_config[key]

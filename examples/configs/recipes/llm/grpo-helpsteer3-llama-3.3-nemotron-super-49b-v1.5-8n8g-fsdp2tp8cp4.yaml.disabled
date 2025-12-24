@@ -45,10 +45,14 @@ data:
   # Training with HelpSteer3 will lead to high logprob error.
   # ISSUE: https://github.com/NVIDIA-NeMo/RL/issues/1570
   prompt_file: null
-  dataset_name: HelpSteer3
-  split: preference
   env_name: "code_jaccard"
   processor: helpsteer3_data_processor
+  train:
+    dataset_name: HelpSteer3
+    split: train
+  validation:
+    dataset_name: HelpSteer3
+    split: validation
 env:
   code_jaccard:
     num_workers: 8
