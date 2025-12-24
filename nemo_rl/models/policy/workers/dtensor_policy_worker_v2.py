@@ -858,6 +858,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             ## NOTE: invalid samples should be multiplied
                             ## by zero in the loss function to prevent them
                             ## from affecting the gradient calculation
+
+                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+                            # but we want to sum them so we cancel out the average here
+                            loss *= self.dp_size * self.cp_size
                             loss.backward()
 
                     if num_valid_samples > 0:
@@ -880,8 +884,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         pp_axis_name=None,
                         foreach=True,
                         num_label_tokens=1,
-                        # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                        # but we want to sum them so we rescale the gradients by self.dp_size * self.cp_size
                         dp_group_size=self.dp_size * self.cp_size,
                     )
                     grad_norm = torch.tensor(
