@@ -45,6 +45,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -185,14 +186,14 @@ class MasterConfig(TypedDict):
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset,
+    datasets: dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
-    StatefulDataLoader,
+    dict[str, StatefulDataLoader],
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
     Logger,
@@ -245,9 +246,14 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    # Validate batch_multiplier
+    # Validate dataloader batch size
+    dataloader_batch_size = data_config["num_prompts_per_dataloader"]
+    if not data_config["use_multiple_dataloader"]:
+        assert dataloader_batch_size == grpo_config["num_prompts_per_step"], (
+            "data.num_prompts_per_dataloader must be equal to grpo.num_prompts_per_step if not using multiple dataloaders (data.use_multiple_dataloader=false)"
+        )
+
     batch_multiplier = grpo_config["batch_multiplier"]
-    dataloader_batch_size = grpo_config["num_prompts_per_step"]
     if not grpo_config["use_dynamic_sampling"]:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
@@ -255,21 +261,25 @@ def setup(
     else:
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
 
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
-    if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+    # Load train dataset
+    dataloaders: dict[str, StatefulDataLoader] = {}
+    for task_name, dataset in datasets.items():
+        dataloaders[task_name] = StatefulDataLoader(
+            dataset,
+            batch_size=dataloader_batch_size,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
         )
-        dataloader.load_state_dict(dataloader_state_dict)
+        if last_checkpoint_path is not None:
+            dataloader_state_dict = torch.load(
+                os.path.join(last_checkpoint_path, f"train_dataloader_{task_name}.pt")
+            )
+            dataloaders[task_name].load_state_dict(dataloader_state_dict)
 
-    print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
+    sample_count = sum(len(dataloader) for dataloader in dataloaders.values())
+    print(f"  ✓ Training dataloader loaded with {sample_count} samples", flush=True)
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -649,7 +659,7 @@ def setup(
         policy,
         policy_generation,
         (train_cluster, inference_cluster),
-        dataloader,
+        dataloaders,
         val_dataloader,
         loss_fn,
         logger,
@@ -985,7 +995,7 @@ def refit_policy_generation(
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    dataloader: StatefulDataLoader,
+    dataloaders: dict[str, StatefulDataLoader],
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
@@ -1060,6 +1070,18 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    # Set dataloader
+    if master_config["data"]["use_multiple_dataloader"]:
+        num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
+        batch_multiplier = master_config["grpo"]["batch_multiplier"]
+        dataloader = MultipleDataloaderWrapper(
+            expected_num_prompts=num_prompts_per_step * batch_multiplier,
+            data_config=master_config["data"],
+            dataloaders=dataloaders,
+        )
+    else:
+        dataloader = dataloaders["all_tasks"]
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -1069,10 +1091,17 @@ def grpo_train(
 
         # Run grpo/dapo training loop (single-turn)
         for batch in dataloader:
-            print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
-                flush=True,
-            )
+            if master_config["data"]["use_multiple_dataloader"]:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
+                    flush=True,
+                )
+
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -1364,10 +1393,12 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = (total_steps + 1 >= max_num_steps) or (
-                    (current_epoch + 1 == max_num_epochs)
-                    and (current_step + 1 == len(dataloader))
-                )
+                is_last_step = total_steps + 1 >= max_num_steps
+                if not master_config["data"]["use_multiple_dataloader"]:
+                    is_last_step = is_last_step or (
+                        (current_epoch + 1 == max_num_epochs)
+                        and (current_step + 1 == len(dataloader))
+                    )
 
                 # Run validation if it's a validation step
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
@@ -1541,10 +1572,13 @@ def grpo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        for task_name, task_dataloader in dataloaders.items():
+                            torch.save(
+                                task_dataloader.state_dict(),
+                                os.path.join(
+                                    checkpoint_path, f"train_dataloader_{task_name}.pt"
+                                ),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
