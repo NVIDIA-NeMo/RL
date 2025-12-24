@@ -11,11 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from unittest.mock import patch
 
 import pytest
 
 import nemo_rl.utils.prefetch_venvs as prefetch_venvs_module
+
+# When NRL_CONTAINER is set, create_frozen_environment_symlinks also calls
+# create_local_venv for each actor, effectively doubling the call count
+CALL_MULTIPLIER = 2 if os.environ.get("NRL_CONTAINER") else 1
 
 
 @pytest.fixture
@@ -51,7 +56,7 @@ class TestPrefetchVenvs:
 
             prefetch_venvs_func(filters=None)
 
-            assert mock_create_venv.call_count == 3
+            assert mock_create_venv.call_count == 3 * CALL_MULTIPLIER
 
             # Verify the actors that were called
             call_args = [call[0] for call in mock_create_venv.call_args_list]
@@ -80,7 +85,7 @@ class TestPrefetchVenvs:
             prefetch_venvs_func(filters=["vllm"])
 
             # Should only create venvs for actors containing "vllm" (1 actor)
-            assert mock_create_venv.call_count == 1
+            assert mock_create_venv.call_count == 1 * CALL_MULTIPLIER
 
             call_args = mock_create_venv.call_args[0]
             assert (
@@ -98,7 +103,7 @@ class TestPrefetchVenvs:
             prefetch_venvs_func(filters=["vllm", "megatron"])
 
             # Should create venvs for actors containing "vllm" OR "megatron" (2 actors)
-            assert mock_create_venv.call_count == 2
+            assert mock_create_venv.call_count == 2 * CALL_MULTIPLIER
 
             call_args = [call[0] for call in mock_create_venv.call_args_list]
             actor_fqns = [args[1] for args in call_args]
@@ -147,7 +152,7 @@ class TestPrefetchVenvs:
             # "policy" should match both dtensor_policy_worker and megatron_policy_worker
             prefetch_venvs_func(filters=["policy"])
 
-            assert mock_create_venv.call_count == 2
+            assert mock_create_venv.call_count == 2 * CALL_MULTIPLIER
 
             call_args = [call[0] for call in mock_create_venv.call_args_list]
             actor_fqns = [args[1] for args in call_args]
@@ -172,25 +177,25 @@ class TestPrefetchVenvs:
             prefetch_venvs_func(filters=[])
 
             # Should create venvs for all uv-based actors (3 total)
-            assert mock_create_venv.call_count == 3
+            assert mock_create_venv.call_count == 3 * CALL_MULTIPLIER
 
     def test_prefetch_venvs_continues_on_error(self, prefetch_venvs_func):
         """Test that prefetching continues even if one venv creation fails."""
         with patch(
             "nemo_rl.utils.prefetch_venvs.create_local_venv"
         ) as mock_create_venv:
-            # First call raises, subsequent calls succeed
+            # Provide enough return values for both prefetch and frozen env symlinks
             mock_create_venv.side_effect = [
                 Exception("Test error"),
                 "/path/to/venv/bin/python",
                 "/path/to/venv/bin/python",
-            ]
+            ] * CALL_MULTIPLIER
 
             # Should not raise, should continue with other venvs
             prefetch_venvs_func(filters=None)
 
             # All 3 uv-based actors should have been attempted
-            assert mock_create_venv.call_count == 3
+            assert mock_create_venv.call_count == 3 * CALL_MULTIPLIER
 
     def test_prefetch_venvs_case_sensitive_filter(self, prefetch_venvs_func):
         """Test that filters are case-sensitive."""
@@ -252,12 +257,12 @@ class TestPrefetchVenvs:
         with patch(
             "nemo_rl.utils.prefetch_venvs.create_local_venv"
         ) as mock_create_venv:
-            # First call raises, subsequent calls succeed
+            # Provide enough return values for both prefetch and frozen env symlinks
             mock_create_venv.side_effect = [
                 Exception("Test error"),
                 "/path/to/venv/bin/python",
                 "/path/to/venv/bin/python",
-            ]
+            ] * CALL_MULTIPLIER
 
             prefetch_venvs_func(filters=None)
 
