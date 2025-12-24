@@ -90,6 +90,10 @@ tests/test_suites/llm/sft-qwen2.5-math7b-2n8g-megatron.sh
 # gpt-oss 20b DeepEP test
 tests/test_suites/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.sh
 
+# Nemotron 3 Nano 30B A3B Base BF16 tests
+tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2.sh
+tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
+
 #######
 # DPO #
 #######
