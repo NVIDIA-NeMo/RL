@@ -1,15 +1,12 @@
-# Nemtron 3 Nano
+# Nemotron 3 Nano
 
 This guide explains how to post-train the [Nemotron 3 Nano model](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Nano-Technical-Report.pdf) using NeMo RL.
 
 ## Download and prepare the data
 
 ```bash
-# Install Hugging Face CLI
-pip install huggingface-hub
-
 # Download RL data blend
-hf download nvidia/Nemotron-3-Nano-RL-Training-Blend --repo-type dataset --local-dir=data
+uvx --from huggingface-hub hf download nvidia/Nemotron-3-Nano-RL-Training-Blend --repo-type dataset --local-dir=data
 
 # Fill in placeholders in dataset
 chmod +x data/create_nanov3_jsonl.py
