@@ -2534,7 +2534,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.2.4"
-source = { git = "https://github.com/yfw/mamba?branch=general_stride_fix#62bc4455e3e4b2cc6c920b47edc888a9785c9ce3" }
+source = { git = "https://github.com/yfw/mamba?branch=stride_fix_revert#09ca6da04fe3535bef3d770b1b15f76f9a5c78fa" }
 dependencies = [
     { name = "causal-conv1d" },
     { name = "ninja" },
@@ -2718,7 +2718,7 @@ requires-dist = [
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.4" },
     { name = "datasets" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
-    { name = "mamba-ssm", git = "https://github.com/yfw/mamba?branch=general_stride_fix" },
+    { name = "mamba-ssm", git = "https://github.com/yfw/mamba?branch=stride_fix_revert" },
     { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-LM-workspace" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
@@ -3473,8 +3473,8 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.8.1" },
     { name = "hydra-core" },
-    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/yfw/mamba?branch=general_stride_fix" },
-    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/yfw/mamba?branch=general_stride_fix" },
+    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/yfw/mamba?branch=stride_fix_revert" },
+    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/yfw/mamba?branch=stride_fix_revert" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
