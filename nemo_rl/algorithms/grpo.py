@@ -49,6 +49,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -214,14 +215,14 @@ class MasterConfig(TypedDict):
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset,
+    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
-    StatefulDataLoader,
+    StatefulDataLoader | dict[str, StatefulDataLoader],
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
     Logger,
@@ -274,9 +275,14 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    # Validate batch_multiplier
+    # Validate dataloader batch size
+    dataloader_batch_size = data_config["num_prompts_per_dataloader"]
+    if not data_config["use_multiple_dataloader"]:
+        assert dataloader_batch_size == grpo_config["num_prompts_per_step"], (
+            "data.num_prompts_per_dataloader must be equal to grpo.num_prompts_per_step if not using multiple dataloaders (data.use_multiple_dataloader=false)"
+        )
+
     batch_multiplier = grpo_config["batch_multiplier"]
-    dataloader_batch_size = grpo_config["num_prompts_per_step"]
     if not grpo_config["use_dynamic_sampling"]:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
@@ -284,21 +290,35 @@ def setup(
     else:
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
 
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
-    if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+    # Load train dataset
+    def init_dataloader(dataset, suffix: str = ""):
+        dataloader = StatefulDataLoader(
+            dataset,
+            batch_size=dataloader_batch_size,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
         )
-        dataloader.load_state_dict(dataloader_state_dict)
+        if last_checkpoint_path is not None:
+            dataloader_state_dict = torch.load(
+                os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
+            )
+            dataloader.load_state_dict(dataloader_state_dict)
+        return dataloader
 
-    print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
+    if data_config["use_multiple_dataloader"]:
+        dataloader = {
+            task_name: init_dataloader(task_dataset, f"_{task_name}")
+            for task_name, task_dataset in dataset.items()
+        }
+        sample_count = sum(
+            len(task_dataloader) for task_dataloader in dataloader.values()
+        )
+    else:
+        dataloader = init_dataloader(dataset)
+        sample_count = len(dataloader)
+    print(f"  ✓ Training dataloader loaded with {sample_count} samples", flush=True)
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -1255,7 +1275,7 @@ def compute_and_apply_seq_logprob_error_masking(
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    dataloader: StatefulDataLoader,
+    dataloader: StatefulDataLoader | dict[str, StatefulDataLoader],
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
@@ -1343,6 +1363,14 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    # Wrap dataloader if using multiple dataloaders
+    if master_config["data"]["use_multiple_dataloader"]:
+        dataloader = MultipleDataloaderWrapper(
+            master_config["grpo"]["num_prompts_per_step"],
+            master_config["data"],
+            dataloader,
+        )
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1357,10 +1385,17 @@ def grpo_train(
             metrics_logging_data = dict()
             metrics = dict()
 
-            print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
-                flush=True,
-            )
+            if master_config["data"]["use_multiple_dataloader"]:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
+                    flush=True,
+                )
+
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -1951,10 +1986,20 @@ def grpo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        if master_config["data"]["use_multiple_dataloader"]:
+                            for task_name, task_dataloader in dataloader.items():
+                                torch.save(
+                                    task_dataloader.state_dict(),
+                                    os.path.join(
+                                        checkpoint_path,
+                                        f"train_dataloader_{task_name}.pt",
+                                    ),
+                                )
+                        else:
+                            torch.save(
+                                dataloader.state_dict(),
+                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging

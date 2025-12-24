@@ -8,6 +8,11 @@ data:
   shuffle: true
   num_workers: 1
 
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+  num_prompts_per_dataloader: ${grpo.num_prompts_per_step}
+  custom_dataloader: null
+
   # dataset
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
   train:

@@ -29,6 +29,9 @@ from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
+TrainDatasetType = Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]
+ValidationDatasetType = Optional[AllTaskProcessedDataset]
+
 
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
@@ -69,7 +72,9 @@ def setup_response_data(
         "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
     )
 
-    # setup environments if needed
+    # ==========================
+    # Setup Environments
+    # ==========================
     has_envs = env_configs is not None
     if has_envs:
         print("\n▶ Setting up envs...")
@@ -81,8 +86,10 @@ def setup_response_data(
                 env_name=registered_env_name, env_config=env_configs[env_name]
             )
 
+    # ==========================
+    # Setup Train Dataset
+    # ==========================
     print("\n▶ Setting up data...")
-    # setup train dataset
     task_data_processors = {}
     task_data_preprocessors = {}
     task_to_env = {}
@@ -105,18 +112,37 @@ def setup_response_data(
         if has_envs:
             task_to_env[task_name] = envs[cfg["env_name"]]
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
-    dataset = AllTaskProcessedDataset(
-        merged_data,
-        tokenizer,
-        None,
-        task_data_processors,
-        task_data_preprocessors=task_data_preprocessors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+    # merge datasets
+    if data_config["use_multiple_dataloader"]:
+        # merge datasets into a dictionary of task name to dataset
+        dataset = {
+            data.task_name: AllTaskProcessedDataset(
+                data.dataset,
+                tokenizer,
+                None,
+                task_data_processors,
+                task_data_preprocessors=task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for data in data_list
+        }
+    else:
+        # merge datasets into a single dataset
+        merged_data = concatenate_datasets([data.dataset for data in data_list])
+        dataset = AllTaskProcessedDataset(
+            merged_data,
+            tokenizer,
+            None,
+            task_data_processors,
+            task_data_preprocessors=task_data_preprocessors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+    sample_count = sum(len(data.dataset) for data in data_list)
+    print(f"  ✓ Training dataset loaded with {sample_count} samples.")
 
-    # setup validation dataset
+    # ==========================
+    # Setup Validation Dataset
+    # ==========================
     val_task_data_processors = {}
     val_task_data_preprocessors = {}
     val_task_to_env = {}
@@ -158,6 +184,7 @@ def setup_response_data(
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
+    # merge datasets
     val_dataset = None
     if len(val_data_list) > 0:
         merged_val_data = concatenate_datasets(val_data_list)
@@ -178,7 +205,9 @@ def setup_response_data(
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
-def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_preference_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig
+) -> tuple[AllTaskProcessedDataset, Optional[AllTaskProcessedDataset]]:
     """Setup preference data.
 
     This function is used to setup the preference data for the training and validation datasets.
