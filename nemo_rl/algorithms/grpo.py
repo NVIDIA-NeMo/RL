@@ -1026,6 +1026,156 @@ def refit_policy_generation(
 # ===============================================================================
 
 
+def dump_lora_layers_metadata(
+    lora_layers_weights,
+    *,
+    dump_path: Optional[str] = None,
+) -> Optional[str]:
+    """Write LoRA layer metadata (layer name, A/B weight shapes and dtypes) to a JSON file.
+
+    Path priority:
+      1) explicit dump_path
+      2) environment variable NRL_LORA_LAYERS_DUMP
+      3) environment variable NRL_OUTPUT_DIR or current working directory + timestamped filename
+    Returns the written path on success; None on failure (and prints a warning).
+    """
+    try:
+        import json
+        import os
+        import time
+
+        if dump_path is None:
+            dump_path = os.environ.get("NRL_LORA_LAYERS_DUMP")
+        if dump_path is None:
+            default_dir = os.environ.get("NRL_OUTPUT_DIR") or os.getcwd()
+            dump_path = os.path.join(
+                default_dir, f"lora_layers_{int(time.time())}.json"
+            )
+
+        # Flatten potential DP-nested structure
+        flattened = []
+        if (
+            isinstance(lora_layers_weights, list)
+            and len(lora_layers_weights) > 0
+            and isinstance(lora_layers_weights[0], list)
+        ):
+            for sub in lora_layers_weights:
+                if sub:
+                    flattened.extend(sub)
+        else:
+            flattened = lora_layers_weights
+
+        def _shapes_and_dtypes(tensors):
+            result = []
+            for t in tensors or []:
+                try:
+                    shape = tuple(int(x) for x in getattr(t, "shape", ()))
+                    dtype = str(getattr(t, "dtype", "unknown"))
+                    result.append({"shape": shape, "dtype": dtype})
+                except Exception:
+                    result.append({"shape": None, "dtype": "unknown"})
+            return result
+
+        sanitized = []
+        for item in flattened or []:
+            if not isinstance(item, dict):
+                continue
+            sanitized.append(
+                {
+                    "name": item.get("name"),
+                    "a_shapes": _shapes_and_dtypes(item.get("a_weights")),
+                    "b_shapes": _shapes_and_dtypes(item.get("b_weights")),
+                }
+            )
+
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        with open(dump_path, "w") as f:
+            json.dump({"layers": sanitized}, f, indent=2)
+        print(f"[INFO] LoRA layer metadata written to {dump_path}")
+        return dump_path
+    except Exception as e:
+        print(f"[WARN] Failed to dump LoRA layer metadata: {e}")
+        return None
+
+
+def dump_lora_layers_tensors(
+    lora_layers_weights,
+    *,
+    dump_path: Optional[str] = None,
+    cast_dtype: Optional[str] = None,
+) -> Optional[str]:
+    """Write full LoRA layer weights to a file (torch.save).
+
+    - Supports single dict or list[list[dict]] / list[dict] inputs.
+    - Moves tensors to CPU by default to avoid CUDA deserialization constraints.
+    - Optional cast_dtype: "float32" | "bfloat16" | "float16"
+    Returns the written path on success; None on failure.
+    """
+    try:
+        import os
+        import time
+
+        import torch
+
+        if dump_path is None:
+            dump_path = os.environ.get("NRL_LORA_LAYERS_TENSORS")
+        if dump_path is None:
+            default_dir = os.environ.get("NRL_OUTPUT_DIR") or os.getcwd()
+            dump_path = os.path.join(default_dir, f"lora_layers_{int(time.time())}.pt")
+
+        # Normalize to a flat list[dict]
+        if isinstance(lora_layers_weights, dict):
+            flattened = [lora_layers_weights]
+        elif (
+            isinstance(lora_layers_weights, list)
+            and len(lora_layers_weights) > 0
+            and isinstance(lora_layers_weights[0], list)
+        ):
+            flattened = []
+            for sub in lora_layers_weights:
+                if sub:
+                    flattened.extend(sub)
+        else:
+            flattened = lora_layers_weights
+
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        target_dtype = dtype_map.get(cast_dtype.lower(), None) if cast_dtype else None
+
+        def _to_cpu_and_cast(tensor):
+            if not hasattr(tensor, "detach"):
+                return tensor
+            t = tensor.squeeze(0).squeeze(0).detach().to("cpu")
+            if target_dtype is not None:
+                t = t.to(target_dtype)
+            return t
+
+        sanitized = []
+        for item in flattened or []:
+            if not isinstance(item, dict):
+                continue
+            a_weights = [_to_cpu_and_cast(t) for t in (item.get("a_weights") or [])]
+            b_weights = [_to_cpu_and_cast(t) for t in (item.get("b_weights") or [])]
+            sanitized.append(
+                {
+                    "name": item.get("name"),
+                    "a_weights": a_weights,
+                    "b_weights": b_weights,
+                }
+            )
+
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        torch.save({"layers": sanitized}, dump_path)
+        print(f"[INFO] LoRA layer tensors written to {dump_path}")
+        return dump_path
+    except Exception as e:
+        print(f"[WARN] Failed to dump LoRA layer tensors: {e}")
+        return None
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1203,6 +1353,39 @@ def grpo_train(
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
 
+                # lora_layers_weights = policy_generation.get_lora_layers()[0][0]
+                # try:
+                #     dump_lora_layers_metadata(lora_layers_weights, dump_path="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_metadata.json")
+                #     print(f"[INFO] LoRA layer metadata written to /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_metadata.json")
+                #     dump_lora_layers_tensors(lora_layers_weights, dump_path="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_tensors.pt")
+                #     print(f"[INFO] LoRA layer tensors written to /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_tensors.pt")
+                # except Exception as e:
+                #     print(f"[WARN] Failed to dump LoRA layer metadata: {e}")
+
+                # print(f"[INFO] Initializing checkpoint...")
+                # checkpoint_path = checkpointer.init_tmp_checkpoint(
+                #     total_steps + 1, grpo_save_state, master_config
+                # )
+                # policy.save_checkpoint(
+                #     weights_path=os.path.join(
+                #         checkpoint_path, "policy", "weights"
+                #     ),
+                #     optimizer_path=os.path.join(
+                #         checkpoint_path, "policy", "optimizer"
+                #     ),
+                #     tokenizer_path=os.path.join(
+                #         checkpoint_path, "policy", "tokenizer"
+                #     ),
+                #     checkpointing_cfg=master_config["checkpointing"],
+                # )
+                # torch.save(
+                #     dataloader.state_dict(),
+                #     os.path.join(checkpoint_path, "train_dataloader.pt"),
+                # )
+                # checkpointer.finalize_checkpoint(checkpoint_path)
+                # print(f"[INFO] Checkpoint saved to {checkpoint_path}")
+                # exit()
+
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
@@ -1342,8 +1525,14 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message in LLMMessageLogType
+                    # print_colored(f"length of message_log: {len(repeated_batch['message_log'])}", BLUE)
+                    # print_colored(f"repeated_batch['message_log']: {repeated_batch['message_log']}", BLUE)
                     for i, message_log in enumerate(repeated_batch["message_log"]):
+                        # print_colored(f"length of message_log {i}: {len(message_log)}", BLUE)
+                        # print_colored(f"message_log {i}: {message_log}", BLUE)
                         for j, message in enumerate(message_log):
+                            # print_colored(f"length of message {i}, {j}: {len(message)}", BLUE)
+                            # print_colored(f"message {i}, {j}: {message}", BLUE)
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
@@ -1353,6 +1542,7 @@ def grpo_train(
                                     message["token_ids"]
                                 )
                             if "generation_logprobs" not in message:
+                                # print_colored(f"Set Generation logprobs to zeros for message {i}, {j}")
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
