@@ -6,7 +6,7 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:
@@ -48,11 +48,12 @@ policy:
 data:
   max_input_seq_length: 4096
 logger:
-  log_dir: logs/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
+    name: grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e
 cluster:
+  num_nodes: 2
   gpus_per_node: 8
