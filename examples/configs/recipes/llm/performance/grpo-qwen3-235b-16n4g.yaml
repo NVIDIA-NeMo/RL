@@ -1,0 +1,18 @@
+defaults: ./grpo-qwen3-235b-16n8g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-16n4g
+policy:
+  megatron_cfg:
+    pipeline_model_parallel_size: 4
+    num_layers_in_first_pipeline_stage: 23
+    num_layers_in_last_pipeline_stage: 23
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+logger:
+  log_dir: logs/grpo-qwen3-235b-16n4g
+  wandb:
+    name: grpo-qwen3-235b-16n4g
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

@@ -107,7 +107,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     val_dataset = data.formatted_ds["validation"]
     sft_task_spec = data.task_spec
     print(
-        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset) if val_dataset else 0} samples, respectively."
     )
 
     # add preprocessor if needed
@@ -133,19 +133,20 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = AllTaskProcessedDataset(
-        val_dataset,
-        tokenizer,
-        sft_task_spec,
-        partial(
-            sft_preprocessor,
-            add_bos=data_config.get("add_bos", True),
-            add_eos=data_config.get("add_eos", True),
-            add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor,
-        ),
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    if val_dataset is not None:
+        val_dataset = AllTaskProcessedDataset(
+            val_dataset,
+            tokenizer,
+            sft_task_spec,
+            partial(
+                sft_preprocessor,
+                add_bos=data_config.get("add_bos", True),
+                add_eos=data_config.get("add_eos", True),
+                add_generation_prompt=data_config["add_generation_prompt"],
+                datum_preprocessor=datum_preprocessor,
+            ),
+            max_seq_length=data_config["max_input_seq_length"],
+        )
 
     return train_dataset, val_dataset, sft_task_spec
 
