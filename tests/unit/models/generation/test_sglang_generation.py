@@ -486,7 +486,7 @@ def test_sglang_generate_text(cluster, tokenizer):
         }
     )
 
-    # Create SGLang config with gpus_per_server=1 for simpler test
+    # Create SGLang config with gpus_per_server=2 (using tensor parallelism)
     sglang_config = deepcopy(basic_sglang_test_config)
     sglang_config["sglang_cfg"]["gpus_per_server"] = 2
     sglang_config = configure_sglang_config(sglang_config, tokenizer, is_eval=True)
