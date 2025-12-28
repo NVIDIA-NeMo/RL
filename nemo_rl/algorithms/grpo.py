@@ -1029,6 +1029,11 @@ def refit_policy_generation(
                 update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
+            # SGLang haven't implemented non-colocated inference mode.
+            if isinstance(policy_generation, SGLangGeneration):
+                raise NotImplementedError(
+                    "SGLang haven't implemented non-colocated inference mode. "
+                )
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
