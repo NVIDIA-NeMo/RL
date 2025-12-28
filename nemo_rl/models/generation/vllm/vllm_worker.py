@@ -142,6 +142,30 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
+        output_len_or_output_len_generator = self.cfg.get(
+            "output_len_or_output_len_generator", None
+        )
+        if output_len_or_output_len_generator is not None:
+            if isinstance(output_len_or_output_len_generator, dict):
+                output_len_or_output_len_generator = get_sequence_length_generator(
+                    output_len_or_output_len_generator
+                )
+            elif isinstance(output_len_or_output_len_generator, int):
+                pass
+            else:
+                raise ValueError(
+                    f"Invalid output_len_or_output_len_generator: {output_len_or_output_len_generator}"
+                )
+            self.cfg["output_len_or_output_len_generator"] = (
+                output_len_or_output_len_generator
+            )
+        else:
+            self.cfg["output_len_or_output_len_generator"] = None
+
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
@@ -460,7 +484,10 @@ class BaseVllmGenerationWorker:
             top_k=top_k_val,
             max_tokens=max_tokens,
             logprobs=0,
-            stop_token_ids=self.cfg["stop_token_ids"],
+            stop_token_ids=self.cfg["stop_token_ids"]
+            if not self.cfg["ignore_eos"]
+            else [],
+            ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,
         )
@@ -681,6 +708,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             top_k=top_k if not greedy else 1,
             max_tokens=self.cfg["max_new_tokens"],
             stop_token_ids=self.cfg["stop_token_ids"],
+            ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
         )

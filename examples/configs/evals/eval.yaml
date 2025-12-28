@@ -16,6 +16,7 @@ generation:
   model_name: "Qwen/Qwen2.5-Math-1.5B-Instruct"
   stop_token_ids: null
   stop_strings: null
+  ignore_eos: false
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
