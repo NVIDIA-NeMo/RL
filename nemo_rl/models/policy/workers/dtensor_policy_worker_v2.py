@@ -91,6 +91,7 @@ from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weights import is_base_model_weight_name, is_lora_weight_name
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -292,7 +293,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 ]
             else:
                 sdpa_method = None
-
+            print(f"[Rank {self.rank}] sdpa_method: {sdpa_method}")
             self.model = model_class.from_pretrained(
                 model_name,
                 attn_implementation=attn_impl,
@@ -1689,18 +1690,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         return self.model.config
 
-    def _is_lora_weight(self, name: str) -> bool:
-        """Check if the weight is a lora weight."""
-        return (
-            name.endswith(".lora_A.weight")
-            or name.endswith(".lora_B.weight")
-            or name.endswith(".lora_scaling.weight")
-        )
-
-    def _is_base_model_weight(self, name: str) -> bool:
-        """Check if the weight is a base model weight."""
-        return not self._is_lora_weight(name)
-
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
@@ -1754,10 +1743,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             """
             for name, tensor in self.model.state_dict().items():
                 # Skip base model weights if skip_base_model_weights is True
-                if self._is_base_model_weight(name) and not refit_base_model_weights:
+                if is_base_model_weight_name(name) and not refit_base_model_weights:
                     continue
 
-                if self._is_lora_weight(name) and not refit_lora_weights:
+                if is_lora_weight_name(name) and not refit_lora_weights:
                     continue
 
                 if isinstance(tensor, DTensor):
@@ -1816,9 +1805,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             """Iterator that yields only base model weights when skip_base_model_weights is True."""
             for name, tensor in self.model.state_dict().items():
                 # Skip base model weights if skip_base_model_weights is True
-                if self._is_base_model_weight(name) and not refit_base_model_weights:
+                if is_base_model_weight_name(name) and not refit_base_model_weights:
                     continue
-                if self._is_lora_weight(name) and not refit_lora_weights:
+                if is_lora_weight_name(name) and not refit_lora_weights:
                     continue
                 yield (name, tensor)
 

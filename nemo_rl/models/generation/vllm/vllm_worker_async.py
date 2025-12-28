@@ -276,6 +276,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        # Ensure LoRA patches are applied inside engine worker processes (async path)
+        if getattr(self, "lora_enabled", False) and self.llm is not None:
+            try:
+                await self.llm.collective_rpc("apply_lora_patches", args=tuple())
+                print(
+                    "Successfully applied lora patches in engine workers (async worker)"
+                )
+            except Exception as e:
+                print(
+                    f"[WARNING] Failed to apply lora patches in engine workers (async worker): {e}"
+                )
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
@@ -1025,7 +1036,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1038,7 +1051,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
 
             if asyncio.iscoroutine(result_or_coro):

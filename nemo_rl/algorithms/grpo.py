@@ -974,8 +974,15 @@ def refit_policy_generation(
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
+            futures_train = policy.broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
+            futures_inference = policy_generation.update_weights_from_collective(
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -1525,14 +1532,8 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message in LLMMessageLogType
-                    # print_colored(f"length of message_log: {len(repeated_batch['message_log'])}", BLUE)
-                    # print_colored(f"repeated_batch['message_log']: {repeated_batch['message_log']}", BLUE)
                     for i, message_log in enumerate(repeated_batch["message_log"]):
-                        # print_colored(f"length of message_log {i}: {len(message_log)}", BLUE)
-                        # print_colored(f"message_log {i}: {message_log}", BLUE)
                         for j, message in enumerate(message_log):
-                            # print_colored(f"length of message {i}, {j}: {len(message)}", BLUE)
-                            # print_colored(f"message {i}, {j}: {message}", BLUE)
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
@@ -1542,7 +1543,6 @@ def grpo_train(
                                     message["token_ids"]
                                 )
                             if "generation_logprobs" not in message:
-                                # print_colored(f"Set Generation logprobs to zeros for message {i}, {j}")
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
@@ -2137,6 +2137,8 @@ def async_grpo_train(
         policy_generation = policy
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
+    REFIT_BASE_MODEL_WEIGHTS = True
+    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None
 
     # Training state
@@ -2248,9 +2250,16 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                refit_lora_weights=REFIT_LORA_WEIGHTS,
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
+            REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
             import traceback
@@ -2568,10 +2577,14 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
-
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
@@ -2593,9 +2606,14 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(

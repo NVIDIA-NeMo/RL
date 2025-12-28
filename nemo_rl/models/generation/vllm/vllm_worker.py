@@ -34,7 +34,6 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
-from nemo_rl.utils.logger import print_colored
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -393,9 +392,12 @@ class BaseVllmGenerationWorker:
         # Lora is enabled, add it to the vllm kwargs
         self.lora_enabled = False
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
-            from nemo_rl.models.generation.lora import apply_lora_patches
+            try:
+                from nemo_rl.models.generation.lora import apply_lora_patches
 
-            apply_lora_patches()
+                apply_lora_patches()
+            except Exception as e:
+                print(f"[WARNING] Failed to apply lora patches (sync worker): {e}")
             self.lora_enabled = True
             vllm_kwargs["enable_lora"] = True
             vllm_kwargs["max_loras"] = 1  # only support one lora adapter
@@ -575,7 +577,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         lora_req = None
         if self.lora_enabled:
-            # print_colored(f"list_lora in generate: {self.llm.llm_engine.list_loras()}")
             from vllm.lora.request import LoRARequest
 
             from nemo_rl.models.generation.lora import get_vllm_lora_metadata
@@ -584,7 +585,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             lora_req = LoRARequest(
                 **lora_metadata,
             )
-        print_colored(f"lora_req in generate: {lora_req}")
         outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
         # Process the outputs - but preserve the original input padding structure
@@ -778,7 +778,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -791,7 +793,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
             worker_result = result_or_coro[0]
 
@@ -820,7 +823,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             details = []
             for name, module in model.named_modules():
-                print_colored(f"name: {name}")
                 if isinstance(module, BaseLinearLayerWithLoRA):
                     a_shapes = [tuple(t.shape) for t in module.lora_a_stacked]
                     b_shapes = [tuple(t.shape) for t in module.lora_b_stacked]

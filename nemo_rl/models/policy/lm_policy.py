@@ -114,9 +114,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             lora_cfg = config.get("dtensor_cfg", {}).get("lora_cfg", {})
             self.lora_enabled = lora_cfg.get("enabled", False)
-            from nemo_rl.utils.logger import print_colored
 
-            print_colored(f"LORA ENABLED in lm_policy: {self.lora_enabled}")
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
 
@@ -782,12 +780,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_base_model_weights=refit_base_model_weights,
+            refit_lora_weights=refit_lora_weights,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
