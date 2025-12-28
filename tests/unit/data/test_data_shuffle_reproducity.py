@@ -43,13 +43,16 @@ def create_dataloader(
     """Create a dataloader with consistent configuration for testing."""
     # Initialize dataset
     data = OpenMathInstruct2Dataset(seed=seed)
+    task_name = (
+        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
+    )
 
     # Setup tokenizer
     tokenizer = get_tokenizer(TOKENIZER_CONFIG)
 
     # Configure task specification
     math_task_spec = TaskDataSpec(
-        task_name="math",
+        task_name=task_name,
         prompt_file=f"{os.path.dirname(os.path.abspath(__file__))}/../../../examples/prompts/cot.txt",
         system_prompt_file=None,
     )
@@ -57,7 +60,7 @@ def create_dataloader(
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
+    task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         dataset=data.formatted_ds["train"].select(range(1000)),

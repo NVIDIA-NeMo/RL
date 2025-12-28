@@ -16,6 +16,11 @@ import os
 import sys
 from pathlib import Path
 
+# Configure logging to show file location
+logging.basicConfig(
+    format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
+)
+
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
 add Megatron-LM to the python path. This is because the only sub-package
@@ -47,6 +52,154 @@ from nemo_rl.package_info import (
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+
+
+def _is_build_isolation():
+    """Detect if we're running in a uv build isolation environment.
+
+    When running uv lock/sync, uv creates a temporary isolated environment
+    in ~/.cache/uv/builds-v*/ to build packages and introspect metadata.
+    We skip the fingerprint check in this context since the user is updating dependencies.
+
+    Returns True if in build isolation, False otherwise.
+    """
+    # Check if we're in uv's build isolation directory
+    # uv always uses paths like: /root/.cache/uv/builds-v0/.tmp*/
+    return "/builds-v" in sys.prefix
+
+
+def _check_container_fingerprint():
+    """Check if container dependencies match the current code (container-only).
+
+    This check only runs when NRL_CONTAINER=1 is set (inside containers).
+    It compares the container's fingerprint (computed at build time) with
+    the current code's fingerprint to detect dependency drift.
+
+    This check is also skipped entirely if NRL_FORCE_REBUILD_VENVS=true is set,
+    since environment rebuilding will ensure dependencies are consistent regardless
+    of a mismatch.
+
+    If there's a mismatch, raises RuntimeError unless NRL_IGNORE_VERSION_MISMATCH is set.
+    """
+    # Skip check if not in container or if we're going to force venv rebuild anyway
+    if not os.environ.get("NRL_CONTAINER"):
+        return
+    if os.environ.get("NRL_FORCE_REBUILD_VENVS", "").lower() == "true":
+        logging.info(
+            "Skipping container fingerprint check because NRL_FORCE_REBUILD_VENVS=true (venvs will be rebuilt anyway)"
+        )
+        return
+
+    # Skip check if we're in a build isolation environment (e.g., during uv lock/sync)
+    if _is_build_isolation():
+        logging.debug(
+            "Skipping container fingerprint check because we're in a build isolation environment"
+        )
+        return
+
+    try:
+        import json
+        import runpy
+        import sys
+        from io import StringIO
+
+        # Get repo root (relative to this module)
+        repo_root = Path(__file__).parent.parent
+        fingerprint_script = repo_root / "tools" / "generate_fingerprint.py"
+
+        # Check if script exists
+        if not fingerprint_script.exists():
+            logging.warning(
+                f"Fingerprint script not found at {fingerprint_script}, skipping version check"
+            )
+            return
+
+        # Compute current code fingerprint using runpy (cleaner than subprocess)
+        old_stdout = sys.stdout
+        sys.stdout = captured_output = StringIO()
+        try:
+            runpy.run_path(str(fingerprint_script), run_name="__main__")
+            current_fingerprint_json = captured_output.getvalue().strip()
+        finally:
+            sys.stdout = old_stdout
+
+        if not current_fingerprint_json:
+            logging.warning("Failed to compute code fingerprint: empty output")
+            return
+
+        current_fingerprint = json.loads(current_fingerprint_json)
+
+        # Read container fingerprint
+        container_fingerprint_file = Path("/opt/nemo_rl_container_fingerprint")
+        if not container_fingerprint_file.exists():
+            logging.warning(
+                "Container fingerprint file not found, skipping version check"
+            )
+            return
+
+        container_fingerprint = json.loads(
+            container_fingerprint_file.read_text().strip()
+        )
+
+        # Compare fingerprints and find differences
+        all_keys = set(current_fingerprint.keys()) | set(container_fingerprint.keys())
+        differences = []
+
+        for key in sorted(all_keys):
+            current_val = current_fingerprint.get(key, "missing")
+            container_val = container_fingerprint.get(key, "missing")
+
+            if current_val != container_val:
+                differences.append(f"  - {key}:")
+                differences.append(f"      Container: {container_val}")
+                differences.append(f"      Current:   {current_val}")
+
+        if differences:
+            diff_text = "\n".join(differences)
+            sep_line = "\n" + ("-" * 80)
+            warning_msg = (
+                f"{sep_line}\n"
+                "WARNING: Container/Code Version Mismatch Detected!\n"
+                f"{sep_line}\n"
+                "Your container's dependencies do not match your current code.\n"
+                "\n"
+                "Differences found:\n"
+                f"{diff_text}\n"
+                "\n"
+                "This can lead to unexpected behavior or errors.\n"
+                "\n"
+                "Solutions:\n"
+                "  1. Rebuild the container to match your code\n"
+                "  2. Set NRL_FORCE_REBUILD_VENVS=true to rebuild virtual environments\n"
+                "     (This forces Ray workers to recreate their venvs with updated dependencies)\n"
+                "  3. Update the container fingerprint to match your current code (for local dev):\n"
+                "     python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint\n"
+                "  4. Set NRL_IGNORE_VERSION_MISMATCH=1 to bypass this check (not recommended)\n"
+                "\n"
+                "Learn more about dependency management:\n"
+                "  https://github.com/NVIDIA-NeMo/RL/blob/main/docs/design-docs/dependency-management.md\n"
+                f"{sep_line}\n"
+            )
+
+            # Check if user wants to ignore the mismatch
+            if not bool(os.environ.get("NRL_IGNORE_VERSION_MISMATCH")):
+                logging.warning(
+                    warning_msg
+                    + "Proceeding anyway (NRL_IGNORE_VERSION_MISMATCH is set)..."
+                )
+        else:
+            logging.debug("Container fingerprint matches code fingerprint")
+
+    except RuntimeError:
+        # Re-raise RuntimeError for version mismatches (user should see this)
+        raise
+    except Exception as e:
+        # Log other errors but don't crash on version check failures
+        logging.debug(f"Version check failed (non-fatal): {e}")
+
+
+# Perform container version check
+_check_container_fingerprint()
 
 
 def _patch_nsight_file():
@@ -114,3 +267,25 @@ def _patch_nsight_file():
 
 # Apply the patch
 _patch_nsight_file()
+
+
+# Need to set PYTHONPATH to include transformers downloaded modules.
+# Assuming the cache directory is the same cross venvs.
+def patch_transformers_module_dir(env_vars: dict[str, str]):
+    hf_home = os.environ.get("HF_HOME", None)
+    if hf_home is None:
+        return env_vars
+
+    module_dir = os.path.join(hf_home, "modules")
+    if not os.path.isdir(module_dir):
+        return env_vars
+
+    if "PYTHONPATH" not in env_vars:
+        env_vars["PYTHONPATH"] = module_dir
+    else:
+        env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
+
+    return env_vars
+
+
+patch_transformers_module_dir(os.environ)

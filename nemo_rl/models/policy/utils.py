@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import gc
-import importlib
 import os
 import traceback
 from enum import Enum
@@ -23,7 +22,6 @@ import torch
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForTextToWaveform,
@@ -31,7 +29,7 @@ from transformers import (
 
 # Try to import nemo_automodel classes, fallback to None if not available
 try:
-    from nemo_automodel.components._transformers.auto_model import (
+    from nemo_automodel._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForTextToWaveform,
@@ -194,20 +192,6 @@ def is_vllm_v1_engine_enabled() -> bool:
     return os.environ.get("NRL_VLLM_USE_V1", "1") == "1"
 
 
-def import_class_from_path(name: str) -> Any:
-    """Import a class from a string path (e.g. 'torch.optim.AdamW').
-
-    Args:
-        full_path: Full path to class including module path and class name
-
-    Returns:
-        The imported class object
-    """
-    module_name, cls_name = name.rsplit(".", 1)
-    cls_instance = getattr(importlib.import_module(module_name), cls_name)
-    return cls_instance
-
-
 def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
     """Return information about the GPU being used by this worker."""
     import torch
@@ -272,35 +256,6 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
             if k.startswith("CUDA") or k in ["LOCAL_RANK", "RANK", "WORLD_SIZE"]
         },
     }
-
-
-def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
-    """Returns configuration overrides to handle sliding window settings based on model rules.
-
-    Args:
-        model_name: The HuggingFace model name or path to load configuration from
-
-    Returns:
-        dict: Dictionary with overwrite values, or empty dict if no overwrites needed
-    """
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    overwrite_dict = {}
-
-    # Override sliding_window setting to address a HF mismatch relevant to use_sliding_window
-    # TODO(@zhiyul): remove this once the bug is fixed https://github.com/huggingface/transformers/issues/38002
-    if (
-        hasattr(hf_config, "use_sliding_window")
-        and hf_config.use_sliding_window == False
-    ):
-        assert hasattr(hf_config, "sliding_window")
-        overwrite_dict = {
-            "sliding_window": None,
-        }
-        print(
-            f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}"
-        )
-
-    return overwrite_dict
 
 
 def configure_dynamo_cache() -> None:

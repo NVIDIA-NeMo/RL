@@ -17,10 +17,12 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-def format_math(data: dict[str, str | float | int]) -> dict[str, list[Any] | str]:
+def format_math(
+    data: dict[str, str | float | int], task_name: str = "DeepScaler"
+) -> dict[str, list[Any] | str]:
     return {
         "messages": [
             {
@@ -32,12 +34,13 @@ def format_math(data: dict[str, str | float | int]) -> dict[str, list[Any] | str
                 "content": data["answer"],
             },
         ],
-        # For v0.1 release, nemo rl datasets require a task_name key such that user can map a task processor per unique task.
-        "task_name": "math",
+        "task_name": task_name,
     }
 
 
-def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
+def prepare_deepscaler_dataset(
+    seed: int = 42, task_name: str = "DeepScaler"
+) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
@@ -49,8 +52,16 @@ def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     train_ds = train_ds.shuffle(seed=seed)
 
     # Format the examples, removing original columns
-    train_formatted = train_ds.map(format_math, remove_columns=train_ds.column_names)
-    val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
+    train_formatted = train_ds.map(
+        format_math,
+        remove_columns=train_ds.column_names,
+        fn_kwargs={"task_name": task_name},
+    )
+    val_formatted = val_ds.map(
+        format_math,
+        remove_columns=val_ds.column_names,
+        fn_kwargs={"task_name": task_name},
+    )
 
     # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
     val_repeated = []
@@ -64,15 +75,14 @@ def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     }
 
 
-class DeepScalerDataset:
+class DeepScalerDataset(RawDataset):
     def __init__(self, seed: int = 42) -> None:
         """Initialize the DeepScaler dataset with train/test split.
 
         Args:
             seed: Random seed for reproducible splitting
         """
-        self.formatted_ds = prepare_deepscaler_dataset(seed=seed)
-
-        self.task_spec = TaskDataSpec(
-            task_name="DeepScaler",
+        self.task_name = "DeepScaler"
+        self.formatted_ds = prepare_deepscaler_dataset(
+            seed=seed, task_name=self.task_name
         )
