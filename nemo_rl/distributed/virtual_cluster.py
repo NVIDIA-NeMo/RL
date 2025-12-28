@@ -52,16 +52,14 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
-    # Use NeMo-RL direct dependencies, nemo-automodel, and SGLang.
-    AUTOMODEL_SGLANG = f"uv run --locked --extra automodel --extra sglang --directory {git_root}"
-
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
-    SGLANG = "uv run --locked --extra sglang --directory {git_root}"
+    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

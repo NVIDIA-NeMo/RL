@@ -184,7 +184,7 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     def stream_weights_via_http(
         self, sglang_url_to_gpu_uuids: dict[str, list[str]]
-    ) -> None:
+    ) -> list[ray.ObjectRef]:
         """Stream model weights to SGLang servers via HTTP API.
         
         Args:
