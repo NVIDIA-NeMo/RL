@@ -140,6 +140,20 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+@pytest.mark.hf_gated
+def test_get_tokenizer_vlm_custom_chat_template(conversation_messages):
+    """Test get_tokenizer custom chat template override with VLM processor."""
+    config = {
+        "name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "chat_template": "testing VLM override",
+    }
+    processor = get_tokenizer(config, get_processor=True)
+
+    # Verify that the VLM processor uses the custom template
+    formatted = processor.apply_chat_template(conversation_messages, tokenize=False)
+    assert formatted == "testing VLM override"
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
