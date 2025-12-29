@@ -38,9 +38,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
-# model_name = "Qwen/Qwen3-0.6B"
-# model_name = "Qwen/Qwen2.5-1.5B"
-model_name = "unsloth/Llama-3.2-1B-Instruct"
+model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",
@@ -935,12 +933,14 @@ async def test_vllm_generation_with_hf_training_colocated(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", True),
+        (False, True, "bfloat16", True),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
