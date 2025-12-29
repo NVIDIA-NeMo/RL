@@ -277,7 +277,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-            if cp_size > 1 or self.cfg["dtensor_cfg"]["activation_checkpointing"]:
+            # if cp_size > 1 or self.cfg["dtensor_cfg"]["activation_checkpointing"]:
+            if cp_size > 1:
                 # For cp, match Automodel's `get_train_context` in `cp_utils.py` where only
                 # flash and efficient backends are supported
                 # Ref: https://github.com/NVIDIA-NeMo/Automodel/blob/81788d6f4848f5f066c4a6a2bece4689a6a83687/nemo_automodel/components/distributed/cp_utils.py#L57
