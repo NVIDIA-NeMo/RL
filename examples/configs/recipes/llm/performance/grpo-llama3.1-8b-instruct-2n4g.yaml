@@ -1,0 +1,58 @@
+defaults: ../../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+  max_num_steps: 500
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g
+policy:
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+  tokenizer:
+    name: meta-llama/Llama-3.1-8B-Instruct
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+    fp8_cfg:
+      enabled: false
+  generation:
+    max_new_tokens: 4096
+    stop_token_ids:
+    - 128009
+    vllm_cfg:
+      max_model_len: 4096
+      tensor_parallel_size: 1
+data:
+  max_input_seq_length: 4096
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-llama3.1-8b-instruct-2n4g
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
+
