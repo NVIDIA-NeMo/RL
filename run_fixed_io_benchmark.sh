@@ -38,7 +38,8 @@ OUTPUT_LEN=${OUTPUT_LEN:-3968}
 TOTAL_LEN=$((INPUT_LEN + OUTPUT_LEN))
 WANDB_PROJECT=${WANDB_PROJECT:-sync-grpo-gb200-benchmark-fixedRLconfig}
 # Models to benchmark (matching Megatron-Bridge configs)
-DEFAULT_PRESETS="llama8b llama70b qwen30b qwen32b"
+# Format: "preset:variant:input_len:output_len" or just "preset" for defaults
+DEFAULT_PRESETS="llama8b llama70b llama70b_r512 llama70b_highseq qwen30b qwen30b_ep4 qwen30b_ep8 qwen32b"
 
 # ============================================================
 # Parse Arguments
@@ -86,10 +87,12 @@ while [[ $# -gt 0 ]]; do
             echo "  OUTPUT_LEN=N           Set output length"
             echo ""
             echo "Available model presets:"
-            echo "  llama8b    - LLaMA3.1-8B-Instruct (8 GPUs)"
-            echo "  llama70b   - LLaMA3.1-70B-Instruct (16 GPUs)"
-            echo "  qwen30b    - Qwen3-30B-A3B MoE (16 GPUs)"
-            echo "  qwen32b    - Qwen3-32B (16 GPUs)"
+            echo "  llama8b         - LLaMA3.1-8B-Instruct (8 GPUs)"
+            echo "  llama70b        - LLaMA3.1-70B-Instruct (16 GPUs, RolloutGBS=2048)"
+            echo "  llama70b_r512   - LLaMA3.1-70B-Instruct (16 GPUs, RolloutGBS=512)"
+            echo "  llama70b_highseq- LLaMA3.1-70B-Instruct (16 GPUs, MaxLen=16384)"
+            echo "  qwen30b         - Qwen3-30B-A3B MoE (16 GPUs)"
+            echo "  qwen32b         - Qwen3-32B (16 GPUs)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all models with default I/O"
@@ -116,17 +119,21 @@ if [[ "$LIST_ONLY" == "true" ]]; then
     echo ""
     echo "Available model presets for fixed I/O benchmark:"
     echo ""
-    echo "  Preset      Model                      GPUs   Megatron-Bridge Config"
-    echo "  --------    -------------------------  -----  ----------------------"
-    echo "  llama8b     meta-llama/Llama-3.1-8B    8      llama31_8b_nemorl"
-    echo "  llama70b    meta-llama/Llama-3.1-70B   16     llama31_70b_nemorl"
-    echo "  qwen30b     Qwen/Qwen3-30B-A3B (MoE)   16     qwen3_30b_ep8"
-    echo "  qwen32b     Qwen/Qwen3-32B             16     qwen3_32b_tp4"
+    echo "  Preset           Model                      GPUs   RolloutGBS  MaxLen"
+    echo "  ---------------  -------------------------  -----  ----------  ------"
+    echo "  llama8b          meta-llama/Llama-3.1-8B    8      2048        4096"
+    echo "  llama70b         meta-llama/Llama-3.1-70B   16     2048        4096"
+    echo "  llama70b_r512    meta-llama/Llama-3.1-70B   16     512         4096"
+    echo "  llama70b_highseq meta-llama/Llama-3.1-70B   16     2048        16384"
+    echo "  qwen30b          Qwen/Qwen3-30B-A3B (MoE)   16     2048        4096"
+    echo "  qwen32b          Qwen/Qwen3-32B             16     2048        4096"
     echo ""
     echo "Default I/O configuration (OpenMathInstruct-2):"
     echo "  Input:  ${INPUT_LEN} tokens"
     echo "  Output: ${OUTPUT_LEN} tokens"
     echo "  Total:  ${TOTAL_LEN} tokens (matches Megatron-Bridge seq_length)"
+    echo ""
+    echo "Note: llama70b_highseq uses same I/O but MaxSeqLen=16384 (larger context window)"
     echo ""
     exit 0
 fi
@@ -176,22 +183,62 @@ LAUNCHED=0
 FAILED=0
 
 for preset in $PRESETS; do
+    # Determine preset, variant, and I/O lengths based on preset name
+    BASE_PRESET=""
+    VARIANT_ARG=""
+    CURR_INPUT_LEN=${INPUT_LEN}
+    CURR_OUTPUT_LEN=${OUTPUT_LEN}
+    
+    case "$preset" in
+        llama8b)
+            BASE_PRESET="llama8b"
+            ;;
+        llama70b)
+            BASE_PRESET="llama70b"
+            ;;
+        llama70b_r512)
+            BASE_PRESET="llama70b"
+            VARIANT_ARG="--variant gb200_r512"
+            ;;
+        llama70b_highseq)
+            BASE_PRESET="llama70b"
+            VARIANT_ARG="--variant gb200_highseq"
+            # Same I/O as default, but MaxSeqLen=16384 (allows longer context window)
+            ;;
+        qwen30b)
+            BASE_PRESET="qwen30b"
+            ;;
+        qwen30b_ep4)
+            BASE_PRESET="qwen30b"
+            VARIANT_ARG="--variant gb200_ep4"
+            ;;
+        qwen30b_ep8)
+            BASE_PRESET="qwen30b"
+            VARIANT_ARG="--variant gb200_ep8"
+            ;;
+        qwen32b)
+            BASE_PRESET="qwen32b"
+            VARIANT_ARG="--variant gb200_tp2"
+            ;;
+        *)
+            # For custom presets, use as-is
+            BASE_PRESET="$preset"
+            ;;
+    esac
+    
+    CURR_TOTAL=$((CURR_INPUT_LEN + CURR_OUTPUT_LEN))
+    
     echo "============================================================"
     echo "[$((LAUNCHED + FAILED + 1))] Launching: ${preset}"
-    echo "    Config: Input=${INPUT_LEN}, Output=${OUTPUT_LEN}, Total=${TOTAL_LEN}"
+    echo "    Base: ${BASE_PRESET}, Variant: ${VARIANT_ARG:-default}"
+    echo "    Config: Input=${CURR_INPUT_LEN}, Output=${CURR_OUTPUT_LEN}, Total=${CURR_TOTAL}"
     echo "============================================================"
     
-    # Set variant for specific models (optional)
-    VARIANT_ARG=""
-    if [[ "$preset" == "qwen32b" ]]; then
-        VARIANT_ARG="--variant gb200_tp2"
-    fi
-    
-    CMD="python3 launch_grpo.py --preset ${preset} \
+    CMD="python3 launch_grpo.py --preset ${BASE_PRESET} \
         ${VARIANT_ARG} \
         --use-random-dataset \
-        --input-length ${INPUT_LEN} \
-        --output-length ${OUTPUT_LEN} \
+        --input-length ${CURR_INPUT_LEN} \
+        --output-length ${CURR_OUTPUT_LEN} \
         --disable-sequence-packing \
         --wandb-project ${WANDB_PROJECT} \
         ${DRY_RUN}"

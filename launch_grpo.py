@@ -200,6 +200,20 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "num_prompts": 64, "num_generations": 32,
                 "generation": {"tp": 2, "pp": 1},
                 "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 2}
+            },
+            # GB200 variant: RolloutGBS=512, MaxLen=4096
+            "gb200_r512": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 512, "train_gbs": 512,
+                "num_prompts": 16, "num_generations": 32,  # 16×32 = 512
+                "generation": {"tp": 2, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 2}
+            },
+            # GB200 variant: RolloutGBS=2048, MaxLen=16384 (high sequence length)
+            "gb200_highseq": {
+                "num_gpus": 16, "max_seqlen": 16384, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 2, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 2}
             }
         },
         "qwen32b": {
@@ -244,6 +258,20 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "num_prompts": 64, "num_generations": 32,
                 "generation": {"tp": 1, "pp": 1},
                 "training": {"tp": 1, "cp": 1, "ep": 16, "pp": 1}
+            },
+            # EP4: 16 GPUs with EP=4, TP=4 (4*4=16)
+            "gb200_ep4": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 4, "pp": 1}
+            },
+            # EP8: 16 GPUs with EP=8, TP=2 (2*8=16)
+            "gb200_ep8": {
+                "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 8, "pp": 1}
             }
         },
         "qwen235b": {
@@ -734,7 +762,7 @@ Examples:
     parser.add_argument("--wandb-project", default="sync-grpo-benchmark",
                         help="WandB project name (cluster type appended)")
     parser.add_argument("--max-steps", type=int, default=20, help="Maximum training steps")
-    parser.add_argument("--time", default="04:00:00", help="Job time limit")
+    parser.add_argument("--time", default="05:00:00", help="Job time limit")
     parser.add_argument("--account", default=None, help="SLURM account (default: auto based on cluster)")
     parser.add_argument("--job-partition", default=None, help="SLURM job partition (default: auto based on cluster)")
     

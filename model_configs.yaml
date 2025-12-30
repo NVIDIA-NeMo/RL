@@ -178,6 +178,23 @@ llama70b:
       pp: 2
       # dp: 2
   
+  # Alias for gb200_lowgbs (RolloutGBS=512)
+  gb200_r512:
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 512
+    train_gbs: 512
+    num_prompts: 16
+    num_generations: 32  # 16×32 = 512
+    generation:
+      tp: 2
+      pp: 1
+    training:
+      tp: 4
+      cp: 1
+      ep: 1
+      pp: 2
+  
   gb200_highseq:
     # GB200: 16 GPUs (4 nodes), SeqLen=16384
     # High sequence length variant
@@ -339,7 +356,7 @@ qwen30b:
       # dp: 4
   
   gb200:
-    # GB200 default: EP=4 (optimized for 192GB memory, node-local All-to-All)
+    # GB200 default: EP=16 (all 16 GPUs for expert parallelism)
     num_gpus: 16
     max_seqlen: 4096
     rollout_gbs: 2048
@@ -353,6 +370,40 @@ qwen30b:
       tp: 1
       cp: 1
       ep: 16
+      pp: 1
+  
+  # GB200 variant: EP=4, TP=4 (4×4=16 GPUs)
+  gb200_ep4:
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 4
+      pp: 1
+  
+  # GB200 variant: EP=8, TP=2 (2×8=16 GPUs)
+  gb200_ep8:
+    num_gpus: 16
+    max_seqlen: 4096
+    rollout_gbs: 2048
+    train_gbs: 512
+    num_prompts: 64
+    num_generations: 32
+    generation:
+      tp: 1
+      pp: 1
+    training:
+      tp: 1
+      cp: 1
+      ep: 8
       pp: 1
   
   gb200_matched:
