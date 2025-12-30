@@ -506,4 +506,3 @@ class RayVirtualCluster:
         user calls shutdown().
         """
         self.shutdown()
-        

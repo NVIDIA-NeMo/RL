@@ -87,14 +87,14 @@ class SGLangGenerationWorker:
             node_idx = bundle_indices[0]
             local_bundle_indices = bundle_indices[1]
             init_kwargs["bundle_indices"] = local_bundle_indices
-            
+
             # Calculate a unique seed from node_idx and bundle_indices
             if len(local_bundle_indices) == 1:
                 seed = node_idx * 1024 + local_bundle_indices[0]
             else:
                 bundle_id = local_bundle_indices[0] // len(local_bundle_indices)
                 seed = node_idx * 1024 + bundle_id
-            
+
             init_kwargs["seed"] = seed
 
         # Check if this worker is part of a parallel group (multiple GPUs per server).
@@ -137,15 +137,15 @@ class SGLangGenerationWorker:
         self.is_model_owner = bundle_indices is not None
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.sglang_cfg = config["sglang_cfg"]
-        
+
         # Create a dedicated event loop thread for async operations
         # there will be issues if we use the event loop in the main thread
         self.async_loop_thread = AsyncLoopThread()
-        
+
         # temp: Maximum concurrent requests per server
         # we may remove this limit in the future
         self.max_concurrent_requests = config.get("max_concurrent_requests", 999999)
-        
+
         # Only the primary worker (local_rank=0) in each server group starts the SGLang server
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
@@ -153,13 +153,12 @@ class SGLangGenerationWorker:
 
         # Determine tp_size from bundle_indices length
         tp_size = len(bundle_indices)
-        
+
         base_gpu_id = bundle_indices[0] if bundle_indices else 0
-        
+
         # Get the global CUDA_VISIBLE_DEVICES (all engines see the same global value)
         global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        
-        
+
         logger.info(
             f"[SGLang Server] Rank {self.global_rank}: "
             f"base_gpu_id={base_gpu_id}, tp_size={tp_size}, "
@@ -169,12 +168,14 @@ class SGLangGenerationWorker:
         # Get current node IP and a free port for the server
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local()
-        
+
         # Build SGLang server arguments
         kwargs = {
             "model_path": self.sglang_cfg["model_path"],
             "trust_remote_code": True,
-            "random_seed": seed if seed is not None else self.sglang_cfg.get("random_seed", 1),
+            "random_seed": seed
+            if seed is not None
+            else self.sglang_cfg.get("random_seed", 1),
             # Memory settings
             "enable_memory_saver": self.sglang_cfg["enable_memory_saver"],
             "gpu_id_step": 1,
@@ -191,12 +192,20 @@ class SGLangGenerationWorker:
             "port": free_port,
             "torchao_config": "",
         }
-        
+
         for key in [
-            "dtype", "kv_cache_dtype", "context_length", "max_running_requests",
-            "chunked_prefill_size", "max_prefill_tokens", "schedule_policy",
-            "schedule_conservativeness", "cpu_offload_gb", "log_level",
-            "mem_fraction_static", "allow_auto_truncate",
+            "dtype",
+            "kv_cache_dtype",
+            "context_length",
+            "max_running_requests",
+            "chunked_prefill_size",
+            "max_prefill_tokens",
+            "schedule_policy",
+            "schedule_conservativeness",
+            "cpu_offload_gb",
+            "log_level",
+            "mem_fraction_static",
+            "allow_auto_truncate",
         ]:
             if key in self.sglang_cfg:
                 kwargs[key] = self.sglang_cfg[key]
@@ -205,12 +214,14 @@ class SGLangGenerationWorker:
         # Save server_args and base_url for use in generate() and _make_request()
         self.server_args = server_args
         self.base_url = f"http://{node_ip}:{free_port}"
-        
-        logger.info(f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}")
-        
+
+        logger.info(
+            f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}"
+        )
+
         self.session = None
         self.connector = None
-        
+
         self.server_process = self._launch_server_process(server_args)
 
     def get_base_url(self) -> str:
@@ -219,20 +230,20 @@ class SGLangGenerationWorker:
 
     def invalidate_kv_cache(self) -> bool:
         """Invalidate KV cache before weight updates (Megatron-style).
-        
+
         This flushes the cache before weight updates to clear stale cache.
         Uses retry logic to handle cases where there are pending requests.
-        
+
         Returns:
             bool: True if flush was successful, False otherwise
         """
         if not self.is_model_owner:
             return True
-        
+
         url = f"{self.base_url}/flush_cache"
         max_attempts = 60
         connection_retry_limit = 5
-        
+
         # flush_cache will not return status_code 200 when there are pending requests
         for attempt in range(max_attempts):
             try:
@@ -260,9 +271,9 @@ class SGLangGenerationWorker:
                         f"{max_attempts} attempts: {e}"
                     )
                     return False
-            
+
             time.sleep(1)
-        
+
         # All attempts exhausted without success
         logger.error(
             f"[SGLang Worker] Rank {self.global_rank} Timeout: Cache flush failed after "
@@ -272,12 +283,12 @@ class SGLangGenerationWorker:
 
     def get_gpu_uuids(self) -> list[str]:
         """Get list of GPU UUIDs used by this SGLang server.
-        
+
         Returns:
             List of GPU UUIDs (e.g., ["GPU-xxxxx", "GPU-yyyyy"])
         """
         from nemo_rl.utils.nvml import get_device_uuid
-        
+
         # Get all GPU UUIDs used by this server
         # SGLang server uses GPUs starting from base_gpu_id with tp_size GPUs
         gpu_uuids = []
@@ -285,25 +296,24 @@ class SGLangGenerationWorker:
             gpu_id = self.server_args.base_gpu_id + i
             uuid = get_device_uuid(gpu_id)
             gpu_uuids.append(uuid)
-        
-        return gpu_uuids
 
+        return gpu_uuids
 
     def _merge_stop_strings(self, batch_stop_strings):
         """Merge stop strings from config and batch.
-        
+
         Args:
             batch_stop_strings: List of stop strings from batch (one per sample)
-            
+
         Returns:
             List of merged stop strings (one per sample)
         """
         stop_set: set[str] = set()
-        
+
         # Add stop strings from config
         if self.cfg.get("stop_strings"):
             stop_set.update(self.cfg["stop_strings"])
-        
+
         # Merge stop strings from batch
         merged_stop_strings = []
         for sample_ss in batch_stop_strings:
@@ -313,9 +323,11 @@ class SGLangGenerationWorker:
                     sample_stop_set.add(sample_ss)
                 elif isinstance(sample_ss, list):
                     sample_stop_set.update(sample_ss)
-            
-            merged_stop_strings.append(list(sample_stop_set) if sample_stop_set else None)
-        
+
+            merged_stop_strings.append(
+                list(sample_stop_set) if sample_stop_set else None
+            )
+
         return merged_stop_strings
 
     def _build_sampling_params(
@@ -329,7 +341,7 @@ class SGLangGenerationWorker:
         sample_index: Optional[int] = None,
     ) -> dict[str, Any]:
         """Build sampling parameters dictionary for SGLang API.
-        
+
         Args:
             greedy: Whether to use greedy decoding (temperature=0.0)
             stop_strings: Merged stop strings (not used here, handled per sample)
@@ -337,18 +349,18 @@ class SGLangGenerationWorker:
             input_len: Input length for this sample (used for context_length adjustment)
             context_length: Maximum context length (if provided, adjusts max_new_tokens)
             sample_index: Sample index (used for warning messages, 0-indexed)
-            
+
         Returns:
             Dictionary of sampling parameters compatible with SGLang API
         """
         top_k_cfg = self.cfg.get("top_k")
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
         temperature = 0.0 if greedy else self.cfg["temperature"]
-        
+
         base_max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
-        
+
         # TODO: check if this is needed
         final_max_tokens = base_max_tokens
         if context_length is not None and input_len is not None:
@@ -362,21 +374,21 @@ class SGLangGenerationWorker:
                         f"would exceed context_length ({context_length}). "
                         f"Reducing max_new_tokens to {final_max_tokens} for this sample."
                     )
-        
+
         # Build sampling params dict
         sampling_params = {
             "temperature": temperature,
             "top_p": self.cfg.get("top_p", 1.0),
             "max_new_tokens": final_max_tokens,
         }
-        
+
         if top_k_val != -1:
             sampling_params["top_k"] = top_k_val
-        
+
         stop_token_ids = self.cfg.get("stop_token_ids")
         if stop_token_ids is not None:
             sampling_params["stop_token_ids"] = stop_token_ids
-        
+
         return sampling_params
 
     async def _ensure_session(self):
@@ -385,7 +397,9 @@ class SGLangGenerationWorker:
             self.connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
             # Create session with timeout
             timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
-            self.session = aiohttp.ClientSession(connector=self.connector, timeout=timeout)
+            self.session = aiohttp.ClientSession(
+                connector=self.connector, timeout=timeout
+            )
         return self.session
 
     async def _generate_single_sample(
@@ -395,12 +409,12 @@ class SGLangGenerationWorker:
         stop_string: Optional[str] = None,
     ) -> tuple[list[int], list[float]]:
         """Generate a single sample using SGLang API (async function).
-        
+
         Args:
             input_ids: List of input token IDs (without padding)
             sampling_params: Dictionary of sampling parameters (temperature, top_p, max_new_tokens, etc.)
             stop_string: Optional stop string for this sample
-            
+
         Returns:
             Tuple of (generated_tokens, logprobs):
                 - generated_tokens: List of generated token IDs
@@ -413,32 +427,34 @@ class SGLangGenerationWorker:
             # stop can be a string or list of strings
             sampling_params = sampling_params.copy()  # Don't modify the original
             sampling_params["stop"] = stop_string
-        
+
         payload = {
             "sampling_params": sampling_params,
             "return_logprob": True,
             "input_ids": input_ids,
         }
-        
+
         url = f"{self.base_url}/generate"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
-        
+
         session = await self._ensure_session()
-        
+
         try:
             async with session.post(url, json=payload, headers=headers) as response:
                 response.raise_for_status()
                 result = await response.json()
         except Exception as e:
-            logger.error(f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}")
+            logger.error(
+                f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}"
+            )
             raise
-        
+
         # Extract generated tokens and logprobs
         meta_info = result.get("meta_info", {})
         output_token_logprobs = meta_info.get("output_token_logprobs", [])
-        
+
         if output_token_logprobs:
             new_tokens = [item[1] for item in output_token_logprobs]
             new_logprobs = [item[0] for item in output_token_logprobs]
@@ -446,17 +462,17 @@ class SGLangGenerationWorker:
             # Fallback: empty if token logprobs not available
             new_tokens = []
             new_logprobs = []
-        
+
         return new_tokens, new_logprobs
 
     async def _generate_async(self, tasks):
         """Execute generation tasks with concurrency control.
-        
+
         TEMP: Uses a semaphore to limit the number of concurrent requests per server, preventing server overload.
         A router based solution is preffered in the future.
         """
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
-        
+
         async def wrap(idx, coro):
             async with semaphore:
                 try:
@@ -474,11 +490,15 @@ class SGLangGenerationWorker:
             results[idx] = value
             count += 1
             if count % 50 == 0 or count == len(tasks):
-                logger.debug(f"[SGLang Worker] Rank {self.global_rank} Completed {count}/{len(tasks)} tasks")
+                logger.debug(
+                    f"[SGLang Worker] Rank {self.global_rank} Completed {count}/{len(tasks)} tasks"
+                )
 
         return results
 
-    def _launch_server_process(self, server_args: ServerArgs) -> multiprocessing.Process:
+    def _launch_server_process(
+        self, server_args: ServerArgs
+    ) -> multiprocessing.Process:
         """Launch the SGLang server process and wait for it to be ready."""
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
         p.start()
@@ -499,21 +519,24 @@ class SGLangGenerationWorker:
                         f"[SGLang Server] Rank {self.global_rank} Server failed to start within {max_wait_time}s"
                     )
                 try:
-                    response = session.get(f"{self.base_url}/health_generate", headers=headers, timeout=10)
+                    response = session.get(
+                        f"{self.base_url}/health_generate", headers=headers, timeout=10
+                    )
                     if response.status_code == 200:
-                        logger.info(f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}")
+                        logger.info(
+                            f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}"
+                        )
                         break
                 except requests.RequestException:
                     pass
 
                 if not p.is_alive():
-                    raise RuntimeError(f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly.")
+                    raise RuntimeError(
+                        f"[SGLang Server] Rank {self.global_rank} Server process terminated unexpectedly."
+                    )
 
                 time.sleep(2)
         return p
-
-    
-        
 
     @wrap_with_nvtx_name("sglang_genertion_worker/generate")
     def generate(
@@ -542,38 +565,40 @@ class SGLangGenerationWorker:
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
                 }
             )
-        
+
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
         batch_stop_strings = data.get("stop_strings", [None] * len(input_lengths))
         stop_strings = self._merge_stop_strings(batch_stop_strings)
         batch_size = len(input_lengths)
         pad_token_id = self.cfg["_pad_token_id"]
-        
+
         # Verify inputs have correct padding
         verify_right_padding(data, pad_value=pad_token_id)
-        
+
         # Original input length with padding
         padded_input_length = input_ids.size(1)
-        
-        logger.debug(f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}")
-        
+
+        logger.debug(
+            f"[SGLang Worker] Rank {self.global_rank} batch_size: {batch_size}, padded_input_length: {padded_input_length}"
+        )
+
         if batch_size == 0:
             raise ValueError("Empty batch received")
-        
+
         context_length = self.sglang_cfg.get("context_length", None)
-        
+
         # Create async tasks for all samples
         tasks = []
         for i in range(batch_size):
             input_len = input_lengths[i].item()
-            
+
             # Truncate input if it exceeds context_length
             if context_length is not None and input_len >= context_length:
                 input_len = context_length - 1
-            
+
             valid_input_ids = input_ids[i, :input_len].tolist()
-            
+
             # Build sampling params for this sample (with context_length adjustment)
             sample_sampling_params = self._build_sampling_params(
                 greedy=greedy,
@@ -583,7 +608,7 @@ class SGLangGenerationWorker:
                 context_length=context_length,
                 sample_index=i,
             )
-            
+
             tasks.append(
                 self._generate_single_sample(
                     input_ids=valid_input_ids,
@@ -591,66 +616,72 @@ class SGLangGenerationWorker:
                     stop_string=stop_strings[i],
                 )
             )
-        
+
         # Execute all requests concurrently using the dedicated event loop thread
         try:
             all_results = self.async_loop_thread.run(self._generate_async(tasks))
         except Exception as e:
             raise
-        
+
         total_generated_tokens = sum(len(tokens) for tokens, _ in all_results)
-        avg_generation_length = total_generated_tokens / batch_size if batch_size > 0 else 0
-        
+        avg_generation_length = (
+            total_generated_tokens / batch_size if batch_size > 0 else 0
+        )
+
         # Process results
         output_ids_list = []
         logprobs_list = []
         generation_lengths_list = []
         unpadded_sequence_lengths_list = []
         max_length = 0
-        
+
         # First pass: calculate max_length
         for i, (new_tokens, new_logprobs) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
             max_length = max(max_length, unpadded_length)
-        
+
         total_length = max(max_length, padded_input_length)
-        
+
         for i, (new_tokens, new_logprobs) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
-            
+
             full_output = torch.full(
                 (total_length,), pad_token_id, dtype=input_ids.dtype
             )
             full_output[:input_len] = input_ids[i][:input_len]
-            
+
             # Add generated tokens after the original input
             if new_tokens:
-                full_output[input_len : input_len + len(new_tokens)] = (
-                    torch.tensor(new_tokens, dtype=input_ids.dtype)
+                full_output[input_len : input_len + len(new_tokens)] = torch.tensor(
+                    new_tokens, dtype=input_ids.dtype
                 )
-            
+
             # Construct logprobs: zeros for input tokens, actual logprobs for generated tokens
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if new_logprobs:
                 for idx, logprob in enumerate(new_logprobs):
                     position = input_len + idx
                     full_logprobs[position] = logprob
-            
+
             output_ids_list.append(full_output)
             logprobs_list.append(full_logprobs)
             generation_lengths_list.append(generation_length)
             unpadded_sequence_lengths_list.append(unpadded_length)
-        
+
         # Stack into tensors
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
         generation_lengths = torch.tensor(generation_lengths_list, dtype=torch.long)
-        unpadded_sequence_lengths = torch.tensor(unpadded_sequence_lengths_list, dtype=torch.long)
-        logger.debug(f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)")
+        unpadded_sequence_lengths = torch.tensor(
+            unpadded_sequence_lengths_list, dtype=torch.long
+        )
+        logger.debug(
+            f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)"
+        )
         return BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": output_ids,
@@ -670,7 +701,7 @@ class SGLangGenerationWorker:
 
     def shutdown(self) -> bool:
         """Shutdown the SGLang server process and cleanup async resources.
-        
+
         Returns:
             bool: True if shutdown was successful, False otherwise
         """
@@ -678,49 +709,62 @@ class SGLangGenerationWorker:
             if hasattr(self, "async_loop_thread"):
                 try:
                     self.async_loop_thread.shutdown()
-                    logger.info(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                    logger.info(
+                        f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down."
+                    )
                 except Exception as e:
-                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
+                    logger.error(
+                        f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}"
+                    )
             return True
-        
+
         try:
             if hasattr(self, "session") and self.session is not None:
                 try:
+
                     async def close_session():
                         await self.session.close()
                         if self.connector is not None:
                             await self.connector.close()
-                    
+
                     self.async_loop_thread.run(close_session())
-                    logger.info(f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed.")
+                    logger.info(
+                        f"[SGLang Worker] Rank {self.global_rank} aiohttp session closed."
+                    )
                 except Exception as e:
-                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}")
-            
+                    logger.error(
+                        f"[SGLang Worker] Rank {self.global_rank} Error closing aiohttp session: {e}"
+                    )
+
             # Shutdown async loop thread after session cleanup
             if hasattr(self, "async_loop_thread"):
                 try:
                     self.async_loop_thread.shutdown()
-                    logger.info(f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down.")
+                    logger.info(
+                        f"[SGLang Worker] Rank {self.global_rank} Async loop thread shut down."
+                    )
                 except Exception as e:
-                    logger.error(f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}")
-            
+                    logger.error(
+                        f"[SGLang Worker] Rank {self.global_rank} Error shutting down async loop thread: {e}"
+                    )
+
             if not hasattr(self, "server_process") or self.server_process is None:
                 return True
-            
+
             logger.info(
                 f"[SGLang Worker] Rank {self.global_rank} Shutting down server at {self.base_url}..."
             )
-            
+
             if self.server_process.is_alive():
                 kill_process_tree(self.server_process.pid)
-            
+
             # Wait for the process to terminate
             self.server_process.join(timeout=5.0)
-            
+
             if self.server_process.is_alive():
                 return False
             return True
-            
+
         except Exception as e:
             logger.error(
                 f"[SGLang Worker] Rank {self.global_rank} Error during shutdown: {e}"

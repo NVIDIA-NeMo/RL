@@ -260,7 +260,7 @@ class GenerationInterface(ABC):
 
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
-        
+
         This is an optional method that backends can implement to clear
         telemetry metrics. Default implementation does nothing.
         """
@@ -268,10 +268,10 @@ class GenerationInterface(ABC):
 
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting.
-        
+
         This is an optional method that backends can implement to collect
         telemetry metrics. Default implementation returns empty dict.
-        
+
         Returns:
             Dictionary of metrics. Format may vary by backend.
         """

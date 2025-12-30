@@ -19,10 +19,11 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
-    
+
     Most fields below map directly to SGLang's ServerArgs (see:
     https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py).
     """
+
     model_path: NotRequired[str]
     gpus_per_server: NotRequired[int]
     random_seed: NotRequired[int]
@@ -92,7 +93,6 @@ class SglangSpecificArgs(TypedDict):
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
+
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
-
-    

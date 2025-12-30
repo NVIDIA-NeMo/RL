@@ -1764,7 +1764,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         sglang_url_to_gpu_uuids: dict[str, list[str]],
     ) -> None:
         """Stream model weights to SGLang servers via HTTP API.
-        
+
         Args:
             sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
         """
@@ -1778,9 +1778,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         current_device_uuid = self.report_device_id()
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
-            """
-            state_dict_items = sorted(self.model.state_dict().items(), key=lambda x: x[0])
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            state_dict_items = sorted(
+                self.model.state_dict().items(), key=lambda x: x[0]
+            )
             for name, tensor in state_dict_items:
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
@@ -1793,6 +1794,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     # Convert to target dtype
                     yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+
         # Use the HTTP implementation
         stream_weights_via_http_impl(
             params_generator=dtensor_params_generator(),

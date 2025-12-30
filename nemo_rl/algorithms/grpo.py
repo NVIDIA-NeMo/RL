@@ -499,14 +499,14 @@ def setup(
     ):
         """
         Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
-        
+
         Args:
             init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
             generation_name: Name of the generation engine ("vLLM" or "SGLang")
             init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
             colocated_inference: Whether inference is colocated with training
             worker_init_timing_metrics: Dictionary to store timing metrics
-            
+
         Returns:
             Tuple of (policy_generation, policy)
         """
@@ -608,11 +608,11 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-        
+
         # Set model_path if not already set
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-        
+
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
@@ -1004,13 +1004,13 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = policy_generation.get_sglang_url_to_gpu_uuids()
+                sglang_url_to_gpu_uuids = (
+                    policy_generation.get_sglang_url_to_gpu_uuids()
+                )
                 # Stream weights via HTTP
                 flush_success = policy_generation.invalidate_kv_cache()
                 if not flush_success:
-                    print(
-                        "SGLang KV cache invalidation failed before weight update. "
-                    )
+                    print("SGLang KV cache invalidation failed before weight update. ")
                 futures_train = policy.stream_weights_via_http(
                     sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
                 )
@@ -1227,7 +1227,6 @@ def grpo_train(
 
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
@@ -1283,7 +1282,9 @@ def grpo_train(
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
-                        generation_logger_metrics = policy_generation.get_logger_metrics()
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
+                        )
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -2375,7 +2376,9 @@ def async_grpo_train(
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
-                        generation_logger_metrics = policy_generation.get_logger_metrics()
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
+                        )
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")

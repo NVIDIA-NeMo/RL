@@ -772,7 +772,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, sglang_url_to_gpu_uuids: dict[str, list[str]]
     ) -> list[ray.ObjectRef]:
         """Send the weights to SGLang servers via HTTP API.
-        
+
         Args:
             sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
         """
