@@ -36,7 +36,19 @@ cd "$SCRIPT_DIR"
 INPUT_LEN=${INPUT_LEN:-128}
 OUTPUT_LEN=${OUTPUT_LEN:-3968}
 TOTAL_LEN=$((INPUT_LEN + OUTPUT_LEN))
-WANDB_PROJECT=${WANDB_PROJECT:-sync-grpo-gb200-benchmark-fixedRLconfig}
+# Auto-detect cluster type for WandB project naming
+# H100: 8 GPUs/node, GB200: 4 GPUs/node
+if command -v sinfo &> /dev/null; then
+    GPUS_PER_NODE=$(sinfo -p batch -h -o "%G" 2>/dev/null | grep -oP 'gpu:\K\d+' | head -1)
+    if [[ "$GPUS_PER_NODE" == "8" ]]; then
+        CLUSTER_TYPE="h100"
+    else
+        CLUSTER_TYPE="gb200"
+    fi
+else
+    CLUSTER_TYPE="h100"  # default fallback
+fi
+WANDB_PROJECT=${WANDB_PROJECT:-sync-grpo-${CLUSTER_TYPE}-benchmark-fixedRLconfig}
 # Models to benchmark (matching Megatron-Bridge configs)
 # Format: "preset:variant:input_len:output_len" or just "preset" for defaults
 DEFAULT_PRESETS="llama8b llama70b llama70b_r512 llama70b_highseq qwen30b qwen30b_ep4 qwen30b_ep8 qwen32b"
@@ -198,11 +210,19 @@ for preset in $PRESETS; do
             ;;
         llama70b_r512)
             BASE_PRESET="llama70b"
-            VARIANT_ARG="--variant gb200_r512"
+            if [[ "$CLUSTER_TYPE" == "gb200" ]]; then
+                VARIANT_ARG="--variant gb200_r512"
+            else
+                VARIANT_ARG="--variant h100_r512"
+            fi
             ;;
         llama70b_highseq)
             BASE_PRESET="llama70b"
-            VARIANT_ARG="--variant gb200_highseq"
+            if [[ "$CLUSTER_TYPE" == "gb200" ]]; then
+                VARIANT_ARG="--variant gb200_highseq"
+            else
+                VARIANT_ARG="--variant h100_highseq"
+            fi
             # Same I/O as default, but MaxSeqLen=16384 (allows longer context window)
             ;;
         qwen30b)
@@ -210,15 +230,28 @@ for preset in $PRESETS; do
             ;;
         qwen30b_ep4)
             BASE_PRESET="qwen30b"
-            VARIANT_ARG="--variant gb200_ep4"
+            if [[ "$CLUSTER_TYPE" == "gb200" ]]; then
+                VARIANT_ARG="--variant gb200_ep4"
+            else
+                VARIANT_ARG="--variant h100_ep4"
+            fi
             ;;
         qwen30b_ep8)
             BASE_PRESET="qwen30b"
-            VARIANT_ARG="--variant gb200_ep8"
+            if [[ "$CLUSTER_TYPE" == "gb200" ]]; then
+                VARIANT_ARG="--variant gb200_ep8"
+            else
+                VARIANT_ARG="--variant h100_ep8"
+            fi
             ;;
         qwen32b)
             BASE_PRESET="qwen32b"
-            VARIANT_ARG="--variant gb200_tp2"
+            if [[ "$CLUSTER_TYPE" == "gb200" ]]; then
+                VARIANT_ARG="--variant gb200_tp2"
+            else
+                # H100 uses default variant (no special variant needed)
+                VARIANT_ARG=""
+            fi
             ;;
         *)
             # For custom presets, use as-is
