@@ -99,7 +99,7 @@ mcore = [
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
 ]
-# modelopt = ["nvidia-modelopt"]
+modelopt = ["nvidia-modelopt"]
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
@@ -168,7 +168,7 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
-# nvidia-modelopt = { path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer", editable = true }
+nvidia-modelopt = { path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer", editable = true }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 
 [tool.uv.workspace]
