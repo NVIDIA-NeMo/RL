@@ -15,7 +15,16 @@
 """NVIDIA Resiliency Extension (NVRX) Fault Tolerance Client wrapper."""
 
 from contextlib import contextmanager
+import logging
+import os
+import tempfile
+import uuid
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+import torch
+import torch.distributed as dist
 
 try:
     import nvidia_resiliency_ext.fault_tolerance as ft
@@ -29,10 +38,10 @@ except ImportError:
 class FTClient:
     """Wrapper for NVRX RankMonitorClient."""
 
-    def __init__(self):
+    def __init__(self, use_sections: bool = False):
         self._client: Optional[Any] = None
         self._enabled = False
-        self._use_sections = False
+        self._use_sections = use_sections
 
     @property
     def enabled(self) -> bool:
@@ -55,12 +64,24 @@ class FTClient:
                 timeout control. If False, use simple heartbeat API.
         """
         if not NVRX_AVAILABLE:
+            logger.info("FT monitoring skipped - nvidia-resiliency-ext not installed")
             return
+
+        if not dist.is_initialized():
+            temp_dir = tempfile.gettempdir()
+            init_file = os.path.join(temp_dir, f"ft_pg_init_{uuid.uuid4().hex[:8]}")
+            dist.init_process_group(
+                backend="gloo",
+                rank=0,
+                world_size=1,
+                init_method=f"file://{init_file}",
+            )
 
         self._use_sections = use_sections
         self._client = ft.RankMonitorClient()
         self._client.init_workload_monitoring()
         self._enabled = True
+        logger.info("FT monitoring initialized successfully")
 
     def shutdown_workload_monitoring(self) -> None:
         """Shutdown FT monitoring.
@@ -71,6 +92,7 @@ class FTClient:
             self._client.shutdown_workload_monitoring()
             self._client = None
             self._enabled = False
+            logger.info("FT monitoring shutdown complete")
 
     def send_heartbeat(self) -> None:
         """Send heartbeat signal.
@@ -128,8 +150,8 @@ class FTClient:
         if self._client:
             if self._use_sections:
                 self._client.calculate_and_set_section_timeouts()
-            else:
-                self._client.calculate_and_set_hb_timeouts()
+            self._client.calculate_and_set_hb_timeouts()
+            logging.info("FT timeouts calculated and set successfully")
 
     def state_dict(self) -> dict:
         """Get state dict for checkpointing.
@@ -167,7 +189,7 @@ def get_ft_client() -> FTClient:
     """
     global _ft_client
     if _ft_client is None:
-        _ft_client = FTClient()
+        _ft_client = FTClient(use_sections=True)
     return _ft_client
 
 
