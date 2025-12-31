@@ -3257,6 +3257,9 @@ mcore = [
 penguin = [
     { name = "penguin" },
 ]
+resiliency = [
+    { name = "nvidia-resiliency-ext" },
+]
 vllm = [
     { name = "causal-conv1d" },
     { name = "cuda-python" },
@@ -3337,6 +3340,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'resiliency'" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "penguin", marker = "extra == 'penguin'", editable = "3rdparty/Penguin-workspace" },
@@ -3363,7 +3367,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.0" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore", "penguin"]
+provides-extras = ["automodel", "vllm", "mcore", "penguin", "resiliency"]
 
 [package.metadata.requires-dev]
 build = [
