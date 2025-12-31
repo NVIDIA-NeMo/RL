@@ -14,6 +14,7 @@
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from functools import lru_cache
@@ -71,8 +72,6 @@ def create_local_venv(
     # Force rebuild if requested
     if force_rebuild and os.path.exists(venv_path):
         logger.info(f"Force rebuilding venv at {venv_path}")
-        import shutil
-
         shutil.rmtree(venv_path)
 
     logger.info(f"Creating new venv at {venv_path}")
