@@ -74,6 +74,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.ft_client import get_ft_client
 
 # ===============================================================================
 # Configuration
@@ -994,6 +995,15 @@ def grpo_train(
     )
     timeout.start_iterations()
 
+    # Initialize fault tolerance monitoring
+    ft_client = get_ft_client()
+    ft_client.init_workload_monitoring()
+
+    if grpo_save_state.get("ft_state"):
+        ft_client.load_state_dict(grpo_save_state["ft_state"])
+    
+    ft_timeouts_calculated = False
+
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     NEED_REFIT = True
@@ -1136,7 +1146,7 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
-                with timer.time("generation"):
+                with timer.time("generation"), ft_client.section("generation"):
                     # Clear vLLM logger metrics for each generation step
                     if policy_generation is not None and hasattr(
                         policy_generation, "clear_vllm_logger_metrics"
@@ -1213,7 +1223,7 @@ def grpo_train(
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
-                with timer.time("reward_calculation"):
+                with timer.time("reward_calculation"), ft_client.section("environment"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
@@ -1337,7 +1347,8 @@ def grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
+
+                with timer.time("policy_training"), ft_client.section("training"):
                     train_results = policy.train(train_data, loss_fn)
 
                 # Recompute KV scales after policy training if needed
@@ -1470,6 +1481,11 @@ def grpo_train(
                     elif "val_reward" in grpo_save_state:
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
+
+
+                    ft_state = ft_client.state_dict()
+                    if ft_state:
+                        grpo_save_state["ft_state"] = ft_state
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
@@ -1627,20 +1643,33 @@ def grpo_train(
             dynamic_sampling_num_gen_batches = 0
 
             timer.reset()
+
+
+            ft_client.send_heartbeat()
+
+            
+            if not ft_timeouts_calculated and total_steps >= 5:
+                ft_client.calculate_and_set_timeouts()
+                ft_timeouts_calculated = True
+
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
+                ft_client.shutdown_workload_monitoring()
                 return
             if total_steps >= max_num_steps:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                ft_client.shutdown_workload_monitoring()
                 return
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    ft_client.shutdown_workload_monitoring()
 
 
 def validate(
