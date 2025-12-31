@@ -293,3 +293,7 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+
+fault_tolerance:
+  enabled: false
+  use_sections: true

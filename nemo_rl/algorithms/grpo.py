@@ -167,6 +167,11 @@ class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
+class FaultToleranceConfig(TypedDict):
+    enabled: bool
+    use_sections: NotRequired[bool]
+
+
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -176,6 +181,7 @@ class MasterConfig(TypedDict):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    fault_tolerance: NotRequired[FaultToleranceConfig]
 
 
 # ===============================================================================
@@ -996,13 +1002,14 @@ def grpo_train(
     timeout.start_iterations()
 
     # Initialize fault tolerance monitoring
-    ft_client = get_ft_client()
-    ft_client.init_workload_monitoring()
-
+    ft_config = master_config.get("fault_tolerance", {})
+    ft_client = get_ft_client(
+        enabled=ft_config.get("enabled", False),
+        use_sections=ft_config.get("use_sections", False),
+    )
+    ft_timeouts_calculated = False
     if grpo_save_state.get("ft_state"):
         ft_client.load_state_dict(grpo_save_state["ft_state"])
-    
-    ft_timeouts_calculated = False
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
@@ -1644,10 +1651,7 @@ def grpo_train(
 
             timer.reset()
 
-
             ft_client.send_heartbeat()
-
-            
             if not ft_timeouts_calculated and total_steps >= 5:
                 ft_client.calculate_and_set_timeouts()
                 ft_timeouts_calculated = True
