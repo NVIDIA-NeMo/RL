@@ -74,6 +74,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.fault_injection import FaultInjector
 from nemo_rl.utils.ft_client import get_ft_client
 
 # ===============================================================================
@@ -1008,8 +1009,15 @@ def grpo_train(
         use_sections=ft_config.get("use_sections", False),
     )
     ft_timeouts_calculated = False
+    steps_this_session = 0
     if grpo_save_state.get("ft_state"):
         ft_client.load_state_dict(grpo_save_state["ft_state"])
+
+
+    fi_config = ft_config.get("fault_injection", {})
+    fault_injector = (
+        FaultInjector(fi_config) if fi_config.get("enabled", False) else None
+    )
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
@@ -1356,7 +1364,10 @@ def grpo_train(
                 print("▶ Training policy...", flush=True)
 
                 with timer.time("policy_training"), ft_client.section("training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    fault_plan = (
+                        fault_injector.get_plan("training") if fault_injector else None
+                    )
+                    train_results = policy.train(train_data, loss_fn, fault_plan=fault_plan)
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1652,7 +1663,8 @@ def grpo_train(
             timer.reset()
 
             ft_client.send_heartbeat()
-            if not ft_timeouts_calculated and total_steps >= 5:
+            steps_this_session += 1
+            if not ft_timeouts_calculated and steps_this_session >= 5:
                 ft_client.calculate_and_set_timeouts()
                 ft_timeouts_calculated = True
 

@@ -36,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.utils.fault_injection import FaultPlan
 
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
@@ -421,7 +422,10 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM."""
         assert isinstance(data, BatchedDataDict), (
@@ -442,7 +446,7 @@ class VllmGeneration(GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
+            common_kwargs={"greedy": greedy, "fault_plan": fault_plan},
         )
 
         # Get results from the workers, respecting tied worker groups (only one result per tied worker group)

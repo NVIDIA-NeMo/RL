@@ -48,6 +48,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.utils.fault_injection import FaultPlan, check_workload_exception, dispatch_fault_if_target
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -536,8 +537,12 @@ class DTensorPolicyWorker:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+
+        dispatch_fault_if_target(fault_plan, self.rank)
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -897,6 +902,9 @@ class DTensorPolicyWorker:
                 "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
             }
+
+            # Check for pending WORKLOAD_EXC fault at safe point
+            check_workload_exception()
 
             return metrics
 

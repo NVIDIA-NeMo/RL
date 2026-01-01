@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
@@ -20,6 +20,9 @@ import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+
+if TYPE_CHECKING:
+    from nemo_rl.utils.fault_injection import FaultPlan
 
 
 class LogprobOutputSpec(TypedDict):
@@ -102,6 +105,7 @@ class PolicyInterface(ABC):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        fault_plan: Optional["FaultPlan"] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -111,6 +115,7 @@ class PolicyInterface(ABC):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            fault_plan: Optional fault injection plan for testing FT mechanisms
         """
         pass
 

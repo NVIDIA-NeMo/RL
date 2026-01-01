@@ -296,4 +296,4 @@ cluster:
 
 fault_tolerance:
   enabled: false
-  use_sections: true
+  use_sections: false

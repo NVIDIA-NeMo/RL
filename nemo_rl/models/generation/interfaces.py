@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    from nemo_rl.utils.fault_injection import FaultPlan
 
 
 def verify_right_padding(
@@ -224,7 +227,10 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def generate(
-        self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
+        self,
+        data: BatchedDataDict["GenerationDatumSpec"],
+        greedy: bool,
+        fault_plan: Optional["FaultPlan"] = None,
     ) -> BatchedDataDict["GenerationOutputSpec"]:
         pass
 

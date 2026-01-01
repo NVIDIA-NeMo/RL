@@ -94,6 +94,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.fault_injection import FaultPlan, check_workload_exception, dispatch_fault_if_target
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -932,8 +933,12 @@ class MegatronPolicyWorker:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+
+        dispatch_fault_if_target(fault_plan, self.rank)
+
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1190,6 +1195,10 @@ class MegatronPolicyWorker:
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
+        # Check for pending WORKLOAD_EXC fault at safe point
+        check_workload_exception()
+
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1774,18 +1783,27 @@ class MegatronPolicyWorker:
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
-        self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using huggingface framework generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
+            greedy: Whether to use greedy decoding
+            fault_plan: Optional fault injection plan for testing FT mechanisms
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
                 - output_ids: input + generated token IDs
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+        # Schedule fault injection if this rank is the target
+        dispatch_fault_if_target(fault_plan, self.rank)
+
         # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -1984,6 +2002,9 @@ class MegatronPolicyWorker:
 
         self.model.config.flash_decode = False
         no_grad.__exit__(None, None, None)
+
+        # Check for pending WORKLOAD_EXC fault at safe point
+        check_workload_exception()
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 

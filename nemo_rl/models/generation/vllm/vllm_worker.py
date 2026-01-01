@@ -32,6 +32,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.fault_injection import FaultPlan, check_workload_exception, dispatch_fault_if_target
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -427,13 +428,17 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
             greedy: Whether to use greedy decoding instead of sampling
+            fault_plan: Optional fault injection plan for testing FT mechanisms
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
@@ -442,6 +447,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
+        # Schedule fault injection if this rank is the target
+        dispatch_fault_if_target(fault_plan, self.rank)
+
         # Handle empty input case
         if len(data["input_ids"]) == 0:
             # Return empty BatchedDataDict with all required fields
@@ -549,6 +557,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 ),
             }
         )
+
+        # Check for pending WORKLOAD_EXC fault at safe point
+        check_workload_exception()
 
         return return_data
 

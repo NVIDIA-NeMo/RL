@@ -23,6 +23,7 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.utils.fault_injection import FaultPlan
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -465,6 +466,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
@@ -521,6 +523,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "eval_mode": eval_mode,
                 "gbs": batch_size,
                 "mbs": micro_batch_size,
+                "fault_plan": fault_plan,
             },
         )
         results = self.worker_group.get_all_worker_results(futures)
@@ -556,7 +559,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return aggregated_results
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        fault_plan: Optional[FaultPlan] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
         # Verify input data is right-padded
@@ -575,7 +581,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"greedy": greedy},
+            common_kwargs={"greedy": greedy, "fault_plan": fault_plan},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
         result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
