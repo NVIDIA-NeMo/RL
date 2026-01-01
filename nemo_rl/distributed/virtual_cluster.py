@@ -47,13 +47,16 @@ class PY_EXECUTABLES:
     BASE = f"uv run --locked --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
+    # Includes resiliency for fault injection support in workers.
+    VLLM = f"uv run --locked --extra vllm --extra resiliency --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
+    # Includes resiliency for fault injection support in workers.
+    AUTOMODEL = f"uv run --locked --extra automodel --extra resiliency --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
-    MCORE = f"uv run --locked --extra mcore --directory {git_root}"
+    # Includes resiliency for fault injection support in workers.
+    MCORE = f"uv run --locked --extra mcore --extra resiliency --directory {git_root}"
 
     # Use Penguin dependencies
     PENGUIN = f"uv run --locked --extra penguin --directory {git_root}"
