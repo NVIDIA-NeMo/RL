@@ -211,7 +211,7 @@ policy:
       num_first_layers_in_bf16: 0
       expose_http_server: true
       skip_tokenizer_init: false
-      kv_cache_dtype: null
+      kv_cache_dtype: ${policy.precision}
       http_server_serving_chat_kwargs:
         # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
         enable_auto_tools: true
@@ -234,10 +234,21 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/validation.jsonl
+  max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/train.jsonl
+    repeat: 1
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/validation.jsonl
+  default:
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
 
 env:
   should_use_nemo_gym: true

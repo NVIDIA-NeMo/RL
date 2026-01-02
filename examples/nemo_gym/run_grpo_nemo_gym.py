@@ -17,7 +17,7 @@ import json
 import os
 import pprint
 from itertools import chain, repeat
-from typing import Optional
+from typing import Dict, Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -25,6 +25,7 @@ import wandb.util
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
 import ray
+from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from wandb import Table
 
@@ -42,18 +43,19 @@ from nemo_rl.algorithms.grpo import (
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_response_dataset,
+    update_single_dataset_config,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGym,
     NemoGymConfig,
     nemo_gym_example_to_nemo_rl_datum_spec,
     setup_nemo_gym_config,
 )
+from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -107,6 +109,80 @@ def setup_single_nemo_gym_dataset(
         None,
         passthrough_task_processor,
     )
+
+
+def setup_data(
+    tokenizer: TokenizerType,
+    data_config: Dict,
+    env_configs: Dict,
+    seed: int,
+) -> tuple[
+    AllTaskProcessedDataset,
+    Optional[AllTaskProcessedDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
+    print("\n▶ Setting up data...")
+    # setup train dataset
+    data_list = []
+    task_data_processors = {}
+
+    if isinstance(data_config["train"], dict):
+        data_config["train"] = [data_config["train"]]
+    for cfg in data_config["train"]:
+        update_single_dataset_config(cfg, data_config["default"])
+        data = load_response_dataset(cfg, seed)
+        data_list.append(data)
+        task_data_processors[data.task_name] = (data.task_spec, data.processor)
+
+    merged_data = concatenate_datasets([data.dataset for data in data_list])
+    dataset = AllTaskProcessedDataset(
+        merged_data,
+        tokenizer,
+        None,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+
+    # setup validation dataset
+    val_task_data_processors = {}
+    val_data_list = []
+
+    for data in data_list:
+        if hasattr(data, "val_dataset") and data.val_dataset is not None:
+            val_data_list.append(data.val_dataset)
+            # bind task_name to task_data_processors
+            task_name = data.task_name
+            val_task_data_processors[task_name] = task_data_processors[task_name]
+
+    if data_config["validation"] is not None:
+        if isinstance(data_config["validation"], dict):
+            data_config["validation"] = [data_config["validation"]]
+
+        for cfg in data_config["validation"]:
+            update_single_dataset_config(cfg, data_config["default"])
+            val_data = load_response_dataset(cfg, seed)
+            val_data_list.append(val_data.dataset)
+            # bind task_name to task_data_processors
+            val_task_data_processors[val_data.task_name] = (
+                val_data.task_spec,
+                val_data.processor,
+            )
+
+    val_dataset = None
+    if len(val_data_list) > 0:
+        merged_val_data = concatenate_datasets(val_data_list)
+        val_dataset = AllTaskProcessedDataset(
+            merged_val_data,
+            tokenizer,
+            None,
+            val_task_data_processors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+
+    return dataset, val_dataset
 
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
@@ -202,13 +278,11 @@ def main() -> None:
     assert _should_use_nemo_gym(config)
 
     print("\n▶ Setting up data...")
-    train_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["train_jsonl_fpath"],
+    train_dataset, val_dataset = setup_data(
         tokenizer=tokenizer,
-    )
-    val_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["validation_jsonl_fpath"],
-        tokenizer=tokenizer,
+        data_config=config["data"],
+        env_configs=config["env"],
+        seed=config["grpo"]["seed"],
     )
 
     # Validation dataset config setup.
@@ -254,13 +328,7 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    nemo_gym = NemoGym.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.nemo_gym.NemoGym"
-            ),
-        }
-    ).remote(nemo_gym_config)
+    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
     task_to_env = {"nemo_gym": nemo_gym}
