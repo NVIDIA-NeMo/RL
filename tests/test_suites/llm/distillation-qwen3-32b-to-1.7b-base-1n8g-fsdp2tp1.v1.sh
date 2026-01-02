@@ -20,7 +20,7 @@ uv run examples/run_distillation_math.py \
     distillation.val_period=20 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=nemo-rl-distillation \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \

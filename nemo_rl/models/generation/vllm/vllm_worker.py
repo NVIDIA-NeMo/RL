@@ -388,6 +388,10 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+        elif "Gemma3ForConditionalGeneration" in getattr(hf_config, "architectures", []):
+            if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
+                print("Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details.")
+            self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
         llm_kwargs = dict(
             model=self.model_name,
