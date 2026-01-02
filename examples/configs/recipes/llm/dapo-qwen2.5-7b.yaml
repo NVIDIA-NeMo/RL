@@ -82,11 +82,12 @@ policy:
       enforce_eager: true
 data:
   max_input_seq_length: 2048
-  prompt_file: null
   train:
     dataset_name: DAPOMath17K
   validation:
     dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
 env:
   math:
     num_workers: 16

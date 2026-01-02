@@ -2,7 +2,8 @@
 defaults: "grpo_math_1B.yaml"
 
 data:
-  env_name: "reward_model"
+  default:
+    env_name: "reward_model"
 
 env:
   reward_model:  

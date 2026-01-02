@@ -250,14 +250,16 @@ data:
   num_workers: 1
 
   # dataset
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
-  processor: "math_hf_data_processor"
-  env_name: "math"
   train:
     dataset_name: OpenMathInstruct-2
     split_validation_size: 0.05 # use 5% of the training data as validation data
   validation: null
+  # default settings for all datasets
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
   # You can use custom response datasets for training and validation. For example:
   #   train:
   #     dataset_name: ResponseDataset

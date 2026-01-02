@@ -23,7 +23,6 @@ policy:
       eps: 1.0e-08
 data:
   add_generation_prompt: true
-  prompt_file: examples/prompts/math.txt
   train:
     dataset_name: OpenMathInstruct-2
     output_key: generated_solution
@@ -31,6 +30,8 @@ data:
     seed: 42
     split_validation_size: 0.05
   validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
 logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2
   wandb:

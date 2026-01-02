@@ -232,16 +232,18 @@ data:
   num_workers: 1
 
   # dataset
-  prompt_file: "examples/prompts/clevr_cogent_cot.txt"
-  system_prompt_file: null
-  processor: "vlm_hf_data_processor"
-  env_name: "clevr-cogent"
   train:
     dataset_name: clevr-cogent
     split: train
   validation:
     dataset_name: clevr-cogent
     split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "clevr-cogent"
 
 env:
   clevr-cogent:

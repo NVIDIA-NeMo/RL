@@ -65,6 +65,7 @@ policy:
   max_total_sequence_length: 32768
   precision: "bfloat16"
   logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
     _v2: false
@@ -210,6 +211,7 @@ policy:
       num_first_layers_in_bf16: 0
       expose_http_server: true
       skip_tokenizer_init: false
+      kv_cache_dtype: ${policy.precision}
       http_server_serving_chat_kwargs:
         # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
         enable_auto_tools: true
@@ -232,10 +234,21 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/validation.jsonl
+  max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/train.jsonl
+    repeat: 1
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/validation.jsonl
+  default:
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
 
 env:
   should_use_nemo_gym: true
@@ -243,10 +256,10 @@ env:
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
-    - resources_servers/library_judge_math/configs/library_judge_math.yaml
-    library_judge_math:
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    math_with_judge:
       resources_servers:
-        library_judge_math:
+        math_with_judge:
           judge_model_server:
             name: policy_model
           should_use_judge: false
