@@ -517,6 +517,9 @@ def setup(
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
+            assert not policy_config["dtensor_cfg"]["lora_cfg"]["enabled"], (
+                "LoRA is not supported with vLLM FP8 generation."
+            )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
