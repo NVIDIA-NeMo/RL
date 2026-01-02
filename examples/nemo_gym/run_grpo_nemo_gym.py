@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import argparse
-import json
 import os
 import pprint
-from itertools import chain, repeat
 from typing import Dict, Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
@@ -45,14 +43,13 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
+    extract_necessary_env_names,
     load_response_dataset,
     update_single_dataset_config,
 )
-from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
-    nemo_gym_example_to_nemo_rl_datum_spec,
     setup_nemo_gym_config,
 )
 from nemo_rl.environments.utils import create_env
@@ -77,40 +74,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
-def setup_single_nemo_gym_dataset(
-    jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None
-):
-    with open(jsonl_fpath) as f:
-        nemo_gym_examples = list(map(json.loads, f))
-
-    print(f"Loaded data at {jsonl_fpath}. Found {len(nemo_gym_examples)} examples")
-
-    if num_repeats:
-        previous_length = len(nemo_gym_examples)
-        nemo_gym_examples = list(
-            chain.from_iterable(
-                repeat(nemo_gym_example, num_repeats)
-                for nemo_gym_example in nemo_gym_examples
-            )
-        )
-        print(
-            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(nemo_gym_examples)}!"
-        )
-
-    nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
-    ]
-
-    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
-    return AllTaskProcessedDataset(
-        nemo_rl_compatible_examples,
-        tokenizer,
-        None,
-        passthrough_task_processor,
-    )
-
-
 def setup_data(
     tokenizer: TokenizerType,
     data_config: Dict,
@@ -122,10 +85,18 @@ def setup_data(
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
+    print("\n▶ Setting up envs...")
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+        for env_name in env_name_list
+        if env_name != "nemo_gym"
+    }
     print("\n▶ Setting up data...")
     # setup train dataset
-    data_list = []
     task_data_processors = {}
+    task_to_env = {}
+    data_list = []
 
     if isinstance(data_config["train"], dict):
         data_config["train"] = [data_config["train"]]
@@ -133,7 +104,12 @@ def setup_data(
         update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg, seed)
         data_list.append(data)
-        task_data_processors[data.task_name] = (data.task_spec, data.processor)
+        # bind task_name to task_data_processors and task_to_env
+        task_name = data.task_name
+        task_data_processors[task_name] = (data.task_spec, data.processor)
+        # Skip binding nemo_gym env to task_to_env, nemo_gym env need to initialize policy first
+        if cfg["env_name"] != "nemo_gym":
+            task_to_env[task_name] = envs[cfg["env_name"]]
 
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
@@ -147,6 +123,7 @@ def setup_data(
 
     # setup validation dataset
     val_task_data_processors = {}
+    val_task_to_env = {}
     val_data_list = []
 
     for data in data_list:
@@ -155,6 +132,8 @@ def setup_data(
             # bind task_name to task_data_processors
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_to_env:
+                val_task_to_env[task_name] = task_to_env[task_name]
 
     if data_config["validation"] is not None:
         if isinstance(data_config["validation"], dict):
@@ -165,10 +144,13 @@ def setup_data(
             val_data = load_response_dataset(cfg, seed)
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors
-            val_task_data_processors[val_data.task_name] = (
+            task_name = val_data.task_name
+            val_task_data_processors[task_name] = (
                 val_data.task_spec,
                 val_data.processor,
             )
+            if cfg["env_name"] != "nemo_gym":
+                val_task_to_env[task_name] = envs[cfg["env_name"]]
 
     val_dataset = None
     if len(val_data_list) > 0:
@@ -182,7 +164,7 @@ def setup_data(
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
-    return dataset, val_dataset
+    return dataset, val_dataset, task_to_env, val_task_to_env
 
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
@@ -278,7 +260,7 @@ def main() -> None:
     assert _should_use_nemo_gym(config)
 
     print("\n▶ Setting up data...")
-    train_dataset, val_dataset = setup_data(
+    train_dataset, val_dataset, task_to_env, val_task_to_env = setup_data(
         tokenizer=tokenizer,
         data_config=config["data"],
         env_configs=config["env"],
@@ -328,11 +310,12 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
+    # Default nemo_gym env is used for trajectory collection
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
-    task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = task_to_env
+    task_to_env["nemo_gym"] = nemo_gym
+    val_task_to_env["nemo_gym"] = nemo_gym
 
     if is_trajectory_collection:
         collect_trajectories(
