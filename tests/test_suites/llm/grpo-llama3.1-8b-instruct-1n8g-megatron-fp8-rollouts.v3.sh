@@ -38,4 +38,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'mean(data["train/token_mult_prob_error"], ignore_top_p=0.05) < 1.1' \
         'ratio_above(data["train/token_mult_prob_error"], 1.1) < 0.1'
     # ratio_above @ 1.1 was 0.03,0.06,0.05: 3sigma ~=0.1
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi

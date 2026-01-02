@@ -60,6 +60,9 @@ cat ${RUN_LOG}.aime-8k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"scor
 uv run tests/check_metrics.py ${RUN_LOG}-8k-metric.json \
   'data["score"] >= 0.2396' 
 
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"
+
 # This comment is for reference on how the aime24 eval baseline was chosen:
 # The variance in aime24 is pretty high when only taking one sample per prompt.
 # I have observed huge variance even between A100 and H100 with one sample per prompt,

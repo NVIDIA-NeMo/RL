@@ -66,3 +66,6 @@ cat ${RUN_LOG}.aime-16k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"sco
 # 240 step checkpoint 0.3
 uv run tests/check_metrics.py ${RUN_LOG}-16k-metric.json \
   'data["score"] >= 0.2396'
+
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"
