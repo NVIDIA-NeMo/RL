@@ -3770,9 +3770,6 @@ mcore = [
 nemo-gym = [
     { name = "nemo-gym" },
 ]
-penguin = [
-    { name = "penguin" },
-]
 resiliency = [
     { name = "nvidia-resiliency-ext" },
 ]
