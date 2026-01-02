@@ -29,6 +29,73 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# NeMo RL resource name prefixes used for identifying resources to clean up during FT restart
+NEMO_RL_PLACEMENT_GROUP_PREFIXES = (
+    "grpo_policy_cluster",
+    "vllm_cluster",
+    "inference_cluster",
+    "train_cluster",
+)
+NEMO_RL_ACTOR_PREFIXES = (
+    "lm_policy",
+    "vllm_policy",
+    "reward_model_policy",
+    "MathEnvironment",
+    "CodeEnvironment",
+    "VLMEnvironment",
+)
+
+
+def cleanup_stale_placement_groups_and_actors(wait_after_cleanup: float = 5.0) -> None:
+    """Clean up stale NeMo RL placement groups and actors from previous runs."""
+    actors_killed = _cleanup_actors()
+    pgs_removed = _cleanup_placement_groups()
+
+    if pgs_removed > 0 or actors_killed > 0:
+        logger.info(f"Cleaned up {pgs_removed} placement groups, {actors_killed} actors")
+        if wait_after_cleanup > 0:
+            logger.info(f"Waiting {wait_after_cleanup}s for resources to be released...")
+            time.sleep(wait_after_cleanup)
+
+
+def _cleanup_placement_groups() -> int:
+    """Remove stale NeMo RL placement groups."""
+    removed_count = 0
+    pg_table = placement_group_table()
+
+    for pg_id, pg_info in pg_table.items():
+        pg_name = pg_info["name"]
+        pg_state = pg_info["state"]
+
+        if pg_state == "REMOVED" or not pg_name:
+            continue
+
+        if any(pg_name.startswith(prefix) for prefix in NEMO_RL_PLACEMENT_GROUP_PREFIXES):
+            pg = PlacementGroup(ray.PlacementGroupID.from_hex(pg_id))
+            remove_placement_group(pg)
+            logger.info(f"Removed stale placement group: {pg_name}")
+            removed_count += 1
+
+    return removed_count
+
+
+def _cleanup_actors() -> int:
+    """Kill stale NeMo RL actors."""
+    killed_count = 0
+    actor_names = ray.util.list_named_actors(all_namespaces=True)
+
+    for actor_name in actor_names:
+        if any(actor_name.startswith(prefix) for prefix in NEMO_RL_ACTOR_PREFIXES):
+            try:
+                actor_handle = ray.get_actor(actor_name)
+                ray.kill(actor_handle, no_restart=True)
+                logger.info(f"Killed stale actor: {actor_name}")
+                killed_count += 1
+            except ValueError:
+                pass  # Actor already terminated
+
+    return killed_count
+
 
 class ClusterConfig(TypedDict):
     gpus_per_node: int
@@ -85,7 +152,7 @@ def _get_free_port_local() -> int:
     return port
 
 
-def init_ray(log_dir: Optional[str] = None) -> None:
+def init_ray(log_dir: Optional[str] = None, cleanup_stale_resources: bool = True) -> None:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
@@ -94,6 +161,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
+        cleanup_stale_resources: If True, clean up stale NeMo RL resources (actors,
+            placement groups).
     """
     # Set up runtime environment
     env_vars = dict(os.environ)
@@ -128,6 +197,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
                 logger.info(
                     f"Connected to existing Ray cluster (driver CVD_TAG '{cvd_tag}' matched): {cluster_res}"
                 )
+                if cleanup_stale_resources:
+                    cleanup_stale_placement_groups_and_actors()
                 return
 
             # If neither reuse condition is met, but we connected to *something*
@@ -148,6 +219,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         # Always reuse if it's an externally managed cluster.
         else:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
+            if cleanup_stale_resources:
+                cleanup_stale_placement_groups_and_actors()
             return
 
     except ConnectionError:
