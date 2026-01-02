@@ -80,7 +80,7 @@ def setup_data(
     env_configs: Dict,
     seed: int,
 ) -> tuple[
-    AllTaskProcessedDataset,
+    dict[str, AllTaskProcessedDataset],
     Optional[AllTaskProcessedDataset],
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
@@ -111,15 +111,33 @@ def setup_data(
         if cfg["env_name"] != "nemo_gym":
             task_to_env[task_name] = envs[cfg["env_name"]]
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
-    dataset = AllTaskProcessedDataset(
-        merged_data,
-        tokenizer,
-        None,
-        task_data_processors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+    if data_config["use_multiple_dataloader"]:
+        assert data_config["num_prompts_per_dataloader"] is not None, (
+            "num_prompts_per_dataloader must be set when using multiple_dataloader"
+        )
+        datasets = {
+            data.task_name: AllTaskProcessedDataset(
+                data.dataset,
+                tokenizer,
+                None,
+                task_data_processors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for data in data_list
+        }
+    else:
+        merged_data = concatenate_datasets([data.dataset for data in data_list])
+        datasets = {
+            "all_tasks": AllTaskProcessedDataset(
+                merged_data,
+                tokenizer,
+                None,
+                task_data_processors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+        }
+    sample_count = sum(len(data.dataset) for data in data_list)
+    print(f"  ✓ Training dataset loaded with {sample_count} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
@@ -164,7 +182,7 @@ def setup_data(
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
-    return dataset, val_dataset, task_to_env, val_task_to_env
+    return datasets, val_dataset, task_to_env, val_task_to_env
 
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
@@ -260,7 +278,7 @@ def main() -> None:
     assert _should_use_nemo_gym(config)
 
     print("\n▶ Setting up data...")
-    train_dataset, val_dataset, task_to_env, val_task_to_env = setup_data(
+    train_datasets, val_dataset, task_to_env, val_task_to_env = setup_data(
         tokenizer=tokenizer,
         data_config=config["data"],
         env_configs=config["env"],
@@ -293,14 +311,14 @@ The validation set you pass in will directly be used for validation with no addi
         policy,
         policy_generation,
         cluster,
-        dataloader,
+        dataloaders,
         val_dataloader,
         loss_fn,
         logger,
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(config, tokenizer, train_datasets, val_dataset)
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
@@ -331,7 +349,7 @@ The validation set you pass in will directly be used for validation with no addi
         grpo_train(
             policy,
             policy_generation,
-            dataloader,
+            dataloaders,
             val_dataloader,
             tokenizer,
             loss_fn,
