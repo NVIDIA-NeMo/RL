@@ -57,7 +57,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_penguin_rollout,
+    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -304,7 +304,7 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     reward_model_enabled = (
-        "reward_model" in env_configs and env_configs["reward_model"]["enabled"]
+        "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
 
     total_nodes = cluster_config["num_nodes"]
@@ -609,6 +609,17 @@ def setup(
 
     loss_fn = ClippedPGLossFn(loss_config)
 
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        print("  ✓ force_on_policy_ratio enabled")
+
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -875,16 +886,16 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
-def _should_use_penguin(master_config: MasterConfig) -> bool:
-    """Determine if Penguin should be used for rollouts and validation based on the configuration."""
+def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
+    """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.get("env") or dict()
-    should_use_penguin = bool(env_config.get("should_use_penguin"))
-    if not should_use_penguin:
-        return should_use_penguin
+    should_use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
+    if not should_use_nemo_gym:
+        return should_use_nemo_gym
 
-    # Validate the setup for training with Penguin
+    # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use Penguin, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
     )
 
     generation_config = master_config["policy"]["generation"]
@@ -892,10 +903,10 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
     assert should_expose_http_server, (
-        "In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
+        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
     )
 
-    return should_use_penguin
+    return should_use_nemo_gym
 
 
 def refit_policy_generation(
@@ -1167,10 +1178,10 @@ def grpo_train(
                         policy_generation, "clear_vllm_logger_metrics"
                     ):
                         policy_generation.clear_vllm_logger_metrics()
-                    # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
-                    if _should_use_penguin(master_config):
+                    # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
+                    if _should_use_nemo_gym(master_config):
                         generation_config = master_config["policy"]["generation"]
-                        penguin_rollout_result = run_async_penguin_rollout(
+                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -1180,9 +1191,9 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                         )
-                        input_ids = penguin_rollout_result.input_ids
-                        repeated_batch = penguin_rollout_result.final_batch
-                        rollout_metrics = penguin_rollout_result.rollout_metrics
+                        input_ids = nemo_gym_rollout_result.input_ids
+                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                     # Use async rollouts if vLLM async engine is enabled
                     elif _should_use_async_rollouts(master_config):
                         (
@@ -1454,7 +1465,17 @@ def grpo_train(
 
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -1604,6 +1625,20 @@ def grpo_train(
                     logger,
                 )
 
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            if (
+                master_config["policy"]["generation"]
+                .get("vllm_cfg", {})
+                .get("async_engine", False)
+            ):
+                for metric_name in metrics.keys():
+                    if metric_name.startswith("histogram/"):
+                        logger.log_histogram(
+                            metrics[metric_name],
+                            total_steps + 1,
+                            f"generation_metrics/{metric_name}",
+                        )
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -1723,10 +1758,10 @@ def validate(
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
-            # We cascade penguin first since penguin also uses async rollouts.
-            if _should_use_penguin(master_config):
+            # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
+            if _should_use_nemo_gym(master_config):
                 generation_config = master_config["policy"]["generation"]
-                penguin_rollout_result = run_async_penguin_rollout(
+                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
@@ -1736,8 +1771,8 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                 )
-                val_batch = penguin_rollout_result.final_batch
-                gen_metrics = penguin_rollout_result.rollout_metrics
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
                 additional_metrics_to_report = gen_metrics
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
@@ -1777,9 +1812,7 @@ def validate(
         num_samples = len(total_rewards)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            # Unscaled binary reward values range = {0.0, 1.0}
-            correct_response_reward = torch.tensor(1.0, dtype=torch.float32)
-            accuracy = (rewards_t == correct_response_reward).float().mean().item()
+            accuracy = rewards_t.mean().item()
         else:
             accuracy = 0.0
 
@@ -2414,7 +2447,17 @@ def async_grpo_train(
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -2541,6 +2584,20 @@ def async_grpo_train(
                     ],
                     logger,
                 )
+
+            # Plot ISL/OSL/ISL+OSL histograms to wandb
+            if (
+                master_config["policy"]["generation"]
+                .get("vllm_cfg", {})
+                .get("async_engine", False)
+            ):
+                for metric_name in metrics.keys():
+                    if metric_name.startswith("histogram/"):
+                        logger.log_histogram(
+                            metrics[metric_name],
+                            step + 1,
+                            f"generation_metrics/{metric_name}",
+                        )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")

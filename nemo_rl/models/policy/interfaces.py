@@ -70,7 +70,9 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -103,6 +105,7 @@ class PolicyInterface(ABC):
         data: BatchedDataDict,
         loss_fn: LossFunction,
         eval_mode: bool = False,
+        *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         fault_plan: Optional["FaultPlan"] = None,
@@ -117,13 +120,6 @@ class PolicyInterface(ABC):
             mbs: Micro batch size override (if None, uses config default)
             fault_plan: Optional fault injection plan for testing FT mechanisms
         """
-        pass
-
-    @abstractmethod
-    def score(
-        self, data: BatchedDataDict[GenerationDatumSpec]
-    ) -> BatchedDataDict[ScoreOutputSpec]:
-        """Score a batch of data using the policy."""
         pass
 
     @abstractmethod
@@ -195,4 +191,8 @@ class ColocatablePolicyInterface(PolicyInterface):
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def prepare_for_lp_inference(self) -> None:
         pass

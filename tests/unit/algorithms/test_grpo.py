@@ -726,7 +726,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1},
+        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -784,7 +784,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1},
+        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -897,6 +897,7 @@ def mock_grpo_components():
             "truncated_importance_sampling_ratio": None,
             "sequence_level_importance_ratios": False,
             "token_level_loss": True,
+            "force_on_policy_ratio": False,
         }
     )
     logger = MagicMock()
