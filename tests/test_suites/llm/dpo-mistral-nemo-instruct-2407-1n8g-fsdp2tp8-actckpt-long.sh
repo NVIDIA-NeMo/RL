@@ -37,4 +37,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["1"] > 0.680' \
         'data["train/loss"]["1"] < 0.70' \
         'data["train/loss"]["100"] < 0.60'
-fi 
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
+fi
