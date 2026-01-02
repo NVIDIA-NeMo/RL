@@ -80,6 +80,16 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+# ANSI color codes
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 
 class RewardScalingConfig(TypedDict):
     """Configure linear reward scaling with clamping.
@@ -460,6 +470,12 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+    if policy_config.get("dtensor_cfg", {}).get("enabled", False):
+        lora_cfg = policy_config.get("dtensor_cfg", {}).get("lora_cfg", {})
+        if lora_cfg.get("enabled", False):
+            # Override the vLLM lora config with the DTensor lora config
+            generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
+
     # Define initialization functions that will be used in all paths
     def init_policy():
         """Initialize policy training workers."""
@@ -500,6 +516,9 @@ def setup(
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+            assert not policy_config["dtensor_cfg"]["lora_cfg"]["enabled"], (
+                "LoRA is not supported with vLLM FP8 generation."
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
@@ -908,6 +927,8 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    refit_base_model_weights: Optional[bool] = True,
+    refit_lora_weights: Optional[bool] = False,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -920,18 +941,13 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
+    assert refit_base_model_weights or refit_lora_weights, (
+        "refit_base_model_weights and refit_lora_weights cannot be both False"
     )
-    with timer_context:
-        # update weights
+
+    def _perform_refit_weights(
+        refit_base_model_weights: bool, refit_lora_weights: bool
+    ):
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
@@ -946,17 +962,30 @@ def refit_policy_generation(
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
             )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            futures_inference = policy_generation.update_weights_via_ipc_zmq(
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
+            futures_train = policy.broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
+            futures_inference = policy_generation.update_weights_from_collective(
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -971,6 +1000,31 @@ def refit_policy_generation(
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
             raise RuntimeError(error_message)
+        return update_success
+
+    if colocated_inference:
+        policy.offload_before_refit()
+        policy_generation.prepare_for_generation(tags=["weights"])
+
+    # Create a context manager that does nothing when timer is None
+    timer_context = (
+        timer.time("prepare_for_generation/transfer_and_update_weights")
+        if timer is not None
+        else nullcontext()
+    )
+    with timer_context:
+        update_success = False
+        if refit_base_model_weights:
+            update_success = _perform_refit_weights(
+                refit_base_model_weights=True, refit_lora_weights=False
+            )
+        if refit_lora_weights:
+            update_success = (
+                _perform_refit_weights(
+                    refit_base_model_weights=False, refit_lora_weights=True
+                )
+                and update_success
+            )
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -980,6 +1034,156 @@ def refit_policy_generation(
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
+
+
+def dump_lora_layers_metadata(
+    lora_layers_weights,
+    *,
+    dump_path: Optional[str] = None,
+) -> Optional[str]:
+    """Write LoRA layer metadata (layer name, A/B weight shapes and dtypes) to a JSON file.
+
+    Path priority:
+      1) explicit dump_path
+      2) environment variable NRL_LORA_LAYERS_DUMP
+      3) environment variable NRL_OUTPUT_DIR or current working directory + timestamped filename
+    Returns the written path on success; None on failure (and prints a warning).
+    """
+    try:
+        import json
+        import os
+        import time
+
+        if dump_path is None:
+            dump_path = os.environ.get("NRL_LORA_LAYERS_DUMP")
+        if dump_path is None:
+            default_dir = os.environ.get("NRL_OUTPUT_DIR") or os.getcwd()
+            dump_path = os.path.join(
+                default_dir, f"lora_layers_{int(time.time())}.json"
+            )
+
+        # Flatten potential DP-nested structure
+        flattened = []
+        if (
+            isinstance(lora_layers_weights, list)
+            and len(lora_layers_weights) > 0
+            and isinstance(lora_layers_weights[0], list)
+        ):
+            for sub in lora_layers_weights:
+                if sub:
+                    flattened.extend(sub)
+        else:
+            flattened = lora_layers_weights
+
+        def _shapes_and_dtypes(tensors):
+            result = []
+            for t in tensors or []:
+                try:
+                    shape = tuple(int(x) for x in getattr(t, "shape", ()))
+                    dtype = str(getattr(t, "dtype", "unknown"))
+                    result.append({"shape": shape, "dtype": dtype})
+                except Exception:
+                    result.append({"shape": None, "dtype": "unknown"})
+            return result
+
+        sanitized = []
+        for item in flattened or []:
+            if not isinstance(item, dict):
+                continue
+            sanitized.append(
+                {
+                    "name": item.get("name"),
+                    "a_shapes": _shapes_and_dtypes(item.get("a_weights")),
+                    "b_shapes": _shapes_and_dtypes(item.get("b_weights")),
+                }
+            )
+
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        with open(dump_path, "w") as f:
+            json.dump({"layers": sanitized}, f, indent=2)
+        print(f"[INFO] LoRA layer metadata written to {dump_path}")
+        return dump_path
+    except Exception as e:
+        print(f"[WARN] Failed to dump LoRA layer metadata: {e}")
+        return None
+
+
+def dump_lora_layers_tensors(
+    lora_layers_weights,
+    *,
+    dump_path: Optional[str] = None,
+    cast_dtype: Optional[str] = None,
+) -> Optional[str]:
+    """Write full LoRA layer weights to a file (torch.save).
+
+    - Supports single dict or list[list[dict]] / list[dict] inputs.
+    - Moves tensors to CPU by default to avoid CUDA deserialization constraints.
+    - Optional cast_dtype: "float32" | "bfloat16" | "float16"
+    Returns the written path on success; None on failure.
+    """
+    try:
+        import os
+        import time
+
+        import torch
+
+        if dump_path is None:
+            dump_path = os.environ.get("NRL_LORA_LAYERS_TENSORS")
+        if dump_path is None:
+            default_dir = os.environ.get("NRL_OUTPUT_DIR") or os.getcwd()
+            dump_path = os.path.join(default_dir, f"lora_layers_{int(time.time())}.pt")
+
+        # Normalize to a flat list[dict]
+        if isinstance(lora_layers_weights, dict):
+            flattened = [lora_layers_weights]
+        elif (
+            isinstance(lora_layers_weights, list)
+            and len(lora_layers_weights) > 0
+            and isinstance(lora_layers_weights[0], list)
+        ):
+            flattened = []
+            for sub in lora_layers_weights:
+                if sub:
+                    flattened.extend(sub)
+        else:
+            flattened = lora_layers_weights
+
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        target_dtype = dtype_map.get(cast_dtype.lower(), None) if cast_dtype else None
+
+        def _to_cpu_and_cast(tensor):
+            if not hasattr(tensor, "detach"):
+                return tensor
+            t = tensor.squeeze(0).squeeze(0).detach().to("cpu")
+            if target_dtype is not None:
+                t = t.to(target_dtype)
+            return t
+
+        sanitized = []
+        for item in flattened or []:
+            if not isinstance(item, dict):
+                continue
+            a_weights = [_to_cpu_and_cast(t) for t in (item.get("a_weights") or [])]
+            b_weights = [_to_cpu_and_cast(t) for t in (item.get("b_weights") or [])]
+            sanitized.append(
+                {
+                    "name": item.get("name"),
+                    "a_weights": a_weights,
+                    "b_weights": b_weights,
+                }
+            )
+
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        torch.save({"layers": sanitized}, dump_path)
+        print(f"[INFO] LoRA layer tensors written to {dump_path}")
+        return dump_path
+    except Exception as e:
+        print(f"[WARN] Failed to dump LoRA layer tensors: {e}")
+        return None
 
 
 def grpo_train(
@@ -1013,6 +1217,8 @@ def grpo_train(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
+    REFIT_BASE_MODEL_WEIGHTS = True
+    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None  # for mypy type check
 
     # Check if we need to sync KV cache scales
@@ -1044,8 +1250,16 @@ def grpo_train(
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                refit_lora_weights=REFIT_LORA_WEIGHTS,
+            )
             POLICY_GENERATION_STALE = False
+            # Disable base model weights refit after first refit if enable lora weights refit
+            REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -1139,12 +1353,48 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
+
+                # lora_layers_weights = policy_generation.get_lora_layers()[0][0]
+                # try:
+                #     dump_lora_layers_metadata(lora_layers_weights, dump_path="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_metadata.json")
+                #     print(f"[INFO] LoRA layer metadata written to /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_metadata.json")
+                #     dump_lora_layers_tensors(lora_layers_weights, dump_path="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_tensors.pt")
+                #     print(f"[INFO] LoRA layer tensors written to /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/lora_layers_tensors.pt")
+                # except Exception as e:
+                #     print(f"[WARN] Failed to dump LoRA layer metadata: {e}")
+
+                # print(f"[INFO] Initializing checkpoint...")
+                # checkpoint_path = checkpointer.init_tmp_checkpoint(
+                #     total_steps + 1, grpo_save_state, master_config
+                # )
+                # policy.save_checkpoint(
+                #     weights_path=os.path.join(
+                #         checkpoint_path, "policy", "weights"
+                #     ),
+                #     optimizer_path=os.path.join(
+                #         checkpoint_path, "policy", "optimizer"
+                #     ),
+                #     tokenizer_path=os.path.join(
+                #         checkpoint_path, "policy", "tokenizer"
+                #     ),
+                #     checkpointing_cfg=master_config["checkpointing"],
+                # )
+                # torch.save(
+                #     dataloader.state_dict(),
+                #     os.path.join(checkpoint_path, "train_dataloader.pt"),
+                # )
+                # checkpointer.finalize_checkpoint(checkpoint_path)
+                # print(f"[INFO] Checkpoint saved to {checkpoint_path}")
+                # exit()
 
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
@@ -1377,8 +1627,11 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
@@ -1887,6 +2140,8 @@ def async_grpo_train(
         policy_generation = policy
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
+    REFIT_BASE_MODEL_WEIGHTS = True
+    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None
 
     # Training state
@@ -1998,9 +2253,16 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                refit_lora_weights=REFIT_LORA_WEIGHTS,
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
+            REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
             import traceback
@@ -2318,10 +2580,14 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
-
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
@@ -2343,9 +2609,14 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
