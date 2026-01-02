@@ -70,6 +70,7 @@ basic_vllm_test_config: VllmConfig = {
         "skip_tokenizer_init": False,
         "load_format": "auto",
         "enforce_eager": "False",
+        "kv_cache_dtype": "auto",
     },
     "colocated": {
         "enabled": True,
@@ -105,6 +106,7 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
+        "_v2": False,
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
@@ -128,7 +130,7 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 basic_lora_test_config: LoRAConfig = {
-    "enabled": True,
+    "enabled": False,
     "target_modules": [],
     "exclude_modules": [],
     "match_all_linear": True,
@@ -137,7 +139,7 @@ basic_lora_test_config: LoRAConfig = {
     "dropout": 0.0,
     "dropout_position": "post",
     "lora_A_init": "xavier",
-    "use_triton": True,
+    "use_triton": False,
 }
 
 
@@ -701,7 +703,13 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
+    lm_policy,
+    vllm_policy,
+    tokenizer,
+    async_engine,
+    colocated,
+    vllm_precision,
+    enable_lora,
 ):
     """Validates that the two policies can work together.
 
@@ -742,7 +750,13 @@ async def run_hf_train_process(
         )
 
         print("refitting vllm policy...")
-        refit_policy_generation(lm_policy, vllm_policy, colocated)
+        refit_policy_generation(
+            lm_policy,
+            vllm_policy,
+            colocated,
+            refit_base_model_weights=True,
+            refit_lora_weights=enable_lora,
+        )
 
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
@@ -881,16 +895,17 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "bfloat16", True),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
 
@@ -907,6 +922,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
 
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -916,6 +933,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
@@ -926,7 +946,13 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        True,
+        vllm_precision,
+        enable_lora,
     )
 
 
@@ -935,16 +961,20 @@ async def test_vllm_generation_with_hf_training_colocated(
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16", True),
-        (False, True, "bfloat16", True),
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
+        (True, False, "bfloat16", True),
         (True, False, "fp8", False),
         (False, True, "fp8", False),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
-    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
+    policy_cluster_separate,
+    tokenizer,
+    async_engine,
+    cpu_offload,
+    vllm_precision,
+    enable_lora,
 ):
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -960,19 +990,30 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
     vllm_config["colocated"]["enabled"] = False
+    if vllm_precision == "fp8":
+        vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
     vllm_policy.finish_generation()
 
+    assert not (enable_lora and vllm_precision == "fp8"), (
+        "LoRA is not supported with FP8"
+    )
     # Create Policy
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["generation"]["colocated"]["enabled"] = False
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["train_global_batch_size"] = 4
+    # lora must use dtensor v2
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
     # Refit
@@ -995,7 +1036,13 @@ async def test_vllm_generation_with_hf_training_non_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        False,
+        vllm_precision,
+        enable_lora,
     )
 
 
@@ -2533,127 +2580,3 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
-
-
-from nemo_rl.utils.logger import BLUE, print_colored
-
-
-def test_vllm_lora_refit_sync_colocated(cluster, tokenizer):
-    """Test vLLM LoRA refit with sync engine and colocated setup."""
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = True
-    vllm_config["vllm_cfg"]["async_engine"] = False
-    vllm_config = configure_generation_config(vllm_config, tokenizer)
-
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["dtensor_cfg"]["_v2"] = True
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = True
-
-    print_colored("CREATING DTENSOR POLICY", BLUE)
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
-
-    print_colored("CREATING VLLM POLICY", BLUE)
-    vllm_policy = VllmGeneration(cluster, vllm_config)
-    vllm_policy.finish_generation()
-
-    print_colored("PREPARING REFIT INFO", BLUE)
-    state_dict_info = lm_policy.prepare_refit_info()
-    vllm_policy.prepare_refit_info(state_dict_info)
-    # take it outside statistics to get clean peak memory during refit
-    lm_policy.offload_before_refit()
-
-    print_colored("STARTING VLLM POLICY REFIT BASE MODEL WEIGHTS", BLUE)
-    refit_policy_generation(
-        lm_policy,
-        vllm_policy,
-        vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=3,
-        refit_base_model_weights=True,
-        refit_lora_weights=vllm_config["vllm_cfg"]["lora_cfg"]["enabled"],
-    )
-
-    # vllm_model_state_dict = vllm_policy.get_model_state_dict()[0][0]
-    # print_colored(f"VLLM MODEL STATE DICT: {vllm_model_state_dict.keys()}", BLUE)
-    # from transformers import AutoModel
-
-    # model = AutoModel.from_pretrained(model_name)
-    # model_state_dict = model.state_dict()
-
-    # for name, vllm_tensor in vllm_model_state_dict.items():
-    #     name = name.replace("model.", "")
-    #     model_tensor = model_state_dict[name]
-    #     print_colored(
-    #         f"NAME: {name}, vllm type : {vllm_tensor.dtype}, model type: {model_tensor.dtype}",
-    #         BLUE,
-    #     )
-    #     vllm_tensor = vllm_tensor.to("cpu")
-    #     model_tensor = model_tensor.to(vllm_tensor.dtype).to("cpu")
-    #     if not torch.allclose(vllm_tensor, model_tensor):
-    #         print_colored(f"Tensor {name} is not close", RED)
-    #         print_colored(f"MODEL TENSOR: {model_tensor.shape}", RED)
-    #         print_colored(f"VLLM TENSOR: {vllm_tensor.shape}", RED)
-    #         assert False, f"Tensor {name} is not close"
-
-    print_colored("GENERATING TEXT", BLUE)
-    prompts = [
-        "What is the largest number, all of whose digits are 1 or 4, and whose digits add up to 12?"
-    ]
-    test_tokenizer = get_tokenizer({"name": model_name})
-    tokenized = test_tokenizer(
-        prompts,
-        padding=True,
-        truncation=True,
-        max_length=256,
-        return_tensors="pt",
-        padding_side="right",
-    )
-    test_input_data = BatchedDataDict(
-        {
-            "input_ids": tokenized["input_ids"],
-            "input_lengths": tokenized["attention_mask"].sum(dim=1).to(torch.int32),
-        }
-    )
-    vllm_policy.prepare_for_generation()
-    outputs = vllm_policy.generate(test_input_data, greedy=True)
-    output_ids = outputs["output_ids"]
-    generated_texts = test_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    print_colored(f"GENERATED TEXT: {generated_texts}")
-
-
-def test_vllm_lora_generation(cluster, tokenizer):
-    """Test vLLM LoRA refit with sync engine and colocated setup."""
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = True
-    vllm_config["vllm_cfg"]["async_engine"] = False
-    vllm_config = configure_generation_config(vllm_config, tokenizer)
-
-    print_colored("CREATING VLLM POLICY")
-    vllm_policy = VllmGeneration(cluster, vllm_config)
-    vllm_policy.prepare_for_generation()
-
-    # print_colored("GENERATING TEXT")
-    # prompts = [
-    #     "What is the largest number, all of whose digits are 1 or 4, and whose digits add up to 12?"
-    # ]
-    # test_tokenizer = get_tokenizer({"name": model_name})
-    # tokenized = test_tokenizer(
-    #     prompts,
-    #     padding=True,
-    #     truncation=True,
-    #     max_length=256,
-    #     return_tensors="pt",
-    #     padding_side="right",
-    # )
-    # test_input_data = BatchedDataDict(
-    #     {
-    #         "input_ids": tokenized["input_ids"],
-    #         "input_lengths": tokenized["attention_mask"].sum(dim=1).to(torch.int32),
-    #     }
-    # )
-    # outputs = vllm_policy.generate(test_input_data, greedy=True)
-    # output_ids = outputs["output_ids"]
-    # generated_texts = test_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    # print_colored(f"GENERATED TEXT: {generated_texts}")
