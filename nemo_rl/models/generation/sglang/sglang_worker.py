@@ -12,23 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import gc
-import logging
-import os
-import sys
-from typing import Any, Optional, cast
-import requests
 import asyncio
-import aiohttp
-
-import time
-import ray
-import torch
+import logging
 import multiprocessing
+import os
+import time
+from typing import Any, Optional
+
+import aiohttp
+import ray
+import requests
+import torch
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -37,12 +37,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.utils import AsyncLoopThread
-from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
-from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
 
 logger = logging.getLogger(__name__)
 

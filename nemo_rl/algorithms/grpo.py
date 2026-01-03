@@ -61,8 +61,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -497,8 +497,7 @@ def setup(
         colocated_inference: bool,
         worker_init_timing_metrics: dict,
     ):
-        """
-        Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
+        """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
 
         Args:
             init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)

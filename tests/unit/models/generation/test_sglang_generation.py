@@ -30,7 +30,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 
-
 model_name = "Qwen/Qwen3-0.6B"
 
 # Define basic SGLang test config
@@ -533,8 +532,9 @@ def test_sglang_generate_text(cluster, tokenizer):
 
 def _wait_for_sglang_http_server_spinup(base_url: str):
     """Wait for the SGLang HTTP server to be ready."""
-    import requests
     import time
+
+    import requests
 
     max_wait = 60  # 60 seconds max wait
     start = time.time()

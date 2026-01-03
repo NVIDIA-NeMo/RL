@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import logging
 import os
-from collections import defaultdict
 from typing import (
     Any,
-    AsyncGenerator,
     Optional,
     Union,
 )
 
 import numpy as np
 import ray
-from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -219,7 +215,6 @@ class SGLangGeneration(GenerationInterface):
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication.
-
 
         TODO:       if weight updates via NCCL are needed in the future.
         """

@@ -12,20 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
 import gc
 import os
-import pickle
 import traceback
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 import requests
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -504,13 +501,17 @@ def stream_weights_via_http_impl(
         worker_name: Name of the worker for logging
         current_device_uuid: UUID of the current training worker's GPU
     """
-    from sglang.srt.utils import MultiprocessingSerializer
+    from sglang.srt.utils import MultiprocessingSerializer  # type: ignore[import-error]
 
     try:
-        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+        from sglang.srt.utils.patch_torch import (
+            monkey_patch_torch_reductions,  # type: ignore[import-error]
+        )
     except ImportError:
-        from sglang.srt.patch_torch import monkey_patch_torch_reductions
-    print(f"[sglang refit details] entering stream_weights_via_http_impl")
+        from sglang.srt.patch_torch import (
+            monkey_patch_torch_reductions,  # type: ignore[import-error]
+        )
+    print("[sglang refit details] entering stream_weights_via_http_impl")
 
     monkey_patch_torch_reductions()
 
@@ -564,16 +565,18 @@ def stream_weights_via_http_impl(
             serialized_handler = MultiprocessingSerializer.serialize(
                 named_tensors, output_str=True
             )
+            # output_str=True ensures the return type is str
+            serialized_handler_str = cast(str, serialized_handler)
 
             gathered_handlers = _gather_ipc_handlers(
-                serialized_handler,
+                serialized_handler_str,
                 ipc_gather_group,
                 ipc_gather_src,
                 rank,
                 matching_ranks,
             )
 
-            if rank == ipc_gather_src:
+            if rank == ipc_gather_src and gathered_handlers is not None:
                 _send_tensor_to_sglang(
                     url,
                     name,
@@ -678,11 +681,12 @@ def _gather_ipc_handlers(
 
     world_size = dist.get_world_size()
 
-    all_handlers = [None] * world_size
+    all_handlers: list[Optional[str]] = [None for _ in range(world_size)]
     dist.all_gather_object(all_handlers, serialized_handler)
+    all_handlers_str = cast(list[str], all_handlers)
 
     if rank == gather_src and matching_ranks is not None:
-        filtered_handlers = [all_handlers[r] for r in matching_ranks]
+        filtered_handlers: list[str] = [all_handlers_str[r] for r in matching_ranks]
         return filtered_handlers
     else:
         return None
