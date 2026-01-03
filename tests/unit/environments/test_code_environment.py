@@ -57,7 +57,7 @@ basic_vllm_test_config: VllmConfig = {
         "max_model_len": 1024,
         "disable_log_stats": True,
         "disable_log_requests": True,
-        "gpu_memory_utilization": 0.6,
+        "gpu_memory_utilization": 0.2,
         "enforce_eager": "False",
     },
     "colocated": {
