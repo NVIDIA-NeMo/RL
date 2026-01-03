@@ -876,6 +876,14 @@ class VllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting."""
+        self.clear_vllm_logger_metrics()
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics for performance reporting."""
+        return self.get_vllm_logger_metrics()
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
