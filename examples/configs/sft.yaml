@@ -114,11 +114,25 @@ policy:
     defer_fp32_logits: False
     moe_per_layer_logging: False
 
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+
+
     optimizer:
-      optimizer: "adam"
+      optimizer: "adam" # When weight decay is set, it actually uses AdamW 
       lr: 5.0e-6
       min_lr: 4.9999e-6
-      weight_decay: 0.1
+      weight_decay: 0.1 # When weight decay is set, it actually uses AdamW
       bf16: true
       fp16: false
       params_dtype: "float32"

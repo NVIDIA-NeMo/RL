@@ -28,7 +28,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     sft.max_num_steps=3 \
     sft.val_batches=1 \
     sft.val_period=3 \
-    policy.dtensor_cfg.lora.enabled=true \
+    policy.dtensor_cfg.lora_cfg.enabled=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
