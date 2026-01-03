@@ -97,6 +97,38 @@ def mean(value, range_start=1, range_end=0, ignore_top_p=0.0):
     return statistics.mean(vals)
 
 
+def median(value, range_start=1, range_end=0):
+    """Return the median of values (or a range of values) in a dictionary.
+
+    Note:
+        step, and ranges, are 1 indexed. Range_end is exclusive.
+        range_end=0 means to include until the last step in the run
+
+    Args:
+        value: Dictionary of step -> value
+        range_start: Starting step (1-indexed, default=1)
+        range_end: Ending step (1-indexed, exclusive, 0 means last step)
+    """
+
+    ## find potential offset that might arise from resuming from a checkpoint
+    max_step_reached = builtins.max([int(s) for s in value.keys()])
+    ## this is the number of steps that occurred prior to resuming
+    offset = max_step_reached - len(value)
+
+    num_elem = len(value)
+    if range_start < 0:
+        range_start += num_elem + 1 + offset
+    if range_end <= 0:
+        range_end += num_elem + 1 + offset
+
+    vals = []
+    for step, v in value.items():
+        if range_start <= int(step) and int(step) < range_end:
+            vals.append(float(v))
+
+    return statistics.median(vals)
+
+
 def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
     """Evaluate a check against the data.
 
@@ -109,6 +141,7 @@ def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
         "min": min,
         "max": max,
         "mean": mean,
+        "median": median,
         "ratio_above": ratio_above,
     }
 
@@ -152,6 +185,7 @@ def main():
       # Use helper functions
       python check_metrics.py results.json "min(data['class_f1']) > 0.6"
       python check_metrics.py results.json "mean(data['accuracies']) > 0.85"
+      python check_metrics.py results.json "median(data['accuracies']) > 0.85"
       python check_metrics.py results.json "mean(data['loss'], ignore_top_p=0.05) < 1.5"
       python check_metrics.py results.json "ratio_above(data['error'], 1.05) < 0.02"
     """
