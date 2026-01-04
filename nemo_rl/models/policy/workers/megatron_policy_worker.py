@@ -594,9 +594,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
             "moe_router_bias_update_rate"
         ]
-        model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"][
-            "moe_enable_deepep"
-        ]
+        model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"]["moe_enable_deepep"]
         model_cfg.moe_token_dispatcher_type = self.cfg["megatron_cfg"][
             "moe_token_dispatcher_type"
         ]
