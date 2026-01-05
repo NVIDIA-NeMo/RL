@@ -1685,7 +1685,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         assert refit_base_model_weights and refit_lora_weights == False, (
-            "dtensor v1 not support lora. refit_lora_weights must be False"
+            f"dtensor v1 not support lora. refit_lora_weights must be False, but got refit_lora_weights={refit_lora_weights} and refit_base_model_weights={refit_base_model_weights}"
         )
         if kv_scales is not None:
             raise NotImplementedError(

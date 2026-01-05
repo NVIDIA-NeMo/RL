@@ -169,8 +169,8 @@ class VllmInternalWorkerExtension:
     def update_weights_via_ipc_zmq(
         self,
         lora_config: dict[str, Any] = {},
-        refit_base_model_weights: bool = False,
-        refit_lora_weights: bool = True,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
