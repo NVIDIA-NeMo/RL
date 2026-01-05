@@ -12,9 +12,6 @@ NUM_MINUTES=180
 
 exit_if_max_steps_reached
 
-# This is needed for correctly importing transformers_modules for moonlight
-export HF_HOME=$HF_HOME
-
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_grpo_math.py \
