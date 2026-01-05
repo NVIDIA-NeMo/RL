@@ -38,5 +38,5 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/gen_kl_error"]["30"] < 0.001 ' \
         'data["train/reward"]["30"] > 0.4' \
         'data["train/grad_norm"] < 0.5' \
-        'data["train/grad_norm"] > 0.05' \
+        'data["train/grad_norm"] > 0.05'
 fi
