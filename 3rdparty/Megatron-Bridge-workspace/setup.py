@@ -44,6 +44,8 @@ CACHED_DEPENDENCIES = [
     "mamba-ssm",
     "nvidia-resiliency-ext",
     "causal-conv1d",
+    "timm",
+    "open-clip-torch>=3.2.0",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject
