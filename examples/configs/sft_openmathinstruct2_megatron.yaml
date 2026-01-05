@@ -35,7 +35,6 @@ policy:
     activation_checkpointing: false
     context_parallel_size: 1
     distributed_data_parallel_config:
-      average_in_collective: true
       data_parallel_sharding_strategy: optim_grads_params
       grad_reduce_in_fp32: true
       overlap_grad_reduce: true
