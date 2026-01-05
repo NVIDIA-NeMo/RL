@@ -40,7 +40,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -48,15 +48,16 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.automodel.data import (
+    get_microbatch_iterator,
+    process_global_batch,
+    process_microbatch,
+)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_and_prepare_config,
-)
-from nemo_rl.models.huggingface.common import (
-    get_flash_attention_kwargs,
-    pack_sequences,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -325,70 +326,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             losses = []
             all_mb_metrics = []
             for gb_idx in range(num_global_batches):
-                global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-
-                assert "sample_mask" in global_batch, (
-                    "sample_mask must be present in the data!"
+                # Process global batch and compute normalization factors
+                gb_result = process_global_batch(
+                    data, gb_idx, local_gbs, loss_fn, self.dp_mesh
                 )
-                ## get the normalization factor for the loss
-                local_valid_seqs = torch.sum(global_batch["sample_mask"])
-
-                if "token_mask" not in global_batch:
-                    local_valid_toks = (
-                        local_valid_seqs * global_batch["input_ids"].shape[1]
-                    )
-                else:
-                    local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
-                    )
-
-                to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-                torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
-                global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
-
-                if (
-                    hasattr(loss_fn, "loss_type")
-                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
-                ):
-                    assert "token_mask" in global_batch, (
-                        "token_mask must be present in the data when using token-level loss"
-                    )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
 
                 self.optimizer.zero_grad()
                 mb_losses = []
-                batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-                # Calculate number of microbatches to process
-                # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
-                # so its safe to not check for the case where the last data slice is smaller than mbs
-                dummy_iterator = iter([])
-                if self.cfg["dynamic_batching"]["enabled"]:
-                    mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
-                    iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
-                elif self.enable_seq_packing:
-                    mb_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
-                    )
-                    iterator_len, max_seqlen = (
-                        batch.get_microbatch_iterator_for_packable_sequences_len()
-                    )
-                    max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                    torch.distributed.all_reduce(
-                        max_batch_ct, op=torch.distributed.ReduceOp.MAX
-                    )
-
-                    # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
-                    # We add dummy batches to the end of the iterator to make the batch counts equal.
-                    dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                    dummy_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
-                    )
-                    dummy_iterator = itertools.islice(
-                        itertools.cycle(dummy_iterator), dummy_batch_ct
-                    )
-                else:
-                    mb_iterator = batch.make_microbatch_iterator(mbs)
-                    iterator_len = batch.size // mbs
+                # Get microbatch iterator based on batching strategy
+                mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+                    batch, self.cfg, self.enable_seq_packing, mbs, self.dp_mesh
+                )
 
                 empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
                     "clear_cache_every_n_steps"
@@ -405,62 +356,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
 
+                    # Process microbatch and prepare inputs for model forward
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        if self.enable_seq_packing:
-                            input_ids = mb.get("input_ids").cuda()
-                            input_ids, position_ids, _ = pack_sequences(
-                                input_ids=input_ids,
-                                input_lengths=mb["input_lengths"],
-                                packed_sequence_size=[
-                                    len(mb["input_lengths"])
-                                ],  # flash attention 2 expects flattened input
-                                padding_value=self.tokenizer.eos_token_id,
-                                return_attention_mask=False,
-                                min_seq_len=self.cfg["sequence_packing"][
-                                    "train_mb_tokens"
-                                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
-                            )
-                            seq_len = input_ids.shape[1]
-                            attention_mask = None
-                            flash_attn_kwargs = get_flash_attention_kwargs(
-                                input_lengths=mb["input_lengths"],
-                            )
-
-                        else:
-                            input_ids = mb.get("input_ids").cuda()
-                            batch_size, seq_len = input_ids.shape
-
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
-                            position_ids = torch.arange(
-                                seq_len, device=input_ids.device
-                            ).repeat(batch_size, 1)
-                            flash_attn_kwargs = {}
-
-                        # add vlm kwargs to model call
-                        vlm_kwargs = mb.get_multimodal_dict(
-                            as_tensors=True, device=input_ids.device
+                        processed_inputs = process_microbatch(
+                            mb,
+                            self.tokenizer,
+                            self.enable_seq_packing,
+                            self.cfg,
+                            self.cp_size,
                         )
-                        if len(vlm_kwargs) > 0:
-                            position_ids = None
-                            assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
-                                "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
-                            )
 
-                    if self.cp_size > 1:
-                        assert len(vlm_kwargs) == 0, (
-                            f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
-                        )
-                        seq_index = torch.arange(
-                            seq_len, device=input_ids.device
-                        ).repeat(1, 1)
-                        cp_buffers = [input_ids, position_ids, seq_index]
-                    else:
-                        cp_buffers = []
-                        seq_index = None
+                    # Extract values from processed inputs for use in forward pass
+                    input_ids = processed_inputs.input_ids
+                    attention_mask = processed_inputs.attention_mask
+                    position_ids = processed_inputs.position_ids
+                    flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+                    vlm_kwargs = processed_inputs.vlm_kwargs
+                    cp_buffers = processed_inputs.cp_buffers
+                    seq_index = processed_inputs.seq_index
+                    seq_len = processed_inputs.seq_len
 
                     with get_train_context(
                         cp_size=self.cp_size,
@@ -699,102 +613,50 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with torch.no_grad():
             data.to("cuda")
-            dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
-                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            elif self.enable_seq_packing:
-                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = (
-                    data.get_microbatch_iterator_for_packable_sequences_len()
-                )
-                max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(
-                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
-                )
-
-                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
-                # We add dummy batches to the end of the iterator to make the batch counts equal.
-                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(
-                    itertools.cycle(dummy_iterator), dummy_batch_ct
-                )
-            else:
-                mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
-                iterator_len = data.size // logprob_batch_size
+            # Get microbatch iterator based on batching strategy
+            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+                data,
+                self.cfg,
+                self.enable_seq_packing,
+                logprob_batch_size,
+                self.dp_mesh,
+            )
 
             step = 0
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
                 step += 1
-                input_ids = lp_batch.get("input_ids").cuda()
-                input_lengths = lp_batch.get("input_lengths")
-                vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                # Process microbatch and prepare inputs for model forward
+                processed_inputs = process_microbatch(
+                    lp_batch,
+                    self.tokenizer,
+                    self.enable_seq_packing,
+                    self.cfg,
+                    self.cp_size,
                 )
 
-                batch_size, seq_len = input_ids.shape
-                if self.enable_seq_packing:
-                    assert len(vlm_kwargs) == 0, (
-                        "multimodal kwargs are not supported for sequence packing"
-                    )
-                    input_ids, position_ids, _ = pack_sequences(
-                        input_ids=input_ids,
-                        input_lengths=input_lengths,
-                        packed_sequence_size=[
-                            batch_size
-                        ],  # flash attention 2 expects flattened input
-                        padding_value=self.tokenizer.eos_token_id,
-                        return_attention_mask=False,
-                    )
-                    seq_len = input_ids.shape[1]
-                    attention_mask = None
-                    flash_attn_kwargs = get_flash_attention_kwargs(
-                        input_lengths=input_lengths,
-                    )
-                else:
-                    # Create post_attention_mask for right-padded data for masking token after forwarding.
+                # Extract values from processed inputs
+                input_ids = processed_inputs.input_ids
+                attention_mask = processed_inputs.attention_mask
+                position_ids = processed_inputs.position_ids
+                flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+                vlm_kwargs = processed_inputs.vlm_kwargs
+                cp_buffers = processed_inputs.cp_buffers
+                seq_index = processed_inputs.seq_index
+                seq_len = processed_inputs.seq_len
+
+                input_lengths = lp_batch.get("input_lengths")
+                batch_size = input_ids.shape[0]
+
+                # Create post_attention_mask for right-padded data (used for masking after forward)
+                if not self.enable_seq_packing:
                     post_attention_mask = torch.zeros(
                         (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
                         post_attention_mask[i, :length] = 1
-
-                    # explicitly create position ids for the input, otherwise the sharding
-                    # for DTensor will be incorrect
-                    position_ids = torch.arange(
-                        seq_len, device=input_ids.device
-                    ).repeat(batch_size, 1)
-                    flash_attn_kwargs = {}
-
-                    # DTensor requires the casual attention kernel to hit,
-                    # yet our attention mask above is not always all 1s
-                    # this is fine because we mask with the actual attention mask
-                    # later, but for input it has to be all 1s
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
-
-                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
-                if len(vlm_kwargs) > 0:
-                    position_ids = None
-
-                if self.cp_size > 1:
-                    assert len(vlm_kwargs) == 0, (
-                        "multimodal kwargs are not supported for context parallel"
-                    )
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
-                        1, 1
-                    )
-                    cp_buffers = [input_ids, position_ids, seq_index]
-                else:
-                    cp_buffers = []
-                    seq_index = None
 
                 with get_train_context(
                     cp_size=self.cp_size,
@@ -984,76 +846,34 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         print("Begin to batch datas")
         with torch.no_grad():
             data.to("cuda")
-            dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
-                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            elif self.enable_seq_packing:
-                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = (
-                    data.get_microbatch_iterator_for_packable_sequences_len()
-                )
-                max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(
-                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
-                )
-                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(
-                    itertools.cycle(dummy_iterator), dummy_batch_ct
-                )
-            else:
-                mb_iterator = data.make_microbatch_iterator(global_batch_size)
-                iterator_len = data.size // global_batch_size
+            # Get microbatch iterator based on batching strategy
+            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+                data, self.cfg, self.enable_seq_packing, global_batch_size, self.dp_mesh
+            )
             step = 0
             all_rm_scores = []
             for batch_idx, generate_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
                 step += 1
-                input_ids = generate_batch.get("input_ids").cuda()
-                input_lengths = generate_batch.get("input_lengths")
-                batch_size, seq_len = input_ids.shape
-                if self.enable_seq_packing:
-                    input_ids, position_ids, _ = pack_sequences(
-                        input_ids=input_ids,
-                        input_lengths=input_lengths,
-                        packed_sequence_size=[
-                            batch_size
-                        ],  # flash attention 2 expects flattened input
-                        padding_value=self.tokenizer.eos_token_id,
-                        return_attention_mask=False,
-                    )
-                    seq_len = input_ids.shape[1]
-                    attention_mask = None
-                    flash_attn_kwargs = get_flash_attention_kwargs(
-                        input_lengths=input_lengths,
-                    )
-                else:
-                    # Create attention mask for right-padded data
-                    post_attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
-                    )
-                    for i, length in enumerate(input_lengths):
-                        # For right-padded sequence, set 1s at the beginning of the sequence
-                        post_attention_mask[i, :length] = 1
-                    position_ids = torch.arange(
-                        seq_len, device=input_ids.device
-                    ).repeat(batch_size, 1)
+                # Process microbatch and prepare inputs for model forward
+                processed_inputs = process_microbatch(
+                    generate_batch,
+                    self.tokenizer,
+                    self.enable_seq_packing,
+                    self.cfg,
+                    self.cp_size,
+                )
 
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
-                if self.cp_size > 1:
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
-                        1, 1
-                    )
-                    cp_buffers = [input_ids, position_ids, seq_index]
-                else:
-                    cp_buffers = []
-                    seq_index = None
+                # Extract values from processed inputs
+                input_ids = processed_inputs.input_ids
+                attention_mask = processed_inputs.attention_mask
+                position_ids = processed_inputs.position_ids
+                flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+                vlm_kwargs = processed_inputs.vlm_kwargs
+                cp_buffers = processed_inputs.cp_buffers
+                seq_index = processed_inputs.seq_index
+                seq_len = processed_inputs.seq_len
 
                 with get_train_context(
                     cp_size=self.cp_size,
@@ -1127,85 +947,45 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with torch.no_grad():
             data.to("cuda")
-            dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
-                # dynamic batching support (no CP/packed)
-                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            elif self.enable_seq_packing:
-                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = (
-                    data.get_microbatch_iterator_for_packable_sequences_len()
-                )
-                max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(
-                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
-                )
-
-                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
-                # We add dummy batches to the end of the iterator to make the batch counts equal.
-                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(
-                    itertools.cycle(dummy_iterator), dummy_batch_ct
-                )
-            else:
-                mb_iterator = data.make_microbatch_iterator(topk_batch_size)
-                iterator_len = data.size // topk_batch_size
+            # Get microbatch iterator based on batching strategy
+            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+                data, self.cfg, self.enable_seq_packing, topk_batch_size, self.dp_mesh
+            )
 
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
-                input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
 
-                batch_size, seq_len = input_ids.shape
-                # Store original shapes for unpacking later
-                original_batch_size = batch_size
-                original_seq_len = seq_len
+                # Store original shapes before processing (needed for unpacking later)
+                original_batch_size = lp_batch.get("input_ids").shape[0]
+                original_seq_len = lp_batch.get("input_ids").shape[1]
 
-                if self.enable_seq_packing:
-                    input_ids, position_ids, _ = pack_sequences(
-                        input_ids=input_ids,
-                        input_lengths=input_lengths,
-                        packed_sequence_size=[
-                            batch_size
-                        ],  # flash attention 2 expects flattened input
-                        padding_value=self.tokenizer.eos_token_id,
-                        return_attention_mask=False,
-                    )
-                    seq_len = input_ids.shape[1]
-                    attention_mask = None
-                    flash_attn_kwargs = get_flash_attention_kwargs(
-                        input_lengths=input_lengths,
-                    )
-                else:
-                    # Build attention mask (right-padded inputs)
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
-                    )
-                    for i, length in enumerate(input_lengths):
-                        attention_mask[i, :length] = 1
+                # Process microbatch and prepare inputs for model forward
+                processed_inputs = process_microbatch(
+                    lp_batch,
+                    self.tokenizer,
+                    self.enable_seq_packing,
+                    self.cfg,
+                    self.cp_size,
+                )
 
-                    position_ids = torch.arange(
-                        seq_len, device=input_ids.device
-                    ).repeat(batch_size, 1)
+                # Extract values from processed inputs
+                input_ids = processed_inputs.input_ids
+                attention_mask = processed_inputs.attention_mask
+                position_ids = processed_inputs.position_ids
+                flash_attn_kwargs = processed_inputs.flash_attn_kwargs
+                vlm_kwargs = processed_inputs.vlm_kwargs
+                cp_buffers = processed_inputs.cp_buffers
+                seq_index = processed_inputs.seq_index
+                seq_len = processed_inputs.seq_len
+                batch_size = input_ids.shape[0]
 
-                    flash_attn_kwargs = {}
-
+                # Create all-ones attention mask for model input (required by DTensor)
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     attention_mask_input_all_ones = torch.ones(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
-
-                if self.cp_size > 1:
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
-                        1, 1
-                    )
-                    cp_buffers = [input_ids, position_ids, seq_index]
-                else:
-                    cp_buffers = []
-                    seq_index = None
 
                 with get_train_context(
                     cp_size=self.cp_size,
