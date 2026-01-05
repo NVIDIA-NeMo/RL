@@ -10,7 +10,7 @@
 </div>
 
 ## 📣 News
-* [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [Reproducible code here](https://github.com/NVIDIA-NeMo/RL/tree/nano-v3)
+* [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [12/1/2025] [Release v0.4.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.4.0)
     * First release with official NGC Container [nvcr.io/nvidia/nemo-rl:v0.4.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1u5lmjHOsYpJqXaeYstjw7Qbzvbo67U0v?usp=sharing) to get a head start on your experimentation.
