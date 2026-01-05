@@ -1,0 +1,23 @@
+defaults:
+  - ../../grpo_math_1B.yaml
+  - grpo-acereason-math-7b-16K.yaml
+policy:
+  max_total_sequence_length: 24576
+  dtensor_cfg:
+    activation_checkpointing: true
+    context_parallel_size: 8
+  dynamic_batching:
+    logprob_mb_tokens: 49152
+    train_mb_tokens: 24576
+  sequence_packing:
+    enabled: false
+    logprob_mb_tokens: 49152
+    train_mb_tokens: 24576
+  optimizer:
+    kwargs:
+      lr: 5.0e-07
+  generation:
+    max_new_tokens: 24576
+data:
+  max_input_seq_length: 24576
+
