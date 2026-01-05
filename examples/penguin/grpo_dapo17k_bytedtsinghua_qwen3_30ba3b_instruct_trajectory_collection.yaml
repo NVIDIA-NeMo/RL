@@ -1,10 +1,10 @@
 defaults: "grpo_dapo17k_bytedtsinghua_qwen3_30ba3b_instruct_mcore.yaml"
 
 data:
-  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/dapo17k_trajectory_collection/validation.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/dapo17k_trajectory_collection/validation.jsonl
 
 env:
-  penguin:
+  nemo_gym:
     is_trajectory_collection: true  # Set this to true to enable trajectory collection (no training)
 
 policy:

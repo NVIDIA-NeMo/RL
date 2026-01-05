@@ -1,11 +1,11 @@
 defaults: grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml
 
 data:
-  train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/comp_coding/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/comp_coding/validation.jsonl
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/comp_coding/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/comp_coding/validation.jsonl
 
 env:
-  penguin:
+  nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/comp_coding/configs/comp_coding.yaml

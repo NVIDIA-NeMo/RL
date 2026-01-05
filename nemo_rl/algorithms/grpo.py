@@ -906,11 +906,11 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     return should_use_nemo_gym
 
 
-def _should_log_penguin_responses(master_config: MasterConfig) -> bool:
+def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     env_config = master_config.get("env") or dict()
-    should_log_penguin_responses = bool(env_config.get("should_log_penguin_responses"))
+    should_log_nemo_gym_responses = bool(env_config.get("should_log_nemo_gym_responses"))
 
-    return should_log_penguin_responses
+    return should_log_nemo_gym_responses
 
 
 def refit_policy_generation(
@@ -1198,8 +1198,8 @@ def grpo_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
-                        # Penguin responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_penguin_responses(master_config):
+                        # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
+                        if not _should_log_nemo_gym_responses(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
@@ -1654,7 +1654,7 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_penguin_responses(master_config):
+            if not _should_log_nemo_gym_responses(master_config):
                 log_data = {"content": metrics_logging_data["content"]}
                 log_data["rewards"] = rewards.tolist()
                 if master_config["grpo"]["use_dynamic_sampling"]:
