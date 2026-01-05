@@ -20,7 +20,7 @@ uv run examples/run_grpo_math.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
-    logger.wandb.name=$EXP_NAME \
+    logger.wandb.name=$EXP_NAME-yarn-${NRL_MCORE_OVERRIDE_EMBEDDING_TYPE:-0} \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \

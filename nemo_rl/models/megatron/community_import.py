@@ -39,6 +39,19 @@ def import_model_from_hf_name(
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
+    if (
+        "rope_scaling" in config_overrides
+        and config_overrides["rope_scaling"]["rope_type"] == "yarn"
+        and os.getenv("NRL_MCORE_OVERRIDE_EMBEDDING_TYPE", "0") == "1"
+    ):
+        model_provider.position_embeddings_type = "yarn"
+        model_provider.yarn_rotary_scaling_factor = config_overrides["rope_scaling"][
+            "factor"
+        ]
+        model_provider.yarn_original_max_position_embeddings = config_overrides[
+            "rope_scaling"
+        ]["original_max_position_embeddings"]
+
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
     orig_pipeline_model_parallel_size = model_provider.pipeline_model_parallel_size
