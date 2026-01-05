@@ -767,7 +767,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         buffer_size_bytes: int,
         kv_scales: Optional[dict[str, float]] = None,
         refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
