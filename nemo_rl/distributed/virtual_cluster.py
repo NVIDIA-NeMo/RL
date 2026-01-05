@@ -82,12 +82,15 @@ def _cleanup_placement_groups() -> int:
 def _cleanup_actors() -> int:
     """Kill stale NeMo RL actors."""
     killed_count = 0
-    actor_names = ray.util.list_named_actors(all_namespaces=True)
+    # all_namespaces=True returns list of dicts: [{"name": ..., "namespace": ...}, ...]
+    actor_infos = ray.util.list_named_actors(all_namespaces=True)
 
-    for actor_name in actor_names:
+    for actor_info in actor_infos:
+        actor_name = actor_info["name"]
+        namespace = actor_info["namespace"]
         if any(actor_name.startswith(prefix) for prefix in NEMO_RL_ACTOR_PREFIXES):
             try:
-                actor_handle = ray.get_actor(actor_name)
+                actor_handle = ray.get_actor(actor_name, namespace=namespace)
                 ray.kill(actor_handle, no_restart=True)
                 logger.info(f"Killed stale actor: {actor_name}")
                 killed_count += 1
