@@ -182,6 +182,12 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 1
+
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+  num_prompts_per_dataloader: ${grpo.num_prompts_per_step}
+  custom_dataloader: null
+
   # dataset
   train:
     dataset_name: clevr-cogent

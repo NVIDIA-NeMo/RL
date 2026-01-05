@@ -65,7 +65,7 @@ def setup_data(
     env_configs: dict[str, Any],
     seed: int,
 ) -> tuple[
-    AllTaskProcessedDataset,
+    dict[str, AllTaskProcessedDataset],
     Optional[AllTaskProcessedDataset],
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
@@ -96,15 +96,33 @@ def setup_data(
         task_data_processors[task_name] = (data.task_spec, data.processor)
         task_to_env[task_name] = envs[cfg["env_name"]]
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
-    dataset = AllTaskProcessedDataset(
-        merged_data,
-        tokenizer,
-        None,
-        task_data_processors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+    if data_config["use_multiple_dataloader"]:
+        assert data_config["num_prompts_per_dataloader"] is not None, (
+            "num_prompts_per_dataloader must be set when using multiple_dataloader"
+        )
+        datasets = {
+            data.task_name: AllTaskProcessedDataset(
+                data.dataset,
+                tokenizer,
+                None,
+                task_data_processors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for data in data_list
+        }
+    else:
+        merged_data = concatenate_datasets([data.dataset for data in data_list])
+        datasets = {
+            "all_tasks": AllTaskProcessedDataset(
+                merged_data,
+                tokenizer,
+                None,
+                task_data_processors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+        }
+    sample_count = sum(len(data.dataset) for data in data_list)
+    print(f"  ✓ Training dataset loaded with {sample_count} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
@@ -150,7 +168,7 @@ def setup_data(
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
-    return dataset, val_dataset, task_to_env, val_task_to_env
+    return datasets, val_dataset, task_to_env, val_task_to_env
 
 
 def main() -> None:
@@ -198,7 +216,7 @@ def main() -> None:
 
     # setup data
     (
-        dataset,
+        datasets,
         val_dataset,
         task_to_env,
         val_task_to_env,
@@ -208,14 +226,14 @@ def main() -> None:
         policy,
         policy_generation,
         cluster,
-        dataloader,
+        dataloaders,
         val_dataloader,
         loss_fn,
         logger,
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(config, tokenizer, datasets, val_dataset)
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
@@ -240,6 +258,13 @@ def main() -> None:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
+
+        # Async GRPO does not support multiple dataloaders
+        if config["data"]["use_multiple_dataloader"]:
+            raise NotImplementedError(
+                "use_multiple_dataloader is not supported with async GRPO"
+            )
+        dataloader = dataloaders["all_tasks"]
 
         from nemo_rl.algorithms.grpo import async_grpo_train
 
@@ -269,7 +294,7 @@ def main() -> None:
         grpo_train(
             policy,
             policy_generation,
-            dataloader,
+            dataloaders,
             val_dataloader,
             tokenizer,
             loss_fn,

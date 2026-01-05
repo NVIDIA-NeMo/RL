@@ -540,22 +540,22 @@ def multichoice_qa_processor(
 
 def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
-    *args,
-    **kwargs,
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
-    # Ensure message_log exists and contains tensor token_ids so downstream padding works
-    if "message_log" not in datum_dict or not datum_dict["message_log"]:
-        datum_dict["message_log"] = [
-            {"role": "user", "content": "", "token_ids": torch.tensor([])}
-        ]
-    else:
-        for msg in datum_dict["message_log"]:
-            if "token_ids" not in msg:
-                msg["token_ids"] = torch.tensor([])
-            elif not isinstance(msg["token_ids"], torch.Tensor):
-                msg["token_ids"] = torch.tensor(msg["token_ids"])
-    return cast(DatumSpec, datum_dict)
+    output: DatumSpec = {
+        "extra_env_info": datum_dict["extra_env_info"],
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        # padding values to be compatible with the current GRPO implementation
+        "message_log": [{"role": "user", "content": "", "token_ids": torch.tensor([])}],
+        "length": 0,
+    }
+    return output
 
 
 # Processor registry. Key is the processor name, value is the processor function.

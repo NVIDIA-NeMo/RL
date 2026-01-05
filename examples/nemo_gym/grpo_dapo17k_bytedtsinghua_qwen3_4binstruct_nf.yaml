@@ -237,10 +237,17 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+  num_prompts_per_dataloader: ${grpo.num_prompts_per_step}
+  custom_dataloader: null
   train:
-    dataset_name: NemoGymDataset
-    data_path: 3rdparty/Gym-workspace/Gym/data/train.jsonl
-    repeat: 1
+    - dataset_name: NemoGymDataset
+      data_path: 3rdparty/Gym-workspace/Gym/data/train_half_00.jsonl 
+      repeat: 1
+    - dataset_name: NemoGymDataset
+      data_path: 3rdparty/Gym-workspace/Gym/data/train_half_01.jsonl 
+      repeat: 1
   validation:
     dataset_name: NemoGymDataset
     data_path: 3rdparty/Gym-workspace/Gym/data/validation.jsonl
