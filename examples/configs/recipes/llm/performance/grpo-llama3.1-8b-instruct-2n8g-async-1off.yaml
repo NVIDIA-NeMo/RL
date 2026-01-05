@@ -9,6 +9,8 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off
 policy:
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
   generation:
     colocated:
       enabled: false
