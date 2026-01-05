@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
+import numpy as np
 import ray
 import requests
 import swanlab
@@ -65,6 +66,7 @@ class MLflowConfig(TypedDict):
     experiment_name: str
     run_name: str
     tracking_uri: NotRequired[str]
+    artifact_location: NotRequired[str | None]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -107,6 +109,11 @@ class LoggerInterface(ABC):
         """Log dictionary of hyperparameters."""
         pass
 
+    @abstractmethod
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics."""
+        pass
+
 
 class TensorboardLogger(LoggerInterface):
     """Tensorboard logger backend."""
@@ -132,7 +139,7 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
-            # Penguin will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
+            # NeMo-Gym will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
             # This logic catches non-compatible objects being logged.
             if not isinstance(value, (int, float, bool, str)):
                 continue
@@ -152,6 +159,10 @@ class TensorboardLogger(LoggerInterface):
             except Exception as e:
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to Tensorboard."""
+        return
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
@@ -363,28 +374,31 @@ class WandbLogger(LoggerInterface):
         """
         self.run.log({name: figure}, step=step)
 
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to wandb.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+
 
 class SwanlabLogger(LoggerInterface):
     """SwanLab logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
+        """Initialize the SwanlabLogger by starting a Swanlab run and storing the resulting run on self.run.
+
+        Parameters:
+            cfg (SwanlabConfig): Configuration for the Swanlab run (e.g., project and name).
+            log_dir (Optional[str]): Optional offline log directory passed to Swanlab's init.
+        """
         self.run = swanlab.init(**cfg, logdir=log_dir)
         print(
             f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
         )
-
-    def define_metric(
-        self,
-        name: str,
-        step_metric: Optional[str] = None,
-    ) -> None:
-        """Define a metric with custom step metric.
-
-        Args:
-            name: Name of the metric or pattern (e.g. 'ray/*')
-            step_metric: Optional name of the step metric to use
-        """
-        self.run.define_metric(name, step_metric=step_metric)
 
     def log_metrics(
         self,
@@ -394,14 +408,13 @@ class SwanlabLogger(LoggerInterface):
         step_metric: Optional[str] = None,
         step_finished: bool = False,
     ) -> None:
-        """Log metrics to swanlab.
+        """Log metrics to the associated Swanlab run.
 
-        Args:
-            metrics: Dict of metrics to log
-            step: Global step value
-            prefix: Optional prefix for metric names
-            step_metric: Optional name of a field in metrics to use as step instead
-                         of the provided step value
+        Parameters:
+            metrics (dict[str, Any]): Mapping of metric names to metric values.
+            step (int): Global step value to associate with all logged metrics.
+            prefix (Optional[str]): Optional prefix applied to metric names; metric names equal to `step_metric` are not prefixed.
+            step_metric (Optional[str]): Name of a metric that should be excluded from prefixing.
         """
         if prefix:
             metrics = {
@@ -409,18 +422,13 @@ class SwanlabLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # If step_metric is provided, use the corresponding value from metrics as step
-        if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
-        else:
-            self.run.log(metrics, step=step)
+        self.run.log(metrics, step=step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
-        """Log hyperparameters to swanlab.
+        """Update the Swanlab run configuration with the provided hyperparameters.
 
-        Args:
-            params: Dict of hyperparameters to log
+        Parameters:
+            params (Mapping[str, Any]): Mapping of hyperparameter names to values to store in the run configuration.
         """
         self.run.config.update(params)
 
@@ -431,7 +439,11 @@ class SwanlabLogger(LoggerInterface):
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        self.run.log({name: swanlab.Image(figure)}, step=step)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to swanlab."""
+        return
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -740,31 +752,30 @@ class MLflowLogger(LoggerInterface):
 
         Args:
             cfg: MLflow configuration
-            log_dir: Optional log directory
+            log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        if cfg["tracking_uri"]:
-            mlflow.set_tracking_uri(cfg["tracking_uri"])
+        tracking_uri = cfg.get("tracking_uri")
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
 
-        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        experiment_name = cfg["experiment_name"]
+        experiment = mlflow.get_experiment_by_name(experiment_name)
         if experiment is None:
-            if log_dir:
-                mlflow.create_experiment(
-                    name=cfg["experiment_name"],
-                    artifact_location=log_dir,
-                )
-            else:
-                mlflow.create_experiment(cfg["experiment_name"])
+            mlflow.create_experiment(
+                name=experiment_name,
+                **{"artifact_location": cfg.get("artifact_location", log_dir)}
+                if "artifact_location" in cfg or log_dir
+                else {},
+            )
         else:
-            mlflow.set_experiment(cfg["experiment_name"])
+            mlflow.set_experiment(experiment_name)
 
         # Start run
-        run_kwargs: dict[str, str] = {}
-        run_kwargs["run_name"] = cfg["run_name"]
-
+        run_name = cfg["run_name"]
+        run_kwargs = {"run_name": run_name}
         self.run = mlflow.start_run(**run_kwargs)
         print(
-            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
-            f"run {cfg['run_name']}"
+            f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}"
         )
 
     def log_metrics(
@@ -809,6 +820,10 @@ class MLflowLogger(LoggerInterface):
             figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
             mlflow.log_artifact(tmp_file.name, f"plots/{name}")
 
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to MLflow."""
+        return
+
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
         try:
@@ -822,19 +837,15 @@ class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
     def __init__(self, cfg: LoggerConfig):
-        """Initialize the logger.
+        """Create and configure enabled logging backends and optionally start GPU monitoring.
 
-        Args:
-            cfg: Config dict with the following keys:
-                - wandb_enabled
-                - tensorboard_enabled
-                - mlflow_enabled
-                - wandb
-                - tensorboard
-                - mlflow
-                - monitor_gpus
-                - gpu_collection_interval
-                - gpu_flush_interval
+        Parameters:
+            cfg (LoggerConfig): Configuration mapping. Expected keys include:
+                - "log_dir": base directory for backend logs.
+                - "wandb_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled": booleans to enable backends.
+                - "wandb", "swanlab", "tensorboard", "mlflow": per-backend configuration dicts.
+                - "monitor_gpus": boolean to enable Ray GPU monitoring.
+                - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
@@ -864,8 +875,10 @@ class Logger(LoggerInterface):
             self.loggers.append(tensorboard_logger)
 
         if cfg["mlflow_enabled"]:
-            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
-            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_log_dir = self.base_log_dir
+            if mlflow_log_dir:
+                mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
+                os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 
@@ -876,11 +889,6 @@ class Logger(LoggerInterface):
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
                 self.wandb_logger.define_metric(
-                    f"{metric_prefix}/*", step_metric=step_metric
-                )
-
-            if cfg["swanlab_enabled"] and self.swanlab_logger:
-                self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
@@ -968,6 +976,98 @@ class Logger(LoggerInterface):
                 f.write(sample + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_plot_per_worker_timeline_metrics(
+        self,
+        metrics: dict[int, list[Any]],
+        step: int,
+        prefix: str,
+        name: str,
+        timeline_interval: float,
+    ) -> None:
+        """Log a plot of per-worker timeline metrics.
+
+        Args:
+            metrics: Dictionary of metrics to log, where the keys are the worker IDs and the values are the lists of metric values
+            - metrics: dict[str, list[Any]] = {worker_id: [metric_value_1, metric_value_2, ...]}
+            - metric values are time series values over time, the timing gap between the values is the timeline_interval
+            step: Global step value
+            name: Name of the plot
+            timeline_interval: Interval between timeline points (in seconds)
+        """
+        if not metrics:
+            print(
+                f"Skipping {name} per-worker timeline logging because no metrics were provided."
+            )
+            return
+
+        if timeline_interval <= 0:
+            raise ValueError(
+                f"timeline_interval must be positive; received {timeline_interval}"
+            )
+
+        # Plot the per-worker timeline metrics
+        x_series: list[list[float]] = []
+        y_series: list[list[float]] = []
+        series_labels: list[str] = []
+
+        if not any(metrics.values()):
+            print(
+                f"Skipping {name} per-worker timeline logging because all series were empty."
+            )
+            return
+
+        for worker_id in sorted(metrics.keys()):
+            metric_values = metrics[worker_id]
+            if not metric_values:
+                continue
+
+            x_series.append([i * timeline_interval for i in range(len(metric_values))])
+            y_series.append([float(v) for v in metric_values])
+            series_labels.append(f"worker_{worker_id}")
+
+        fig, ax = plt.subplots()
+        for label, xs, ys in zip(series_labels, x_series, y_series):
+            ax.plot(xs, ys, label=label)
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (per worker)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        plt.close(fig)
+
+        # Plot the average of the metrics
+        min_length = min(len(v) for v in metrics.values())
+        x_series = [i * timeline_interval for i in range(min_length)]
+        truncated_y_serise = [v[:min_length] for v in y_series]
+
+        avg_y_serise = np.mean(truncated_y_serise, axis=0)
+
+        fig, ax = plt.subplots()
+        ax.plot(x_series, avg_y_serise, label="average")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"{name} (average)")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+        fig.tight_layout()
+        for logger in self.loggers:
+            logger.log_plot(fig, step, f"{prefix}/average_{name}")
+        plt.close(fig)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to all backends if available.
+
+        Args:
+            histogram: List of histogram values
+            step: Global step value
+            name: Name of the metric
+        """
+        for logger in self.loggers:
+            logger.log_histogram(histogram, step, name)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str

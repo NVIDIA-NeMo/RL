@@ -169,6 +169,7 @@ def setup_configs(args, tokenizer):
             },
         },
         "precision": "bfloat16",
+        "offload_optimizer_for_logprob": False,
         "pipeline_dtype": "bfloat16",
         "parallel_output": True,
         "max_total_sequence_length": args.max_sequence_length,
@@ -215,6 +216,7 @@ def setup_configs(args, tokenizer):
             "pipeline_dtype": "bfloat16",
             "train_iters": 1,
             "bias_activation_fusion": False,
+            "moe_per_layer_logging": False,
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "optimizer": {

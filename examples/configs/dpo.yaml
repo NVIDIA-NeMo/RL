@@ -45,6 +45,8 @@ policy:
   max_total_sequence_length: 1024
   precision: "bfloat16"
 
+  offload_optimizer_for_logprob: false
+
   dtensor_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
@@ -116,6 +118,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
     
     optimizer:
       optimizer: "adam"
@@ -202,6 +205,9 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb:
+    project: "dpo-dev"
+    name: "dpo"
+  swanlab:
     project: "dpo-dev"
     name: "dpo"
   tensorboard:

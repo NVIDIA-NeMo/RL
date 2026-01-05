@@ -35,6 +35,8 @@ policy:
   precision: "bfloat16"
   activation_checkpointing_enabled: false
 
+  offload_optimizer_for_logprob: false
+
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
@@ -167,6 +169,9 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
+    project: "rm-dev"
+    name: "rm-dev-${data.dataset_name}"
+  swanlab:
     project: "rm-dev"
     name: "rm-dev-${data.dataset_name}"
   tensorboard:

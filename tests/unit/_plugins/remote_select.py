@@ -60,8 +60,8 @@ Two JSON files are written to the repository root:
          "/workspaces/nemo-rl/nemo_rl/distributed/worker_groups.py",
          "/workspaces/nemo-rl/nemo_rl/distributed/virtual_cluster.py"
        ],
-       "tests/unit/models/policy/test_dtensor_worker.py::test_lm_policy_init[True]": [
-         "/workspaces/nemo-rl/nemo_rl/models/policy/dtensor_policy_worker.py"
+       "tests/unit/models/policy/workers/test_dtensor_worker.py::test_lm_policy_init[True]": [
+         "/workspaces/nemo-rl/nemo_rl/models/policy/workers/dtensor_policy_worker.py"
        ]
      }
 
@@ -70,7 +70,7 @@ Two JSON files are written to the repository root:
    - Example:
      {
        "/workspaces/nemo-rl/nemo_rl/distributed/worker_groups.py": 1725369123.456,
-       "/workspaces/nemo-rl/nemo_rl/models/policy/dtensor_policy_worker.py": 1725369187.012
+       "/workspaces/nemo-rl/nemo_rl/models/policy/workers/dtensor_policy_worker.py": 1725369187.012
      }
 """
 

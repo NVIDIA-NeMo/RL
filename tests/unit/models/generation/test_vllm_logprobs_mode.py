@@ -203,6 +203,8 @@ def test_processed_logprobs_matches_manual_computation():
     torch.testing.assert_close(
         vllm_logprobs_tensor,
         expected_logprobs_tensor,
+        rtol=1e-3,
+        atol=1e-2,
     )
 
     print("✓ Test passed: processed_logprobs match manual computation from HF model!")

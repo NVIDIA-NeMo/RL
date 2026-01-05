@@ -27,6 +27,8 @@ policy:
   max_total_sequence_length: 4096
   precision: "bfloat16"
 
+  offload_optimizer_for_logprob: false
+
   dtensor_cfg:
     enabled: true
     cpu_offload: False
@@ -84,6 +86,9 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
+    project: "sft-dev"
+    name: "openmathinstruct-nemorl-1M_train"
+  swanlab:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"
   tensorboard:
