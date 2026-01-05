@@ -312,13 +312,15 @@ def setup(
             task_name: init_dataloader(task_dataset, f"_{task_name}")
             for task_name, task_dataset in dataset.items()
         }
-        sample_count = sum(
+        train_sample_count = sum(
             len(task_dataloader) for task_dataloader in dataloader.values()
         )
     else:
         dataloader = init_dataloader(dataset)
-        sample_count = len(dataloader)
-    print(f"  ✓ Training dataloader loaded with {sample_count} samples", flush=True)
+        train_sample_count = len(dataloader)
+    print(
+        f"  ✓ Training dataloader loaded with {train_sample_count} samples", flush=True
+    )
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -526,7 +528,7 @@ def setup(
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
             grpo_config["max_num_steps"],
-            grpo_config["max_num_epochs"] * len(dataloader),
+            grpo_config["max_num_epochs"] * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
