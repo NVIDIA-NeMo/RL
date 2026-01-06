@@ -102,6 +102,29 @@ STRING_TO_DTYPE = {
 }
 
 
+def dtensor_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+
+    Args:
+        model: The model whose parameters to generate.
+        target_dtype: The dtype to convert tensors to.
+
+    Yields:
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+    """
+    for name, tensor in model.state_dict().items():
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            # Convert to target dtype
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+            )
+
+
 def _maybe_adapt_tensor_to_hf(
     model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
 ) -> list[tuple[str, torch.Tensor]]:
@@ -1799,25 +1822,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
-                full_tensor = (
-                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-                )
-                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
-                    self.model, name, full_tensor
-                )
-                for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                    # Convert to target dtype
-                    yield (
-                        adapted_fqn,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(),
+            params_generator=dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1842,27 +1849,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             self.model = self.move_to_cuda(self.model)
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format."""
-            for name, tensor in self.model.state_dict().items():
-                full_tensor = (
-                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-                )
-                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
-                    self.model, name, full_tensor
-                )
-                for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                    # Convert to target dtype
-                    yield (
-                        adapted_fqn,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(),
+            iterator=dtensor_params_generator(self.model, self.dtype),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,

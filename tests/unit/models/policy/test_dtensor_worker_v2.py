@@ -32,6 +32,7 @@ from tests.unit.test_utils import SimpleLoss
 try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         _maybe_adapt_tensor_to_hf,
+        dtensor_params_generator,
         get_train_context,
     )
 
@@ -564,6 +565,142 @@ class TestMaybeAdaptTensorToHF:
         assert call_kwargs["exclude_key_regex"] == r".*_extra_state.*", (
             "Should exclude extra_state tensors"
         )
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestDTensorParamsGenerator:
+    """Tests for the dtensor_params_generator helper function."""
+
+    def test_simple_model_yields_adapted_tensors(self):
+        """Test that generator yields correct (name, tensor) pairs for a simple model."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        assert len(results) == 2, "Linear layer should have weight and bias"
+        names = [name for name, _ in results]
+        assert "weight" in names
+        assert "bias" in names
+
+        # Check that tensors are in the correct dtype and contiguous
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype, (
+                f"Tensor {name} should be {target_dtype}"
+            )
+            assert tensor.is_contiguous(), f"Tensor {name} should be contiguous"
+
+    def test_dtype_conversion(self):
+        """Test that tensors are converted to target dtype."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        # Initialize with float32
+        model = model.to(torch.float32)
+        target_dtype = torch.bfloat16
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype, (
+                f"Tensor {name} should be converted to {target_dtype}"
+            )
+
+    def test_contiguous_output(self):
+        """Test that output tensors are contiguous."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        for name, tensor in results:
+            assert tensor.is_contiguous(), f"Tensor {name} should be contiguous"
+
+    def test_with_adapter_model(self):
+        """Test that adapter is used when present on model."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        adapter_mock = Mock()
+        # Mock adapter to return multiple tensors for a single input
+        adapter_mock.convert_single_tensor_to_hf.return_value = [
+            ("adapted.weight.1", torch.randn(5, 10)),
+            ("adapted.weight.2", torch.randn(5, 10)),
+        ]
+        model.state_dict_adapter = adapter_mock
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        # Each state_dict entry (weight, bias) goes through adapter
+        # Adapter returns 2 tensors for each, so we expect 4 total
+        assert len(results) >= 4, "Should have adapted tensors from adapter"
+
+        # Verify adapter was called
+        assert adapter_mock.convert_single_tensor_to_hf.call_count >= 2
+
+    def test_empty_model(self):
+        """Test handling of model with no parameters."""
+        # Arrange
+        model = nn.Module()  # Empty module with no parameters
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        assert len(results) == 0, "Empty model should yield no parameters"
+
+    def test_generator_is_iterable(self):
+        """Test that dtensor_params_generator returns an iterable generator."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        gen = dtensor_params_generator(model, target_dtype)
+
+        # Assert
+        from collections.abc import Generator as ABCGenerator
+
+        assert isinstance(gen, ABCGenerator), "Should return a generator"
+
+        # Verify we can iterate over it
+        results = list(gen)
+        assert len(results) > 0, "Should yield at least one item"
+
+    def test_multiple_layers(self):
+        """Test generator with a more complex model with multiple layers."""
+        # Arrange
+        model = nn.Sequential(
+            nn.Linear(10, 5),
+            nn.ReLU(),
+            nn.Linear(5, 2),
+        )
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        # Should have 4 parameters: 2 weights + 2 biases from the Linear layers
+        assert len(results) == 4, (
+            "Sequential with 2 Linear layers should have 4 parameters"
+        )
+
+        # Check all tensors
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype
+            assert tensor.is_contiguous()
 
 
 @pytest.mark.automodel
