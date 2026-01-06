@@ -121,6 +121,23 @@ class TensorboardLogger(LoggerInterface):
         self.writer = SummaryWriter(log_dir=log_dir)
         print(f"Initialized TensorboardLogger at {log_dir}")
 
+    @staticmethod
+    def _coerce_to_scalar(value: Any) -> int | float | bool | str | None:
+        """Coerce a value to a Python scalar for TensorBoard logging.
+
+        Returns the coerced value, or None if it can't be converted to a scalar.
+        """
+        if isinstance(value, (int, float, bool, str)):
+            return value
+        if isinstance(value, (np.floating, np.integer, np.bool_)):
+            return value.item()
+        if isinstance(value, np.ndarray) and (value.ndim == 0 or value.size == 1):
+            return value.item()
+        if isinstance(value, torch.Tensor) and (value.ndim == 0 or value.numel() == 1):
+            return value.item()
+        # dict, list, multi-element arrays/tensors, or incompatible types
+        return None
+
     def log_metrics(
         self,
         metrics: dict[str, Any],
@@ -137,23 +154,19 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
-            # NeMo-Gym will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
-            # This logic catches non-compatible objects being logged.
-            if not isinstance(value, (int, float, bool, str)):
-                continue
-
             if prefix:
                 name = f"{prefix}/{name}"
 
-            # Skip non-scalar values that TensorBoard can't handle
-            if isinstance(value, (dict, list)):
+            scalar = self._coerce_to_scalar(value)
+            if scalar is None:
                 print(
-                    f"Warning: Skipping non-scalar metric '{name}' for TensorBoard logging (type: {type(value).__name__})"
+                    f"Warning: Skipping metric '{name}' for TensorBoard logging "
+                    f"(unsupported type: {type(value).__name__})"
                 )
                 continue
 
             try:
-                self.writer.add_scalar(name, value, step)
+                self.writer.add_scalar(name, scalar, step)
             except Exception as e:
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
