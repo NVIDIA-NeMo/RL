@@ -1344,7 +1344,6 @@ def grpo_train(
                             advantages=advantages,
                             std=std,
                         )
-                        del zero_std_mask
 
                     del input_ids
                     del baseline
