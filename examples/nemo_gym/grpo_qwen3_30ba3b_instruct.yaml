@@ -87,7 +87,7 @@ policy:
     # This is possibly related to some refit issues.
     freeze_moe_router: false
     moe_router_dtype: fp32
-    moe_router_load_balancing_type: global_aux_loss # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_load_balancing_type: none # "seq_aux_loss" causes logprob error divergence for grpo. As of Jan 06, 2025, global_aux_loss is also not supported properly in mcore.
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
     moe_permute_fusion: true
