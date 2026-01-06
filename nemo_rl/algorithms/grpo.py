@@ -1561,7 +1561,6 @@ def grpo_train(
                         # TODO remove this
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
-                metrics.update(rollout_metrics)
                 metrics["vllm_logger_metrics"] = vllm_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
