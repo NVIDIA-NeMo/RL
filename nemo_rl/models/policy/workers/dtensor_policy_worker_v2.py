@@ -49,7 +49,6 @@ from nemo_automodel.components.moe.parallelizer import (
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
-from torch.backends import cuda
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -184,6 +183,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # - Packed sequence requires FA2 and CP must be 1
         # - CP > 1 requires SDPA
         cp_size_cfg = self.cfg["dtensor_cfg"]["context_parallel_size"]
+
+        # NeMoAutoModelForCausalLM uses flash_attention_2 by default
+        # so we need to set it to None if sequence packing is disabled
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
         attn_impl = (
             "flash_attention_2"
             if (self.enable_seq_packing and cp_size_cfg == 1)
@@ -274,18 +277,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             automodel_kwargs["use_liger_kernel"] = False
 
         with init_empty_weights():
-            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
-            # so we need to set it to None if sequence packing is disabled
-            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
+            from torch.nn.attention import SDPBackend
+
             if cp_size > 1:
                 # Match Automodel's `get_train_context` in `cp_utils.py` where only
                 # flash and efficient backends are supported
                 # Ref: https://github.com/NVIDIA-NeMo/Automodel/blob/81788d6f4848f5f066c4a6a2bece4689a6a83687/nemo_automodel/components/distributed/cp_utils.py#L57
-                from torch.nn.attention import SDPBackend
-
                 sdpa_method = [
                     SDPBackend.FLASH_ATTENTION,
                     SDPBackend.EFFICIENT_ATTENTION,
+                ]
+            elif self.cfg["dtensor_cfg"]["activation_checkpointing"]:
+                # For activation checkpointing, we must disable the cudnn SDPA backend because
+                # it may not be selected during recomputation.
+                # In that case, we will get the following error:
+                # "Recomputed values have different metadata than during forward pass."
+                sdpa_method = [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
                 ]
             else:
                 sdpa_method = None
@@ -302,11 +312,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             if self.lora_enabled:
                 apply_lora_to_linear_modules(self.model, self.peft_config)
 
-        # For activation checkpointing, we must globally disable the cudnn SDPA backend.
-        # Otherwise we will get the following error:
-        # "Recomputed values have different metadata than during forward pass."
+        # For activation checkpointing, we also must globally disable the cudnn SDPA backend
+        # to ensure that cudnn does not get selected during recomputation.
         if self.cfg["dtensor_cfg"]["activation_checkpointing"]:
-            # importing torch.backends.cuda at the top of the file prevents a ray serialization error
+            from torch.backends import cuda
+
             cuda.enable_cudnn_sdp(False)
 
         # Hold a copy of model state_dict keys before any parallelization
