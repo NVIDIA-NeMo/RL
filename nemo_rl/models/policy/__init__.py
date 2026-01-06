@@ -35,6 +35,13 @@ class LoRAConfig(TypedDict):
 
 
 class AutomodelBackendConfig(TypedDict):
+    """Configuration for custom MoE implementation backend in Automodel.
+
+    Used when setting the backend in automodel_kwargs in your config.
+    Alternatively, pass `force_hf: true` in automodel_kwargs to fall back
+    to the HuggingFace implementation.
+    """
+
     # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
     _target_: str
     # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
@@ -60,6 +67,8 @@ class AutomodelKwargs(TypedDict):
     use_liger_kernel: NotRequired[bool]
     # Backend configuration for MoE models
     backend: NotRequired[AutomodelBackendConfig]
+    # Whether to force use of the HuggingFace implementation for MoE models
+    force_hf: NotRequired[bool]
 
 
 class DTensorConfigDisabled(TypedDict):
