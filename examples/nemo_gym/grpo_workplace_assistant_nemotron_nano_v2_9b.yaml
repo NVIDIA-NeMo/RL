@@ -241,10 +241,6 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
-    workplace_assistant_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 6  # Workplace assistant allows up to 6 tool-calling steps per task
     policy_model:
       responses_api_models:
         vllm_model:
@@ -253,6 +249,10 @@ env:
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
+    workplace_assistant_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 6  # Workplace assistant allows up to 6 tool-calling steps per task
 
 logger:
   log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b"  # Base directory for all logs
