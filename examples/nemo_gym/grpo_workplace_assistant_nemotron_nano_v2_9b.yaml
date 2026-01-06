@@ -227,8 +227,8 @@ policy:
 data:
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/validation.jsonl
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
   shuffle: true
   num_workers: 0
 
