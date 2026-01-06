@@ -241,6 +241,7 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    # You can uncomment these during `ng_prepare_data` and here to train on multiple environments at once!
     # - resources_servers/math_with_judge/configs/math_with_judge.yaml
     # - resources_servers/code_gen/configs/code_gen.yaml
     # - resources_servers/mcqa/configs/mcqa.yaml
