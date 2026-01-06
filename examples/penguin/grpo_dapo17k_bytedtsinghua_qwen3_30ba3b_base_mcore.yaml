@@ -1,6 +1,0 @@
-defaults: "grpo_dapo17k_bytedtsinghua_qwen3_30ba3b_instruct_mcore.yaml"
-
-policy:
-  model_name: "Qwen/Qwen3-30B-A3B-Base"
-
-  max_total_sequence_length: 32768

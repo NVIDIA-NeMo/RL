@@ -1,4 +1,0 @@
-defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
-
-policy:
-  model_name: "Qwen/Qwen3-4B-Base"
