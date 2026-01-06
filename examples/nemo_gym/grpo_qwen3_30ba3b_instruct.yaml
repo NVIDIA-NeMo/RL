@@ -56,6 +56,13 @@ policy:
       # Refit after train, refit before validation.
       gpu_memory_utilization: 0.7
 
+      http_server_serving_chat_kwargs:
+        # This is the tool parser for Qwen 3 30B A3B Instruct. This needs to be changed for other models.
+        enable_auto_tools: true
+        tool_parser: hermes
+        # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
+        # reasoning_parser: deepseek_r1
+
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 

@@ -201,7 +201,7 @@ policy:
       kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
-      tool_parser_plugin: ???
+      # tool_parser_plugin: ???  # This is set to the path for Nemotron Nano v2
       http_server_serving_chat_kwargs:
         # Workplace assistant uses 26 tools, so we enable auto_tools.
         # For Nemotron Nano v2, we use the dedicated `nemotron_json` tool parser
@@ -229,7 +229,6 @@ data:
   # Train: 1129 samples, Validation: 126 samples
   train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/train.jsonl
   validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/validation.jsonl
-  agent_name: workplace_assistant_simple_agent
   shuffle: true
   num_workers: 0
 
