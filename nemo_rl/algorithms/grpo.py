@@ -1407,7 +1407,6 @@ def grpo_train(
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
-                    del flat_messages
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 print("▶ Preparing for logprob inference...", flush=True)
@@ -1499,6 +1498,7 @@ def grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = flat_messages["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
+                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
