@@ -1,8 +1,0 @@
-defaults: "grpo_dapo17k_bytedtsinghua_qwen3_30ba3b_instruct_large_rollout_batch.yaml"
-
-grpo:
-  max_num_epochs: 15
-
-data:
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/dapo17k_filtered_qwen330ba3binstruct/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/dapo17k_filtered_qwen330ba3binstruct/validation.jsonl
