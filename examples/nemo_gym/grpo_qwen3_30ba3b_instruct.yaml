@@ -1,10 +1,15 @@
-defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
+defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
 
 grpo:
   # We observe MoE likes more data per optimization step. Here we increase the num prompts per step from the dense 64 to 256.
   # We retain the 16 generations per prompt for now. Later on this may change for agentic tasks as the action/sample space grows.
-  num_prompts_per_step: 256
+  # We take up to 16 steps off policy, which is 256 * 16 = 4096
+  num_prompts_per_step: 4096
   num_generations_per_prompt: 16
+  # Each "step" in NeMo RL is all 16 minibatch steps we want to take. So we val and save every step.
+  val_period: 1
+  # The advantages are much larger and this becomes non-trivially expensive.
+  calculate_advantages_on_gpu: true
 
 # We use GSPO rather than GRPO for MoE models
 loss_fn:
@@ -23,6 +28,9 @@ loss_fn:
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
   logprob_chunk_size: null
+
+  # This is one minibatch, which is 256 prompts per step * 16 rollouts per prompt.
+  train_global_batch_size: 4096
 
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
   # max_total_sequence_length: 131072
@@ -136,4 +144,4 @@ checkpointing:
   # 4. The checkpoint time for this model is around 10 mins, pessimistically around 15 mins.
   # So in total, in order to properly save out by the 4 hour time limit, we should save a checkpoint by 45 mins before the 4 hour limit.
   checkpoint_must_save_by: "00:03:15:00"
-  save_period: 10
+  save_period: 1
