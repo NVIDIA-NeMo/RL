@@ -63,6 +63,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tokenizer: PreTrainedTokenizerBase,
         name_prefix: str = "lm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        num_nodes: Optional[int] = None,
+        cluster_node_offset: int = 0,
+        cluster_gpu_offset_each_node: int = 0,
         init_optimizer: bool = True,
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
@@ -131,7 +134,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
-        actual_world_size = cluster.world_size()
+        num_nodes = num_nodes or cluster.node_count()
+        workers_per_node = workers_per_node or cluster.workers_per_node()
+        actual_world_size = num_nodes * workers_per_node
 
         if actual_world_size < model_parallel_size:
             raise ValueError(
@@ -151,7 +156,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
+            layout=np.arange(actual_world_size).reshape(
                 pp_size,  # PP
                 -1,  # DP
                 cp_size,  # CP
@@ -179,33 +184,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        if cluster._sorted_bundle_indices is not None:
-            # The cluster has initialized a unified placemenet group across nodes
-            # In this case, we need to create workers based on sorted bundle indices
-            group_size = cluster.num_gpus_per_node
-            tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
-            ]
-
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                bundle_indices_list=tied_groups,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
-            )
-
-        else:
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                workers_per_node=workers_per_node,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars or {},
-            )
+        self.worker_group = RayWorkerGroup(
+            cluster,
+            worker_builder,
+            num_nodes=num_nodes,
+            workers_per_node=workers_per_node,
+            cluster_node_offset=cluster_node_offset,
+            cluster_gpu_offset_each_node=cluster_gpu_offset_each_node,
+            name_prefix=name_prefix,
+            sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars or {},
+        )
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -541,8 +530,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
-            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
-            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
+            aggregated_results["num_ranks"] = len(self.worker_group.workers)
+            gpus_per_worker = len(self.worker_group.workers) / len(results)
 
             try:
                 aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
@@ -853,35 +842,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
-    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
         """Print the node IP and GPU ID of the current worker."""
         results = ray.get(
             self.worker_group.run_all_workers_single_data(
                 "report_node_ip_and_gpu_id",
             )
         )
-        all_node_ips = sorted(set([result[0] for result in results]))
-        all_gpu_ids = sorted(set([result[1] for result in results]))
-
-        worker_id_list = [
-            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
-        ]
-        for worker_id, (ip, gpu_id) in enumerate(results):
-            node_idx = all_node_ips.index(ip)
-            gpu_idx = all_gpu_ids.index(gpu_id)
-            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
-
-        from prettytable import PrettyTable
-
-        table = PrettyTable()
-        table.title = "Policy worker mapping to Nodes and GPUs"
-        table.field_names = ["Node_IP"] + [
-            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
-        ]
-        for i, node_idx in enumerate(all_node_ips):
-            row = [node_idx]
-            for j in range(len(all_gpu_ids)):
-                row.append(tuple(worker_id_list[i][j]))
-            table.add_row(row)
-
-        print(table)
+        return results

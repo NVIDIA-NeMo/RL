@@ -175,8 +175,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 class GetGPUIDActor:  # pragma: no cover
     """Util actor class to return GPU id of the current worker."""
 
-    def get_gpu_id(self):
-        return ray.get_gpu_ids()[0]
+    def get_ip_and_gpu_id(self):
+        return ray._private.services.get_node_ip_address(), int(ray.get_gpu_ids()[0])
 
 
 class ResourceInsufficientError(Exception):
@@ -203,7 +203,7 @@ class RayVirtualCluster:
         max_colocated_worker_groups: int = 1,
         num_gpus_per_node: int = 8,
         name: str = "",
-        placement_group_strategy: str = "SPREAD",
+        placement_group_strategy: str = "PACK",
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -218,9 +218,9 @@ class RayVirtualCluster:
         """
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
-        self._node_placement_groups: Optional[list[PlacementGroup]] = None
-        self._sorted_bundle_indices: Optional[list[int]] = None
-
+        self._unified_placement_group: Optional[PlacementGroup] = None
+        self._bundle_ids_sorted_by_ip_and_gpu: Optional[list[int]] = None
+        self._node_ids_sorted_by_ip_and_gpu: Optional[list[int]] = None
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
         if use_gpus:
@@ -231,10 +231,10 @@ class RayVirtualCluster:
         self.name = name
         self.placement_group_strategy = placement_group_strategy
 
-    def _init_placement_groups(
-        self, strategy: str | None = None, use_unified_pg: bool = False
-    ) -> list[PlacementGroup]:
-        """Creates placement groups based on whether cross-node model parallelism is needed.
+        self._init_placement_group()
+
+    def _init_placement_group(self) -> None:
+        """Creates a unified placement group based on whether cross-node model parallelism is needed.
 
         Args:
             strategy: Ray placement group strategy (defaults to self.placement_group_strategy)
@@ -244,11 +244,8 @@ class RayVirtualCluster:
         Returns:
             List of placement groups
         """
-        if self._node_placement_groups is not None:
-            return self._node_placement_groups
-
-        if strategy is None:
-            strategy = self.placement_group_strategy
+        if self._unified_placement_group is not None:
+            return
 
         # Add retry logic that was previously in __init__
         max_retries = int(os.environ.get("NRL_VIRTUAL_CLUSTER_MAX_RETRIES", 6))
@@ -258,12 +255,14 @@ class RayVirtualCluster:
 
         for i in range(max_retries):
             try:
-                self._node_placement_groups = self._create_placement_groups_internal(
-                    strategy, use_unified_pg
+                self._unified_placement_group = self._create_placement_group_internal(
+                    self.placement_group_strategy
                 )
-                if use_unified_pg and self.use_gpus:
-                    self._sorted_bundle_indices = self._get_sorted_bundle_indices()
-                return self._node_placement_groups
+                (
+                    self._bundle_ids_sorted_by_ip_and_gpu,
+                    self._node_ids_sorted_by_ip_and_gpu,
+                ) = self._get_sorted_bundle_and_node_ids()
+                return
             except ResourceInsufficientError as e:
                 print(e)
                 print(
@@ -275,9 +274,7 @@ class RayVirtualCluster:
             f"Maximum number of retries reached ({max_retries}). Cluster resources may be insufficient or cluster itself is highly unstable. Please check your cluster configuration and your cluster logs."
         )
 
-    def _create_placement_groups_internal(
-        self, strategy: str, use_unified_pg: bool = False
-    ) -> list[PlacementGroup]:
+    def _create_placement_group_internal(self, strategy: str) -> PlacementGroup:
         """Internal method to create placement groups without retry logic."""
         # Check available resources in the Ray cluster
         cluster_resources = ray.cluster_resources()
@@ -307,64 +304,43 @@ class RayVirtualCluster:
         # num_gpus_per_bundle == 1 indicates that there is 1 GPU per process
         num_gpus_per_bundle = 1 if self.use_gpus else 0
 
-        placement_groups = []
-        if use_unified_pg:
-            # Create a single unified placement group for cross-node model parallelism
-            all_bundles = []
-            for bundle_count in self._bundle_ct_per_node_list:
-                for _ in range(bundle_count):
-                    all_bundles.append(
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                    )
-
-            placement_groups = [
-                placement_group(
-                    bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
+        # Create a single unified placement group for cross-node model parallelism
+        all_bundles = []
+        for bundle_count in self._bundle_ct_per_node_list:
+            for _ in range(bundle_count):
+                all_bundles.append(
+                    {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
                 )
-            ]
-        else:
-            # Create per-node placement groups to respect bundle_ct_per_node_list
-            for node_idx, bundle_count in enumerate(self._bundle_ct_per_node_list):
-                if bundle_count > 0:
-                    node_bundles = [
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                        for _ in range(bundle_count)
-                    ]
-                    pg = placement_group(
-                        bundles=node_bundles,
-                        strategy="PACK",  # Use PACK to keep bundles together
-                        name=f"{self.name}-node{node_idx}",
-                    )
-                    placement_groups.append(pg)
+
+        pg = placement_group(
+            bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
+        )
 
         # Add timeout to prevent hanging indefinitely
         try:
-            ray.get(
-                [pg.ready() for pg in placement_groups], timeout=180
-            )  # 3-minute timeout
+            ray.get(pg.ready(), timeout=180)  # 3-minute timeout
         except (TimeoutError, ray.exceptions.GetTimeoutError):
             # Clean up any created placement groups
-            for pg in placement_groups:
-                try:
-                    remove_placement_group(pg)
-                except Exception:
-                    pass
+            try:
+                remove_placement_group(pg)
+            except Exception:
+                pass
             raise TimeoutError(
                 "Timed out waiting for placement groups to be ready. The cluster may not have enough resources "
                 "to satisfy the requested configuration, or the resources may be busy with other tasks."
             )
 
-        return placement_groups
+        return pg
+
+    def get_unified_placement_group(self) -> PlacementGroup:
+        assert self._unified_placement_group is not None, (
+            "Placement group must be initialized before calling get_unified_placement_group"
+        )
+        return self._unified_placement_group
 
     def get_placement_groups(self) -> list[PlacementGroup]:
-        # Initialize placement groups if not already created
-        if self._node_placement_groups is None:
-            self._init_placement_groups()
-
-        assert self._node_placement_groups is not None, (
-            "Placement groups must be initialized before calling get_placement_groups"
-        )
-        return [pg for pg in self._node_placement_groups if pg.bundle_specs]
+        """Keeping for backward compatibility."""
+        return [self._unified_placement_group]
 
     def world_size(self) -> int:
         return self._world_size
@@ -372,40 +348,22 @@ class RayVirtualCluster:
     def node_count(self) -> int:
         return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
 
-    def get_available_address_and_port(
-        self, pg_idx: int, bundle_idx: int
-    ) -> tuple[str, int]:
+    def get_available_address_and_port(self, bundle_idx: int) -> tuple[str, int]:
         """Gets an available address and port for the given placement group index and bundle index.
 
         Returns:
             Tuple of (address, port)
         """
         # Get placement groups if not already created
-        if not self._node_placement_groups:
-            self.get_placement_groups()
+        pg = self.get_unified_placement_group()
 
-        # Get the placement group
-        placement_groups = self.get_placement_groups()
-        if len(placement_groups) == 1:
-            pg = placement_groups[0]
-        else:
-            pg = placement_groups[pg_idx]
-
-        if pg.bundle_specs:
-            # Launch port finder on the given bundle of this placement group
-            addr, port = ray.get(
-                _get_node_ip_and_free_port.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=bundle_idx
-                    ),
-                    # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
-                    num_cpus=0,
-                ).remote()
-            )
-            return addr, port
-
-        raise RuntimeError(
-            "No valid placement groups found to get available address and port"
+        return ray.get(
+            _get_node_ip_and_free_port.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg, placement_group_bundle_index=bundle_idx
+                ),
+                num_cpus=0,
+            ).remote()
         )
 
     def get_master_address_and_port(self) -> tuple[str, int]:
@@ -414,36 +372,30 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
+        assert self._bundle_ids_sorted_by_ip_and_gpu is not None, (
+            "self._bundle_ids_sorted_by_ip_and_gpu should be created before calling get_master_address_and_port."
+        )
         # Get placement groups if not already created
-        if not self._node_placement_groups:
-            self.get_placement_groups()
+        pg = self.get_unified_placement_group()
+        bundle_ids = self._bundle_ids_sorted_by_ip_and_gpu  # Type guard for mypy
+        return ray.get(
+            _get_node_ip_and_free_port.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=bundle_ids[0],
+                ),
+                num_cpus=0,
+            ).remote()
+        )
 
-        # If sorted bundle indices are available, get the address and port for the first bundle index
-        if self._sorted_bundle_indices is not None:
-            return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
-            )
-
-        # Otherwise, get the address and port for bundle index 0
-        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
-
-    def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
+    def _get_sorted_bundle_and_node_ids(self) -> tuple[list[int], list[int]]:
         """Gets the sorted bundle indices for the placement groups."""
-        if self._node_placement_groups is None:
-            raise ValueError(
-                "Placement groups must be initialized before calling _get_sorted_bundle_indices"
-            )
-
-        if not self.use_gpus:
-            return None
-
-        if len(self._node_placement_groups) != 1:
-            return None
-
-        pg = self._node_placement_groups[0]
+        pg = self.get_unified_placement_group()
         pg_data = placement_group_table(pg)
         num_bundles = len(pg_data["bundles"])
         bundle_to_node_ids = pg_data["bundles_to_node_id"]
+        sorted_node_ids = sorted(set(bundle_to_node_ids.values()))
+        node_id_to_index = {node_id: idx for idx, node_id in enumerate(sorted_node_ids)}
 
         # use info actor to get the GPU id
         info_actors = []
@@ -460,19 +412,99 @@ class RayVirtualCluster:
                 ).remote()
             )
 
-        gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+        ip_and_gpu_ids = ray.get(
+            [actor.get_ip_and_gpu_id.remote() for actor in info_actors]
+        )
         for actor in info_actors:
             ray.kill(actor)
 
         # original index, node_id, gpu_id
+        ip_map = lambda ip_address: tuple(int(x) for x in ip_address.split("."))
         bundle_infos = [
-            (i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)
+            (i, ip_map(ip_and_gpu_ids[i][0]), ip_and_gpu_ids[i][1])
+            for i in range(num_bundles)
         ]
-        pg_reordered_bundle_indices = [
-            bundle_info[0]
-            for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
-        ]  # sort by node_id, then gpu_id
-        return pg_reordered_bundle_indices
+        sorted_bundle_ids = []
+        sorted_node_ids = []
+        for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2])):
+            bundle_index = bundle_info[0]
+            nid = bundle_to_node_ids[bundle_index]
+            node_index = node_id_to_index[nid]
+            sorted_bundle_ids.append(bundle_index)
+            sorted_node_ids.append(node_index)
+        return sorted_bundle_ids, sorted_node_ids
+
+    def get_bundle_indices_list_for_worker_group(
+        self,
+        tied_worker_group_size: int,
+        workers_per_node: Optional[int],
+        num_nodes: Optional[int],
+        cluster_node_offset: Optional[int],
+        cluster_gpu_offset_each_node: Optional[int],
+    ) -> list[tuple[int, list[int]]]:
+        """Gets the bundle indices list for a worker group.
+
+        Args:
+            tied_worker_group_size: Number of workers in a tied worker group
+            workers_per_node: Number of workers per node
+            num_nodes: Number of nodes in the cluster
+            cluster_node_offset: Offset of the first node in the cluster
+            cluster_gpu_offset_each_node: Offset of the first GPU on each node in the cluster
+
+        Returns:
+            List of (node_idx, bundle_indices) tuples, where each tuple specifies a tied group with its node and local bundle indices.
+        """
+        assert self._bundle_ids_sorted_by_ip_and_gpu is not None, (
+            "self._bundle_ids_sorted_by_ip_and_gpu should be created before calling get_bundle_indices_list_for_worker_group."
+        )
+        assert self._node_ids_sorted_by_ip_and_gpu is not None, (
+            "self._node_ids_sorted_by_ip_and_gpu should be created before calling get_bundle_indices_list_for_worker_group."
+        )
+
+        # Type guards for mypy
+        bundle_ids = self._bundle_ids_sorted_by_ip_and_gpu
+        node_ids = self._node_ids_sorted_by_ip_and_gpu
+
+        # default values for arguments
+        num_nodes = num_nodes or self.node_count()
+        workers_per_node = workers_per_node or self.num_gpus_per_node
+        cluster_node_offset = cluster_node_offset or 0
+        cluster_gpu_offset_each_node = cluster_gpu_offset_each_node or 0
+
+        # sanity check
+        assert cluster_node_offset + num_nodes <= self.node_count(), (
+            f"cluster_node_offset={cluster_node_offset} + num_nodes={num_nodes} must be less than or equal to the number of nodes in the cluster ({self.node_count()})"
+        )
+        assert (
+            cluster_gpu_offset_each_node + workers_per_node <= self.num_gpus_per_node
+        ), (
+            f"cluster_gpu_offset_each_node={cluster_gpu_offset_each_node} + workers_per_node={workers_per_node} must be less than or equal to the number of GPUs per node in the cluster ({self.num_gpus_per_node})"
+        )
+
+        flattened_bundle_indices = []
+        flattened_node_indices = []
+        for x in range(cluster_node_offset, cluster_node_offset + num_nodes):
+            for y in range(
+                cluster_gpu_offset_each_node,
+                cluster_gpu_offset_each_node + workers_per_node,
+            ):
+                flattened_bundle_indices.append(
+                    bundle_ids[x * self.num_gpus_per_node + y]
+                )
+                flattened_node_indices.append(node_ids[x * self.num_gpus_per_node + y])
+        bundle_indices_list = []
+        for group_idx in range(len(flattened_bundle_indices) // tied_worker_group_size):
+            bundle_indices_this_group = flattened_bundle_indices[
+                group_idx * tied_worker_group_size : (group_idx + 1)
+                * tied_worker_group_size
+            ]
+            first_worker_node_idx = flattened_node_indices[
+                group_idx * tied_worker_group_size
+            ]
+            bundle_indices_list.append(
+                (first_worker_node_idx, bundle_indices_this_group)
+            )
+        return bundle_indices_list
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
@@ -481,17 +513,18 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
-        if self._node_placement_groups is not None:
+        if self._unified_placement_group is not None:
             # Remove all placement groups
-            for pg in self._node_placement_groups:
-                try:
-                    remove_placement_group(pg)
-                except Exception as e:
-                    # Log but continue if a placement group can't be removed
-                    print(f"Error removing placement group {pg.id}: {e}")
+            try:
+                remove_placement_group(self._unified_placement_group)
+            except Exception as e:
+                # Log but continue if a placement group can't be removed
+                print(
+                    f"Error removing placement group {self._unified_placement_group.id}: {e}"
+                )
 
             # Reset internal state
-            self._node_placement_groups = None
+            self._unified_placement_group = None
 
         return True
 
