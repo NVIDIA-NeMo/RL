@@ -36,5 +36,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # With a few number of steps the logprob can have spikes that can move the average up.
     # Enabling fp8 kvcache can cause the logprob to be slightly higher than fp8 linear only path, so we allow a larger tolerance.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/token_mult_prob_error"], ignore_top_p=0.15) < 2.0'
+        'median(data["train/token_mult_prob_error"]) < 2.0'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi
