@@ -80,11 +80,11 @@ def make_processed_microbatch_iterator(
             packed_seq_params,
             cu_seqlens_padded,
         ) = process_microbatch(
-            data_dict,
-            seq_length_key,
-            pad_individual_seqs_to_multiple_of,
-            pad_packed_seq_to_multiple_of,
-            pad_full_seq_to,
+            data_dict=data_dict,
+            seq_length_key=seq_length_key,
+            pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+            pad_full_seq_to=pad_full_seq_to,
             pack_sequences=pack_sequences,
         )
 
