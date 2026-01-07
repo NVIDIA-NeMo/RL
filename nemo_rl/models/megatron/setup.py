@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Callable, NamedTuple, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
@@ -44,6 +44,9 @@ from megatron.bridge.training import fault_tolerance
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -65,6 +68,37 @@ from nemo_rl.models.policy.utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+## returned from validate_and_set_config
+class RuntimeConfig(NamedTuple):
+    """Runtime configuration for model training and inference.
+
+    This contains all validated runtime settings needed for model initialization,
+    parallelization, and training.
+    """
+
+    megatron_cfg: ConfigContainer
+    model_cfg: Any
+    dtype: torch.dtype
+    optimizer_cpu_offload: bool
+    offload_optimizer_for_logprob: bool
+    is_generation_colocated: Optional[bool]
+    final_padded_vocab_size: int
+
+## returned from setup_model_and_optimizer
+class ModelAndOptimizerState(NamedTuple):
+    """Container for model and optimizer state.
+
+    This named tuple holds all model-related state including the model itself,
+    optimizer, scheduler, and metadata about the model type and configuration.
+    """
+
+    state: GlobalState
+    model: MegatronModule
+    optimizer: MegatronOptimizer
+    scheduler: OptimizerParamScheduler
+    checkpointing_context: dict[str, Any]
+    param_sync_func: Optional[Callable]
 
 
 def destroy_parallel_state():
@@ -227,7 +261,7 @@ def validate_and_set_config(
         config["megatron_cfg"]["tensor_model_parallel_size"],
     )
 
-    return (
+    return RuntimeConfig(
         megatron_cfg,
         model_cfg,
         dtype,
@@ -698,7 +732,14 @@ def setup_model_and_optimizer(
     # Get the first model from the list
     model = model[0]
 
-    return state, model, optimizer, scheduler, checkpointing_context, param_sync_func
+    return ModelAndOptimizerState(
+        state,
+        model,
+        optimizer,
+        scheduler,
+        checkpointing_context,
+        param_sync_func,
+    )
 
 def handle_model_import(config: PolicyConfig, hf_model_name: str, pretrained_path: str, pt_checkpoint_exists: bool) -> None:
     """Handle HF model import if checkpoint doesn't exist."""

@@ -86,14 +86,14 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
-from nemo_rl.models.megatron.setup import (
-    finalize_megatron_setup,
+from nemo_rl.models.megatron import (
     handle_model_import,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_model_paths,
     validate_and_set_config,
+    finalize_megatron_setup,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -208,15 +208,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        (
-            self.megatron_cfg,
-            model_cfg,
-            self.dtype,
-            self.optimizer_cpu_offload,
-            self.offload_optimizer_for_logprob,
-            self.is_generation_colocated,
-            self.final_padded_vocab_size,
-        ) = validate_and_set_config(
+        runtime_config = validate_and_set_config(
             config,
             self.rank,
             hf_model_name,
@@ -224,9 +216,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             tokenizer,
         )
 
+        self.megatron_cfg = runtime_config.megatron_cfg
+        self.dtype = runtime_config.dtype
+        self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
+        self.offload_optimizer_for_logprob = runtime_config.offload_optimizer_for_logprob
+        self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
+
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
-        ) and (model_cfg.fp16 or model_cfg.bf16)
+        ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
         
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -235,14 +234,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.megatron_cfg.validate()
         
         # Step 4: Setup Megatron model and components
-        (
-            self.mcore_state,
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.checkpointing_context,
-            param_sync_func,
-        ) = setup_model_and_optimizer(config, self.megatron_cfg, init_optimizer)
+        model_and_optimizer_state = setup_model_and_optimizer(config, self.megatron_cfg, init_optimizer)
+
+        self.mcore_state = model_and_optimizer_state.state
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.checkpointing_context = model_and_optimizer_state.checkpointing_context
+        param_sync_func = model_and_optimizer_state.param_sync_func
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
