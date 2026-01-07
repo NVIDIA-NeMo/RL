@@ -29,7 +29,7 @@ checkpointing:
   checkpoint_dir: results/dapo-qwen2.5-7b
   keep_top_k: 5
   save_period: 5
-  model_save_format: "dcp"
+  model_save_format: null
 policy:
   model_name: Qwen/Qwen2.5-Math-7B
   hf_config_overrides:
