@@ -254,22 +254,10 @@ env:
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
-    workplace_assistant_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 6  # Workplace assistant allows up to 6 tool-calling steps per task
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          judge_model_server:
-            name: policy_model
-          should_use_judge: false
     code_gen:
       resources_servers:
         code_gen:
           num_processes: ${mul:64, ${cluster.num_nodes}}
-          unit_test_timeout_secs: 10
-          debug: false
 
 logger:
   log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b"  # Base directory for all logs
