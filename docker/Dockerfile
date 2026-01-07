@@ -38,6 +38,9 @@ apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos
 apt update
 apt install -y nsight-systems-cli
 
+# Remove unused dependencies related to CVE-2025-68973
+apt-get remove --purge -y gnupg gpgv
+apt-get autoremove -y
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
