@@ -19,7 +19,7 @@ uv run examples/run_distillation_math.py \
     distillation.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=nemo-rl-distillation \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
@@ -38,4 +38,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["100"] < 0.25' \
         'data["validation/accuracy"]["100"] > 0.2' \
         'mean(data["timing/train/total_step_time"], -6, -1) < 1600'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi
