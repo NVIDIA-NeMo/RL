@@ -9,7 +9,7 @@ NUM_NODES=16
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=100
+NUM_MINUTES=115
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -24,6 +24,7 @@ uv run examples/run_grpo_math.py \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
