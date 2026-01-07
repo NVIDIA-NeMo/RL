@@ -72,7 +72,8 @@ def load_model_with_engine(
     temp_dir: str = "/tmp/model_hf_converted", 
     engine: str = "fast-dllm",
     algorithm_name: str = None,
-    use_chat_template: bool = True
+    use_chat_template: bool = True,
+    batch_size: int = 1,
 ):
     """
     Load model using the specified inference engine.
@@ -136,9 +137,9 @@ def load_model_with_engine(
     # Load the model using the algorithm
     try:
         if model_path:
-            success = algorithm.load_model_from_hf(model_path)
+            success = algorithm.load_model_from_hf(model_path, batch_size=batch_size)
         elif dcp_path:
-            success = algorithm.load_model_from_dcp(dcp_path, base_model, temp_dir)
+            success = algorithm.load_model_from_dcp(dcp_path, base_model, temp_dir, batch_size=batch_size)
         else:
             logger.error("Either model_path or dcp_path must be provided")
             return False
@@ -256,7 +257,7 @@ def validate_engine_for_model_type(model_type: str, engine: str) -> None:
     # Define valid engine combinations
     valid_engines = {
         'llada': ['fast-dllm', 'dinfer'],
-        'nemotron': ['nemotron', 'hf']
+        'nemotron': ['nemotron', 'dllm_eval', 'hf']
     }
     
     allowed = valid_engines.get(model_type, [])
@@ -923,7 +924,8 @@ Examples:
         temp_dir=args.temp_dir,
         engine=args.engine,
         algorithm_name=args.algorithm,
-        use_chat_template=not args.no_chat_template
+        use_chat_template=not args.no_chat_template,
+        batch_size=args.batch_size
     )
     
     if not success:

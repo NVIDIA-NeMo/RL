@@ -215,6 +215,13 @@ def _register_builtin_algorithms():
         logger.warning(f"Failed to register dInfer Credit generation: {e}")
 
     try:
+        from .dllmeval import DLLMEval
+        register_algorithm(DLLMEval(), aliases=['dllm_eval'])
+        logger.debug("Registered DLLM-Eval generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register DLLM-Eval: {e}")
+
+    try:
         from .huggingface import HuggingFaceGeneration
         register_algorithm(HuggingFaceGeneration(), aliases=['hf', 'huggingface', 'hugging_face', 'AR', 'ar'])
         logger.debug("Registered HuggingFace generation algorithm")

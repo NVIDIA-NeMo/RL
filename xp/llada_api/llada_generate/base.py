@@ -89,7 +89,7 @@ class GenerationAlgorithm(ABC):
         """
         pass
     
-    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None) -> bool:
+    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None, batch_size: int = 1) -> bool:
         """
         Load model from HuggingFace format.
         
@@ -126,7 +126,7 @@ class GenerationAlgorithm(ABC):
             
             # Load model using algorithm-specific loader
             logger.info("Loading model...")
-            self.model = self.load_model_class(model_path, torch_dtype=torch.bfloat16)
+            self.model = self.load_model_class(model_path, torch_dtype=torch.bfloat16, batch_size=batch_size)
             self.model = self.model.to(self.device).eval()
             
             # Load config
@@ -141,7 +141,7 @@ class GenerationAlgorithm(ABC):
             logger.error(f"Failed to load model from {path_type} '{model_path}': {e}")
             return False
     
-    def load_model_from_dcp(self, dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted") -> bool:
+    def load_model_from_dcp(self, dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted", batch_size: int = 1) -> bool:
         """
         Load model from DCP checkpoint by converting to HF format first.
         
@@ -192,7 +192,7 @@ class GenerationAlgorithm(ABC):
 
                 try:
                     logger.info("Attempting to load checkpoint without HF conversion...")
-                    res = self.load_model_from_hf(base_model, model_type=model_type)
+                    res = self.load_model_from_hf(base_model, model_type=model_type, batch_size=batch_size)
                     if res:
                         load_checkpoint(
                             model=self.model,
@@ -226,7 +226,7 @@ class GenerationAlgorithm(ABC):
             logger.info(f"Conversion completed. Loading from: {hf_path}")
             
             # Load from converted HF format
-            return self.load_model_from_hf(hf_path, model_type=model_type)
+            return self.load_model_from_hf(hf_path, model_type=model_type, batch_size=batch_size)
             
         except Exception as e:
             logger.error(f"Failed to convert or load DCP checkpoint: {e}")

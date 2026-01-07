@@ -30,6 +30,7 @@ class NemotronGeneration(GenerationAlgorithm):
         Always uses standard AutoModel for Nemotron.
         """
         logger.info("Loading Nemotron model with standard AutoModel")
+        kwargs.pop("batch_size", None)
         return AutoModel.from_pretrained(
             model_path,
             dlm_paradigm="bidirectional",

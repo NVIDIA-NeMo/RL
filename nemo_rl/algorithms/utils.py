@@ -17,6 +17,7 @@ import random
 import warnings
 from functools import partial, wraps
 from typing import Optional
+from itertools import groupby
 
 import numpy as np
 import torch
@@ -79,7 +80,7 @@ def prepare_for_mdlm_train_data(cat_and_padded: BatchedDataDict, mask_token_id: 
 
     return new_cat_and_padded
 
-def prepare_for_mdlm_train_data_blockwise(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25,) -> BatchedDataDict:
+def prepare_for_mdlm_train_data_blockwise_orig(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
     """
     Two-stage corruption with optional per-block sampling.
     • Stage 1:  m ~ U(eps, 1)   →   k = round(m · len)  (exact budget).
@@ -160,6 +161,115 @@ def prepare_for_mdlm_train_data_blockwise(cat_and_padded: BatchedDataDict, mask_
 
     if token_loss_mask is not None:
         masked_indices[token_loss_mask == 0] = 0
+
+    noisy_batch = torch.where(masked_indices, mask_token_id, input_ids)
+    
+    new_cat_and_padded = BatchedDataDict(
+        {
+            "token_ids": input_ids,
+            "noisy_token_ids": noisy_batch,
+            "token_loss_mask": token_loss_mask,
+            "noise_mask": masked_indices,
+            "p_mask": p_mask,
+        }
+    )
+
+    for k, v in cat_and_padded.items():
+        if k not in new_cat_and_padded:
+            new_cat_and_padded[k] = v
+
+    return new_cat_and_padded
+
+def prepare_for_mdlm_train_data_blockwise(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
+    """
+    Two-stage corruption with optional per-block sampling.
+    • Stage 1:  m ~ U(eps, 1)   →   k = round(m · len)  (exact budget).
+    • Stage 2:  sample exactly k positions with weights
+                w_i(m) = exp[ λ · (1−m) · i ]   (late-heavy when m→0,
+                                                 uniform when m→1).
+      If `block_size` is given, the procedure is run *independently*
+      inside each contiguous block of that length (last block may be shorter).
+      When block_size is provided, m is sampled per-block and p_mask is per-block.
+    Args
+    ----
+    input_ids : (B, L)  LongTensor
+    eps       : minimum corruption ratio
+    block_size: if not None, operate block-wise with per-block m sampling
+    half_life_ratio : controls steepness when m→0
+    """
+    
+    input_ids = cat_and_padded["token_ids"]
+    token_loss_mask = cat_and_padded["token_loss_mask"]
+    
+    assert token_loss_mask is not None
+    assert input_ids.ndim == token_loss_mask.ndim, f"NDIM mismatch, input_ids is {input_ids.ndim} and token_loss_mask is {token_loss_mask.ndim}"
+    
+    B, L = input_ids.shape
+    device = input_ids.device
+    dtype  = torch.float32
+
+    masked_indices = torch.zeros((B, L), dtype=torch.bool, device=device)
+    p_mask = torch.zeros((B, L), dtype=dtype, device=device)
+
+    # ---------- Stage 1 & 2: whole-sentence or block-wise -------------------
+    for b in range(B):
+        if block_size is None:
+            # ---------- Per-batch sampling (original behavior) ----------
+            m = eps + (1.0 - eps) * torch.rand(1, device=device).item()   # scalar
+            k_tot = int(round(m * L))
+            k_tot = max(1, min(k_tot, L))  # clamp to [1, L]
+            
+            # Fill p_mask for this batch
+            p_mask[b, :] = m
+            
+            slope = 1.0 - m          # ∈ [0,1]; 0 ⇒ uniform, 1 ⇒ late-heavy
+            
+            # ------- single pool over the whole sentence -------------
+            lam_base = math.log(2.0) / (half_life_ratio * L) # base decay rate (λ when slope=1)
+
+            pos   = torch.arange(L, device=device, dtype=dtype)
+            log_w = (lam_base * slope * pos).clone()
+
+            masked_indices[b] = gumbel_topk(log_w, k_tot)
+
+        else:
+            # ---------- Per-block sampling ----------
+            for mask_id, mask_idxes in groupby([(k,v) for k,v in zip(torch.arange(input_ids[b].shape[-1]).tolist(), token_loss_mask[b].tolist())], key=lambda x: x[1]):
+                mask_idxes_as_tensor = torch.tensor([x[0] for x in list(mask_idxes)], dtype=input_ids.dtype)
+                if mask_id == 0:
+                    continue
+                num_blocks = math.ceil(len(mask_idxes_as_tensor) / block_size)
+                lam_base = math.log(2.0) / (half_life_ratio * block_size) # base decay rate (λ when slope=1)
+    
+                for blk in range(num_blocks):
+                    start = (blk * block_size) + mask_idxes_as_tensor[0].item()
+                    end   = min((blk + 1) * block_size, len(mask_idxes_as_tensor)) + mask_idxes_as_tensor[0].item()
+                    blk_len = end - start
+    
+                    # Sample m per block
+                    m_blk = eps + (1.0 - eps) * torch.rand(1, device=device).item()
+                    
+                    # Fill p_mask for this block
+                    p_mask[b, start:end] = m_blk
+                    
+                    # per-block budget
+                    k_blk = int(round(m_blk * blk_len))
+                    k_blk = max(0, min(k_blk, blk_len))
+                    if k_blk == 0:
+                        continue
+    
+                    slope = 1.0 - m_blk          # ∈ [0,1]; 0 ⇒ uniform, 1 ⇒ late-heavy
+    
+                    pos   = torch.arange(blk_len, device=device, dtype=dtype)
+                    log_w = lam_base * slope * pos
+    
+                    blk_mask = gumbel_topk(log_w, k_blk)
+                    masked_indices[b, start:end] = blk_mask
+
+    assert p_mask[token_loss_mask == 0].sum() == 0, "p_mask elements at token_loss_mask are non-zero"
+    assert masked_indices[token_loss_mask == 0].sum() == 0, "masked_indices at token_loss_mask are non-zero"
+    assert p_mask.sum() > 0, "p_mask is entirely zeros"
+    assert masked_indices.sum() > 0, "masked_indices is entirely false"
 
     noisy_batch = torch.where(masked_indices, mask_token_id, input_ids)
     

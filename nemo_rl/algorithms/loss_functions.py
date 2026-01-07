@@ -517,7 +517,7 @@ class NLLLoss(LossFunction):
                 loss = loss / num_unmasked_tokens.clamp(min=1)
         elif mdlm_loss:
             p_mask = data["p_mask"]
-            loss = -masked_mean(token_logprobs / p_mask, mask, global_normalization_factor=global_valid_toks)
+            loss = -masked_mean(token_logprobs * torch.nan_to_num(1.0 / p_mask, posinf=1.0, neginf=1.0), mask, global_normalization_factor=global_valid_toks)
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
