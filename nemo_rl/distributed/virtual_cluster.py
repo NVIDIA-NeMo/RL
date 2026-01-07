@@ -59,7 +59,7 @@ class PY_EXECUTABLES:
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and SGLang.
-    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+    SGLANG = f"uv run --locked --extra automodel --extra sglang --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover
