@@ -1839,7 +1839,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> nn.Module:
         # FSDP modules do not move buffers to the device automatically
         for v in model.buffers():
-            v.data = v.data.to(device)
+            torch.utils.swap_tensors(v, v.to(device))
 
         return model
 
