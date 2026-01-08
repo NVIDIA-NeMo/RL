@@ -150,7 +150,7 @@ policy:
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-      max_tokens: 16384  # Maximum number of tokens to use in a single step
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       
     vllm_cfg:
       tensor_parallel_size: 1
