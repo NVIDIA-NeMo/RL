@@ -23,9 +23,6 @@ import aiohttp
 import ray
 import requests
 import torch
-from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
@@ -40,6 +37,22 @@ from nemo_rl.models.generation.sglang.utils import AsyncLoopThread
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 logger = logging.getLogger(__name__)
+
+
+def _require_sglang():
+    """Import `sglang` lazily so test collection works without the optional extra."""
+    try:
+        from sglang.srt.entrypoints.http_server import launch_server
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.utils import kill_process_tree
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "Optional dependency `sglang` is required for the SGLang generation backend.\n"
+            "Install it via the project extra (e.g. `uv run --extra sglang ...`) to use "
+            "`SGLangGenerationWorker`."
+        ) from e
+
+    return launch_server, ServerArgs, kill_process_tree
 
 
 @ray.remote(
@@ -145,6 +158,9 @@ class SGLangGenerationWorker:
         # Secondary workers (local_rank!=0) just returns
         if not self.is_model_owner:
             return
+
+        # `sglang` is an optional dependency; import only when we actually start a server.
+        _, ServerArgs, _ = _require_sglang()
 
         # Determine tp_size from bundle_indices length
         tp_size = len(bundle_indices)
@@ -491,10 +507,10 @@ class SGLangGenerationWorker:
 
         return results
 
-    def _launch_server_process(
-        self, server_args: ServerArgs
-    ) -> multiprocessing.Process:
+    def _launch_server_process(self, server_args: Any) -> multiprocessing.Process:
         """Launch the SGLang server process and wait for it to be ready."""
+        # Ensure `sglang` is importable when we actually start a server.
+        launch_server, _, kill_process_tree = _require_sglang()
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
         p.start()
 
@@ -714,6 +730,8 @@ class SGLangGenerationWorker:
             return True
 
         try:
+            # Only model owners started a server process; they require sglang for shutdown.
+            _, _, kill_process_tree = _require_sglang()
             if hasattr(self, "session") and self.session is not None:
                 try:
 

@@ -13,10 +13,19 @@
 # limitations under the License.
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 
 __all__ = [
     "SGLangConfig",
     "SGLangGeneration",
     "SGLangGenerationWorker",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SGLangGenerationWorker":
+        from nemo_rl.models.generation.sglang.sglang_worker import (
+            SGLangGenerationWorker,
+        )
+
+        return SGLangGenerationWorker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
