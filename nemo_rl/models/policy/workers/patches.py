@@ -106,70 +106,19 @@ def apply_transformer_engine_patch():
         print(f"Error checking/patching transformer_engine: {e}")
 
 
-from typing import Optional, Union
+# import torch
+# from torch.distributed.tensor.experimental import register_sharding
+# from torch.distributed.tensor.placement_types import Replicate, Shard
+
+# @register_sharding(torch.ops.aten.alias.default)
+# def custom_alias_sharding(x):
+#     acceptable_shardings = [(x.placements, x.placements)]
+#     return acceptable_shardings
 
 import torch
-from transformers.cache_utils import Cache
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
+from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
+from torch.distributed.tensor._ops.utils import (
+    register_op_strategy,
 )
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
-
-def _patched_qwen2_modeling_Qwen2ForCausalLM_forward(
-    self,
-    input_ids: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[Cache] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    logits_to_keep: Union[int, torch.Tensor] = 0,
-    **kwargs,
-) -> CausalLMOutputWithPast:
-    outputs: BaseModelOutputWithPast = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        cache_position=cache_position,
-        **kwargs,
-    )
-
-    hidden_states = outputs.last_hidden_state
-    # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-    if isinstance(logits_to_keep, int):
-        slice_indices_start = -logits_to_keep
-        slice_indices_end = hidden_states.shape[1]
-
-    else:
-        slice_indices_start = logits_to_keep[0]
-        slice_indices_end = logits_to_keep[1]
-
-    slice_indices_length = slice_indices_end - slice_indices_start
-    logits = self.lm_head(
-        hidden_states.narrow(1, slice_indices_start, slice_indices_length)
-    )
-
-    loss = None
-    if labels is not None:
-        loss = self.loss_function(
-            logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
-        )
-
-    return CausalLMOutputWithPast(
-        loss=loss,
-        logits=logits,
-        past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
-    )
-
-
-def apply_qwen2_modeling_qwen2_patch():
-    Qwen2ForCausalLM.forward = _patched_qwen2_modeling_Qwen2ForCausalLM_forward
+register_op_strategy(torch.ops.aten.alias.default)(propagate_single_input_strategy)
