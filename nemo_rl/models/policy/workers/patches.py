@@ -17,9 +17,7 @@ from importlib.util import find_spec
 
 import torch
 from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
-from torch.distributed.tensor._ops.utils import (
-    register_op_strategy,
-)
+from torch.distributed.tensor._ops.utils import register_op_strategy
 
 
 def _get_transformer_engine_file(relative_path: str) -> str:
@@ -119,6 +117,9 @@ def apply_torch_aten_alias_tensor_patch():
     in PyTorch 2.9. See https://github.com/pytorch/pytorch/pull/166867 for the upstream fix.
     We can remove this patch when we upgrade torch to include this fix.
     """
+    assert torch.__version__.startswith("2.9.0"), (
+        "This patch is needed for torch 2.9.0. Please retest if you upgrade torch to a newer version and remove this patch."
+    )
     try:
         register_op_strategy(torch.ops.aten.alias.default)(
             propagate_single_input_strategy

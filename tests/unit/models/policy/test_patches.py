@@ -451,14 +451,12 @@ def permutation_kernel(x):
 
 def build_sharded_3d(rank: int, world_size: int):
     """
-    Create a 3D DTensor sharded on the first dimension across 2 GPUs.
-
-    Shard: dimension 0 split evenly -> each rank gets shape (4, 4, 16)
+    Build tensor, DTensor, and test the sharding rule for torch.ops.aten.alias.default.
     """
     from torch.distributed.tensor import DeviceMesh, DTensor
 
     mesh = DeviceMesh("cuda", list(range(world_size)))
-    global_shape = (2, 2, 2)
+    global_shape = (4, 2, 4)
     tensor = torch.arange(
         torch.tensor(global_shape).prod(), dtype=torch.float32
     ).reshape(global_shape)
