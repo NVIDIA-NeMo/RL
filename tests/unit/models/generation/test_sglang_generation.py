@@ -228,6 +228,7 @@ def get_generation_cluster_separate(num_gpus_per_node: int = 2) -> RayVirtualClu
 # =============================================================================
 
 
+@pytest.mark.sglang
 @pytest.mark.timeout(120)
 def test_sglang_missing_required_config_key(cluster, tokenizer):
     """Test that an error is raised when a required config key is missing."""
@@ -240,6 +241,7 @@ def test_sglang_missing_required_config_key(cluster, tokenizer):
         SGLangGeneration(cluster, incomplete_config)
 
 
+@pytest.mark.sglang
 def test_sglang_top_p_top_k_validation(cluster, tokenizer):
     """Test that top_p and top_k values are accepted by SGLang.
 
@@ -270,6 +272,7 @@ def test_sglang_top_p_top_k_validation(cluster, tokenizer):
 # =============================================================================
 
 
+@pytest.mark.sglang
 @pytest.mark.timeout(180)
 def test_sglang_policy_generation(policy, test_input_data, tokenizer):
     """Test SGLang policy generation capabilities."""
@@ -308,6 +311,7 @@ def test_sglang_policy_generation(policy, test_input_data, tokenizer):
     )
 
 
+@pytest.mark.sglang
 def test_sglang_worker_seed_behavior(cluster, tokenizer):
     """
     Test that different workers generate different outputs for identical prompts due to different seeds.
@@ -405,6 +409,7 @@ def test_sglang_worker_seed_behavior(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
+@pytest.mark.sglang
 def test_sglang_policy_tensor_parallel(cluster, tokenizer):
     """Test SGLang policy with tensor parallelism > 1 (gpus_per_server=2)."""
     # Configure with gpus_per_server=2 for tensor parallelism
@@ -461,6 +466,7 @@ def test_sglang_policy_tensor_parallel(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
+@pytest.mark.sglang
 def test_sglang_generate_text(cluster, tokenizer):
     """Test that SGLang can generate coherent text.
 
@@ -549,6 +555,7 @@ def _wait_for_sglang_http_server_spinup(base_url: str):
     raise TimeoutError(f"SGLang server at {base_url} did not start within {max_wait}s")
 
 
+@pytest.mark.sglang
 def test_sglang_http_server(cluster, tokenizer):
     """Test that SGLang HTTP server works with direct API calls.
 
@@ -645,6 +652,7 @@ def test_sglang_http_server(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
+@pytest.mark.sglang
 @pytest.mark.timeout(180)
 def test_sglang_non_divisible_batch_handling(policy):
     """Test that SGLang generation handles non divisible input batches correctly."""
@@ -676,6 +684,7 @@ def test_sglang_non_divisible_batch_handling(policy):
 # =============================================================================
 
 
+@pytest.mark.sglang
 @pytest.mark.timeout(300)
 def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
     """Test that DTensor policy can work together with colocated SGLang policy."""
@@ -745,6 +754,7 @@ def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
 
 @pytest.mark.skip(reason="Non-colocated mode not implemented for SGLang")
 @pytest.mark.timeout(300)
+@pytest.mark.sglang
 def test_sglang_generation_with_hf_training_non_colocated(
     policy_cluster_separate, tokenizer
 ):
@@ -828,6 +838,7 @@ def test_sglang_generation_with_hf_training_non_colocated(
             print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
+@pytest.mark.sglang
 @pytest.mark.timeout(180)
 def test_sglang_weight_update_and_prefix_cache_reset(cluster, tokenizer):
     """Test that the SGLang prefix cache is correctly reset when weights change."""

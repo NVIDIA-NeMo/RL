@@ -313,6 +313,7 @@ markers = [
   "hf_gated: marks tests that require HuggingFace token access for gated models",
   "automodel: marks tests that require the automodel extra",
   "vllm: marks tests that require the vllm extra",
+  "sglang: marks tests that require the sglang extra",
 ]
 
 [tool.pyrefly]
