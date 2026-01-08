@@ -119,7 +119,7 @@ class AbstractPolicyWorker:
     def report_node_ip_and_gpu_id(self) -> tuple[str, int]:
         """Report the node IP and GPU ID of the current worker."""
         ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
+        gpu_id = int(ray.get_gpu_ids()[0])
         return (ip, gpu_id)
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
