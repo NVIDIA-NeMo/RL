@@ -25,6 +25,7 @@ import ray
 import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
+from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
@@ -49,6 +50,7 @@ from megatron.bridge.training.initialize import (
 )
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.setup import (
+    _create_peft_pre_wrap_hook,
     _update_model_config_funcs,
 )
 from megatron.bridge.training.state import GlobalState
@@ -85,6 +87,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import get_ltor_masks_and_position_ids
@@ -277,7 +280,14 @@ def setup_megatron_model(
 
     pre_wrap_hook = []
     mixed_precision_wrapper = Float16Module
+
+    use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
+        if use_peft:
+            raise ValueError(
+                "Freezing the MOE router is not currently supported when using PEFT"
+            )
 
         def freeze_moe_router(megatron_model):
             if not isinstance(megatron_model, list):
@@ -296,6 +306,34 @@ def setup_megatron_model(
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
 
+    if use_peft:
+        peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
+        peft = LoRA(
+            target_modules=peft_cfg["target_modules"],
+            exclude_modules=peft_cfg["exclude_modules"],
+            dim=peft_cfg["dim"],
+            alpha=peft_cfg["alpha"],
+            dropout=peft_cfg["dropout"],
+            dropout_position=peft_cfg["dropout_position"],
+            lora_A_init_method=peft_cfg["lora_A_init_method"],
+            lora_B_init_method=peft_cfg["lora_B_init_method"],
+            a2a_experimental=peft_cfg["a2a_experimental"],
+            lora_dtype=peft_cfg["lora_dtype"],
+        )
+    else:
+        peft = None
+    cfg.peft = peft
+
+    if cfg.peft is not None:
+        pre_peft_hook = _create_peft_pre_wrap_hook(cfg, state)
+        cfg.model.register_pre_wrap_hook(pre_peft_hook)
+
+        def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+            model = pre_peft_hook(model)
+            return model
+
+        pre_wrap_hook.extend([composed_peft_hook])
+
     # Model, optimizer, and learning rate.
     model = get_model(
         cfg.model,
@@ -306,6 +344,7 @@ def setup_megatron_model(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
+
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=cfg.optimizer,
@@ -319,15 +358,23 @@ def setup_megatron_model(
 
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
+    if cfg.peft is not None:
+        should_load_checkpoint = cfg.checkpoint.load is not None and checkpoint_exists(
+            cfg.checkpoint.load
+        )
+        if should_load_checkpoint:
+            # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
+            # This is switched off here in order to load these states from the checkpoint
+            cfg.checkpoint.finetune = False
+    else:
+        should_load_checkpoint = (
+            cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load)
+        ) or (
+            cfg.checkpoint.pretrained_checkpoint is not None
+            and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
+        )
 
-    # Load checkpoint if applicable
-    if (
-        cfg.checkpoint.load is not None
-        or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and (
-        checkpoint_exists(cfg.checkpoint.load)
-        or checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
-    ):
+    if should_load_checkpoint:
         load_checkpoint(
             state,
             model,
