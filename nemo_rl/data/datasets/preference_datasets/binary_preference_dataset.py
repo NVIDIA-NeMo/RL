@@ -13,31 +13,11 @@
 # limitations under the License.
 from typing import Any, Optional
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def to_preference_data_format(
-    data: dict[str, Any], prompt_key: str, chosen_key: str, rejected_key: str
-) -> dict[str, list[dict[str, Any]]]:
-    return {
-        "context": data[prompt_key]
-        if isinstance(data[prompt_key], list)
-        else [{"role": "user", "content": data[prompt_key]}],
-        "completions": [
-            {
-                "rank": 0,
-                "completion": [{"role": "assistant", "content": data[chosen_key]}],
-            },
-            {
-                "rank": 1,
-                "completion": [{"role": "assistant", "content": data[rejected_key]}],
-            },
-        ],
-    }
-
-
-class BinaryPreferenceDataset:
+class BinaryPreferenceDataset(RawDataset):
     """Dataset class for binary preference data which can be loaded from a JSON file.
 
     This class handles loading of preference data for DPO and RM training.
@@ -51,60 +31,57 @@ class BinaryPreferenceDataset:
     }
 
     Args:
-        train_data_path: Path to the JSON file containing training data
-        val_data_path: Path to the JSON file containing validation data
+        data_path: Path to the dataset JSON file
         prompt_key: Key for the input prompt/context, default is "prompt"
         chosen_key: Key for the preferred/winning response, default is "chosen"
         rejected_key: Key for the non-preferred/losing response, default is "rejected"
-        train_split: Split name for the training data, used for HuggingFace datasets, default is None
-        val_split: Split name for the validation data, used for HuggingFace datasets, default is None
+        split: Optional split name for the dataset, used for HuggingFace datasets
     """
 
     def __init__(
         self,
-        train_data_path: str,
-        val_data_path: Optional[str] = None,
+        data_path: str,
         prompt_key: str = "prompt",
         chosen_key: str = "chosen",
         rejected_key: str = "rejected",
-        train_split: Optional[str] = None,
-        val_split: Optional[str] = None,
+        split: Optional[str] = None,
+        **kwargs,
     ):
         self.prompt_key = prompt_key
         self.chosen_key = chosen_key
         self.rejected_key = rejected_key
+        self.task_name = data_path.split("/")[-1].split(".")[0]
 
-        # load from json file or huggingface
-        train_ds = load_dataset_from_path(train_data_path, train_split)
-        if val_data_path:
-            val_ds = load_dataset_from_path(val_data_path, val_split)
-        else:
-            val_ds = None
+        # load from local or huggingface
+        self.dataset = load_dataset_from_path(data_path, split)
 
         # format the dataset
-        # convert to PreferenceDataset format
-        train_ds = train_ds.map(
-            to_preference_data_format,
-            fn_kwargs={
-                "prompt_key": prompt_key,
-                "chosen_key": chosen_key,
-                "rejected_key": rejected_key,
-            },
+        self.dataset = self.dataset.map(
+            self.format_data,
+            remove_columns=self.dataset.column_names,
         )
-        if val_ds:
-            val_ds = val_ds.map(
-                to_preference_data_format,
-                fn_kwargs={
-                    "prompt_key": prompt_key,
-                    "chosen_key": chosen_key,
-                    "rejected_key": rejected_key,
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(data[self.prompt_key], list):
+            context = data[self.prompt_key]
+        else:
+            context = [{"role": "user", "content": data[self.prompt_key]}]
+
+        return {
+            "context": context,
+            "completions": [
+                {
+                    "rank": 0,
+                    "completion": [
+                        {"role": "assistant", "content": data[self.chosen_key]}
+                    ],
                 },
-            )
-
-        # store the formatted dataset
-        self.formatted_ds = {
-            "train": train_ds,
-            "validation": val_ds,
+                {
+                    "rank": 1,
+                    "completion": [
+                        {"role": "assistant", "content": data[self.rejected_key]}
+                    ],
+                },
+            ],
+            "task_name": self.task_name,
         }
-
-        self.task_spec = TaskDataSpec(task_name="BinaryPreferenceDataset")

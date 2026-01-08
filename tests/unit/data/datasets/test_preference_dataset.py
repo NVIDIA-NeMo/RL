@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import os
 import tempfile
 
 import pytest
@@ -21,220 +20,121 @@ import pytest
 from nemo_rl.data.datasets import load_preference_dataset
 
 
-@pytest.fixture
-def mock_preference_data():
-    """Create temporary preference dataset files with sample data."""
-    preference_data = [
+def create_sample_data(
+    is_binary, prompt_key="prompt", chosen_key="chosen", rejected_key="rejected"
+):
+    data = [
         {
-            "context": [{"role": "user", "content": "What is 2+2?"}],
-            "completions": [
-                {
-                    "rank": 1,
-                    "completion": [
-                        {"role": "assistant", "content": "The answer is 4."}
-                    ],
-                },
-                {
-                    "rank": 2,
-                    "completion": [{"role": "assistant", "content": "I don't know."}],
-                },
-            ],
+            prompt_key: "What is 2+2?",
+            chosen_key: "The answer is 4.",
+            rejected_key: "I don't know.",
         },
         {
-            "context": [{"role": "user", "content": "What is the capital of France?"}],
-            "completions": [
-                {
-                    "rank": 1,
-                    "completion": [
-                        {
-                            "role": "assistant",
-                            "content": "The capital of France is Paris.",
-                        }
-                    ],
-                },
-                {
-                    "rank": 2,
-                    "completion": [
-                        {
-                            "role": "assistant",
-                            "content": "The capital of France is London.",
-                        }
-                    ],
-                },
-            ],
+            prompt_key: "What is the capital of France?",
+            chosen_key: "The capital of France is Paris.",
+            rejected_key: "The capital of France is London.",
         },
     ]
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as preference_file:
-        json.dump(preference_data, preference_file)
-        preference_path = preference_file.name
+    if not is_binary:
+        data = [
+            {
+                "context": [{"role": "user", "content": item[prompt_key]}],
+                "completions": [
+                    {
+                        "rank": 0,
+                        "completion": [
+                            {"role": "assistant", "content": item[chosen_key]}
+                        ],
+                    },
+                    {
+                        "rank": 1,
+                        "completion": [
+                            {"role": "assistant", "content": item[rejected_key]}
+                        ],
+                    },
+                ],
+            }
+            for item in data
+        ]
 
-    try:
-        yield preference_path
-    finally:
-        # Cleanup
-        os.unlink(preference_path)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        data_path = f.name
 
-
-def test_preference_dataset_initialization(mock_preference_data):
-    """Test that PreferenceDataset initializes correctly with valid data files."""
-    # Load the dataset
-    data_config = {
-        "dataset_name": "PreferenceDataset",
-        "train_data_path": mock_preference_data,
-    }
-    dataset = load_preference_dataset(data_config)
-
-    # Verify dataset initialization
-    assert dataset.task_spec.task_name == "PreferenceDataset"
-
-    # Verify formatted_ds structure
-    assert "train" in dataset.formatted_ds
-    assert len(dataset.formatted_ds["train"]) == 2
-
-
-def test_preference_dataset_data_format(mock_preference_data):
-    """Test that PreferenceDataset correctly loads and formats the data."""
-    # Load the dataset
-    data_config = {
-        "dataset_name": "PreferenceDataset",
-        "train_data_path": mock_preference_data,
-    }
-    dataset = load_preference_dataset(data_config)
-
-    # Verify data format
-    sample = dataset.formatted_ds["train"][0]
-    assert "context" in sample
-    assert "completions" in sample
-
-    # Verify context structure
-    assert isinstance(sample["context"], list)
-    assert len(sample["context"]) == 1
-    assert "role" in sample["context"][0]
-    assert "content" in sample["context"][0]
-
-    # Verify completions structure
-    assert isinstance(sample["completions"], list)
-    assert len(sample["completions"]) == 2
-
-    for completion in sample["completions"]:
-        assert "rank" in completion
-        assert "completion" in completion
-        assert isinstance(completion["rank"], int)
-        assert isinstance(completion["completion"], list)
+    return data_path
 
 
-@pytest.fixture
-def mock_binary_preference_data():
-    """Create temporary chosen_rejected dataset files with sample data."""
-    train_data = [
-        {
-            "prompt": "What is 2+2?",
-            "chosen_response": "The answer is 4.",
-            "rejected_response": "I don't know.",
-        },
-        {
-            "prompt": "What is the capital of France?",
-            "chosen_response": "The capital of France is Paris.",
-            "rejected_response": "The capital of France is London.",
-        },
-    ]
-
-    val_data = [
-        {
-            "prompt": "What is 3*3?",
-            "chosen_response": "The answer is 9.",
-            "rejected_response": "The answer is 6.",
-        }
-    ]
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as train_file:
-        json.dump(train_data, train_file)
-        train_path = train_file.name
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as val_file:
-        json.dump(val_data, val_file)
-        val_path = val_file.name
-
-    try:
-        yield train_path, val_path
-    finally:
-        # Cleanup
-        os.unlink(train_path)
-        os.unlink(val_path)
-
-
-def test_binary_preference_dataset_initialization(mock_binary_preference_data):
-    """Test that PreferenceDataset initializes correctly with valid data files."""
-    # Load the dataset
-    train_path, val_path = mock_binary_preference_data
+@pytest.mark.parametrize(
+    "prompt_key,chosen_key,rejected_key",
+    [("prompt", "chosen", "rejected"), ("question", "answer1", "answer2")],
+)
+def test_binary_preference_dataset(prompt_key, chosen_key, rejected_key):
+    # load the dataset
+    data_path = create_sample_data(
+        is_binary=True,
+        prompt_key=prompt_key,
+        chosen_key=chosen_key,
+        rejected_key=rejected_key,
+    )
     data_config = {
         "dataset_name": "BinaryPreferenceDataset",
-        "train_data_path": train_path,
-        "val_data_path": val_path,
-        "prompt_key": "prompt",
-        "chosen_key": "chosen_response",
-        "rejected_key": "rejected_response",
+        "data_path": data_path,
+        "prompt_key": prompt_key,
+        "chosen_key": chosen_key,
+        "rejected_key": rejected_key,
     }
     dataset = load_preference_dataset(data_config)
 
-    # Verify dataset initialization
-    assert dataset.task_spec.task_name == "BinaryPreferenceDataset"
+    # check prompt, chosen and rejected keys
+    assert dataset.prompt_key == prompt_key
+    assert dataset.chosen_key == chosen_key
+    assert dataset.rejected_key == rejected_key
 
-    # Verify formatted_ds structure
-    assert "train" in dataset.formatted_ds
-    assert "validation" in dataset.formatted_ds
+    # check the first example
+    first_example = dataset.dataset[0]
 
-    assert len(dataset.formatted_ds["train"]) == 2
-    assert len(dataset.formatted_ds["validation"]) == 1
+    # only contains context, completions and task_name
+    assert len(first_example.keys()) == 3
+    assert "context" in first_example
+    assert "completions" in first_example
+    assert "task_name" in first_example
 
-
-def test_binary_preference_dataset_invalid_files():
-    """Test that PreferenceDataset raises appropriate errors with invalid files."""
-    with pytest.raises(FileNotFoundError):
-        data_config = {
-            "dataset_name": "BinaryPreferenceDataset",
-            "train_data_path": "nonexistent.json",
-            "val_data_path": "nonexistent.json",
-            "prompt_key": "prompt",
-            "chosen_key": "chosen_response",
-            "rejected_key": "rejected_response",
-        }
-        load_preference_dataset(data_config)
-
-
-def test_binary_preference_dataset_data_format(mock_binary_preference_data):
-    """Test that PreferenceDataset correctly formats the data."""
-    # Load the dataset
-    train_path, val_path = mock_binary_preference_data
-    data_config = {
-        "dataset_name": "BinaryPreferenceDataset",
-        "train_data_path": train_path,
-        "val_data_path": val_path,
-        "prompt_key": "prompt",
-        "chosen_key": "chosen_response",
-        "rejected_key": "rejected_response",
-    }
-    dataset = load_preference_dataset(data_config)
-
-    # Verify data format
-    train_sample = dataset.formatted_ds["train"][0]
-    assert "context" in train_sample
-    assert "completions" in train_sample
-
-    # Verify data content
-    print(train_sample["completions"])
-    assert train_sample["context"] == [{"content": "What is 2+2?", "role": "user"}]
-    assert train_sample["completions"] == [
+    # check the content
+    assert first_example["context"] == [{"role": "user", "content": "What is 2+2?"}]
+    assert first_example["completions"] == [
         {
-            "completion": [{"content": "The answer is 4.", "role": "assistant"}],
+            "completion": [{"role": "assistant", "content": "The answer is 4."}],
             "rank": 0,
         },
-        {"completion": [{"content": "I don't know.", "role": "assistant"}], "rank": 1},
+        {"completion": [{"role": "assistant", "content": "I don't know."}], "rank": 1},
+    ]
+
+
+def test_preference_dataset():
+    # load the dataset
+    data_path = create_sample_data(is_binary=False)
+    data_config = {
+        "dataset_name": "PreferenceDataset",
+        "data_path": data_path,
+    }
+    dataset = load_preference_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains context, completions and task_name
+    assert len(first_example.keys()) == 3
+    assert "context" in first_example
+    assert "completions" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["context"] == [{"role": "user", "content": "What is 2+2?"}]
+    assert first_example["completions"] == [
+        {
+            "completion": [{"role": "assistant", "content": "The answer is 4."}],
+            "rank": 0,
+        },
+        {"completion": [{"role": "assistant", "content": "I don't know."}], "rank": 1},
     ]
