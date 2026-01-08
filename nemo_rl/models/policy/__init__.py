@@ -55,6 +55,7 @@ class AutomodelBackendConfig(TypedDict):
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
     # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
+    # This should almost always be set to True when using a custom MoE implementation. Set to False only for specific use cases like debugging or performance testing.
     enable_hf_state_dict_adapter: NotRequired[bool]
     # Enable FSDP-specific optimizations
     enable_fsdp_optimizations: NotRequired[bool]
