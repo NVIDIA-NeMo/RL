@@ -56,7 +56,7 @@ def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
     }
 ```
 
-NeMo RL SFT uses HuggingFace chat templates to format the individual examples. Three types of chat templates are supported, which can be configured via `tokenizer.chat_template` in your yaml config (see [sft.yaml](../../examples/configs/sft.yaml) for an example):
+NeMo RL SFT uses Hugging Face chat templates to format the individual examples. Three types of chat templates are supported, which can be configured using the `tokenizer.chat_template` in your YAML config (see [sft.yaml](../../examples/configs/sft.yaml) for an example):
 
 1. Apply the tokenizer's default chat template. To use the tokenizer's default, either omit `tokenizer.chat_template` from the config altogether, or set `tokenizer.chat_template="default"`.
 2. Use a "passthrough" template which simply concatenates all messages. This is desirable if the chat template has been applied to your dataset as an offline preprocessing step. In this case, you should set `tokenizer.chat_template` to None as follows:
@@ -64,7 +64,7 @@ NeMo RL SFT uses HuggingFace chat templates to format the individual examples. T
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
@@ -74,7 +74,7 @@ NeMo RL SFT uses HuggingFace chat templates to format the individual examples. T
 By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
   train:
@@ -187,7 +187,7 @@ NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
 Notes:
 - LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
-- Triton kernels are only used in the DTensor v2 path. For TP > 1, Automodel currently does not support Triton kernels (see note below).
+- Triton kernels are only used in the DTensor v2 path. For `tensor_parallel_size > 1`, Automodel currently does not support Triton kernels (see note below).
 
 ### DTensor Configuration Parameters
 
