@@ -55,7 +55,6 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
         )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
-        # TODO: also test after SFT updated
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
@@ -69,9 +68,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
     elif dataset_name == "DAPOMathAIME2024":
         base_dataset: Any = DAPOMathAIME2024Dataset(**data_config)
     # for vlm training
-    # TODO: test after GRPO-VLM updated
     elif dataset_name == "clevr-cogent":
-        # TODO: also test after SFT updated
         base_dataset: Any = CLEVRCoGenTDataset(**data_config)
     elif dataset_name == "refcoco":
         base_dataset: Any = RefCOCODataset(**data_config)
