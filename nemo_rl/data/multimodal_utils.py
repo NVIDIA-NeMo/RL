@@ -322,7 +322,6 @@ def load_media_from_message(
     if "audio" in media_in_message:
         for aud in media_in_message["audio"]:
             if isinstance(aud, str):
-                print(multimodal_load_kwargs)
                 assert "audio" in multimodal_load_kwargs and "sampling_rate"  in multimodal_load_kwargs["audio"]
                 try:
                     loaded_media["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
