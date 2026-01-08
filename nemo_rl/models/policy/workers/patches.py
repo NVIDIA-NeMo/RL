@@ -15,6 +15,12 @@
 import os
 from importlib.util import find_spec
 
+import torch
+from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
+from torch.distributed.tensor._ops.utils import (
+    register_op_strategy,
+)
+
 
 def _get_transformer_engine_file(relative_path: str) -> str:
     """Return absolute path to a Transformer Engine file or raise if it cannot be found.
@@ -106,19 +112,16 @@ def apply_transformer_engine_patch():
         print(f"Error checking/patching transformer_engine: {e}")
 
 
-# import torch
-# from torch.distributed.tensor.experimental import register_sharding
-# from torch.distributed.tensor.placement_types import Replicate, Shard
+def apply_torch_aten_alias_tensor_patch():
+    """Register a sharding rule for `torch.ops.aten.alias.default`.
 
-# @register_sharding(torch.ops.aten.alias.default)
-# def custom_alias_sharding(x):
-#     acceptable_shardings = [(x.placements, x.placements)]
-#     return acceptable_shardings
-
-import torch
-from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
-from torch.distributed.tensor._ops.utils import (
-    register_op_strategy,
-)
-
-register_op_strategy(torch.ops.aten.alias.default)(propagate_single_input_strategy)
+    Work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
+    in PyTorch 2.9. See https://github.com/pytorch/pytorch/pull/166867 for the upstream fix.
+    We can remove this patch when we upgrade torch to include this fix.
+    """
+    try:
+        register_op_strategy(torch.ops.aten.alias.default)(
+            propagate_single_input_strategy
+        )
+    except Exception as e:
+        print(f"Error applying torch.ops.aten.alias.default patch: {e}")

@@ -87,6 +87,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
+    apply_torch_aten_alias_tensor_patch,
     apply_transformer_engine_patch,
 )
 from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
@@ -129,6 +130,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Initialize the DTensorPolicyWorkerV2."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
+        apply_torch_aten_alias_tensor_patch()
 
         self.tokenizer = tokenizer
         self.processor = processor
