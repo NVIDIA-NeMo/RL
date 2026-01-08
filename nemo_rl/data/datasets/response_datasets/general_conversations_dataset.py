@@ -13,17 +13,128 @@
 # limitations under the License.
 
 import os
+import re
+import warnings
 from functools import partial
-from typing import Any, Optional, Literal
+from typing import Any, Dict, Callable, Optional
 from collections import defaultdict
 
 from nemo_rl.data import multimodal_utils
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.datasets.response_datasets import conversation_base
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
 _DEBUG=True
+
+
+# map the senders from the sample to the allowed ones
+conversation_sender_mapping_sample_to_allowed = {
+    'human': 'user',
+    'gpt': 'assistant',
+    'agent': 'assistant',
+}
+
+
+# convert 
+def convert_metadata(metadata: Dict[str, Any], return_inplace=False):
+    data = metadata
+    if not return_inplace:
+        data = metadata.copy()
+
+    for tag in multimodal_utils.media_tags_to_allowed:
+        if tag in data:
+            tag_mapped = multimodal_utils.media_tags_to_allowed[tag]
+            if tag_mapped not in data:
+                data[tag_mapped] = data[tag]
+                del  data[tag]
+            else:
+                warnings.warn(
+                    f"Trying to map {tag} to {tag_mapped}, but {tag_mapped} already exists in the raw data. Mapping is not carried out."
+                )
+
+    for idx, message in enumerate(data["conversations"]):
+        msg_str = message["value"]
+        for tag in multimodal_utils.media_tags_to_allowed:
+            tag_str = '<' + tag + '>'
+            if tag_str in msg_str:
+                tag_str_mapped = multimodal_utils.media_tags[
+                    multimodal_utils.media_tags_to_allowed[tag]
+                ]
+                msg_str = msg_str.replace(tag_str, tag_str_mapped)
+        message["value"] = msg_str
+        data["conversations"][idx] = message
+
+    if not return_inplace:
+        return data
+
+
+def conversation_process_message(
+    metadata: Dict[str, Any],
+    message: Dict[str, str],
+    media_index: dict,
+    raw: Optional[Dict[str, Any]] = None,
+    allow_empty_text: bool = False,
+    check_if_media_file_exist: bool = True,
+    tried_default_extensions: Optional[set] = None,
+    process_message_fragment: Callable = lambda tag, fragment: [{tag: fragment}],
+) -> list[Dict[str, Any]]:
+    """
+    Args:
+        raw: dictionary with all webdataset compliant keys of a sample. 
+            Emtpy for jsonl dataset, non-empty otherwise
+        metadata: 
+    """
+    if raw is None:
+        raw = {}
+    if tried_default_extensions is None:
+        tried_default_extensions = set()
+    fragments = []    
+    parts = re.split(multimodal_utils.media_tag_pattern, message["value"])
+    
+    # Convert the parts to message fragments
+    empty_text = True
+    for i, part in enumerate(parts):
+        if part in multimodal_utils.media_tags.values():
+            # process multimodal tags
+            tag = multimodal_utils.media_tags_reversed[part]
+            if tag not in metadata:
+                raise ValueError(f"{part} is found in the message, but no corresponding {tag} key can be found in {metadata}")
+            if not isinstance(metadata[tag], list):
+                metadata[tag] = [metadata[tag]]
+            # try to extract the media object from the shard
+            ext = os.path.basename(metadata[tag][media_index[tag]]).split('.', 1)[1]
+            if raw and ext not in raw and \
+                tag not in tried_default_extensions and \
+                tag in multimodal_utils.default_media_extensions:
+                # try the default extension
+                for ext in multimodal_utils.default_media_extensions[tag]:
+                    if ext in raw:
+                        tried_default_extensions.add(ext)
+                        break
+            media_file = None
+            if ext in raw:
+                media_file = ext
+            elif isinstance(metadata[tag][media_index[tag]], str) and \
+                os.path.isfile(metadata[tag][media_index[tag]]):
+                # if cannot get it from the shard files, try to find the local file
+                media_file = metadata[tag][media_index[tag]]
+            elif check_if_media_file_exist:
+                sample_to_print = raw if raw else metadata
+                raise ValueError(f"Cannot find the media file {metadata[tag][media_index[tag]]} from {sample_to_print} or locally.")
+            else:
+                media_file = metadata[tag][media_index[tag]]
+            media_index[tag] += 1
+            fragments += process_message_fragment(tag, media_file)
+        else:
+            # process text
+            if part.strip():
+                fragments += process_message_fragment('text', part)
+                empty_text = False
+                
+    if not allow_empty_text and empty_text:
+        fragments += process_message_fragment('text', ' ')
+
+    return fragments
 
 
 class GeneralConversationsJsonlDataset:
@@ -98,7 +209,7 @@ class GeneralConversationsJsonlDataset:
 
         self.datum_preprocessor = {
             "train": partial(self._datum_preprocessor, media_directory=train_media_data_dir),
-            "val": partial(self._datum_preprocessor, media_directory=val_media_data_dir)
+            "validation": partial(self._datum_preprocessor, media_directory=val_media_data_dir)
         }
         
         self.task_spec = TaskDataSpec(task_name="GeneralConversationsJsonlDataset")
@@ -133,13 +244,15 @@ class GeneralConversationsJsonlDataset:
         if "conversations" in example:
             media_index = defaultdict(int)
             tried_default_extensions = set()
-            data = conversation_base.convert_metadata(example)
+            data = convert_metadata(example)
 
             for message in data["conversations"]:
                 role = message["from"]
                 if role not in {"user", "assistant"}:
-                    role = conversation_base.conversation_sender_mapping_sample_to_allowed[role]
-                content = conversation_base.conversation_process_message(
+                    role = conversation_sender_mapping_sample_to_allowed.get(role)
+                    if role is None:
+                        raise ValueError(f"Unknown conversation role: {message['from']}")
+                content = conversation_process_message(
                     data,
                     message,
                     media_index,
