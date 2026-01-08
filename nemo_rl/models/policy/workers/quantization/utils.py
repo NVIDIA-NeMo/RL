@@ -26,7 +26,7 @@ from modelopt.torch.utils.dataset_utils import (
     create_forward_loop,
     get_dataset_dataloader,
 )
-from modelopt.torch.utils.plugins.megatron_generate import megatron_prefill
+from modelopt.torch.utils.plugins import megatron_prefill
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -214,14 +214,13 @@ def get_forward_loop_func(
             for _, module in model.named_modules():
                 if isinstance(module, TopKRouter):
                     module.topk = module.num_experts
-
         for batch in calib_dataloader:
             megatron_prefill(model, batch["input_ids"])
 
-            if force_all_expert_routing:
-                for _, module in model.named_modules():
-                    if isinstance(module, TopKRouter):
-                        module.topk = module.config.moe_router_topk
+        if force_all_expert_routing:
+            for _, module in model.named_modules():
+                if isinstance(module, TopKRouter):
+                    module.topk = module.config.moe_router_topk
 
     return _forward_loop
 
@@ -235,6 +234,7 @@ def quantize_model(
     batch_size=32,
     data="cnn_dailymail",
     force_all_expert_routing: bool = True,
+    max_sample_length=1024,
 ):
     """Quantizes the model with the provided calibration dataset.
 
@@ -259,6 +259,7 @@ def quantize_model(
         num_samples=calib_size,
         device=device,
         include_labels=False,
+        max_sample_length=max_sample_length,
     )
 
     mtq_cfg = CUSTOM_CONFIG.get(quant_cfg)  # type: ignore [arg-type]

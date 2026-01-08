@@ -66,14 +66,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         buf.weight_loader = input_amax_loader
                     elif "weight_quantizer" in name:
                         buf.weight_loader = weight_amax_loader
-                    print("buf", name, buf.shape)
+                    # print("buf", name, buf.shape)
                     buffers_with_loader.append(buf)
                 yield name, buf
 
         # Bind the new method to the instance
         model.named_parameters = types.MethodType(new_named_parameters, model)
         try:
-            print("calling patch named parameters to include buffers")
+            # print("calling patch named parameters to include buffers")
             yield
         finally:
             # Restore original method

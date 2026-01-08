@@ -19,20 +19,25 @@ from contextlib import contextmanager
 from typing import Generator
 
 import ray
+import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import quantization_layer_spec
 from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
+from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
 from modelopt.torch.opt.dynamic import DynamicModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
+from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
+    destroy_parallel_state,
 )
 from nemo_rl.models.policy.workers.quantization.utils import (
     get_tokenizer,
@@ -45,17 +50,47 @@ from nemo_rl.models.policy.workers.quantization.utils import (
 )  # pragma: no cover
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
-        # config["megatron_cfg"]["transformer_layer_spec"] = quantization_layer_spec
-        hf_model_name = config["model_name"]
+        self._patch_setup_megatron_model()
+        super().__init__(config, *args, **kwargs)
+
+        # add quantizer states to reference state dict, so we don't need to modify use_reference_model logic
+        if hasattr(self, "reference_state_dict"):
+            for name, item in self.model.state_dict().items():
+                if "_quantizer." in name:
+                    self.reference_state_dict[name] = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
+
+    def _import_model_from_hf(self, hf_model_name: str):
+        """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
+
+        This will quantize the model before saving. In cases like distillation, if the teacher model is same as the student
+        model, we need to save an extra quantized checkpoint.
+
+        Args:
+            hf_model_name: Hugging Face model ID or local path (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
+
+        Returns:
+            The path to the Megatron checkpoint.
+        """
+        # Check if the checkpoint already exists
         hf_model_subdir = hf_model_name
         if os.path.exists(hf_model_name):
             hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
         pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
-        iter_0_path = os.path.join(pretrained_path, "iter_0000000")
+        iter0_path = os.path.join(pretrained_path, "iter_0000000")
         pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-            iter_0_path
+            iter0_path
         )
+        # In cases like distillation, if the teacher model is same as the student model, we need to save an extra quantized checkpoint
+        if pt_checkpoint_exists and not has_modelopt_state(iter0_path):
+            pretrained_path += "_quantized"
+            iter0_path = os.path.join(pretrained_path, "iter_0000000")
+            pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
+                iter0_path
+            )
+
         pre_quantized_model_path = os.environ.get(
             "NRL_PRE_QUANTIZED_MEGATRON_MODEL_PATH"
         )
@@ -64,12 +99,33 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             absolute_pre_quantized_model_path = os.path.abspath(
                 pre_quantized_model_path
             )
-            os.symlink(absolute_pre_quantized_model_path, iter_0_path)
+            os.symlink(absolute_pre_quantized_model_path, iter0_path)
+            return pretrained_path
 
-        kwargs["import_model_post_wrap_hook"] = self._quantize
-        kwargs["import_model_transformer_layer_spec"] = quantization_layer_spec
-        self._patch_setup_megatron_model()
-        super().__init__(config, *args, **kwargs)
+        # Ensure clean slate before import
+        destroy_parallel_state()
+
+        # Set for rank for non-collocated to check which ranks to broadcast from
+        self.rank = get_rank_safe()
+        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
+        torch.distributed.init_process_group("nccl")
+        if pt_checkpoint_exists:
+            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
+        else:
+            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
+            import_model_from_hf_name(
+                hf_model_name,
+                pretrained_path,
+                self.cfg["megatron_cfg"],
+                model_post_wrap_hook=self._quantize,
+                transformer_layer_spec=quantization_layer_spec,
+                **hf_config_overrides,
+            )
+
+            if parallel_state.model_parallel_is_initialized():
+                print("Reinitializing model parallel after loading model state.")
+                parallel_state.destroy_model_parallel()
+        return pretrained_path
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -77,11 +133,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         quant_dataset_name = self.cfg.get("quant_dataset_name", "cnn_dailymail")
         quant_calib_size = self.cfg.get("quant_calib_size", 512)
         quant_batch_size = self.cfg.get("quant_batch_size", 1)
-        # if quant_batch_size > 1:
-        #     warnings.warn("Quantization batch size > 1 for megatron model is not supported yet. Setting to 1.")
-        #     quant_batch_size = 1
-        # quant_force_all_expert_routing = self.cfg.get("quant_force_all_expert_routing", True)
-
         unwrapped_model = unwrap_model(model)[0]
 
         tokenizer = get_tokenizer(self.cfg["model_name"])
@@ -97,8 +148,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
         return model
 
-    @staticmethod
-    def _patch_setup_megatron_model():
+    def _patch_setup_megatron_model(self):
         if hasattr(megatron_policy_worker, "_original_setup_megatron_model"):
             return
         megatron_policy_worker._original_setup_megatron_model = (
@@ -189,7 +239,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         quantizers = []
         try:
             for _, module in self.model.named_modules():
-                if isinstance(module, TensorQuantizer) and module.enabled:
+                if isinstance(module, TensorQuantizer) and module.is_enabled:
                     quantizers.append(module)
                     module.disable()
             yield
@@ -206,3 +256,17 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """
         with self.disable_quantization(), super().use_reference_model():
             yield
+
+    def save_checkpoint(self, *args, **kwargs):
+        # temp patch, a config is added to Quantizer which will break saving.
+        configs = {}
+        try:
+            for name, module in self.model.named_modules():
+                if isinstance(module, TensorQuantizer):
+                    if hasattr(module, "config"):
+                        configs[name] = module.config
+                        delattr(module, "config")
+            return super().save_checkpoint(*args, **kwargs)
+        finally:
+            for name, config in configs.items():
+                setattr(self.model.get_submodule(name), "config", config)

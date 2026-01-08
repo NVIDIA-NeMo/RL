@@ -176,6 +176,7 @@ class MegatronConfig(TypedDict):
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    gradient_accumulation_fusion: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):

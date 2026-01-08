@@ -488,44 +488,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # with different order of node_bundles
         configure_dynamo_cache()
 
-        # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
-        # check if hf_model_name is a path
         hf_model_name = self.cfg["model_name"]
-        # Check if the checkpoint already exists
-        hf_model_subdir = hf_model_name
-        if os.path.exists(hf_model_name):
-            hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
-
-        pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
-        pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-            os.path.join(pretrained_path, "iter_0000000")
-        )
-
-        # Ensure clean slate before import
-        destroy_parallel_state()
-
-        # Set for rank for non-collocated to check which ranks to broadcast from
-        self.rank = get_rank_safe()
-        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-        torch.distributed.init_process_group("nccl")
-        if pt_checkpoint_exists:
-            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
-        else:
-            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
-            import_model_from_hf_name(
-                hf_model_name,
-                pretrained_path,
-                self.cfg["megatron_cfg"],
-                model_post_wrap_hook=kwargs.get("import_model_post_wrap_hook", None),
-                transformer_layer_spec=kwargs.get(
-                    "import_model_transformer_layer_spec", None
-                ),
-                **hf_config_overrides,
-            )
-
-            if parallel_state.model_parallel_is_initialized():
-                print("Reinitializing model parallel after loading model state.")
-                parallel_state.destroy_model_parallel()
+        pretrained_path = self._import_model_from_hf(hf_model_name)
 
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
@@ -935,6 +899,47 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    def _import_model_from_hf(self, hf_model_name: str):
+        # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
+        # check if hf_model_name is a path
+        # hf_model_name = self.cfg["model_name"]
+        # Check if the checkpoint already exists
+        hf_model_subdir = hf_model_name
+        if os.path.exists(hf_model_name):
+            hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
+
+        pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
+        pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
+            os.path.join(pretrained_path, "iter_0000000")
+        )
+
+        # Ensure clean slate before import
+        destroy_parallel_state()
+
+        # Set for rank for non-collocated to check which ranks to broadcast from
+        self.rank = get_rank_safe()
+        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
+        torch.distributed.init_process_group("nccl")
+        if pt_checkpoint_exists:
+            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
+        else:
+            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
+            import_model_from_hf_name(
+                hf_model_name,
+                pretrained_path,
+                self.cfg["megatron_cfg"],
+                # model_post_wrap_hook=kwargs.get("import_model_post_wrap_hook", None),
+                # transformer_layer_spec=kwargs.get(
+                #     "import_model_transformer_layer_spec", None
+                # ),
+                **hf_config_overrides,
+            )
+
+            if parallel_state.model_parallel_is_initialized():
+                print("Reinitializing model parallel after loading model state.")
+                parallel_state.destroy_model_parallel()
+        return pretrained_path
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
