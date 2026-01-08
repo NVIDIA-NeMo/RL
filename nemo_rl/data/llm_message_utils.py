@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-import time
 from typing import Any, Optional, Union, cast
 
 import torch
@@ -593,9 +592,7 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        start = time.time()
         media_cur_message = load_media_from_message(message, multimodal_load_kwargs=multimodal_load_kwargs)
-        print(f"Media loading took {time.time() - start} seconds")
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities

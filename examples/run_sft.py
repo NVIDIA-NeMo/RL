@@ -120,7 +120,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
         datum_preprocessor_train = datum_preprocessor_val = partial(format_clevr_cogent_dataset, return_pil=True)
     elif hasattr(data, "datum_preprocessor"):
         datum_preprocessor_train = data.datum_preprocessor["train"]
-        datum_preprocessor_val = data.datum_preprocessor["val"]
+        datum_preprocessor_val = data.datum_preprocessor["validation"]
 
     train_dataset = AllTaskProcessedDataset(
         train_dataset,

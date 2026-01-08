@@ -219,7 +219,7 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
 
 def get_multimodal_default_settings_from_processor(processor) -> dict[str, dict[str, Any]]:
     if isinstance(processor, PreTrainedTokenizerBase):
-        return []
+        return {}
 
     default_settings = {}
     if hasattr(processor, "video_processor"):
@@ -250,10 +250,10 @@ def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
     """Get all media from a message log item."""
     # Handle None or missing content (e.g., assistant messages with only tool_calls)
     if message.get("content") is None:
-        return []
+        return {}
     # Handle string content (no images)
     if isinstance(message["content"], str):
-        return []
+        return {}
     # iterate over the content list
     media = defaultdict(list)
     for item in message["content"]:
@@ -268,10 +268,13 @@ def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
 def load_media_from_message(
     message: dict[str, Any], 
     processor = None, 
-    multimodal_load_kwargs: dict[str, dict[str, Any]] = {},
-) -> dict[list[Any]]:
+    multimodal_load_kwargs: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, list[Any]]:
     loaded_media = defaultdict(list)
     media_in_message = get_media_from_message(message)
+
+    if multimodal_load_kwargs is None:
+        multimodal_load_kwargs = {}
 
     if not multimodal_load_kwargs and processor is not None:
         multimodal_load_kwargs = get_multimodal_default_settings_from_processor(processor)
@@ -281,14 +284,14 @@ def load_media_from_message(
     if "audio" in media_in_message:
         for aud in media_in_message["audio"]:
             if isinstance(aud, str):
-                print(multimodal_load_kwargs)
                 assert "audio" in multimodal_load_kwargs and "sampling_rate"  in multimodal_load_kwargs["audio"]
                 try:
                     loaded_media["audio"].append(load_audio(aud, **multimodal_load_kwargs["audio"]))
-                except:
+                except Exception as e:
+                    print(f"audio loading failed. Fall back to decord.")
                     # use decord
                     loaded_audio = decord.AudioReader(aud, sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"], mono=True)
-                    loaded_media["audio"].append(loaded_audio[:].asnumpy()[get_dim_to_pack_along(tokenizer, key)])
+                    loaded_media["audio"].append(loaded_audio[:].asnumpy()[get_dim_to_pack_along(processor, "audio")])
             else:
                 loaded_media["audio"].append(aud)
     if "video" in media_in_message:
