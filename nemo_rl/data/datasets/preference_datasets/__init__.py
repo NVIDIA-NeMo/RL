@@ -19,62 +19,33 @@ from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
     PreferenceDataset,
 )
 from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
-from nemo_rl.data.datasets.utils import get_extra_kwargs
+
+DATASET_REGISTRY = {
+    # built-in datasets
+    "HelpSteer3": HelpSteer3Dataset,
+    "Tulu3Preference": Tulu3PreferenceDataset,
+    # load from local JSONL file or HuggingFace
+    "BinaryPreferenceDataset": BinaryPreferenceDataset,
+    "PreferenceDataset": PreferenceDataset,
+}
 
 
-# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
 def load_preference_dataset(data_config):
     """Loads preference dataset."""
     dataset_name = data_config["dataset_name"]
 
-    if dataset_name == "HelpSteer3":
-        base_dataset = HelpSteer3Dataset()
-    elif dataset_name == "Tulu3Preference":
-        base_dataset = Tulu3PreferenceDataset()
-    # fall back to load from JSON file
-    elif dataset_name == "BinaryPreferenceDataset":
-        if "train_data_path" not in data_config:
-            raise ValueError(
-                "train_data_path is required for dataset_name=BinaryPreferenceDataset."
-            )
-        extra_kwargs = get_extra_kwargs(
-            data_config,
-            [
-                "val_data_path",
-                "prompt_key",
-                "chosen_key",
-                "rejected_key",
-                "train_split",
-                "val_split",
-            ],
-        )
-        base_dataset = BinaryPreferenceDataset(
-            train_data_path=data_config["train_data_path"],
-            **extra_kwargs,
-        )
-    elif dataset_name == "PreferenceDataset":
-        if "train_data_path" not in data_config:
-            raise ValueError(
-                "train_data_path is required for dataset_name=PreferenceDataset."
-            )
-        extra_kwargs = get_extra_kwargs(
-            data_config,
-            [
-                "val_data_path",
-                "train_split",
-                "val_split",
-            ],
-        )
-        base_dataset = PreferenceDataset(
-            train_data_path=data_config["train_data_path"],
-            **extra_kwargs,
-        )
+    # load dataset
+    if dataset_name in DATASET_REGISTRY:
+        base_dataset = DATASET_REGISTRY[dataset_name](**data_config)
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
-            "Please either set dataset_name in {'HelpSteer3', 'Tulu3Preference'} to use a built-in dataset "
-            "or set dataset_name in {'PreferenceDataset', 'BinaryPreferenceDataset'} to load from local JSONL file or HuggingFace."
+            "Please either use a built-in dataset "
+            "or set dataset_name in {'BinaryPreferenceDataset', 'PreferenceDataset'} to load from local JSONL file or HuggingFace."
         )
+
+    # bind prompt and system prompt
+    base_dataset.set_task_spec(data_config)
 
     return base_dataset
 
@@ -84,4 +55,5 @@ __all__ = [
     "HelpSteer3Dataset",
     "PreferenceDataset",
     "Tulu3PreferenceDataset",
+    "load_preference_dataset",
 ]

@@ -107,4 +107,5 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "load_response_dataset",
 ]
