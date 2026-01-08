@@ -40,6 +40,8 @@ time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_cor
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 time uv run --no-sync bash ./tests/functional/distillation.sh
 time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+time uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
+time uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 
 # Research functional tests (self-discovery)
 for test_script in research/*/tests/functional/*.sh; do
