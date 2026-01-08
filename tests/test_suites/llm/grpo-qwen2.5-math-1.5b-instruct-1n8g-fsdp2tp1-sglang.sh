@@ -40,3 +40,4 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'mean(data["timing/train/total_step_time"], 2) < 25'
 fi
 
+
