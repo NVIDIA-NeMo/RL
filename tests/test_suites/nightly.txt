@@ -80,6 +80,10 @@ tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron-seqpack.sh
 # validate TP/DP
 tests/test_suites/llm/sft-qwen2.5-math7b-2n8g-megatron.sh
 
+# nano-v3
+tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-megatron.sh
+tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-megatron-lora.sh
+
 #######
 # DPO #
 #######

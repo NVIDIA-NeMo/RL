@@ -1,0 +1,58 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 100
+checkpointing:
+  enabled: false
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  train_global_batch_size: 16
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    bias_activation_fusion: False
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    freeze_moe_router: true
+      # moe_router_dtype: "fp64"
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false 
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: true
+    defer_fp32_logits: true
+    track_moe_metrics: false
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+      weight_decay: 0.1
+      bf16: true
+    scheduler:
+      lr_warmup_init: 5.0e-6
+    peft:
+      enabled: true
+      dim: 256
+      alpha: 512
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+logger:
+  wandb:
+    project: nemo-rl
+    name: sft-nanov3-30BA3B-2n8g-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-megatron
+  mlflow:
+    run_name: sft-nanov3-30BA3B-2n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
