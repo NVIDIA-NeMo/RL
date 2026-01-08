@@ -55,7 +55,6 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
         )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
-        print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
     elif dataset_name == "DeepScaler":
         base_dataset: Any = DeepScalerDataset(**data_config)
@@ -96,16 +95,16 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
 __all__ = [
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",
-    "DeepScalerDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
+    "DeepScalerDataset",
     "Geometry3KDataset",
-    "OpenAIFormatDataset",
+    "HelpSteer3Dataset",
     "OasstDataset",
+    "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
-    "HelpSteer3Dataset",
 ]
