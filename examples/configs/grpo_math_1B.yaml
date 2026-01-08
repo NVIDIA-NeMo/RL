@@ -216,6 +216,15 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    mcore_generation_config:
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
+      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
+      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
