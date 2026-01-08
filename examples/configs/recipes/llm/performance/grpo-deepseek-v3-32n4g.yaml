@@ -11,7 +11,7 @@ policy:
     num_layers_in_last_pipeline_stage: 6
   generation:
     vllm_cfg:
-      tensor_parallel_size: 16
+      tensor_parallel_size: 32
 logger:
   log_dir: logs/grpo-deepseek-v3-32n4g
   wandb:
