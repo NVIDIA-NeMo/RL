@@ -130,13 +130,6 @@ nemo_gym = ["nemo_gym"]
 build = [
   # Build requirement for TE
   "torch==2.9.0",
-  # Ensure a CMake 3.x is available in the main env. This is important when building
-  # git/path packages without isolation (e.g., sgl-kernel) to avoid scikit-build-core
-  # falling back to a bundled CMake 4.x wheel (which can break dlpack).
-  "cmake>=3.31,<4",
-  # Build requirement for sgl-kernel (when built without isolation)
-  "scikit-build-core>=0.10,<0.11",
-  "ninja",
   # Build requirement for TE
   "setuptools",
   "packaging",
