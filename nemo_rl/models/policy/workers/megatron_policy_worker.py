@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterator, Optional, TypedDict, TypeVar, cast
 
 import ray
 import torch
@@ -143,6 +143,27 @@ except ImportError:
     HAVE_FSDP2 = False
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class MegatronGenerationConfig(TypedDict):
+    # Total GPU memory (in GB) allocated for KV cache buffers
+    buffer_size_gb: int
+    # Fraction of buffer reserved for guaranteed active requests
+    buffer_guaranteed_fraction: float
+    # Number of CUDA graphs to pre-compile for different batch sizes
+    num_cuda_graphs: int
+    # Size of each KV cache block in tokens (affects memory granularity)
+    block_size_tokens: int
+    # Enable CUDA graphs for prefill/context processing
+    use_cuda_graphs_for_non_decode_steps: bool
+    # Split long prefills into chunks for better memory management
+    enable_chunked_prefill: bool
+    # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+    unified_memory_level: int
+    # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens.
+    # Can cause OOM if set too high so should be tuned with buffer_size_gb if OOMing. If set too
+    # low, then will only do 512 tokens at a time, which can be slow.
+    max_tokens: int
 
 
 def broadcast_object_across_pp_ranks(obj):
@@ -1820,22 +1841,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
-        buffer_size_gb = mcore_generation_config.get("buffer_size_gb", 20)
+        mcore_generation_config = cast(
+            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
+        )
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
 
-        num_cuda_graphs = mcore_generation_config.get("num_cuda_graphs", 16)
-        block_size_tokens = mcore_generation_config.get("block_size_tokens", 256)
-        use_cuda_graphs_for_non_decode_steps = mcore_generation_config.get(
-            "use_cuda_graphs_for_non_decode_steps", True
-        )
-        enable_chunked_prefill = mcore_generation_config.get(
-            "enable_chunked_prefill", True
-        )
-        unified_memory_level = mcore_generation_config.get("unified_memory_level", 0)
-        buffer_guaranteed_fraction = mcore_generation_config.get(
-            "buffer_guaranteed_fraction", 0.1
-        )
-        max_tokens = mcore_generation_config.get("max_tokens", 16384)
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        block_size_tokens = mcore_generation_config["block_size_tokens"]
+        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
+            "use_cuda_graphs_for_non_decode_steps"
+        ]
+        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
+        unified_memory_level = mcore_generation_config["unified_memory_level"]
+        buffer_guaranteed_fraction = mcore_generation_config[
+            "buffer_guaranteed_fraction"
+        ]
+        max_tokens = mcore_generation_config["max_tokens"]
 
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
