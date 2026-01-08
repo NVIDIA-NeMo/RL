@@ -90,6 +90,10 @@ def create_megatron_test_config(
                 "buffer_size_gb": 20,
                 "buffer_guaranteed_fraction": 0.1,
                 "num_cuda_graphs": 16,
+                "block_size_tokens": 256,
+                "use_cuda_graphs_for_non_decode_steps": True,
+                "enable_chunked_prefill": True,
+                "unified_memory_level": 0,
                 "max_tokens": 16384,
             },
             "colocated": {
