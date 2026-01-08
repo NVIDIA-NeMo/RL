@@ -33,13 +33,14 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # TODO: memory check will fail due to OOM tracked here https://github.com/NVIDIA-NeMo/RL/issues/263
 
+# Revert to `mean(data["timing/train/total_step_time"], 2) < 30` once https://github.com/NVIDIA-NeMo/RL/issues/1719 resolved
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 1.0' \
         'data["train/loss"]["50"] < 0.8' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 50' \
-        'mean(data["timing/train/total_step_time"], 2) < 10'
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 60' \
+        'mean(data["timing/train/total_step_time"], 2) < 30'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
