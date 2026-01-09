@@ -89,7 +89,6 @@ class ModelAndOptimizerState(NamedTuple):
     model_state_dict_keys: list[str]
     optimizer: Optional[torch.optim.Optimizer]
     scheduler: Optional[Any]
-    reference_model_state_dict: Optional[dict[str, torch.Tensor]]
     is_hf_model: bool
     is_moe_model: bool
     is_reward_model: bool
@@ -250,6 +249,28 @@ def validate_and_prepare_config(
     )
 
 
+def setup_reference_model_state(
+    model: torch.nn.Module,
+) -> dict[str, torch.Tensor]:
+    """Set up reference model state dict by creating a CPU copy of the model's state dict.
+
+    This creates a reference copy of the model weights on CPU with pinned memory
+    for efficient CPU-GPU transfers. The reference model is typically used to
+    compute reference log probabilities during RL training.
+
+    Args:
+        model: The model to create a reference copy from
+
+    Returns:
+        Dictionary mapping parameter names to CPU tensors with pinned memory
+
+    Example:
+        >>> model = setup_model(...)
+        >>> reference_model_state_dict = setup_reference_model_state(model)
+    """
+    return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
+
+
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
@@ -327,7 +348,6 @@ def setup_model_and_optimizer(
     checkpoint_manager: Any,
     is_vlm: bool = False,
     init_optimizer: bool = True,
-    init_reference_model: bool = True,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
 ) -> ModelAndOptimizerState:
@@ -344,7 +364,6 @@ def setup_model_and_optimizer(
         checkpoint_manager: Checkpoint manager for loading/saving weights
         is_vlm: Whether this is a vision-language model
         init_optimizer: Whether to initialize optimizer
-        init_reference_model: Whether to keep a reference model copy
         weights_path: Optional path to checkpoint weights to load
         optimizer_path: Optional path to optimizer state to load
 
@@ -529,13 +548,6 @@ def setup_model_and_optimizer(
             v.data = v.data.to("cpu")
         model = model.to("cpu")
 
-    # Initialize reference model
-    reference_model_state_dict = None
-    if init_reference_model:
-        reference_model_state_dict = get_cpu_state_dict(
-            model.state_dict().items(), pin_memory=True
-        )
-
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
@@ -592,7 +604,6 @@ def setup_model_and_optimizer(
         model_state_dict_keys=model_state_dict_keys,
         optimizer=optimizer,
         scheduler=scheduler,
-        reference_model_state_dict=reference_model_state_dict,
         is_hf_model=is_hf_model,
         is_moe_model=is_moe_model,
         is_reward_model=is_reward_model,

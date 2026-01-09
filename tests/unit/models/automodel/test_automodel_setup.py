@@ -375,7 +375,6 @@ class TestModelAndOptimizerState:
             model_state_dict_keys=["key1", "key2"],
             optimizer=optimizer,
             scheduler=scheduler,
-            reference_model_state_dict=None,
             is_hf_model=True,
             is_moe_model=False,
             is_reward_model=False,
@@ -405,7 +404,6 @@ class TestModelAndOptimizerState:
             model_state_dict_keys=[],
             optimizer=None,
             scheduler=None,
-            reference_model_state_dict=None,
             is_hf_model=False,
             is_moe_model=True,
             is_reward_model=False,
@@ -417,6 +415,5 @@ class TestModelAndOptimizerState:
 
         assert state.optimizer is None
         assert state.scheduler is None
-        assert state.reference_model_state_dict is None
         assert state.is_moe_model is True
         assert state.autocast_enabled is False

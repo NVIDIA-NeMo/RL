@@ -51,6 +51,7 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
+    setup_reference_model_state,
     validate_and_prepare_config,
 )
 from nemo_rl.models.huggingface.common import (
@@ -220,7 +221,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=is_vlm,
             init_optimizer=init_optimizer,
-            init_reference_model=init_reference_model,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
         )
@@ -231,7 +231,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model_state_dict_keys,
             self.optimizer,
             self.scheduler,
-            self.reference_model_state_dict,
             self.is_hf_model,
             self.is_moe_model,
             self._is_reward_model,  # Note: using underscore prefix for internal naming
@@ -240,6 +239,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
+
+        # Initialize reference model if requested
+        self.reference_model_state_dict = None
+        if init_reference_model:
+            self.reference_model_state_dict = setup_reference_model_state(self.model)
 
         # Additional derived attributes
         self.lora_enabled = self.peft_config is not None
