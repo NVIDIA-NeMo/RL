@@ -37,10 +37,10 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         llm_kwargs["worker_cls"] = (
-            "nemo_rl.models.generation.vllm.vllm_quant_patch.FakeQuantWorker"
+            "nemo_rl.models.generation.vllm.quantization.vllm_quant_patch.FakeQuantWorker"
         )
         llm_kwargs["worker_extension_cls"] = (
-            "nemo_rl.models.generation.vllm.vllm_quant_backend.VllmQuantInternalWorkerExtension"
+            "nemo_rl.models.generation.vllm.quantization.vllm_quant_backend.VllmQuantInternalWorkerExtension"
         )
         if self.cfg["quant_cfg"]:
             print("setting VLLM_QUANT_CFG to: ", self.cfg["quant_cfg"])
@@ -59,10 +59,10 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         llm_kwargs["worker_cls"] = (
-            "nemo_rl.models.generation.vllm.vllm_quant_patch.FakeQuantWorker"
+            "nemo_rl.models.generation.vllm.quantization.vllm_quant_patch.FakeQuantWorker"
         )
         llm_kwargs["worker_extension_cls"] = (
-            "nemo_rl.models.generation.vllm.vllm_quant_backend.VllmQuantInternalWorkerExtension"
+            "nemo_rl.models.generation.vllm.quantization.vllm_quant_backend.VllmQuantInternalWorkerExtension"
         )
         if self.cfg["quant_cfg"]:
             os.environ["VLLM_QUANT_CFG"] = self.cfg["quant_cfg"]

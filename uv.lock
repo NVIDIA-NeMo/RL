@@ -29,7 +29,7 @@ constraints = [
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
 overrides = [
-    { name = "nvidia-modelopt", extras = ["torch"], editable = "../../lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer" },
+    { name = "nvidia-modelopt", extras = ["torch"], editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
     { name = "onnx", specifier = "<1.19.0" },
     { name = "onnxscript", specifier = "<=0.2.7" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
@@ -3339,7 +3339,7 @@ requires-dist = [
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
     { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", editable = "../../lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
     { name = "nvidia-resiliency-ext", specifier = ">=0.4.0a0,<0.5.0" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
@@ -4191,7 +4191,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nv-grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", editable = "../../lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
@@ -4520,8 +4520,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.41.0.dev10+g6cec9e2ec.d20260109"
-source = { editable = "../../lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer" }
+version = "0.41.0.dev10+g6cec9e2ec.d20251220"
+source = { editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy" },
