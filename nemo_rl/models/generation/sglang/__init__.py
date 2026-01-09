@@ -13,10 +13,8 @@
 # limitations under the License.
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 
 __all__ = [
     "SGLangConfig",
     "SGLangGeneration",
-    "SGLangGenerationWorker",
 ]
