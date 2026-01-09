@@ -41,6 +41,7 @@ def patched_load_adapter(self, lora_request: LoRARequestWithCfgAndWeights):
         lora_weights = None
 
         if isinstance(lora_request, LoRARequestWithCfgAndWeights):
+            # if hasattr(lora_request, "lora_weights") and getattr(lora_request, "lora_weights", None) is not None:
             lora_cfg = lora_request.lora_cfg
             lora_weights = lora_request.lora_weights
             peft_helper = PEFTHelper.from_dict(lora_cfg)
