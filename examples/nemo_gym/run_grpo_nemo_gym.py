@@ -233,15 +233,6 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
-    @ray.remote
-    class DummyActor:
-        def __init__(self) -> None:
-            pass
-
-    print(f"{ray.available_resources()=} {ray.cluster_resources()=}")
-    dummy_actor = DummyActor.options(num_gpus=4).remote()
-    print(f"{ray.available_resources()=} {ray.cluster_resources()=}")
-
     (
         policy,
         policy_generation,
@@ -254,10 +245,6 @@ The validation set you pass in will directly be used for validation with no addi
         grpo_state,
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
-
-    print(f"{ray.available_resources()=} {ray.cluster_resources()=}")
-    ray.kill(dummy_actor)
-    print(f"{ray.available_resources()=} {ray.cluster_resources()=}")
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
