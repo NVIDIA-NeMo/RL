@@ -95,7 +95,6 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-        # self.vllm_state_dict_keys = self.model_runner.model.state_dict().keys()
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -244,9 +243,6 @@ class VllmInternalWorkerExtension:
                             LoRARequestWithCfgAndWeights,
                             get_vllm_lora_metadata,
                         )
-
-                        # Convert vLLM LoRAConfig object to dict for PEFTHelper
-                        # LoRAConfig(max_lora_rank=8, max_loras=1, fully_sharded_loras=False, max_cpu_loras=1, lora_dtype=torch.bfloat16, lora_extra_vocab_size=256, default_mm_loras=None, bias_enabled=False)
 
                         lora_cfg_dict = dict(
                             {

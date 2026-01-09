@@ -120,7 +120,7 @@ def apply_lora_patches():
     setattr(LRUCacheWorkerLoRAManager, "_load_adapter", patched_load_adapter)
 
 
-# Note: Not sure put it here or in nemo_rl/models/generation/vllm/utils.py
+# Please Review: Not sure put it here or in nemo_rl/models/generation/vllm/utils.py
 def get_vllm_lora_metadata() -> dict[str, Any]:
     lora_int_id = 1  # Can be any unique id exclude 0
     lora_name = f"{lora_int_id}"
