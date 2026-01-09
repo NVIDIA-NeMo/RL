@@ -40,6 +40,7 @@ from megatron.bridge.training.config import (
     DistributedDataParallelConfig,
     LoggerConfig,
     OptimizerConfig,
+    RNGConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -695,6 +696,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
             "bias_activation_fusion"
         ]
+
+        # CUDA Graph configuration
+        if "enable_cuda_graph" in self.cfg["megatron_cfg"]:
+            model_cfg.enable_cuda_graph = self.cfg["megatron_cfg"]["enable_cuda_graph"]
+            if "cuda_graph_scope" in self.cfg["megatron_cfg"]:
+                model_cfg.cuda_graph_scope = self.cfg["megatron_cfg"]["cuda_graph_scope"]
+                if not model_cfg.enable_cuda_graph:
+                    warnings.warn(
+                        "cuda_graph_scope is configured but enable_cuda_graph is False. "
+                        "The cuda_graph_scope setting will have no effect."
+                    )
+            if model_cfg.enable_cuda_graph:
+                model_cfg.use_te_rng_tracker = True
+            else:
+                model_cfg.use_te_rng_tracker = False
         fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
         self.fp8_cfg = fp8_cfg
         if fp8_cfg is not None and fp8_cfg.get("enabled", False):
@@ -773,10 +789,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
         )
 
+        rng_config = RNGConfig(
+            te_rng_tracker=self.cfg["megatron_cfg"].get("enable_cuda_graph", False),
+        )
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
             logger=LoggerConfig(logging_level=0),
+            rng=rng_config,
             train=TrainingConfig(
                 micro_batch_size=1,  # ignored
                 global_batch_size=self.cfg["train_global_batch_size"],  # ignored
