@@ -83,6 +83,8 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        print(f"NeMo Gym initial Global Config dict: {initial_global_config_dict}")
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
