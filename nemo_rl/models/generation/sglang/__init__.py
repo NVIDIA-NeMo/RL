@@ -17,7 +17,6 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 __all__ = [
     "SGLangConfig",
     "SGLangGeneration",
-    "SGLangGenerationWorker",
 ]
 
 
