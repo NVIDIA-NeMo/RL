@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import tempfile
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import ray
 import torch
+import torch.nn as nn
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -25,6 +28,17 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLoss
+
+try:
+    from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+        _maybe_adapt_tensor_to_hf,
+        dtensor_params_generator,
+        get_train_context,
+    )
+
+    NEMO_AUTOMODEL_AVAILABLE = True
+except ImportError:
+    NEMO_AUTOMODEL_AVAILABLE = False
 
 
 def create_test_config(
@@ -456,3 +470,418 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         assert worker_info is not None, "Should get worker info"
     finally:
         policy.shutdown()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestMaybeAdaptTensorToHF:
+    """Tests for the _maybe_adapt_tensor_to_hf helper function."""
+
+    def test_no_adapter_returns_single_tuple(self):
+        """Test that when model has no adapter, returns single FQN-tensor tuple."""
+        # Arrange
+        model = nn.Linear(10, 10)
+        fqn = "layer.weight"
+        tensor = torch.randn(10, 10)
+
+        # Act
+        result = _maybe_adapt_tensor_to_hf(model, fqn, tensor)
+
+        # Assert
+        assert len(result) == 1, "Should return single tuple when no adapter"
+        assert result[0][0] == fqn, "FQN should be unchanged"
+        assert torch.equal(result[0][1], tensor), "Tensor should be unchanged"
+
+    def test_adapter_converts_single_tensor(self):
+        """Test that adapter is called when present on model."""
+        # Arrange
+        model = nn.Linear(10, 10)
+        adapter_mock = Mock()
+        adapter_mock.convert_single_tensor_to_hf.return_value = [
+            ("adapted.weight", torch.randn(10, 10)),
+            ("adapted.bias", torch.randn(10)),
+        ]
+        model.state_dict_adapter = adapter_mock
+
+        fqn = "layer.weight"
+        tensor = torch.randn(10, 10)
+
+        # Act
+        result = _maybe_adapt_tensor_to_hf(model, fqn, tensor)
+
+        # Assert
+        adapter_mock.convert_single_tensor_to_hf.assert_called_once_with(
+            fqn,
+            tensor,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=False,
+        )
+        assert len(result) == 2, "Should return multiple adapted tensors"
+        assert result[0][0] == "adapted.weight"
+        assert result[1][0] == "adapted.bias"
+
+    def test_adapter_with_quantization_flag(self):
+        """Test that quantization flag is passed to adapter correctly."""
+        # Arrange
+        model = nn.Linear(10, 10)
+        adapter_mock = Mock()
+        adapter_mock.convert_single_tensor_to_hf.return_value = [
+            ("quantized.weight", torch.randn(10, 10))
+        ]
+        model.state_dict_adapter = adapter_mock
+
+        fqn = "layer.weight"
+        tensor = torch.randn(10, 10)
+
+        # Act
+        result = _maybe_adapt_tensor_to_hf(model, fqn, tensor, quantization=True)
+
+        # Assert
+        adapter_mock.convert_single_tensor_to_hf.assert_called_once_with(
+            fqn,
+            tensor,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=True,
+        )
+        assert len(result) == 1
+
+    def test_adapter_excludes_extra_state_regex(self):
+        """Test that _extra_state regex is always passed to exclude such tensors."""
+        # Arrange
+        model = nn.Linear(10, 10)
+        adapter_mock = Mock()
+        adapter_mock.convert_single_tensor_to_hf.return_value = []
+        model.state_dict_adapter = adapter_mock
+
+        fqn = "layer._extra_state"
+        tensor = torch.randn(10)
+
+        # Act
+        _maybe_adapt_tensor_to_hf(model, fqn, tensor)
+
+        # Assert
+        adapter_mock.convert_single_tensor_to_hf.assert_called_once()
+        call_kwargs = adapter_mock.convert_single_tensor_to_hf.call_args[1]
+        assert call_kwargs["exclude_key_regex"] == r".*_extra_state.*", (
+            "Should exclude extra_state tensors"
+        )
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestDTensorParamsGenerator:
+    """Tests for the dtensor_params_generator helper function."""
+
+    def test_simple_model_yields_adapted_tensors(self):
+        """Test that generator yields correct (name, tensor) pairs for a simple model."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        assert len(results) == 2, "Linear layer should have weight and bias"
+        names = [name for name, _ in results]
+        assert "weight" in names
+        assert "bias" in names
+
+        # Check that tensors are in the correct dtype and contiguous
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype, (
+                f"Tensor {name} should be {target_dtype}"
+            )
+            assert tensor.is_contiguous(), f"Tensor {name} should be contiguous"
+
+    def test_dtype_conversion(self):
+        """Test that tensors are converted to target dtype."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        # Initialize with float32
+        model = model.to(torch.float32)
+        target_dtype = torch.bfloat16
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype, (
+                f"Tensor {name} should be converted to {target_dtype}"
+            )
+
+    def test_contiguous_output(self):
+        """Test that output tensors are contiguous."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        for name, tensor in results:
+            assert tensor.is_contiguous(), f"Tensor {name} should be contiguous"
+
+    def test_with_adapter_model(self):
+        """Test that adapter is used when present on model."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        adapter_mock = Mock()
+        # Mock adapter to return multiple tensors for a single input
+        adapter_mock.convert_single_tensor_to_hf.return_value = [
+            ("adapted.weight.1", torch.randn(5, 10)),
+            ("adapted.weight.2", torch.randn(5, 10)),
+        ]
+        model.state_dict_adapter = adapter_mock
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        # Each state_dict entry (weight, bias) goes through adapter
+        # Adapter returns 2 tensors for each, so we expect 4 total
+        assert len(results) >= 4, "Should have adapted tensors from adapter"
+
+        # Verify adapter was called
+        assert adapter_mock.convert_single_tensor_to_hf.call_count >= 2
+
+    def test_empty_model(self):
+        """Test handling of model with no parameters."""
+        # Arrange
+        model = nn.Module()  # Empty module with no parameters
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        assert len(results) == 0, "Empty model should yield no parameters"
+
+    def test_generator_is_iterable(self):
+        """Test that dtensor_params_generator returns an iterable generator."""
+        # Arrange
+        model = nn.Linear(10, 5)
+        target_dtype = torch.float32
+
+        # Act
+        gen = dtensor_params_generator(model, target_dtype)
+
+        # Assert
+        from collections.abc import Generator as ABCGenerator
+
+        assert isinstance(gen, ABCGenerator), "Should return a generator"
+
+        # Verify we can iterate over it
+        results = list(gen)
+        assert len(results) > 0, "Should yield at least one item"
+
+    def test_multiple_layers(self):
+        """Test generator with a more complex model with multiple layers."""
+        # Arrange
+        model = nn.Sequential(
+            nn.Linear(10, 5),
+            nn.ReLU(),
+            nn.Linear(5, 2),
+        )
+        target_dtype = torch.float32
+
+        # Act
+        results = list(dtensor_params_generator(model, target_dtype))
+
+        # Assert
+        # Should have 4 parameters: 2 weights + 2 biases from the Linear layers
+        assert len(results) == 4, (
+            "Sequential with 2 Linear layers should have 4 parameters"
+        )
+
+        # Check all tensors
+        for name, tensor in results:
+            assert tensor.dtype == target_dtype
+            assert tensor.is_contiguous()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestGetTrainContext:
+    """Tests for the get_train_context context manager function."""
+
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    )
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    )
+    def test_no_cp_with_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
+        """Test context creation without context parallel but with autocast."""
+        # Arrange
+        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+
+        cp_size = 1
+        cp_mesh = None
+        cp_buffers = []
+        sequence_dim = 1
+        dtype = torch.bfloat16
+
+        # Act
+        with get_train_context(
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            sequence_dim=sequence_dim,
+            dtype=dtype,
+            autocast_enabled=True,
+        ):
+            pass
+
+        # Assert - CP context should not be created when cp_size=1
+        mock_create_cp_ctx.assert_not_called()
+        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
+
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    )
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    )
+    def test_with_cp_and_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
+        """Test context creation with context parallel and autocast."""
+        # Arrange
+        mock_cp_ctx = MagicMock()
+        mock_create_cp_ctx.return_value = mock_cp_ctx
+        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+
+        cp_size = 2
+        cp_mesh = MagicMock()
+        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10)]
+        sequence_dim = 1
+        dtype = torch.bfloat16
+
+        # Act
+        with get_train_context(
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            sequence_dim=sequence_dim,
+            dtype=dtype,
+            autocast_enabled=True,
+        ):
+            pass
+
+        # Assert - CP context should be created when cp_size > 1
+        mock_create_cp_ctx.assert_called_once_with(
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            cp_seq_dims=[sequence_dim] * len(cp_buffers),
+            cp_no_restore_buffers=set(cp_buffers),
+        )
+        mock_get_train_ctx_am.assert_called_once_with(False, False, mock_cp_ctx)
+
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    )
+    def test_autocast_disabled(self, mock_get_train_ctx_am):
+        """Test context creation with autocast disabled."""
+        # Arrange
+        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+
+        cp_size = 1
+        cp_mesh = None
+        cp_buffers = []
+        sequence_dim = 1
+        dtype = torch.bfloat16
+
+        # Act
+        with get_train_context(
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            sequence_dim=sequence_dim,
+            dtype=dtype,
+            autocast_enabled=False,
+        ):
+            # Verify we're NOT in autocast mode
+            assert not torch.is_autocast_enabled("cuda"), (
+                "Autocast should be disabled when autocast_enabled=False"
+            )
+
+        # Assert
+        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
+
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    )
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    )
+    def test_cp_buffers_empty_when_cp_size_one(
+        self, mock_create_cp_ctx, mock_get_train_ctx_am
+    ):
+        """Test that CP context is not created when cp_size is 1."""
+        # Arrange
+        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+
+        cp_size = 1
+        cp_mesh = MagicMock()
+        cp_buffers = []  # Empty buffers for cp_size=1
+        sequence_dim = 1
+        dtype = torch.float32
+
+        # Act
+        with get_train_context(
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            sequence_dim=sequence_dim,
+            dtype=dtype,
+            autocast_enabled=True,
+        ):
+            pass
+
+        # Assert - CP context should not be created when cp_size=1
+        mock_create_cp_ctx.assert_not_called()
+
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    )
+    @patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    )
+    def test_multiple_cp_buffers_sequence_dim_replication(
+        self, mock_create_cp_ctx, mock_get_train_ctx_am
+    ):
+        """Test that sequence_dim is properly replicated for each CP buffer."""
+        # Arrange
+        mock_cp_ctx = MagicMock()
+        mock_create_cp_ctx.return_value = mock_cp_ctx
+        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+
+        cp_size = 2
+        cp_mesh = MagicMock()
+        # Three buffers
+        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10), torch.randn(2, 10)]
+        sequence_dim = 1
+        dtype = torch.float16
+
+        # Act
+        with get_train_context(
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            cp_buffers=cp_buffers,
+            sequence_dim=sequence_dim,
+            dtype=dtype,
+            autocast_enabled=True,
+        ):
+            pass
+
+        # Assert - sequence_dim should be replicated for each buffer
+        mock_create_cp_ctx.assert_called_once()
+        call_kwargs = mock_create_cp_ctx.call_args[1]
+        assert call_kwargs["cp_seq_dims"] == [
+            sequence_dim,
+            sequence_dim,
+            sequence_dim,
+        ], "sequence_dim should be replicated for each buffer"
+        assert len(call_kwargs["cp_seq_dims"]) == 3
