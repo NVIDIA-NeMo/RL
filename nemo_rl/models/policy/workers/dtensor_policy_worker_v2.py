@@ -198,6 +198,17 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             config=config,
             runtime_config=runtime_config,
         )
+        # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
+        self.rank = torch.distributed.get_rank()
+        self.device_mesh = distributed_manager.device_mesh
+        self.dp_cp_mesh = self.device_mesh["dp_cp"]
+        self.dp_mesh = self.device_mesh["dp"]
+        self.tp_mesh = self.device_mesh["tp"]
+        self.cp_mesh = self.device_mesh["cp"]
+        self.moe_mesh = distributed_manager.moe_mesh
+        self.dp_size = distributed_manager.dp_size
+        self.tp_size = distributed_manager.tp_size
+        self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
@@ -264,18 +275,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.is_generation_colocated,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
-
-        # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
-        self.rank = torch.distributed.get_rank()
-        self.device_mesh = distributed_manager.device_mesh
-        self.dp_cp_mesh = self.device_mesh["dp_cp"]
-        self.dp_mesh = self.device_mesh["dp"]
-        self.tp_mesh = self.device_mesh["tp"]
-        self.cp_mesh = self.device_mesh["cp"]
-        self.moe_mesh = distributed_manager.moe_mesh
-        self.dp_size = distributed_manager.dp_size
-        self.tp_size = distributed_manager.tp_size
-        self.cp_size = distributed_manager.cp_size
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
