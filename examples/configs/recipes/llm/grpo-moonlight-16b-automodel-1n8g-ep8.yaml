@@ -47,12 +47,6 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 13
-  generation:
-    _pad_token_id: 163838
-    max_new_tokens: 4096
-    pad_token_id: 163838
-    stop_token_ids:
-    - 163585
 data:
   max_input_seq_length: 4096
 cluster:
