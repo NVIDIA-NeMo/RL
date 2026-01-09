@@ -466,9 +466,6 @@ def setup(
             # Override the vLLM lora config with the DTensor lora config
             generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
 
-            assert colocated_inference, (
-                "LoRA in DTensor backend is only supported with colocated inference."
-            )
             assert not _should_use_async_rollouts(master_config), (
                 "Async rollouts are not supported with LoRA in DTensor backend."
             )
