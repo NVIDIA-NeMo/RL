@@ -227,11 +227,6 @@ def validate_and_prepare_config(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
             "Enable tp_size > 1 to use sequence parallelism."
         )
-    elif sequence_parallel_enabled and tp_size > 1:
-        raise RuntimeError(
-            "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. "
-            "See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
-        )
 
     return RuntimeConfig(
         model_class=model_class,
@@ -425,12 +420,24 @@ def setup_model_and_optimizer(
         automodel_kwargs["use_liger_kernel"] = False
 
     # Determine SDPA method for activation checkpointing and CP
-    if cp_size > 1 or config["dtensor_cfg"]["activation_checkpointing"]:
-        from torch.nn.attention import SDPBackend
+    from torch.nn.attention import SDPBackend
 
+    if cp_size > 1:
+        # Match Automodel's `get_train_context` in `cp_utils.py` where only
+        # flash and efficient backends are supported
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
+        ]
+    elif config["dtensor_cfg"]["activation_checkpointing"]:
+        # For activation checkpointing, we must disable the cudnn SDPA backend because
+        # it may not be selected during recomputation.
+        # In that case, we will get the following error:
+        # "Recomputed values have different metadata than during forward pass."
+        sdpa_method = [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
         ]
     else:
         sdpa_method = None
@@ -448,6 +455,13 @@ def setup_model_and_optimizer(
         )
         if lora_enabled:
             apply_lora_to_linear_modules(model, peft_config)
+
+    # For activation checkpointing, we also must globally disable the cudnn SDPA backend
+    # to ensure that cudnn does not get selected during recomputation.
+    if config["dtensor_cfg"]["activation_checkpointing"]:
+        from torch.backends import cuda
+
+        cuda.enable_cudnn_sdp(False)
 
     # Store original state dict keys
     model_state_dict_keys = list(model.state_dict().keys())

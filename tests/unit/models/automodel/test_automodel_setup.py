@@ -211,23 +211,37 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_sequence_parallel_with_large_tp_raises_error(
+    def test_sequence_parallel_with_tp_size_one_prints_warning(
         self,
         mock_dynamo,
         mock_resolve_class,
         mock_autoconfig_class,
         mock_config,
+        mock_autoconfig,
+        capsys,
     ):
-        """Test that sequence parallel with tp > 1 raises RuntimeError."""
-        mock_config["dtensor_cfg"]["sequence_parallel"] = True
-        mock_config["dtensor_cfg"]["tensor_parallel_size"] = 2
+        """Test that sequence parallel with tp = 1 prints a warning."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
 
-        with pytest.raises(RuntimeError, match="Sequence parallel \\+ tp_size >1"):
-            validate_and_prepare_config(
-                config=mock_config,
-                processor=None,
-                rank=0,
-            )
+        mock_config["dtensor_cfg"]["sequence_parallel"] = True
+        mock_config["dtensor_cfg"]["tensor_parallel_size"] = 1
+
+        # Should not raise an error, just print a warning
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+        )
+
+        # Verify result is valid
+        assert isinstance(result, RuntimeConfig)
+
+        # Check warning was printed
+        captured = capsys.readouterr()
+        assert (
+            "sequence_parallel=True, but tp_size=1 which has no effect" in captured.out
+        )
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
