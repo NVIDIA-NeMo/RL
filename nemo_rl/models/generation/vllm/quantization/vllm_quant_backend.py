@@ -98,9 +98,6 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         finally:
             mtq.fold_weight(model, keep_attrs=True)
 
-        # model.layers.0.self_attn.qkv_proj.weight_quantizer
-        # layers.0.self_attn.qkv_proj.input_quantizer._amax
-
     def _load_weights(self, weights):
         with ExitStack() as contexts:
             contexts.enter_context(self._fold_weight(self.model_runner.model))
@@ -113,136 +110,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 )
             return super()._load_weights(weights)
 
-    # @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    # def update_weights_via_ipc_zmq(self) -> bool:
-    #     """Receive and update model weights via ZMQ IPC socket.
-
-    #     Returns:
-    #         bool: True if weights were successfully updated.
-    #     """
-    #     buffer = None
-    #     weights = None
-
-    #     try:
-    #         self.maybe_init_zmq()
-    #         while True:
-    #             # Blocking receive with timeout (this is the main operation)
-    #             payload = self.zmq_socket.recv_pyobj()
-
-    #             if payload == IPCProtocol.COMPLETE:
-    #                 # means the update is done
-    #                 from vllm.model_executor.model_loader.utils import (
-    #                     process_weights_after_loading,
-    #                 )
-
-    #                 process_weights_after_loading(self.model_runner.model, self.model_config, self.device)
-    #                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-    #                 break
-
-    #             ipc_handle, list_keys, used_bytes = payload
-    #             buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
-
-    #             weights = []
-    #             offset = 0
-    #             for key in list_keys:
-    #                 shape, dtype = self.state_dict_info[key]  # pyrefly
-    #                 if isinstance(shape, list):
-    #                     shape = torch.Size(shape)
-    #                 size_in_bytes = dtype.itemsize * shape.numel()
-    #                 weights.append(
-    #                     (
-    #                         key,
-    #                         buffer[offset : offset + size_in_bytes].view(dtype=dtype).view(shape),
-    #                     )
-    #                 )
-    #                 aligned_size = calculate_aligned_size(size_in_bytes)
-    #                 offset += aligned_size
-    #             assert (
-    #                 offset == used_bytes
-    #             ), "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
-    #             # Load weights into the model
-    #             from nemo_rl.models.generation import fp8
-
-    #             print("update weghts: ", [key for key, _ in weights])
-
-    #             if fp8.is_fp8_model(self.model_runner.vllm_config):
-    #                 # the fp8 load_weights additionally casts bf16 weights into fp8
-    #                 fp8.load_weights(weights, self.model_runner)
-    #             else:
-    #                 with (
-    #                     self._fold_weight(self.model_runner.model),
-    #                     self._patch_named_parameters_to_include_buffers(self.model_runner.model.model),
-    #                 ):
-    #                     self.model_runner.model.load_weights(weights=weights)
-
-    #             torch.cuda.current_stream().synchronize()
-
-    #             # CRITICAL: Delete views before ACK to prevent corruption.
-    #             # 'weights' contains views into IPC shared memory. Even though load_weights()
-    #             # copied the data, Python may not garbage collect these view objects immediately.
-    #             # If sender reuses the buffer before GC runs, old views would read corrupted data.
-    #             # Explicit del ensures immediate cleanup before sending ACK.
-    #             del weights, buffer
-    #             weights = None
-    #             buffer = None
-    #             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-
-    #         # Process weights after loading for FP8 KV cache
-    #         self._maybe_process_fp8_kv_cache()
-
-    #         gc.collect()
-    #         torch.cuda.empty_cache()
-    #         return True
-    #     except Exception as e:
-    #         print(
-    #             f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n" f"{traceback.format_exc()}"
-    #         )
-    #         return False
-
-    # @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_from_collective")
-    # def update_weights_from_collective(self) -> bool:
-    #     """Update the model weights from collective communication."""
-    #     assert self.state_dict_info is not None, (
-    #         "state_dict_info is not prepared. " "Please call prepare_refit_info when initializing the worker."
-    #     )
-
-    #     def _load_model_weights(weights, model_runner):
-    #         """Load model weights.
-
-    #         Args:
-    #             weights: List[(name, tensor)]
-    #             model_runner: vLLM ModelRunner
-
-    #         Returns:
-    #             None
-    #         """
-    #         from nemo_rl.models.generation import fp8
-
-    #         if fp8.is_fp8_model(model_runner.vllm_config):
-    #             # the fp8 load_weights additionally casts bf16 weights into fp8
-    #             fp8.load_weights(weights, model_runner)
-    #         else:
-    #             with (
-    #                 self._fold_weight(model_runner.model),
-    #                 self._patch_named_parameters_to_include_buffers(model_runner.model),
-    #             ):
-    #                 model_runner.model.load_weights(weights=weights)
-
-    #     load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
-
-    #     try:
-    #         packed_broadcast_consumer(
-    #             iterator=iter(self.state_dict_info.items()),
-    #             group=self.model_update_group,
-    #             src=0,
-    #             post_unpack_func=load_model_weight_func,
-    #         )
-
-    #         # Process weights after loading for FP8 KV cache
-    #         self._maybe_process_fp8_kv_cache()
-
-    #     except Exception as e:
-    #         print(f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}")
-    #         return False
-
-    #     return True
+    def export_amax(self) -> dict[str, torch.Tensor]:
+        """Export amax buffers from the model for testing/debugging."""
+        try:
+            model = self.model_runner.model
+            return {
+                n: b.detach().cpu()
+                for n, b in model.named_buffers()
+                if n.endswith("amax")
+            }
+        except AttributeError:
+            return {}

@@ -28,6 +28,8 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     if isinstance(dtype, str):
         key = dtype.lower()
         aliases = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
             "fp16": torch.float16,

@@ -48,6 +48,16 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
 
         super()._create_engine(llm_kwargs)
 
+    def export_amax(self) -> dict[str, Any]:
+        """Export amax buffers for testing/debugging."""
+        if not hasattr(self, "llm"):
+            return {}
+        try:
+            results = self.llm.collective_rpc("export_amax", args=tuple())
+            return results[0] if results else {}
+        except Exception:
+            return {}
+
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
@@ -68,3 +78,13 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
             os.environ["VLLM_QUANT_CFG"] = self.cfg["quant_cfg"]
 
         super()._create_engine(llm_kwargs)
+
+    def export_amax(self) -> dict[str, Any]:
+        """Export amax buffers for testing/debugging."""
+        if not hasattr(self, "llm"):
+            return {}
+        try:
+            results = self.llm.collective_rpc("export_amax", args=tuple())
+            return results[0] if results else {}
+        except Exception:
+            return {}
