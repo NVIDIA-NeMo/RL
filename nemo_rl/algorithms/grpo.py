@@ -2385,6 +2385,7 @@ def async_grpo_train(
                             policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
+
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
