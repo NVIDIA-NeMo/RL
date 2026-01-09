@@ -50,7 +50,7 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 
-# ===== Optional cuDNN 9.17.0 setup (inside container) =====
+# ===== Optional cuDNN setup (inside container) =====
 # Motivation:
 # - Some fused-attention / TE kernels require a newer cuDNN than what your container ships with.
 # - Downloads cuDNN tarball and sets CUDNN_HOME for uv to build TE with the new cuDNN.
@@ -61,11 +61,26 @@ COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If le
 #
 # Notes:
 # - When pyproject.toml specifies TE 2.10.0 with no-build-isolation, uv will build TE from source.
-# - Setting CUDNN_HOME ensures TE is compiled against cuDNN 9.17.0.
+# - Setting CUDNN_HOME ensures TE is compiled against the specified cuDNN version.
+#
+# ===== cuDNN 9.17.0 (public NVIDIA download, .tar.xz) =====
+# CUDNN_INSTALL=1 CUDNN_VERSION=9.17.0 CUDNN_BUILD=29 \
+# CUDNN_TARBALL_URL=https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.17.0.29_cuda12-archive.tar.xz \
+# CUDNN_HOME_DIR=cudnn-linux-x86_64-9.17.0.29_cuda12-archive \
+# sbatch ray.sub
+#
+# ===== cuDNN 9.18.0 (NVIDIA internal artifactory, .tar.gz) =====
+# CUDNN_INSTALL=1 sbatch ray.sub   # Uses defaults below
+#
 CUDNN_INSTALL=${CUDNN_INSTALL:-0}
-CUDNN_VERSION=${CUDNN_VERSION:-9.17.0}
-# cuDNN tarball URL
-CUDNN_TARBALL_URL=${CUDNN_TARBALL_URL:-https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive.tar.xz}
+CUDNN_VERSION=${CUDNN_VERSION:-9.18.0}
+CUDNN_BUILD=${CUDNN_BUILD:-65}
+# cuDNN tarball URL (NVIDIA internal artifactory - 9.18.0.65 for CUDA 12.9)
+CUDNN_TARBALL_URL=${CUDNN_TARBALL_URL:-https://urm.nvidia.com/artifactory/hw-cudnn-generic/CUDNN/v9.18/v9.18.0.65/12.9/cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}.tar.gz}
+# CUDNN_HOME - extraction directory name (differs between versions)
+# 9.17: cudnn-linux-x86_64-9.17.0.29_cuda12-archive
+# 9.18: cudnn-linux-x86_64-9.18.0.65
+CUDNN_HOME_DIR=${CUDNN_HOME_DIR:-cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}}
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -289,20 +304,20 @@ export NEMO_RL_PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-# ===== Optional cuDNN 9.17.0 setup (head) =====
+# ===== Optional cuDNN setup (head) =====
 # Download cuDNN tarball and set CUDNN_HOME for uv to build TE with the new cuDNN.
 if [[ "$CUDNN_INSTALL" == "1" ]]; then
-  CUDNN_HOME="/tmp/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive"
+  CUDNN_HOME="/tmp/${CUDNN_HOME_DIR}"
   CUDNN_MARKER="/tmp/.cudnn_${CUDNN_VERSION}_tarball_installed"
   
   if [[ ! -f "\$CUDNN_MARKER" ]]; then
     echo "[INFO] Installing cuDNN ${CUDNN_VERSION} via tarball (head)..."
     cd /tmp
     
-    # Download cuDNN tarball
-    CUDNN_TARBALL="cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive.tar.xz"
+    # Download cuDNN tarball - extract filename from URL (supports both .tar.gz and .tar.xz)
+    CUDNN_TARBALL=\$(basename "$CUDNN_TARBALL_URL")
     if [[ ! -f "\$CUDNN_TARBALL" ]]; then
-      echo "[INFO] Downloading cuDNN tarball..."
+      echo "[INFO] Downloading cuDNN tarball: \$CUDNN_TARBALL"
       wget -q --show-progress "$CUDNN_TARBALL_URL" -O "\$CUDNN_TARBALL" || {
         echo "[ERROR] Failed to download cuDNN tarball (head)." >&2
       }
@@ -312,11 +327,21 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     if [[ -f "\$CUDNN_TARBALL" && ! -d "\$CUDNN_HOME" ]]; then
       echo "[INFO] Extracting cuDNN tarball..."
       tar -xf "\$CUDNN_TARBALL"
+      
+      # Handle different tarball directory naming conventions
+      # 9.17 (.tar.xz): extracts to cudnn-linux-x86_64-9.17.0.29_cuda12-archive (matches CUDNN_HOME, no rename needed)
+      # 9.18 (.tar.gz): extracts to just "cudnn" (needs rename to CUDNN_HOME)
+      if [[ -d "cudnn" && ! -d "\$CUDNN_HOME" ]]; then
+        echo "[INFO] Renaming 'cudnn' to \$CUDNN_HOME..."
+        mv cudnn "\$CUDNN_HOME"
+      fi
     fi
     
     if [[ -d "\$CUDNN_HOME" ]]; then
       touch "\$CUDNN_MARKER"
       echo "[INFO] cuDNN ${CUDNN_VERSION} tarball extracted to \$CUDNN_HOME (head)."
+    else
+      echo "[ERROR] cuDNN extraction failed - \$CUDNN_HOME not found (head)." >&2
     fi
   else
     echo "[INFO] cuDNN tarball already installed (head)."
@@ -330,7 +355,21 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     echo "[INFO] LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
     
     # Verify cuDNN version
-    ls -la "\${CUDNN_HOME}/lib/" | head -5 || true
+    echo "[INFO] cuDNN library files:"
+    ls -la "\${CUDNN_HOME}/lib/libcudnn.so"* 2>/dev/null | head -3 || true
+    
+    # Print cuDNN version from header file
+    if [[ -f "\${CUDNN_HOME}/include/cudnn_version.h" ]]; then
+      CUDNN_MAJOR=\$(grep "#define CUDNN_MAJOR" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      CUDNN_MINOR=\$(grep "#define CUDNN_MINOR" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      CUDNN_PATCHLEVEL=\$(grep "#define CUDNN_PATCHLEVEL" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      echo "[INFO] =========================================="
+      echo "[INFO] cuDNN Version: \${CUDNN_MAJOR}.\${CUDNN_MINOR}.\${CUDNN_PATCHLEVEL}"
+      echo "[INFO] =========================================="
+    else
+      echo "[WARNING] cudnn_version.h not found, checking lib symlink..."
+      ls -la "\${CUDNN_HOME}/lib/libcudnn.so" 2>/dev/null || true
+    fi
   fi
 fi
 
@@ -442,20 +481,20 @@ export NEMO_RL_PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-# ===== Optional cuDNN 9.17.0 setup (worker) =====
+# ===== Optional cuDNN setup (worker) =====
 # Download cuDNN tarball and set CUDNN_HOME for uv to build TE with the new cuDNN.
 if [[ "$CUDNN_INSTALL" == "1" ]]; then
-  CUDNN_HOME="/tmp/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive"
+  CUDNN_HOME="/tmp/${CUDNN_HOME_DIR}"
   CUDNN_MARKER="/tmp/.cudnn_${CUDNN_VERSION}_tarball_installed"
   
   if [[ ! -f "\$CUDNN_MARKER" ]]; then
     echo "[INFO] Installing cuDNN ${CUDNN_VERSION} via tarball (worker)..."
     cd /tmp
     
-    # Download cuDNN tarball
-    CUDNN_TARBALL="cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive.tar.xz"
+    # Download cuDNN tarball - extract filename from URL (supports both .tar.gz and .tar.xz)
+    CUDNN_TARBALL=\$(basename "$CUDNN_TARBALL_URL")
     if [[ ! -f "\$CUDNN_TARBALL" ]]; then
-      echo "[INFO] Downloading cuDNN tarball..."
+      echo "[INFO] Downloading cuDNN tarball: \$CUDNN_TARBALL"
       wget -q --show-progress "$CUDNN_TARBALL_URL" -O "\$CUDNN_TARBALL" || {
         echo "[ERROR] Failed to download cuDNN tarball (worker)." >&2
       }
@@ -465,11 +504,21 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     if [[ -f "\$CUDNN_TARBALL" && ! -d "\$CUDNN_HOME" ]]; then
       echo "[INFO] Extracting cuDNN tarball..."
       tar -xf "\$CUDNN_TARBALL"
+      
+      # Handle different tarball directory naming conventions
+      # 9.17 (.tar.xz): extracts to cudnn-linux-x86_64-9.17.0.29_cuda12-archive (matches CUDNN_HOME, no rename needed)
+      # 9.18 (.tar.gz): extracts to just "cudnn" (needs rename to CUDNN_HOME)
+      if [[ -d "cudnn" && ! -d "\$CUDNN_HOME" ]]; then
+        echo "[INFO] Renaming 'cudnn' to \$CUDNN_HOME..."
+        mv cudnn "\$CUDNN_HOME"
+      fi
     fi
     
     if [[ -d "\$CUDNN_HOME" ]]; then
       touch "\$CUDNN_MARKER"
       echo "[INFO] cuDNN ${CUDNN_VERSION} tarball extracted to \$CUDNN_HOME (worker)."
+    else
+      echo "[ERROR] cuDNN extraction failed - \$CUDNN_HOME not found (worker)." >&2
     fi
   else
     echo "[INFO] cuDNN tarball already installed (worker)."
@@ -481,6 +530,20 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     export LD_LIBRARY_PATH="\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}"
     echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"
     echo "[INFO] LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
+    
+    # Verify cuDNN version
+    echo "[INFO] cuDNN library files:"
+    ls -la "\${CUDNN_HOME}/lib/libcudnn.so"* 2>/dev/null | head -3 || true
+    
+    # Print cuDNN version from header file
+    if [[ -f "\${CUDNN_HOME}/include/cudnn_version.h" ]]; then
+      CUDNN_MAJOR=\$(grep "#define CUDNN_MAJOR" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      CUDNN_MINOR=\$(grep "#define CUDNN_MINOR" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      CUDNN_PATCHLEVEL=\$(grep "#define CUDNN_PATCHLEVEL" "\${CUDNN_HOME}/include/cudnn_version.h" | awk '{print \$3}')
+      echo "[INFO] =========================================="
+      echo "[INFO] cuDNN Version: \${CUDNN_MAJOR}.\${CUDNN_MINOR}.\${CUDNN_PATCHLEVEL}"
+      echo "[INFO] =========================================="
+    fi
   fi
 fi
 
@@ -575,10 +638,10 @@ else
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
 
-# Auto-setup cuDNN 9.17.0 environment if available
+# Auto-setup cuDNN environment if available
 CUDNN_SETUP=""
 if [[ "$CUDNN_INSTALL" == "1" ]]; then
-  CUDNN_SETUP="export CUDNN_HOME=/tmp/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive && export LD_LIBRARY_PATH=\\\${CUDNN_HOME}/lib:\\\${LD_LIBRARY_PATH:-} && "
+  CUDNN_SETUP="export CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} && export LD_LIBRARY_PATH=\\\${CUDNN_HOME}/lib:\\\${LD_LIBRARY_PATH:-} && "
 fi
 
 WORKER_NUM=\${1:-}
@@ -589,7 +652,7 @@ if [[ -z "\$WORKER_NUM" ]]; then
   else
     # Set up cuDNN environment and start interactive shell
     # Using env to pass environment variables to the new bash process
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
   fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
@@ -603,7 +666,7 @@ else
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\${CUDNN_SETUP}\$COMMAND"
   else
     # Set up cuDNN environment and start interactive shell
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/cudnn-linux-x86_64-${CUDNN_VERSION}.29_cuda12-archive bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
   fi
 fi
 EOF
