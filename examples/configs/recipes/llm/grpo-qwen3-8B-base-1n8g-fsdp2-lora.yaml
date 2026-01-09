@@ -9,6 +9,7 @@ policy:
   dtensor_cfg:
     activation_checkpointing: true
     lora_cfg:
+      enabled: True
       dim: 256
       alpha: 512
   sequence_packing:

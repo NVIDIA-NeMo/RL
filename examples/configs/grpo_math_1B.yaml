@@ -92,7 +92,7 @@ policy:
     custom_parallel_plan: null
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
-      enabled: True  # Set to True to enable LoRA fine-tuning
+      enabled: False  # Set to True to enable LoRA fine-tuning
       target_modules: []  # List of module names to apply LoRA (empty list with match_all_linear=true applies to all linear layers)
       exclude_modules: []  # List of module names to exclude from LoRA
       match_all_linear: true  # If True, applies LoRA to all linear layers (overrides target_modules)
