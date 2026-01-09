@@ -38,6 +38,8 @@ apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos
 apt update
 apt install -y nsight-systems-cli
 
+# To fix CVE-2025-68973
+apt install -y --only-upgrade gnupg
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
