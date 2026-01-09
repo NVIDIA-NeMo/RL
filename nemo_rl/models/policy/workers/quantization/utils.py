@@ -27,7 +27,7 @@ from modelopt.torch.utils.dataset_utils import (
     get_dataset_dataloader,
 )
 from modelopt.torch.utils.plugins import megatron_prefill
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
 MAX_SEQ_LEN = 2048
@@ -200,6 +200,17 @@ def merge_qkv_gate_up_proj_amaxs(model):
             print(f"Merged Gate/Up amax for {base_pattern} (gate,up)")
 
 
+class _DictDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, idx):
+        return {key: val[idx] for key, val in self.data.items()}
+
+    def __len__(self):
+        return len(next(iter(self.data.values())))
+
+
 def get_forward_loop_func(
     is_megatron: bool,
     calib_dataloader: DataLoader,
@@ -251,16 +262,21 @@ def quantize_model(
     device = (
         model.device if hasattr(model, "device") else next(model.parameters()).device
     )
-
-    calib_dataloader = get_dataset_dataloader(
-        dataset_name=data,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        num_samples=calib_size,
-        device=device,
-        include_labels=False,
-        max_sample_length=max_sample_length,
-    )
+    if data == "random":
+        calib_size = 1
+        calib_dataloader = DataLoader(
+            _DictDataset({"input_ids": torch.randint(0, 100, (1, 5))}), batch_size=1
+        )
+    else:
+        calib_dataloader = get_dataset_dataloader(
+            dataset_name=data,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_samples=calib_size,
+            device=device,
+            include_labels=False,
+            max_sample_length=max_sample_length,
+        )
 
     mtq_cfg = CUSTOM_CONFIG.get(quant_cfg)  # type: ignore [arg-type]
     if mtq_cfg is None:
