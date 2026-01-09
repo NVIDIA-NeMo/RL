@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # ----- PARAMETERS -----
-# WANDB_API_KEY, EXP_NAME, NUM_ACTOR_NODES, REPO_LOCATION, CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
+# WANDB_API_KEY, EXP_NAME, NUM_ACTOR_NODES, NUM_SLURM_NODES (optional), REPO_LOCATION, CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
 
 # ray.sub needs to be launched from the NeMo-RL root directory
 cd $REPO_LOCATION
@@ -36,11 +36,13 @@ echo -e "Running command:\n$COMMAND"
 
 mount=$(findmnt -n -o TARGET --target .)
 
+FINAL_NUM_SLURM_NODES="${NUM_SLURM_NODES:-$NUM_ACTOR_NODES}"
+
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
 MOUNTS=$mount:$mount \
 sbatch \
-    --nodes=$NUM_ACTOR_NODES \
+    --nodes=$FINAL_NUM_SLURM_NODES \
     --account=$SLURM_ACCOUNT \
     --partition=$SLURM_PARTITION \
     --time=4:0:0 \
