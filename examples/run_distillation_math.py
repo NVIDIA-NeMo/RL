@@ -72,6 +72,11 @@ def setup_data(
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
+    assert "train" in data_config, (
+        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset "
+        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
+    )
+
     print("\n▶ Setting up envs...")
     env_name = data_config["env_name"]
     env = create_env(env_name=env_name, env_configs=env_configs)
