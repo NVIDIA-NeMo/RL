@@ -400,9 +400,14 @@ class BaseVllmGenerationWorker:
         # Lora is enabled, add it to the vllm kwargs
         self.lora_enabled = False
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
-            from nemo_rl.models.generation.lora import apply_lora_patches
+            try:
+                from nemo_rl.models.generation.lora import apply_lora_patches
 
-            apply_lora_patches()
+                apply_lora_patches()
+
+            except Exception as e:
+                print(f"[WARNING] Failed to apply lora patches: {e}")
+
             self.lora_enabled = True
             vllm_kwargs["enable_lora"] = True
             vllm_kwargs["max_loras"] = 1  # only support one lora adapter
@@ -783,7 +788,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -796,7 +803,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
             worker_result = result_or_coro[0]
 
