@@ -66,7 +66,6 @@ def setup_data(
     tokenizer: TokenizerType,
     data_config: DataConfig,
     env_configs: dict[str, Any],
-    seed: int,
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],
@@ -86,7 +85,7 @@ def setup_data(
 
     # setup train dataset
     update_single_dataset_config(data_config["train"], data_config)
-    data = load_response_dataset(data_config["train"], seed)
+    data = load_response_dataset(data_config["train"])
     task_data_processors = {data.task_name: (data.task_spec, data.processor)}
     task_to_env = {data.task_name: env}
 
@@ -113,7 +112,7 @@ def setup_data(
     # validation dataset from config
     if data_config["validation"] is not None:
         update_single_dataset_config(data_config["validation"], data_config)
-        val_data = load_response_dataset(data_config["validation"], seed)
+        val_data = load_response_dataset(data_config["validation"])
         val_data_list.append(val_data.dataset)
         val_task_data_processors[val_data.task_name] = (
             val_data.task_spec,
@@ -172,7 +171,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"], 42)
+    ) = setup_data(tokenizer, config["data"], config["env"])
 
     (
         student_policy,

@@ -41,6 +41,7 @@ data:
     output_key: generated_solution
     split: train_1M
     split_validation_size: 0.05
+    seed: ${sft.seed}
   validation: null
 logger:
   wandb:

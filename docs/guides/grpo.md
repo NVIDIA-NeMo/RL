@@ -51,6 +51,7 @@ data:
     output_key: <AnswerKey>, default is "output"
     split: <TrainSplit>, default is None  # used for HuggingFace datasets
     split_validation_size: 0.05 # use 5% of the training data as validation data
+    seed: 42 # seed for train/validation split when split_validation_size > 0
   validation:
     dataset_name: ResponseDataset
     data_path: <PathToValidationDataset>
@@ -150,7 +151,7 @@ default_task_spec = TaskDataSpec(
 )
 
 # 3) Load dataset using the helper (built-ins or local/HF datasets)
-data = load_response_dataset(data_config["train"], seed)
+data = load_response_dataset(data_config["train"])
 
 # 4) Build task_data_processors mapping
 task_data_processors = {data.task_name: (data.task_spec, data.processor)}
@@ -166,7 +167,7 @@ dataset = AllTaskProcessedDataset(
 
 # 6) Do the same thing for validation dataset if it exists
 if data_config["validation"] is not None:
-    val_data = load_response_dataset(data_config["validation"], seed)
+    val_data = load_response_dataset(data_config["validation"])
 
     val_task_data_processors = {val_data.task_name: (val_data.task_spec, val_data.processor)}
 
