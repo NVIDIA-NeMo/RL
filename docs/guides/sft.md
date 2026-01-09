@@ -84,6 +84,7 @@ data:
     output_key: <AnswerKey>, default is "output"
     split: <TrainSplit>, default is None  # used for HuggingFace datasets
     split_validation_size: 0.05 # use 5% of the training data as validation data
+    seed: 42 # seed for train/validation split when split_validation_size > 0
   validation:
     dataset_name: ResponseDataset
     data_path: <PathToValidationDataset>

@@ -81,6 +81,7 @@ data:
     output_key: generated_solution
     split: train_1M
     split_validation_size: 0.05 # use 5% of the training data as validation data
+    seed: ${sft.seed} # seed for train/validation split when split_validation_size > 0
   validation: null
 
 logger:

@@ -48,6 +48,7 @@ data:
   train:
     dataset_name: tulu3_sft_mixture
     split_validation_size: 0.05
+    seed: ${sft.seed}
   validation: null
 logger:
   tensorboard_enabled: false

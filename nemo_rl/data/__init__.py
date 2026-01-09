@@ -26,7 +26,10 @@ class ResponseDatasetConfig(TypedDict):
     env_name: NotRequired[str]
     processor: NotRequired[str]  # remove once processor is refactored
     download_dir: NotRequired[str]
+    # Size of the validation data
     split_validation_size: NotRequired[float]
+    # Seed for train/validation split when split_validation_size > 0
+    seed: NotRequired[int]
 
 
 # TODO: split this typed dict up so it can be PreferenceDatasetConfig | ResponseDatasetConfig | etc

@@ -29,8 +29,8 @@ data:
   add_generation_prompt: true
   train:
     dataset_name: tulu3_sft_mixture
-    seed: 42
     split_validation_size: 0.05
+    seed: ${sft.seed}
   validation: null
 logger:
   log_dir: logs/sft-tmblog-llama3.1-8b

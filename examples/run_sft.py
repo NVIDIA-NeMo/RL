@@ -56,7 +56,7 @@ def parse_args():
 # =======================================================
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     default_task_spec = TaskDataSpec(
         task_name="sft_default",
@@ -66,7 +66,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
 
     # setup train dataset
     update_single_dataset_config(data_config["train"], data_config)
-    data = load_response_dataset(data_config["train"], seed)
+    data = load_response_dataset(data_config["train"])
     data_processor = partial(
         data.processor,
         add_bos=data_config["add_bos"],
@@ -96,7 +96,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     # validation dataset from config
     if data_config["validation"] is not None:
         update_single_dataset_config(data_config["validation"], data_config)
-        val_data = load_response_dataset(data_config["validation"], seed)
+        val_data = load_response_dataset(data_config["validation"])
         val_data_list.append(val_data.dataset)
         val_data_processor = partial(
             val_data.processor,
@@ -163,7 +163,7 @@ def main(is_vlm: bool = False):
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
+    ) = setup_data(tokenizer, config["data"])
 
     (
         policy,

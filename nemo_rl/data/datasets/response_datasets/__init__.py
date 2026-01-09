@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
-
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
@@ -36,48 +34,35 @@ from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDat
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
+DATASET_REGISTRY = {
+    # built-in datasets
+    "AIME2024": AIME2024Dataset,
+    "clevr-cogent": CLEVRCoGenTDataset,
+    "DAPOMath17K": DAPOMath17KDataset,
+    "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
+    "DeepScaler": DeepScalerDataset,
+    "geometry3k": Geometry3KDataset,
+    "HelpSteer3": HelpSteer3Dataset,
+    "open_assistant": OasstDataset,
+    "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "refcoco": RefCOCODataset,
+    "squad": SquadDataset,
+    "tulu3_sft_mixture": Tulu3SftMixtureDataset,
+    # load from local JSONL file or HuggingFace
+    "openai_format": OpenAIFormatDataset,
+    "ResponseDataset": ResponseDataset,
+}
 
-# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
+
+def load_response_dataset(data_config: ResponseDatasetConfig):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
-    # for sft training
-    if dataset_name == "open_assistant":
-        base_dataset: Any = OasstDataset(**data_config, seed=seed)
-    elif dataset_name == "squad":
-        base_dataset: Any = SquadDataset(**data_config)
-    elif dataset_name == "tulu3_sft_mixture":
-        base_dataset: Any = Tulu3SftMixtureDataset(**data_config, seed=seed)
-    elif dataset_name == "openai_format":
-        base_dataset: Any = OpenAIFormatDataset(
-            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for this class
-        )
-    # for rl training
-    elif dataset_name == "OpenMathInstruct-2":
-        base_dataset: Any = OpenMathInstruct2Dataset(**data_config, seed=seed)
-    elif dataset_name == "DeepScaler":
-        base_dataset: Any = DeepScalerDataset(**data_config)
-    elif dataset_name == "DAPOMath17K":
-        base_dataset: Any = DAPOMath17KDataset(**data_config)
-    elif dataset_name == "HelpSteer3":
-        base_dataset: Any = HelpSteer3Dataset(**data_config)
-    elif dataset_name == "AIME2024":
-        base_dataset: Any = AIME2024Dataset(**data_config)
-    elif dataset_name == "DAPOMathAIME2024":
-        base_dataset: Any = DAPOMathAIME2024Dataset(**data_config)
-    # for vlm training
-    elif dataset_name == "clevr-cogent":
-        base_dataset: Any = CLEVRCoGenTDataset(**data_config)
-    elif dataset_name == "refcoco":
-        base_dataset: Any = RefCOCODataset(**data_config)
-    elif dataset_name == "geometry3k":
-        base_dataset: Any = Geometry3KDataset(**data_config)
-    # fall back to load from JSON file
-    elif dataset_name == "ResponseDataset":
-        base_dataset: Any = ResponseDataset(
-            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` is required for this class
-            seed=seed,
+    # load dataset
+    if dataset_name in DATASET_REGISTRY:
+        dataset_class = DATASET_REGISTRY[dataset_name]
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
     else:
         raise ValueError(
@@ -86,10 +71,11 @@ def load_response_dataset(data_config: ResponseDatasetConfig, seed: int = 42):
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
-    base_dataset.set_task_spec(data_config)
-    base_dataset.set_processor()
+    dataset.set_task_spec(data_config)
+    # Remove this after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658
+    dataset.set_processor()
 
-    return base_dataset
+    return dataset
 
 
 __all__ = [
@@ -107,4 +93,5 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "load_response_dataset",
 ]
