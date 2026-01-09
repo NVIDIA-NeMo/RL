@@ -34,7 +34,6 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
-from nemo_rl.utils.logger import print_colored
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -583,7 +582,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         lora_req = None
         if self.lora_enabled:
-            # print_colored(f"list_lora in generate: {self.llm.llm_engine.list_loras()}")
             from vllm.lora.request import LoRARequest
 
             from nemo_rl.models.generation.lora import get_vllm_lora_metadata
@@ -592,7 +590,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             lora_req = LoRARequest(
                 **lora_metadata,
             )
-        print_colored(f"lora_req in generate: {lora_req}")
         outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
         # Process the outputs - but preserve the original input padding structure
@@ -828,7 +825,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             details = []
             for name, module in model.named_modules():
-                print_colored(f"name: {name}")
                 if isinstance(module, BaseLinearLayerWithLoRA):
                     a_shapes = [tuple(t.shape) for t in module.lora_a_stacked]
                     b_shapes = [tuple(t.shape) for t in module.lora_b_stacked]

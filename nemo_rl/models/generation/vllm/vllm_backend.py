@@ -23,7 +23,6 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
-from nemo_rl.utils.logger import RED, print_colored
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
@@ -180,10 +179,6 @@ class VllmInternalWorkerExtension:
         buffer = None
         weights = None
 
-        print_colored(
-            f"lora_config in update_weights_via_ipc_zmq: {self.model_runner.vllm_config.lora_config}",
-            RED,
-        )
         try:
             self.maybe_init_zmq()
             while True:
@@ -241,7 +236,6 @@ class VllmInternalWorkerExtension:
                         ):
                             weights = self._apply_weight_name_mapping(weights)
                         self.model_runner.model.load_weights(weights=weights)
-                        print_colored("updated base model weights", RED)
                     elif refit_lora_weights:
                         assert lora_config, (
                             "lora_config is not provided, can not refit lora weights"
@@ -275,7 +269,6 @@ class VllmInternalWorkerExtension:
                             ),
                         )
                         self.add_lora(lora_request=lora_request)
-                        print_colored("updated lora weights", RED)
                     else:
                         raise ValueError(
                             "refit_base_model_weights and refit_lora_weights cannot be both False"

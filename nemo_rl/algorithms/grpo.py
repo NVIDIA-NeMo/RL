@@ -80,16 +80,6 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
-# ANSI color codes
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-BLUE = "\033[94m"
-MAGENTA = "\033[95m"
-RED = "\033[91m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-
 
 class RewardScalingConfig(TypedDict):
     """Configure linear reward scaling with clamping.
@@ -1528,14 +1518,8 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message in LLMMessageLogType
-                    # print_colored(f"length of message_log: {len(repeated_batch['message_log'])}", BLUE)
-                    # print_colored(f"repeated_batch['message_log']: {repeated_batch['message_log']}", BLUE)
                     for i, message_log in enumerate(repeated_batch["message_log"]):
-                        # print_colored(f"length of message_log {i}: {len(message_log)}", BLUE)
-                        # print_colored(f"message_log {i}: {message_log}", BLUE)
                         for j, message in enumerate(message_log):
-                            # print_colored(f"length of message {i}, {j}: {len(message)}", BLUE)
-                            # print_colored(f"message {i}, {j}: {message}", BLUE)
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
@@ -1545,7 +1529,6 @@ def grpo_train(
                                     message["token_ids"]
                                 )
                             if "generation_logprobs" not in message:
-                                # print_colored(f"Set Generation logprobs to zeros for message {i}, {j}")
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
