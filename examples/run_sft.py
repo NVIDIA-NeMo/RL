@@ -57,6 +57,11 @@ def parse_args():
 
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+    assert "train" in data_config, (
+        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
+        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
+    )
+
     print("\n▶ Setting up data...")
     default_task_spec = TaskDataSpec(
         task_name="sft_default",
