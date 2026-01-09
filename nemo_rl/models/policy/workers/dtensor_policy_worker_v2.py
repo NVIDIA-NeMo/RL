@@ -195,6 +195,72 @@ def get_train_context(
         yield
 
 
+def dtensor_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+
+    Args:
+        model: The model whose parameters to generate.
+        target_dtype: The dtype to convert tensors to.
+
+    Yields:
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+    """
+    for name, tensor in model.state_dict().items():
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            # Convert to target dtype
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+            )
+
+
+def _maybe_adapt_tensor_to_hf(
+    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
+) -> list[tuple[str, torch.Tensor]]:
+    adapter = getattr(model_part, "state_dict_adapter", None)
+    if adapter:
+        return adapter.convert_single_tensor_to_hf(
+            fqn,
+            tensor,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=quantization,
+        )
+    return [(fqn, tensor)]
+
+
+@contextlib.contextmanager
+def get_train_context(
+    cp_size: int,
+    cp_mesh: Any,
+    cp_buffers: list,
+    sequence_dim: int,
+    dtype: torch.dtype,
+    autocast_enabled: bool = True,
+) -> Generator[None, None, None]:
+    """Create combined context manager for training with context parallel and autocast."""
+    with contextlib.ExitStack() as stack:
+        context_parallel_ctx = None
+        if cp_size > 1:
+            # Create context parallel context
+            context_parallel_ctx = create_context_parallel_ctx(
+                cp_mesh=cp_mesh,
+                cp_buffers=cp_buffers,
+                cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                cp_no_restore_buffers=set(cp_buffers),
+            )
+
+        stack.enter_context(
+            get_train_context_automodel(False, False, context_parallel_ctx)()
+        )
+        if autocast_enabled:
+            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
+        yield
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
