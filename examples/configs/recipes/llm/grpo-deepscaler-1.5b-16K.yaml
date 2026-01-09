@@ -1,6 +1,4 @@
-defaults:
-  - ../../grpo_math_1B.yaml
-  - grpo-deepscaler-1.5b-8K.yaml
+defaults: grpo-deepscaler-1.5b-8K.yaml
 loss_fn:
   reference_policy_kl_penalty: 0.001
   ratio_clip_max: 0.28
@@ -8,7 +6,4 @@ policy:
   max_total_sequence_length: 16384
   logprob_batch_size: 2
   dtensor_cfg:
-    cpu_offload: true
-    activation_checkpointing: true
     tensor_parallel_size: 2
-    _v2: false

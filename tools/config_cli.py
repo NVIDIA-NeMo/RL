@@ -21,10 +21,10 @@
 
 Subcommands:
   - expand: Resolve a config with OmegaConf interpolation and inheritance.
-  - minimize: Given a base config and a config, remove keys in the config that
-    are equal to the base, and ensure a defaults entry pointing to the base
-    exists. The defaults path in the resulting config is written relative to
-    the base config file.
+  - minimize: Remove keys in the config that are equal to what it inherits from
+    its `defaults` chain. By default, the base is inferred from the config's
+    `defaults` key (which must be a string, not a list). Optionally, pass
+    --base to override and rebase the config to a different parent.
   - minimize-check: Same args as `minimize` but only checks if minimization
     would change the file; exits non-zero if changes are needed.
 
@@ -37,40 +37,24 @@ Example:
   # Expand a config with a root level "defaults" key to see the full config; edit the config in place
   tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
 
-  # Minimize a config and remove all keys that are present in the base config; print to stdout
-  # tools/config_cli.py minimize <base_config> <config>
-  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  # Minimize a config (base inferred from its defaults key); print to stdout
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
 
-  # Minimize a config and remove all keys that are present in the base config; edit the config in place
-  # tools/config_cli.py minimize <base_config> <config>
-  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  # Minimize a config in place
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
 
-  # Minimize all llm the configs:
-  for algo in grpo dpo sft distillation; do
-    base_config=examples/configs/${algo}.yaml
-    if [[ ${algo} == grpo ]]; then
-      base_config=examples/configs/grpo_math_1B.yaml
-    elif [[ ${algo} == distillation ]]; then
-      base_config=examples/configs/distillation_math.yaml
+  # Minimize with explicit base (rebase to a different parent)
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --base examples/configs/dpo.yaml --in-place
+
+  # Minimize all configs:
+  for recipe in examples/configs/recipes/{llm,vlm}/*.yaml; do
+    if ! tools/config_cli.py minimize-check $recipe 2>/dev/null; then
+      tools/config_cli.py minimize $recipe --in-place
     fi
-    for recipe in examples/configs/recipes/llm/${algo}-*.yaml; do
-      tools/config_cli.py minimize $base_config $recipe --in-place
-    done
-  done
-
-  # Minimize vlm configs:
-  for recipe in examples/configs/recipes/vlm/vlm_grpo-*.yaml; do
-    tools/config_cli.py minimize examples/configs/vlm_grpo_3B.yaml $recipe --in-place
   done
 
   # Compare two configs
   tools/config_cli.py compare examples/configs/grpo_math_1B.yaml examples/configs/grpo_math_8B.yaml
-
-  # Minimize a config and compare it to not minimzing (should be the same)
-  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml >examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
-  tools/config_cli.py compare \
-    examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml \
-    examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
 """
 
 import argparse
@@ -312,27 +296,67 @@ def expand(args: argparse.Namespace) -> int:
     return 0
 
 
+def _infer_base_from_defaults(child_path: Path, child_cfg_raw: DictConfig) -> Path:
+    """Infer the base config path from the child's defaults key.
+
+    Args:
+        child_path: Resolved path to the child config
+        child_cfg_raw: Raw loaded child config
+
+    Returns:
+        Resolved path to the base config
+
+    Raises:
+        ValueError: If defaults is missing, not a string, or is a list
+    """
+    defaults = child_cfg_raw.get("defaults")
+    if defaults is None:
+        raise ValueError(
+            f"Config {child_path} has no 'defaults' key. "
+            "Either add a 'defaults' key or use --base to specify the base config."
+        )
+    if not isinstance(defaults, str):
+        raise ValueError(
+            f"Config {child_path} has 'defaults' as a list, but only string defaults are "
+            "supported for minimize. Please simplify to a single defaults entry or use --base."
+        )
+    return (child_path.parent / defaults).resolve()
+
+
 def minimize(args: argparse.Namespace) -> int:
     child_path = Path(args.config).resolve()
-    base_path = Path(args.base).resolve()
 
     child_cfg_raw = OmegaConf.load(child_path)
     if not isinstance(child_cfg_raw, DictConfig):
         raise TypeError(
             f"Config at {child_path} must be a mapping (DictConfig), got {type(child_cfg_raw)}"
         )
-    base_cfg_raw = OmegaConf.load(base_path)
-    if not isinstance(base_cfg_raw, DictConfig):
-        raise TypeError(
-            f"Config at {base_path} must be a mapping (DictConfig), got {type(base_cfg_raw)}"
-        )
 
-    # Resolve both before comparison
+    # Determine base: from --base arg or infer from defaults
+    if args.base:
+        base_path = Path(args.base).resolve()
+        base_inferred = False
+        # Load raw base for comparison
+        base_cfg_raw = OmegaConf.load(base_path)
+        if not isinstance(base_cfg_raw, DictConfig):
+            raise TypeError(
+                f"Config at {base_path} must be a mapping (DictConfig), got {type(base_cfg_raw)}"
+            )
+        base_resolved = OmegaConf.to_container(base_cfg_raw)
+    else:
+        base_path = _infer_base_from_defaults(child_path, child_cfg_raw)
+        base_inferred = True
+        # Load EXPANDED base (full inheritance chain) for proper comparison
+        base_resolved = OmegaConf.to_container(load_config(str(base_path)))
+
+    # Get child's explicit values (without defaults key for comparison)
     child_resolved = OmegaConf.to_container(child_cfg_raw)
-    base_resolved = OmegaConf.to_container(base_cfg_raw)
 
     if not isinstance(child_resolved, dict) or not isinstance(base_resolved, dict):
         raise TypeError("Both child and base configs must be mappings after resolution")
+
+    # Remove defaults from child before pruning (we'll handle it separately)
+    child_defaults = child_resolved.pop("defaults", None)
 
     pruned = _prune_equal(child_resolved, base_resolved)
 
@@ -340,12 +364,15 @@ def minimize(args: argparse.Namespace) -> int:
     if pruned is None or not isinstance(pruned, dict):
         pruned = {} if pruned is None else {"value": pruned}
 
-    # Ensure defaults reference base (relative path from child)
-    _ensure_defaults_relative(child_path, base_path, pruned)
-
-    # Ensure `defaults` appears first in the top-level mapping
-    if "defaults" in pruned:
-        pruned = {"defaults": pruned["defaults"], **pruned}
+    if base_inferred:
+        # Keep the existing defaults as-is
+        if child_defaults is not None:
+            pruned = {"defaults": child_defaults, **pruned}
+    else:
+        # Explicit base: update defaults to point to the new base
+        _ensure_defaults_relative(child_path, base_path, pruned)
+        if "defaults" in pruned:
+            pruned = {"defaults": pruned["defaults"], **pruned}
 
     # Emit
     text = OmegaConf.to_yaml(OmegaConf.create(pruned))
@@ -424,26 +451,43 @@ def minimize_check(args: argparse.Namespace) -> int:
     """Check if minimizing would change the file. Exit non-zero if so.
 
     Args (same as `minimize`):
-      base: Base config path
       config: Child config path
+      base: Optional base config path (inferred from defaults if not provided)
     """
     child_path = Path(args.config).resolve()
-    base_path = Path(args.base).resolve()
 
     # Compute minimized text (same as minimize())
     child_cfg_raw = OmegaConf.load(child_path)
-    base_cfg_raw = OmegaConf.load(base_path)
-    if not isinstance(child_cfg_raw, DictConfig) or not isinstance(
-        base_cfg_raw, DictConfig
-    ):
+    if not isinstance(child_cfg_raw, DictConfig):
         print(
-            f"[minimize-check] Both child and base must be mappings: {child_path} vs {base_path}",
+            f"[minimize-check] Config must be a mapping: {child_path}",
             file=sys.stderr,
         )
         return 2
 
+    # Determine base: from --base arg or infer from defaults
+    if args.base:
+        base_path = Path(args.base).resolve()
+        base_inferred = False
+        base_cfg_raw = OmegaConf.load(base_path)
+        if not isinstance(base_cfg_raw, DictConfig):
+            print(
+                f"[minimize-check] Base config must be a mapping: {base_path}",
+                file=sys.stderr,
+            )
+            return 2
+        base_resolved = OmegaConf.to_container(base_cfg_raw)
+    else:
+        try:
+            base_path = _infer_base_from_defaults(child_path, child_cfg_raw)
+        except ValueError as e:
+            print(f"[minimize-check] {e}", file=sys.stderr)
+            return 2
+        base_inferred = True
+        # Load EXPANDED base (full inheritance chain) for proper comparison
+        base_resolved = OmegaConf.to_container(load_config(str(base_path)))
+
     child_resolved = OmegaConf.to_container(child_cfg_raw)
-    base_resolved = OmegaConf.to_container(base_cfg_raw)
     if not isinstance(child_resolved, dict) or not isinstance(base_resolved, dict):
         print(
             f"[minimize-check] Both child and base must resolve to mappings: {child_path} vs {base_path}",
@@ -451,12 +495,23 @@ def minimize_check(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Remove defaults from child before pruning (we'll handle it separately)
+    child_defaults = child_resolved.pop("defaults", None)
+
     pruned = _prune_equal(child_resolved, base_resolved)
     if pruned is None or not isinstance(pruned, dict):
         pruned = {} if pruned is None else {"value": pruned}
-    _ensure_defaults_relative(child_path, base_path, pruned)
-    if "defaults" in pruned:
-        pruned = {"defaults": pruned["defaults"], **pruned}
+
+    if base_inferred:
+        # Keep the existing defaults as-is
+        if child_defaults is not None:
+            pruned = {"defaults": child_defaults, **pruned}
+    else:
+        # Explicit base: update defaults to point to the new base
+        _ensure_defaults_relative(child_path, base_path, pruned)
+        if "defaults" in pruned:
+            pruned = {"defaults": pruned["defaults"], **pruned}
+
     minimized_text = OmegaConf.to_yaml(OmegaConf.create(pruned))
 
     # Normalize current file via OmegaConf to reduce noise from formatting differences
@@ -466,9 +521,12 @@ def minimize_check(args: argparse.Namespace) -> int:
         current_norm_text = child_path.read_text()
 
     if current_norm_text != minimized_text:
+        suggested_cmd = f"tools/config_cli.py minimize {child_path} --in-place"
+        if args.base:
+            suggested_cmd = f"tools/config_cli.py minimize {child_path} --base {base_path} --in-place"
         print(
             f"[minimize-check] {child_path} is not minimized.\n"
-            f"  Suggested fix: tools/config_cli.py minimize {base_path} {child_path} --in-place",
+            f"  Suggested fix: {suggested_cmd}",
             file=sys.stderr,
         )
         return 1
@@ -492,10 +550,13 @@ if __name__ == "__main__":
 
     p_min = sub.add_parser(
         "minimize",
-        help="Remove keys equal to base and ensure defaults reference base",
+        help="Remove keys equal to inherited values from defaults chain",
     )
-    p_min.add_argument("base", help="Base config path")
-    p_min.add_argument("config", help="Child config path")
+    p_min.add_argument("config", help="Config file to minimize")
+    p_min.add_argument(
+        "--base",
+        help="Base config path (if not provided, inferred from config's defaults key)",
+    )
     p_min.add_argument(
         "--in-place",
         action="store_true",
@@ -513,12 +574,13 @@ if __name__ == "__main__":
 
     p_minchk = sub.add_parser(
         "minimize-check",
-        help=(
-            "Exit non-zero if minimizing would change the file; args mirror `minimize`"
-        ),
+        help="Exit non-zero if minimizing would change the file",
     )
-    p_minchk.add_argument("base", help="Base config path")
-    p_minchk.add_argument("config", help="Child config path")
+    p_minchk.add_argument("config", help="Config file to check")
+    p_minchk.add_argument(
+        "--base",
+        help="Base config path (if not provided, inferred from config's defaults key)",
+    )
     p_minchk.set_defaults(func=minimize_check)
 
     args = parser.parse_args()

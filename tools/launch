@@ -41,6 +41,7 @@ extract_config() {
         echo
         echo "# ===== BEGIN CONFIG ====="
         echo "NUM_NODES=1        # How many nodes this job uses"
+        echo "GPUS_PER_NODE=8    # GPUs per node (8 for H100, 4 for GB200)"
         echo "STEPS_PER_RUN=60   # Approximately how many steps reached in one job"
         echo "MAX_STEPS=60       # Max training steps"
         echo 'NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up'
@@ -117,8 +118,11 @@ for SCRIPT in $SCRIPTS; do
     fi
     eval "$config"
 
+    # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
+    export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
     # NUM_RUNS * NUM_NODES * NUM_GPUS * (NUM_MINUTES / 60)
-    gpu_hours=$((NUM_RUNS * NUM_NODES * 8 * NUM_MINUTES / 60))
+    gpu_hours=$((NUM_RUNS * NUM_NODES * GPUS_PER_NODE * NUM_MINUTES / 60))
     total_gpu_hours=$((total_gpu_hours + gpu_hours))
     echo "[INFO]: $gpu_hours GPUhrs to run $SCRIPT"
     if [[ "${DRYRUN}" -eq 1 ]]; then
@@ -162,7 +166,7 @@ sbatch \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
     --time=0:${NUM_MINUTES}:0 \\
-    --gres=gpu:8 \\
+    --gres=gpu:$GPUS_PER_NODE \\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF

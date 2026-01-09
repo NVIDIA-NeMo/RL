@@ -1,0 +1,15 @@
+defaults: ./sft-llama3.1-70b-8n8g-tp4pp2-long-megatron.yaml
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+  make_sequence_length_divisible_by: 2
+checkpointing:
+  checkpoint_dir: results/sft-llama3.1-70b-8n4g-tp2pp2-long-megatron
+logger:
+  wandb:
+    name: sft-llama3.1-70b-8n4g-tp2pp2-long-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-llama3.1-70b-8n4g-tp2pp2-long-megatron
+cluster:
+  gpus_per_node: 4
+
