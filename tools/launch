@@ -32,8 +32,8 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/..)
 # Function to extract config from a script
 extract_config() {
     local script_path="$1"
-    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" | 
-                   grep -v "^#" | 
+    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" |
+                   grep -v "^#" |
                    grep "=" )
     if [[ -z "$config" ]]; then
         echo "[ERROR]: No config section found in script_path=$script_path"
@@ -131,7 +131,7 @@ for SCRIPT in $SCRIPTS; do
     fi
 
     rel_script=$(check_file_in_version_control_and_get_relpath_from_git_root $SCRIPT)
-    
+
     EXP_NAME=$(basename $SCRIPT .sh)
     SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
 
@@ -147,8 +147,14 @@ for SCRIPT in $SCRIPTS; do
                 logger.wandb.name=$(basename $SCRIPT .sh)-$(git rev-parse --short HEAD)
             )
         fi
-    
+
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
+        # Conditionally include --gres argument
+        GRES_ARG=""
+        if [[ -z "${EXCLUDE_GRES:-}" ]]; then
+            GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -165,8 +171,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 \\
-    --gres=gpu:$GPUS_PER_NODE \\
+    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF
