@@ -8,7 +8,7 @@ GPUS_PER_NODE=4
 STEPS_PER_RUN=450
 MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
