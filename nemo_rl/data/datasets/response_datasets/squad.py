@@ -1,3 +1,4 @@
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +18,7 @@ from typing import Any
 
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
@@ -39,10 +40,8 @@ def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     }
 
 
-class SquadDataset:
+class SquadDataset(RawDataset):
     def __init__(self) -> None:
         original_ds = load_dataset("rajpurkar/squad")
+        self.task_name = "SQuAD"
         self.formatted_ds = original_ds.map(format_squad)
-        self.task_spec = TaskDataSpec(
-            task_name="SQuAD",
-        )

@@ -14,14 +14,122 @@
 
 """Contains data processors for evaluation."""
 
-from typing import Any, cast
+from typing import Any, Dict, cast
 
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, TaskDataSpec
+from nemo_rl.data.interfaces import (
+    DatumSpec,
+    LLMMessageLogType,
+    TaskDataProcessFnCallable,
+    TaskDataSpec,
+)
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def helpsteer3_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a HelpSteer3 preference datum into a DatumSpec for GRPO training.
+
+    This function converts HelpSteer3 preference data to work with GRPO by:
+    1. Using the context as the prompt
+    2. Using the preferred completion as the target response
+    3. Creating a reward signal based on preference scores
+    """
+    # Extract context and completions from HelpSteer3 format
+    context = datum_dict["context"]
+    preferred_completion = datum_dict["response"]
+
+    # Build the conversation from context
+    message_log: LLMMessageLogType = []
+
+    # Add context messages
+    if isinstance(context, list):
+        for msg in context:
+            message_log.append(
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+            )
+    else:
+        # If context is a string, treat it as a user message
+        message_log.append(
+            {
+                "role": "user",
+                "content": context,
+            }
+        )
+
+    # Add the preferred completion as the target
+    for completion_msg in preferred_completion:
+        message_log.append(
+            {
+                "role": completion_msg["role"],
+                "content": completion_msg["content"],
+            }
+        )
+
+    # Apply chat template and tokenize
+    formatted_conversation = tokenizer.apply_chat_template(
+        message_log,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=True,
+    )
+
+    # Tokenize the entire conversation
+    full_tokens = tokenizer(
+        formatted_conversation,
+        return_tensors="pt",
+        add_special_tokens=False,  # Already added by chat template
+    )["input_ids"][0]
+
+    # For simplicity, assign all tokens to the first message
+    # In a more sophisticated implementation, you might want to split tokens properly
+    message_log[0]["token_ids"] = full_tokens
+    message_log[0]["content"] = formatted_conversation
+
+    # Clear token_ids for other messages to avoid double counting
+    for i in range(1, len(message_log)):
+        message_log[i]["token_ids"] = tokenizer("", return_tensors="pt")["input_ids"][
+            0
+        ]  # Empty tensor
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    # Create ground truth from the preferred completion for environment evaluation
+    ground_truth = " ".join([msg["content"] for msg in preferred_completion])
+    extra_env_info = {"ground_truth": ground_truth}
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # Truncate if too long
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(
+                    max_seq_length // len(message_log), len(chat_message["token_ids"])
+                )
+            ]
+        loss_multiplier = 0.0  # Reduce loss for truncated sequences
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
 
 
 # Example of a generic math data processor
@@ -231,3 +339,31 @@ def multichoice_qa_processor(
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
     return output
+
+
+# Processor registry. Key is the processor name, value is the processor function.
+# Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
+# type checkers see each concrete function's signature as a distinct callable type.
+# Without the cast, the registry's inferred type becomes a union of those specific
+# callables, which is not assignable to the uniform TaskDataProcessFnCallable.
+# The cast asserts our intent that all entries conform to the common callable protocol.
+PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
+    Dict[str, TaskDataProcessFnCallable],
+    {
+        "default": math_hf_data_processor,
+        "math_hf_data_processor": math_hf_data_processor,
+        "multichoice_qa_processor": multichoice_qa_processor,
+        "math_data_processor": math_data_processor,
+        "helpsteer3_data_processor": helpsteer3_data_processor,
+    },
+)
+
+
+def register_processor(
+    processor_name: str, processor_function: TaskDataProcessFnCallable
+) -> None:
+    if processor_name in PROCESSOR_REGISTRY:
+        raise ValueError(f"Processor name {processor_name} already registered")
+    PROCESSOR_REGISTRY[processor_name] = processor_function
+
+    print(f"[INFO] Dataset processor {processor_name} registered")
