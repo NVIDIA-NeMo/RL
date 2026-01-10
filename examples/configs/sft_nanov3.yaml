@@ -14,7 +14,7 @@ sft:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/sft_nanov3_lora_permute_fusion_true"
+  checkpoint_dir: "results/sft_nanov3_full_sft_permute_fusion_true_lr_5e-5"
   metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 3
@@ -64,7 +64,7 @@ policy:
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
-      lr: 5.0e-6
+      lr: 5.0e-5
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
@@ -115,8 +115,8 @@ policy:
 
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 4.9999e-6
+      lr: 5.0e-5
+      min_lr: 5.0e-5
       weight_decay: 0.1
       bf16: false
       fp16: false
@@ -146,8 +146,8 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: 1000
-      lr_warmup_iters: 50
-      lr_warmup_init: 4.9999e-6
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-5
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -164,7 +164,7 @@ data:
   shuffle: false
   num_workers: 1
 
-  dataset_name: "squad"
+  dataset_name: "tulu3_sft_mixture"
   # You can use custom response datasets for training and validation. For example:
   #   data:
   #     dataset_name: ResponseDataset
@@ -200,8 +200,8 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "sft-dev"
-    name: "sft-dev-${data.dataset_name}"
+    project: "lora-sft"
+    name: "full-sft-nanov3-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
   mlflow:
