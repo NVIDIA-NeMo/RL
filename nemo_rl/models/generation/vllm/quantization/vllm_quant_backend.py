@@ -55,9 +55,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 raise ValueError("Now only tensor-wise quantization is supported.")
 
         def new_named_parameters(self, *args, **kwargs):
-            # 1. Yield actual parameters
             yield from original_named_parameters(*args, **kwargs)
-            # 2. Yield buffers as if they were parameters
             for name, buf in self.named_buffers(*args, **kwargs):
                 if "_quantizer" not in name:
                     continue
@@ -66,19 +64,16 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         buf.weight_loader = input_amax_loader
                     elif "weight_quantizer" in name:
                         buf.weight_loader = weight_amax_loader
-                    # print("buf", name, buf.shape)
+                    print("buf", name, buf.shape)
                     buffers_with_loader.append(buf)
                 yield name, buf
 
-        # Bind the new method to the instance
         model.named_parameters = types.MethodType(new_named_parameters, model)
         try:
             # print("calling patch named parameters to include buffers")
             yield
         finally:
-            # Restore original method
             model.named_parameters = original_named_parameters
-            # Clean up weight_loader from buffers
             for buf in buffers_with_loader:
                 if hasattr(buf, "weight_loader"):
                     del buf.weight_loader

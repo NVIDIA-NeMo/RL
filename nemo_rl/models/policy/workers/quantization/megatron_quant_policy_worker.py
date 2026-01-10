@@ -50,6 +50,8 @@ from nemo_rl.models.policy.workers.quantization.utils import (
 )  # pragma: no cover
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
+        # Turn on bridge quantization mapping
+        os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
         self._patch_setup_megatron_model()
         super().__init__(config, *args, **kwargs)
 

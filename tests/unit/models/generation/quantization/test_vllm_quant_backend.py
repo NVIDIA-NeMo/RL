@@ -120,7 +120,6 @@ def test_vllm_quant_refit_loads_amax(cluster):
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
         )
 
-        # Collect amax buffers from rollout workers
         futures = vllm_policy.worker_group.run_all_workers_single_data("export_amax")
         amax_list = ray.get(futures)
 
