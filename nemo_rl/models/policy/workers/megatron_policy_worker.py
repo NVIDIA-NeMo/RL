@@ -691,6 +691,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
             "bias_activation_fusion"
         ]
+        if "attention_backend" in self.cfg["megatron_cfg"]:
+            from megatron.core.transformer.enums import AttnBackend
+            attention_backend_str = self.cfg["megatron_cfg"].get("attention_backend")
+            if attention_backend_str is not None:
+                try:
+                    model_cfg.attention_backend = AttnBackend[attention_backend_str]
+                except KeyError:
+                    raise ValueError(f"Invalid attention backend: {attention_backend_str}. Available backends are: {AttnBackend.__members__}")
         fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
         self.fp8_cfg = fp8_cfg
         if fp8_cfg is not None and fp8_cfg.get("enabled", False):
