@@ -91,6 +91,7 @@ MOUNTS=${MOUNTS:-}
 # DRYRUN=2 additionally creates the snapshots (helpful to run a hermetic example manually or share a repro)
 DRYRUN=${DRYRUN:-}
 IS_RELEASE=${IS_RELEASE:-}  # Adds extra configuration for wandb to track this in the right project
+EXCLUDE_GRES=${EXCLUDE_GRES:-} # If set, will not include --gres=gpu:$GPUS_PER_NODE in the sbatch invocation
 NOW=$(date '+%y%m%d-%H%M%S')
 
 if [[ -n "$MOUNTS" ]]; then
@@ -149,10 +150,10 @@ for SCRIPT in $SCRIPTS; do
         fi
 
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
-        # Conditionally include --gres argument
-        GRES_ARG=""
-        if [[ -z "${EXCLUDE_GRES:-}" ]]; then
-            GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
+
+        GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
+        if [[ -n "${EXCLUDE_GRES}" ]]; then
+            GRES_ARG=""
         fi
 
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
