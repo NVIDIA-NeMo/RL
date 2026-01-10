@@ -168,8 +168,8 @@ triton = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "2a288a1a0a9ff63d374cc0b90bfa40f66e89da98" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "4a8a2a2ac9a1ed4aee2edb9207f41421ca11c5a4" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 
 [tool.uv.workspace]
