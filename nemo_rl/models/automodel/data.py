@@ -16,7 +16,7 @@
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
 from transformers import AutoTokenizer
@@ -340,3 +340,28 @@ def process_global_batch(
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
     }
+
+
+def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
+    """Check and validate sequence dimension across all tensors.
+
+    Verifies that dimension 1 is the sequence dimension for all tensors
+    in the data dictionary that have more than one dimension.
+
+    Args:
+        data: BatchedDataDict to validate
+
+    Returns:
+        Tuple of (sequence_dim, seq_dim_size)
+
+    Raises:
+        AssertionError: If any tensor has inconsistent sequence dimension
+    """
+    sequence_dim = 1
+    seq_dim_size = data.get("input_ids").shape[sequence_dim]
+    for k, v in data.items():
+        if torch.is_tensor(v) and len(v.shape) > 1:
+            assert v.shape[sequence_dim] == seq_dim_size, (
+                f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+            )
+    return sequence_dim, seq_dim_size
