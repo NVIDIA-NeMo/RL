@@ -501,16 +501,11 @@ def stream_weights_via_http_impl(
         worker_name: Name of the worker for logging
         current_device_uuid: UUID of the current training worker's GPU
     """
-    from sglang.srt.utils import MultiprocessingSerializer  # type: ignore[import-error]
+    from nemo_rl.models.generation.sglang.sglang_copied_utils import (
+        MultiprocessingSerializer,
+        monkey_patch_torch_reductions,
+    )
 
-    try:
-        from sglang.srt.utils.patch_torch import (
-            monkey_patch_torch_reductions,  # type: ignore[import-error]
-        )
-    except ImportError:
-        from sglang.srt.patch_torch import (
-            monkey_patch_torch_reductions,  # type: ignore[import-error]
-        )
     print("[sglang refit details] entering stream_weights_via_http_impl")
 
     monkey_patch_torch_reductions()
