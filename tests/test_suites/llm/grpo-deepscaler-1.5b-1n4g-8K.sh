@@ -56,10 +56,10 @@ uv run examples/run_eval.py \
     2>&1 | tee ${RUN_LOG}.aime-8k
 
 cat ${RUN_LOG}.aime-8k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > ${RUN_LOG}-8k-metric.json
- 
+
 # 0.2 is the baseline score for AIME on the base checkpoint
 uv run tests/check_metrics.py ${RUN_LOG}-8k-metric.json \
-  'data["score"] >= 0.2396' 
+  'data["score"] >= 0.2396'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"
