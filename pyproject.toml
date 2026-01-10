@@ -65,6 +65,8 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch]==2.8.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+  "vllm==0.11.2",
 ]
 vllm = [
   "cuda-python",

@@ -4739,6 +4739,12 @@ fsdp = [
     { name = "flash-attn" },
     { name = "mamba-ssm" },
 ]
+fsdp = [
+    { name = "causal-conv1d" },
+    { name = "flash-attn" },
+    { name = "mamba-ssm" },
+    { name = "vllm" },
+]
 mcore = [
     { name = "deep-ep" },
     { name = "flash-attn" },
