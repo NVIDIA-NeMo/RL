@@ -3648,6 +3648,12 @@ automodel = [
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
+fsdp = [
+    { name = "causal-conv1d" },
+    { name = "flash-attn" },
+    { name = "mamba-ssm" },
+    { name = "vllm" },
+]
 mcore = [
     { name = "deep-ep" },
     { name = "flash-attn" },
@@ -3660,12 +3666,9 @@ nemo-gym = [
     { name = "nemo-gym" },
 ]
 vllm = [
-    { name = "causal-conv1d" },
     { name = "cuda-python" },
     { name = "deep-ep" },
     { name = "deep-gemm" },
-    { name = "flash-attn" },
-    { name = "mamba-ssm" },
     { name = "num2words" },
     { name = "vllm" },
 ]
@@ -3714,7 +3717,7 @@ requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "blobfile" },
     { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
-    { name = "causal-conv1d", marker = "extra == 'vllm'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
+    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
     { name = "colored", specifier = "==2.2.3" },
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
@@ -3725,11 +3728,11 @@ requires-dist = [
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },
+    { name = "flash-attn", marker = "extra == 'fsdp'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
-    { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.8.1" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
-    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
@@ -3767,11 +3770,12 @@ requires-dist = [
     { name = "transformers", specifier = "==4.57.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.2" },
+    { name = "vllm", marker = "extra == 'fsdp'", specifier = "==0.11.2" },
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.11.2" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.2" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore", "nemo-gym"]
+provides-extras = ["fsdp", "automodel", "vllm", "mcore", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
