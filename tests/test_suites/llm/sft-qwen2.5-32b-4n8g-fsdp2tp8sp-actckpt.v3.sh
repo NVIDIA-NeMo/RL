@@ -7,8 +7,8 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=5
-MAX_STEPS=5
+STEPS_PER_RUN=20  # step_time ~ 29sec
+MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=30
 # ===== END CONFIG =====
