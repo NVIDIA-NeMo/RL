@@ -177,7 +177,7 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
                 # Load weights into the model
-                from nemo_rl.models.generation import fp8
+                from nemo_rl.models.generation.vllm.quantization import fp8
 
                 if fp8.is_fp8_model(self.model_runner.vllm_config):
                     # the fp8 load_weights additionally casts bf16 weights into fp8
@@ -230,7 +230,7 @@ class VllmInternalWorkerExtension:
             Returns:
                 None
             """
-            from nemo_rl.models.generation import fp8
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
             if fp8.is_fp8_model(model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
