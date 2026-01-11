@@ -975,7 +975,7 @@ def _calculate_single_metric(
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/stddev": statistics.stdev(values) if len(values) >= 2 else None,
         f"{key_name}/histogram": Histogram(values),
     }
 
