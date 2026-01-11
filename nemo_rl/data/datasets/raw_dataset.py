@@ -12,18 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datasets import Dataset
+
+from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class RawDataset:
-    def __init__(self, data_config: dict, seed: int = 42):
-        self.data_config: dict = data_config
-        self.seed: int = seed
-        self.task_name: str | None = None
-        self.processor: TaskDataProcessFnCallable | None = None
-        self.task_spec: TaskDataSpec | None = None
-        raise NotImplementedError("__init__ is not implemented")
+    # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
+    data_config: ResponseDatasetConfig
+    dataset: Dataset
+    # `val_dataset` is used only when current dataset is used for both training and validation
+    val_dataset: Dataset | None
+    processor: TaskDataProcessFnCallable
+    task_spec: TaskDataSpec
+
+    def split_train_validation(self, test_size: float, seed: int):
+        if test_size > 0:
+            split_dataset = self.dataset.train_test_split(
+                test_size=test_size, seed=seed
+            )
+            self.dataset = split_dataset["train"]
+            self.val_dataset = split_dataset["test"]
 
     def set_processor(self):
         processor_name = (
@@ -36,7 +47,7 @@ class RawDataset:
         )
         self.processor = PROCESSOR_REGISTRY[processor_name]
 
-    def set_task_spec(self, data_config: dict):
+    def set_task_spec(self, data_config: ResponseDatasetConfig):
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
