@@ -153,10 +153,16 @@ class VllmGeneration(GenerationInterface):
 
         # Create worker builder for VllmGenerationWorker
         if self.cfg["vllm_cfg"]["async_engine"]:
-            worker_cls = "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+            worker_cls = (
+                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+                if self.cfg.get("quant_cfg", None) is None
+                else "nemo_rl.models.generation.vllm.quantization.vllm_quant_worker.VllmQuantAsyncGenerationWorker"
+            )
         else:
             worker_cls = (
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
+                if self.cfg.get("quant_cfg", None) is None
+                else "nemo_rl.models.generation.vllm.quantization.vllm_quant_worker.VllmQuantGenerationWorker"
             )
         worker_builder = RayWorkerBuilder(worker_cls, config)
 

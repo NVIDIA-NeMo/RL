@@ -143,10 +143,7 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
-)  # pragma: no cover
-class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -1149,3 +1146,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
+)  # pragma: no cover
+class VllmAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
+    pass

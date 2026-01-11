@@ -963,8 +963,9 @@ def validate(
 
         max_batches = (
             master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
+            + master_config["distillation"]["val_batch_size"]
+            - 1
+        ) // master_config["distillation"]["val_batch_size"]
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break

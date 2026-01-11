@@ -61,6 +61,17 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # For QARL with modelopt
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:
