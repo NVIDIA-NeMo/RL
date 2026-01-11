@@ -42,9 +42,9 @@ class SequencePackingGradientTestActor:
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
         from nemo_rl.models.megatron.common import (
-            _pack_sequences_for_megatron,
             forward_step_arbitrary_loss,
         )
+        from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
 
         # Initialize process group
         torch.distributed.init_process_group(backend="nccl")
