@@ -761,14 +761,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.calculate_per_token_loss = True
         model_cfg.perform_initialization = True
 
-        assert (
-            "aux_loss" not in model_cfg.moe_router_load_balancing_type
-            or model_cfg.moe_aux_loss_coeff == 0
-        ), (
-            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-        )
-
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,

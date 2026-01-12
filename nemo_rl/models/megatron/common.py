@@ -411,6 +411,7 @@ def forward_step_arbitrary_loss(
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
+        padding_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -445,6 +446,27 @@ def forward_step_arbitrary_loss(
             # The PackedSeqParams handles all necessary sequence information
             position_ids = None
             attention_mask = None
+			(
+				_,
+				padding_mask,
+				_,
+				cu_seqlens_mask,
+				cu_seqlens_padded_mask,
+			) = _pack_sequences_for_megatron(
+				data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1), # do the same as if we were to deal with the loss
+				seq_lengths,
+				pad_individual_seqs_to_multiple_of,
+				pad_full_seq_to,
+				cp_rank=get_context_parallel_rank(),
+				cp_size=get_context_parallel_world_size(),
+			)
+
+			if model.config.sequence_parallel:
+				tp_size = model.config.tensor_model_parallel_size
+				padding_mask = padding_mask.tensor_split(tp_size, dim=-1)[get_tensor_model_parallel_rank()]
+
+			assert torch.allclose(cu_seqlens_mask, cu_seqlens), f"cu_seqlens_mask: {cu_seqlens_mask}, cu_seqlens: {cu_seqlens} are not the same"
+
         else:
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
@@ -467,6 +489,9 @@ def forward_step_arbitrary_loss(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    if padding_mask is not None:
+        additional_kwargs["padding_mask"] = padding_mask
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
