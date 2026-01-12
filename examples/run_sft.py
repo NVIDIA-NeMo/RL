@@ -95,7 +95,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     # validation dataset from config
     if data_config["validation"] is not None:
         if "default" in data_config:
-            update_single_dataset_config(data_config["validation"], data_config["default"])
+            update_single_dataset_config(
+                data_config["validation"], data_config["default"]
+            )
         val_data = load_response_dataset(data_config["validation"])
         val_data_list.append(val_data.dataset)
         val_data_processor = partial(
