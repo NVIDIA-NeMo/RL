@@ -16,7 +16,7 @@ from typing import Literal, NotRequired, TypedDict
 
 
 class ResponseDatasetConfig(TypedDict):
-    dataset_name: str
+    dataset_name: NotRequired[str]
     data_path: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]

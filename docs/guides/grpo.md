@@ -141,16 +141,19 @@ Then, you can set the data up as follows:
 
 ```python
 
-# 1) Select environment from data config
-env_name = data_config["env_name"]
-env = create_env(env_name=env_name, env_configs=env_configs)
+# 1) Setup environments from data config
+env_name_list = extract_necessary_env_names(data_config)
+envs = {
+    env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+    for env_name in env_name_list
+}
 
 # 2) Load dataset using the helper (built-ins or local/HF datasets)
 data = load_response_dataset(data_config["train"])
 
 # 3) Build task mapping
 task_data_processors = {data.task_name: (data.task_spec, data.processor)}
-task_to_env = {data.task_name: env}
+task_to_env = {data.task_name: envs[data_config["train"]["env_name"]]}
 
 # 4) Construct processed dataset
 dataset = AllTaskProcessedDataset(
@@ -166,6 +169,7 @@ if data_config["validation"] is not None:
     val_data = load_response_dataset(data_config["validation"])
 
     val_task_data_processors = {val_data.task_name: (val_data.task_spec, val_data.processor)}
+    val_task_to_env = {val_data.task_name: envs[data_config["validation"]["env_name"]]}
 
     val_dataset = AllTaskProcessedDataset(
         val_data.dataset,
@@ -187,7 +191,7 @@ For more information about environments, see the [Environments Guide](environmen
 ### Env–Task Mapping
 
 - env:
-  - The environment actor for reward/evaluation, constructed using `create_env(env_name=..., env_configs=...)`.
+  - The environment actor for reward/evaluation, constructed using `create_env(env_name=..., env_config=...)`.
   - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
 - task_to_env:
   - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
@@ -195,11 +199,13 @@ For more information about environments, see the [Environments Guide](environmen
 Example (simplified):
 
 ```python
-env_name = data_config["env_name"]  # declared under config.data
-env = create_env(env_name=env_name, env_configs=env_configs)
+env_name_list = extract_necessary_env_names(data_config)
+envs = {
+    env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+    for env_name in env_name_list
+}
 
-task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: env)
-task_to_env[task_name] = env
+task_to_env[task_name] = envs[data_config["train"]["env_name"]]
 val_task_to_env = task_to_env  # validation usually mirrors training mapping
 ```
 
