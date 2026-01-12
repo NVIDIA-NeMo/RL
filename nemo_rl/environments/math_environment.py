@@ -230,6 +230,77 @@ class EnglishMultichoiceVerifyWorker:
             return results
 
 
+@ray.remote  # pragma: no cover
+class GSM8KVerifyWorker:
+    _MAX_SOLUTION_LENGTH = 300
+
+    def extract_solution(self, solution_str, method="strict"):
+        assert method in ["strict", "flexible"]
+
+        if len(solution_str) > self._MAX_SOLUTION_LENGTH:
+            solution_str = solution_str[-self._MAX_SOLUTION_LENGTH :]
+
+        if method == "strict":
+            # Strict mode: Requires formatted answer "#### <number>"
+            # This also validates that the model follows the expected format.
+            matches = re.findall(r"#### ((?:\-)?[0-9\.\\,]+)", solution_str)
+            if len(matches) == 0:
+                final_answer = None
+            else:
+                # take the last solution
+                final_answer = matches[-1].replace(",", "").replace("$", "")
+            return final_answer
+        elif method == "flexible":
+            # Flexible mode: Extract any number from the text
+            matches = re.findall(r"((?:\-)?[0-9\.\\,]+)", solution_str)
+            if not matches:
+                return None
+
+            # Find the last valid number (skip empty strings and lone periods)
+            invalid_values = {"", "."}
+            for candidate in reversed(matches):
+                if candidate not in invalid_values:
+                    return candidate
+
+            return None
+
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+        **kwargs,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
+        """
+        results = []
+        extracted_answers: list[str | None] = []
+
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            extracted_answer = self.extract_solution(response, method="strict")
+            ground_truth_answer = self.extract_solution(ground_truth, method="strict")
+            if extracted_answer is None:
+                results.append(0.0)
+                extracted_answers.append(None)
+            else:
+                results.append(1.0 if extracted_answer == ground_truth_answer else 0.0)
+                extracted_answers.append(extracted_answer)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
 class MathEnvironmentMetadata(TypedDict):
     ground_truth: str
     extracted_answer: str | None
@@ -250,6 +321,7 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
             "math": HFVerifyWorker,
             "english_multichoice": EnglishMultichoiceVerifyWorker,
             "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
+            "gsm8k": GSM8KVerifyWorker,
         }[verifier_type]
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)

@@ -17,6 +17,7 @@ from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
+from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
@@ -105,6 +106,10 @@ def load_response_dataset(data_config, seed: int = 42):
         )
     elif dataset_name == "HelpSteer3":
         base_dataset: Any = HelpSteer3Dataset()
+    elif dataset_name == "GSM8K":
+        base_dataset: Any = GSM8KDataset(
+            seed=seed,
+        )
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
