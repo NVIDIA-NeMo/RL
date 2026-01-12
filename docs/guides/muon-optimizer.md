@@ -77,7 +77,7 @@ policy:
 
 ## Experimental Results
 
-Using Muon for post-training in NeMo-RL is still in an experimental stage. Currently, we have only tested using Muon for SFT and RL from models that were pre-trained using Adam. While Muon is expected to show the greatest benefit when both pre- and post-training are performed using Muon, we have observed some minor benefit from using Muon for SFT, even when the model was pre-trained using Adam. 
+Muon support in NeMo-RL is experimental. We have tested Muon for SFT and RL on models pre-trained with Adam. While Muon is expected to show the greatest benefit when used for both pre-training and post-training, we have observed minor improvements even when applying Muon only during post-training. 
 
 For example, the following is a comparison between Adam and Muon for running SFT on Qwen3-235B-A22B:
 
