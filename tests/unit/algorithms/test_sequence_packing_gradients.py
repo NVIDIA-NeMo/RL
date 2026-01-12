@@ -344,6 +344,7 @@ class SequencePackingGradientTestActor:
                 },
                 seq_length_key="input_lengths",
                 pad_individual_seqs_to_multiple_of=pad_to_multiple,
+                pad_packed_seq_to_multiple_of=1,
                 pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             ),
             model=MockModel(),
