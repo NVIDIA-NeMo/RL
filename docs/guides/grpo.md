@@ -44,20 +44,28 @@ All of these datasets are downloaded from HuggingFace and preprocessed on-the-fl
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
+  # other data settings, see `examples/configs/grpo_math_1B.yaml` for more details
+  ...
+  # dataset settings
   train:
-    dataset_name: ResponseDataset
-    data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-    input_key: <QuestionKey>, default is "input"
-    output_key: <AnswerKey>, default is "output"
-    split: <TrainSplit>, default is None  # used for HuggingFace datasets
-    split_validation_size: 0.05 # use 5% of the training data as validation data
-    seed: 42 # seed for train/validation split when split_validation_size > 0
+    # this dataset will override input_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    input_key: question
+    split: train  # used for HuggingFace datasets
+    split_validation_size: 0.05  # use 5% of the training data as validation data
+    seed: 42  # seed for train/validation split when split_validation_size > 0
   validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
     dataset_name: ResponseDataset
-    data_path: <PathToValidationDataset>
-    input_key: <QuestionKey>, default is "input"
-    output_key: <AnswerKey>, default is "output"
-    split: <ValidationSplit>, default is None  # used for HuggingFace datasets
+    input_key: input
+    output_key: output
+    prompt_file: null
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
 ```
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
@@ -108,23 +116,17 @@ We have an example of this as `math_data_processor` in [processors.py](../../nem
   - Determines which processor, env, prompts, and dataset to use for this task.
   - Currently, we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in the config (i.e., config.data.dataset_name).
 - task_spec (TaskDataSpec):
-  - Specifies per-task system prompt and prompt (with defaults applied from a global spec when unspecified).
+  - Specifies per-task system prompt and prompt.
 - task_data_processors:
   - Dict mapping: task_name -> (task_spec, processor_fn).
-  - Typical flow: provide a default mapping using defaultdict, then explicitly register the dataset-provided processor under the resolved task_name.
+- task_to_env:
+  - Dict mapping: task_name -> task_env.
 
 Example (simplified):
 
 ```python
-# task_spec
-default_task_spec = TaskDataSpec(
-    task_name="math_default",
-    prompt_file=data_config["prompt_file"],
-    system_prompt_file=data_config["system_prompt_file"],
-)
-
-# task_data_processors
 task_data_processors = {data.task_name: (data.task_spec, data.processor)}
+task_to_env = {data.task_name: env}
 ```
 
 #### Putting It All Together
@@ -143,29 +145,23 @@ Then, you can set the data up as follows:
 env_name = data_config["env_name"]
 env = create_env(env_name=env_name, env_configs=env_configs)
 
-# 2) Build default TaskDataSpec from config (prompts loaded from files if present)
-default_task_spec = TaskDataSpec(
-    task_name="math_default",
-    prompt_file=data_config["prompt_file"],
-    system_prompt_file=data_config["system_prompt_file"],
-)
-
-# 3) Load dataset using the helper (built-ins or local/HF datasets)
+# 2) Load dataset using the helper (built-ins or local/HF datasets)
 data = load_response_dataset(data_config["train"])
 
-# 4) Build task_data_processors mapping
+# 3) Build task mapping
 task_data_processors = {data.task_name: (data.task_spec, data.processor)}
+task_to_env = {data.task_name: env}
 
-# 5) Construct processed dataset
+# 4) Construct processed dataset
 dataset = AllTaskProcessedDataset(
     data.dataset,
     tokenizer,
-    default_task_spec,
+    None,
     task_data_processors,
     max_seq_length=data_config["max_input_seq_length"],
 )
 
-# 6) Do the same thing for validation dataset if it exists
+# 5) Do the same thing for validation dataset if it exists
 if data_config["validation"] is not None:
     val_data = load_response_dataset(data_config["validation"])
 
@@ -174,7 +170,7 @@ if data_config["validation"] is not None:
     val_dataset = AllTaskProcessedDataset(
         val_data.dataset,
         tokenizer,
-        default_task_spec,
+        None,
         val_task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )

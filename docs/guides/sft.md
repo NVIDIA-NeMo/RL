@@ -77,20 +77,27 @@ All of these datasets are downloaded from HuggingFace and preprocessed on-the-fl
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
+  # other data settings, see `examples/configs/sft.yaml` for more details
+  ...
+  # dataset settings
   train:
-    dataset_name: ResponseDataset
-    data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-    input_key: <QuestionKey>, default is "input"
-    output_key: <AnswerKey>, default is "output"
-    split: <TrainSplit>, default is None  # used for HuggingFace datasets
-    split_validation_size: 0.05 # use 5% of the training data as validation data
-    seed: 42 # seed for train/validation split when split_validation_size > 0
+    # this dataset will override input_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    input_key: question
+    split: train  # used for HuggingFace datasets
+    split_validation_size: 0.05  # use 5% of the training data as validation data
+    seed: 42  # seed for train/validation split when split_validation_size > 0
   validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
     dataset_name: ResponseDataset
-    data_path: <PathToValidationDataset>
-    input_key: <QuestionKey>, default is "input"
-    output_key: <AnswerKey>, default is "output"
-    split: <ValidationSplit>, default is None  # used for HuggingFace datasets
+    input_key: input
+    output_key: output
+    prompt_file: null
+    system_prompt_file: null
+    processor: "sft_processor"
 ```
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.

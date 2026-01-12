@@ -274,18 +274,22 @@ data:
     processor: "math_hf_data_processor"
     env_name: "math"
   # You can use custom response datasets for training and validation. For example:
-  #   train:
-  #     dataset_name: ResponseDataset
-  #     data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     input_key: <QuestionKey>, default is "input"
-  #     output_key: <AnswerKey>, default is "output"
-  #     split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #   validation:
-  #     dataset_name: ResponseDataset
-  #     data_path: <PathToValidationDataset>
-  #     input_key: <QuestionKey>, default is "input"
-  #     output_key: <AnswerKey>, default is "output"
-  #     split: <ValidationSplit>, default is None  # used for HuggingFace datasets
+  # train:
+  #   # this dataset will override input_key and use the default values for other vars
+  #   data_path: /path/to/local/train_dataset.jsonl
+  #   input_key: question
+  # validation:
+  #   # this dataset will use the default values for other vars except data_path
+  #   data_path: /path/to/local/val_dataset.jsonl
+  # default:
+  #   # will use below vars as default values if dataset doesn't specify it
+  #   dataset_name: ResponseDataset
+  #   input_key: input
+  #   output_key: output
+  #   prompt_file: null
+  #   system_prompt_file: null
+  #   processor: "math_hf_data_processor"
+  #   env_name: math
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
 
 env:
