@@ -28,13 +28,15 @@ data:
   add_generation_prompt: false
 
   # dataset
-  prompt_file: null
   train:
     dataset_name: clevr-cogent
     split: train
   validation:
     dataset_name: clevr-cogent
     split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: null
 
 logger:
   log_dir: "logs"  # Base directory for all logs
