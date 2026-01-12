@@ -74,3 +74,65 @@ policy:
       start_weight_decay: 0.1
       end_weight_decay: 0.1
 ```
+
+## Experimental Results
+
+Using Muon for post-training in NeMo-RL is still in an experimental stage. Currently, we have only tested using Muon for SFT and RL from models that were pre-trained using Adam. While Muon is expected to show the greatest benefit when both pre- and post-training are performed using Muon, we have observed some minor benefit from using Muon for SFT, even when the model was pre-trained using Adam. 
+
+For example, the following is a comparison between Adam and Muon for running SFT on Qwen3-235B-A22B:
+
+<p align="center">
+<img src="../assets/muon-sft-comparison.png" alt="Muon vs Adam SFT Comparison" width="600">
+</p>
+
+The full Muon command used for this run is:
+
+```
+uv run examples/run_sft.py 
+  --config examples/configs/sft_openmathinstruct2_megatron.yaml \
+  ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
+  ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
+  ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
+  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.2 \
+  policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
+  ++policy.megatron_cfg.optimizer.lr=2e-5 \
+  policy.megatron_cfg.optimizer.use_distributed_optimizer=False \
+  cluster.num_nodes=4 \
+  cluster.gpus_per_node=8 \
+  policy.megatron_cfg.pipeline_model_parallel_size=8 \
+  policy.megatron_cfg.sequence_parallel=True \
+  policy.megatron_cfg.expert_model_parallel_size=8 \
+  policy.megatron_cfg.tensor_model_parallel_size=8 \
+  policy.sequence_packing.enabled=True \
+  policy.model_name=Qwen/Qwen3-235B-A22B \
+  policy.tokenizer.name=Qwen/Qwen3-235B-A22B checkpointing.enabled=True \
+  cluster.num_nodes=16 \
+  policy.megatron_cfg.num_layers_in_first_pipeline_stage=11 \
+  policy.megatron_cfg.num_layers_in_last_pipeline_stage=11
+```
+
+
+Here is a comparison of Muon vs Adam for DAPO with Qwen3.5-7B:
+
+<p align="center">
+<img src="../assets/muon-dapo-reward.png" alt="Muon vs Adam DAPO Train Reward" height="300">
+<img src="../assets/muon-dapo-val-acc.png" alt="Muon vs Adam DAPO Validation Accuracy" height="300">
+</p>
+
+The command to generate the Muon results is:
+
+```
+uv run examples/run_grpo_math.py \
+  --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml \
+  ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
+  ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
+  ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
+  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.5 \
+  policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
+  policy.megatron_cfg.optimizer.use_distributed_optimizer=False \
+  cluster.num_nodes=16 cluster.gpus_per_node=8 \
+  policy.sequence_packing.enabled=True \
+  ~checkpointing.model_save_format
+```
