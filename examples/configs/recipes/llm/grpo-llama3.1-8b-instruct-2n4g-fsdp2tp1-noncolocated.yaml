@@ -7,4 +7,4 @@ logger:
     name: grpo-llama3.1-8b-instruct-2n4g-fsdp2tp1-noncolocated
 cluster:
   gpus_per_node: 4
-
+  inference_gpus_per_node: 4
