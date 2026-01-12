@@ -26,6 +26,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
+    extract_necessary_env_names,
     load_response_dataset,
     update_single_dataset_config,
 )
@@ -80,8 +81,11 @@ def setup_data(
     )
 
     print("\n▶ Setting up envs...")
-    env_name = data_config["env_name"]
-    env = create_env(env_name=env_name, env_configs=env_configs)
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+        for env_name in env_name_list
+    }
 
     print("\n▶ Setting up data...")
     # setup train dataset
@@ -89,7 +93,7 @@ def setup_data(
         update_single_dataset_config(data_config["train"], data_config["default"])
     data = load_response_dataset(data_config["train"])
     task_data_processors = {data.task_name: (data.task_spec, data.processor)}
-    task_to_env = {data.task_name: env}
+    task_to_env = {data.task_name: envs[data_config["train"]["env_name"]]}
 
     dataset = AllTaskProcessedDataset(
         data.dataset,
@@ -123,7 +127,9 @@ def setup_data(
             val_data.task_spec,
             val_data.processor,
         )
-        val_task_to_env[val_data.task_name] = env
+        val_task_to_env[val_data.task_name] = envs[
+            data_config["validation"]["env_name"]
+        ]
 
     val_dataset = None
     if len(val_data_list) > 0:

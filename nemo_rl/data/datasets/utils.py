@@ -114,3 +114,27 @@ def update_single_dataset_config(data_config: dict, default_data_config: dict) -
     for key in default_data_config.keys():
         if key not in data_config:
             data_config[key] = default_data_config[key]
+
+
+def extract_necessary_env_names(data_config: dict) -> list[str]:
+    """Extract the necessary environment names from the data config.
+
+    Some environments are set in env_configs but not used in the data config.
+    This function extracts the necessary environment names from the data config.
+
+    Args:
+        data_config: The data config.
+
+    Returns:
+        The necessary environment names.
+    """
+    necessary_env_names = set()
+    keys = ["train", "validation", "default"]
+    for key in keys:
+        if (
+            key in data_config
+            and data_config[key] is not None
+            and "env_name" in data_config[key]
+        ):
+            necessary_env_names.add(data_config[key]["env_name"])
+    return list(necessary_env_names)

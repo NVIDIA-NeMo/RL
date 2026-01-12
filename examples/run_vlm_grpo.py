@@ -26,15 +26,13 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
+    extract_necessary_env_names,
     load_response_dataset,
     update_single_dataset_config,
 )
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.vlm_environment import VLMEnvironment
+from nemo_rl.environments.utils import create_env
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -72,15 +70,11 @@ def setup_data(
     )
 
     print("\n▶ Setting up envs...")
-    env_name = data_config["env_name"]
-    env = VLMEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.vlm_environment.VLMEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs[env_name])
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name="vlm", env_config=env_configs[env_name])
+        for env_name in env_name_list
+    }
 
     print("\n▶ Setting up data...")
     # setup train dataset
@@ -88,7 +82,7 @@ def setup_data(
         update_single_dataset_config(data_config["train"], data_config["default"])
     data = load_response_dataset(data_config["train"])
     task_data_processors = {data.task_name: (data.task_spec, data.processor)}
-    task_to_env = {data.task_name: env}
+    task_to_env = {data.task_name: envs[data_config["train"]["env_name"]]}
 
     dataset = AllTaskProcessedDataset(
         data.dataset,
@@ -122,7 +116,9 @@ def setup_data(
             val_data.task_spec,
             val_data.processor,
         )
-        val_task_to_env[val_data.task_name] = env
+        val_task_to_env[val_data.task_name] = envs[
+            data_config["validation"]["env_name"]
+        ]
 
     val_dataset = None
     if len(val_data_list) > 0:
