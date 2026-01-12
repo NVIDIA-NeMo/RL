@@ -138,3 +138,47 @@ def test_preference_dataset():
         },
         {"completion": [{"role": "assistant", "content": "I don't know."}], "rank": 1},
     ]
+
+
+@pytest.mark.parametrize("dataset_name", ["HelpSteer3", "Tulu3Preference"])
+def test_build_in_dataset(dataset_name):
+    # load the dataset
+    data_config = {"dataset_name": dataset_name}
+    dataset = load_preference_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains context, completions and task_name
+    assert len(first_example.keys()) == 3
+    assert "context" in first_example
+    assert "completions" in first_example
+    assert first_example["task_name"] == dataset_name
+
+    # check the content
+    assert first_example["context"][-1]["role"] == "user"
+    for i in range(2):
+        assert first_example["completions"][i]["rank"] == i
+        assert first_example["completions"][i]["completion"][0]["role"] == "assistant"
+
+    if dataset_name == "HelpSteer3":
+        assert first_example["context"][-1]["content"][:20] == 'At the "tasks_B = [t'
+        assert (
+            first_example["completions"][0]["completion"][0]["content"][:20]
+            == "Yes, you are correct"
+        )
+        assert (
+            first_example["completions"][1]["completion"][0]["content"][:20]
+            == "Sure! Here's the upd"
+        )
+
+    elif dataset_name == "Tulu3Preference":
+        assert first_example["context"][-1]["content"][:20] == "Your entire response"
+        assert (
+            first_example["completions"][0]["completion"][0]["content"][:20]
+            == "what is the true hea"
+        )
+        assert (
+            first_example["completions"][1]["completion"][0]["content"][:20]
+            == "it's a bit tricky as"
+        )
