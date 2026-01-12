@@ -40,7 +40,7 @@ overrides = [
 
 [[manifest.dependency-metadata]]
 name = "causal-conv1d"
-version = "1.5.0.post8"
+version = "1.5.4"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -59,7 +59,7 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[manifest.dependency-metadata]]
 name = "mamba-ssm"
-version = "2.2.4"
+version = "2.2.6.post3"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[manifest.dependency-metadata]]
@@ -771,8 +771,8 @@ wheels = [
 
 [[package]]
 name = "causal-conv1d"
-version = "1.5.0.post8"
-source = { git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8#82867a9d2e6907cc0f637ac6aff318f696838548" }
+version = "1.5.4"
+source = { git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0#67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -2697,8 +2697,8 @@ wheels = [
 
 [[package]]
 name = "mamba-ssm"
-version = "2.2.4"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4#2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+version = "2.2.6.post3"
+source = { git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1#d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 dependencies = [
     { name = "causal-conv1d" },
     { name = "ninja" },
@@ -2882,11 +2882,11 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
+    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
     { name = "datasets" },
     { name = "flash-linear-attention" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
-    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-LM-workspace" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
@@ -2939,12 +2939,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "av", specifier = "<16.0.0" },
-    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
+    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
     { name = "einops", specifier = "~=0.8" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
     { name = "flash-linear-attention", specifier = "~=0.3.2" },
     { name = "flashinfer-python" },
-    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
@@ -3716,8 +3716,8 @@ test = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "blobfile" },
-    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
-    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
+    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
+    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
     { name = "colored", specifier = "==2.2.3" },
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
@@ -3731,8 +3731,8 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'fsdp'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
     { name = "hydra-core" },
-    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
-    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
+    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
