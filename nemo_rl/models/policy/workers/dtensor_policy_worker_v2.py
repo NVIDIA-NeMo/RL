@@ -235,7 +235,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
-        if self.max_grad_norm == 0.0: # allow zero grad norm for consistency with megatron
+        # allow zero grad norm for consistency with megatron
+        if self.max_grad_norm == 0.0: 
             self.max_grad_norm = None
 
         try:
