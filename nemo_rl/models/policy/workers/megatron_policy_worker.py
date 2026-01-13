@@ -85,7 +85,6 @@ from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     TopkLogitsPostProcessor,
 )
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,

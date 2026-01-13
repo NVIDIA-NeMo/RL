@@ -58,6 +58,7 @@ class ProcessedMicrobatch:
         packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
     """
+
     data_dict: BatchedDataDict[Any]
     input_ids: torch.Tensor
     input_ids_cp_sharded: torch.Tensor
@@ -202,6 +203,7 @@ def get_microbatch_iterator(
         padded_seq_length,
     )
 
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -336,6 +338,7 @@ def process_global_batch(
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
     }
+
 
 
 def _pack_sequences_for_megatron(
