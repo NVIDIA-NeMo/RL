@@ -614,20 +614,16 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
 
         # Original O(n * m) implementation
         """
-        num_iterations = 0
         ffd_bins: List[List[Tuple[int, int]]] = []
         for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
             placed = False
             for bin_ffd in ffd_bins:
-                num_iterations += 1
                 if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
                     bin_ffd.append((idx, size))
                     placed = True
                     break
             if not placed:
                 ffd_bins.append([(idx, size)])
-
-        print(f"Phase 5 took {num_iterations} total iterations and ended with {len(ffd_bins)} bins")
         """
 
         from bisect import bisect
