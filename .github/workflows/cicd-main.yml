@@ -155,6 +155,18 @@ jobs:
     needs: [pre-flight]
     runs-on: ubuntu-latest
     steps:
+      - name: Free up disk space
+        run: |
+          # Remove unnecessary packages and files on Ubuntu
+          sudo apt-get clean
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/az || true
+          # Clear pip and npm caches
+          pip cache purge || true
+          sudo npm cache clean --force || true
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
