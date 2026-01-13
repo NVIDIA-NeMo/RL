@@ -3698,7 +3698,7 @@ test = [
 
 [[package]]
 name = "nemo-gym"
-source = { editable = "3rdparty/Gym-workspace" }
+source = { editable = "3rdparty/Gym-workspace/Gym" }
 dependencies = [
     { name = "aiohttp" },
     { name = "datasets" },
@@ -3883,7 +3883,7 @@ requires-dist = [
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-LM-workspace" },
     { name = "mlflow", specifier = ">=3.5.0,<3.6.0" },
     { name = "nemo-automodel", marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
-    { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace" },
+    { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
     { name = "ninja" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
