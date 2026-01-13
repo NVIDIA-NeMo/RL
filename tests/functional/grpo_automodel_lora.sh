@@ -34,7 +34,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=4 \
     logger.wandb_enabled=False \
     checkpointing.enabled=false \
-    cluster.gpus_per_node=8 \
+    cluster.gpus_per_node=2 \
     checkpointing.checkpoint_dir=/tmp/lora_grpo_checkpoints \
     "$@" \
     2>&1 | tee $RUN_LOG

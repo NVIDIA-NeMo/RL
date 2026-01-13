@@ -363,7 +363,7 @@ class BaseVllmGenerationWorker:
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
-            from nemo_rl.models.generation.fp8 import init_fp8
+            from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
@@ -400,9 +400,16 @@ class BaseVllmGenerationWorker:
         # Lora is enabled, add it to the vllm kwargs
         self.lora_enabled = False
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
-            from nemo_rl.models.generation.lora import apply_lora_patches
+            try:
+                from nemo_rl.models.generation.lora import apply_lora_patches
 
-            apply_lora_patches()
+                apply_lora_patches()
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Lora is enabled, but failed to apply lora patches: {e}"
+                )
+
             self.lora_enabled = True
             vllm_kwargs["enable_lora"] = True
             vllm_kwargs["max_loras"] = 1  # only support one lora adapter
@@ -719,7 +726,20 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            from vllm.lora.request import LoRARequest
+
+            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+            lora_metadata = get_vllm_lora_metadata()
+            lora_req = LoRARequest(
+                **lora_metadata,
+            )
+        outputs = self.llm.generate(
+            data["prompts"], sampling_params, lora_request=lora_req
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
