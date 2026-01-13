@@ -41,8 +41,9 @@ class SequencePackingGradientTestActor:
 
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-        from nemo_rl.models.megatron.common import (
-            forward_step_arbitrary_loss,
+        from nemo_rl.models.megatron.train import (
+            forward_with_post_processing_fn,
+            LossPostProcessor,
         )
         from nemo_rl.models.megatron.data import (
             _pack_sequences_for_megatron,
@@ -289,7 +290,7 @@ class SequencePackingGradientTestActor:
             packed_grad, baseline_grad_store, atol=1e-5, rtol=1e-5
         )
 
-        # test 3: with forward_step_arbitrary_loss
+        # test 3: with forward_with_post_processing_fn
         # reset grad
         baseline_logits.grad.zero_()
         packed_logits = make_packed_logits(baseline_logits)
@@ -307,15 +308,24 @@ class SequencePackingGradientTestActor:
             ):
                 return self.logits
 
-        class MockMcoreState:
-            def __init__(self):
-                # context that does nothing, but supports both with straggler_timer and with straggler_timer(bdata=True)
-                from contextlib import nullcontext
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "dynamic_batching": {"enabled": False},
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": cp_size,
+            },
+        }
 
-                class DummyStragglerTimer:
-                    def __call__(self, *args, **kwargs):
-                        return nullcontext()
+        post_processor = LossPostProcessor(
+            loss_fn=base_loss_fn,
+            cfg=cfg,
+            cp_normalize=True,
+        )
 
+<<<<<<< HEAD
                     def __enter__(self):
                         return self
 
@@ -342,6 +352,12 @@ class SequencePackingGradientTestActor:
                         "context_parallel_size": cp_size,
                     },
                 },
+=======
+        output_tensor, wrapped_loss_fn = forward_with_post_processing_fn(
+            data_iterator=make_processed_microbatch_iterator(
+                iter([packed_data_dict]),
+                cfg=cfg,
+>>>>>>> a11ae1b2e (fix unit test)
                 seq_length_key="input_lengths",
                 pad_individual_seqs_to_multiple_of=pad_to_multiple,
                 pad_packed_seq_to_multiple_of=1,
@@ -349,9 +365,10 @@ class SequencePackingGradientTestActor:
                 pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             ),
             model=MockModel(),
-            loss_fn=base_loss_fn,
-            pack_sequences=True,
-            cp_normalize=True,
+            cfg=cfg,
+            post_processing_fn=post_processor,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
         )
         loss, metrics = wrapped_loss_fn(output_tensor)
 
