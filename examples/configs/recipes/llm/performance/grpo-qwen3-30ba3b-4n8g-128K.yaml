@@ -8,7 +8,7 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
-  max_total_sequence_length: 131072
+  max_total_sequence_length: 40960
   dtensor_cfg:
     enabled: false
   optimizer: null
@@ -17,10 +17,11 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
-    sequence_parallel: false
+    sequence_parallel: true
+    context_parallel_size: 8
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08
@@ -29,6 +30,7 @@ policy:
       lr_warmup_init: 3.0e-08
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+    activation_checkpointing: true
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
