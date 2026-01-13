@@ -133,7 +133,13 @@ data:
   shuffle: true
   num_workers: 1
 
-  dataset_name: HelpSteer3
+  # dataset
+  train:
+    dataset_name: HelpSteer3
+    split: train
+  validation:
+    dataset_name: HelpSteer3
+    split: validation
   # You can use custom preference datasets for training and validation. For example:
   # 1. PreferenceDataset
   #   train:
@@ -186,12 +192,12 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "rm-dev"
-    name: "rm-dev-${data.dataset_name}"
+    name: "rm-dev-${data.train.dataset_name}"
   swanlab:
     project: "rm-dev"
-    name: "rm-dev-${data.dataset_name}"
+    name: "rm-dev-${data.train.dataset_name}"
   tensorboard:
-    log_dir: "tb_logs-rm-dev-${data.dataset_name}"
+    log_dir: "tb_logs-rm-dev-${data.train.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

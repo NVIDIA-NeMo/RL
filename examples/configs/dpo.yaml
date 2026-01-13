@@ -182,7 +182,13 @@ data:
   shuffle: true
   num_workers: 1
 
-  dataset_name: HelpSteer3
+  # dataset
+  train:
+    dataset_name: HelpSteer3
+    split: train
+  validation:
+    dataset_name: HelpSteer3
+    split: validation
   # You can use custom preference datasets for training and validation. For example:
   # 1. PreferenceDataset
   #   train:
