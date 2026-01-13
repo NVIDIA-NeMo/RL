@@ -130,6 +130,13 @@ nemo_gym = ["nemo_gym"]
 build = [
   # Build requirement for TE
   "torch==2.9.0",
+  # Ensure a CMake 3.x is available in the main env. This is important when building
+  # git/path packages without isolation (e.g., sgl-kernel) to avoid scikit-build-core
+  # falling back to a bundled CMake 4.x wheel (which can break dlpack).
+  "cmake>=3.31,<4",
+  # Build requirement for sgl-kernel (when built without isolation)
+  "scikit-build-core>=0.10,<0.11",
+  "ninja",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -227,6 +234,8 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  # Build sgl-kernel (git/path) without isolation so we can control the CMake version (CMake 4+ breaks dlpack).
+  "sgl-kernel",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -346,16 +355,16 @@ select = ["D", "F"]
 #   documentation for every function parameter.
 # - F841: local variable assigned but never used (exluced to favor readability)
 # TODO: Remove D10 once we are about to release to get all the docstrings written
-ignore = ["D417", "D10", "F841"]
+# Also ignore rules that conflict with Google style or are overly rigid.
+ignore = ["D417", "D10", "F841", "D203", "D213", "D401"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+ignore-decorators = []
 
 # Section to exclude errors for different file types
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
-# Ignore all files that end in `_test.py`.
-"*_test.py" = ["D"]
-# Ignore F401 (import but unused) in __init__.py
-"__init__.py" = ["F401"]
+"nemo_rl/__init__.py" = ["F401"]
+"nemo_rl/**/__init__.py" = ["F401"]
