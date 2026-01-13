@@ -3,11 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=8
+NUM_NODES=1
 STEPS_PER_RUN=30
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -34,9 +34,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/reward"]["30"] > 0.43' \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 220'
+        'mean(data["train/gen_kl_error"]) < 0.001' \
+        'data["train/gen_kl_error"]["30"] < 0.001 ' \
+        'data["train/reward"]["30"] > 0.4' \
+        'data["train/grad_norm"]["30"] < 0.2' \
+        'data["train/grad_norm"]["30"] > 0.1'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

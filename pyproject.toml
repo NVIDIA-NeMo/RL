@@ -52,19 +52,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Currently unused, but after https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved, we should use this for the "BASE" PYEXECUTABLE
+fsdp = [
+  "flash-attn==2.8.1",
+  "mamba-ssm",
+  "causal-conv1d",
+  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+  "vllm==0.11.2",
+]
 automodel = [
   "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "vllm==0.11.2",                                                                                     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
   "flash-attn==2.8.1",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch]==2.8.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+  "vllm==0.11.2",
 ]
 vllm = [
   "cuda-python",
@@ -75,12 +82,6 @@ vllm = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   "vllm==0.11.2",
   "num2words>=0.5.14",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "flash-attn==2.8.1",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "mamba-ssm",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "causal-conv1d",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -95,12 +96,12 @@ mcore = [
   "transformer-engine[pytorch]==2.8.0",
   "megatron-core",
   "megatron-bridge",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm==0.11.2",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+  "vllm==0.11.2",
 ]
 nemo_gym = ["nemo_gym"]
 
@@ -168,8 +169,8 @@ triton = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 
 [tool.uv.workspace]
@@ -227,11 +228,12 @@ override-dependencies = [
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
 ]
-# CVE fxies
+# CVE fixes
 constraint-dependencies = [
   "brotli>=1.2.0",     # Address CVE GHSA-2qfp-q593-8484
   "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
-  "urllib3>=2.6.0",    # Address CVE GHSA-gm62-xv2j-4w53
+  "urllib3>=2.6.3",    # Address CVE GHSA-38jv-5279-wg99
+  "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
 ]
 
 # Augment build dependencies for packages that need torch at build time
@@ -254,13 +256,13 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
-version = "1.5.0.post8"
+version = "1.5.4"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "2.2.4"
+version = "2.2.6.post3"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]
