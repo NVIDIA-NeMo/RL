@@ -3,20 +3,20 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=8
-STEPS_PER_RUN=30
-MAX_STEPS=30
+NUM_NODES=1
+STEPS_PER_RUN=50
+MAX_STEPS=50
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo_math.py \
+uv run examples/run_sft.py \
     --config $CONFIG_PATH \
-    grpo.max_num_steps=$MAX_STEPS \
+    sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -31,12 +31,16 @@ uv run examples/run_grpo_math.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# TODO: memory check will fail due to OOM tracked here https://github.com/NVIDIA-NeMo/RL/issues/263
+
+# Revert to `mean(data["timing/train/total_step_time"], 2) < 30` once https://github.com/NVIDIA-NeMo/RL/issues/1719 resolved
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/reward"]["30"] > 0.43' \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 220'
+        'data["train/loss"]["1"] < 1.0' \
+        'data["train/loss"]["50"] < 0.8' \
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 60' \
+        'mean(data["timing/train/total_step_time"], 2) < 30'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
