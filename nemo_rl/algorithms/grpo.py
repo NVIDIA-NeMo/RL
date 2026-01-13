@@ -460,6 +460,19 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+        peft_cfg = policy_config.get("megatron_cfg", {}).get("peft", {})
+        if peft_cfg.get("enabled", False):
+            # Override the vLLM lora config with the Megatron PEFT config
+            generation_config["vllm_cfg"]["lora_cfg"] = peft_cfg
+
+            # Not implemented yet
+            assert colocated_inference, (
+                "LoRA in Megatron backend is only supported with colocated inference."
+            )
+            assert not _should_use_async_rollouts(master_config), (
+                "Async rollouts are not supported with LoRA in Megatron backend."
+            )
+
     if policy_config.get("dtensor_cfg", {}).get("enabled", False):
         lora_cfg = policy_config.get("dtensor_cfg", {}).get("lora_cfg", {})
         if lora_cfg.get("enabled", False):
@@ -516,6 +529,9 @@ def setup(
             )
             assert not policy_config["dtensor_cfg"]["lora_cfg"]["enabled"], (
                 "LoRA is not supported with vLLM FP8 generation."
+            )
+            assert not policy_config["megatron_cfg"]["peft"]["enabled"], (
+                "LoRA in Megatron backend is not supported with vLLM FP8 generation."
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
@@ -937,6 +953,8 @@ def refit_policy_generation(
             This parameter is primarily used for testing.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+        refit_base_model_weights: Whether to update base model weights, if false base model weights are frozen.
+        refit_lora_weights: Whether to update the LoRA weights.
     """
     assert refit_base_model_weights or refit_lora_weights, (
         "refit_base_model_weights and refit_lora_weights cannot be both False"
