@@ -97,6 +97,7 @@ from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weights import is_base_model_weight_name, is_lora_weight_name
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -106,7 +107,10 @@ STRING_TO_DTYPE = {
 
 
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    refit_base_model_weights: bool = True,
+    refit_lora_weights: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
@@ -118,6 +122,11 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
     for name, tensor in model.state_dict().items():
+        if is_base_model_weight_name(name) and not refit_base_model_weights:
+            continue
+        if is_lora_weight_name(name) and not refit_lora_weights:
+            continue
+
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
@@ -1809,6 +1818,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
@@ -1825,7 +1836,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=dtensor_params_generator(
+                self.model, self.dtype, refit_base_model_weights, refit_lora_weights
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
