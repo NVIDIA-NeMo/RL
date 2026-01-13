@@ -139,6 +139,7 @@ class BaseVllmGenerationWorker:
         self.enable_expert_parallel = self.expert_parallel_size > 1
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
         self.precision = self.cfg["vllm_cfg"]["precision"]
+        self.lora_cfg = self.cfg["vllm_cfg"].get("lora_cfg", None)
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -396,6 +397,23 @@ class BaseVllmGenerationWorker:
                     "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+        # Lora is enabled, add it to the vllm kwargs
+        self.lora_enabled = False
+        if self.lora_cfg is not None and self.lora_cfg["enabled"]:
+            try:
+                from nemo_rl.models.generation.lora import apply_lora_patches
+
+                apply_lora_patches()
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Lora is enabled, but failed to apply lora patches: {e}"
+                )
+
+            self.lora_enabled = True
+            vllm_kwargs["enable_lora"] = True
+            vllm_kwargs["max_loras"] = 1  # only support one lora adapter
+            vllm_kwargs["max_lora_rank"] = self.lora_cfg["dim"]
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -568,7 +586,18 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            from vllm.lora.request import LoRARequest
+
+            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+            lora_metadata = get_vllm_lora_metadata()
+            lora_req = LoRARequest(
+                **lora_metadata,
+            )
+        outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -697,7 +726,20 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            from vllm.lora.request import LoRARequest
+
+            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+            lora_metadata = get_vllm_lora_metadata()
+            lora_req = LoRARequest(
+                **lora_metadata,
+            )
+        outputs = self.llm.generate(
+            data["prompts"], sampling_params, lora_request=lora_req
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
@@ -727,7 +769,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
@@ -741,7 +785,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=tuple(),
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
             worker_result = result_or_coro[0]
 
