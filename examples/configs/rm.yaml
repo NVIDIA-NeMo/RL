@@ -135,25 +135,41 @@ data:
 
   dataset_name: HelpSteer3
   # You can use custom preference datasets for training and validation. For example:
-  #   1. PreferenceDataset
-  #   data:
+  # 1. PreferenceDataset
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
   #     dataset_name: PreferenceDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_paths:
-  #       <NameOfValidationDataset1>: <PathToValidationDataset1>
-  #       ...
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
-  #   2. BinaryPreferenceDataset
-  #   data:
+  #     prompt_file: null
+  #     system_prompt_file: null
+  #   # multiple validation sets is supported by using val_data_paths
+  #   # this will be removed after refactor
+  #   val_data_paths:
+  #     <NameOfValidationDataset1>: /path/to/local/val_dataset_1.jsonl
+  #     <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
+  # 2. BinaryPreferenceDataset
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     prompt_key: context
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
   #     dataset_name: BinaryPreferenceDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
-  #     prompt_key: <PromptKey>, default is "prompt"
-  #     chosen_key: <ChosenKey>, default is "chosen"
-  #     rejected_key: <RejectedKey>, default is "rejected"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  #     prompt_key: prompt
+  #     chosen_key: chosen
+  #     rejected_key: rejected
+  #     prompt_file: null
+  #     system_prompt_file: null
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/rm.md#datasets for more details.
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
