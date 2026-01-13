@@ -66,8 +66,8 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
-    broadcast_obj_from_pp_rank,
     broadcast_loss_metrics_from_last_stage,
+    broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.setup import (
@@ -80,10 +80,10 @@ from nemo_rl.models.megatron.setup import (
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
-    megatron_forward_backward,
-    LossPostProcessor,
     LogprobsPostProcessor,
+    LossPostProcessor,
     TopkLogitsPostProcessor,
+    megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -632,7 +632,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 # Broadcast loss metrics from last stage to all stages
                 ## TODO: check with PP > 1
-                gb_loss_metrics = broadcast_loss_metrics_from_last_stage(gb_loss_metrics)
+                gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
+                    gb_loss_metrics
+                )
                 if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 

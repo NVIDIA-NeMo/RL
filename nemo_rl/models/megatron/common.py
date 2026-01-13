@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return (
@@ -29,6 +29,7 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
         if value % multiple != 0
         else value
     )
+
 
 def broadcast_tensor(
     tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup

@@ -41,13 +41,13 @@ class SequencePackingGradientTestActor:
 
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-        from nemo_rl.models.megatron.train import (
-            forward_with_post_processing_fn,
-            LossPostProcessor,
-        )
         from nemo_rl.models.megatron.data import (
             _pack_sequences_for_megatron,
             make_processed_microbatch_iterator,
+        )
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
         )
 
         # Initialize process group
