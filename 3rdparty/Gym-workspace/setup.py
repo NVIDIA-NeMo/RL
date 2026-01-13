@@ -42,6 +42,7 @@ CACHED_DEPENDENCIES = [
     "ray[default]",
     "psutil",
     "datasets",
+    "orjson",
 ]
 
 if src_dir.exists():
