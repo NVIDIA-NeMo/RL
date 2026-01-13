@@ -18,6 +18,7 @@ import enum
 import math
 import random
 from abc import ABC, abstractmethod
+from bisect import bisect
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 
@@ -625,8 +626,6 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
             if not placed:
                 ffd_bins.append([(idx, size)])
         """
-
-        from bisect import bisect
 
         # New O(n * logn) implementation
         ffd_bins: List[List[Tuple[int, int]]] = [[]]
