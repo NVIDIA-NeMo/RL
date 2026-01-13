@@ -279,7 +279,7 @@ We will create a Ray cluster with **1x Head node** and **1x Worker node** (with 
 * **Memory:** Disables Ray's OOM killer to prevent false positives.
 * **Caching:** Redirects HuggingFace cache to the shared PVC.
 * **Version Match:** The `rayVersion` spec must match the version in `RL/pyproject.toml`. Check this example [version snapshot](https://github.com/NVIDIA-NeMo/RL/blob/b2e4265d4f2424c0467691f2f0f864cdebe1ab0f/pyproject.toml#L25).
-
+* **Container image:** Replace the image name `nvcr.io/nvidian/nemo-rl:latest` with your actual image, e.g., `nvcr.io/YOUR_NGC_ORG/nemo-rl:latest`.
 
 > [!WARNING]
 > **Check Your Node Capacity & Resource Limits**
@@ -322,7 +322,7 @@ spec:
         dnsPolicy: ClusterFirstWithHostNet
 
         tolerations:
-          - key: "[nvidia.com/gpu](https://nvidia.com/gpu)"
+          - key: "nvidia.com/gpu"
             operator: "Exists"
             effect: "NoSchedule"
         
@@ -332,11 +332,11 @@ spec:
           imagePullPolicy: Always
           resources:
             limits:
-              [nvidia.com/gpu](https://nvidia.com/gpu): 8 
+              nvidia.com/gpu: 8 
               cpu: "128"
               memory: "1500Gi"
             requests:
-              [nvidia.com/gpu](https://nvidia.com/gpu): 8
+              nvidia.com/gpu: 8
               cpu: "128"
               memory: "1500Gi"
           env:
@@ -400,11 +400,11 @@ spec:
           imagePullPolicy: Always
           resources:
             limits:
-              [nvidia.com/gpu](https://nvidia.com/gpu): 8 
+              nvidia.com/gpu: 8 
               cpu: "128"
               memory: "1500Gi"
             requests:
-              [nvidia.com/gpu](https://nvidia.com/gpu): 8
+              nvidia.com/gpu: 8
               cpu: "128"
               memory: "1500Gi"
           env:
@@ -423,7 +423,7 @@ spec:
               name: dshm
         
         tolerations:
-          - key: "[nvidia.com/gpu](https://nvidia.com/gpu)"
+          - key: "nvidia.com/gpu"
             operator: "Exists"
             effect: "NoSchedule"
         volumes:
@@ -434,6 +434,7 @@ spec:
             emptyDir:
               medium: Memory
               sizeLimit: "1000Gi"
+
 ```
 
 **Cluster Management Commands:**
