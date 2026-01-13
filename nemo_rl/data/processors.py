@@ -14,6 +14,7 @@
 
 """Contains data processors for evaluation."""
 
+import logging
 from typing import Any, Dict, cast
 
 import torch
@@ -22,6 +23,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
+    PreferenceDatumSpec,
     TaskDataProcessFnCallable,
     TaskDataSpec,
     VLMMessageLogType,
@@ -178,6 +180,126 @@ def sft_processor(
         "message_log": message_log,
         "length": length,
         "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+def preference_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> PreferenceDatumSpec:
+    """Process a datum dictionary for RM/DPO training.
+
+    Examples:
+        ```{doctest}
+        >>> from transformers import AutoTokenizer
+        >>> from nemo_rl.data.interfaces import TaskDataSpec
+        >>>
+        >>> # Initialize tokenizer and task spec
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        >>> ## set a passthrough chat template for simplicity
+        >>> tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        >>> task_spec = TaskDataSpec(task_name="test_dpo")
+        >>>
+        >>> datum = {
+        ...     "context": [{"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
+        ... }
+        >>>
+        >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
+        >>> len(processed["message_log_chosen"])
+        2
+        >>> processed["message_log_chosen"][0]["content"]
+        '<|begin_of_text|>What is 2+2?'
+        >>> processed["message_log_chosen"][-1]["content"]
+        '4<|eot_id|>'
+        >>> processed["message_log_rejected"][-1]["content"]
+        '5<|eot_id|>'
+        >>>
+        >>> # context can also contain multiple turns
+        >>> datum = {
+        ...     "context": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
+        ... }
+        >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
+        >>> len(processed["message_log_chosen"])
+        4
+        >>> processed["message_log_chosen"][1]["content"]
+        'Sure!'
+        >>> processed["message_log_chosen"][-1]["content"]
+        '4<|eot_id|>'
+        >>> processed["message_log_rejected"][-1]["content"]
+        '5<|eot_id|>'
+
+        ```
+    """
+    assert len(datum_dict["completions"]) == 2, (
+        "RM/DPO training supports only two completions"
+    )
+    # Lower rank is preferred
+    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][0]
+        rejected_completion = datum_dict["completions"][1]
+    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][1]
+        rejected_completion = datum_dict["completions"][0]
+    else:
+        raise NotImplementedError(
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+        )
+
+    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
+    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
+
+    message_log_chosen = get_formatted_message_log(
+        messages_chosen, tokenizer, task_data_spec
+    )
+    message_log_rejected = get_formatted_message_log(
+        messages_rejected, tokenizer, task_data_spec
+    )
+
+    length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+    length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+    loss_multiplier = 1.0
+    if max(length_chosen, length_rejected) > max_seq_length:
+        logging.warning(
+            f"Sequence length {max(length_chosen, length_rejected)} exceeds max_seq_length {max_seq_length}. Ignoring example."
+        )
+
+        # make smaller and mask out
+        for message in message_log_chosen:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_chosen))
+            ]
+        for message in message_log_rejected:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_rejected))
+            ]
+        loss_multiplier = 0.0
+
+        length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+        length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+        # safeguard against edge case where there are too many turns to fit within the max length
+        assert max(length_chosen, length_rejected) <= max_seq_length
+
+    output: PreferenceDatumSpec = {
+        "message_log_chosen": message_log_chosen,
+        "message_log_rejected": message_log_rejected,
+        "length_chosen": length_chosen,
+        "length_rejected": length_rejected,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
     }

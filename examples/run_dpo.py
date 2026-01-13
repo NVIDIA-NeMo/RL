@@ -15,8 +15,6 @@
 import argparse
 import os
 import pprint
-import warnings
-from typing import Any
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -24,10 +22,13 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.dpo import MasterConfig, dpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_preference_dataset,
+    update_single_dataset_config,
+)
 from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
-from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
-from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -49,146 +50,27 @@ def parse_args():
 # =======================================================
 # Data Processing
 # =======================================================
-def dpo_preprocessor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    """Process a datum dictionary for DPO training.
-
-    Examples:
-        ```{doctest}
-        >>> from transformers import AutoTokenizer
-        >>> from nemo_rl.data.interfaces import TaskDataSpec
-        >>>
-        >>> # Initialize tokenizer and task spec
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-        >>> ## set a passthrough chat template for simplicity
-        >>> tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
-        >>> task_spec = TaskDataSpec(task_name="test_dpo")
-        >>>
-        >>> datum = {
-        ...     "context": [{"role": "user", "content": "What is 2+2?"}],
-        ...     "completions": [
-        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
-        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
-        ...     ]
-        ... }
-        >>>
-        >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
-        >>> len(processed["message_log_chosen"])
-        2
-        >>> processed["message_log_chosen"][0]["content"]
-        '<|begin_of_text|>What is 2+2?'
-        >>> processed["message_log_chosen"][-1]["content"]
-        '4<|eot_id|>'
-        >>> processed["message_log_rejected"][-1]["content"]
-        '5<|eot_id|>'
-        >>>
-        >>> # context can also contain multiple turns
-        >>> datum = {
-        ...     "context": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
-        ...     "completions": [
-        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
-        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
-        ...     ]
-        ... }
-        >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
-        >>> len(processed["message_log_chosen"])
-        4
-        >>> processed["message_log_chosen"][1]["content"]
-        'Sure!'
-        >>> processed["message_log_chosen"][-1]["content"]
-        '4<|eot_id|>'
-        >>> processed["message_log_rejected"][-1]["content"]
-        '5<|eot_id|>'
-
-        ```
-    """
-    assert len(datum_dict["completions"]) == 2, (
-        "DPO training supports only two completions"
-    )
-    # Lower rank is preferred
-    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
-        chosen_completion = datum_dict["completions"][0]
-        rejected_completion = datum_dict["completions"][1]
-    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
-        chosen_completion = datum_dict["completions"][1]
-        rejected_completion = datum_dict["completions"][0]
-    else:
-        raise NotImplementedError(
-            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
-        )
-
-    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
-    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
-
-    message_log_chosen = get_formatted_message_log(
-        messages_chosen, tokenizer, task_data_spec
-    )
-    message_log_rejected = get_formatted_message_log(
-        messages_rejected, tokenizer, task_data_spec
-    )
-
-    length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
-    length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
-
-    loss_multiplier = 1.0
-    if max(length_chosen, length_rejected) > max_seq_length:
-        warnings.warn(
-            f"Sequence length {max(length_chosen, length_rejected)} exceeds max_seq_length {max_seq_length}. Ignoring example."
-        )
-        # make smaller and mask out
-        for message in message_log_chosen:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log_chosen))
-            ]
-        for message in message_log_rejected:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log_rejected))
-            ]
-        loss_multiplier = 0.0
-
-    output = {
-        "message_log_chosen": message_log_chosen,
-        "length_chosen": length_chosen,
-        "message_log_rejected": message_log_rejected,
-        "length_rejected": length_rejected,
-        "extra_env_info": None,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
-    return output
-
-
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
+    # setup train dataset
+    if "default" in data_config:
+        update_single_dataset_config(data_config["train"], data_config["default"])
+    data = load_preference_dataset(data_config["train"])
+    task_data_processors = {data.task_name: (data.task_spec, preference_preprocessor)}
 
-    # load dataset
-    data = load_preference_dataset(data_config)
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
-
-    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
-    if val_dataset:
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
-
-    dpo_task_spec = data.task_spec
-
-    train_dataset = AllTaskProcessedDataset(
-        train_dataset,
+    dataset = AllTaskProcessedDataset(
+        data.dataset,
         tokenizer,
-        dpo_task_spec,
-        dpo_preprocessor,
+        None,
+        task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
+    # setup validation dataset
     # TODO @yukih: unify the code when support multiple datasets for other algorithms
+    val_dataset = {}
     if "val_data_paths" in data_config and data_config["val_data_paths"]:
-        val_dataset = {}
-
         assert isinstance(data_config["val_data_paths"], dict), (
             f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
         )
@@ -198,31 +80,37 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             assert val_dataset_name not in val_dataset
             val_data = PreferenceDataset(val_dataset_path)
             print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.dataset)} samples."
             )
             val_dataset[val_dataset_name] = AllTaskProcessedDataset(
-                val_data.formatted_ds["train"],
+                val_data.dataset,
                 tokenizer,
                 val_data.task_spec,
-                dpo_preprocessor,
+                preference_preprocessor,
                 max_seq_length=data_config["max_input_seq_length"],
             )
-    else:
-        val_dataset = (
-            {
-                "default": AllTaskProcessedDataset(
-                    val_dataset,
-                    tokenizer,
-                    dpo_task_spec,
-                    dpo_preprocessor,
-                    max_seq_length=data_config["max_input_seq_length"],
-                )
-            }
-            if val_dataset
-            else {}
+    elif "validation" in data_config and data_config["validation"] is not None:
+        if "default" in data_config:
+            update_single_dataset_config(
+                data_config["validation"], data_config["default"]
+            )
+        val_data = load_preference_dataset(data_config["validation"])
+        val_task_data_processors = {
+            val_data.task_name: (val_data.task_spec, preference_preprocessor)
+        }
+
+        val_dataset["default"] = AllTaskProcessedDataset(
+            val_data.dataset,
+            tokenizer,
+            None,
+            val_task_data_processors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        print(
+            f"  ✓ Validation dataset loaded with {len(val_dataset['default'])} samples."
         )
 
-    return train_dataset, val_dataset, dpo_task_spec
+    return dataset, val_dataset
 
 
 def main():
@@ -259,11 +147,7 @@ def main():
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
     # setup data
-    (
-        train_dataset,
-        val_dataset,
-        dpo_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    dataset, val_dataset = setup_data(tokenizer, config["data"])
 
     (
         policy,
@@ -275,7 +159,7 @@ def main():
         checkpointer,
         dpo_save_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(config, tokenizer, dataset, val_dataset)
 
     dpo_train(
         policy,
