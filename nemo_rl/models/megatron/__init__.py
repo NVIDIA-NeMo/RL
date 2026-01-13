@@ -11,29 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Megatron setup utilities for NeMo RL."""
-
-from nemo_rl.models.megatron.setup import (
-    ModelAndOptimizerState,
-    RuntimeConfig,
-    handle_model_import,
-    setup_distributed,
-    setup_model_and_optimizer,
-    setup_reference_model_state,
-    validate_and_set_config,
-    validate_model_paths,
-    finalize_megatron_setup,
-)
-
-__all__ = [
-    "ModelAndOptimizerState",
-    "RuntimeConfig",
-    "handle_model_import",
-    "validate_and_set_config",
-    "setup_distributed",
-    "setup_model_and_optimizer",
-    "setup_reference_model_state",
-    "validate_model_paths",
-    "finalize_megatron_setup",
-]

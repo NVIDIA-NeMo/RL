@@ -86,7 +86,7 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
-from nemo_rl.models.megatron import (
+from nemo_rl.models.megatron.setup import (
     handle_model_import,
     setup_distributed,
     setup_model_and_optimizer,

@@ -787,7 +787,7 @@ class TestRuntimeConfigNamedTuple:
 
     def test_runtime_config_fields(self):
         """Test that RuntimeConfig has all expected fields."""
-        from nemo_rl.models.megatron.setup import RuntimeConfig
+        from nemo_rl.models.megatron.config import RuntimeConfig
 
         runtime_config = RuntimeConfig(
             megatron_cfg=MagicMock(),
@@ -811,7 +811,7 @@ class TestModelAndOptimizerStateNamedTuple:
 
     def test_model_and_optimizer_state_fields(self):
         """Test that ModelAndOptimizerState has all expected fields."""
-        from nemo_rl.models.megatron.setup import ModelAndOptimizerState
+        from nemo_rl.models.megatron.config import ModelAndOptimizerState
 
         state = ModelAndOptimizerState(
             state=MagicMock(),
