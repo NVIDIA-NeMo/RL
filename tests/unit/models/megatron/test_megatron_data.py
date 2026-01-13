@@ -1709,4 +1709,3 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
     # Check that all workers succeeded
     for i, result in enumerate(results):
         assert result["success"], f"Worker {i} failed: {result['error']}"
-
