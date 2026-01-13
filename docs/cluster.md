@@ -342,6 +342,9 @@ spec:
           env:
             - name: NVIDIA_VISIBLE_DEVICES
               value: "all"
+             # IMPORTANT: Verify the correct network interface with your cluster admin
+             # Common values: bond0, eth0, ib0 (for InfiniBand)
+             # Run 'ip addr' or 'ifconfig' on a node to identify available interfaces
             - name: NCCL_SOCKET_IFNAME
               value: bond0
             - name: NCCL_SHM_DISABLE
@@ -408,6 +411,9 @@ spec:
               cpu: "128"
               memory: "1500Gi"
           env:
+             # IMPORTANT: Verify the correct network interface with your cluster admin
+             # Common values: bond0, eth0, ib0 (for InfiniBand)
+             # Run 'ip addr' or 'ifconfig' on a node to identify available interfaces
             - name: NCCL_SOCKET_IFNAME
               value: bond0
             - name: NCCL_SHM_DISABLE
