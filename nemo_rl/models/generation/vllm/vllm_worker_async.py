@@ -276,6 +276,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        # Ensure LoRA patches are applied inside engine worker processes (async path)
+        if getattr(self, "lora_enabled", False) and self.llm is not None:
+            try:
+                await self.llm.collective_rpc("apply_lora_patches", args=tuple())
+                print(
+                    "Successfully applied lora patches in engine workers (async worker)"
+                )
+            except Exception as e:
+                print(
+                    f"[WARNING] Failed to apply lora patches in engine workers (async worker): {e}"
+                )
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
@@ -746,10 +757,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             request_id = str(uuid.uuid4())
 
+            lora_req = None
+            if self.lora_enabled:
+                from vllm.lora.request import LoRARequest
+                from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+                lora_metadata = get_vllm_lora_metadata()
+                lora_req = LoRARequest(
+                    **lora_metadata,
+                )
+
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
                 prompt=prompt,
                 sampling_params=sampling_params_for_request,
+                lora_request=lora_req,
                 request_id=request_id,
             )
 
@@ -919,10 +941,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             request_id = str(uuid.uuid4())
 
+            lora_req = None
+            if self.lora_enabled:
+                from vllm.lora.request import LoRARequest
+                from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+
+                lora_metadata = get_vllm_lora_metadata()
+                lora_req = LoRARequest(
+                    **lora_metadata,
+                )
+
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
+                lora_request=lora_req,
                 request_id=request_id,
             )
 
@@ -1027,7 +1060,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1040,7 +1075,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
             )
 
             if asyncio.iscoroutine(result_or_coro):

@@ -466,10 +466,6 @@ def setup(
             # Override the vLLM lora config with the DTensor lora config
             generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
 
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts are not supported with LoRA in DTensor backend."
-            )
-
     # Define initialization functions that will be used in all paths
     def init_policy():
         """Initialize policy training workers."""
@@ -1930,6 +1926,8 @@ def async_grpo_train(
         policy_generation = policy
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
+    REFIT_BASE_MODEL_WEIGHTS = True
+    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None
 
     # Training state
@@ -2041,9 +2039,16 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                refit_lora_weights=REFIT_LORA_WEIGHTS,
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
+            REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
             import traceback
@@ -2361,9 +2366,14 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
@@ -2386,9 +2396,14 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            refit_base_model_weights=REFIT_BASE_MODEL_WEIGHTS,
+                            refit_lora_weights=REFIT_LORA_WEIGHTS,
                         )
                         POLICY_GENERATION_STALE = False
+                        REFIT_BASE_MODEL_WEIGHTS = False if REFIT_LORA_WEIGHTS else True
                     else:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
