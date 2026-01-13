@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from nemo_rl.data import PreferenceDatasetConfig
 from nemo_rl.data.datasets.preference_datasets.binary_preference_dataset import (
     BinaryPreferenceDataset,
 )
@@ -30,13 +31,16 @@ DATASET_REGISTRY = {
 }
 
 
-def load_preference_dataset(data_config):
+def load_preference_dataset(data_config: PreferenceDatasetConfig):
     """Loads preference dataset."""
     dataset_name = data_config["dataset_name"]
 
     # load dataset
     if dataset_name in DATASET_REGISTRY:
-        base_dataset = DATASET_REGISTRY[dataset_name](**data_config)
+        dataset_class = DATASET_REGISTRY[dataset_name]
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+        )
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
@@ -45,9 +49,9 @@ def load_preference_dataset(data_config):
         )
 
     # bind prompt and system prompt
-    base_dataset.set_task_spec(data_config)
+    dataset.set_task_spec(data_config)
 
-    return base_dataset
+    return dataset
 
 
 __all__ = [

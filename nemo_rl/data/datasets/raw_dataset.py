@@ -14,14 +14,14 @@
 
 from datasets import Dataset
 
-from nemo_rl.data import ResponseDatasetConfig
+from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class RawDataset:
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
-    data_config: ResponseDatasetConfig
+    data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
     # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
@@ -37,17 +37,19 @@ class RawDataset:
             self.val_dataset = split_dataset["test"]
 
     def set_processor(self):
-        processor_name = (
-            self.data_config["processor"]
-            if "processor" in self.data_config
-            else "default"
-        )
+        processor_name = "default"
+        if "processor" in self.data_config:
+            processor_name = self.data_config[
+                "processor"  # pyrefly: ignore[typed-dict-key-error]  `processor` is only required for response datasets and will be removed after data processor is refactored
+            ]
         assert processor_name in PROCESSOR_REGISTRY, (
             f"Processor {processor_name} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."
         )
         self.processor = PROCESSOR_REGISTRY[processor_name]
 
-    def set_task_spec(self, data_config: ResponseDatasetConfig):
+    def set_task_spec(
+        self, data_config: ResponseDatasetConfig | PreferenceDatasetConfig
+    ):
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
