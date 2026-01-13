@@ -116,7 +116,7 @@ def setup_data(
         val_task_to_env = task_to_env.copy()
 
     # validation dataset from config
-    if data_config["validation"] is not None:
+    if "validation" in data_config and data_config["validation"] is not None:
         if "default" in data_config:
             update_single_dataset_config(
                 data_config["validation"], data_config["default"]

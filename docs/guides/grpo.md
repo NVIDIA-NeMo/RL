@@ -165,7 +165,7 @@ dataset = AllTaskProcessedDataset(
 )
 
 # 5) Do the same thing for validation dataset if it exists
-if data_config["validation"] is not None:
+if "validation" in data_config and data_config["validation"] is not None:
     val_data = load_response_dataset(data_config["validation"])
 
     val_task_data_processors = {val_data.task_name: (val_data.task_spec, val_data.processor)}
