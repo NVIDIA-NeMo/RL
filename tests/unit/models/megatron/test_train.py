@@ -142,7 +142,9 @@ class TestModelForward:
         mock_model.return_value = torch.randn(1, 10, 100)
 
         mock_data_dict = MagicMock()
-        mock_data_dict.get_multimodal_dict.return_value = {"images": torch.randn(1, 3, 224, 224)}
+        mock_data_dict.get_multimodal_dict.return_value = {
+            "images": torch.randn(1, 3, 224, 224)
+        }
 
         model_forward(
             model=mock_model,
@@ -160,20 +162,24 @@ class TestModelForward:
 class TestForwardWithPostProcessingFn:
     """Tests for forward_with_post_processing_fn function."""
 
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1)
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_loss_post_processor(
         self, mock_model_forward, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
         """Test forward with LossPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
         from nemo_rl.models.megatron.train import (
             LossPostProcessor,
             forward_with_post_processing_fn,
         )
-        from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
         # Set up mock return values for process groups
         mock_tp_grp.return_value = MagicMock()
@@ -215,11 +221,11 @@ class TestForwardWithPostProcessingFn:
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_logprobs_post_processor(self, mock_model_forward):
         """Test forward with LogprobsPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
         from nemo_rl.models.megatron.train import (
             LogprobsPostProcessor,
             forward_with_post_processing_fn,
         )
-        from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
         mock_model_forward.return_value = torch.randn(2, 10, 100)
 
@@ -250,11 +256,11 @@ class TestForwardWithPostProcessingFn:
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
         """Test forward with TopkLogitsPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
         from nemo_rl.models.megatron.train import (
             TopkLogitsPostProcessor,
             forward_with_post_processing_fn,
         )
-        from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
         mock_model_forward.return_value = torch.randn(2, 10, 100)
 
@@ -269,7 +275,10 @@ class TestForwardWithPostProcessingFn:
         )
 
         data_iterator = iter([processed_mb])
-        cfg = {"sequence_packing": {"enabled": False}, "megatron_cfg": {"context_parallel_size": 1}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"context_parallel_size": 1},
+        }
         post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
@@ -285,8 +294,8 @@ class TestForwardWithPostProcessingFn:
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_unknown_post_processor_raises(self, mock_model_forward):
         """Test that unknown post-processor type raises TypeError."""
-        from nemo_rl.models.megatron.train import forward_with_post_processing_fn
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import forward_with_post_processing_fn
 
         mock_model_forward.return_value = torch.randn(2, 10, 100)
 
@@ -382,10 +391,14 @@ class TestMegatronForwardBackward:
 class TestLossPostProcessor:
     """Tests for LossPostProcessor class."""
 
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1)
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
     def test_loss_post_processor_no_packing(
         self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
@@ -416,10 +429,14 @@ class TestLossPostProcessor:
         assert isinstance(metrics, dict)
         assert len(metrics) == 1 and metrics["loss"] == 0.5
 
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2)
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
+    )
     def test_loss_post_processor_with_cp_normalize(
         self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
@@ -443,10 +460,14 @@ class TestLossPostProcessor:
         # Loss should be divided by CP size (2)
         assert torch.isclose(loss, torch.tensor(0.5))
 
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1)
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
     @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")
     def test_loss_post_processor_with_packing(
         self, mock_wrapper, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
@@ -477,7 +498,9 @@ class TestLogprobsPostProcessor:
     """Tests for LogprobsPostProcessor class."""
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs")
     def test_logprobs_post_processor_no_packing(
         self, mock_from_logits, mock_tp_rank, mock_tp_grp
@@ -492,7 +515,9 @@ class TestLogprobsPostProcessor:
         processor = LogprobsPostProcessor(cfg=cfg)
 
         mock_data_dict = MagicMock()
-        mock_data_dict.__getitem__ = MagicMock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
+        mock_data_dict.__getitem__ = MagicMock(
+            return_value=torch.tensor([[1, 2, 3, 4, 5]])
+        )
 
         mock_logprobs = torch.randn(1, 4)  # One less than input length
         mock_from_logits.return_value = mock_logprobs
@@ -514,9 +539,13 @@ class TestLogprobsPostProcessor:
         assert result["logprobs"].shape[1] == 5
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
-    @patch("nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs_packed_sequences")
+    @patch(
+        "nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs_packed_sequences"
+    )
     def test_logprobs_post_processor_with_packing(
         self, mock_from_logits_packed, mock_cp_grp, mock_tp_rank, mock_tp_grp
     ):
@@ -531,7 +560,9 @@ class TestLogprobsPostProcessor:
         processor = LogprobsPostProcessor(cfg=cfg)
 
         mock_data_dict = MagicMock()
-        mock_data_dict.__getitem__ = MagicMock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
+        mock_data_dict.__getitem__ = MagicMock(
+            return_value=torch.tensor([[1, 2, 3, 4, 5]])
+        )
 
         mock_logprobs = torch.randn(1, 4)
         mock_from_logits_packed.return_value = mock_logprobs
@@ -553,11 +584,11 @@ class TestTopkLogitsPostProcessor:
     """Tests for TopkLogitsPostProcessor class."""
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
-    def test_topk_post_processor_no_packing(
-        self, mock_topk, mock_tp_rank, mock_tp_grp
-    ):
+    def test_topk_post_processor_no_packing(self, mock_topk, mock_tp_rank, mock_tp_grp):
         """Test TopkLogitsPostProcessor without sequence packing."""
         from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
 
@@ -595,7 +626,9 @@ class TestTopkLogitsPostProcessor:
         assert result["topk_logits"].shape[-1] == k
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
     def test_topk_post_processor_with_packing(
         self, mock_topk, mock_tp_rank, mock_tp_grp
@@ -641,7 +674,9 @@ class TestTopkLogitsPostProcessor:
 
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
-    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
     @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
     def test_topk_cp_without_packing_raises(
         self, mock_topk, mock_tp_rank, mock_tp_grp, mock_cp_grp
@@ -666,12 +701,16 @@ class TestTopkLogitsPostProcessor:
             else torch.tensor([3])
         )
 
-        mock_topk.return_value = (torch.randn(1, 3, 5), torch.randint(0, 100, (1, 3, 5)))
+        mock_topk.return_value = (
+            torch.randn(1, 3, 5),
+            torch.randint(0, 100, (1, 3, 5)),
+        )
 
         wrapped_fn = processor(data_dict=mock_data_dict, cu_seqlens_padded=None)
 
         output_tensor = torch.randn(1, 3, 100)
 
-        with pytest.raises(RuntimeError, match="Context Parallelism.*requires sequence packing"):
+        with pytest.raises(
+            RuntimeError, match="Context Parallelism.*requires sequence packing"
+        ):
             wrapped_fn(output_tensor)
-

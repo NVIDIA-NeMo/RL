@@ -16,7 +16,6 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
 import torch
-
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -37,7 +36,6 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
-
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
     "LossPostProcessor",
@@ -56,9 +54,8 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = None,
 ) -> torch.Tensor:
-    """
-    Perform a single forward pass through the model.
-    
+    """Perform a single forward pass through the model.
+
     Args:
         model: The model to run forward pass on
         data_dict (BatchedDataDict): Dictionary containing batch data
@@ -68,7 +65,7 @@ def model_forward(
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
-        
+
     Returns:
         torch.Tensor: Output tensor from the model (logits)
     """
@@ -84,7 +81,7 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    #with straggler_timer:
+    # with straggler_timer:
     output_tensor = model(
         input_ids=input_ids_cp_sharded,
         position_ids=position_ids,
@@ -95,13 +92,11 @@ def model_forward(
 
     # Apply temperature scaling to logits for training
     # This matches the dtensor worker's _apply_temperature_scaling in the train method
-    if (
-        "generation" in cfg
-        and cfg["generation"] is not None
-    ):
+    if "generation" in cfg and cfg["generation"] is not None:
         output_tensor.div_(cfg["generation"]["temperature"])
-        
+
     return output_tensor
+
 
 def forward_with_post_processing_fn(
     data_iterator: Iterator[ProcessedMicrobatch],
@@ -112,22 +107,21 @@ def forward_with_post_processing_fn(
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Callable]:
-    """
-    Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
-    
+    """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
+
     This function takes a pre-processed microbatch (with sequence packing already handled),
     runs the forward step through the model, and prepares a post-processing function for
     post-processing the outputs.
-    
+
     Args:
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
-        model: The model to run forward pass on  
+        model: The model to run forward pass on
         cfg (dict): Configuration dictionary
         post_processing_fn: Post-processing function to post-process the logits
         defer_fp32_logits: Whether to defer FP32 conversion of logits
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
-        
+
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
             - output_tensor: Raw model outputs (logits)
@@ -177,9 +171,12 @@ def forward_with_post_processing_fn(
             cu_seqlens_padded=cu_seqlens_padded,
         )
     else:
-        raise TypeError(f"Unknown post-processing function type: {type(post_processing_fn)}")
+        raise TypeError(
+            f"Unknown post-processing function type: {type(post_processing_fn)}"
+        )
 
     return output_tensor, post_processing_fn_wrapped
+
 
 def megatron_forward_backward(
     model: GPTModel,
@@ -195,13 +192,12 @@ def megatron_forward_backward(
     global_valid_toks: Optional[torch.Tensor] = None,
     do_not_average_loss: bool = False,
 ) -> Any:
-    """
-    Execute forward and backward passes using Megatron's utilities.
-    
+    """Execute forward and backward passes using Megatron's utilities.
+
     This is the main training loop function that coordinates forward and backward
     passes across multiple microbatches using Megatron's pipeline parallel
     execution framework.
-    
+
     Args:
         model: The model to train
         cfg (dict): Configuration dictionary
@@ -214,7 +210,7 @@ def megatron_forward_backward(
         defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
-        
+
     Returns:
         BatchedDataDict: Results from the forward/backward execution
     """
@@ -239,8 +235,8 @@ def megatron_forward_backward(
         do_not_average_loss=do_not_average_loss,
     )
 
-class LossPostProcessor:
 
+class LossPostProcessor:
     def __init__(
         self,
         loss_fn: LossFunction,
@@ -250,16 +246,16 @@ class LossPostProcessor:
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.cp_normalize = cp_normalize
-    
-    def __call__(self,
+
+    def __call__(
+        self,
         data_dict: BatchedDataDict[Any],
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
-        """
-        Create a loss post-processing function for training.
-        
+        """Create a loss post-processing function for training.
+
         This function wraps a loss function with the necessary context and parameters
         to compute loss and metrics from model outputs. It handles sequence packing
         and context parallelism normalization.
@@ -274,7 +270,6 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-
         loss_fn = self.loss_fn
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
@@ -307,8 +302,8 @@ class LossPostProcessor:
 
         return loss_fn_wrapped
 
-class LogprobsPostProcessor:
 
+class LogprobsPostProcessor:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
 
@@ -318,8 +313,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """
-        Create a post-processing function that computes token log probabilities.
+        """Create a post-processing function that computes token log probabilities.
 
         This function returns a processor that takes model logits and converts them
         to token-level log probabilities, handling both packed and unpacked sequences.
@@ -370,11 +364,11 @@ class LogprobsPostProcessor:
             return torch.tensor(0.0, device=token_logprobs.device), {
                 "logprobs": token_logprobs
             }
+
         return processor_fn_inner
 
 
 class TopkLogitsPostProcessor:
-
     def __init__(self, cfg: Dict[str, Any], k: int):
         self.cfg = cfg
         self.k = k
@@ -384,8 +378,7 @@ class TopkLogitsPostProcessor:
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """
-        Create a post-processing function that computes top-k logits and indices.
+        """Create a post-processing function that computes top-k logits and indices.
 
         This function returns a processor that extracts the top-k highest logits
         and their corresponding vocabulary indices from model outputs. It handles
@@ -396,10 +389,9 @@ class TopkLogitsPostProcessor:
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
 
         Returns:
-            Callable: Function that takes output tensor and returns 
+            Callable: Function that takes output tensor and returns
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
-
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
@@ -521,4 +513,5 @@ class TopkLogitsPostProcessor:
                     "topk_logits": topk_vals_full,
                     "topk_indices": topk_idx_full,
                 }
+
         return processor_fn_inner

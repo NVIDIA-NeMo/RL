@@ -24,15 +24,19 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 
+
 def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     """Broadcast an object across pipeline parallel ranks.
     This utility function handles broadcasting an object from the rank that owns it
     to all other pipeline parallel ranks. If only one rank has the object (non-None),
     it will be broadcast to all other ranks.
+
     Args:
         obj: The object to broadcast. Can be None on ranks that don't own it.
+
     Returns:
         The object on all ranks (either the original or the broadcast copy).
+
     Raises:
         ValueError: If the object doesn't exist on any pipeline parallel rank.
     """
@@ -72,21 +76,22 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
 
     return obj_list[0]
 
+
 def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) -> list:
     """Broadcast loss metrics from the last pipeline stage to all stages.
-    
+
     This utility handles the common pattern where loss computation happens on the last
     pipeline stage and needs to be broadcast to all other stages.
-    
+
     Args:
         loss_metrics: List of loss metrics if on last stage, None otherwise
-        
+
     Returns:
         List of loss metrics on all ranks
     """
     pp_group = get_pipeline_model_parallel_group()
     last_rank = get_pipeline_model_parallel_last_rank()
-    
+
     if is_pipeline_last_stage(ignore_virtual=True):
         metrics_to_broadcast = [loss_metrics]
         torch.distributed.broadcast_object_list(
@@ -106,36 +111,38 @@ def broadcast_loss_metrics_from_last_stage(loss_metrics: Optional[list] = None) 
 
 
 def broadcast_tensors_from_last_stage(
-    tensors: dict[str, Optional[torch.Tensor]], 
+    tensors: dict[str, Optional[torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
     """Broadcast multiple tensors from the last pipeline stage to all stages.
-    
+
     Args:
         tensors: Dictionary mapping tensor names to tensors (None on non-last stages)
         pp_group: Pipeline parallel group (auto-detected if None)
-        
+
     Returns:
         Dictionary of broadcasted tensors on all ranks
     """
     pp_group = get_pipeline_model_parallel_group()
-    
+
     from nemo_rl.models.megatron.common import broadcast_tensor
-    
+
     last_rank = get_pipeline_model_parallel_last_rank()
     current_rank = torch.distributed.get_rank()
-    
+
     broadcasted_tensors = {}
-    
+
     if is_pipeline_last_stage(ignore_virtual=True):
         # Broadcast tensors from last stage
         for name, tensor in tensors.items():
             if tensor is not None:
-                broadcasted_tensors[name] = broadcast_tensor(tensor, current_rank, pp_group)
+                broadcasted_tensors[name] = broadcast_tensor(
+                    tensor, current_rank, pp_group
+                )
             else:
                 broadcasted_tensors[name] = None
     else:
         # Receive tensors on other stages
         for name in tensors.keys():
             broadcasted_tensors[name] = broadcast_tensor(None, last_rank, pp_group)
-    
+
     return broadcasted_tensors
