@@ -2024,16 +2024,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 checkpoint_root=checkpoint_root,
             )
 
-    # def set_model_state_dict(
-    #     self, model_state_dict: dict[str, Any], options: StateDictOptions
-    # ) -> None:
-    #     """Set the model state dict."""
-    #     set_model_state_dict(
-    #         self.model,
-    #         model_state_dict=model_state_dict,
-    #         options=options,
-    #     )
-
 
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
