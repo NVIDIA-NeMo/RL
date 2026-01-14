@@ -950,6 +950,8 @@ def refit_policy_generation(
             This parameter is primarily used for testing.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+        refit_base_model_weights: Whether to refit the base model weights.
+        refit_lora_weights: Whether to refit the lora weights.
     """
     assert refit_base_model_weights or refit_lora_weights, (
         "refit_base_model_weights and refit_lora_weights cannot be both False"

@@ -15,9 +15,12 @@
 
 from typing import Any, Optional
 
+from torch import nn
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
+from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.linear import LinearBase
 
 
 class LoRARequestWithCfgAndWeights(LoRARequest):
@@ -112,9 +115,49 @@ def patched_load_adapter(self, lora_request: LoRARequestWithCfgAndWeights):
     return lora
 
 
+def patched_get_supported_lora_modules(model: nn.Module) -> list[str]:
+    """Skip lm_head modules in the supported_lora_modules.
+
+    In vLLM, all linear layers support LoRA. But in Automodel, lm_head not support LoRA.
+    Refer to https://github.com/NVIDIA-NeMo/Automodel/blob/50253d14c2aefa2206036022b4ccce9f3476ba4d/nemo_automodel/components/_peft/module_matcher.py#L99 for more details.
+    """
+    supported_lora_modules: set[str] = set()
+    for name, module in model.named_modules():
+        # get the embedding modules if the module's embedding_modules
+        # is not empty.
+        embedding_modules = getattr(module, "embedding_modules", None)
+        if embedding_modules is not None:
+            for name in embedding_modules:
+                if "lm_head" in name:
+                    continue
+                supported_lora_modules.add(name)
+
+        # get all the linear subfixes.
+        if isinstance(module, (LinearBase,)):
+            supported_lora_modules.add(name.split(".")[-1])
+
+        if isinstance(module, (FusedMoE,)):
+            supported_lora_modules.add(name.split(".")[-1])
+
+    return list(supported_lora_modules)
+
+
 def apply_lora_patches():
-    # func_path = "vllm.lora.worker_manager.LRUCacheWorkerLoRAManager.load_adapter"
-    # patcher = patch(func_path, patched_load_adapter)
+    # patch the get_supported_lora_modules function
+    import vllm.lora.utils as lora_utils
+
+    setattr(
+        lora_utils, "get_supported_lora_modules", patched_get_supported_lora_modules
+    )
+
+    # patch the get_supported_lora_modules function in lora_models
+    import vllm.lora.models as lora_models
+
+    setattr(
+        lora_models, "get_supported_lora_modules", patched_get_supported_lora_modules
+    )
+
+    # patch the load_adapter function in LRUCacheWorkerLoRAManager
     from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 
     setattr(LRUCacheWorkerLoRAManager, "_load_adapter", patched_load_adapter)
