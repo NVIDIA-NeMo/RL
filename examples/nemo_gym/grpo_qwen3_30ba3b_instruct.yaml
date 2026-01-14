@@ -1,6 +1,7 @@
 defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
 
 grpo:
+  max_num_epochs: 10
   # We observe MoE likes more data per optimization step. Here we increase the num prompts per step from the dense 64 to 256.
   # We retain the 16 generations per prompt for now. Later on this may change for agentic tasks as the action/sample space grows.
   # We take up to 16 steps off policy, which is 256 * 16 = 4096
