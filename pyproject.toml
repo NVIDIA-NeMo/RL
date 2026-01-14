@@ -219,7 +219,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-extra-build-variables = { sgl-kernel = { FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a" } }
+extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "48", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
