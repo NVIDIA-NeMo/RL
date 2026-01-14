@@ -24,7 +24,7 @@ g_i        & : \text{the } i^{th} \text{ item in } \text{generation-logprobs}, \
 p_i        & : \text{the } i^{th} \text{ item in } \text{policy-logprobs}, \\
 m_i        & : \text{mask the } i^{th} \text{ token , whether 1 or 0}  \\
 &\text{global-valid-toks}  = \sum_i m_i \, . \\
-& \text{token-mult-prob-error}= \frac{1}{\text{global-valid-toks}}\sum_{i} m_i \exp\!\left(\left|g_i - p_i\right|\right)
+& \text{token-mult-prob-error}= \frac{1}{\text{global-valid-toks}}\sum_{i} m_i \exp\left(\left|g_i - p_i\right|\right)
 \end{aligned}
 $$
 
