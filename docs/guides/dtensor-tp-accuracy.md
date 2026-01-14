@@ -136,8 +136,8 @@ $$
       W_2^T
       \end{bmatrix},
       \quad\text{where}\quad
-      W_1^T \in \mathbb{R}^{d_{\text{in}}^{(1)} \times d_{\text{out}}},\;
-      W_2^T \in \mathbb{R}^{d_{\text{in}}^{(2)} \times d_{\text{out}}},\;
+      W_1^T \in \mathbb{R}^{d_{\text{in}}^{(1)} \times d_{\text{out}}},\quad
+      W_2^T \in \mathbb{R}^{d_{\text{in}}^{(2)} \times d_{\text{out}}},\quad
       d_{\text{in}}^{(1)} + d_{\text{in}}^{(2)} = d_{\text{in}}.
 $$
    
@@ -149,7 +149,7 @@ $$
       x_1 & x_2
       \end{bmatrix},
       \quad
-      x_1 \in \mathbb{R}^{d_{\text{in}}^{(1)}},\;
+      x_1 \in \mathbb{R}^{d_{\text{in}}^{(1)}},\quad
       x_2 \in \mathbb{R}^{d_{\text{in}}^{(2)}}.
 $$
    
@@ -167,8 +167,8 @@ $$
       W_1^T & W_2^T
       \end{bmatrix},
       \quad \text{where} \quad
-      W_1^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(1)}},\;
-      W_2^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(2)}},\;
+      W_1^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(1)}},\quad
+      W_2^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(2)}},\quad
       d_{\text{out}}^{(1)} + d_{\text{out}}^{(2)} = d_{\text{out}}.
 $$
    
