@@ -18,23 +18,23 @@ Using [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruc
 
 The `token_mult_prob_error` [metric](https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiplicative-token-probability-error) measures the discrepancy between the inference engine and the training engine when processing the same sample. It is defined as follows:
 
-```math
+$$
 \begin{aligned}
-g_i        & : \text{the } i^{th} \text{ item in } \text{generation\_logprobs}, \\
-p_i        & : \text{the } i^{th} \text{ item in } \text{policy\_logprobs}, \\
+g_i        & : \text{the } i^{th} \text{ item in } \text{generation-logprobs}, \\
+p_i        & : \text{the } i^{th} \text{ item in } \text{policy-logprobs}, \\
 m_i        & : \text{mask the } i^{th} \text{ token , whether 1 or 0}  \\
-&\text{global\_valid\_toks}  = \sum_i m_i \, . \\
-& \text{token\_mult\_prob\_error}= \frac{1}{\text{global\_valid\_toks}}\sum_{i} m_i \exp\!\left(\left|g_i - p_i\right|\right)
+&\text{global-valid-toks}  = \sum_i m_i \, . \\
+& \text{token-mult-prob-error}= \frac{1}{\text{global-valid-toks}}\sum_{i} m_i \exp\!\left(\left|g_i - p_i\right|\right)
 \end{aligned}
-```
+$$
 
 In general, **generation logprobs** and **policy logprobs** should align closely, resulting in a `token_mult_prob_error` value near **1.0**. In our development, when this metric exceeds **1.05**, we consider it indicative of a potential framework issue that warrants further investigation.
 
 As shown in Figure 1, numerous spikes can be observed during training. Occasional spikes are acceptable if the `token_mult_prob_error` quickly returns to around 1.0. However, in this case, even with EMA smoothing applied, the figure reveals an overall upward trend, which is unacceptable and indicates a persistent misalignment between the training and inference behaviors.
 
-<img src="./Fig/token_mult_prob_error_qwen3_4B.png" alt="The token_mult_prob_error for Qwen3-4B" style="zoom:33%;" />
+<img src="../assets/dtensor-tp-accuracy/token_mult_prob_error_qwen3_4B.png" alt="The token_mult_prob_error for Qwen3-4B" style="zoom:33%;" />
 
-<center style="color:#C0C0C0;">  Fig 1:The token_mult_prob_error of Qwen3-4B </center>
+<p align="center"><em>Fig 1: The token_mult_prob_error of Qwen3-4B</em></p>
 
 
 
@@ -48,25 +48,25 @@ To investigate whether mixed‑precision arithmetic was a major contributor, aut
 | ------------- | ------ | ------ | ------ | ------ |
 | With autocast | 0.6035 | 0.6010 | 0.5864 | 0.6021 |
 | W/O autocast  | 0.6035 | 0.6010 | 0.5864 | 0.6021 |
-<center style="color:#C0C0C0;">  Table 1:The validation loss of reward model training </center> 
+<p align="center"><em>Table 1: The validation loss of reward model training</em></p> 
 
 ### 1.3  Overall Performance Degradation Under Tensor Parallelism
 
 Figure 2 and Figure 3 present the reward curves and validation accuracy curves for multiple runs under different tensor parallel (TP) configurations. We also apply EMA smoothing for better visualization. The mismatch between the policy engine and the generation engine can lead to degraded downstream accuracy. This issue is most evident in the blue and purple curves, whose corresponding experiments are also the most abnormal cases observed in Figure 1. 
 
-Combine the three images for observation, it's not true that abnormal `token_mult_prob_erro`r must lead to abnormal reward and validation accuracy. This is because for several reasons.
+Combine the three images for observation, it's not true that abnormal `token_mult_prob_error` must lead to abnormal reward and validation accuracy. This is because for several reasons.
 
 1. **Spike pattern instead of continuous growth**: In many runs, `token_mult_prob_error` shows frequent spikes rather than a monotonically increasing trend, indicating that training is unstable but not fundamentally broken.
 2. **Stochastic occurrence of spikes**: The abnormal `token_mult_prob_error` is itself unstable; even with the same batch of data, spikes may not appear in every run.
 3. **Dilution effect with large datasets**: When the dataset is sufficiently large and no critical samples are repeatedly affected, these extreme but sporadic spikes may have limited impact on aggregate metrics, so the final reward and validation accuracy may not exhibit significant deviations.
 
-<img src="./Fig/image-20260111142255534.png" alt="image-20260111142255534" style="zoom: 33%;" />
+<img src="../assets/dtensor-tp-accuracy/image-20260111142255534.png" alt="image-20260111142255534" style="zoom: 33%;" />
 
-<center style="color:#C0C0C0;">  Fig 2: The reward of Qwen3-4B </center>
+<p align="center"><em>Fig 2: The reward of Qwen3-4B</em></p>
 
-<img src="./Fig/validation_accuracy.png" style="zoom:33%;" />
+<img src="../assets/dtensor-tp-accuracy/validation_accuracy.png" style="zoom:33%;" />
 
-<center style="color:#C0C0C0;">  Fig 3: The validation accuracy of Qwen3-4B </center>
+<p align="center"><em>Fig 3: The validation accuracy of Qwen3-4B</em></p>
 
 However, such training instability is unacceptable for an RL training framework, so we aim to identify and eliminate the underlying issues. There are several challenges in resolving this problem:
 
@@ -82,23 +82,23 @@ Our in-depth analysis across multiple models and runs indicates that this behavi
 
 In RL training, log probabilities are typically computed for samples drawn from the old policy, denoted as `prev_logprobs`. The same samples are then evaluated under the current policy being optimized, yielding `current_logprobs`. Using these two quantities, we compute the ratio between the current and previous policies as follows:
 
-```math
+$$
 \begin{aligned}
-\text{ratio} &= \exp\!\left(\text{current\_logprobs} - \text{prev\_logprobs}\right) \\
-&= \exp\!\left(\log\!\left(\frac{\text{current\_probs}}{\text{prev\_probs}}\right)\right) \\
-&= \frac{\text{current\_probs}}{\text{prev\_probs}}
+\text{ratio} &= \exp\left(\text{current-logprobs} - \text{prev-logprobs}\right) \\
+&= \exp\left(\log\left(\frac{\text{current-probs}}{\text{prev-probs}}\right)\right) \\
+&= \frac{\text{current-probs}}{\text{prev-probs}}
 \end{aligned}
-```
+$$
 
-This ratio is the standard [importance sampling](https://en.wikipedia.org/wiki/Importance_sampling) ratio used in off-policy RL to reweight returns when the data are collected under an older behavior policy.  In on-policy training, this ratio should be exactly 1.  However, in our experiments, we observed cases where the ratio deviates from 1, indicating a mismatch between the intended on-policy setting and the actual behavior of the system. Figure 4 and Figure 5 illustrate this phenomenon by showing the mismatch between `prev_logprobs` and `current_logprobs` under TP=4, as well as the reward curves under TP=4 and TP=1 for the `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` model.
+This ratio is the standard importance ratio used in off-policy RL to reweight returns when the data are collected under an older behavior policy.  In on-policy training, this ratio should be exactly 1.  However, in our experiments, we observed cases where the ratio deviates from 1, indicating a mismatch between the intended on-policy setting and the actual behavior of the system. Figure 4 and Figure 5 illustrate this phenomenon by showing the mismatch between `prev_logprobs` and `current_logprobs` under TP=4, as well as the reward curves under TP=4 and TP=1 for the `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` model.
 
-![](./Fig/logprobs_unequal_1.png)
+![](../assets/dtensor-tp-accuracy/logprobs_unequal_1.png)
 
-<center style="color:#C0C0C0;">  Fig 4: The mismatch of prev_logprobs and current_logprobs under TP=4 </center>
+<p align="center"><em>Fig 4: The mismatch of prev_logprobs and current_logprobs under TP=4</em></p>
 
-<img src="./Fig/image-20260111160656891-1768118824549-2.png" alt="image-20260111160656891" style="zoom: 25%;" />
+<img src="../assets/dtensor-tp-accuracy/image-20260111160656891-1768118824549-2.png" alt="image-20260111160656891" style="zoom: 25%;" />
 
-<center style="color:#C0C0C0;">  Fig 5: The reward of deepseek-ai/DeepSeek-R1-Distill-Qwen-7B under TP=4 and TP=1 </center>
+<p align="center"><em>Fig 5: The reward of deepseek-ai/DeepSeek-R1-Distill-Qwen-7B under TP=4 and TP=1</em></p>
 
 ### 2.1 Root Cause
 
@@ -129,45 +129,48 @@ Consider a linear layer $y=xW^T$ with $` W^T \in \mathbb{R}^{d_{\text{in}} \time
 
    In **row-wise** parallelism, we split $W^T$ by rows (input dimension) into two blocks:
 
-```math
-   W^T = 
-   \begin{bmatrix}
-   W_1^T \\
-   W_2^T
-   \end{bmatrix},
-   \quad\text{where}\quad
-   W_1^T \in \mathbb{R}^{d_{\text{in}}^{(1)} \times d_{\text{out}}},\;
-   W_2^T \in \mathbb{R}^{d_{\text{in}}^{(2)} \times d_{\text{out}}},\;
-   d_{\text{in}}^{(1)} + d_{\text{in}}^{(2)} = d_{\text{in}}.
-```
+$$
+      W^T = 
+      \begin{bmatrix}
+      W_1^T \\
+      W_2^T
+      \end{bmatrix},
+      \quad\text{where}\quad
+      W_1^T \in \mathbb{R}^{d_{\text{in}}^{(1)} \times d_{\text{out}}},\;
+      W_2^T \in \mathbb{R}^{d_{\text{in}}^{(2)} \times d_{\text{out}}},\;
+      d_{\text{in}}^{(1)} + d_{\text{in}}^{(2)} = d_{\text{in}}.
+$$
+   
    We also split the input:
-   ```math
-   x =
-   \begin{bmatrix}
-   x_1 & x_2
-   \end{bmatrix},
-   \quad
-   x_1 \in \mathbb{R}^{d_{\text{in}}^{(1)}},\;
-   x_2 \in \mathbb{R}^{d_{\text{in}}^{(2)}}.
-```
-   Each GPU holds its own **input slice** and weight slice, and computes: $y_1 = x_1W_1^T,\quad y_2 =x_2W_2^T$, then we **sum** the partial outputs: $y = y_1 + y_2$
+   
+$$
+      x =
+      \begin{bmatrix}
+      x_1 & x_2
+      \end{bmatrix},
+      \quad
+      x_1 \in \mathbb{R}^{d_{\text{in}}^{(1)}},\;
+      x_2 \in \mathbb{R}^{d_{\text{in}}^{(2)}}.
+$$
+   
+   Each GPU holds its own **input slice** and weight slice, and computes: $y_1 =    x_1W_1^T,\quad y_2 =x_2W_2^T$, then we **sum** the partial outputs: $y = y_1 +   y_2$
 
    
 
 2. Column-wise parallel (TP = 2)
 
    In **column-wise** parallelism, we split \(W^T\) by columns (output dimension) into two blocks:
-
-```math
-   W^T =
-   \begin{bmatrix}
-   W_1^T & W_2^T
-   \end{bmatrix},
-   \quad \text{where} \quad
-   W_1^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(1)}},\;
-   W_2^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(2)}},\;
-   d_{\text{out}}^{(1)} + d_{\text{out}}^{(2)} = d_{\text{out}}.
-```
+   
+$$
+      W^T =
+      \begin{bmatrix}
+      W_1^T & W_2^T
+      \end{bmatrix},
+      \quad \text{where} \quad
+      W_1^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(1)}},\;
+      W_2^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}^{(2)}},\;
+      d_{\text{out}}^{(1)} + d_{\text{out}}^{(2)} = d_{\text{out}}.
+$$
    
    Each GPU gets the **full input** $x$ and computes: $y_1 = xW_1^T ,\quad y_2 = xW_2^T$, then we **concatenate** along the output dimension: $y = \left[ y_1, y_2 \right]$.
 
@@ -225,15 +228,15 @@ Beyond the TP-related issues discussed above, our experiments also highlight tha
 
 Figure 6 reports the KL divergence between the logits produced by the Hugging Face stack and those produced by NeMo‑RL for the same input sequence. The plot shows that, even with identical data and model weights, the resulting logit distributions differ noticeably across the two execution engines. In our experiments, similar behavior appeared when varying attention implementations and hardware configurations, where we consistently observed measurable numerical discrepancies, although we did not attempt to systematically eliminate every such source of variation.
 
-<img src="./Fig/kl_hf_prev.png" alt="image-20260112204939998" style="zoom: 67%;" />
+<img src="../assets/dtensor-tp-accuracy/kl_hf_prev.png" alt="image-20260112204939998" style="zoom: 67%;" />
 
-<center style="color:#C0C0C0;"> Fig 6: The KL divergence between hugging face and nemorl </center>
+<p align="center"><em>Fig 6: The KL divergence between hugging face and nemorl</em></p>
 
 The broader research community has proposed multiple strategies to mitigate these issues. We have referred to a list of publications:
 
 * [Defeating the Training-Inference Mismatch via FP16](https://arxiv.org/pdf/2510.26788)
-* Accumulator accuracy: https://docs.pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms
+* [Accumulator accuracy](https://docs.pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms)
 * [Systematic Outliers in Large Language Models](https://arxiv.org/abs/2502.06415)
-* [Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda#271211a558b78046af48c3129693f3f1)
+* [Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 
 In our current work, we treat these effects primarily as **background noise** and focus on TP‑induced misalignment that has a clear and actionable impact on RL training. A more exhaustive treatment—such as systematically unifying attention backends, enforcing TP‑invariant kernels, or integrating compensated summation into critical paths—is left as future engineering work informed by the aforementioned research directions.
