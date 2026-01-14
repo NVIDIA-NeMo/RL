@@ -398,6 +398,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
                 if not vllm_async_generation_worker_ref.do_on_policy_fixes or request.required_prefix_token_ids is None:
+                    # TODO remove
+                    print(f"Skipping on policy fixes. {vllm_async_generation_worker_ref.do_on_policy_fixes=}")
                     return res
 
                 # Find the last assistant message
