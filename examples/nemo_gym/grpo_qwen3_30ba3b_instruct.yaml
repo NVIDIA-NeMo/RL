@@ -33,7 +33,7 @@ policy:
   train_global_batch_size: 4096
 
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
-  # max_total_sequence_length: 131072
+  max_total_sequence_length: 32768
 
   # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
   dtensor_cfg:
