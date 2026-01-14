@@ -147,9 +147,8 @@ checkpointing:
   # This assumes a slurm job timeout of 4 hours.
   # 1. It will usually take a 10-15 minutes to spin up the training job and for the timeout iterations to start.
   # 2. The next step may also be a validation step which takes extra long.
-  #     1. For this config Qwen 3 30BA3B on math with 131k context length, the validation could take up to 20 mins pessimistically.
-  # 3. The step time for this config could take around 10 mins
-  # 4. The checkpoint time for this model is around 10 mins, pessimistically around 15 mins.
-  # So in total, in order to properly save out by the 4 hour time limit, we should save a checkpoint by 45 mins before the 4 hour limit.
-  checkpoint_must_save_by: "00:03:15:00"
+  #     1. For this config Qwen 3 30BA3B on math with 32k context length, the validation could take up to 10 mins.
+  # 3. The step time for this config on 32 nodes takes around 30 mins.
+  # 4. The checkpoint time for this model is around 10 mins.
+  checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
