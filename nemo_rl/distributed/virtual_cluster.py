@@ -49,6 +49,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = f"uv run --locked --extra vllm --directory {git_root}"
 
+    # Use NeMo-RL direct dependencies and fsdp.
+    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 

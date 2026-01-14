@@ -18,7 +18,7 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run --extra sglang coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+uv run --extra sglang --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_math.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_sglang.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
