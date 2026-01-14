@@ -503,12 +503,9 @@ def stream_weights_via_http_impl(
     """
     from nemo_rl.models.generation.sglang.sglang_copied_utils import (
         MultiprocessingSerializer,
-        monkey_patch_torch_reductions,
     )
 
     print("[sglang refit details] entering stream_weights_via_http_impl")
-
-    monkey_patch_torch_reductions()
 
     target_urls = [
         url
