@@ -90,6 +90,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.lora_enabled = False
 
         if megatron_enable:
+            peft_cfg = config.get("megatron_cfg", {}).get("peft", {})
+            self.lora_enabled = peft_cfg.get("enabled", False)
+
             worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
