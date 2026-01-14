@@ -31,7 +31,6 @@ def disable_compilation(model):
 
 def _fakequant_run_prolog_worker(self) -> None:
     def calibrate_loop(model: Any = None) -> None:
-        # self.execute_dummy_batch()
         self.model_runner._dummy_run(1, skip_eplb=True, remove_lora=False)
 
     quant_cfg = getattr(mtq, os.environ.get("VLLM_QUANT_CFG", None))

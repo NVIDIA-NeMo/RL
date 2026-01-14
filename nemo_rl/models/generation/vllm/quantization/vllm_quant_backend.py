@@ -17,19 +17,10 @@ from contextlib import ExitStack, contextmanager
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+import vllm  # noqa: F401
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 from nemo_rl.models.generation.vllm.vllm_backend import VllmInternalWorkerExtension
-
-try:
-    import vllm  # noqa: F401
-except ImportError:
-    raise ImportError(
-        "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
-        "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-        "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
-        "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
-    )
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
@@ -64,7 +55,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         buf.weight_loader = input_amax_loader
                     elif "weight_quantizer" in name:
                         buf.weight_loader = weight_amax_loader
-                    print("buf", name, buf.shape)
+                    # print("buf", name, buf.shape)
                     buffers_with_loader.append(buf)
                 yield name, buf
 
@@ -80,6 +71,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
     @contextmanager
     def _fold_weight(self, model: nn.Module):
+        """Enable quantizers and fold weight after loading weights."""
         print("folding weight context")
         for _, module in model.named_children():
             if (
@@ -94,6 +86,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             mtq.fold_weight(model, keep_attrs=True)
 
     def _load_weights(self, weights):
+        """Load weights and fold weight after loading weights."""
         with ExitStack() as contexts:
             contexts.enter_context(self._fold_weight(self.model_runner.model))
             # we need to patch the children of the root model

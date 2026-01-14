@@ -20,6 +20,7 @@ from collections import defaultdict
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.transformer.moe.router import TopKRouter
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -238,7 +239,7 @@ def get_forward_loop_func(
 
 def quantize_model(
     model: nn.Module,
-    quant_cfg: str | list[str],
+    quant_cfg: str,
     tokenizer,
     calib_size,
     is_megatron: bool = False,
@@ -317,3 +318,17 @@ def get_modelopt_checkpoint_dir() -> str:
             )
     print(f"Using default modelopt checkpoint dir: {modelopt_checkpoint_dir}")
     return modelopt_checkpoint_dir
+
+
+def quantization_layer_spec(config):
+    """Layer specification for quantization with ModelOpt.
+
+    We need to disable arbitrary attention mask for sequence packing.
+    """
+    return get_gpt_modelopt_spec(
+        config=config,
+        local_core_attention=False,
+        remap_te_layernorm=True,
+        real_quant_cfg="None",
+        use_arbitrary_attention_mask=False,
+    )

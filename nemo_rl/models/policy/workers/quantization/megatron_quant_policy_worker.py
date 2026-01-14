@@ -14,19 +14,15 @@
 
 
 import os
-import types
 from contextlib import contextmanager
 from typing import Generator
 
 import ray
 import torch
-import torch.nn as nn
-from megatron.bridge.models.gpt_provider import quantization_layer_spec
 from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
-from modelopt.torch.opt.dynamic import DynamicModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
@@ -41,6 +37,7 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 )
 from nemo_rl.models.policy.workers.quantization.utils import (
     get_tokenizer,
+    quantization_layer_spec,
     quantize_model,
 )
 
@@ -50,6 +47,7 @@ from nemo_rl.models.policy.workers.quantization.utils import (
 )  # pragma: no cover
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
+        """Initialize the MegatronQuantPolicyWorker."""
         # Turn on bridge quantization mapping
         os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
         self._patch_setup_megatron_model()
@@ -151,6 +149,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         return model
 
     def _patch_setup_megatron_model(self):
+        """Patch the setup_megatron_model function to restore the modelopt state."""
         if hasattr(megatron_policy_worker, "_original_setup_megatron_model"):
             return
         megatron_policy_worker._original_setup_megatron_model = (
@@ -192,49 +191,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         megatron_policy_worker.setup_megatron_model = _setup_megatron_model
 
-    def _patch_automapping(self):
-        # Cache proxy classes by original class name to avoid repeated class creation
-        _proxy_class_cache = {}
-
-        def _patched_detect_parallelism_type(self, module: nn.Module) -> str:
-            if isinstance(module, DynamicModule):
-                # Get or create a proxy class with the correct __name__
-                # This avoids modifying the actual class object (thread-safe)
-                original_name = module.original_cls.__name__
-                # print()
-                if original_name not in _proxy_class_cache:
-                    _proxy_class_cache[original_name] = type(original_name, (), {})
-
-                # Create proxy instance and copy all attributes
-                proxy = _proxy_class_cache[original_name]()
-                proxy.__dict__.update(module.__dict__)
-                print(
-                    "module.original_cls.__name__:",
-                    original_name,
-                    " proxy name:",
-                    type(proxy).__name__,
-                )
-
-                return self._original_detect_parallelism_type(proxy)
-            print("module in patched_detect_parallelism_type:", module)
-            return self._original_detect_parallelism_type(module)
-
-        for task in self.refit_conversion_tasks:
-            if hasattr(task.mapping, "_detect_parallelism_type") and not hasattr(
-                task.mapping, "_original_detect_parallelism_type"
-            ):
-                task.mapping._original_detect_parallelism_type = (
-                    task.mapping._detect_parallelism_type
-                )
-                task.mapping._detect_parallelism_type = types.MethodType(
-                    _patched_detect_parallelism_type, task.mapping
-                )
-
-    def _calculate_refit_param_info(self):
-        param_info = super()._calculate_refit_param_info()
-        # self._patch_automapping()
-        return param_info
-
     @contextmanager
     def disable_quantization(self):
         """Context manager that temporarily disables quantization."""
@@ -251,16 +207,16 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
-        """Context manager that temporarily swaps the reference model and active model.
-
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
-        """
-        with self.disable_quantization(), super().use_reference_model():
+        """Context manager that temporarily swaps the reference model and active model."""
+        with (
+            self.disable_quantization(),
+            self.without_model_config(),
+            super().use_reference_model(),
+        ):
             yield
 
-    def save_checkpoint(self, *args, **kwargs):
-        # temp patch, a config is added to Quantizer which will break saving.
+    @contextmanager
+    def without_model_config(self):
         configs = {}
         try:
             for name, module in self.model.named_modules():
@@ -268,7 +224,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     if hasattr(module, "config"):
                         configs[name] = module.config
                         delattr(module, "config")
-            return super().save_checkpoint(*args, **kwargs)
+            yield
         finally:
             for name, config in configs.items():
                 setattr(self.model.get_submodule(name), "config", config)
+
+    def save_checkpoint(self, *args, **kwargs):
+        """Save the checkpoint."""
+        # temp patch, a config is added to Quantizer which will break saving.
+        with self.without_model_config():
+            return super().save_checkpoint(*args, **kwargs)
