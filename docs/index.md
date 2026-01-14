@@ -217,6 +217,7 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+dtensor-tp-accuracy/dtensor-tp-accuracy.md
 ```
 
 ```{toctree}
