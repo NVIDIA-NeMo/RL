@@ -217,8 +217,8 @@ Cluster Setup <get-started/cluster.md>
 :caption: Training Algorithms
 :maxdepth: 2
 
-guides/grpo.md
-guides/dapo.md
+guides/nemotron-3-nano.md
+adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/rm.md
