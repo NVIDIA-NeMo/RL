@@ -131,13 +131,17 @@ class VllmInternalWorkerExtension:
         """Apply weight name mapping if LoRA is enabled."""
 
         def map_param_name(param_name: str) -> str:
-            lora_mgr = self.model_runner.model.lora_manager
-            supported_modules = lora_mgr.supported_lora_modules
-            packed_modules_mapping = lora_mgr.packed_modules_mapping
+            # Vllm add logits_processor to lm_head weight(https://github.com/vllm-project/vllm/blob/b8b302cde434df8c9289a2b465406b47ebab1c2d/vllm/lora/models.py#L506), we skip mapping for lm_head weight
+            if "lm_head" in param_name:
+                return param_name
 
             parts = param_name.split(".")
             if len(parts) < 2:
                 return param_name
+
+            lora_mgr = self.model_runner.model.lora_manager
+            supported_modules = lora_mgr.supported_lora_modules
+            packed_modules_mapping = lora_mgr.packed_modules_mapping
 
             base_name = ".".join(parts[:-2])  # prefix
             module_name = parts[-2]  # e.g. q_proj/k_proj/v_proj/gate_proj/up_proj/...
@@ -174,6 +178,13 @@ class VllmInternalWorkerExtension:
 
         This unifies the duplicate logic used by both IPC and collective paths.
         """
+        # Exactly one of refit_base_model_weights or refit_lora_weights must be True,
+        # as they have different weight name mapping rules
+        assert refit_base_model_weights ^ refit_lora_weights, (
+            f"Exactly one of refit_base_model_weights or refit_lora_weights must be True, "
+            f"got refit_base_model_weights={refit_base_model_weights}, refit_lora_weights={refit_lora_weights}"
+        )
+
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         runner = self.model_runner
