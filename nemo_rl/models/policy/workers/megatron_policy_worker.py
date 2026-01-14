@@ -131,6 +131,7 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weights import is_base_model_weight_name, is_lora_weight_name
 
 try:
     from megatron.core.distributed import (
@@ -2129,6 +2130,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2147,6 +2150,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Yield the original parameters first.
         for name, tensor in base_iter:
+            if is_base_model_weight_name(name) and not refit_base_model_weights:
+                continue
+            if is_lora_weight_name(name) and not refit_lora_weights:
+                continue
             yield name, tensor
 
         # Check whether FP8 KV cache is enabled.
@@ -2201,6 +2208,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         stream_weights_via_ipc_zmq_impl(
             params_generator=self._iter_params_with_optional_kv_scales(
                 kv_scales=kv_scales
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
             ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
@@ -2210,12 +2219,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self, 
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication."""
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
