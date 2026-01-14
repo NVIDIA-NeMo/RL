@@ -283,6 +283,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _reset_do_on_policy_fixes(self) -> None:
         self.do_on_policy_fixes = self.cfg["vllm_cfg"].get("http_server_performs_on_policy_fixes", False)
 
+    def prepare_http_server_for_training(self) -> None:
+        self._reset_do_on_policy_fixes()
+
+    def prepare_http_server_for_validation(self) -> None:
+        self.do_on_policy_fixes = False
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
