@@ -1,265 +1,284 @@
+---
+description: "NeMo RL is an open-source post-training library for scaling reinforcement learning methods for multimodal models (LLMs, VLMs, etc.)"
+categories:
+  - documentation
+  - home
+tags:
+  - reinforcement-learning
+  - post-training
+  - scalable
+  - distributed
+  - llm-training
+personas:
+  - Data Scientists
+  - Machine Learning Engineers
+  - Cluster Administrators
+difficulty: beginner
+content_type: index
+---
+
+(rl-home)=
+
 # NeMo RL Documentation
 
-Welcome to the NeMo RL documentation. NeMo RL is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs, etc.).
+**NeMo RL** is an open-source post-training library within the [NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs, etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
-This documentation provides comprehensive guides, examples, and references to help you get started with NeMo RL and build powerful post-training pipelines for your models.
+## Introduction to NeMo RL
 
-## Getting Started
+Learn about NeMo RL, how it works at a high-level, and the key features.
 
-::::{grid} 1 1 2 2
-:gutter: 3
+::::{grid} 1 2 2 2
+:gutter: 1 1 1 2
 
-:::{grid-item-card} {octicon}`book` Overview
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` About NeMo RL
 :link: about/overview
 :link-type: doc
-
-Learn about NeMo RL's architecture, design philosophy, and key features that make it ideal for scalable reinforcement learning.
+Overview of NeMo RL and its capabilities.
++++
+{bdg-secondary}`architecture` {bdg-secondary}`design-philosophy` {bdg-secondary}`scalable-rl`
 :::
 
-:::{grid-item-card} {octicon}`rocket` Quick Start
-:link: about/quick-start
-:link-type: doc
-
-Get up and running quickly with examples for both DTensor and Megatron Core training backends.
-:::
-
-:::{grid-item-card} {octicon}`download` Installation
-:link: about/installation
-:link-type: doc
-
-Step-by-step instructions for installing NeMo RL, including prerequisites, system dependencies, and environment setup.
-:::
-
-:::{grid-item-card} {octicon}`star` Features
+:::{grid-item-card} {octicon}`star;1.5em;sd-mr-1` Key Features
 :link: about/features
 :link-type: doc
-
-Explore the current features and upcoming enhancements in NeMo RL, including distributed training, advanced parallelism, and more.
+Discover the main features of NeMo RL for post-training.
++++
+{bdg-secondary}`algorithms` {bdg-secondary}`backends` {bdg-secondary}`distributed-training`
 :::
 
-:::{grid-item-card} {octicon}`light-bulb` Tips and Tricks
-:link: about/tips-and-tricks
-:link-type: doc
-
-Troubleshooting common issues including missing submodules, Ray dashboard access, and debugging techniques.
-:::
-
-::::
-
-## Training and Generation
-
-::::{grid} 1 1 2 2
-:gutter: 3
-
-:::{grid-item-card} {octicon}`cpu` Training Backends
+:::{grid-item-card} {octicon}`cpu;1.5em;sd-mr-1` Training Backends
 :link: about/backends
 :link-type: doc
-
-Learn about DTensor and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
-:::
-
-:::{grid-item-card} {octicon}`workflow` Algorithms
-:link: about/algorithms/index
-:link-type: doc
-
-Discover supported algorithms including GRPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
-:::
-
-:::{grid-item-card} {octicon}`graph` Evaluation
-:link: about/evaluation
-:link-type: doc
-
-Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
-:::
-
-:::{grid-item-card} {octicon}`server` Cluster Setup
-:link: about/clusters
-:link-type: doc
-
-Configure and deploy NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+Explore PyTorch DTensor and Megatron Core training backends and how to choose the right one.
++++
+{bdg-secondary}`dtensor` {bdg-secondary}`megatron-core` {bdg-secondary}`parallelism`
 :::
 
 ::::
 
-## Guides and Examples
+## Get Started
 
-::::{grid} 1 1 2 2
-:gutter: 3
+Start here to install NeMo RL and run your first training job.
 
-:::{grid-item-card} {octicon}`mortar-board` GRPO DeepscaleR
+::::{grid} 1 2 2 2
+:gutter: 1 1 1 2
+
+:::{grid-item-card} {octicon}`play;1.5em;sd-mr-1` Installation & Quickstart
+:link: get-started/index
+:link-type: doc
+**Start Here**: Install NeMo RL and run your first local training job in minutes.
++++
+{bdg-primary}`installation` {bdg-secondary}`first-run`
+:::
+
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` GRPO Worfklow
+:link: get-started/grpo
+:link-type: doc
+Run Group Relative Policy Optimization (GRPO) training.
++++
+{bdg-secondary}`on-policy` {bdg-secondary}`reinforcement-learning`
+:::
+
+:::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` SFT Worfklow
+:link: get-started/sft
+:link-type: doc
+Run supervised fine-tuning (SFT) on instruction datasets.
++++
+{bdg-secondary}`fine-tuning` {bdg-secondary}`instruction-following`
+:::
+
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` DPO Worfklow
+:link: get-started/dpo
+:link-type: doc
+Run Direct Preference Optimization (DPO) training.
++++
+{bdg-secondary}`preference-learning` {bdg-secondary}`alignment`
+:::
+
+::::
+
+## Training Algorithms
+
+Explore how you can use NeMo RL with different training algorithms.
+
+::::{grid} 1 2 2 2
+:gutter: 1 1 1 2
+
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` GRPO
+:link: guides/grpo
+:link-type: doc
+Group Relative Policy Optimization for efficient on-policy reinforcement learning.
++++
+{bdg-secondary}`on-policy-rl` {bdg-secondary}`reward-optimization` {bdg-secondary}`multi-turn`
+:::
+
+:::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` Supervised Fine-Tuning
+:link: guides/sft
+:link-type: doc
+Fine-tune models on instruction-following datasets with supervised learning.
++++
+{bdg-secondary}`instruction-tuning` {bdg-secondary}`supervised-learning`
+:::
+
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` DPO
+:link: guides/dpo
+:link-type: doc
+Direct Preference Optimization for preference-based training without reward models.
++++
+{bdg-secondary}`preference-learning` {bdg-secondary}`alignment`
+:::
+
+:::{grid-item-card} {octicon}`trophy;1.5em;sd-mr-1` Reward Modeling
+:link: guides/rm
+:link-type: doc
+Train reward models for preference learning and evaluation.
++++
+{bdg-secondary}`reward-models` {bdg-secondary}`preference-learning`
+:::
+
+::::
+
+## Tutorial Highlights
+
+Check out tutorials to get a quick start on using NeMo RL.
+
+::::{grid} 1 2 2 2
+:gutter: 1 1 1 2
+
+:::{grid-item-card} {octicon}`mortar-board;1.5em;sd-mr-1` GRPO DeepscaleR
 :link: guides/grpo-deepscaler
 :link-type: doc
-
 Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning tasks.
++++
+{bdg-secondary}`mathematical-reasoning` {bdg-secondary}`reproduction`
 :::
 
-:::{grid-item-card} {octicon}`number` SFT on OpenMathInstruct2
+:::{grid-item-card} {octicon}`number;1.5em;sd-mr-1` SFT on OpenMathInstruct2
 :link: guides/sft-openmathinstruct2
 :link-type: doc
-
 Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
++++
+{bdg-secondary}`math-datasets` {bdg-secondary}`instruction-tuning`
 :::
 
-:::{grid-item-card} {octicon}`stack` Environments
+:::{grid-item-card} {octicon}`stack;1.5em;sd-mr-1` Custom Environments
 :link: guides/environments
 :link-type: doc
-
 Create custom reward environments and integrate them with NeMo RL training pipelines.
++++
+{bdg-secondary}`custom-rewards` {bdg-secondary}`environment-integration`
 :::
 
-:::{grid-item-card} {octicon}`plus-circle` Adding New Models
+:::{grid-item-card} {octicon}`plus-circle;1.5em;sd-mr-1` Adding New Models
 :link: adding-new-models
 :link-type: doc
-
 Learn how to add support for new model architectures in NeMo RL.
++++
+{bdg-secondary}`model-integration` {bdg-secondary}`custom-models`
 :::
 
 ::::
 
-## Advanced Topics
+---
 
-::::{grid} 1 1 2 2
-:gutter: 3
-
-:::{grid-item-card} {octicon}`telescope` Design and Philosophy
-:link: design-docs/design-and-philosophy
-:link-type: doc
-
-Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
-:::
-
-:::{grid-item-card} {octicon}`bug` Debugging
-:link: debugging
-:link-type: doc
-
-Tools and techniques for debugging distributed Ray applications and RL training runs.
-:::
-
-:::{grid-item-card} {octicon}`zap` FP8 Quantization
-:link: fp8
-:link-type: doc
-
-Optimize large language models with FP8 quantization for faster training and inference.
-:::
-
-:::{grid-item-card} {octicon}`container` Docker Containers
-:link: docker
-:link-type: doc
-
-Build and use Docker containers for reproducible NeMo RL environments.
-:::
-
+::::{toctree}
+:hidden:
+Home <self>
 ::::
 
-## API Reference
-
-::::{grid} 1 1 1 1
-:gutter: 3
-
-:::{grid-item-card} {octicon}`code` Complete API Documentation
-:link: apidocs/index
-:link-type: doc
-
-Comprehensive reference for all NeMo RL modules, classes, functions, and methods. Browse the complete Python API with detailed docstrings and usage examples.
-:::
-
+::::{toctree}
+:hidden:
+:caption: About NeMo RL
+:maxdepth: 1
+about/overview.md
+about/features.md
+about/backends.md
+about/algorithms/index.md
+about/evaluation.md
+about/tips-and-tricks.md
+about/performance-summary.md
 ::::
 
-```{toctree}
-:caption: About
+::::{toctree}
 :hidden:
+:caption: Get Started
+:maxdepth: 2
 
-about/overview
-about/performance-summary
-about/features
-about/backends
-about/quick-start
-about/installation
-about/algorithms/index
-about/evaluation
-about/clusters
-about/tips-and-tricks
-```
+Quickstart <get-started/index.md>
+Installation <get-started/installation.md>
+SFT <get-started/sft.md>
+DPO <get-started/dpo.md>
+GRPO <get-started/grpo.md>
+Cluster Setup <get-started/cluster.md>
+::::
 
-
-
-```{toctree}
-:caption: Environment Start
+::::{toctree}
 :hidden:
-
-local-workstation.md
-cluster.md
-
-```
-
-```{toctree}
-:caption: E2E Examples
-:hidden:
-
-guides/sft-openmathinstruct2.md
-```
-
-```{toctree}
-:caption: Guides
-:hidden:
+:caption: Training Algorithms
+:maxdepth: 2
 
 guides/nemotron-3-nano.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
-guides/dapo.md
-guides/grpo.md
-guides/grpo-deepscaler.md
-guides/grpo-sliding-puzzle.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
+::::
+
+::::{toctree}
+:hidden:
+:caption: Examples & Tutorials
+:maxdepth: 2
+
+guides/grpo-deepscaler.md
+guides/sft-openmathinstruct2.md
+guides/grpo-sliding-puzzle.md
 guides/deepseek.md
-model-quirks.md
 guides/async-grpo.md
-```
+adding-new-models.md
+model-quirks.md
+::::
 
-```{toctree}
-:caption: Containers
+::::{toctree}
 :hidden:
+:caption: Setup & Deployment
+:maxdepth: 2
 
+get-started/cluster.md
 docker.md
-```
+::::
 
-```{toctree}
-:caption: Development
+::::{toctree}
 :hidden:
-
-testing.md
-documentation.md
-debugging.md
-nsys-profiling.md
-fp8.md
-guides/use-custom-vllm.md
-```
-
-```{toctree}
-:caption: Design Docs
-:hidden:
+:caption: Advanced Topics
+:maxdepth: 2
 
 design-docs/design-and-philosophy.md
-design-docs/padding.md
-design-docs/logger.md
-design-docs/uv.md
+design-docs/training-backends.md
 design-docs/dependency-management.md
-design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
-design-docs/fsdp2-parallel-plan.md
-design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
+design-docs/fsdp2-parallel-plan.md
+design-docs/padding.md
+design-docs/logger.md
+design-docs/chat-datasets.md
+design-docs/uv.md
 design-docs/env-vars.md
-```
+debugging.md
+fp8.md
+nsys-profiling.md
+testing.md
+documentation.md
+guides/use-custom-vllm.md
+::::
 
-```{toctree}
-:caption: API Reference
+::::{toctree}
 :hidden:
+:caption: Reference
+:maxdepth: 2
 
-apidocs/index
-```
+apidocs/index.rst
+::::

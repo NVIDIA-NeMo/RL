@@ -4,7 +4,7 @@ This document explains how to perform SFT within NeMo RL. It outlines key operat
 
 ## Launch an SFT Run
 
-The script, [examples/run_sft.py](../../examples/run_sft.py), can be used to launch an experiment. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
+The script, [examples/run_sft.py](../../examples/run_sft.py), can be used to launch an experiment. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../get-started/cluster.md).
 
 Be sure to launch the job using `uv`. The command to launch an SFT job is as follows:
 
