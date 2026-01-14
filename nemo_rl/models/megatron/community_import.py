@@ -139,6 +139,7 @@ def export_model_from_megatron(
     hf_tokenizer_path: str,
     overwrite: bool = False,
     hf_overrides: Optional[dict[str, Any]] = {},
+    strict: bool = True,
 ):
     if os.path.exists(output_path) and not overwrite:
         raise FileExistsError(
@@ -169,7 +170,7 @@ def export_model_from_megatron(
         )
 
         # Save in HuggingFace format
-        bridge.save_hf_pretrained(megatron_model, output_path)
+        bridge.save_hf_pretrained(megatron_model, output_path, strict=strict)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine

@@ -46,6 +46,11 @@ def parse_args():
     parser.add_argument(
         "--hf-ckpt-path", type=str, default=None, help="Path to save HF checkpoint"
     )
+    parser.add_argument(
+        "--non-strict",
+        action="store_true",
+        help="Whether to perform non-strict validation during weight export",
+    )
     # Parse known args for the script
     args = parser.parse_args()
 
@@ -69,6 +74,7 @@ def main():
         output_path=args.hf_ckpt_path,
         hf_tokenizer_path=tokenizer_name,
         hf_overrides=hf_overrides,
+        strict=not args.non_strict,
     )
 
 
