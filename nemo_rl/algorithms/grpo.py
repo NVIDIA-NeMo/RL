@@ -1086,11 +1086,7 @@ def grpo_train(
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
+            refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
