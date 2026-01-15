@@ -32,7 +32,7 @@ In general, **generation logprobs** and **policy logprobs** should align closely
 
 As shown in Figure 1, numerous spikes can be observed during training. Occasional spikes are acceptable if the `token_mult_prob_error` quickly returns to around 1.0. However, in this case, even with EMA smoothing applied, the figure reveals an overall upward trend, which is unacceptable and indicates a persistent misalignment between the training and inference behaviors.
 
-<img src="../assets/dtensor-tp-accuracy/token_mult_prob_error_qwen3_4B.png" alt="The token_mult_prob_error for Qwen3-4B" style="zoom:33%;" />
+![](../assets/dtensor-tp-accuracy/token_mult_prob_error_qwen3_4B.png)
 
 <p align="center"><em>Fig 1: The token_mult_prob_error of Qwen3-4B</em></p>
 
@@ -60,11 +60,11 @@ Combining the three images for observation, it is not necessarily true that abno
 2. **Stochastic occurrence of spikes**: The abnormal `token_mult_prob_error` is itself unstable; even with the same batch of data, spikes may not appear in every run.
 3. **Dilution effect with large datasets**: When the dataset is sufficiently large and no critical samples are repeatedly affected, these extreme but sporadic spikes may have limited impact on aggregate metrics, so the final reward and validation accuracy may not exhibit significant deviations.
 
-<img src="../assets/dtensor-tp-accuracy/image-20260111142255534.png" alt="image-20260111142255534" style="zoom: 33%;" />
+![](../assets/dtensor-tp-accuracy/image-20260111142255534.png)
 
 <p align="center"><em>Fig 2: The reward of Qwen3-4B</em></p>
 
-<img src="../assets/dtensor-tp-accuracy/validation_accuracy.png" style="zoom:33%;" />
+![](../assets/dtensor-tp-accuracy/validation_accuracy.png)
 
 <p align="center"><em>Fig 3: The validation accuracy of Qwen3-4B</em></p>
 
@@ -96,7 +96,7 @@ This ratio is the standard importance ratio used in off-policy RL to reweight re
 
 <p align="center"><em>Fig 4: The mismatch of prev_logprobs and current_logprobs under TP=4</em></p>
 
-<img src="../assets/dtensor-tp-accuracy/image-20260111160656891-1768118824549-2.png" alt="image-20260111160656891" style="zoom: 25%;" />
+![](../assets/dtensor-tp-accuracy/image-20260111160656891-1768118824549-2.png)
 
 <p align="center"><em>Fig 5: The reward of deepseek-ai/DeepSeek-R1-Distill-Qwen-7B under TP=4 and TP=1</em></p>
 
@@ -123,7 +123,7 @@ When using DTensor with TP > 1, or when `probs_ratio != 1` is observed in an on-
 
 Row-wise and column-wise parallelism are two common ways to split a large linear layer across multiple devices. They differ in **which dimension of the weight matrix is partitioned** and how the partial results are combined. 
 
-Consider a linear layer $y=xW^T$ with $` W^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}},\quad x \in \mathbb{R}^{d_{\text{in}}},\quad y \in \mathbb{R}^{d_{\text{out}}}. `$.
+Consider a linear layer $y=xW^T$ with $ W^T \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}},\quad x \in \mathbb{R}^{d_{\text{in}}},\quad y \in \mathbb{R}^{d_{\text{out}}}. $.
 
 1. Row-wise parallel (TP = 2)
 
@@ -228,7 +228,7 @@ Beyond the TP-related issues discussed above, our experiments also highlight tha
 
 Figure 6 reports the KL divergence between the logits produced by the Hugging Face stack and those produced by NeMo‑RL for the same input sequence. The plot shows that, even with identical data and model weights, the resulting logit distributions differ noticeably across the two execution engines. In our experiments, similar behavior appeared when varying attention implementations and hardware configurations, where we consistently observed measurable numerical discrepancies, although we did not attempt to systematically eliminate every such source of variation.
 
-<img src="../assets/dtensor-tp-accuracy/kl_hf_prev.png" alt="image-20260112204939998" style="zoom: 67%;" />
+![](../assets/dtensor-tp-accuracy/kl_hf_prev.png)
 
 <p align="center"><em>Fig 6: The KL divergence between hugging face and nemorl</em></p>
 
