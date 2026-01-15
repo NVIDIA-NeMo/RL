@@ -330,7 +330,7 @@ def quantization_layer_spec(config):
         os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")
     )
     if disable_modelopt_layer_spec:
-        return transformer_engine_layer_spec
+        return transformer_engine_layer_spec(config)
     return get_gpt_modelopt_spec(
         config=config,
         local_core_attention=False,
