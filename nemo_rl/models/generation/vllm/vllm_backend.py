@@ -200,7 +200,7 @@ class VllmInternalWorkerExtension:
             assert lora_config, (
                 "lora_config is not provided, can not refit lora weights"
             )
-            from nemo_rl.models.generation.lora import (
+            from nemo_rl.models.generation.vllm.lora import (
                 LoRARequestWithCfgAndWeights,
                 get_vllm_lora_metadata,
             )

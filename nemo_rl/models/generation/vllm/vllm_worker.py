@@ -401,7 +401,7 @@ class BaseVllmGenerationWorker:
         self.lora_enabled = False
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
             try:
-                from nemo_rl.models.generation.lora import apply_lora_patches
+                from nemo_rl.models.generation.vllm.lora import apply_lora_patches
 
                 apply_lora_patches()
 
@@ -591,7 +591,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         if self.lora_enabled:
             from vllm.lora.request import LoRARequest
 
-            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+            from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
 
             lora_metadata = get_vllm_lora_metadata()
             lora_req = LoRARequest(
@@ -731,7 +731,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         if self.lora_enabled:
             from vllm.lora.request import LoRARequest
 
-            from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+            from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
 
             lora_metadata = get_vllm_lora_metadata()
             lora_req = LoRARequest(
