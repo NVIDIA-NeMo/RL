@@ -281,7 +281,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return self.base_url
 
     def _reset_do_on_policy_fixes(self) -> None:
-        self.do_on_policy_fixes = self.cfg["vllm_cfg"].get("http_server_performs_on_policy_fixes", False)
+        self.do_on_policy_fixes = self.cfg["vllm_cfg"].get("http_server_performs_on_policy_fixes", True)
 
     def prepare_http_server_for_training(self) -> None:
         self._reset_do_on_policy_fixes()
