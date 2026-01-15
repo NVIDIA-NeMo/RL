@@ -132,7 +132,7 @@ class VllmInternalWorkerExtension:
     def apply_lora_patches(self) -> None:
         """Apply LoRA patches inside the vLLM worker process. Used for async worker."""
         try:
-            from nemo_rl.models.generation.lora import apply_lora_patches
+            from nemo_rl.models.generation.vllm.lora import apply_lora_patches
 
             apply_lora_patches()
 

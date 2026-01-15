@@ -760,7 +760,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_req = None
             if self.lora_enabled:
                 from vllm.lora.request import LoRARequest
-                from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+                from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
 
                 lora_metadata = get_vllm_lora_metadata()
                 lora_req = LoRARequest(
@@ -944,7 +944,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_req = None
             if self.lora_enabled:
                 from vllm.lora.request import LoRARequest
-                from nemo_rl.models.generation.lora import get_vllm_lora_metadata
+                from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
 
                 lora_metadata = get_vllm_lora_metadata()
                 lora_req = LoRARequest(
@@ -1061,7 +1061,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     async def update_weights_from_collective_async(
-        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+        self,
+        refit_mode: Optional[str] = "base_model",
     ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
@@ -1076,7 +1077,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective",
-                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
+                args=(self.lora_cfg, refit_mode),
             )
 
             if asyncio.iscoroutine(result_or_coro):
