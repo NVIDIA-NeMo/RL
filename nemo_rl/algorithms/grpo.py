@@ -1926,8 +1926,6 @@ def async_grpo_train(
         policy_generation = policy
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
-    REFIT_BASE_MODEL_WEIGHTS = True
-    REFIT_LORA_WEIGHTS = policy.lora_enabled
     assert policy_generation is not None
 
     # Training state
