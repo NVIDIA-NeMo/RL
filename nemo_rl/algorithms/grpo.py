@@ -1132,11 +1132,7 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
+            refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()

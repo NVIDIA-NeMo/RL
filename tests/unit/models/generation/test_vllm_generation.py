@@ -750,13 +750,7 @@ async def run_hf_train_process(
         )
 
         print("refitting vllm policy...")
-        refit_policy_generation(
-            lm_policy,
-            vllm_policy,
-            colocated,
-            refit_base_model_weights=True,
-            refit_lora_weights=enable_lora,
-        )
+        refit_policy_generation(lm_policy, vllm_policy, colocated)
 
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
