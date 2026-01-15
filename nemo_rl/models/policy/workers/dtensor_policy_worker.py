@@ -1727,12 +1727,11 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
-        refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = False,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Broadcast the weights for collective communication."""
-        assert refit_base_model_weights and refit_lora_weights == False, (
-            "dtensor v1 not support lora. refit_lora_weights must be False"
+        assert refit_mode == "base_model", (
+            f"refit_mode must be 'base_model' in dtensor v1, but got {refit_mode}"
         )
         if kv_scales is not None:
             raise NotImplementedError(

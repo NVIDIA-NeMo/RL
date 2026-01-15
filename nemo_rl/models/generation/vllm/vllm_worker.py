@@ -805,7 +805,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(
-        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+        self,
+        refit_mode: Optional[str] = "base_model",
     ) -> bool:
         """Update the model weights from collective communication."""
         try:
@@ -820,7 +821,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective",
-                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
+                args=(self.lora_cfg, refit_mode),
             )
             worker_result = result_or_coro[0]
 

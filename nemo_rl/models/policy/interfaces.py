@@ -186,8 +186,7 @@ class ColocatablePolicyInterface(PolicyInterface):
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
-        refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = False,
+        refit_mode: Optional[str] = "base_model",
     ) -> list[ray.ObjectRef]:
         pass
 

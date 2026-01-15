@@ -332,8 +332,7 @@ class VllmInternalWorkerExtension:
     def update_weights_from_collective(
         self,
         lora_config: dict[str, Any] = {},
-        refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = False,
+        refit_mode: Optional[str] = "base_model",
     ) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
@@ -345,17 +344,16 @@ class VllmInternalWorkerExtension:
             """Iterator that yields only base model weights when skip_base_model_weights is True."""
             for name, tensor_tuple in self.state_dict_info.items():
                 # Skip base model weights if skip_base_model_weights is True
-                if is_base_model_weight_name(name) and not refit_base_model_weights:
+                if is_base_model_weight_name(name) and refit_mode != "base_model":
                     continue
-                if is_lora_weight_name(name) and not refit_lora_weights:
+                if is_lora_weight_name(name) and refit_mode != "lora":
                     continue
                 yield name, tensor_tuple
 
         load_model_weight_func = lambda weights: self._apply_loaded_weights(
             weights=weights,
             lora_config=lora_config,
-            refit_base_model_weights=refit_base_model_weights,
-            refit_lora_weights=refit_lora_weights,
+            refit_mode=refit_mode,
         )
 
         try:

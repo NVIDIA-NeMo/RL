@@ -966,13 +966,10 @@ def refit_policy_generation(
         else:
             # update weights through nccl
             futures_train = policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales,
-                refit_base_model_weights=refit_base_model_weights,
-                refit_lora_weights=refit_lora_weights,
+                kv_scales=kv_scales, refit_mode=refit_mode
             )
             futures_inference = policy_generation.update_weights_from_collective(
-                refit_base_model_weights=refit_base_model_weights,
-                refit_lora_weights=refit_lora_weights,
+                refit_mode=refit_mode
             )
             # wait for all futures to complete
             ray.get(futures_train)
