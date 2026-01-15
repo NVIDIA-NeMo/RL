@@ -129,6 +129,20 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    def apply_lora_patches(self) -> None:
+        """Apply LoRA patches inside the vLLM worker process. Used for async worker."""
+        try:
+            from nemo_rl.models.generation.vllm.lora import apply_lora_patches
+
+            apply_lora_patches()
+
+        except Exception as e:
+            print(f"Failed to apply LoRA patches in worker extension: {e}")
+            import traceback as _tb
+
+            print(_tb.format_exc())
+            raise e
+
     def _apply_weight_name_mapping(
         self, weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
