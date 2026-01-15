@@ -987,7 +987,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_via_ipc_zmq_async(
-        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+        self,
+        refit_mode: Optional[str] = "base_model",
     ) -> bool:
         """Async version of update_weights_via_ipc_zmq."""
         try:
@@ -1003,7 +1004,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=(self.lora_cfg, refit_base_model_weights, refit_lora_weights),
+                args=(self.lora_cfg, refit_mode),
             )
 
             if asyncio.iscoroutine(result_or_coro):
