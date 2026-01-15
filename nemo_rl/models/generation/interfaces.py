@@ -251,7 +251,9 @@ class GenerationInterface(ABC):
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_mode: Optional[str] = "base_model"
+    ) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError
 

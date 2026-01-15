@@ -791,7 +791,9 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_mode: Optional[str] = "base_model"
+    ) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -807,6 +809,7 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            refit_mode=refit_mode,
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside

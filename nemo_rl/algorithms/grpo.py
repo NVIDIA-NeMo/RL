@@ -466,9 +466,6 @@ def setup(
             # Override the vLLM lora config with the DTensor lora config
             generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
 
-            assert colocated_inference, (
-                "LoRA in DTensor backend is only supported with colocated inference."
-            )
             assert not _should_use_async_rollouts(master_config), (
                 "Async rollouts are not supported with LoRA in DTensor backend."
             )
@@ -968,8 +965,12 @@ def refit_policy_generation(
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
+            futures_train = policy.broadcast_weights_for_collective(
+                kv_scales=kv_scales, refit_mode=refit_mode
+            )
+            futures_inference = policy_generation.update_weights_from_collective(
+                refit_mode=refit_mode
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)

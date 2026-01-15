@@ -1856,13 +1856,21 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Broadcast the weights for collective communication."""
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
+
+        if refit_mode == "base_model" and self.lora_enabled:
+            assert not self.lora_base_refit_done, (
+                "Base model weights have already been refit, cannot refit again"
+            )
+            self.lora_base_refit_done = True
 
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1876,7 +1884,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=dtensor_params_generator(self.model, self.dtype, refit_mode),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,

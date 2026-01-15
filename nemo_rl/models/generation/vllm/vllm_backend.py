@@ -25,6 +25,10 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.weights import (
+    is_base_model_weight_name,
+    is_lora_weight_name,
+)
 
 try:
     import vllm  # noqa: F401
@@ -325,36 +329,36 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self,
+        lora_config: dict[str, Any] = {},
+        refit_mode: Optional[str] = "base_model",
+    ) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        def _load_model_weights(weights, model_runner):
-            """Load model weights.
+        def _filtered_state_dict_iterator():
+            """Iterator that yields only base model weights when skip_base_model_weights is True."""
+            for name, tensor_tuple in self.state_dict_info.items():
+                # Skip base model weights if skip_base_model_weights is True
+                if is_base_model_weight_name(name) and refit_mode != "base_model":
+                    continue
+                if is_lora_weight_name(name) and refit_mode != "lora":
+                    continue
+                yield name, tensor_tuple
 
-            Args:
-                weights: List[(name, tensor)]
-                model_runner: vLLM ModelRunner
-
-            Returns:
-                None
-            """
-            from nemo_rl.models.generation.vllm.quantization import fp8
-
-            if fp8.is_fp8_model(model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, model_runner)
-            else:
-                model_runner.model.load_weights(weights=weights)
-
-        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+        load_model_weight_func = lambda weights: self._apply_loaded_weights(
+            weights=weights,
+            lora_config=lora_config,
+            refit_mode=refit_mode,
+        )
 
         try:
             packed_broadcast_consumer(
-                iterator=iter(self.state_dict_info.items()),
+                iterator=_filtered_state_dict_iterator(),
                 group=self.model_update_group,
                 src=0,
                 post_unpack_func=load_model_weight_func,

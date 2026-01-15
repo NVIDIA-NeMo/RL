@@ -1725,9 +1725,14 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Broadcast the weights for collective communication."""
+        assert refit_mode == "base_model", (
+            f"refit_mode must be 'base_model' in dtensor v1, but got {refit_mode}"
+        )
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."

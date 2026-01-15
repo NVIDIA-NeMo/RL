@@ -778,12 +778,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_mode: Optional[str] = "base_model",
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_mode=refit_mode,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
