@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -246,7 +246,7 @@ class GenerationInterface(ABC):
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(
-        self, refit_base_model_weights: bool = True, refit_lora_weights: bool = False
+        self, refit_mode: Optional[str] = "base_model"
     ) -> list[ray.ObjectRef]:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError

@@ -2189,8 +2189,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
-        refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = False,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()

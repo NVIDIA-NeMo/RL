@@ -947,6 +947,16 @@ def refit_policy_generation(
     def _perform_refit_weights(
         refit_base_model_weights: bool, refit_lora_weights: bool
     ):
+        assert refit_base_model_weights ^ refit_lora_weights, (
+            "refit_base_model_weights and refit_lora_weights cannot be both True or False"
+        )
+        refit_mode = (
+            "base_model"
+            if refit_base_model_weights
+            else "lora"
+            if refit_lora_weights
+            else None
+        )
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
@@ -963,12 +973,10 @@ def refit_policy_generation(
             futures_train = policy.stream_weights_via_ipc_zmq(
                 buffer_size_bytes=buffer_size_bytes,
                 kv_scales=kv_scales,
-                refit_base_model_weights=refit_base_model_weights,
-                refit_lora_weights=refit_lora_weights,
+                refit_mode=refit_mode,
             )
             futures_inference = policy_generation.update_weights_via_ipc_zmq(
-                refit_base_model_weights=refit_base_model_weights,
-                refit_lora_weights=refit_lora_weights,
+                refit_mode=refit_mode,
             )
             # wait for all futures to complete
             ray.get(futures_train)
@@ -992,7 +1000,6 @@ def refit_policy_generation(
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
             raise RuntimeError(error_message)
-        return update_success
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -1005,17 +1012,13 @@ def refit_policy_generation(
         else nullcontext()
     )
     with timer_context:
-        update_success = False
         if refit_base_model_weights:
-            update_success = _perform_refit_weights(
+            _perform_refit_weights(
                 refit_base_model_weights=True, refit_lora_weights=False
             )
         if refit_lora_weights:
-            update_success = (
-                _perform_refit_weights(
-                    refit_base_model_weights=False, refit_lora_weights=True
-                )
-                and update_success
+            _perform_refit_weights(
+                refit_base_model_weights=False, refit_lora_weights=True
             )
 
     if colocated_inference:

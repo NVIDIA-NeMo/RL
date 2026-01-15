@@ -13,7 +13,7 @@
 # limitations under the License.
 import gc
 import traceback
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import zmq
@@ -171,18 +171,14 @@ class VllmInternalWorkerExtension:
         self,
         weights: list[tuple[str, torch.Tensor]],
         lora_config: dict[str, Any],
-        refit_base_model_weights: bool,
-        refit_lora_weights: bool,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Apply loaded weights to model or LoRA based on flags.
 
         This unifies the duplicate logic used by both IPC and collective paths.
         """
-        # Exactly one of refit_base_model_weights or refit_lora_weights must be True,
-        # as they have different weight name mapping rules
-        assert refit_base_model_weights ^ refit_lora_weights, (
-            f"Exactly one of refit_base_model_weights or refit_lora_weights must be True, "
-            f"got refit_base_model_weights={refit_base_model_weights}, refit_lora_weights={refit_lora_weights}"
+        assert refit_mode in ["base_model", "lora"], (
+            f"refit_mode must be 'base_model' or 'lora', but got {refit_mode}"
         )
 
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -194,13 +190,13 @@ class VllmInternalWorkerExtension:
             fp8.load_weights(weights, runner)
             return
 
-        if refit_base_model_weights:
+        if refit_mode == "base_model":
             if lora_config and "enabled" in lora_config and lora_config["enabled"]:
                 weights = self._apply_weight_name_mapping(weights)
             runner.model.load_weights(weights=weights)
             return
 
-        if refit_lora_weights:
+        if refit_mode == "lora":
             assert lora_config, (
                 "lora_config is not provided, can not refit lora weights"
             )
@@ -236,15 +232,14 @@ class VllmInternalWorkerExtension:
             return
 
         raise ValueError(
-            "refit_base_model_weights and refit_lora_weights cannot be both False"
+            f"refit_mode must be 'base_model' or 'lora', but got {refit_mode}"
         )
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(
         self,
         lora_config: dict[str, Any] = {},
-        refit_base_model_weights: bool = True,
-        refit_lora_weights: bool = False,
+        refit_mode: Optional[str] = "base_model",
     ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
@@ -299,8 +294,7 @@ class VllmInternalWorkerExtension:
                 self._apply_loaded_weights(
                     weights=weights,
                     lora_config=lora_config,
-                    refit_base_model_weights=refit_base_model_weights,
-                    refit_lora_weights=refit_lora_weights,
+                    refit_mode=refit_mode,
                 )
 
                 torch.cuda.current_stream().synchronize()
