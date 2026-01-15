@@ -2037,11 +2037,7 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
+            refit_policy_generation(policy, policy_generation, colocated_inference)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2361,9 +2357,7 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                            policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -2388,9 +2382,7 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                            policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
                     else:
