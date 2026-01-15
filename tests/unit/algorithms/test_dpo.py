@@ -23,10 +23,74 @@ from nemo_rl.algorithms.dpo import (
     _default_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
+    DPOTrainer,
+    DPOConfig,
+    DPOLoss,
+    create_dpo_loss_function,
 )
 from nemo_rl.algorithms.loss_functions import PreferenceLoss
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+
+
+class TestDPOTrainer:
+    """Tests for the new DPOTrainer class."""
+
+    def test_import_dpo_trainer(self):
+        """Test DPOTrainer can be imported from dpo package."""
+        from nemo_rl.algorithms.dpo import DPOTrainer
+        assert DPOTrainer is not None
+
+    def test_dpo_trainer_initialization(self):
+        """Test DPOTrainer initializes correctly."""
+        config = {
+            "dpo": {
+                "max_num_epochs": 1,
+                "max_num_steps": 100,
+                "val_period": 50,
+                "val_batches": 5,
+                "reference_policy_kl_penalty": 0.1,
+            },
+            "policy": {},
+            "data": {},
+        }
+        trainer = DPOTrainer(config)
+        assert trainer.val_period == 50
+        assert trainer.val_batches == 5
+
+    def test_dpo_trainer_extends_base_trainer(self):
+        """Test DPOTrainer extends BaseTrainer."""
+        from nemo_rl.trainers.base import BaseTrainer
+        config = {"dpo": {}, "policy": {}}
+        trainer = DPOTrainer(config)
+        assert isinstance(trainer, BaseTrainer)
+
+    def test_dpo_trainer_has_required_methods(self):
+        """Test DPOTrainer has all required methods."""
+        config = {"dpo": {}, "policy": {}}
+        trainer = DPOTrainer(config)
+        
+        assert hasattr(trainer, "_train_step")
+        assert hasattr(trainer, "_compute_loss")
+        assert hasattr(trainer, "_validate_step")
+        assert hasattr(trainer, "_prepare_batch")
+        assert callable(trainer._train_step)
+        assert callable(trainer._compute_loss)
+
+    def test_dpo_loss_factory(self):
+        """Test DPO loss function factory."""
+        config = {
+            "reference_policy_kl_penalty": 0.1,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+        }
+        loss_fn = create_dpo_loss_function(config)
+        assert loss_fn is not None
+
+    def test_dpo_loss_class(self):
+        """Test DPOLoss class is exported."""
+        from nemo_rl.algorithms.dpo import DPOLoss
+        assert DPOLoss is not None
 
 
 class MockPolicy:

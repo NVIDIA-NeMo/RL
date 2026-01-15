@@ -50,6 +50,48 @@ from nemo_rl.package_info import (
     __version__,
 )
 
+# Lazy imports for main components - avoids heavy imports on module load
+def __getattr__(name: str):
+    """Lazy import of heavy modules."""
+    # Main training API
+    if name == "train":
+        from nemo_rl.api import train
+        return train
+    elif name == "TrainResult":
+        from nemo_rl.api import TrainResult
+        return TrainResult
+
+    # Trainers
+    elif name == "BaseTrainer":
+        from nemo_rl.trainers import BaseTrainer
+        return BaseTrainer
+    elif name == "GRPOTrainer":
+        from nemo_rl.algorithms.grpo import GRPOTrainer
+        return GRPOTrainer
+    elif name == "SFTTrainer":
+        from nemo_rl.algorithms.sft import SFTTrainer
+        return SFTTrainer
+    elif name == "DPOTrainer":
+        from nemo_rl.algorithms.dpo import DPOTrainer
+        return DPOTrainer
+
+    # DataModule
+    elif name == "DataModule":
+        from nemo_rl.data import DataModule
+        return DataModule
+
+    # Configs
+    elif name in ("GRPOConfig", "SFTConfig", "DPOConfig", "PolicyConfig", "ClusterConfig"):
+        import nemo_rl.config as config_module
+        return getattr(config_module, name)
+
+    # API helpers
+    elif name in ("create_trainer", "list_algorithms", "get_algorithm"):
+        from nemo_rl import api
+        return getattr(api, name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 

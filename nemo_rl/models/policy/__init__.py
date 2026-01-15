@@ -260,3 +260,53 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+
+
+# Export Policy classes for convenient access
+# Note: These imports are deferred to avoid circular imports
+def __getattr__(name: str):
+    """Lazy import of policy classes to avoid circular imports."""
+    if name == "Policy":
+        from nemo_rl.models.policy.lm_policy import Policy
+
+        return Policy
+    elif name == "TrainingPolicy":
+        from nemo_rl.models.policy.training_policy import TrainingPolicy
+
+        return TrainingPolicy
+    elif name == "GenerationPolicy":
+        from nemo_rl.models.policy.generation_policy import GenerationPolicy
+
+        return GenerationPolicy
+    elif name == "TrainingPolicyProtocol":
+        from nemo_rl.models.policy.training_policy import TrainingPolicyProtocol
+
+        return TrainingPolicyProtocol
+    elif name == "GenerationPolicyProtocol":
+        from nemo_rl.models.policy.generation_policy import GenerationPolicyProtocol
+
+        return GenerationPolicyProtocol
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    # Config types
+    "PolicyConfig",
+    "DTensorConfig",
+    "DTensorConfigDisabled",
+    "MegatronConfig",
+    "MegatronConfigDisabled",
+    "LoRAConfig",
+    "LoRAConfigDisabled",
+    "TokenizerConfig",
+    "DynamicBatchingConfig",
+    "DynamicBatchingConfigDisabled",
+    "SequencePackingConfig",
+    "SequencePackingConfigDisabled",
+    # Policy classes
+    "Policy",
+    "TrainingPolicy",
+    "GenerationPolicy",
+    "TrainingPolicyProtocol",
+    "GenerationPolicyProtocol",
+]

@@ -11,8 +11,77 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""NeMo RL Data Module.
+
+This module provides data loading and management utilities for NeMo RL.
+
+The main components are:
+- DataModule: Unified interface for providing data to trainers
+- HuggingFaceDataModule: Integration with HuggingFace datasets
+- InMemoryDataModule: For small datasets that fit in memory
+
+Example:
+    >>> from nemo_rl.data import DataModule, create_datamodule
+    >>> 
+    >>> # Create from list
+    >>> dm = create_datamodule([{"prompt": "Hello", "response": "Hi"}])
+    >>> 
+    >>> # Or from HuggingFace dataset
+    >>> dm = create_datamodule("nvidia/OpenMathInstruct-2")
+"""
 
 from typing import Literal, NotRequired, TypedDict
+
+# Import DataModule classes
+from nemo_rl.data.module import (
+    CombinedDataModule,
+    DataModule,
+    InMemoryDataModule,
+    IterableDataModule,
+    MapDataModule,
+    create_datamodule,
+)
+
+# Lazy import for HuggingFace to avoid hard dependency
+def __getattr__(name: str):
+    if name == "HuggingFaceDataModule":
+        from nemo_rl.data.module_hf import HuggingFaceDataModule
+        return HuggingFaceDataModule
+    if name == "auto_detect_column_mapping":
+        from nemo_rl.data.module_hf import auto_detect_column_mapping
+        return auto_detect_column_mapping
+    if name == "detect_dataset_format":
+        from nemo_rl.data.module_hf import detect_dataset_format
+        return detect_dataset_format
+    if name == "KNOWN_DATASET_MAPPINGS":
+        from nemo_rl.data.module_hf import KNOWN_DATASET_MAPPINGS
+        return KNOWN_DATASET_MAPPINGS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    # DataModule classes
+    "DataModule",
+    "MapDataModule",
+    "IterableDataModule",
+    "InMemoryDataModule",
+    "CombinedDataModule",
+    "HuggingFaceDataModule",
+    "create_datamodule",
+    # Auto-detection utilities
+    "auto_detect_column_mapping",
+    "detect_dataset_format",
+    "KNOWN_DATASET_MAPPINGS",
+    # Legacy TypedDict configs (kept for backward compatibility)
+    "DataConfig",
+    "MMLUEvalDataConfig",
+    "MMLUProEvalDataConfig",
+    "AIMEEvalDataConfig",
+    "GPQAEvalDataConfig",
+    "MathEvalDataConfig",
+    "LocalMathEvalDataConfig",
+    "EvalDataConfigType",
+]
 
 
 # TODO: split this typed dict up so it can be PreferenceDataConfig | ResponseDataConfig | etc
