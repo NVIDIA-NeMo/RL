@@ -1291,9 +1291,12 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
-                spec_counters_start = aggregate_spec_decode_counters(
-                    policy_generation.get_metrics()
-                )
+                spec_metrics = {}
+                spec_counters_start = {}
+                if hasattr(policy_generation, "get_metrics"):
+                    spec_counters_start = aggregate_spec_decode_counters(
+                        policy_generation.get_metrics()
+                    )
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1437,12 +1440,13 @@ def grpo_train(
                     if not is_batch_complete:
                         continue
 
-                    spec_counters_end = aggregate_spec_decode_counters(
-                        policy_generation.get_metrics()
-                    )
-                    spec_metrics = compute_spec_decode_metrics(
-                        spec_counters_start, spec_counters_end
-                    )
+                    if hasattr(policy_generation, "get_metrics"):
+                        spec_counters_end = aggregate_spec_decode_counters(
+                            policy_generation.get_metrics()
+                        )
+                        spec_metrics = compute_spec_decode_metrics(
+                            spec_counters_start, spec_counters_end
+                        )
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
