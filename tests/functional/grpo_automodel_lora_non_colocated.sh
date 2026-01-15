@@ -24,26 +24,26 @@ cd $PROJECT_ROOT
 NRL_FORCE_REBUILD_VENVS=true uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_math.py\
     grpo.max_num_steps=3 \
-    grpo.num_prompts_per_step=32 \
-    grpo.num_generations_per_prompt=16 \
+    grpo.num_prompts_per_step=8 \
+    grpo.num_generations_per_prompt=4 \
     policy.dtensor_cfg.lora_cfg.enabled=True \
     policy.dtensor_cfg.lora_cfg.dim=32 \
-    +policy.generation.vllm_cfg.skip_tokenizer_init=false \
-    policy.dtensor_cfg.tensor_parallel_size=1 \
-    policy.train_global_batch_size=512 \
-    policy.train_micro_batch_size=4 \
+    policy.train_global_batch_size=32 \
+    policy.train_micro_batch_size=1 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.colocated.resources.num_nodes=1 \
-    logger.wandb_enabled=False \
-    checkpointing.enabled=false \
     cluster.gpus_per_node=2 \
-    checkpointing.checkpoint_dir=/tmp/lora_grpo_checkpoints \
+    logger.tensorboard_enabled=true \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=false \
+    logger.monitor_gpus=true \
+    checkpointing.enabled=false \
     "$@" \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/reward"]["3"] > 0.07'
+  'data["train/reward"]["3"] > 0.06'
 

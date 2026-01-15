@@ -1866,6 +1866,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
 
+        if refit_mode == "base_model" and self.lora_enabled:
+            assert not self.lora_base_refit_done, (
+                "Base model weights have already been refit, cannot refit again"
+            )
+            self.lora_base_refit_done = True
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
