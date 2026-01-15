@@ -148,6 +148,10 @@ Depending on your data shape, you may want to change these values."""
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
     ) -> dict:
+        assert isinstance(nemo_gym_result, dict), (
+            f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
+        )
+
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
