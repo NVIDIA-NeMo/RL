@@ -894,3 +894,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             table.add_row(row)
 
         print(table)
+
+    def check_lora_base_refit_done(self) -> bool:
+        """Check if the base model weights have been refit."""
+        dtensor_cfg = self.cfg.get("dtensor_cfg", {})
+        is_dtensor = dtensor_cfg.get("enabled", False)
+        is_v2 = is_dtensor and dtensor_cfg.get("_v2", False)
+        is_megatron = self.cfg.get("megatron_cfg", {}).get("enabled", False)
+
+        # Only DTensor v2 with LoRA supports lora GRPO workflow
+        lora_enabled = is_v2 and dtensor_cfg.get("lora_cfg", {}).get("enabled", False)
+
+        if is_megatron or (is_dtensor and not is_v2) or (not lora_enabled):
+            return False, False
+
+        # Check if the base model weights have been refit only when LoRA is enabled and DTensor v2 is used
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_lora_base_refit_done"
+        )
+        results = ray.get(futures)
+        return True, bool(results) and all(results)
