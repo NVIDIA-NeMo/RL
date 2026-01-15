@@ -38,7 +38,9 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    aggregate_spec_decode_counters,
     calculate_baseline_and_std_per_prompt,
+    compute_spec_decode_metrics,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
@@ -1289,6 +1291,9 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                spec_counters_start = aggregate_spec_decode_counters(
+                    policy_generation.get_metrics()
+                )
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1431,6 +1436,13 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+
+                    spec_counters_end = aggregate_spec_decode_counters(
+                        policy_generation.get_metrics()
+                    )
+                    spec_metrics = compute_spec_decode_metrics(
+                        spec_counters_start, spec_counters_end
+                    )
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
@@ -1649,6 +1661,7 @@ def grpo_train(
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(spec_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
