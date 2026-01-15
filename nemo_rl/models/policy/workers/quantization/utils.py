@@ -20,6 +20,7 @@ from collections import defaultdict
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.transformer.moe.router import TopKRouter
 from modelopt.torch.quantization.config import need_calibration
@@ -325,6 +326,11 @@ def quantization_layer_spec(config):
 
     We need to disable arbitrary attention mask for sequence packing.
     """
+    disable_modelopt_layer_spec = int(
+        os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")
+    )
+    if disable_modelopt_layer_spec:
+        return transformer_engine_layer_spec
     return get_gpt_modelopt_spec(
         config=config,
         local_core_attention=False,

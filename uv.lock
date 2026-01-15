@@ -4524,7 +4524,7 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.41.0rc2.dev23+gddb26ac28"
+version = "0.41.0.dev11+g6a4a19bae"
 source = { editable = "../modelopt_nemo_rl/TensorRT-Model-Optimizer" }
 dependencies = [
     { name = "ninja" },
@@ -4539,6 +4539,7 @@ dependencies = [
     { name = "scipy" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchprofile" },
     { name = "tqdm" },
 ]
 
@@ -4573,9 +4574,6 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.24.0" },
     { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "huggingface-hub", marker = "extra == 'hf'", specifier = ">=0.24.0" },
-    { name = "lief", marker = "extra == 'all'" },
-    { name = "lief", marker = "extra == 'dev'" },
-    { name = "lief", marker = "extra == 'onnx'" },
     { name = "ml-dtypes", marker = "extra == 'all'" },
     { name = "ml-dtypes", marker = "extra == 'dev'" },
     { name = "ml-dtypes", marker = "extra == 'onnx'" },
@@ -4596,12 +4594,12 @@ requires-dist = [
     { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'all') or (sys_platform == 'darwin' and extra == 'all')", specifier = "~=1.22.0" },
     { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'dev') or (sys_platform == 'darwin' and extra == 'dev')", specifier = "~=1.22.0" },
     { name = "onnxruntime", marker = "(platform_machine == 'aarch64' and extra == 'onnx') or (sys_platform == 'darwin' and extra == 'onnx')", specifier = "~=1.22.0" },
+    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'all'", specifier = "==1.20.0" },
+    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'dev'", specifier = "==1.20.0" },
+    { name = "onnxruntime-directml", marker = "sys_platform == 'win32' and extra == 'onnx'", specifier = "==1.20.0" },
     { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'all'", specifier = "~=1.22.0" },
     { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'dev'", specifier = "~=1.22.0" },
     { name = "onnxruntime-gpu", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'onnx'", specifier = "~=1.22.0" },
-    { name = "onnxruntime-gpu", marker = "sys_platform == 'win32' and extra == 'all'", specifier = "==1.23.2" },
-    { name = "onnxruntime-gpu", marker = "sys_platform == 'win32' and extra == 'dev'", specifier = "==1.23.2" },
-    { name = "onnxruntime-gpu", marker = "sys_platform == 'win32' and extra == 'onnx'", specifier = "==1.23.2" },
     { name = "onnxscript", marker = "extra == 'all'" },
     { name = "onnxscript", marker = "extra == 'dev'" },
     { name = "onnxscript", marker = "extra == 'onnx'" },
@@ -4656,8 +4654,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6" },
     { name = "torch-geometric", marker = "extra == 'dev'" },
     { name = "torch-geometric", marker = "extra == 'dev-test'" },
-    { name = "torchprofile", marker = "extra == 'dev'", specifier = ">=0.0.4" },
-    { name = "torchprofile", marker = "extra == 'dev-test'", specifier = ">=0.0.4" },
+    { name = "torchprofile", specifier = ">=0.0.4" },
     { name = "torchvision", marker = "extra == 'dev'" },
     { name = "torchvision", marker = "extra == 'dev-test'" },
     { name = "tox", marker = "extra == 'dev'", specifier = ">4.18" },
@@ -7706,6 +7703,23 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/95/d4/af694ef718aedbe95a72760ab9ff7a6a7a44ace2d7f70c27bfeb67c5c503/torchdata-0.11.0-py3-none-any.whl", hash = "sha256:52b940fbbe0e00fb21cabddf528449d1bec5bfb0d0823b7487b15f951658ee33", size = 61968, upload-time = "2025-02-20T22:26:30.666Z" },
+]
+
+[[package]]
+name = "torchprofile"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchvision", version = "0.24.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.24.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torchvision", version = "0.24.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(python_full_version >= '3.15' and sys_platform == 'linux') or (platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6f/36/574c0c46e818533b78b3c09505211162918188325ab4165ef11a3f295755/torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b", size = 4557, upload-time = "2021-06-22T04:58:03.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/15/71ad4ed163b03cba1315f1d96e0bc8e39d5a97f92974ffa610a729b273ab/torchprofile-0.0.4-py3-none-any.whl", hash = "sha256:7151fe88dc770f0eeec241244a4c7feaec2c5e8c7852386bc2d6a8d7dde7384d", size = 7694, upload-time = "2021-06-22T04:58:02.485Z" },
 ]
 
 [[package]]

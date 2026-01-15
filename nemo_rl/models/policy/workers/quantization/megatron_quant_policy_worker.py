@@ -165,6 +165,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if has_modelopt_state(model_path):
                 print("setting restore_modelopt_state to True")
                 cfg.model.restore_modelopt_state = True
+                cfg.model.transformer_layer_spec = quantization_layer_spec
 
             def _modelopt_pre_wrap_hook(model):
                 from megatron.bridge.training.post_training.checkpointing import (
@@ -217,6 +218,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def without_model_config(self):
+        """Context manager that temporarily removes the model config from modules."""
         configs = {}
         try:
             for name, module in self.model.named_modules():
@@ -231,6 +233,5 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def save_checkpoint(self, *args, **kwargs):
         """Save the checkpoint."""
-        # temp patch, a config is added to Quantizer which will break saving.
         with self.without_model_config():
             return super().save_checkpoint(*args, **kwargs)
