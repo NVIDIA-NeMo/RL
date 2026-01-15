@@ -340,6 +340,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             # autocast should cast the weights to the correct dtype during the forward pass.
             cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
             self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
+            # Track if the base model weights have been refit, used only for LoRA.
+            self.lora_base_refit_done = False
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
@@ -1828,6 +1830,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
 
+        if refit_mode == "base_model" and self.lora_enabled:
+            assert not self.lora_base_refit_done, (
+                "Base model weights have already been refit, cannot refit again"
+            )
+            self.lora_base_refit_done = True
+
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -2040,3 +2048,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
+
+    def get_lora_base_refit_done(self) -> bool:
+        """Get if the base model weights have been refit."""
+        return self.lora_base_refit_done
