@@ -381,6 +381,21 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def get_metrics(self) -> list[dict[str, float | list[float]]]:
+        """Get speculative decoding metrics from all vLLM workers.
+
+        Collects spec decode counters from DP rank 0 workers for
+        monitoring acceptance rates during training.
+
+        Returns:
+            List of metric dictionaries, one per DP group.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
