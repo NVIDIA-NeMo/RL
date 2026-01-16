@@ -1,0 +1,10 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
+cluster:
+  gpus_per_node: 4
+

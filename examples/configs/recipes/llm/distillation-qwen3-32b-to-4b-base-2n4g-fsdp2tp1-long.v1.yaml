@@ -1,0 +1,14 @@
+defaults: ./distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-long.v1.yaml
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long
+logger:
+  log_dir: logs/distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long
+  wandb:
+    name: distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long
+cluster:
+  gpus_per_node: 4
+
