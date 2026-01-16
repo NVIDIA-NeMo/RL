@@ -1,0 +1,9 @@
+defaults: ./distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.yaml
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-1.7b-base-1n4g-fsdp2tp1
+logger:
+  log_dir: logs/distillation-qwen3-32b-to-1.7b-base-1n4g-fsdp2tp1
+  wandb:
+    name: distillation-qwen3-32b-to-1.7b-base-1n4g-fsdp2tp1
+cluster:
+  gpus_per_node: 4
