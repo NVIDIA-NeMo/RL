@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterator, Optional, TypedDict, TypeVar, cast
 
 import ray
 import torch
@@ -69,10 +69,6 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.fp8 import (
-    convert_calibration_to_vllm_format,
-    get_vllm_qkv_scale_names,
-)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -86,6 +82,7 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
+from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.setup import (
     handle_model_import,
     setup_distributed,
@@ -101,6 +98,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -188,6 +186,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+
+        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
+        apply_transformer_engine_patch()
         
         self.cfg = config
 
@@ -402,6 +403,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         self.cfg["megatron_cfg"],
                         seq_dim_size,
                     )
+                    # if pad_full_seq_to is not None, we need to use it as the sequence length
+                    seq_dim_size = pad_full_seq_to or seq_dim_size
                 else:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
@@ -1165,22 +1168,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
-        buffer_size_gb = mcore_generation_config.get("buffer_size_gb", 20)
+        mcore_generation_config = cast(
+            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
+        )
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
 
-        num_cuda_graphs = mcore_generation_config.get("num_cuda_graphs", 16)
-        block_size_tokens = mcore_generation_config.get("block_size_tokens", 256)
-        use_cuda_graphs_for_non_decode_steps = mcore_generation_config.get(
-            "use_cuda_graphs_for_non_decode_steps", True
-        )
-        enable_chunked_prefill = mcore_generation_config.get(
-            "enable_chunked_prefill", True
-        )
-        unified_memory_level = mcore_generation_config.get("unified_memory_level", 0)
-        buffer_guaranteed_fraction = mcore_generation_config.get(
-            "buffer_guaranteed_fraction", 0.1
-        )
-        max_tokens = mcore_generation_config.get("max_tokens", 16384)
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        block_size_tokens = mcore_generation_config["block_size_tokens"]
+        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
+            "use_cuda_graphs_for_non_decode_steps"
+        ]
+        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
+        unified_memory_level = mcore_generation_config["unified_memory_level"]
+        buffer_guaranteed_fraction = mcore_generation_config[
+            "buffer_guaranteed_fraction"
+        ]
+        max_tokens = mcore_generation_config["max_tokens"]
 
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
@@ -1416,6 +1419,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
         """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_vllm_qkv_scale_names,
+        )
+
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
@@ -1821,6 +1828,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             { "format": "fp8", "percentile": float, "margin": float,
               "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
         """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            convert_calibration_to_vllm_format,
+        )
 
         # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
         # Defaults align with FP8 e4m3 max magnitude.
