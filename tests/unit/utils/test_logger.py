@@ -1494,7 +1494,7 @@ class TestLogger:
 
         # Check that log_metrics was called on both loggers
         mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1606,7 +1606,7 @@ class TestLogger:
             metrics, step, prefix, step_metric, False
         )
         mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1770,11 +1770,11 @@ class TestLogger:
         # Check that log_metrics was called on all loggers
         mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
         mock_swanlab_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+            metrics, step, "", None, False
         )
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
         mock_mlflow_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+            metrics, step, "", None, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
