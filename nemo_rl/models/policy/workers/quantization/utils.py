@@ -228,7 +228,7 @@ def get_forward_loop_func(
                 if isinstance(module, TopKRouter):
                     module.topk = module.num_experts
         for batch in calib_dataloader:
-            megatron_prefill(model, batch["input_ids"])
+            megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
 
         if force_all_expert_routing:
             for _, module in model.named_modules():
