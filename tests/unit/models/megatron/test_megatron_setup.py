@@ -24,7 +24,6 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -836,16 +835,16 @@ class TestHandleModelImport:
         pretrained_path = str(tmp_path / "model")
         config = {"model_name": "test-model", "megatron_cfg": {}}
 
-        handle_model_import(config, "test-model", pretrained_path, pt_checkpoint_exists=True)
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=True
+        )
 
         captured = capsys.readouterr()
         assert "Checkpoint already exists" in captured.out
 
     @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
     @patch("nemo_rl.models.megatron.setup.parallel_state")
-    def test_import_when_checkpoint_missing(
-        self, mock_ps, mock_import, tmp_path
-    ):
+    def test_import_when_checkpoint_missing(self, mock_ps, mock_import, tmp_path):
         """Test that model is imported when checkpoint doesn't exist."""
         from nemo_rl.models.megatron.setup import handle_model_import
 
@@ -858,7 +857,9 @@ class TestHandleModelImport:
             "hf_config_overrides": None,
         }
 
-        handle_model_import(config, "test-model", pretrained_path, pt_checkpoint_exists=False)
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=False
+        )
 
         mock_import.assert_called_once_with(
             "test-model",
@@ -883,7 +884,9 @@ class TestHandleModelImport:
             "hf_config_overrides": {},
         }
 
-        handle_model_import(config, "test-model", pretrained_path, pt_checkpoint_exists=False)
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=False
+        )
 
         mock_ps.destroy_model_parallel.assert_called_once()
 
@@ -975,6 +978,7 @@ class TestSetupModelAndOptimizer:
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 
+
 class TestSetupReferenceModelState:
     """Tests for setup_reference_model_state function."""
 
@@ -1041,6 +1045,7 @@ class TestSetupReferenceModelState:
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
+
 
 class TestFinalizeMegatronSetup:
     """Tests for finalize_megatron_setup function."""

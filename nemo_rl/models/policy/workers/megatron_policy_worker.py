@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypedDict, TypeVar, cast
+from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -84,22 +84,22 @@ from nemo_rl.models.megatron.common import (
 )
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.setup import (
+    finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
-    validate_model_paths,
     validate_and_set_config,
-    finalize_megatron_setup,
+    validate_model_paths,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -186,22 +186,25 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
-
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
-        
+
         self.cfg = config
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
-        
+
         # Step 1: Setup distributed
         setup_distributed()
 
         # Step 2: Validate and setup model paths
-        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(config)
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
         # Handle model import if needed
-        handle_model_import(config, hf_model_name, pretrained_path, pt_checkpoint_exists)
+        handle_model_import(
+            config, hf_model_name, pretrained_path, pt_checkpoint_exists
+        )
 
         # Store tokenizer
         self.tokenizer = tokenizer
@@ -220,22 +223,26 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.megatron_cfg = runtime_config.megatron_cfg
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
-        self.offload_optimizer_for_logprob = runtime_config.offload_optimizer_for_logprob
+        self.offload_optimizer_for_logprob = (
+            runtime_config.offload_optimizer_for_logprob
+        )
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
-        
+
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-        
+
         # Validate configuration
         self.megatron_cfg.validate()
-        
+
         # Step 4: Setup Megatron model and components
-        model_and_optimizer_state = setup_model_and_optimizer(config, self.megatron_cfg, init_optimizer)
+        model_and_optimizer_state = setup_model_and_optimizer(
+            config, self.megatron_cfg, init_optimizer
+        )
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
@@ -247,20 +254,29 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             self.megatron_cfg.param_sync_func = param_sync_func
-        
+
         # Step 5: Setup reference model if needed
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
-            self.reference_state_dict = setup_reference_model_state(config, self.megatron_cfg, pretrained_path)
+            self.reference_state_dict = setup_reference_model_state(
+                config, self.megatron_cfg, pretrained_path
+            )
             self.model = self.move_model(self.model, "cuda")
-        
+
         # Step 6: Finalize setup
         (
             self.megatron_tokenizer,
             self.megatron_bridge,
             self.should_disable_forward_pre_hook,
             self.dp_size,
-        ) = finalize_megatron_setup(config, self.megatron_cfg, hf_model_name, worker_sharding_annotations, self.model, self.optimizer)
+        ) = finalize_megatron_setup(
+            config,
+            self.megatron_cfg,
+            hf_model_name,
+            worker_sharding_annotations,
+            self.model,
+            self.optimizer,
+        )
 
         # vars used for refit
         ## will be initialized in prepare_refit_info

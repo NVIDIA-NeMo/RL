@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, NamedTuple, Optional, TypedDict, TypeVar
+from typing import Any, Callable, NamedTuple, Optional, TypedDict
 
 import torch
 from megatron.bridge.training.config import ConfigContainer
@@ -20,6 +20,7 @@ from megatron.bridge.training.state import GlobalState
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import MegatronModule
+
 
 class MegatronGenerationConfig(TypedDict):
     # Total GPU memory (in GB) allocated for KV cache buffers
@@ -41,6 +42,7 @@ class MegatronGenerationConfig(TypedDict):
     # low, then will only do 512 tokens at a time, which can be slow.
     max_tokens: int
 
+
 ## returned from validate_and_set_config
 class RuntimeConfig(NamedTuple):
     """Runtime configuration for model training and inference.
@@ -56,6 +58,7 @@ class RuntimeConfig(NamedTuple):
     offload_optimizer_for_logprob: bool
     is_generation_colocated: Optional[bool]
     final_padded_vocab_size: int
+
 
 ## returned from setup_model_and_optimizer
 class ModelAndOptimizerState(NamedTuple):
