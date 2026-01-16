@@ -649,7 +649,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         bins.extend(ffd_bins)
 
         # Convert to list of index lists (discard sizes)
-        return [[idx for idx, _ in b] for b in bins]
+        return [[idx for idx, _ in b] for b in bins if b]
 
 
 def get_packer(
