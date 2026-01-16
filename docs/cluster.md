@@ -28,6 +28,9 @@ sbatch \
 > [!TIP]
 > Depending on your Slurm cluster configuration, you may or may not need to include the `--gres=gpu:8` option in the `sbatch` command.
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead of `--gres=gpu:8`.
+
 Upon successful submission, Slurm will print the `SLURM_JOB_ID`:
 ```text
 Submitted batch job 1980204
@@ -58,6 +61,10 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 Upon successful submission, Slurm will print the `SLURM_JOB_ID`:
 ```text
 Submitted batch job 1980204
