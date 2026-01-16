@@ -3866,6 +3866,7 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d" },
+    { name = "flash-attn" },
     { name = "mamba-ssm" },
     { name = "nemo-automodel" },
     { name = "nv-grouped-gemm" },
@@ -3874,10 +3875,12 @@ automodel = [
 ]
 fsdp = [
     { name = "causal-conv1d" },
+    { name = "flash-attn" },
     { name = "mamba-ssm" },
     { name = "vllm" },
 ]
 mcore = [
+    { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "transformer-engine", extra = ["core-cu13", "pytorch"] },
@@ -3941,6 +3944,9 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
+    { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },
+    { name = "flash-attn", marker = "extra == 'fsdp'", specifier = "==2.8.1" },
+    { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
