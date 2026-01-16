@@ -1493,7 +1493,7 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on both loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
         mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1603,7 +1603,7 @@ class TestLogger:
 
         # Check that log_metrics was called on both loggers with correct parameters
         mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
         mock_tb_instance.log_metrics.assert_called_once_with(
             metrics, step, prefix, step_metric
@@ -1768,7 +1768,7 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on all loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
         mock_swanlab_instance.log_metrics.assert_called_once_with(
             metrics, step, "", None
         )
