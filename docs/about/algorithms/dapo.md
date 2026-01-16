@@ -64,6 +64,9 @@ sbatch \
     ray.sub
 ```
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 ## Configuration
 
 DAPO uses the same configuration structure as GRPO. The key parameters are:

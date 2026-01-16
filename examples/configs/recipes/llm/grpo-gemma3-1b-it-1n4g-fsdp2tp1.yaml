@@ -1,0 +1,10 @@
+defaults: ./grpo-gemma3-1b-it-1n8g-fsdp2tp1.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-gemma3-1b-it-1n4g-fsdp2tp1
+logger:
+  log_dir: logs/grpo-gemma3-1b-it-1n4g-fsdp2tp1
+  wandb:
+    name: grpo-gemma3-1b-it-1n4g-fsdp2tp1
+cluster:
+  gpus_per_node: 4
+

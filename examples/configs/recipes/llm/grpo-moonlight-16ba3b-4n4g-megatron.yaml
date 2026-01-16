@@ -1,0 +1,15 @@
+defaults: ./grpo-moonlight-16ba3b-4n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-moonlight-16ba3b-4n4g-megatron
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: 14
+    num_layers_in_last_pipeline_stage: 13
+logger:
+  wandb:
+    name: grpo-moonlight-16ba3b-4n4g-megatron
+cluster:
+  gpus_per_node: 4
+
