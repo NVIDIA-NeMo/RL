@@ -179,9 +179,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.cfg = config
         self.tokenizer = tokenizer
         self.processor = processor
-        is_vlm = processor is not None
+        self.is_vlm = processor is not None
+        self.lora_enabled = (
+            config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+        )
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={is_vlm}")
+        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
@@ -189,7 +192,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
             config=config,
-            processor=processor,
+            processor=self.processor,
             rank=0,  # Temporary, will be updated after distributed init
         )
 
@@ -217,9 +220,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "dequantize_base_checkpoint": config.get(
                     "dequantize_base_checkpoint", False
                 ),
-                "is_peft": config["dtensor_cfg"]
-                .get("lora_cfg", {})
-                .get("enabled", False),
+                "is_peft": self.lora_enabled,
             },
         )
 
@@ -230,7 +231,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             runtime_config=runtime_config,
             distributed_manager=distributed_manager,
             checkpoint_manager=self.checkpoint_manager,
-            is_vlm=is_vlm,
+            is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
@@ -255,10 +256,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
-
-        # Additional derived attributes
-        self.lora_enabled = self.peft_config is not None
-        self.is_vlm = is_vlm
 
         # Set instance attributes from runtime config (tuple unpacking)
         (

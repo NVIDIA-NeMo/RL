@@ -79,7 +79,8 @@ def validate_and_prepare_config(
     if not is_generation_colocated:
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
-    # Configure dynamo cache
+    # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+    # with different order of node_bundles
     configure_dynamo_cache()
 
     # Parse precision
@@ -108,7 +109,9 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
-    # Determine attention implementation
+    # NeMoAutoModelForCausalLM uses flash_attention_2 by default
+    # so we need to set it to None if sequence packing is disabled
+    # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
