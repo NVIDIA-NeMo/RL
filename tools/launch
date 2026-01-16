@@ -32,8 +32,8 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/..)
 # Function to extract config from a script
 extract_config() {
     local script_path="$1"
-    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" | 
-                   grep -v "^#" | 
+    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" |
+                   grep -v "^#" |
                    grep "=" )
     if [[ -z "$config" ]]; then
         echo "[ERROR]: No config section found in script_path=$script_path"
@@ -41,6 +41,7 @@ extract_config() {
         echo
         echo "# ===== BEGIN CONFIG ====="
         echo "NUM_NODES=1        # How many nodes this job uses"
+        echo "GPUS_PER_NODE=8    # GPUs per node (8 for H100, 4 for GB200)"
         echo "STEPS_PER_RUN=60   # Approximately how many steps reached in one job"
         echo "MAX_STEPS=60       # Max training steps"
         echo 'NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up'
@@ -90,6 +91,7 @@ MOUNTS=${MOUNTS:-}
 # DRYRUN=2 additionally creates the snapshots (helpful to run a hermetic example manually or share a repro)
 DRYRUN=${DRYRUN:-}
 IS_RELEASE=${IS_RELEASE:-}  # Adds extra configuration for wandb to track this in the right project
+EXCLUDE_GRES=${EXCLUDE_GRES:-} # If set, will not include --gres=gpu:$GPUS_PER_NODE in the sbatch invocation
 NOW=$(date '+%y%m%d-%H%M%S')
 
 if [[ -n "$MOUNTS" ]]; then
@@ -117,8 +119,11 @@ for SCRIPT in $SCRIPTS; do
     fi
     eval "$config"
 
+    # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
+    export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
     # NUM_RUNS * NUM_NODES * NUM_GPUS * (NUM_MINUTES / 60)
-    gpu_hours=$((NUM_RUNS * NUM_NODES * 8 * NUM_MINUTES / 60))
+    gpu_hours=$((NUM_RUNS * NUM_NODES * GPUS_PER_NODE * NUM_MINUTES / 60))
     total_gpu_hours=$((total_gpu_hours + gpu_hours))
     echo "[INFO]: $gpu_hours GPUhrs to run $SCRIPT"
     if [[ "${DRYRUN}" -eq 1 ]]; then
@@ -127,7 +132,7 @@ for SCRIPT in $SCRIPTS; do
     fi
 
     rel_script=$(check_file_in_version_control_and_get_relpath_from_git_root $SCRIPT)
-    
+
     EXP_NAME=$(basename $SCRIPT .sh)
     SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
 
@@ -143,8 +148,14 @@ for SCRIPT in $SCRIPTS; do
                 logger.wandb.name=$(basename $SCRIPT .sh)-$(git rev-parse --short HEAD)
             )
         fi
-    
+
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
+
+        GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
+        if [[ -n "${EXCLUDE_GRES}" ]]; then
+            GRES_ARG=""
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -161,8 +172,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 \\
-    --gres=gpu:8 \\
+    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF

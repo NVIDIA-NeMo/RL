@@ -21,6 +21,9 @@ from typing import Any
 import pytest
 from omegaconf import OmegaConf
 
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
 
 def _load_cli_module() -> Any:
     # Use a path relative to this test file to import tools/config_cli.py
@@ -101,9 +104,10 @@ def test__ensure_defaults_relative_variants(cli: Any, tmp_path: Path) -> None:
     assert cfg3["defaults"][0] == rel
 
 
-def test_minimize_in_place_and_check(
+def test_minimize_in_place_and_check_with_explicit_base(
     cli: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Test minimize with explicit --base option (rebase mode)."""
     base = tmp_path / "base.yaml"
     child = tmp_path / "child.yaml"
     base.write_text(
@@ -132,14 +136,14 @@ def test_minimize_in_place_and_check(
         ).strip()
     )
 
-    # Before minimizing, check should fail
+    # Before minimizing with explicit base, check should fail
     ns = type("NS", (), {"base": str(base), "config": str(child)})
     ret = cli.minimize_check(ns)
     assert ret == 1
     err = capsys.readouterr().err
     assert "Suggested fix" in err
 
-    # Minimize in place
+    # Minimize in place with explicit base
     ns2 = type("NS", (), {"base": str(base), "config": str(child), "in_place": True})
     ret2 = cli.minimize(ns2)
     assert ret2 == 0
@@ -278,3 +282,271 @@ def test_vendored_loader_drift_against_upstream_source() -> None:
     up_src = inspect.getsource(upstream_fn).strip()
     ven_src = inspect.getsource(vendored_fn).strip()
     assert up_src == ven_src
+
+
+def test_infer_base_from_defaults(cli: Any, tmp_path: Path) -> None:
+    """Test that _infer_base_from_defaults correctly resolves the base path."""
+    parent = tmp_path / "parent.yaml"
+    child = tmp_path / "recipes" / "child.yaml"
+    child.parent.mkdir(parents=True, exist_ok=True)
+    parent.write_text("key: value\n")
+    child.write_text("defaults: ../parent.yaml\noverride: 1\n")
+
+    child_cfg = OmegaConf.load(child)
+    base_path = cli._infer_base_from_defaults(child.resolve(), child_cfg)
+    assert base_path == parent.resolve()
+
+
+def test_infer_base_from_defaults_missing_defaults(cli: Any, tmp_path: Path) -> None:
+    """Test that missing defaults raises an error."""
+    child = tmp_path / "child.yaml"
+    child.write_text("key: value\n")
+
+    child_cfg = OmegaConf.load(child)
+    with pytest.raises(ValueError, match="no 'defaults' key"):
+        cli._infer_base_from_defaults(child.resolve(), child_cfg)
+
+
+def test_infer_base_from_defaults_list_defaults(cli: Any, tmp_path: Path) -> None:
+    """Test that list defaults raises an error (we enforce single inheritance)."""
+    child = tmp_path / "child.yaml"
+    child.write_text("defaults:\n  - parent1.yaml\n  - parent2.yaml\nkey: value\n")
+
+    child_cfg = OmegaConf.load(child)
+    with pytest.raises(ValueError, match="list"):
+        cli._infer_base_from_defaults(child.resolve(), child_cfg)
+
+
+def test_minimize_inferred_base_preserves_chain_overrides(
+    cli: Any, tmp_path: Path
+) -> None:
+    """Test minimize with inferred base correctly handles grandchild → parent → grandparent.
+
+    Scenario:
+      - grandparent.yaml: sets teacher.tp = 1
+      - parent.yaml (defaults: grandparent): sets teacher.tp = 4
+      - child.yaml (defaults: parent): sets teacher.tp = 2 (override back)
+
+    When minimizing child.yaml (with base inferred from defaults=parent.yaml),
+    the teacher.tp = 2 must be kept because it differs from the expanded parent (which has 4).
+    """
+    grandparent = tmp_path / "grandparent.yaml"
+    parent = tmp_path / "parent.yaml"
+    child = tmp_path / "child.yaml"
+
+    grandparent.write_text(
+        dedent(
+            """
+            teacher:
+              tp: 1
+              other: base_value
+            policy:
+              lr: 0.001
+            """
+        ).strip()
+    )
+    parent.write_text(
+        dedent(
+            """
+            defaults: grandparent.yaml
+            teacher:
+              tp: 4
+            """
+        ).strip()
+    )
+    child.write_text(
+        dedent(
+            """
+            defaults: parent.yaml
+            teacher:
+              tp: 2
+            custom: child_only
+            """
+        ).strip()
+    )
+
+    # Minimize child with inferred base (should use parent.yaml)
+    ns = type("NS", (), {"config": str(child), "base": None, "in_place": False})
+    ret = cli.minimize(ns)
+    assert ret == 0
+
+    # Re-read child to check what minimize would output
+    # (since in_place=False, we need to capture stdout)
+    import io
+    import sys
+
+    old_stdout = sys.stdout
+    sys.stdout = captured = io.StringIO()
+    cli.minimize(ns)
+    sys.stdout = old_stdout
+    minimized = captured.getvalue()
+
+    # teacher.tp = 2 must be kept (differs from parent's expanded value of 4)
+    assert "tp: 2" in minimized
+    # custom key must be kept
+    assert "custom: child_only" in minimized
+    # defaults must be preserved as-is
+    assert "defaults: parent.yaml" in minimized
+
+
+def test_minimize_inferred_base_removes_redundant_keys(
+    cli: Any, tmp_path: Path
+) -> None:
+    """Test that keys matching the expanded parent are correctly removed."""
+    grandparent = tmp_path / "grandparent.yaml"
+    parent = tmp_path / "parent.yaml"
+    child = tmp_path / "child.yaml"
+
+    grandparent.write_text(
+        dedent(
+            """
+            common:
+              a: 1
+              b: 2
+            """
+        ).strip()
+    )
+    parent.write_text(
+        dedent(
+            """
+            defaults: grandparent.yaml
+            common:
+              b: 3
+            extra: from_parent
+            """
+        ).strip()
+    )
+    # Child redundantly sets common.b = 3 (same as parent) - should be removed
+    # Child sets common.a = 1 (same as grandparent, but parent doesn't override) - should be removed
+    # Child sets extra = from_parent (same as parent) - should be removed
+    # Child sets unique = child_only - should be kept
+    child.write_text(
+        dedent(
+            """
+            defaults: parent.yaml
+            common:
+              a: 1
+              b: 3
+            extra: from_parent
+            unique: child_only
+            """
+        ).strip()
+    )
+
+    import io
+    import sys
+
+    ns = type("NS", (), {"config": str(child), "base": None, "in_place": False})
+    old_stdout = sys.stdout
+    sys.stdout = captured = io.StringIO()
+    cli.minimize(ns)
+    sys.stdout = old_stdout
+    minimized = captured.getvalue()
+
+    # Redundant keys should be removed
+    assert "a: 1" not in minimized
+    assert "b: 3" not in minimized
+    assert "extra: from_parent" not in minimized
+    # Unique key should be kept
+    assert "unique: child_only" in minimized
+    # defaults preserved
+    assert "defaults: parent.yaml" in minimized
+
+
+def test_minimize_check_inferred_base(cli: Any, tmp_path: Path) -> None:
+    """Test minimize-check with inferred base."""
+    parent = tmp_path / "parent.yaml"
+    child = tmp_path / "child.yaml"
+
+    parent.write_text(
+        dedent(
+            """
+            common:
+              a: 1
+              b: 2
+            """
+        ).strip()
+    )
+    # Child is already minimal
+    child.write_text(
+        dedent(
+            """
+            defaults: parent.yaml
+            common:
+              b: 3
+            """
+        ).strip()
+    )
+
+    ns = type("NS", (), {"config": str(child), "base": None})
+    ret = cli.minimize_check(ns)
+    assert ret == 0  # Already minimized
+
+    # Now add a redundant key
+    child.write_text(
+        dedent(
+            """
+            defaults: parent.yaml
+            common:
+              a: 1
+              b: 3
+            """
+        ).strip()
+    )
+
+    ret2 = cli.minimize_check(ns)
+    assert ret2 == 1  # Needs minimizing
+
+
+def test_minimize_with_explicit_base_rebases(cli: Any, tmp_path: Path) -> None:
+    """Test that --base option rebases the config to a different parent."""
+    grandparent = tmp_path / "grandparent.yaml"
+    parent = tmp_path / "parent.yaml"
+    child = tmp_path / "child.yaml"
+
+    grandparent.write_text(
+        dedent(
+            """
+            teacher:
+              tp: 1
+            policy:
+              lr: 0.001
+            """
+        ).strip()
+    )
+    parent.write_text(
+        dedent(
+            """
+            defaults: grandparent.yaml
+            teacher:
+              tp: 4
+            """
+        ).strip()
+    )
+    child.write_text(
+        dedent(
+            """
+            defaults: parent.yaml
+            teacher:
+              tp: 2
+            """
+        ).strip()
+    )
+
+    import io
+    import sys
+
+    # Minimize with explicit base=grandparent (rebase mode)
+    ns = type(
+        "NS", (), {"config": str(child), "base": str(grandparent), "in_place": False}
+    )
+    old_stdout = sys.stdout
+    sys.stdout = captured = io.StringIO()
+    cli.minimize(ns)
+    sys.stdout = old_stdout
+    minimized = captured.getvalue()
+
+    # defaults should now point to grandparent
+    assert "grandparent.yaml" in minimized
+    # teacher.tp = 2 differs from grandparent's 1, so kept
+    assert "tp: 2" in minimized
