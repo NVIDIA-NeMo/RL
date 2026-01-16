@@ -188,7 +188,8 @@ def validate_and_set_config(
     if "generation" in config and config["generation"] is not None:
         is_generation_colocated = config["generation"]["colocated"]["enabled"]
 
-    # Set NCCL environment for non-colocated generation
+    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
     if not is_generation_colocated:
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
@@ -204,7 +205,7 @@ def validate_and_set_config(
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
     
-    # Validate reward model compatibility
+    # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
         raise NotImplementedError(
             "Reward models are not yet supported with the Megatron backend, this issue is "
@@ -238,6 +239,8 @@ def validate_and_set_config(
 
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths."""
+
+    # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
     
     # Check if the checkpoint already exists
@@ -278,6 +281,7 @@ def setup_model_config(
             pretrained_run_config, mode=InstantiationMode.STRICT
         )
     except Exception as e:
+        # Add helpful context as a note to the exception
         e.add_note(
             f"\n{'=' * 80}\n"
             f"NOTE: A common cause of this error is when the HF->mcore converted checkpoint is\n"
@@ -354,11 +358,20 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.expert_model_parallel_size = config["megatron_cfg"]["expert_model_parallel_size"]
     
     # MoE stability settings
+
+    # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
+    # especially when using many experts.
     model_cfg.moe_router_dtype = config["megatron_cfg"]["moe_router_dtype"]
+
+    # The below two configs (and "freeze_moe_router") are used to stabilize moe training
+    # by preventing updates to the moe router. We found that this is helpful in reducing
+    # logprob error during training.
+
     # Set this to "none" to disable load balancing loss.
     model_cfg.moe_router_load_balancing_type = config["megatron_cfg"]["moe_router_load_balancing_type"]
     # Set this to 0.0 to disable updates to the moe router expert bias
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"]["moe_router_bias_update_rate"]
+
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 
@@ -550,6 +563,8 @@ def _create_megatron_config(
             grad_reduce_in_fp32=config["megatron_cfg"]["distributed_data_parallel_config"]["grad_reduce_in_fp32"],
             overlap_grad_reduce=config["megatron_cfg"]["distributed_data_parallel_config"]["overlap_grad_reduce"],
             overlap_param_gather=config["megatron_cfg"]["distributed_data_parallel_config"]["overlap_param_gather"],
+            # we need to set average_in_collective=False with calculate_per_token_loss=T
+            # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
             use_distributed_optimizer=config["megatron_cfg"]["optimizer"]["use_distributed_optimizer"],
             data_parallel_sharding_strategy=config["megatron_cfg"]["distributed_data_parallel_config"]["data_parallel_sharding_strategy"],
@@ -636,7 +651,7 @@ def setup_model_and_optimizer(
                     if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
-        mixed_precision_wrapper = CustomFloat16Module
+        mixed_precision_wrapper = MoEFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
 
     # Model, optimizer, and learning rate.
@@ -763,7 +778,7 @@ def setup_reference_model_state(
     # Configure mixed precision wrapper for reference model
     ref_mixed_precision_wrapper = Float16Module
     if config["megatron_cfg"].get("freeze_moe_router", False):
-        ref_mixed_precision_wrapper = CustomFloat16Module
+        ref_mixed_precision_wrapper = MoEFloat16Module
 
     reference_model = get_model(
         megatron_cfg.model,
@@ -856,8 +871,8 @@ def finalize_megatron_setup(
     return megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size
 
 
-class CustomFloat16Module(Float16Module):
-    """Float 16 Module.
+class MoEFloat16Module(Float16Module):
+    """Float 16 Module with the ability to keep the expert bias in float32.
 
     Attributes:
         config (TransformerConfig): Transformer config
@@ -869,7 +884,7 @@ class CustomFloat16Module(Float16Module):
     """
 
     def __init__(self, config: TransformerConfig, module: torch.nn.Module):
-        super(CustomFloat16Module, self).__init__(config, module)
+        super(MoEFloat16Module, self).__init__(config, module)
         self.re_enable_float32_expert_bias()
 
     def re_enable_float32_expert_bias(self) -> None:
