@@ -60,7 +60,7 @@ fsdp = [
   "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
 ]
 automodel = [
-  "nemo-automodel",
+  # "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -99,7 +99,7 @@ mcore = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  # "flash-attn==2.8.1",
+  "flash-attn",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
   "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
 ]
@@ -172,11 +172,12 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
+flash-attn = { git = "https://github.com/Dao-AILab/flash-attention", rev = "1e556445878e3724ccfe9384df061a1fce3ff1a4" }
 
 [tool.uv.workspace]
 members = [
   "3rdparty/Megatron-LM-workspace",
-  "3rdparty/Automodel-workspace/Automodel",
+  # "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
   "3rdparty/Gym-workspace",
   # Research projects are also added here in order for them to share the global root level uv.lock.
@@ -252,6 +253,8 @@ nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
+# This version has to match the version in the commit/rev/tag used
+version = "2.8.1"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[tool.uv.dependency-metadata]]
