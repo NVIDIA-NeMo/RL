@@ -908,7 +908,9 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     env_config = master_config.get("env") or dict()
-    should_log_nemo_gym_responses = bool(env_config.get("should_log_nemo_gym_responses"))
+    should_log_nemo_gym_responses = bool(
+        env_config.get("should_log_nemo_gym_responses")
+    )
 
     return should_log_nemo_gym_responses
 
@@ -987,6 +989,30 @@ def refit_policy_generation(
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
+
+
+def _log_mixed_rewards_and_advantages_information(
+    logger: Logger,
+    total_steps: int,
+    metrics: dict[str, Any],
+    baseline: torch.Tensor,
+    advantages: torch.Tensor,
+) -> None:
+    # The histograms that are logged are logged with a prefix "train/" to the name, since that is what the remaining metrics will be logged with.
+    logger.log_histogram(
+        baseline.numpy(), total_steps + 1, "train/baseline_reward/histogram"
+    )
+    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
+    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
+    metrics["baseline_reward/pct_mixed"] = (
+        100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
+    )
+
+    logger.log_histogram(
+        advantages.numpy(), total_steps + 1, "train/advantages/histogram"
+    )
+    metrics["advantages/sum"] = advantages.float().sum().item()
+    metrics["advantages/mean"] = advantages.float().mean().item()
 
 
 # ===============================================================================
@@ -1344,6 +1370,14 @@ def grpo_train(
                             advantages=advantages,
                             std=std,
                         )
+
+                    _log_mixed_rewards_and_advantages_information(
+                        logger=logger,
+                        total_steps=total_steps,
+                        metrics=metrics,
+                        baseline=baseline,
+                        advantages=advantages,
+                    )
 
                     del input_ids
                     del baseline
