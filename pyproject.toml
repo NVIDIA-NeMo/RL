@@ -46,7 +46,7 @@ dependencies = [
   "torchvision>=0.22.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.5.0,<3.6.0",
-  "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
+  "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
 ]
@@ -57,7 +57,7 @@ fsdp = [
   "mamba-ssm",
   "causal-conv1d",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm==0.11.2",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
 ]
 automodel = [
   "nemo-automodel",
@@ -68,10 +68,10 @@ automodel = [
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
-  "transformer-engine[pytorch]==2.8.0",
+  "transformer-engine[pytorch,core_cu13]==2.9.0",
   # "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm==0.11.2",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
 ]
 vllm = [
   "cuda-python",
@@ -80,7 +80,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   # "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.11.2",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
   "num2words>=0.5.14",
 ]
 mcore = [
@@ -93,7 +93,7 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch]==2.8.0",
+  "transformer-engine[pytorch,core_cu13]==2.9.0",
   "megatron-core",
   "megatron-bridge",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -101,7 +101,7 @@ mcore = [
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm==0.11.2",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl",
 ]
 nemo_gym = ["nemo_gym"]
 
@@ -223,7 +223,8 @@ link-mode = "copy"
 # The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
 # The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
-  "transformer-engine[pytorch]==2.8.0",
+  "transformer-engine[pytorch,core_cu13]==2.9.0",
+  "transformer-engine-cu12; sys_platform == 'never'",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
