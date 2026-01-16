@@ -1,0 +1,10 @@
+defaults: ./grpo-deepscaler-1.5b-8K.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-deepscaler-1.5b-1n4g-8K
+logger:
+  log_dir: logs/grpo-deepscaler-1.5b-1n4g-8K
+  wandb:
+    name: grpo-deepscaler-1.5b-1n4g-8K
+cluster:
+  gpus_per_node: 4
+
