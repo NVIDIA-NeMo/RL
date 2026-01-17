@@ -1014,10 +1014,17 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
-from torchdata.stateful_dataloader.stateful_dataloader import _StatefulBaseDataLoaderIter
-class DynamicSamplingStatefulDataLoader(StatefulDataLoader):
+from torchdata.stateful_dataloader.stateful_dataloader import (
+    _StatefulBaseDataLoaderIter, _StatefulSingleProcessDataLoaderIter
+)
+
+
+class NeMoGymDynamicSamplingStatefulDataLoader(StatefulDataLoader):
     def _get_iterator(self) -> "_StatefulBaseDataLoaderIter":
+        # Normally this function will fork on single proc or multi proc.
+        # For now we only support single proc
         assert self.num_workers == 0
+
         it: _StatefulBaseDataLoaderIter
         it = _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
         self.next_iter_state = None
