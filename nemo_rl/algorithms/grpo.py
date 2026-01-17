@@ -1420,9 +1420,9 @@ def grpo_train(
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
-                    )
+                    # This is also used to populate part of the downstream logprob calculation data
+                    extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
+                    train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -1438,6 +1438,7 @@ def grpo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            **extra_multimodal_data,
                         }
                     )
                     train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)[
@@ -1454,6 +1455,7 @@ def grpo_train(
                         )
 
                     del logprob_data
+                    del extra_multimodal_data
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
