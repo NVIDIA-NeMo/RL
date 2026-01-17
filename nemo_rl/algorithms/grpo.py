@@ -1584,7 +1584,8 @@ def grpo_train(
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
-                    else:
+                    elif not isinstance(v, (float, int)):
+                        # We can assume floats and ints don't need aggregations
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
                 metrics["vllm_logger_metrics"] = vllm_logger_metrics
