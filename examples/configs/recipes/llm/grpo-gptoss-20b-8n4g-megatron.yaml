@@ -1,0 +1,11 @@
+defaults: ./grpo-gptoss-20b-8n8g-megatron.yaml
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 4
+    tensor_model_parallel_size: 2
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+cluster:
+  gpus_per_node: 4
+
