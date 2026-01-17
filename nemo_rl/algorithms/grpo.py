@@ -1120,7 +1120,7 @@ def grpo_train(
             metrics_logging_data = dict()
             metrics = dict()
 
-            # TODO @bxyu-nvidia: figure out how to populate the original `len(dataloader)`. Maybe just guesstimate using len(dataloader) // grpo batch size?
+            # TODO @bxyu-nvidia: figure out how to populate the original `len(dataloader)`. Maybe just guesstimate using len(dataloader) // grpo batch size with some drop_last logic?
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
