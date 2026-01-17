@@ -10,8 +10,8 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
-	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = yifu/bump-torch-and-hf
+	url = https://github.com/guyueh1/Automodel.git
+	branch = cuda13
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
