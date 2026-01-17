@@ -280,6 +280,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    def prepare_http_server_for_training(self) -> bool:
+        self.do_on_policy_fixes = self.cfg["vllm_cfg"].get(
+            "http_server_performs_on_policy_fixes_during_training", True
+        )
+        return self.do_on_policy_fixes
+
+    def prepare_http_server_for_validation(self) -> bool:
+        self.do_on_policy_fixes = self.cfg["vllm_cfg"].get(
+            "http_server_performs_on_policy_fixes_during_validation", False
+        )
+        return self.do_on_policy_fixes
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
@@ -306,6 +318,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
         from vllm.entrypoints.openai.tool_parsers import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+
+        # Ref to dedupe from `self` down below
+        vllm_async_generation_worker_ref = self
+        self.prepare_http_server_for_training()  # Reset and default to training setup
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
@@ -384,7 +400,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     add_special_tokens,
                 )
 
-                if request.required_prefix_token_ids is None:
+                if (
+                    not vllm_async_generation_worker_ref.do_on_policy_fixes
+                    or request.required_prefix_token_ids is None
+                ):
                     return res
 
                 # Find the last assistant message

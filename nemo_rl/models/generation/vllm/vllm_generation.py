@@ -688,6 +688,24 @@ class VllmGeneration(GenerationInterface):
         ):
             yield result
 
+    def prepare_http_server_for_training(self) -> bool:
+        """Returns whether or not to do on-policy fixes."""
+        return self._prepare_http_server_for_helper("prepare_http_server_for_training")
+
+    def prepare_http_server_for_validation(self) -> bool:
+        return self._prepare_http_server_for_helper(
+            "prepare_http_server_for_validation"
+        )
+
+    def _prepare_http_server_for_helper(self, method_name: str) -> bool:
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results[0]
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
         # non-colocated no need to wake up

@@ -39,6 +39,11 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Whether or not to do the on-policy fixes when using the HTTP server. See nemo_rl/models/generation/vllm/vllm_worker_async.py::_replace_prefix_tokens
+    # By default, this is opt-out during training since the default behavior is to ensure that RL training is on-policy.
+    http_server_performs_on_policy_fixes_during_training: NotRequired[bool]
+    # This defaults to False during validation so that we perform validation in the same setting as outside of NeMo RL.
+    http_server_performs_on_policy_fixes_during_validation: NotRequired[bool]
 
 
 class VllmConfig(GenerationConfig):
