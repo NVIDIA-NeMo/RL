@@ -1014,6 +1014,16 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
+from torchdata.stateful_dataloader.stateful_dataloader import _StatefulBaseDataLoaderIter
+class DynamicSamplingStatefulDataLoader(StatefulDataLoader):
+    def _get_iterator(self) -> "_StatefulBaseDataLoaderIter":
+        assert self.num_workers == 0
+        it: _StatefulBaseDataLoaderIter
+        it = _StatefulSingleProcessDataLoaderIter(self, self.next_iter_state)
+        self.next_iter_state = None
+        return it
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
