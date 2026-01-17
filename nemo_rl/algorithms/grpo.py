@@ -1434,6 +1434,7 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
+                    # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": train_data["input_ids"],
