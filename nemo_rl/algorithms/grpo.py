@@ -1120,6 +1120,7 @@ def grpo_train(
             metrics_logging_data = dict()
             metrics = dict()
 
+            # TODO @bxyu-nvidia: figure out how to populate `len(dataloader)`
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
