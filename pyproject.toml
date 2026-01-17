@@ -100,6 +100,7 @@ mcore = [
   "flash-attn==2.8.1",
 ]
 nemo_gym = ["nemo_gym"]
+modelopt = ["nvidia-modelopt"]
 
 [dependency-groups]
 
@@ -167,6 +168,8 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.4" }
 mamba-ssm = { git = "https://github.com/yfw/mamba", branch = "stride_fix_revert" }
+nvidia-modelopt = { path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/modelopt-nano3", editable = true }
+
 
 [tool.uv.workspace]
 members = [
@@ -224,7 +227,7 @@ constraint-dependencies = [
   "brotli>=1.2.0",     # Address CVE GHSA-2qfp-q593-8484
   "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
   "urllib3>=2.6.3",    # Address CVE GHSA-38jv-5279-wg99
-  "aiohttp>=3.13.3",    # Address CVE GHSA-mqqc-3gqh-h2x8
+  "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
 ]
 
 # Augment build dependencies for packages that need torch at build time

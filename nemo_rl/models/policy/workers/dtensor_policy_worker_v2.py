@@ -93,10 +93,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
-class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
+class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -1883,3 +1880,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+    pass

@@ -129,6 +129,7 @@ class MegatronConfig(TypedDict):
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    gradient_accumulation_fusion: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
@@ -203,3 +204,15 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+
+    # quantization configs
+    quant_cfg: NotRequired[str | None]
+    quant_dataset_name: NotRequired[str | None]
+    quant_calib_size: NotRequired[int | None]
+    quant_batch_size: NotRequired[int | None]
+
+
+class QuantPolicyConfig(PolicyConfig):
+    quant_cfg: NotRequired[str | None]
+    dataset_name: NotRequired[str | None]
+    calib_size: NotRequired[int | None]

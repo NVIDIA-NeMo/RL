@@ -125,6 +125,15 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    def _load_weights(self, weights):
+        from nemo_rl.models.generation import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            # the fp8 load_weights additionally casts bf16 weights into fp8
+            fp8.load_weights(weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=weights)
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -177,13 +186,7 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
                 # Load weights into the model
-                from nemo_rl.models.generation import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
+                self._load_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -220,25 +223,7 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        def _load_model_weights(weights, model_runner):
-            """Load model weights.
-
-            Args:
-                weights: List[(name, tensor)]
-                model_runner: vLLM ModelRunner
-
-            Returns:
-                None
-            """
-            from nemo_rl.models.generation import fp8
-
-            if fp8.is_fp8_model(model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, model_runner)
-            else:
-                model_runner.model.load_weights(weights=weights)
-
-        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+        load_model_weight_func = self._load_weights
 
         try:
             packed_broadcast_consumer(
