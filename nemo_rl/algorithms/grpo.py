@@ -1421,7 +1421,9 @@ def grpo_train(
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
-                    extra_multimodal_data = flat_messages.get_multimodal_dict(as_tensors=False)
+                    extra_multimodal_data = flat_messages.get_multimodal_dict(
+                        as_tensors=False
+                    )
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
 
