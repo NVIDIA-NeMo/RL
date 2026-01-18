@@ -1230,6 +1230,10 @@ def grpo_train(
                             num_generations_per_prompt=master_config["grpo"][
                                 "num_generations_per_prompt"
                             ],
+                            num_prompts_per_step=master_config["grpo"][
+                                "num_prompts_per_step"
+                            ],
+                            should_use_nemo_gym_dynamic_sampling=_should_use_nemo_gym_dynamic_sampling(master_config),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch

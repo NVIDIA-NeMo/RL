@@ -983,6 +983,8 @@ def run_async_nemo_gym_rollout(
     greedy: bool = False,
     is_validation: bool = False,
     num_generations_per_prompt: Optional[int] = None,
+    num_prompts_per_step: Optional[int] = None,
+    should_use_nemo_gym_dynamic_sampling: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     if is_validation:
