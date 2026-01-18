@@ -161,7 +161,7 @@ The rebuilt container will have all virtual environments pre-cached with your up
 
 ### Option 3: Classic Workflow - Mounting Modified Submodules
 
-For situations where you're **only changing submodules** (like nemo-automodel, Penguin, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
+For situations where you're **only changing submodules** (like nemo-automodel, NeMo Gym, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
 
 The container's NeMo RL code is located at `/opt/nemo-rl`. By mounting your local `3rdparty/` directory over the container's `/opt/nemo-rl/3rdparty/`, you can swap out submodules without rebuilding environments or containers.
 
@@ -193,7 +193,7 @@ This mounts:
 > [!IMPORTANT]
 > This workflow is **only suitable when**:
 > - Python package versions in `pyproject.toml` and `uv.lock` haven't changed
-> - You're only modifying code within submodules (nemo-automodel, Penguin, Megatron-LM, Megatron-Bridge)
+> - You're only modifying code within submodules (nemo-automodel, NeMo Gym, Megatron-LM, Megatron-Bridge)
 > - The submodule commits/branches are compatible with the installed package versions
 
 If you've changed Python package versions or dependencies outside of submodules, use Option 1 (`NRL_FORCE_REBUILD_VENVS=true`) or Option 2 (rebuild the container) instead.
