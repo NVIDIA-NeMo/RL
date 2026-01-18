@@ -116,6 +116,7 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_router_fusion: true
 
     optimizer:
       optimizer: "adam"
