@@ -1513,6 +1513,12 @@ def grpo_train(
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
+                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
+                        rollout_metrics["mean_gen_tokens_per_sample"]
+                    )
+                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    del rollout_metrics
+
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
                 )
@@ -1601,6 +1607,18 @@ def grpo_train(
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
                     del prompt_only_message_logs
                     del prompt_batched_flat
+                    del input_ids
+                    del baseline
+                    del std
+
+                    _log_mixed_rewards_and_advantages_information(
+                        logger=logger,
+                        total_steps=total_steps,
+                        metrics=metrics,
+                        baseline=baseline,
+                        advantages=advantages,
+                    )
+
                     del input_ids
                     del baseline
                     del std
