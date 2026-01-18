@@ -201,9 +201,11 @@ def setup(
         else None,
         init_optimizer=True,
         init_reference_model=False,
+        num_nodes=cluster_config["num_nodes"],
+        workers_per_node=cluster_config["gpus_per_node"],
+        cluster_node_offset=0,
+        cluster_gpu_offset_each_node=0,
     )
-    # print the node IP and GPU ID of the policy workers for debugging
-    policy.print_node_ip_and_gpu_id()
 
     loss_fn = NLLLoss()
     print("  ✓ Model initialized")
