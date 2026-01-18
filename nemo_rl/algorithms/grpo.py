@@ -1800,6 +1800,7 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            # TODO @bxyu-nvidia: check if Gym dynamic sampling has finished.
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
