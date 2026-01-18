@@ -28,7 +28,7 @@ policy:
     activation_checkpointing: true
     num_layers_in_first_pipeline_stage: 3
     num_layers_in_last_pipeline_stage: 2
-    apply_rope_fusion: false
+    apply_rope_fusion: true
     moe_permute_fusion: true
     defer_fp32_logits: true
     optimizer:
