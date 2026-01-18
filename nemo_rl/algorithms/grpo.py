@@ -914,6 +914,15 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _should_use_nemo_gym_dynamic_sampling(master_config: MasterConfig) -> bool:
+    env_config = master_config.get("env") or dict()
+    should_use_nemo_gym_dynamic_sampling = bool(
+        env_config.get("should_use_nemo_gym_dynamic_sampling")
+    )
+
+    return should_use_nemo_gym_dynamic_sampling
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,

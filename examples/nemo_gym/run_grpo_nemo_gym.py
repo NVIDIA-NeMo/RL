@@ -37,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     StatefulDataLoader,
     TokenizerType,
     _should_use_nemo_gym,
+    _should_use_nemo_gym_dynamic_sampling,
     grpo_train,
     refit_policy_generation,
     setup,
@@ -233,6 +234,13 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
+    if _should_use_nemo_gym_dynamic_sampling(config):
+        assert not config["grpo"].get("use_dynamic_sampling")
+
+        # Set this to 1 for the dataloader setup
+        original_grpo_num_prompts_per_step = config["grpo"]["num_prompts_per_step"]
+        config["grpo"]["num_prompts_per_step"] = 1
+
     (
         policy,
         policy_generation,
@@ -245,6 +253,9 @@ The validation set you pass in will directly be used for validation with no addi
         grpo_state,
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
+
+    if _should_use_nemo_gym_dynamic_sampling(config):
+        config["grpo"]["num_prompts_per_step"] = original_grpo_num_prompts_per_step
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False

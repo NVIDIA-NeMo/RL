@@ -235,6 +235,7 @@ data:
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  should_use_nemo_gym_dynamic_sampling: false
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
