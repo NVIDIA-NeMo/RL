@@ -1070,8 +1070,16 @@ def test_grpo_train_collects_generation_logger_metrics(
         fake_batched_message_log_to_flat_message,
     )
     monkeypatch.setattr(
+        grpo_mod, "_should_use_async_rollouts", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
         grpo_mod,
         "run_async_multi_turn_rollout",
+        lambda *_args, **_kwargs: (mock_batch, mock_rollout_metrics),
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "run_multi_turn_rollout",
         lambda *_args, **_kwargs: (mock_batch, mock_rollout_metrics),
     )
     monkeypatch.setattr(
