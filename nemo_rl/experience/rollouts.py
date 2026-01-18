@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import ray
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
@@ -985,6 +986,7 @@ def run_async_nemo_gym_rollout(
     num_generations_per_prompt: Optional[int] = None,
     num_prompts_per_step: Optional[int] = None,
     should_use_nemo_gym_dynamic_sampling: bool = False,
+    dataloader: Optional[StatefulDataLoader] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     if is_validation:
