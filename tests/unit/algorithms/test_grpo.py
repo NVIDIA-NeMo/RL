@@ -881,7 +881,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
-    monkeypatch.setattr(grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
@@ -914,10 +916,18 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
                     "enabled": colocated_inference,
                     "resources": generation_resources,
                 },
-                "sglang_cfg": {"gpus_per_server": 1, "dp_size": 1, "pp_size": 1, "ep_size": 1},
+                "sglang_cfg": {
+                    "gpus_per_server": 1,
+                    "dp_size": 1,
+                    "pp_size": 1,
+                    "ep_size": 1,
+                },
             },
         },
-        "loss_fn": {"force_on_policy_ratio": False, "use_importance_sampling_correction": False},
+        "loss_fn": {
+            "force_on_policy_ratio": False,
+            "use_importance_sampling_correction": False,
+        },
         "env": {},
         "grpo": {
             "seed": 1,
@@ -1026,7 +1036,9 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
         )
 
 
-def test_grpo_train_collects_generation_logger_metrics(monkeypatch, mock_grpo_components):
+def test_grpo_train_collects_generation_logger_metrics(
+    monkeypatch, mock_grpo_components
+):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     policy_generation = MagicMock()
@@ -1052,7 +1064,11 @@ def test_grpo_train_collects_generation_logger_metrics(monkeypatch, mock_grpo_co
         )
         return flat, torch.tensor([2])
 
-    monkeypatch.setattr(grpo_mod, "batched_message_log_to_flat_message", fake_batched_message_log_to_flat_message)
+    monkeypatch.setattr(
+        grpo_mod,
+        "batched_message_log_to_flat_message",
+        fake_batched_message_log_to_flat_message,
+    )
     monkeypatch.setattr(
         grpo_mod,
         "run_async_multi_turn_rollout",
@@ -1063,9 +1079,15 @@ def test_grpo_train_collects_generation_logger_metrics(monkeypatch, mock_grpo_co
         "calculate_baseline_and_std_per_prompt",
         lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
     )
-    monkeypatch.setattr(grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
 
     master_config = mock_grpo_components["master_config"]
     master_config["grpo"]["max_num_steps"] = 1

@@ -148,7 +148,9 @@ def _device_to_uuid(device: int) -> str:  # pragma: no cover
     return str(torch.cuda.get_device_properties(device).uuid)
 
 
-def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:  # pragma: no cover
+def _device_from_maybe_uuid(
+    device_maybe_uuid: Union[int, str],
+) -> int:  # pragma: no cover
     """Convert a device UUID string or index to a device index.
 
     Args:
