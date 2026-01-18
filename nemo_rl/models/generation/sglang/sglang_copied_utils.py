@@ -33,7 +33,7 @@ import torch
 from torch.multiprocessing import reductions
 
 
-class MultiprocessingSerializer:
+class MultiprocessingSerializer:  # pragma: no cover
     """Serialize/deserialize Python objects using ForkingPickler for IPC.
 
     This class enables serialization of objects (including CUDA tensors with IPC
@@ -82,7 +82,7 @@ class MultiprocessingSerializer:
         return ForkingPickler.loads(data)
 
 
-def monkey_patch_torch_reductions():
+def monkey_patch_torch_reductions():  # pragma: no cover
     """Monkey patch torch multiprocessing reductions to use GPU UUIDs.
 
     This patch modifies PyTorch's CUDA tensor IPC mechanism to use GPU UUIDs
@@ -116,7 +116,7 @@ def monkey_patch_torch_reductions():
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
-def _reduce_tensor_modified(*args, **kwargs):
+def _reduce_tensor_modified(*args, **kwargs):  # pragma: no cover
     """Modified reduce_tensor that stores GPU UUID instead of device index.
 
     Original source (sglang v0.5.2):
@@ -129,7 +129,7 @@ def _reduce_tensor_modified(*args, **kwargs):
     return output_fn, output_args
 
 
-def _rebuild_cuda_tensor_modified(*args):
+def _rebuild_cuda_tensor_modified(*args):  # pragma: no cover
     """Modified rebuild_cuda_tensor that accepts GPU UUID or device index.
 
     Original source (sglang v0.5.2):
@@ -139,7 +139,7 @@ def _rebuild_cuda_tensor_modified(*args):
     return reductions._rebuild_cuda_tensor_original(*args)
 
 
-def _device_to_uuid(device: int) -> str:
+def _device_to_uuid(device: int) -> str:  # pragma: no cover
     """Convert a device index to its UUID string.
 
     Original source (sglang v0.5.2):
@@ -148,7 +148,7 @@ def _device_to_uuid(device: int) -> str:
     return str(torch.cuda.get_device_properties(device).uuid)
 
 
-def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
+def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:  # pragma: no cover
     """Convert a device UUID string or index to a device index.
 
     Args:
@@ -175,7 +175,7 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
     raise Exception(f"Unknown type: {device_maybe_uuid=}")
 
 
-def _modify_tuple(t, index: int, modifier: Callable):
+def _modify_tuple(t, index: int, modifier: Callable):  # pragma: no cover
     """Create a new tuple with one element modified by a function.
 
     Original source (sglang v0.5.2):
