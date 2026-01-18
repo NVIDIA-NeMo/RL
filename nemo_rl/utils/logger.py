@@ -99,6 +99,7 @@ class LoggerInterface(ABC):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log a dictionary of metrics."""
         pass
@@ -144,6 +145,7 @@ class TensorboardLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,  # ignored in TensorBoard
+        step_finished: bool = False,  # ignored in TensorBoard
     ) -> None:
         """Log metrics to Tensorboard.
 
@@ -199,6 +201,14 @@ class WandbLogger(LoggerInterface):
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         self.run = wandb.init(**cfg, dir=log_dir)
+
+        if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
+            print(
+                "Uploading raylet.out and raylet.err files to W&B since environment variable RAY_BACKEND_LOG_LEVEL=debug"
+            )
+            wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
+            wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
+
         self._log_code()
         self._log_diffs()
         print(
@@ -332,6 +342,7 @@ class WandbLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to wandb.
 
@@ -352,6 +363,10 @@ class WandbLogger(LoggerInterface):
         if step_metric and step_metric in metrics:
             # commit=False so the step does not get incremented
             self.run.log(metrics, commit=False)
+        elif step_finished:
+            # Commit param defaults to None. By default if step is set, then commit defaults to False
+            # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
+            self.run.log(metrics, step=step, commit=True)
         else:
             self.run.log(metrics, step=step)
 
@@ -404,6 +419,7 @@ class SwanlabLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to the associated Swanlab run.
 
@@ -781,6 +797,7 @@ class MLflowLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to MLflow.
 
@@ -906,6 +923,7 @@ class Logger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to all enabled backends.
 
@@ -917,7 +935,7 @@ class Logger(LoggerInterface):
                          of the provided step value (currently only needed for wandb)
         """
         for logger in self.loggers:
-            logger.log_metrics(metrics, step, prefix, step_metric)
+            logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
@@ -951,6 +969,24 @@ class Logger(LoggerInterface):
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
+
+        print(f"Logged data to {filepath}")
+
+    def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
+        """Log a list of strings to a JSONL file.
+
+        Args:
+            to_log: list of strings to log
+            filename: Filename to log to (within the log directory)
+        """
+        # Create full path within log directory
+        filepath = os.path.join(self.base_log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        # Write to JSONL file
+        with open(filepath, "a") as f:
+            for sample in to_log:
+                f.write(sample + "\n")
 
         print(f"Logged data to {filepath}")
 
