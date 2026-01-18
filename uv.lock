@@ -31,10 +31,11 @@ constraints = [
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
 overrides = [
+    { name = "nvidia-cudnn-cu12", specifier = "==9.14.0.64" },
     { name = "nvidia-modelopt", extras = ["torch"], specifier = ">=0.39.0" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
     { name = "timm", specifier = "<=1.0.22" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.10.0" },
 ]
 
 [[manifest.dependency-metadata]]
@@ -3723,6 +3724,7 @@ dependencies = [
     { name = "ninja" },
     { name = "num2words" },
     { name = "numpy" },
+    { name = "nvidia-cudnn-cu12" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
@@ -3851,6 +3853,7 @@ requires-dist = [
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
     { name = "nv-grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
+    { name = "nvidia-cudnn-cu12", specifier = "==9.14.0.64" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
@@ -3871,8 +3874,8 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.8.0" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.10.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.10.0" },
     { name = "transformers", specifier = "==4.57.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.2" },
@@ -4034,6 +4037,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/6c/90d3f532f608a03a13c1d6c16c266ffa3828e8011b1549d3b61db2ad59f5/nvidia_cublas_cu12-12.9.1.4-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:7a950dae01add3b415a5a5cdc4ec818fb5858263e9cca59004bb99fdbbd3a5d6", size = 575006342, upload-time = "2025-06-05T20:04:16.902Z" },
     { url = "https://files.pythonhosted.org/packages/77/3c/aa88abe01f3be3d1f8f787d1d33dc83e76fec05945f9a28fbb41cfb99cd5/nvidia_cublas_cu12-12.9.1.4-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:453611eb21a7c1f2c2156ed9f3a45b691deda0440ec550860290dc901af5b4c2", size = 581242350, upload-time = "2025-06-05T20:04:51.979Z" },
+    { url = "https://files.pythonhosted.org/packages/45/a1/a17fade6567c57452cfc8f967a40d1035bb9301db52f27808167fbb2be2f/nvidia_cublas_cu12-12.9.1.4-py3-none-win_amd64.whl", hash = "sha256:1e5fee10662e6e52bd71dec533fbbd4971bb70a5f24f3bc3793e5c2e9dc640bf", size = 553153899, upload-time = "2025-06-05T20:13:35.556Z" },
 ]
 
 [[package]]
@@ -4065,14 +4069,15 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.10.2.21"
+version = "9.14.0.64"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878, upload-time = "2025-06-06T21:52:51.348Z" },
-    { url = "https://files.pythonhosted.org/packages/ba/51/e123d997aa098c61d029f76663dedbfb9bc8dcf8c60cbd6adbe42f76d049/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:949452be657fa16687d0930933f032835951ef0892b37d2d53824d1a84dc97a8", size = 706758467, upload-time = "2025-06-06T21:54:08.597Z" },
+    { url = "https://files.pythonhosted.org/packages/41/4e/45037237165a4dfc08144e0f1992b40292e825b1f1f7bbff34b9d53f40a6/nvidia_cudnn_cu12-9.14.0.64-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:02a52983f2438a023bf8d491c0f904f2679d5ec9a436aad8222b9b228d2870e1", size = 646163288, upload-time = "2025-10-09T15:21:49.066Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/15/9104f2882a9eb44ff8fa352f8510d59517426477a0fa08ea45509362784d/nvidia_cudnn_cu12-9.14.0.64-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:f7c123b5b35afba2134ea25b8e89a902eb0b46fabad722c3cbe10ac1302afc9b", size = 647135842, upload-time = "2025-10-09T15:22:54.988Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/e3/1c5eac24344126324e9c9a58d6a7be2db624d71dae7d73c26cc3a9c6a6f2/nvidia_cudnn_cu12-9.14.0.64-py3-none-win_amd64.whl", hash = "sha256:c06ac5ea9e199bcee41f27615d50110ab21fd5318f69770cc9ca40cf0a9528e8", size = 633459136, upload-time = "2025-10-09T15:24:10.336Z" },
 ]
 
 [[package]]
@@ -6954,6 +6959,7 @@ dependencies = [
     { name = "fsspec", marker = "sys_platform == 'darwin'" },
     { name = "jinja2", marker = "sys_platform == 'darwin'" },
     { name = "networkx", marker = "sys_platform == 'darwin'" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'darwin'" },
     { name = "setuptools", marker = "sys_platform == 'darwin'" },
     { name = "sympy", marker = "sys_platform == 'darwin'" },
     { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
@@ -6991,7 +6997,7 @@ dependencies = [
     { name = "nvidia-cuda-cupti-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-cuda-nvrtc-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform != 'darwin'" },
     { name = "nvidia-cufft-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-cufile-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-curand-cu12", marker = "sys_platform == 'linux'" },
@@ -7188,13 +7194,10 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.8.0"
+version = "2.10.0"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "transformer-engine-cu12" },
-]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/be/a7cf5f28b7abbe966956217b18208fc34cc9bfaf62fa9472c0603db74899/transformer_engine-2.8.0-py3-none-any.whl", hash = "sha256:795b056d31b0f67f5d7432725177782dd5084090c1e3c52532577070947fe9a7", size = 638319, upload-time = "2025-10-07T04:55:34.115Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/45/b3402a4931c0850ac662b532888d7cb89d5d8f22324309ae8d24557340ee/transformer_engine-2.10.0-py3-none-any.whl", hash = "sha256:a14ccf4e887409be062c0bd8c4a341df55a77baad6aea6aabfe39c24e38252e5", size = 696221, upload-time = "2025-12-02T20:53:17.688Z" },
 ]
 
 [package.optional-dependencies]
@@ -7204,7 +7207,7 @@ pytorch = [
 
 [[package]]
 name = "transformer-engine-cu12"
-version = "2.8.0"
+version = "2.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -7212,13 +7215,13 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/db/cde3e772cf5cd7e941b64d37e4a61e2762f36ecc2e6508525af536076f8d/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:3a92c781fc3c1a3a6a0009871a36903fa364b2d51ce06b06641d29aeefd59310", size = 480373707, upload-time = "2025-10-07T05:03:05.392Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/14/67860f2f1f9d0eca4a8e5e0cef5a0de5c4fc26340625051f032d16913d8c/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8ee5f9df586491a35fd1a01cb95b6970a9f01a5e8f935ecdacd56173c44d6a67", size = 480875025, upload-time = "2025-10-07T04:54:43.762Z" },
+    { url = "https://files.pythonhosted.org/packages/24/3c/9f480a555c4707cd7b091c5341cc96db1af80b5bfb1a2eae834fb704283b/transformer_engine_cu12-2.10.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:ddd6f4f1f2a8f2c450ea0210d04a08a7b8ceff49a4d900f27b3858980502f21b", size = 286567840, upload-time = "2025-12-02T20:50:26.438Z" },
+    { url = "https://files.pythonhosted.org/packages/29/c7/b63b6989262fcf37402a910112aaee9f3273338d9d1d854478e022f5deb7/transformer_engine_cu12-2.10.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6766d4ea1643a2606d498aa396d4e7da1046fe01580fdef2047c2c8aa37936b0", size = 287067223, upload-time = "2025-12-02T20:52:11.248Z" },
 ]
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.8.0"
+version = "2.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
@@ -7226,8 +7229,9 @@ dependencies = [
     { name = "onnxscript" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "transformer-engine-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/63/1e3953244ed4f318f87889309a56cdd664759f007967eb850ee415a5584d/transformer_engine_torch-2.8.0.tar.gz", hash = "sha256:ce09f1bd9b8e532a5c347b9e9b3a3a771722095daddca673ae82ccce8e68d759", size = 209805, upload-time = "2025-10-07T04:54:11.134Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/94/609a7772569d3acdba34261be7fd30b75f5ff4e5f704117c9e0da517b079/transformer_engine_torch-2.10.0.tar.gz", hash = "sha256:71faff8e3def742553ad74b4e32d2d12e91be9acfb13d1699c89e1e18dd4ecd6", size = 220302, upload-time = "2025-12-02T20:53:57.876Z" }
 
 [[package]]
 name = "transformers"
