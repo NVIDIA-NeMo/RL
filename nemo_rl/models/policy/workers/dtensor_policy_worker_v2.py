@@ -398,6 +398,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if self.lora_enabled:
                 apply_lora_to_linear_modules(self.model, self.peft_config)
+                if hasattr(self.model, "lm_head"):
+                    assert not hasattr(self.model.lm_head, "lora_A"), (
+                        "lm_head should not be patched with LoRA adapters. "
+                        "If this assertion fails, the upstream bug has been fixed in Automodel. "
+                        "You can:\n"
+                        "1. Remove the patch patched_get_supported_lora_modules in nemo_rl/models/generation/vllm/lora.py\n"
+                        "2. Remove the patching call\n"
+                        "3. Retest the reward in train and accuracy in validation at the first step should be exactly equal for Llama3.2-3B-Instruct model.\n"
+                        "4. Delete this assertion"
+                    )
 
         # For activation checkpointing, we also must globally disable the cudnn SDPA backend
         # to ensure that cudnn does not get selected during recomputation.

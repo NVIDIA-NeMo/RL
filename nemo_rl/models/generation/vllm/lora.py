@@ -16,6 +16,7 @@
 from typing import Any, Optional
 
 import torch
+import vllm
 from torch import nn
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
@@ -158,6 +159,15 @@ def apply_lora_patches():
         lora_models, "get_supported_lora_modules", patched_get_supported_lora_modules
     )
 
+    assert vllm.__version__.startswith("0.11."), (
+        "vLLM version must be == 0.11.x to apply the patches. "
+        "If this assertion fails, please check the vLLM version and remove the patching on condition. "
+        "You can:\n"
+        "1. Check whether vllm support load lora from memory.\n"
+        "2. If yes, remove the patching call\n"
+        "3. Delete this assertion"
+        "4. Delete this patch: patched_load_adapter"
+    )
     # patch the load_adapter function in LRUCacheWorkerLoRAManager
     from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 

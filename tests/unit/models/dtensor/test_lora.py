@@ -31,6 +31,7 @@ from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
 )
+from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 
 
 class SimpleLoraMock(nn.Module):
@@ -263,4 +264,30 @@ def test_dropout_pre_post_effects(dummy_input):
     assert out_pre.shape == out_post.shape
     assert not torch.allclose(out_pre, out_post), (
         "Dropout positions should affect output differently"
+    )
+
+
+def test_patched_get_supported_lora_modules_needed():
+    target_modules = ["*"]
+    exclude_modules = []
+    match_all_linear = True
+    is_causal_lm = True
+    module_matcher = ModuleMatcher(
+        target_modules=target_modules,
+        exclude_modules=exclude_modules,
+        match_all_linear=match_all_linear,
+        is_causal_lm=is_causal_lm,
+    )
+
+    model = nn.Module()
+    model.lm_head = nn.Linear(10, 10)
+    is_lm_head_supported = module_matcher.match(model.lm_head, "lm_head")
+    assert is_lm_head_supported is False, (
+        "LoRA Adapter should not be applied to lm_head. "
+        "If this assertion fails, the upstream bug has been fixed in Automodel. "
+        "You can:\n"
+        "1. Remove the patch patched_get_supported_lora_modules in nemo_rl/models/generation/vllm/lora.py\n"
+        "2. Remove the patching call\n"
+        "3. Retest the reward in train and accuracy in validation at the first step should be exactly equal for Llama3.2-3B-Instruct model.\n"
+        "4. Delete this test"
     )
