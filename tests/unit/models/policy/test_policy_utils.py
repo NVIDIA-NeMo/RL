@@ -1,3 +1,18 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import sys
 import types
 from unittest.mock import MagicMock
 
@@ -5,7 +20,6 @@ import pytest
 import requests
 import torch
 
-from nemo_rl.models.generation.sglang import sglang_copied_utils
 from nemo_rl.models.policy import utils as policy_utils
 
 
@@ -140,10 +154,20 @@ def test_stream_weights_via_http_impl_sends_tensors(monkeypatch):
         yield "w1", torch.tensor([1.0])
         yield "w2", torch.tensor([2.0])
 
-    monkeypatch.setattr(
-        sglang_copied_utils.MultiprocessingSerializer,
-        "serialize",
-        lambda *_args, **_kwargs: "handler",
+    dummy_module = types.ModuleType(
+        "nemo_rl.models.generation.sglang.sglang_copied_utils"
+    )
+
+    class DummySerializer:
+        @staticmethod
+        def serialize(*_args, **_kwargs):
+            return "handler"
+
+    dummy_module.MultiprocessingSerializer = DummySerializer
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_rl.models.generation.sglang.sglang_copied_utils",
+        dummy_module,
     )
     monkeypatch.setattr(policy_utils.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
