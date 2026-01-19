@@ -22,6 +22,8 @@ import torch
 
 from nemo_rl.models.policy import utils as policy_utils
 
+pytestmark = pytest.mark.sglang
+
 
 def test_setup_ipc_gather_group_returns_none_when_dist_uninit(monkeypatch):
     monkeypatch.setattr(policy_utils.dist, "is_initialized", lambda: False)
