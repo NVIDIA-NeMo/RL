@@ -397,8 +397,11 @@ class BaseVllmGenerationWorker:
                     "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+
         # Lora is enabled, add it to the vllm kwargs
         self.lora_enabled = False
+        self.lora_metadata = None
+        self.lora_cfg_dict = None
         if self.lora_cfg is not None and self.lora_cfg["enabled"]:
             try:
                 from nemo_rl.models.generation.vllm.lora import apply_lora_patches
@@ -411,6 +414,21 @@ class BaseVllmGenerationWorker:
                 )
 
             self.lora_enabled = True
+            self.lora_metadata = dict(
+                {
+                    "lora_int_id": 1,  # Can be any unique id exclude 0
+                    "lora_name": "lora_1",
+                    "lora_path": "dummy_lora_path",
+                }
+            )
+            self.lora_cfg_dict = dict(
+                {
+                    "r": self.lora_cfg["dim"],
+                    "lora_alpha": self.lora_cfg["alpha"],
+                    "target_modules": self.lora_cfg["target_modules"],
+                }
+            )
+
             vllm_kwargs["enable_lora"] = True
             vllm_kwargs["max_loras"] = 1  # only support one lora adapter
             vllm_kwargs["max_lora_rank"] = self.lora_cfg["dim"]
@@ -591,11 +609,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         if self.lora_enabled:
             from vllm.lora.request import LoRARequest
 
-            from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
-
-            lora_metadata = get_vllm_lora_metadata()
             lora_req = LoRARequest(
-                **lora_metadata,
+                **self.lora_metadata,
             )
         outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
@@ -731,11 +746,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         if self.lora_enabled:
             from vllm.lora.request import LoRARequest
 
-            from nemo_rl.models.generation.vllm.lora import get_vllm_lora_metadata
-
-            lora_metadata = get_vllm_lora_metadata()
             lora_req = LoRARequest(
-                **lora_metadata,
+                **self.lora_metadata,
             )
         outputs = self.llm.generate(
             data["prompts"], sampling_params, lora_request=lora_req
@@ -766,7 +778,15 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(
+                state_dict_info,
+                self.lora_enabled,
+                self.lora_metadata,
+                self.lora_cfg_dict,
+            ),
+        )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(
@@ -786,7 +806,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=(self.lora_cfg, refit_mode),
+                args=(refit_mode,),
             )
             worker_result = result_or_coro[0]
 

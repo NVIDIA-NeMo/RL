@@ -913,4 +913,4 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "get_lora_base_refit_done"
         )
         results = ray.get(futures)
-        return True, bool(results) and all(results)
+        return True, all(results)

@@ -15,6 +15,7 @@
 
 from typing import Any, Optional
 
+import torch
 from torch import nn
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
@@ -163,13 +164,38 @@ def apply_lora_patches():
     setattr(LRUCacheWorkerLoRAManager, "_load_adapter", patched_load_adapter)
 
 
-# Please Review: Not sure put it here or in nemo_rl/models/generation/vllm/utils.py
-def get_vllm_lora_metadata() -> dict[str, Any]:
-    lora_int_id = 1  # Can be any unique id exclude 0
-    lora_name = f"{lora_int_id}"
-    lora_path = "dummy_lora_path"
-    return {
-        "lora_name": lora_name,
-        "lora_int_id": lora_int_id,
-        "lora_path": lora_path,
-    }
+def apply_weight_name_mapping(
+    weights: list[tuple[str, torch.Tensor]],
+    supported_modules: list[str],
+    packed_modules_mapping: dict[str, list[str]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Apply weight name mapping if LoRA is enabled."""
+
+    def map_param_name(param_name: str) -> str:
+        # Vllm add logits_processor to lm_head weight(https://github.com/vllm-project/vllm/blob/b8b302cde434df8c9289a2b465406b47ebab1c2d/vllm/lora/models.py#L506), we skip mapping for lm_head weight
+        if "lm_head" in param_name:
+            return param_name
+        parts = param_name.split(".")
+        if len(parts) < 2:
+            return param_name
+        base_name = ".".join(parts[:-2])  # prefix
+        module_name = parts[-2]  # e.g. q_proj/k_proj/v_proj/gate_proj/up_proj/...
+        field_name = parts[-1]  # weight/bias
+        resolved_module_name = module_name
+        for packed_name, member_names in packed_modules_mapping.items():
+            if module_name in member_names:
+                resolved_module_name = packed_name
+                break
+        # use resolved_module_name for checking, but return the original module_name
+        if resolved_module_name in supported_modules:
+            if base_name != "":
+                return f"{base_name}.{module_name}.base_layer.{field_name}"
+            else:
+                return f"{module_name}.base_layer.{field_name}"
+        return param_name
+
+    new_weights = []
+    for name, w in weights:
+        new_name = map_param_name(name)
+        new_weights.append((new_name, w))
+    return new_weights

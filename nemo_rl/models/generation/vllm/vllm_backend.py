@@ -87,7 +87,13 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        lora_enabled: bool,
+        lora_metadata: Optional[dict[str, Any]] = None,
+        lora_cfg_dict: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
@@ -95,6 +101,9 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_enabled = lora_enabled  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_metadata = lora_metadata  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_cfg_dict = lora_cfg_dict  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -125,52 +134,9 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
-    def _apply_weight_name_mapping(
-        self, weights: list[tuple[str, torch.Tensor]]
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Apply weight name mapping if LoRA is enabled."""
-
-        def map_param_name(param_name: str) -> str:
-            # Vllm add logits_processor to lm_head weight(https://github.com/vllm-project/vllm/blob/b8b302cde434df8c9289a2b465406b47ebab1c2d/vllm/lora/models.py#L506), we skip mapping for lm_head weight
-            if "lm_head" in param_name:
-                return param_name
-
-            parts = param_name.split(".")
-            if len(parts) < 2:
-                return param_name
-
-            lora_mgr = self.model_runner.model.lora_manager
-            supported_modules = lora_mgr.supported_lora_modules
-            packed_modules_mapping = lora_mgr.packed_modules_mapping
-
-            base_name = ".".join(parts[:-2])  # prefix
-            module_name = parts[-2]  # e.g. q_proj/k_proj/v_proj/gate_proj/up_proj/...
-            field_name = parts[-1]  # weight/bias
-
-            resolved_module_name = module_name
-            for packed_name, member_names in packed_modules_mapping.items():
-                if module_name in member_names:
-                    resolved_module_name = packed_name
-                    break
-
-            # use resolved_module_name for checking, but return the original module_name
-            if resolved_module_name in supported_modules:
-                if base_name != "":
-                    return f"{base_name}.{module_name}.base_layer.{field_name}"
-                else:
-                    return f"{module_name}.base_layer.{field_name}"
-            return param_name
-
-        new_weights = []
-        for name, w in weights:
-            new_name = map_param_name(name)
-            new_weights.append((new_name, w))
-        return new_weights
-
     def _apply_loaded_weights(
         self,
         weights: list[tuple[str, torch.Tensor]],
-        lora_config: dict[str, Any],
         refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Apply loaded weights to model or LoRA based on flags.
@@ -186,33 +152,38 @@ class VllmInternalWorkerExtension:
         runner = self.model_runner
 
         if fp8.is_fp8_model(runner.vllm_config):
+            assert refit_mode == "base_model", (
+                "fp8 model only supports base_model refit mode"
+            )
             # the fp8 load_weights additionally casts bf16 weights into fp8
             fp8.load_weights(weights, runner)
             return
 
         if refit_mode == "base_model":
-            if lora_config and "enabled" in lora_config and lora_config["enabled"]:
-                weights = self._apply_weight_name_mapping(weights)
+            if self.lora_enabled:
+                from nemo_rl.models.generation.vllm.lora import (
+                    apply_weight_name_mapping,
+                )
+
+                lora_mgr = self.model_runner.model.lora_manager
+                supported_modules = lora_mgr.supported_lora_modules
+                packed_modules_mapping = lora_mgr.packed_modules_mapping
+
+                weights = apply_weight_name_mapping(
+                    weights, supported_modules, packed_modules_mapping
+                )
             runner.model.load_weights(weights=weights)
             return
 
         if refit_mode == "lora":
-            assert lora_config, (
-                "lora_config is not provided, can not refit lora weights"
-            )
-            from nemo_rl.models.generation.vllm.lora import (
-                LoRARequestWithCfgAndWeights,
-                get_vllm_lora_metadata,
-            )
+            from nemo_rl.models.generation.vllm.lora import LoRARequestWithCfgAndWeights
 
-            lora_cfg_dict = dict(
-                {
-                    "r": lora_config["dim"],
-                    "lora_alpha": lora_config["alpha"],
-                    "target_modules": lora_config["target_modules"],
-                }
-            )
-            lora_metadata = get_vllm_lora_metadata()
+            if self.lora_metadata is None or self.lora_cfg_dict is None:
+                raise ValueError(
+                    "LoRA metadata/config must be set before LoRA refit mode."
+                )
+            lora_metadata = self.lora_metadata
+            lora_cfg_dict = self.lora_cfg_dict
             # Note: We don't need to remove the lora if it is already set max_loras = 1
             self.remove_lora(lora_id=lora_metadata["lora_int_id"])
             lora_request = LoRARequestWithCfgAndWeights(
@@ -237,9 +208,7 @@ class VllmInternalWorkerExtension:
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(
-        self,
-        lora_config: dict[str, Any] = {},
-        refit_mode: Optional[str] = "base_model",
+        self, refit_mode: Optional[str] = "base_model"
     ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
@@ -293,7 +262,6 @@ class VllmInternalWorkerExtension:
                 # Load weights into the model or LoRA
                 self._apply_loaded_weights(
                     weights=weights,
-                    lora_config=lora_config,
                     refit_mode=refit_mode,
                 )
 

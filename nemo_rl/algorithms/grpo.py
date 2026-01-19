@@ -464,9 +464,13 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    if policy_config.get("dtensor_cfg", {}).get("enabled", False):
-        lora_cfg = policy_config.get("dtensor_cfg", {}).get("lora_cfg", {})
-        if lora_cfg.get("enabled", False):
+    if "dtensor_cfg" in policy_config and policy_config["dtensor_cfg"]["enabled"]:
+        lora_cfg = (
+            policy_config["dtensor_cfg"]["lora_cfg"]
+            if "lora_cfg" in policy_config["dtensor_cfg"]
+            else None
+        )
+        if "enabled" in lora_cfg and lora_cfg["enabled"]:
             # Override the vLLM lora config with the DTensor lora config
             generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
 
