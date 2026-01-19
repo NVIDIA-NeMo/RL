@@ -1680,8 +1680,13 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        assert refit_mode == "base_model", (
+            f"refit_mode must be 'base_model' in dtensor v1, but got {refit_mode}"
+        )
+
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."

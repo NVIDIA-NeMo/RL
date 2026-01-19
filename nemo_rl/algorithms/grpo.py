@@ -464,6 +464,23 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+    if "dtensor_cfg" in policy_config and policy_config["dtensor_cfg"]["enabled"]:
+        lora_cfg = (
+            policy_config["dtensor_cfg"]["lora_cfg"]
+            if "lora_cfg" in policy_config["dtensor_cfg"]
+            else None
+        )
+        if "enabled" in lora_cfg and lora_cfg["enabled"]:
+            # Override the vLLM lora config with the DTensor lora config
+            generation_config["vllm_cfg"]["lora_cfg"] = lora_cfg
+
+            assert colocated_inference, (
+                "LoRA in DTensor backend is only supported with colocated inference."
+            )
+            assert not _should_use_async_rollouts(master_config), (
+                "Async rollouts are not supported with LoRA in DTensor backend."
+            )
+
     # Define initialization functions that will be used in all paths
     def init_policy():
         """Initialize policy training workers."""
@@ -504,6 +521,9 @@ def setup(
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+            assert not policy_config["dtensor_cfg"]["lora_cfg"]["enabled"], (
+                "LoRA is not supported with vLLM FP8 generation."
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
@@ -933,18 +953,11 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
 
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        # update weights
+    def _perform_refit_weights(refit_mode: str):
+        assert refit_mode in ("base_model", "lora"), (
+            "refit_mode must be either 'base_model' or 'lora'"
+        )
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
@@ -959,9 +972,13 @@ def refit_policy_generation(
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+                refit_mode=refit_mode,
             )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            futures_inference = policy_generation.update_weights_via_ipc_zmq(
+                refit_mode=refit_mode,
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -984,6 +1001,35 @@ def refit_policy_generation(
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
             raise RuntimeError(error_message)
+
+    lora_enabled, lora_base_refit_done = policy.check_lora_base_refit_done()
+    refit_lora_weights = lora_enabled
+    refit_base_model_weights = not lora_enabled or not lora_base_refit_done
+
+    if colocated_inference:
+        policy.offload_before_refit()
+        policy_generation.prepare_for_generation(tags=["weights"])
+
+    # Create a context manager that does nothing when timer is None
+    timer_context = (
+        timer.time("prepare_for_generation/transfer_and_update_weights")
+        if timer is not None
+        else nullcontext()
+    )
+    with timer_context:
+        if refit_base_model_weights:
+            _perform_refit_weights(refit_mode="base_model")
+            print(
+                "    ▶ Refitting base model weights...",
+                flush=True,
+            )
+
+        if refit_lora_weights:
+            _perform_refit_weights(refit_mode="lora")
+            print(
+                "    ▶ Refitting LoRA weights...",
+                flush=True,
+            )
 
     if colocated_inference:
         policy.offload_after_refit()

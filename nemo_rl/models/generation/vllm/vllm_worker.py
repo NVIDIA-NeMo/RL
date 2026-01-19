@@ -139,6 +139,7 @@ class BaseVllmGenerationWorker:
         self.enable_expert_parallel = self.expert_parallel_size > 1
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
         self.precision = self.cfg["vllm_cfg"]["precision"]
+        self.lora_cfg = self.cfg["vllm_cfg"].get("lora_cfg", None)
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -397,6 +398,41 @@ class BaseVllmGenerationWorker:
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
+        # Lora is enabled, add it to the vllm kwargs
+        self.lora_enabled = False
+        self.lora_metadata = None
+        self.lora_cfg_dict = None
+        if self.lora_cfg is not None and self.lora_cfg["enabled"]:
+            try:
+                from nemo_rl.models.generation.vllm.lora import apply_lora_patches
+
+                apply_lora_patches()
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Lora is enabled, but failed to apply lora patches: {e}"
+                )
+
+            self.lora_enabled = True
+            self.lora_metadata = dict(
+                {
+                    "lora_int_id": 1,  # Can be any unique id exclude 0
+                    "lora_name": "lora_1",
+                    "lora_path": "dummy_lora_path",
+                }
+            )
+            self.lora_cfg_dict = dict(
+                {
+                    "r": self.lora_cfg["dim"],
+                    "lora_alpha": self.lora_cfg["alpha"],
+                    "target_modules": self.lora_cfg["target_modules"],
+                }
+            )
+
+            vllm_kwargs["enable_lora"] = True
+            vllm_kwargs["max_loras"] = 1  # only support one lora adapter
+            vllm_kwargs["max_lora_rank"] = self.lora_cfg["dim"]
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -568,7 +604,15 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            from vllm.lora.request import LoRARequest
+
+            lora_req = LoRARequest(
+                **self.lora_metadata,
+            )
+        outputs = self.llm.generate(prompts, sampling_params, lora_request=lora_req)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -697,7 +741,17 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+
+        lora_req = None
+        if self.lora_enabled:
+            from vllm.lora.request import LoRARequest
+
+            lora_req = LoRARequest(
+                **self.lora_metadata,
+            )
+        outputs = self.llm.generate(
+            data["prompts"], sampling_params, lora_request=lora_req
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
@@ -724,10 +778,21 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(
+                state_dict_info,
+                self.lora_enabled,
+                self.lora_metadata,
+                self.lora_cfg_dict,
+            ),
+        )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self,
+        refit_mode: Optional[str] = "base_model",
+    ) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
@@ -741,7 +806,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=tuple(),
+                args=(refit_mode,),
             )
             worker_result = result_or_coro[0]
 

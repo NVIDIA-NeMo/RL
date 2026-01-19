@@ -22,25 +22,25 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_sft.py \
-    policy.model_name=Qwen/Qwen3-0.6B \
+    $PROJECT_ROOT/examples/run_grpo_math.py\
+    grpo.max_num_steps=3 \
+    grpo.num_prompts_per_step=8 \
+    grpo.num_generations_per_prompt=4 \
+    policy.dtensor_cfg.lora_cfg.enabled=True \
+    policy.dtensor_cfg.lora_cfg.dim=32 \
+    policy.train_global_batch_size=32 \
+    policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
-    sft.max_num_steps=3 \
-    sft.val_batches=1 \
-    sft.val_period=3 \
-    policy.dtensor_cfg.lora_cfg.enabled=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=true \
-    checkpointing.save_period=3 \
-    checkpointing.checkpoint_dir=/tmp/lora_sft_checkpoints \
+    checkpointing.enabled=false \
     "$@" \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 5.9'
+  'data["train/reward"]["3"] > 0.06'
 

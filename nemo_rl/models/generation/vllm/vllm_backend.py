@@ -13,7 +13,7 @@
 # limitations under the License.
 import gc
 import traceback
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import zmq
@@ -87,7 +87,13 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        lora_enabled: bool,
+        lora_metadata: Optional[dict[str, Any]] = None,
+        lora_cfg_dict: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
@@ -95,6 +101,9 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_enabled = lora_enabled  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_metadata = lora_metadata  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.lora_cfg_dict = lora_cfg_dict  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -125,8 +134,82 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    def _apply_loaded_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        refit_mode: Optional[str] = "base_model",
+    ) -> None:
+        """Apply loaded weights to model or LoRA based on flags.
+
+        This unifies the duplicate logic used by both IPC and collective paths.
+        """
+        assert refit_mode in ["base_model", "lora"], (
+            f"refit_mode must be 'base_model' or 'lora', but got {refit_mode}"
+        )
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        runner = self.model_runner
+
+        if fp8.is_fp8_model(runner.vllm_config):
+            assert refit_mode == "base_model", (
+                "fp8 model only supports base_model refit mode"
+            )
+            # the fp8 load_weights additionally casts bf16 weights into fp8
+            fp8.load_weights(weights, runner)
+            return
+
+        if refit_mode == "base_model":
+            if self.lora_enabled:
+                from nemo_rl.models.generation.vllm.lora import (
+                    apply_weight_name_mapping,
+                )
+
+                lora_mgr = self.model_runner.model.lora_manager
+                supported_modules = lora_mgr.supported_lora_modules
+                packed_modules_mapping = lora_mgr.packed_modules_mapping
+
+                weights = apply_weight_name_mapping(
+                    weights, supported_modules, packed_modules_mapping
+                )
+            runner.model.load_weights(weights=weights)
+            return
+
+        if refit_mode == "lora":
+            from nemo_rl.models.generation.vllm.lora import LoRARequestWithCfgAndWeights
+
+            if self.lora_metadata is None or self.lora_cfg_dict is None:
+                raise ValueError(
+                    "LoRA metadata/config must be set before LoRA refit mode."
+                )
+            lora_metadata = self.lora_metadata
+            lora_cfg_dict = self.lora_cfg_dict
+            # Note: We don't need to remove the lora if it is already set max_loras = 1
+            self.remove_lora(lora_id=lora_metadata["lora_int_id"])
+            lora_request = LoRARequestWithCfgAndWeights(
+                **lora_metadata,
+                lora_cfg=lora_cfg_dict,
+                lora_weights=dict({name: tensor for name, tensor in weights}),
+            )
+            try:
+                self.add_lora(lora_request=lora_request)
+            except Exception as e:
+                print(
+                    f"Error in VllmInternalWorkerExtension._apply_loaded_weights: {e}"
+                )
+                print(traceback.format_exc())
+                raise e
+            # self.add_lora(lora_request=lora_request)
+            return
+
+        raise ValueError(
+            f"refit_mode must be 'base_model' or 'lora', but got {refit_mode}"
+        )
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, refit_mode: Optional[str] = "base_model"
+    ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -176,14 +259,11 @@ class VllmInternalWorkerExtension:
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
-                # Load weights into the model
-                from nemo_rl.models.generation.vllm.quantization import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
+                # Load weights into the model or LoRA
+                self._apply_loaded_weights(
+                    weights=weights,
+                    refit_mode=refit_mode,
+                )
 
                 torch.cuda.current_stream().synchronize()
 

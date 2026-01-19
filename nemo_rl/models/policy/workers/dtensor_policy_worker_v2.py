@@ -97,6 +97,7 @@ from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weights import is_base_model_weight_name, is_lora_weight_name
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -106,7 +107,9 @@ STRING_TO_DTYPE = {
 
 
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    refit_mode: Optional[str] = "base_model",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
@@ -117,7 +120,15 @@ def dtensor_params_generator(
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
+    assert refit_mode in ["base_model", "lora"], (
+        f"refit_mode must be 'base_model' or 'lora', but got {refit_mode}"
+    )
     for name, tensor in model.state_dict().items():
+        if is_base_model_weight_name(name) and refit_mode != "base_model":
+            continue
+        if is_lora_weight_name(name) and refit_mode != "lora":
+            continue
+
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
@@ -329,6 +340,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             # autocast should cast the weights to the correct dtype during the forward pass.
             cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
             self.peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
+            # Track if the base model weights have been refit, used only for LoRA.
+            self.lora_base_refit_done = False
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
@@ -385,6 +398,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if self.lora_enabled:
                 apply_lora_to_linear_modules(self.model, self.peft_config)
+                if hasattr(self.model, "lm_head"):
+                    assert not hasattr(self.model.lm_head, "lora_A"), (
+                        "lm_head should not be patched with LoRA adapters. "
+                        "If this assertion fails, the upstream bug has been fixed in Automodel. "
+                        "You can:\n"
+                        "1. Remove the patch patched_get_supported_lora_modules in nemo_rl/models/generation/vllm/lora.py\n"
+                        "2. Remove the patching call\n"
+                        "3. Retest the reward in train and accuracy in validation at the first step should be exactly equal for Llama3.2-3B-Instruct model.\n"
+                        "4. Delete this assertion"
+                    )
 
         # For activation checkpointing, we also must globally disable the cudnn SDPA backend
         # to ensure that cudnn does not get selected during recomputation.
@@ -1809,12 +1832,19 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_mode: Optional[str] = "base_model",
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
+
+        if refit_mode == "base_model" and self.lora_enabled:
+            assert not self.lora_base_refit_done, (
+                "Base model weights have already been refit, cannot refit again"
+            )
+            self.lora_base_refit_done = True
 
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
@@ -1825,7 +1855,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=dtensor_params_generator(
+                self.model, self.dtype, refit_mode=refit_mode
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -2026,3 +2058,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
+
+    def get_lora_base_refit_done(self) -> bool:
+        """Get if the base model weights have been refit."""
+        return self.lora_base_refit_done
