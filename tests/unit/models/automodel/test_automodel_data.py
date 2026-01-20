@@ -21,7 +21,9 @@ from nemo_rl.algorithms.interfaces import LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
+    ProcessedMicrobatch,
     get_microbatch_iterator,
+    make_processed_microbatch_iterator,
     process_global_batch,
     process_microbatch,
 )
@@ -439,6 +441,278 @@ class TestProcessMicrobatch:
                 cfg=cfg,
                 cp_size=cp_size,
             )
+
+
+@pytest.mark.automodel
+class TestProcessedMicrobatch:
+    def test_processed_microbatch_creation(self, mock_tokenizer):
+        """Test that ProcessedMicrobatch correctly stores all attributes."""
+        # Create test data
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (4, 64)),
+            seq_len=64,
+            attention_mask=torch.ones(4, 64, dtype=torch.bool),
+            position_ids=torch.arange(64).unsqueeze(0).expand(4, -1),
+        )
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=4,
+            original_seq_len=64,
+        )
+
+        # Verify all attributes are correctly stored
+        assert processed_mb.data_dict is data_dict
+        assert processed_mb.processed_inputs is processed_inputs
+        assert processed_mb.original_batch_size == 4
+        assert processed_mb.original_seq_len == 64
+
+    def test_processed_microbatch_preserves_original_dimensions(self, mock_tokenizer):
+        """Test that original dimensions are preserved even after processing changes shapes."""
+        # Simulate sequence packing where batch dimension changes
+        original_batch_size = 4
+        original_seq_len = 64
+
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": torch.randint(
+                    0, 1000, (original_batch_size, original_seq_len)
+                ),
+                "sample_mask": torch.ones(original_batch_size, dtype=torch.bool),
+            }
+        )
+
+        # Simulate packed sequence (batch becomes 1, seq_len increases)
+        packed_seq_len = 200
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (1, packed_seq_len)),
+            seq_len=packed_seq_len,
+        )
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=original_batch_size,
+            original_seq_len=original_seq_len,
+        )
+
+        # Verify original dimensions are preserved
+        assert processed_mb.original_batch_size == original_batch_size
+        assert processed_mb.original_seq_len == original_seq_len
+        # But processed inputs have different shape
+        assert processed_mb.processed_inputs.input_ids.shape[0] == 1
+        assert processed_mb.processed_inputs.seq_len == packed_seq_len
+
+
+@pytest.mark.automodel
+class TestMakeProcessedMicrobatchIterator:
+    def test_basic_iteration(self, mock_tokenizer):
+        """Test basic iteration over microbatches."""
+        # Create test data
+        batch1 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 32)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+        batch2 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 32)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch1, batch2])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        # Collect all processed microbatches
+        processed_mbs = list(processed_iterator)
+
+        # Verify correct number of batches
+        assert len(processed_mbs) == 2
+
+        # Verify each is a ProcessedMicrobatch
+        for processed_mb in processed_mbs:
+            assert isinstance(processed_mb, ProcessedMicrobatch)
+            assert isinstance(processed_mb.processed_inputs, ProcessedInputs)
+            assert processed_mb.original_batch_size == 2
+            assert processed_mb.original_seq_len == 32
+
+    def test_preserves_data_dict_reference(self, mock_tokenizer):
+        """Test that the original data dict is accessible."""
+        input_ids = torch.randint(0, 1000, (4, 64))
+        batch = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+                "custom_field": torch.randn(4, 10),
+            }
+        )
+
+        raw_iterator = iter([batch])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mb = next(processed_iterator)
+
+        # Verify data_dict is accessible and contains original fields
+        assert "input_ids" in processed_mb.data_dict
+        assert "sample_mask" in processed_mb.data_dict
+        assert "custom_field" in processed_mb.data_dict
+        assert processed_mb.data_dict is batch
+
+    def test_processed_inputs_are_correct(self, mock_tokenizer):
+        """Test that processed inputs have correct attributes."""
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (3, 48)),
+                "sample_mask": torch.ones(3, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mb = next(processed_iterator)
+        processed_inputs = processed_mb.processed_inputs
+
+        # Verify processed inputs
+        assert processed_inputs.input_ids.shape == (3, 48)
+        assert processed_inputs.attention_mask is not None
+        assert processed_inputs.attention_mask.shape == (3, 48)
+        assert processed_inputs.position_ids is not None
+        assert processed_inputs.position_ids.shape == (3, 48)
+        assert processed_inputs.seq_len == 48
+        assert processed_inputs.cp_buffers == []
+        assert processed_inputs.vlm_kwargs == {}
+
+    def test_with_context_parallel(self, mock_tokenizer):
+        """Test iteration with context parallel enabled."""
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 64)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=2,  # Context parallel enabled
+        )
+
+        processed_mb = next(processed_iterator)
+
+        # Verify context parallel buffers are created
+        assert len(processed_mb.processed_inputs.cp_buffers) == 3
+        assert processed_mb.processed_inputs.seq_index is not None
+
+    def test_empty_iterator(self, mock_tokenizer):
+        """Test that empty iterator yields nothing."""
+        raw_iterator = iter([])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mbs = list(processed_iterator)
+        assert len(processed_mbs) == 0
+
+    def test_varying_batch_sizes(self, mock_tokenizer):
+        """Test iteration with varying batch sizes."""
+        batch1 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 32)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+        batch2 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 32)),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        batch3 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (1, 32)),
+                "sample_mask": torch.ones(1, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch1, batch2, batch3])
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mbs = list(processed_iterator)
+
+        # Verify each batch has correct original dimensions
+        assert processed_mbs[0].original_batch_size == 2
+        assert processed_mbs[1].original_batch_size == 4
+        assert processed_mbs[2].original_batch_size == 1
+
+        # All have same seq_len
+        for processed_mb in processed_mbs:
+            assert processed_mb.original_seq_len == 32
 
 
 @pytest.mark.automodel

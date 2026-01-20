@@ -50,8 +50,8 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
+    make_processed_microbatch_iterator,
     process_global_batch,
-    process_microbatch,
 )
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
@@ -349,22 +349,23 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
 
-                for mb_idx, mb in enumerate(
-                    itertools.chain(mb_iterator, dummy_iterator)
-                ):
+                # Wrap raw iterator to get processed microbatches
+                processed_iterator = make_processed_microbatch_iterator(
+                    itertools.chain(mb_iterator, dummy_iterator),
+                    self.tokenizer,
+                    self.enable_seq_packing,
+                    self.cfg,
+                    self.cp_size,
+                )
+
+                for mb_idx, processed_mb in enumerate(processed_iterator):
                     # Conditioanlly empty cache when sensitive to fragmentation
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
 
-                    # Process microbatch and prepare inputs for model forward
-                    with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        processed_inputs = process_microbatch(
-                            mb,
-                            self.tokenizer,
-                            self.enable_seq_packing,
-                            self.cfg,
-                            self.cp_size,
-                        )
+                    # Extract data dict and processed inputs
+                    mb = processed_mb.data_dict
+                    processed_inputs = processed_mb.processed_inputs
 
                     # Extract values from processed inputs for use in forward pass
                     input_ids = processed_inputs.input_ids
@@ -622,19 +623,21 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self.dp_mesh,
             )
 
+            # Wrap raw iterator to get processed microbatches
+            processed_iterator = make_processed_microbatch_iterator(
+                itertools.chain(mb_iterator, dummy_iterator),
+                self.tokenizer,
+                self.enable_seq_packing,
+                self.cfg,
+                self.cp_size,
+            )
+
             step = 0
-            for batch_idx, lp_batch in enumerate(
-                itertools.chain(mb_iterator, dummy_iterator)
-            ):
+            for batch_idx, processed_mb in enumerate(processed_iterator):
                 step += 1
-                # Process microbatch and prepare inputs for model forward
-                processed_inputs = process_microbatch(
-                    lp_batch,
-                    self.tokenizer,
-                    self.enable_seq_packing,
-                    self.cfg,
-                    self.cp_size,
-                )
+                # Extract data dict and processed inputs
+                lp_batch = processed_mb.data_dict
+                processed_inputs = processed_mb.processed_inputs
 
                 # Extract values from processed inputs
                 input_ids = processed_inputs.input_ids
@@ -850,20 +853,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
                 data, self.cfg, self.enable_seq_packing, global_batch_size, self.dp_mesh
             )
+
+            # Wrap raw iterator to get processed microbatches
+            processed_iterator = make_processed_microbatch_iterator(
+                itertools.chain(mb_iterator, dummy_iterator),
+                self.tokenizer,
+                self.enable_seq_packing,
+                self.cfg,
+                self.cp_size,
+            )
+
             step = 0
             all_rm_scores = []
-            for batch_idx, generate_batch in enumerate(
-                itertools.chain(mb_iterator, dummy_iterator)
-            ):
+            for batch_idx, processed_mb in enumerate(processed_iterator):
                 step += 1
-                # Process microbatch and prepare inputs for model forward
-                processed_inputs = process_microbatch(
-                    generate_batch,
-                    self.tokenizer,
-                    self.enable_seq_packing,
-                    self.cfg,
-                    self.cp_size,
-                )
+                # Extract processed inputs
+                processed_inputs = processed_mb.processed_inputs
 
                 # Extract values from processed inputs
                 input_ids = processed_inputs.input_ids
@@ -952,23 +957,24 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 data, self.cfg, self.enable_seq_packing, topk_batch_size, self.dp_mesh
             )
 
-            for batch_idx, lp_batch in enumerate(
-                itertools.chain(mb_iterator, dummy_iterator)
-            ):
+            # Wrap raw iterator to get processed microbatches
+            processed_iterator = make_processed_microbatch_iterator(
+                itertools.chain(mb_iterator, dummy_iterator),
+                self.tokenizer,
+                self.enable_seq_packing,
+                self.cfg,
+                self.cp_size,
+            )
+
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                # Extract data dict and processed inputs
+                lp_batch = processed_mb.data_dict
+                processed_inputs = processed_mb.processed_inputs
                 input_lengths = lp_batch.get("input_lengths")
 
-                # Store original shapes before processing (needed for unpacking later)
-                original_batch_size = lp_batch.get("input_ids").shape[0]
-                original_seq_len = lp_batch.get("input_ids").shape[1]
-
-                # Process microbatch and prepare inputs for model forward
-                processed_inputs = process_microbatch(
-                    lp_batch,
-                    self.tokenizer,
-                    self.enable_seq_packing,
-                    self.cfg,
-                    self.cp_size,
-                )
+                # Use original shapes from ProcessedMicrobatch (needed for unpacking later)
+                original_batch_size = processed_mb.original_batch_size
+                original_seq_len = processed_mb.original_seq_len
 
                 # Extract values from processed inputs
                 input_ids = processed_inputs.input_ids

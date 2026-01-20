@@ -62,13 +62,82 @@ class ProcessedInputs:
 
     @property
     def has_flash_attention(self) -> bool:
-        """Check if flash attention is configured."""
-        return len(self.flash_attn_kwargs) > 0
+        """Check if flash attention is configured.
+
+        Works for both empty dict {} and dataclass objects like FlashAttnKwargs.
+        """
+        return bool(self.flash_attn_kwargs)
 
     @property
     def is_multimodal(self) -> bool:
         """Check if this is a multimodal input."""
         return len(self.vlm_kwargs) > 0
+
+
+@dataclass
+class ProcessedMicrobatch:
+    """Container for a processed microbatch ready for model forward pass.
+
+    This dataclass holds both the original data dictionary and the processed
+    tensors needed for the automodel forward pass. It follows the same pattern
+    as nemo_rl/models/megatron/data.py ProcessedMicrobatch.
+
+    Attributes:
+        data_dict: The original BatchedDataDict containing raw batch data
+        processed_inputs: ProcessedInputs containing all tensors for forward pass
+        original_batch_size: Original batch size before any packing
+        original_seq_len: Original sequence length before any packing
+    """
+
+    data_dict: BatchedDataDict[Any]
+    processed_inputs: ProcessedInputs
+    original_batch_size: int
+    original_seq_len: int
+
+
+def make_processed_microbatch_iterator(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    tokenizer: AutoTokenizer,
+    enable_seq_packing: bool,
+    cfg: dict[str, Any],
+    cp_size: int,
+) -> Iterator[ProcessedMicrobatch]:
+    """Wrap a raw microbatch iterator to yield processed microbatches.
+
+    This function takes a raw iterator that yields BatchedDataDict objects and
+    wraps it to yield ProcessedMicrobatch objects that contain both the original
+    data and the processed tensors ready for model forward pass.
+
+    Args:
+        raw_iterator: Iterator yielding raw BatchedDataDict microbatches
+        tokenizer: Tokenizer for processing
+        enable_seq_packing: Whether sequence packing is enabled
+        cfg: Configuration dictionary
+        cp_size: Context parallel size
+
+    Yields:
+        ProcessedMicrobatch objects containing processed tensors ready for model forward
+    """
+    for data_dict in raw_iterator:
+        # Store original shapes before processing
+        original_batch_size = data_dict.get("input_ids").shape[0]
+        original_seq_len = data_dict.get("input_ids").shape[1]
+
+        # Process the microbatch
+        processed_inputs = process_microbatch(
+            data_dict,
+            tokenizer,
+            enable_seq_packing,
+            cfg,
+            cp_size,
+        )
+
+        yield ProcessedMicrobatch(
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=original_batch_size,
+            original_seq_len=original_seq_len,
+        )
 
 
 def get_microbatch_iterator(
