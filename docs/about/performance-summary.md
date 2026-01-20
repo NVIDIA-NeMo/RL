@@ -43,7 +43,7 @@ The performance data includes:
 
 ---
 
-## Nemo RL v0.4
+## Nemo RL v0.5
 
 ### H100 BF16 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2); DAPO dataset: [DAPOMath17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k)
