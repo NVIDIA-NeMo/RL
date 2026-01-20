@@ -167,6 +167,7 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
+            # TODO: Even though we fork on `do_on_policy_fixes` here, we still need to fix the downstream logic for massaging the token_ids.
             assert (
                 not do_on_policy_fixes
                 or seen_token_ids
