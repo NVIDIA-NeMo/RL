@@ -52,7 +52,9 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def get_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        **kwargs: Any,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -70,6 +72,7 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -105,6 +108,7 @@ class PolicyInterface(ABC):
         *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 

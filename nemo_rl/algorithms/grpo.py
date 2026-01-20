@@ -1444,17 +1444,19 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)[
-                        "logprobs"
-                    ]
+                    train_data["prev_logprobs"] = policy.get_logprobs(
+                        logprob_data, timer=timer, timer_tag_prefix="policy_logprobs"
+                    )["logprobs"]
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(logprob_data)[
-                                "reference_logprobs"
-                            ]
+                            policy.get_reference_policy_logprobs(
+                                logprob_data,
+                                timer=timer,
+                                timer_tag_prefix="reference_logprobs",
+                            )["reference_logprobs"]
                         )
 
                     del logprob_data
@@ -1468,7 +1470,12 @@ def grpo_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                        timer_tag_prefix="policy_training",
+                    )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
