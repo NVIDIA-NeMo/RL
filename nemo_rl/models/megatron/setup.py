@@ -719,7 +719,7 @@ def setup_model_and_optimizer(
     megatron_cfg.peft = peft
 
     if megatron_cfg.peft is not None:
-        pre_peft_hook = _create_peft_pre_wrap_hook(cfg, state)
+        pre_peft_hook = _create_peft_pre_wrap_hook(megatron_cfg, state)
         megatron_cfg.model.register_pre_wrap_hook(pre_peft_hook)
 
         def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
