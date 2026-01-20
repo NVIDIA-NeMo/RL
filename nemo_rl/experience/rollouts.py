@@ -1042,7 +1042,7 @@ def run_async_nemo_gym_rollout(
                 nemo_gym_rows, tokenizer, timer_prefix, do_on_policy_fixes
             )
         )
-        assert len(results) == num_prompts_per_step * num_generations_per_prompt, (
+        assert (num_prompts_per_step is None and num_generations_per_prompt is None) or len(results) == num_prompts_per_step * num_generations_per_prompt, (
             f"Unexpected number of results! Found {len(results)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}"
         )
 
@@ -1232,7 +1232,7 @@ def run_async_nemo_gym_rollout(
         }
     )
 
-    assert len(input_ids) == num_prompts_per_step * num_generations_per_prompt, (
+    assert (num_prompts_per_step is None and num_generations_per_prompt is None) or len(input_ids) == num_prompts_per_step * num_generations_per_prompt, (
         f"Unexpected number of input_ids! Found {len(input_ids)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}"
     )
 
