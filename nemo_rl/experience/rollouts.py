@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import ray
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
@@ -983,6 +984,9 @@ def run_async_nemo_gym_rollout(
     greedy: bool = False,
     is_validation: bool = False,
     num_generations_per_prompt: Optional[int] = None,
+    num_prompts_per_step: Optional[int] = None,
+    should_use_nemo_gym_dynamic_sampling: bool = False,
+    dataloader: Optional[StatefulDataLoader] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     if is_validation:
@@ -1037,6 +1041,9 @@ def run_async_nemo_gym_rollout(
             nemo_gym_environment.run_rollouts.remote(
                 nemo_gym_rows, tokenizer, timer_prefix, do_on_policy_fixes
             )
+        )
+        assert (num_prompts_per_step is None and num_generations_per_prompt is None) or len(results) == num_prompts_per_step * num_generations_per_prompt, (
+            f"Unexpected number of results! Found {len(results)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}"
         )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
@@ -1223,6 +1230,10 @@ def run_async_nemo_gym_rollout(
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
         }
+    )
+
+    assert (num_prompts_per_step is None and num_generations_per_prompt is None) or len(input_ids) == num_prompts_per_step * num_generations_per_prompt, (
+        f"Unexpected number of input_ids! Found {len(input_ids)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}"
     )
 
     return AsyncNemoGymRolloutResult(

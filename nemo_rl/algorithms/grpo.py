@@ -914,6 +914,15 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _should_use_nemo_gym_dynamic_sampling(master_config: MasterConfig) -> bool:
+    env_config = master_config.get("env") or dict()
+    should_use_nemo_gym_dynamic_sampling = bool(
+        env_config.get("should_use_nemo_gym_dynamic_sampling")
+    )
+
+    return should_use_nemo_gym_dynamic_sampling
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1120,6 +1129,7 @@ def grpo_train(
             metrics_logging_data = dict()
             metrics = dict()
 
+            # TODO @bxyu-nvidia: figure out how to populate the original `len(dataloader)`. Maybe just guesstimate using len(dataloader) // grpo batch size with some drop_last logic?
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
@@ -1220,6 +1230,13 @@ def grpo_train(
                             num_generations_per_prompt=master_config["grpo"][
                                 "num_generations_per_prompt"
                             ],
+                            num_prompts_per_step=master_config["grpo"][
+                                "num_prompts_per_step"
+                            ],
+                            should_use_nemo_gym_dynamic_sampling=_should_use_nemo_gym_dynamic_sampling(
+                                master_config
+                            ),
+                            dataloader=dataloader,
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -1800,6 +1817,7 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            # TODO @bxyu-nvidia: check if Gym dynamic sampling has finished.
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
