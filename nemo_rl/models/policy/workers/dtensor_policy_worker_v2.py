@@ -37,7 +37,6 @@ from torch.distributed.tensor import DTensor
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
-    PreTrainedModel,
 )
 
 from nemo_rl.algorithms.interfaces import LossFunction
