@@ -3951,6 +3951,7 @@ fsdp = [
     { name = "vllm" },
 ]
 mcore = [
+    { name = "deep-ep" },
     { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
@@ -4874,20 +4875,21 @@ wheels = [
 
 [[package]]
 name = "perceptron"
-version = "0.1.4"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama" },
     { name = "httpx", extra = ["http2"] },
     { name = "numpy" },
     { name = "pillow" },
+    { name = "pydantic" },
     { name = "rich" },
     { name = "shellingham" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/30/60/85db2243d8b550823603d8f9c5845b0dd0f01074e9aabf0b2af0c4f52565/perceptron-0.1.4.tar.gz", hash = "sha256:62fd190efb74925e2cc33c0cd38761e19959be3bdb7b24fbf9e3386d6961f690", size = 78116, upload-time = "2025-11-12T20:00:28.024Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/ff/87efbc3988094e09eb29261d545c84cd0a21376daa997435f5566281e2d2/perceptron-0.2.0.tar.gz", hash = "sha256:369ff3078ba7ac9e3b5f30d9f75ff44d72991b64c94f93c5267e751552cab3f6", size = 87447, upload-time = "2026-01-14T23:42:37.713Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ef/17/b7cb1a10ebb0a9a4c9fbcd96a28b43d44e08a90f620bab07e644a658d2f1/perceptron-0.1.4-py3-none-any.whl", hash = "sha256:f490a6df6c15167e91e1a528601cae98ce99a30991cf792f9ef83ebc15d335c4", size = 57421, upload-time = "2025-11-12T20:00:26.395Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/83/983a6663a7814c0772eabdf3f2e616758abd50a244dfbd770785c9c2ab95/perceptron-0.2.0-py3-none-any.whl", hash = "sha256:7dc7713778b797f3cb013406eb507ae729ca360347dba8196e82361134a436e8", size = 61076, upload-time = "2026-01-14T23:42:36.525Z" },
 ]
 
 [[package]]
