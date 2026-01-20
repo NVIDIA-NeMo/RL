@@ -157,7 +157,7 @@ Depending on your data shape, you may want to change these values."""
         )
 
         nemo_rl_message_log = []
-        seen_token_ids: List[int] = []
+        seen_token_ids = torch.tensor([])
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -168,12 +168,15 @@ Depending on your data shape, you may want to change these values."""
                 continue
 
             # TODO: Even though we fork on `do_on_policy_fixes` here, we still need to fix the downstream logic for massaging the token_ids.
+            prompt_token_ids_tensor = torch.tensor(output_item_dict["prompt_token_ids"])
             assert (
                 not do_on_policy_fixes
-                or seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
+                or len(seen_token_ids) == 0
+                or torch.equal(
+                    seen_token_ids, prompt_token_ids_tensor[:len(seen_token_ids)]
+                )
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
+Seen token IDs: {seen_token_ids.tolist()}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
@@ -181,9 +184,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": prompt_token_ids_tensor[len(seen_token_ids) :],
                 }
             )
             nemo_rl_message_log.append(
@@ -197,8 +198,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids = torch.cat(
+                [
+                    seen_token_ids,
+                    nemo_rl_message_log[-2]["token_ids"],
+                    nemo_rl_message_log[-1]["token_ids"],
+                ]
+            )
 
             # We pop to remove larger tensors from logging.
             output_item_dict["prompt_str"] = tokenizer.decode(
