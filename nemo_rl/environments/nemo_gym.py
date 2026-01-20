@@ -173,7 +173,7 @@ Depending on your data shape, you may want to change these values."""
                 not do_on_policy_fixes
                 or len(seen_token_ids) == 0
                 or torch.equal(
-                    seen_token_ids, prompt_token_ids_tensor[:len(seen_token_ids)]
+                    seen_token_ids, prompt_token_ids_tensor[: len(seen_token_ids)]
                 )
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids.tolist()}
