@@ -1233,7 +1233,7 @@ def run_async_nemo_gym_rollout(
     )
 
     assert len(input_ids) == num_prompts_per_step * num_generations_per_prompt, (
-        f"Unexpected number of input_ids! Found {len(input_ids)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}
+        f"Unexpected number of input_ids! Found {len(input_ids)} results, but GRPO (num_prompts_per_step={num_prompts_per_step}) * (num_generations_per_prompt={num_generations_per_prompt}) = {num_prompts_per_step * num_generations_per_prompt}"
     )
 
     return AsyncNemoGymRolloutResult(
