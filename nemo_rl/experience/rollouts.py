@@ -1043,7 +1043,7 @@ def run_async_nemo_gym_rollout(
             )
         )
         assert len(results) == num_prompts_per_step * num_generations_per_prompt, (
-            f"Unexpected number of results! Found {len(results)} results, but GRPO ({num_prompts_per_step=}) * ({num_generations_per_prompt=}) = {num_prompts_per_step * num_generations_per_prompt}
+            f"Unexpected number of results! Found {len(results)} results, but GRPO ({num_prompts_per_step=}) * ({num_generations_per_prompt=}) = {num_prompts_per_step * num_generations_per_prompt}"
         )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
