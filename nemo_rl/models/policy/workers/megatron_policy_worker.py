@@ -131,7 +131,6 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.utils.weights import is_base_model_weight_name, is_lora_weight_name
 
 try:
     from megatron.core.distributed import (
@@ -2142,19 +2141,29 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             get_vllm_qkv_scale_names,
         )
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
+        if refit_base_model_weights:
+            # Converts full megatron model weights to HF weights.
+            base_iter = self.megatron_bridge.export_hf_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            )
 
-        # Yield the original parameters first.
-        for name, tensor in base_iter:
-            if is_base_model_weight_name(name) and not refit_base_model_weights:
-                continue
-            if is_lora_weight_name(name) and not refit_lora_weights:
-                continue
-            yield name, tensor
+            # Yield the original parameters first.
+            for name, tensor in base_iter:
+                yield name, tensor
+
+        elif refit_lora_weights:
+            # Converts megatron LoRA weights to HF weights.
+            lora_iter = self.megatron_bridge.export_adapter_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            )
+
+            # Yield the original parameters first.
+            for name, tensor in lora_iter:
+                yield name, tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -2207,7 +2216,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
             params_generator=self._iter_params_with_optional_kv_scales(
-                kv_scales=kv_scales
+                kv_scales=kv_scales,
                 refit_base_model_weights=refit_base_model_weights,
                 refit_lora_weights=refit_lora_weights,
             ),

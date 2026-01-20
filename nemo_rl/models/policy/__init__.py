@@ -25,13 +25,22 @@ class LoRAConfig(TypedDict):
     enabled: Literal[True]
     target_modules: list[str]
     exclude_modules: list[str]
-    match_all_linear: NotRequired[bool]
     dim: int
     alpha: int
     dropout: float
     dropout_position: Literal["pre", "post"]
+    
+class AutomodelLoRAConfig(LoRAConfig):
+    match_all_linear: NotRequired[bool]
     lora_A_init: str
     use_triton: NotRequired[bool]
+
+class MegatronLoRAConfig(LoRAConfig):
+    lora_A_init_method: str
+    lora_B_init_method: str
+    a2a_experimental: bool
+    lora_dtype: str
+
 
 
 class AutomodelBackendConfig(TypedDict):
@@ -87,7 +96,7 @@ class DTensorConfig(TypedDict):
     context_parallel_size: int
     custom_parallel_plan: str | None
     clear_cache_every_n_steps: NotRequired[int | None]
-    lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
+    lora_cfg: NotRequired[AutomodelLoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
 
 
@@ -184,6 +193,7 @@ class MegatronConfig(TypedDict):
     force_overwrite_initial_ckpt: NotRequired[bool]
     moe_per_layer_logging: bool
     optimizer: MegatronOptimizerConfig
+    peft: NotRequired[MegatronLoRAConfig | LoRAConfigDisabled]
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
 
