@@ -909,6 +909,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 rm_scores = to_local_if_dtensor(logits)
                 rm_scores = rm_scores.squeeze(-1)
+
+                # skip keeping the scores for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
                 all_rm_scores.append(rm_scores)
 
         all_rm_scores = torch.cat(all_rm_scores, dim=0)
@@ -1125,6 +1130,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Update batch_size and seq_len for consistency
                     batch_size = original_batch_size
                     seq_len = original_seq_len
+
+                # skip keeping the topk values for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
 
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
