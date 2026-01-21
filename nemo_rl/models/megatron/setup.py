@@ -398,11 +398,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         "moe_router_bias_update_rate"
     ]
 
-    model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"]["moe_enable_deepep"]
-    model_cfg.moe_token_dispatcher_type = self.cfg["megatron_cfg"][
+    model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
+    model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
-    model_cfg.moe_shared_expert_overlap = self.cfg["megatron_cfg"][
+    model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
 
