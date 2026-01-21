@@ -171,6 +171,7 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 about/overview
 about/performance-summary
+about/model-support
 about/features
 about/backends
 about/quick-start
