@@ -11,11 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    from nemo_gym import config_types  # noqa: F401
-
-    INSTALLED = True
-except Exception:
-    INSTALLED = False
-
-print(f"NEMO_GYM {INSTALLED=}")
