@@ -7,6 +7,7 @@
 ## SYNC
 tests/test_suites/llm/performance/grpo-llama3.1-8b-instruct-2n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n8g.sh
+tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n8g-40K.sh
 tests/test_suites/llm/performance/grpo-deepseek-v3-32n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-32b-4n8g.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-16n8g.sh
