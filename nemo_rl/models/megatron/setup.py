@@ -225,12 +225,7 @@ def validate_and_set_config(
         )
 
     megatron_cfg, model_cfg = setup_model_config(
-        config,
-        rank,
-        dtype,
-        hf_model_name,
-        pretrained_path,
-        weights_path
+        config, rank, dtype, hf_model_name, pretrained_path, weights_path
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -333,9 +328,7 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Create checkpoint configs
-    checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path
-    )
+    checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
