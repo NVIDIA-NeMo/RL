@@ -29,7 +29,7 @@ policy:
       pp_size: 1
       ep_size: 1
       max_running_requests: null
-      mem_fraction_static: 0.7
+      mem_fraction_static: 0.5
       skip_server_warmup: true
 
 data:
