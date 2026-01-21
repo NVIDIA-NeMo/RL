@@ -217,6 +217,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.rank,
             hf_model_name,
             pretrained_path,
+            weights_path,
             tokenizer,
         )
 

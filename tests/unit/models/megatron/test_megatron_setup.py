@@ -30,6 +30,7 @@ import pytest
 import torch
 
 
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 

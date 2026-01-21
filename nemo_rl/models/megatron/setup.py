@@ -192,6 +192,7 @@ def validate_and_set_config(
     rank,
     hf_model_name,
     pretrained_path,
+    weights_path,
     tokenizer,
 ):
     # Handle generation colocation
@@ -229,6 +230,7 @@ def validate_and_set_config(
         dtype,
         hf_model_name,
         pretrained_path,
+        weights_path
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -272,6 +274,7 @@ def setup_model_config(
     dtype,
     hf_model_name: str,
     pretrained_path: str,
+    weights_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
@@ -331,7 +334,7 @@ def setup_model_config(
 
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, config.get("weights_path")
+        pretrained_path, weights_path
     )
 
     # Validate training configuration
