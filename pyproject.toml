@@ -100,6 +100,7 @@ mcore = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
   "vllm==0.11.2",
 ]
@@ -178,7 +179,7 @@ members = [
   "3rdparty/Megatron-LM-workspace",
   "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
-  "3rdparty/Gym-workspace",
+  "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
   # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
@@ -234,6 +235,7 @@ constraint-dependencies = [
   "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
   "urllib3>=2.6.3",    # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
+  "pyasn1>=0.6.2",     # Address CVE GHSA-63vm-454h-vhhq
 ]
 
 # Augment build dependencies for packages that need torch at build time
