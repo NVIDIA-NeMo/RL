@@ -905,7 +905,7 @@ class TestSetupModelAndOptimizer:
     @patch("nemo_rl.models.megatron.setup.get_model")
     @patch("nemo_rl.models.megatron.setup.setup_optimizer")
     @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
-    @patch("nemo_rl.models.megatron.setup.CustomFloat16Module")
+    @patch("nemo_rl.models.megatron.setup.MoEFloat16Module")
     @patch("torch.distributed.all_reduce")
     @patch("torch.distributed.barrier")
     @patch("torch.tensor")

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -229,7 +229,6 @@ def validate_and_set_config(
         dtype,
         hf_model_name,
         pretrained_path,
-        tokenizer,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -273,8 +272,7 @@ def setup_model_config(
     dtype,
     hf_model_name: str,
     pretrained_path: str,
-    tokenizer: TokenizerType,
-) -> ConfigContainer:
+) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
     pretrained_run_config = os.path.join(
@@ -504,7 +502,7 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 def _create_checkpoint_config(
     pretrained_path: str, weights_path: Optional[str]
-) -> tuple[CheckpointConfig, CheckpointConfig]:
+) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
         save_interval=100,
