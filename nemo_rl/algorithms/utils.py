@@ -520,48 +520,48 @@ def print_performance_metrics(
     ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
-    if is_vllm_metrics_logger_enabled:
-        vllm_logger_metrics = metrics.get("generation_logger_metrics", {})
+    generation_logger_metrics = metrics.get("generation_logger_metrics", {})
+    if is_vllm_metrics_logger_enabled and generation_logger_metrics:
+        vllm_logger_metrics = generation_logger_metrics
         # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
 
-        if vllm_logger_metrics:
-            assert "inflight_batch_sizes" in vllm_logger_metrics, (
-                "inflight_batch_sizes not found in vllm_logger_metrics"
-            )
-            assert "num_pending_samples" in vllm_logger_metrics, (
-                "num_pending_samples not found in vllm_logger_metrics"
-            )
-            assert isinstance(vllm_logger_metrics["inflight_batch_sizes"], dict), (
-                "inflight_batch_sizes must be a dictionary"
-            )
-            assert isinstance(vllm_logger_metrics["num_pending_samples"], dict), (
-                "num_pending_samples must be a dictionary"
-            )
+        assert "inflight_batch_sizes" in vllm_logger_metrics, (
+            "inflight_batch_sizes not found in vllm_logger_metrics"
+        )
+        assert "num_pending_samples" in vllm_logger_metrics, (
+            "num_pending_samples not found in vllm_logger_metrics"
+        )
+        assert isinstance(vllm_logger_metrics["inflight_batch_sizes"], dict), (
+            "inflight_batch_sizes must be a dictionary"
+        )
+        assert isinstance(vllm_logger_metrics["num_pending_samples"], dict), (
+            "num_pending_samples must be a dictionary"
+        )
 
-            vllm_metrics_logger_interval = master_config["policy"]["generation"][
-                "vllm_cfg"
-            ]["vllm_metrics_logger_interval"]
-            print("  • vLLM Logger Metrics:")
-            # Visualize the inflight batch sizes timeline
-            if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
+        vllm_metrics_logger_interval = master_config["policy"]["generation"][
+            "vllm_cfg"
+        ]["vllm_metrics_logger_interval"]
+        print("  • vLLM Logger Metrics:")
+        # Visualize the inflight batch sizes timeline
+        if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
+            visualize_per_worker_timeline(
+                vllm_logger_metrics["inflight_batch_sizes"],
+                "Inflight Batch Sizes",
+                vllm_metrics_logger_interval,
+            )
+        if len(vllm_logger_metrics["num_pending_samples"].values()) > 0:
+            max_num_pending_samples = max(
+                (max(v) if v else 0)
+                for v in vllm_logger_metrics["num_pending_samples"].values()
+            )
+            # If there is at least one pending sample, visualize the timeline
+            if max_num_pending_samples > 0:
                 visualize_per_worker_timeline(
-                    vllm_logger_metrics["inflight_batch_sizes"],
-                    "Inflight Batch Sizes",
-                    vllm_metrics_logger_interval,
+                    vllm_logger_metrics["num_pending_samples"],
+                    "Num Pending Samples",
+                    None,
                 )
-            if len(vllm_logger_metrics["num_pending_samples"].values()) > 0:
-                max_num_pending_samples = max(
-                    (max(v) if v else 0)
-                    for v in vllm_logger_metrics["num_pending_samples"].values()
-                )
-                # If there is at least one pending sample, visualize the timeline
-                if max_num_pending_samples > 0:
-                    visualize_per_worker_timeline(
-                        vllm_logger_metrics["num_pending_samples"],
-                        "Num Pending Samples",
-                        None,
-                    )
 
     # =====================================================
     # Throughputs

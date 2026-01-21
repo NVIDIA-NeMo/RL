@@ -20,7 +20,7 @@ policy:
     max_new_tokens: 512
     sglang_cfg:
       model_path: ${policy.model_name}
-      gpus_per_server: 8
+      gpus_per_server: 1
       dtype: ${policy.precision}
       context_length: 512
       allow_auto_truncate: true

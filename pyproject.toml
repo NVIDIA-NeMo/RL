@@ -384,16 +384,16 @@ select = ["D", "F"]
 #   documentation for every function parameter.
 # - F841: local variable assigned but never used (exluced to favor readability)
 # TODO: Remove D10 once we are about to release to get all the docstrings written
-# Also ignore rules that conflict with Google style or are overly rigid.
-ignore = ["D417", "D10", "F841", "D203", "D213", "D401"]
+ignore = ["D417", "D10", "F841"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-ignore-decorators = []
 
 # Section to exclude errors for different file types
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
-"nemo_rl/__init__.py" = ["F401"]
-"nemo_rl/**/__init__.py" = ["F401"]
+# Ignore all files that end in `_test.py`.
+"*_test.py" = ["D"]
+# Ignore F401 (import but unused) in __init__.py
+"__init__.py" = ["F401"]

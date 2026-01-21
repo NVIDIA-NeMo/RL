@@ -18,13 +18,3 @@ __all__ = [
     "SGLangConfig",
     "SGLangGeneration",
 ]
-
-
-def __getattr__(name: str):
-    if name == "SGLangGenerationWorker":
-        from nemo_rl.models.generation.sglang.sglang_worker import (
-            SGLangGenerationWorker,
-        )
-
-        return SGLangGenerationWorker
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
