@@ -195,6 +195,7 @@ members = [
 constraints = [
     { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "brotli", specifier = ">=1.2.0" },
+    { name = "pyasn1", specifier = ">=0.6.2" },
     { name = "starlette", specifier = ">=0.49.1" },
     { name = "urllib3", specifier = ">=2.6.3" },
 ]
@@ -4579,6 +4580,7 @@ fsdp = [
     { name = "vllm" },
 ]
 mcore = [
+    { name = "deep-ep" },
     { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
@@ -4667,6 +4669,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
     { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
+    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "einops", marker = "extra == 'sglang'" },
@@ -5825,20 +5828,21 @@ wheels = [
 
 [[package]]
 name = "perceptron"
-version = "0.1.4"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama" },
     { name = "httpx", extra = ["http2"] },
     { name = "numpy" },
     { name = "pillow" },
+    { name = "pydantic" },
     { name = "rich" },
     { name = "shellingham" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/30/60/85db2243d8b550823603d8f9c5845b0dd0f01074e9aabf0b2af0c4f52565/perceptron-0.1.4.tar.gz", hash = "sha256:62fd190efb74925e2cc33c0cd38761e19959be3bdb7b24fbf9e3386d6961f690", size = 78116, upload-time = "2025-11-12T20:00:28.024Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/ff/87efbc3988094e09eb29261d545c84cd0a21376daa997435f5566281e2d2/perceptron-0.2.0.tar.gz", hash = "sha256:369ff3078ba7ac9e3b5f30d9f75ff44d72991b64c94f93c5267e751552cab3f6", size = 87447, upload-time = "2026-01-14T23:42:37.713Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ef/17/b7cb1a10ebb0a9a4c9fbcd96a28b43d44e08a90f620bab07e644a658d2f1/perceptron-0.1.4-py3-none-any.whl", hash = "sha256:f490a6df6c15167e91e1a528601cae98ce99a30991cf792f9ef83ebc15d335c4", size = 57421, upload-time = "2025-11-12T20:00:26.395Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/83/983a6663a7814c0772eabdf3f2e616758abd50a244dfbd770785c9c2ab95/perceptron-0.2.0-py3-none-any.whl", hash = "sha256:7dc7713778b797f3cb013406eb507ae729ca360347dba8196e82361134a436e8", size = 61076, upload-time = "2026-01-14T23:42:36.525Z" },
 ]
 
 [[package]]
@@ -6215,11 +6219,11 @@ wheels = [
 
 [[package]]
 name = "pyasn1"
-version = "0.6.1"
+version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ba/e9/01f1a64245b89f039897cb0130016d79f77d52669aae6ee7b159a6c4c018/pyasn1-0.6.1.tar.gz", hash = "sha256:6f580d2bdd84365380830acf45550f2511469f673cb4a5ae3857a3170128b034", size = 145322, upload-time = "2024-09-10T22:41:42.55Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fe/b6/6e630dff89739fcd427e3f72b3d905ce0acb85a45d4ec3e2678718a3487f/pyasn1-0.6.2.tar.gz", hash = "sha256:9b59a2b25ba7e4f8197db7686c09fb33e658b98339fadb826e9512629017833b", size = 146586, upload-time = "2026-01-16T18:04:18.534Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c8/f1/d6a797abb14f6283c0ddff96bbdd46937f64122b8c925cab503dd37f8214/pyasn1-0.6.1-py3-none-any.whl", hash = "sha256:0d632f46f2ba09143da3a8afe9e33fb6f92fa2320ab7e886e2d0f7672af84629", size = 83135, upload-time = "2024-09-11T16:00:36.122Z" },
+    { url = "https://files.pythonhosted.org/packages/44/b5/a96872e5184f354da9c84ae119971a0a4c221fe9b27a4d94bd43f2596727/pyasn1-0.6.2-py3-none-any.whl", hash = "sha256:1eb26d860996a18e9b6ed05e7aae0e9fc21619fcee6af91cca9bad4fbea224bf", size = 83371, upload-time = "2026-01-16T18:04:17.174Z" },
 ]
 
 [[package]]
