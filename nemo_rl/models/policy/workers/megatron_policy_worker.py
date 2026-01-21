@@ -25,7 +25,7 @@ import ray
 import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
-from megatron.bridge.peft.lora import LoRA
+from megatron.bridge.peft.lora import LoRA, LoRAMerge
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
@@ -279,11 +279,7 @@ def setup_megatron_model(
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 
-    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-        if use_peft:
-            raise ValueError(
-                "Freezing the MOE router is not currently supported when using PEFT"
-            )
+    if policy_cfg["megatron_cfg"]["freeze_moe_router"] and not use_peft:
 
         def freeze_moe_router(megatron_model):
             if not isinstance(megatron_model, list):
@@ -2060,6 +2056,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         no_grad.__exit__(None, None, None)
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
+
+    def merge_peft_weights(self):
+        merge = LoRAMerge()
+        merged_model = merge(self.model, training=False)
+        for m in merged_model.modules():
+            if hasattr(m, "adapter"):
+                delattr(m, "adapter")
+
+        return merged_model
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
