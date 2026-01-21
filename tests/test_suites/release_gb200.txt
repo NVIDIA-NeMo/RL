@@ -1,0 +1,44 @@
+########
+# GRPO #
+########
+
+# Megatron (Qwen/Qwen2.5-7B-Instruct)
+tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n4g-megatron.sh
+
+# Long 8b run
+tests/test_suites/llm/grpo-llama3.1-8b-instruct-4n4g-fsdp2tp1-long.v3.sh
+
+# Long 32b run
+tests/test_suites/llm/grpo-qwen2.5-32b-32n4g-fsdp2tp4-actckpt-long.v3.sh
+
+# Long Gemma3 27b run
+tests/test_suites/llm/grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.sh
+
+# Long Megatron Qwen3 30B-A3B run
+tests/test_suites/llm/grpo-qwen3-30ba3b-8n4g-megatron.sh
+
+# DAPO 4h run
+tests/test_suites/llm/dapo-qwen2.5-7b-16n4g-fsdp2cp2.sh
+
+# Deepseek-V3 on DAPO dataset
+tests/test_suites/llm/grpo-dapomath17k-dsv3-32n4g-megatron.sh
+
+# GPT-OSS
+tests/test_suites/llm/grpo-gptoss-20b-8n4g-megatron.sh
+
+#######
+# SFT #
+#######
+
+# Long 8b convergence
+tests/test_suites/llm/sft-llama3.1-8b-1n4g-fsdp2tp1-long.sh
+
+# 300 step 70b convergence
+tests/test_suites/llm/sft-llama3.1-70b-8n4g-tp2pp2-long-megatron.sh
+
+################
+# Distillation #
+################
+
+# Long 4b convergence
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long.v1.sh

@@ -19,7 +19,7 @@ uv run examples/run_sft.py \
     sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=ruit_personal_debug \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \

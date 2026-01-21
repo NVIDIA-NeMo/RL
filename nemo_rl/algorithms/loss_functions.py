@@ -168,7 +168,8 @@ class ClippedPGLossFn(LossFunction):
         advantages = data["advantages"][:, 1:]
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
-        reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        if self.reference_policy_kl_penalty != 0:
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
