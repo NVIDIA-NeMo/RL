@@ -53,7 +53,8 @@ def mock_dp_mesh():
 
 @pytest.mark.automodel
 class TestGetMicrobatchIterator:
-    def test_regular_batching(self):
+    def test_regular_batching(self, mock_tokenizer):
+        """Test regular batching returns ProcessedMicrobatch objects."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -62,31 +63,38 @@ class TestGetMicrobatchIterator:
             }
         )
 
-        cfg = {"dynamic_batching": {"enabled": False}}
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
         mbs = 4
         enable_seq_packing = False
         mock_dp_mesh = MagicMock()
 
-        mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+        processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
             enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+            cp_size=1,
         )
 
         # Verify iterator length
         assert iterator_len == 4  # 16 / 4 = 4
 
-        # Verify we can iterate through the data
-        batches = list(mb_iterator)
+        # Verify we get ProcessedMicrobatch objects
+        batches = list(processed_iterator)
         assert len(batches) == 4
-        assert batches[0]["input_ids"].shape[0] == 4
+        for batch in batches:
+            assert isinstance(batch, ProcessedMicrobatch)
+            assert isinstance(batch.processed_inputs, ProcessedInputs)
+            assert batch.original_batch_size == 4
+            assert batch.original_seq_len == 128
 
-        # Verify dummy iterator is empty
-        assert list(dummy_iterator) == []
-
-    def test_dynamic_batching(self):
+    def test_dynamic_batching(self, mock_tokenizer):
+        """Test dynamic batching."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -96,23 +104,46 @@ class TestGetMicrobatchIterator:
         )
 
         # Mock the microbatch iterator methods
-        mock_iterator = iter([data, data, data])
+        batch1 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        batch2 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        batch3 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        mock_iterator = iter([batch1, batch2, batch3])
         data.make_microbatch_iterator_with_dynamic_shapes = MagicMock(
             return_value=mock_iterator
         )
         data.get_microbatch_iterator_dynamic_shapes_len = MagicMock(return_value=3)
 
-        cfg = {"dynamic_batching": {"enabled": True}}
+        cfg = {
+            "dynamic_batching": {"enabled": True},
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
         mbs = 4
         enable_seq_packing = False
         mock_dp_mesh = MagicMock()
 
-        mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+        processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
             enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+            cp_size=1,
         )
 
         # Verify dynamic batching was used
@@ -120,12 +151,30 @@ class TestGetMicrobatchIterator:
         data.make_microbatch_iterator_with_dynamic_shapes.assert_called_once()
         data.get_microbatch_iterator_dynamic_shapes_len.assert_called_once()
 
-        # Verify dummy iterator is empty
-        assert list(dummy_iterator) == []
+        # Verify we get ProcessedMicrobatch objects
+        batches = list(processed_iterator)
+        assert len(batches) == 3
+        for batch in batches:
+            assert isinstance(batch, ProcessedMicrobatch)
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
-    def test_sequence_packing(self, mock_all_reduce):
+    def test_sequence_packing(self, mock_all_reduce, mock_tokenizer):
+        """Test sequence packing."""
         # Create test data
+        batch1 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "input_lengths": torch.tensor([64, 80, 90, 100]),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        batch2 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "input_lengths": torch.tensor([70, 85, 95, 110]),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
         data = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, 1000, (8, 128)),
@@ -135,7 +184,7 @@ class TestGetMicrobatchIterator:
         )
 
         # Mock the microbatch iterator methods
-        mock_iterator = iter([data, data])
+        mock_iterator = iter([batch1, batch2])
         data.make_microbatch_iterator_for_packable_sequences = MagicMock(
             return_value=mock_iterator
         )
@@ -143,7 +192,11 @@ class TestGetMicrobatchIterator:
             return_value=(2, 100)
         )
 
-        cfg = {"dynamic_batching": {"enabled": False}}
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": 512},
+        }
         mbs = 4
         enable_seq_packing = True
         mock_dp_mesh = MagicMock()
@@ -154,12 +207,14 @@ class TestGetMicrobatchIterator:
 
         mock_all_reduce.side_effect = side_effect
 
-        mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+        processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
             enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+            cp_size=1,
         )
 
         # Verify sequence packing was used
@@ -169,56 +224,6 @@ class TestGetMicrobatchIterator:
 
         # Verify all_reduce was called to synchronize batch counts
         mock_all_reduce.assert_called_once()
-
-        # Verify dummy iterator is empty (when all ranks have same batch count)
-        assert list(dummy_iterator) == []
-
-    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
-    def test_sequence_packing_with_uneven_batch_counts(self, mock_all_reduce):
-        # Create test data
-        data = BatchedDataDict(
-            {
-                "input_ids": torch.randint(0, 1000, (8, 128)),
-                "input_lengths": torch.randint(64, 128, (8,)),
-                "sample_mask": torch.ones(8, dtype=torch.bool),
-            }
-        )
-
-        # Mock the microbatch iterator methods
-        mock_iterator1 = iter([data, data])
-        mock_iterator2 = iter([data, data])
-        data.make_microbatch_iterator_for_packable_sequences = MagicMock(
-            side_effect=[mock_iterator1, mock_iterator2]
-        )
-        data.get_microbatch_iterator_for_packable_sequences_len = MagicMock(
-            return_value=(2, 100)
-        )
-
-        cfg = {"dynamic_batching": {"enabled": False}}
-        mbs = 4
-        enable_seq_packing = True
-        mock_dp_mesh = MagicMock()
-
-        # Mock all_reduce to simulate max_batch_ct = 4 (higher than local 2)
-        def side_effect(tensor, *args, **kwargs):
-            tensor[0] = 4  # Simulate max batch count from other ranks
-
-        mock_all_reduce.side_effect = side_effect
-
-        mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
-            data=data,
-            cfg=cfg,
-            enable_seq_packing=enable_seq_packing,
-            mbs=mbs,
-            dp_mesh=mock_dp_mesh,
-        )
-
-        # Verify sequence packing was used
-        assert iterator_len == 2
-
-        # Verify dummy iterator has 2 batches (4 - 2 = 2)
-        dummy_batches = list(dummy_iterator)
-        assert len(dummy_batches) == 2
 
 
 @pytest.mark.automodel
@@ -402,6 +407,40 @@ class TestProcessMicrobatch:
 
         with pytest.raises(
             AssertionError, match="are not supported for context parallel"
+        ):
+            process_microbatch(
+                mb=mb,
+                tokenizer=mock_tokenizer,
+                enable_seq_packing=enable_seq_packing,
+                cfg=cfg,
+                cp_size=cp_size,
+            )
+
+    def test_sequence_packing_with_multimodal_raises_error(self, mock_tokenizer):
+        # Create test microbatch with multimodal data
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 64)),
+                "input_lengths": torch.tensor([32, 64]),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+                "pixel_values": torch.randn(2, 3, 224, 224),
+            }
+        )
+
+        # Mock get_multimodal_dict to return non-empty dict
+        mock_multimodal_dict = {"pixel_values": torch.randn(2, 3, 224, 224)}
+        mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
+
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": 128},
+        }
+        enable_seq_packing = True
+        cp_size = 1
+
+        with pytest.raises(
+            AssertionError,
+            match="multimodal kwargs are not supported for sequence packing",
         ):
             process_microbatch(
                 mb=mb,
@@ -999,30 +1038,23 @@ class TestIntegrationScenarios:
 
         batch = global_batch_result["batch"]
 
-        # Step 2: Get microbatch iterator
-        mb_iterator, iterator_len, _ = get_microbatch_iterator(
+        # Step 2: Get processed microbatch iterator (now integrated with processing)
+        processed_iterator, iterator_len = get_microbatch_iterator(
             data=batch,
             cfg=cfg,
             enable_seq_packing=enable_seq_packing,
             mbs=2,
             dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+            cp_size=cp_size,
         )
 
-        # Step 3: Process each microbatch
-        processed_mbs = []
-        for mb in mb_iterator:
-            result = process_microbatch(
-                mb=mb,
-                tokenizer=mock_tokenizer,
-                enable_seq_packing=enable_seq_packing,
-                cfg=cfg,
-                cp_size=cp_size,
-            )
-            processed_mbs.append(result)
+        # Step 3: Iterate through processed microbatches
+        processed_mbs = list(processed_iterator)
 
         # Verify pipeline results
         assert len(processed_mbs) == iterator_len
-        assert all(isinstance(mb, ProcessedInputs) for mb in processed_mbs)
-        assert all(mb.input_ids.shape[0] == 2 for mb in processed_mbs)
+        assert all(isinstance(mb, ProcessedMicrobatch) for mb in processed_mbs)
+        assert all(mb.processed_inputs.input_ids.shape[0] == 2 for mb in processed_mbs)
         assert global_batch_result["global_valid_seqs"] == 8
         assert global_batch_result["global_valid_toks"] == 512

@@ -146,8 +146,10 @@ def get_microbatch_iterator(
     enable_seq_packing: bool,
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
-) -> tuple[Iterator, int, Iterator]:
-    """Create microbatch iterator based on batching strategy.
+    tokenizer: AutoTokenizer,
+    cp_size: int = 1,
+) -> tuple[Iterator[ProcessedMicrobatch], int]:
+    """Create processed microbatch iterator based on batching strategy.
 
     Args:
         data: Full dataset to iterate over
@@ -155,11 +157,13 @@ def get_microbatch_iterator(
         enable_seq_packing: Whether sequence packing is enabled
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
+        tokenizer: Tokenizer for processing
+        cp_size: Context parallel size
 
     Returns:
-        Tuple of (microbatch_iterator, iterator_length, dummy_iterator)
+        Tuple of (processed_microbatch_iterator, iterator_length)
     """
-    dummy_iterator = iter([])
+    dummy_iterator: Iterator[BatchedDataDict[Any]] = iter([])
 
     if cfg["dynamic_batching"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
@@ -181,7 +185,15 @@ def get_microbatch_iterator(
         mb_iterator = data.make_microbatch_iterator(mbs)
         iterator_len = data.size // mbs
 
-    return mb_iterator, iterator_len, dummy_iterator
+    # Wrap raw iterators to get processed microbatches
+    processed_iterator = make_processed_microbatch_iterator(
+        itertools.chain(mb_iterator, dummy_iterator),
+        tokenizer,
+        enable_seq_packing,
+        cfg,
+        cp_size,
+    )
+    return processed_iterator, iterator_len
 
 
 def process_microbatch(
@@ -240,6 +252,9 @@ def process_microbatch(
     vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
     if len(vlm_kwargs) > 0:
         position_ids = None
+        assert not enable_seq_packing, (
+            "multimodal kwargs are not supported for sequence packing"
+        )
         assert not cfg["dtensor_cfg"]["sequence_parallel"], (
             "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
         )

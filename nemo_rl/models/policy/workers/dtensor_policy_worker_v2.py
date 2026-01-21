@@ -14,7 +14,6 @@
 
 import contextlib
 import gc
-import itertools
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -50,7 +49,6 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
-    make_processed_microbatch_iterator,
     process_global_batch,
 )
 from nemo_rl.models.automodel.setup import (
@@ -337,8 +335,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self.optimizer.zero_grad()
                 mb_losses = []
                 # Get microbatch iterator based on batching strategy
-                mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
-                    batch, self.cfg, self.enable_seq_packing, mbs, self.dp_mesh
+                processed_iterator, iterator_len = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    self.enable_seq_packing,
+                    mbs,
+                    self.dp_mesh,
+                    tokenizer=self.tokenizer,
+                    cp_size=self.cp_size,
                 )
 
                 empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -348,15 +352,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     warnings.warn(
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
-
-                # Wrap raw iterator to get processed microbatches
-                processed_iterator = make_processed_microbatch_iterator(
-                    itertools.chain(mb_iterator, dummy_iterator),
-                    self.tokenizer,
-                    self.enable_seq_packing,
-                    self.cfg,
-                    self.cp_size,
-                )
 
                 for mb_idx, processed_mb in enumerate(processed_iterator):
                     # Conditioanlly empty cache when sensitive to fragmentation
@@ -398,10 +393,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
                             # Note that it should be empty anyway since sequence packing
                             # is not supported for reward models.
-                            assert not flash_attn_kwargs
+                            assert not processed_inputs.has_flash_attention
                             del model_args["flash_attn_kwargs"]
                         # remove flash_attn_kwargs if there are multimodal kwargs
-                        if len(vlm_kwargs) > 0:
+                        if processed_inputs.is_multimodal:
                             del model_args["flash_attn_kwargs"]
 
                         if (
@@ -615,21 +610,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             # Get microbatch iterator based on batching strategy
-            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+            processed_iterator, iterator_len = get_microbatch_iterator(
                 data,
                 self.cfg,
                 self.enable_seq_packing,
                 logprob_batch_size,
                 self.dp_mesh,
-            )
-
-            # Wrap raw iterator to get processed microbatches
-            processed_iterator = make_processed_microbatch_iterator(
-                itertools.chain(mb_iterator, dummy_iterator),
-                self.tokenizer,
-                self.enable_seq_packing,
-                self.cfg,
-                self.cp_size,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
             )
 
             step = 0
@@ -638,6 +626,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Extract data dict and processed inputs
                 lp_batch = processed_mb.data_dict
                 processed_inputs = processed_mb.processed_inputs
+
+                # Use original shapes from ProcessedMicrobatch (needed for unpacking later)
+                original_batch_size = processed_mb.original_batch_size
+                original_seq_len = processed_mb.original_seq_len
 
                 # Extract values from processed inputs
                 input_ids = processed_inputs.input_ids
@@ -677,7 +669,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         flash_attn_kwargs=flash_attn_kwargs,
                         **vlm_kwargs,
                     )
-                    if len(vlm_kwargs) > 0:
+                    if processed_inputs.is_multimodal:
                         del model_args["flash_attn_kwargs"]
 
                     if (
@@ -801,13 +793,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     token_logprobs = token_logprobs * post_attention_mask
                 else:
                     # For packed sequences, unpack logprobs
+                    # Use original_batch_size since packed sequences have shape [1, packed_seq_len]
                     unpacked_logprobs = torch.zeros(
-                        (batch_size, seq_dim_size),
+                        (original_batch_size, seq_dim_size),
                         dtype=token_logprobs.dtype,
                         device=token_logprobs.device,
                     )
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q
-                    for i in range(batch_size):
+                    for i in range(original_batch_size):
                         start = cu_seqlens[i].item() + 1
                         end = cu_seqlens[i + 1].item()
                         seq_len_actual = input_lengths[i].item()
@@ -850,17 +843,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             # Get microbatch iterator based on batching strategy
-            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
-                data, self.cfg, self.enable_seq_packing, global_batch_size, self.dp_mesh
-            )
-
-            # Wrap raw iterator to get processed microbatches
-            processed_iterator = make_processed_microbatch_iterator(
-                itertools.chain(mb_iterator, dummy_iterator),
-                self.tokenizer,
-                self.enable_seq_packing,
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
                 self.cfg,
-                self.cp_size,
+                self.enable_seq_packing,
+                global_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
             )
 
             step = 0
@@ -958,17 +948,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             # Get microbatch iterator based on batching strategy
-            mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
-                data, self.cfg, self.enable_seq_packing, topk_batch_size, self.dp_mesh
-            )
-
-            # Wrap raw iterator to get processed microbatches
-            processed_iterator = make_processed_microbatch_iterator(
-                itertools.chain(mb_iterator, dummy_iterator),
-                self.tokenizer,
-                self.enable_seq_packing,
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
                 self.cfg,
-                self.cp_size,
+                self.enable_seq_packing,
+                topk_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
