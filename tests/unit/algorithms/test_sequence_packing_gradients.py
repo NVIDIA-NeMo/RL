@@ -339,8 +339,6 @@ class SequencePackingGradientTestActor:
                         "pipeline_model_parallel_size": 1,
                         "context_parallel_size": cp_size,
                     },
-
-
                 },
                 seq_length_key="input_lengths",
                 pad_individual_seqs_to_multiple_of=pad_to_multiple,

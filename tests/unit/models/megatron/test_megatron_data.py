@@ -73,6 +73,7 @@ class TestProcessedMicrobatchDataclass:
         assert microbatch.packed_seq_params == mock_packed_seq_params
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
 
+
 class TestCheckSequenceDim:
     """Tests for check_sequence_dim function."""
 
@@ -154,7 +155,9 @@ class TestProcessMicrobatch:
 
         # Create test data
         data_dict = MagicMock()
-        input_ids = torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0, 0, 0], [6, 7, 8, 9, 10, 11, 12, 0, 0, 0]])
+        input_ids = torch.tensor(
+            [[1, 2, 3, 4, 5, 0, 0, 0, 0, 0], [6, 7, 8, 9, 10, 11, 12, 0, 0, 0]]
+        )
         data_dict.__getitem__ = MagicMock(return_value=input_ids)
 
         (
@@ -178,7 +181,9 @@ class TestProcessMicrobatch:
         mock_get_masks.assert_called_once()
 
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
-    @patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
     @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
     def test_process_microbatch_with_packing(
         self, mock_pack, mock_cp_world, mock_cp_rank
@@ -226,7 +231,7 @@ class TestProcessMicrobatch:
         assert attention_mask is None
         assert position_ids is None
         assert cu_seqlens_padded is not None
-  
+
         # Verify pack was called
         mock_pack.assert_called_once()
 
@@ -323,6 +328,7 @@ class TestProcessGlobalBatch:
 
         assert "sample_mask must be present" in str(exc_info.value)
 
+
 class TestGetMicrobatchIterator:
     """Tests for get_microbatch_iterator function."""
 
@@ -383,8 +389,13 @@ class TestGetMicrobatchIterator:
         mock_make_iterator.return_value = mock_iterator
 
         mock_data = MagicMock()
-        mock_data.make_microbatch_iterator_for_packable_sequences.return_value = iter([])
-        mock_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (10, 512)
+        mock_data.make_microbatch_iterator_for_packable_sequences.return_value = iter(
+            []
+        )
+        mock_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (
+            10,
+            512,
+        )
 
         cfg = {
             "dynamic_batching": {"enabled": False},
@@ -473,8 +484,13 @@ class TestGetMicrobatchIterator:
         mock_make_iterator.return_value = mock_iterator
 
         mock_data = MagicMock()
-        mock_data.make_microbatch_iterator_for_packable_sequences.return_value = iter([])
-        mock_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (5, 256)
+        mock_data.make_microbatch_iterator_for_packable_sequences.return_value = iter(
+            []
+        )
+        mock_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (
+            5,
+            256,
+        )
 
         cfg = {
             "dynamic_batching": {"enabled": False},
@@ -1677,4 +1693,3 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
     # Check that all workers succeeded
     for i, result in enumerate(results):
         assert result["success"], f"Worker {i} failed: {result['error']}"
-

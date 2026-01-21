@@ -113,11 +113,11 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
+from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -1000,7 +1000,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     micro_batch_size,
                     seq_length,
                     padded_seq_length,
-                ) = get_microbatch_iterator(batch, self.cfg, mbs)
+                ) = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    mbs,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
@@ -1024,9 +1029,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         data_iterator=data_iterator,
                         model=self.model,
                         num_microbatches=num_microbatches,
-                        seq_length=seq_dim_size,
+                        seq_length=padded_seq_length,
                         micro_batch_size=mbs,
-                        decoder_seq_length=seq_dim_size,
+                        decoder_seq_length=padded_seq_length,
                         forward_only=eval_mode,
                         do_not_average_loss=True,
                     )
@@ -1176,7 +1181,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             micro_batch_size,
             seq_length,
             padded_seq_length,
-        ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
@@ -1378,7 +1388,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             micro_batch_size,
             seq_length,
             padded_seq_length,
-        ) = get_microbatch_iterator(data, self.cfg, logprob_batch_size)
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel

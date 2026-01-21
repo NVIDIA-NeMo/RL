@@ -29,6 +29,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -39,6 +40,7 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
         if value % multiple != 0
         else value
     )
+
 
 def forward_step_arbitrary_loss(
     state: GlobalState,
