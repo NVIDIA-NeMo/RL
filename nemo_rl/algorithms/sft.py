@@ -296,13 +296,16 @@ def validate(
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
             ## just run model fwd
-            val_results = policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                gbs=val_data.size,
-                mbs=val_mbs,
-            )
+            with timer.time("policy_training"):
+                val_results = policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                    timer=timer,
+                    timer_tag_prefix="policy_training",
+                )
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
@@ -456,7 +459,12 @@ def sft_train(
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                        timer_tag_prefix="policy_training",
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
