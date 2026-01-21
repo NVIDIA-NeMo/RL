@@ -64,6 +64,9 @@ sbatch \
     ray.sub
 ```
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 The required `CONTAINER` can be built by following the instructions in the [Docker documentation](../../docker.md).
 
 ## GRPO Qwen2.5-32B
@@ -91,6 +94,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## GRPO Multi-Turn
 
