@@ -347,3 +347,26 @@ def test_get_latest_checkpoint_path_across_digits(checkpoint_manager, checkpoint
     )
     assert len(all_checkpoints) == checkpoint_manager.keep_top_k
     assert all_checkpoints[-1].name == f"step_{max(steps)}"
+
+
+def test_if_correct_checkpoint_is_loaded(checkpoint_manager, checkpoint_dir):
+    """Test that the correct checkpoint is loaded based on the step number.
+    This verifies that the correct model name is loaded from the checkpoint config.yaml
+    """
+    # Create a tmp checkpoint
+    step = 1
+    training_info = {"loss": 0.5, "tensor": torch.tensor(0.5), "numpy": np.array(0.5)}
+    run_config = {"policy": {"model_name": "test_model"}}
+    tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info, run_config)
+    checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # We did not set the model name in the checkpoint manager, so this should catch the ValueError
+    # ValueError: Model name in checkpoint test_model does not match policy model name None. Please verify if the correct checkpoint is loaded
+    # This ensures the initialized checkpoint manager does not load the incorrect checkpoint by checking the model name in the checkpoint config.yaml
+    with pytest.raises(ValueError):
+        latest_path = checkpoint_manager.get_latest_checkpoint_path()
+
+    # Set the model name in the checkpoint manager to test_model that we have provided in the run config and it should pass the check
+    checkpoint_manager._model_name = "test_model"
+    latest_path = checkpoint_manager.get_latest_checkpoint_path()
+    assert latest_path == str(checkpoint_dir / f"step_{step}")
