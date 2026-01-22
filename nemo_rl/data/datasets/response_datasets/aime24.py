@@ -19,47 +19,33 @@ from datasets import load_dataset
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class DAPOMath17KDataset(RawDataset):
-    """Simple wrapper around the DAPO Math 17K dataset with train split."""
+class AIME2024Dataset(RawDataset):
+    """Simple wrapper around the AIME2024 dataset with train split.
 
-    def __init__(self, **kwargs) -> None:
-        self.task_name = "DAPOMath17K"
+    Args:
+        repeat: Number of times to repeat the dataset, default is 16
+    """
+
+    def __init__(self, repeat: int = 16, **kwargs) -> None:
+        self.task_name = "AIME2024"
 
         # load from huggingface
-        self.dataset = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
+        self.dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
 
         # format the dataset
         self.dataset = self.dataset.map(
             self.format_data,
             remove_columns=self.dataset.column_names,
         )
+
+        # repeat the dataset
+        self.dataset = self.dataset.repeat(repeat)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "messages": [
-                {
-                    "role": "user",
-                    "content": data["prompt"][0]["content"],
-                },
-                {
-                    "role": "assistant",
-                    "content": data["reward_model"]["ground_truth"],
-                },
+                {"role": "user", "content": data["problem"]},
+                {"role": "assistant", "content": data["answer"]},
             ],
             "task_name": self.task_name,
         }
-
-
-class DAPOMathAIME2024Dataset(DAPOMath17KDataset):
-    def __init__(self, **kwargs) -> None:
-        """Initialize the DAPO Math AIME 2024 dataset with train split."""
-        self.task_name = "DAPOMathAIME2024"
-
-        # load from huggingface
-        self.dataset = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")
-
-        # format the dataset
-        self.dataset = self.dataset.map(
-            self.format_data,
-            remove_columns=self.dataset.column_names,
-        )
