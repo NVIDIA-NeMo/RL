@@ -317,9 +317,12 @@ class RayWorkerGroup:
         self,
         cluster: RayVirtualCluster,
         remote_worker_builder: RayWorkerBuilder,
-        workers_per_node: Optional[Union[int, list[int]]] = None,
+        workers_per_node: Optional[int] = None,
+        num_nodes: Optional[int] = None,
+        tied_worker_group_size: int = 1,
+        cluster_node_offset: int = 0,
+        cluster_gpu_offset_each_node: int = 0,
         name_prefix: str = "",
-        bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
         env_vars: dict[str, str] = {},
     ):
@@ -328,13 +331,13 @@ class RayWorkerGroup:
         Args:
             cluster: RayVirtualCluster
             remote_worker_builder: Callable that launches a ray worker and has updatable options
-            workers_per_node: Defaults to launch one worker per bundle in the cluster.
-                          Alternatively specify an int or list to launch a different number of workers per node.
+            num_nodes: Number of nodes in the cluster
+            workers_per_node: Number of workers per node
+            cluster_node_offset: Offset of the first node in the cluster
+            cluster_gpu_offset_each_node: Offset of the first GPU on each node in the cluster
             name_prefix: Optional prefix for the names of the workers
-            bundle_indices_list: Explicit list of (node_idx, [local_bundle_indices]) tuples.
-                               Each tuple defines a tied group of workers placed on the same node.
-                               If provided, workers_per_node is ignored.
             sharding_annotations: NamedSharding object representing mapping of named axes to ranks (i.e. for TP, PP, etc.)
+            env_vars: Environment variables to set for the workers
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
@@ -343,56 +346,16 @@ class RayWorkerGroup:
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
 
-        # If explicit bundle indices are provided, use those
-        if bundle_indices_list is None:
-            # Create bundle_indices_list from workers_per_node specification
-            # In this case, each worker is its own group (no tied workers)
-            bundle_indices_list = []
+        # get bundle indices list from logical worker group
 
-            # Get placement groups
-            placement_groups = self.cluster.get_placement_groups()
-            if len(placement_groups) == 1:
-                # Single unified placement group
-                pg = placement_groups[0]
-                workers_per_group = [pg.bundle_count]
-            else:
-                # Multiple per-node placement groups
-                workers_per_group = [pg.bundle_count for pg in placement_groups]
+        bundle_indices_list = cluster.get_bundle_indices_list_for_worker_group(
+            tied_worker_group_size,
+            workers_per_node=workers_per_node,
+            num_nodes=num_nodes,
+            cluster_node_offset=cluster_node_offset,
+            cluster_gpu_offset_each_node=cluster_gpu_offset_each_node,
+        )
 
-            # Determine how many workers per node/placement group
-            if workers_per_node is None:
-                workers_per_group = [pg.bundle_count for pg in placement_groups]
-            elif isinstance(workers_per_node, int):
-                workers_per_group = [workers_per_node] * len(placement_groups)
-            elif isinstance(workers_per_node, list):
-                if len(workers_per_node) == 1 and len(placement_groups) == 1:
-                    workers_per_group = workers_per_node
-                elif len(workers_per_node) != len(placement_groups):
-                    raise ValueError(
-                        f"workers_per_node list length ({len(workers_per_node)}) must match "
-                        f"number of placement groups ({len(placement_groups)})"
-                    )
-                else:
-                    workers_per_group = workers_per_node
-            else:
-                raise ValueError(
-                    "workers_per_node must be None (for default distribution), an int, or a list"
-                )
-
-            # Validate workers_per_group
-            for i, (pg, worker_count) in enumerate(
-                zip(placement_groups, workers_per_group)
-            ):
-                if worker_count > pg.bundle_count:
-                    raise ValueError(
-                        f"Placement group {i} has {pg.bundle_count} bundles, "
-                        f"but {worker_count} workers were requested"
-                    )
-
-                for bundle_idx in range(worker_count):
-                    # Each worker is its own single-element group
-                    # The first element is the PG index (node_idx in the context of tied workers)
-                    bundle_indices_list.append((i, [bundle_idx]))
 
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
@@ -426,7 +389,7 @@ class RayWorkerGroup:
                                 spans multiple nodes, the node_idx will be the first node's index in the tied group.
         """
         self.master_address, self.master_port = (
-            self.cluster.get_master_address_and_port()
+            self.cluster.get_available_address_and_port(bundle_indices_list[0][1][0])
         )
 
         # Update env_vars with the current environment variables
@@ -459,26 +422,19 @@ class RayWorkerGroup:
         worker_info = []  # Store metadata for each worker
 
         # Get all placement groups
-        placement_groups = self.cluster.get_placement_groups()
+        pg = self.cluster.get_unified_placement_group()
 
         # Get available address and port for each worker
         available_addresses = []
         available_ports = []
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+        for group_idx, (node_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
-                addr, port = self.cluster.get_available_address_and_port(
-                    pg_idx, bundle_idx
-                )
+                addr, port = self.cluster.get_available_address_and_port(bundle_idx)
                 available_addresses.append(addr)
                 available_ports.append(port)
 
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+        for group_idx, (node_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
-
-            if len(placement_groups) == 1:
-                pg = placement_groups[0]
-            else:
-                pg = placement_groups[pg_idx]
 
             is_parallel_group = len(local_bundle_indices) > 1
 
@@ -492,7 +448,7 @@ class RayWorkerGroup:
                         "WORLD_SIZE": str(self.world_size),
                         "MASTER_ADDR": self.master_address,
                         "MASTER_PORT": str(self.master_port),
-                        "NODE_RANK": str(pg_idx),
+                        "NODE_RANK": str(node_idx),
                         "AVAILABLE_ADDR_LIST": str(available_addresses),
                         "AVAILABLE_PORT_LIST": str(available_ports),
                     }
@@ -509,14 +465,14 @@ class RayWorkerGroup:
                 # This ensures only one worker per group is the model owner
                 worker_bundle_indices = None
                 if local_rank == 0:
-                    worker_bundle_indices = (pg_idx, local_bundle_indices)
+                    worker_bundle_indices = (node_idx, local_bundle_indices)
                     self.dp_leader_worker_indices.append(global_rank)
 
                 # Create a descriptive name based on group structure
                 name = (
                     f"{self.name_prefix}-grp{group_idx}-{local_rank}"
                     if is_parallel_group
-                    else f"{self.name_prefix}-{pg_idx}-{bundle_idx}"
+                    else f"{self.name_prefix}-{node_idx}-{bundle_idx}"
                 )
 
                 # Calculate GPU resources
@@ -552,7 +508,7 @@ class RayWorkerGroup:
                     {
                         "group_idx": group_idx,
                         "worker_idx": worker_idx,
-                        "node_idx": pg_idx,
+                        "node_idx": node_idx,
                         "local_rank": local_rank,
                         "global_rank": global_rank,
                         "name": name,

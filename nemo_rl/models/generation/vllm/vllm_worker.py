@@ -862,3 +862,19 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Report the node IP and GPU ID of the current worker."""
+        assert self.llm is not None, (
+            "Attempting to report node IP and GPU ID with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "report_node_ip_and_gpu_id cannot be used with async_engine=True. Use report_node_ip_and_gpu_id_async instead."
+            )
+
+        result_or_coro = self.llm.collective_rpc(
+            "report_node_ip_and_gpu_id", args=tuple()
+        )
+        return cast(list[tuple[str, int]], result_or_coro)
