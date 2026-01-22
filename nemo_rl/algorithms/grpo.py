@@ -1471,13 +1471,8 @@ def grpo_train(
                     batch_size = rewards.shape[0]
                     advantages = torch.zeros(batch_size, 1)
 
-                    _log_mixed_rewards_and_advantages_information(
-                        logger=logger,
-                        total_steps=total_steps,
-                        metrics=metrics,
-                        baseline=baseline,
-                        advantages=advantages,
-                    )
+                    # Save baseline for logging (before deletion)
+                    baseline_for_log = baseline.clone()
 
                     # Save prompt_ids for adv_estimator (will be used after logprobs)
                     prompt_ids_for_adv = input_ids.clone()
@@ -1580,19 +1575,24 @@ def grpo_train(
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
-                    # Get token-level mask: token_mask * sample_mask
-                    token_mask = train_data["token_mask"]
-                    sample_mask = train_data["sample_mask"]
-                    mask = token_mask * sample_mask.unsqueeze(-1)
-
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
-                        mask=mask,
+                        mask=train_data["token_mask"],
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     del prompt_ids_for_adv
+
+                    # Log rewards and advantages information
+                    _log_mixed_rewards_and_advantages_information(
+                        logger=logger,
+                        total_steps=total_steps,
+                        metrics=metrics,
+                        baseline=baseline_for_log,
+                        advantages=train_data["advantages"],
+                    )
+                    del baseline_for_log
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
