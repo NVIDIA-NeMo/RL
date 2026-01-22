@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
 
+from nemo_rl.data import ResponseDatasetConfig
+from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
-from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
+from nemo_rl.data.datasets.response_datasets.dapo_math import (
+    DAPOMath17KDataset,
+    DAPOMathAIME2024Dataset,
+)
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
@@ -29,101 +33,36 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
-from nemo_rl.data.datasets.utils import get_extra_kwargs
+
+DATASET_REGISTRY = {
+    # built-in datasets
+    "AIME2024": AIME2024Dataset,
+    "clevr-cogent": CLEVRCoGenTDataset,
+    "DAPOMath17K": DAPOMath17KDataset,
+    "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
+    "DeepScaler": DeepScalerDataset,
+    "geometry3k": Geometry3KDataset,
+    "HelpSteer3": HelpSteer3Dataset,
+    "open_assistant": OasstDataset,
+    "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "refcoco": RefCOCODataset,
+    "squad": SquadDataset,
+    "tulu3_sft_mixture": Tulu3SftMixtureDataset,
+    # load from local JSONL file or HuggingFace
+    "openai_format": OpenAIFormatDataset,
+    "ResponseDataset": ResponseDataset,
+}
 
 
-# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-def load_response_dataset(data_config, seed: int = 42):
+def load_response_dataset(data_config: ResponseDatasetConfig):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
-    # TODO @yukih: remove duplicated dataset_name (openmathinstruct2, clevr_cogent)
-    # for sft training
-    if dataset_name == "open_assistant":
-        base_dataset = OasstDataset(
-            output_dir="/tmp/open_assistant",
-            seed=seed,
-        )
-    elif dataset_name == "squad":
-        base_dataset = SquadDataset()
-    elif dataset_name == "openmathinstruct2":
-        base_dataset = OpenMathInstruct2Dataset(
-            split=data_config["split"],
-            output_key=data_config["output_key"],
-            prompt_file=data_config["prompt_file"],
-            seed=seed,
-        )
-    elif dataset_name == "clevr_cogent":
-        base_dataset = CLEVRCoGenTDataset(
-            split=data_config["split"],
-            prompt_file=data_config["prompt_file"],
-        )
-    elif dataset_name == "openai_format":
-        base_dataset = OpenAIFormatDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["chat_key"],
-            data_config["system_key"],
-            data_config["system_prompt"],
-            data_config["tool_key"],
-            data_config["use_preserving_dataset"],
-        )
-    # for rl training
-    elif dataset_name == "OpenMathInstruct-2":
-        print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
-        base_dataset: Any = OpenMathInstruct2Dataset(seed=seed)
-    elif dataset_name == "DeepScaler":
-        print(
-            "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
-        )
-        base_dataset: Any = DeepScalerDataset(seed=seed)
-    elif dataset_name == "DAPOMath17K":
-        print(
-            "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
-        )
-        base_dataset: Any = DAPOMath17KDataset(seed=seed)
-    # for vlm rl training
-    elif dataset_name == "clevr-cogent":
-        base_dataset: Any = CLEVRCoGenTDataset(
-            split=data_config["split"],
-        )
-    elif dataset_name == "refcoco":
-        base_dataset: Any = RefCOCODataset(
-            split=data_config["split"],
-            download_dir=data_config["download_dir"],
-        )
-    elif dataset_name == "geometry3k":
-        base_dataset: Any = Geometry3KDataset(
-            split=data_config["split"],
-        )
-    elif dataset_name == "tulu3_sft_mixture":
-        base_dataset: Any = Tulu3SftMixtureDataset(
-            test_size=data_config.get("test_size", 0.05),
-            prompt_file=data_config.get("prompt_file", None),
-            max_samples=data_config.get("max_samples", None),
-            seed=seed,
-        )
-    elif dataset_name == "HelpSteer3":
-        base_dataset: Any = HelpSteer3Dataset()
-    # fall back to load from JSON file
-    elif dataset_name == "ResponseDataset":
-        if "train_data_path" not in data_config:
-            raise ValueError(
-                "train_data_path is required when dataset_name is not one of the built-ins."
-            )
-        extra_kwargs = get_extra_kwargs(
-            data_config,
-            [
-                "val_data_path",
-                "input_key",
-                "output_key",
-                "train_split",
-                "val_split",
-            ],
-        )
-        base_dataset = ResponseDataset(
-            train_data_path=data_config["train_data_path"],
-            **extra_kwargs,
+    # load dataset
+    if dataset_name in DATASET_REGISTRY:
+        dataset_class = DATASET_REGISTRY[dataset_name]
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
     else:
         raise ValueError(
@@ -132,33 +71,27 @@ def load_response_dataset(data_config, seed: int = 42):
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
-    base_dataset.set_task_spec(data_config)
-    # Skip sft datasets, the run_sft.py has not been refactored yet.
-    # TODO: refactor run_sft.py to use the new processor interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-    if dataset_name not in [
-        "open_assistant",
-        "squad",
-        "openmathinstruct2",
-        "clevr_cogent",
-        "openai_format",
-        "tulu3_sft_mixture",
-    ]:
-        base_dataset.set_processor()
+    dataset.set_task_spec(data_config)
+    # Remove this after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658
+    dataset.set_processor()
 
-    return base_dataset
+    return dataset
 
 
 __all__ = [
+    "AIME2024Dataset",
     "CLEVRCoGenTDataset",
-    "DeepScalerDataset",
     "DAPOMath17KDataset",
+    "DAPOMathAIME2024Dataset",
+    "DeepScalerDataset",
     "Geometry3KDataset",
-    "OpenAIFormatDataset",
+    "HelpSteer3Dataset",
     "OasstDataset",
+    "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
-    "HelpSteer3Dataset",
+    "load_response_dataset",
 ]
