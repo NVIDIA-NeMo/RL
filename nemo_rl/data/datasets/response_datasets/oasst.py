@@ -15,10 +15,9 @@
 import copy
 import gzip
 import json
-import os
-import random
 
-import requests
+from datasets import Dataset
+from huggingface_hub import hf_hub_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
@@ -67,7 +66,7 @@ def parse_conversations(tree_obj, first: bool = False):
     return all_conversations
 
 
-def get_data_records(objs, task_name: str = "OASST"):
+def get_data_records(objs, task_name: str = "oasst"):
     ## TODO: old format was multi-conversation per example, but ours is single conversation
     ## is this just because of the input data format?
     output = []
@@ -87,46 +86,31 @@ def get_data_records(objs, task_name: str = "OASST"):
     return output
 
 
-def download_and_process_oasst(
-    output_directory: str = ".",
-    seed: int = 42,
-    task_name: str = "OASST",
-    split_ratio: float = 0.95,
-) -> dict[str, list]:
-    os.makedirs(output_directory, exist_ok=True)
-    filename = f"{output_directory}/2023-04-12_oasst_all.trees.jsonl.gz"
-
-    # only download if doesn't exist
-    if not os.path.isfile(filename):
-        url = "https://huggingface.co/datasets/OpenAssistant/oasst1/resolve/main/2023-04-12_oasst_all.trees.jsonl.gz"
-        response = requests.get(url)
-        with open(filename, mode="wb") as fw:
-            fw.write(response.content)
-
-    with gzip.open(filename) as f:
-        file_content = f.readlines()
-
-    all_objs = [json.loads(dp.decode("utf-8")) for dp in file_content]
-
-    random.seed(seed)
-    random.shuffle(all_objs)
-    train_num = int(len(all_objs) * split_ratio)
-    train_objs = all_objs[:train_num]
-    val_objs = all_objs[train_num:]
-    train_records = get_data_records(train_objs, task_name=task_name)
-    val_records = get_data_records(val_objs, task_name=task_name)
-
-    formatted_ds = {
-        "train": train_records,
-        "validation": val_records,
-    }
-
-    return formatted_ds
-
-
 class OasstDataset(RawDataset):
-    def __init__(self, output_dir: str = ".", seed: int = 42) -> None:
-        self.task_name = "OASST"
-        self.formatted_ds = download_and_process_oasst(
-            output_dir, seed, task_name=self.task_name
+    """Simple wrapper around the OASST dataset.
+
+    Args:
+        split_validation_size: Size of the validation data, default is 0.05
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
+    """
+
+    def __init__(self, split_validation_size: float = 0.05, seed: int = 42, **kwargs):
+        self.task_name = "oasst"
+
+        # load from huggingface
+        filename = hf_hub_download(
+            repo_id="OpenAssistant/oasst1",
+            filename="2023-04-12_oasst_all.trees.jsonl.gz",
+            repo_type="dataset",
         )
+        with gzip.open(filename) as f:
+            file_content = f.readlines()
+
+        # format the dataset
+        all_objs = [json.loads(dp.decode("utf-8")) for dp in file_content]
+        self.dataset = get_data_records(all_objs, task_name=self.task_name)
+        self.dataset = Dataset.from_list(self.dataset)
+
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
