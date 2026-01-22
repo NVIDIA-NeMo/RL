@@ -16,6 +16,7 @@ import os
 from importlib.util import find_spec
 
 import torch
+import torch.nn.functional as F
 from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
 from torch.distributed.tensor._ops.utils import register_op_strategy
 
@@ -126,3 +127,25 @@ def apply_torch_aten_alias_tensor_patch():
         )
     except Exception as e:
         print(f"Error applying torch.ops.aten.alias.default patch: {e}")
+
+
+def patched_lora_linear_forward(self, x):
+    if self.dropout_position == "pre":
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+
+    lora_weight = torch.matmul(self.lora_B.weight, self.lora_A.weight) * self.scale
+
+    if self.dropout_position == "post":
+        lora_weight = F.dropout(lora_weight, p=self.dropout_p, training=self.training)
+
+    temp_weight = self.weight + lora_weight
+
+    res = F.linear(x, temp_weight, self.bias)
+
+    return res
+
+
+def apply_lora_linear_forward_patch():
+    from nemo_automodel.components._peft.lora import LinearLoRA
+
+    LinearLoRA.forward = patched_lora_linear_forward
