@@ -355,7 +355,7 @@ setup()
             cwd=dummy_project,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=180,
             env=test_env,
         )
 

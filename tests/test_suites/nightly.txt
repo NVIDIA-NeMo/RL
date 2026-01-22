@@ -7,6 +7,10 @@ tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp1.v3.sh
 tests/test_suites/llm/grpo-gemma3-1b-it-1n8g-fsdp2tp1.sh
 
+# SGLang backend
+tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-sglang.sh
+tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang.sh
+
 # Dtensor (Qwen/Qwen2.5-7B-Instruct)
 tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4.v3.sh
 
