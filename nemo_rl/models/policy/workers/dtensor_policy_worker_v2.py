@@ -1485,6 +1485,53 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
+    def stream_weights_via_http(
+        self,
+        sglang_url_to_gpu_uuids: dict[str, list[str]],
+    ) -> None:
+        """Stream model weights to SGLang servers via HTTP API.
+
+        Args:
+            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        """
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+
+        # Get current GPU UUID
+        current_device_uuid = self.report_device_id()
+
+        def dtensor_params_generator():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            state_dict_items = sorted(
+                self.model.state_dict().items(), key=lambda x: x[0]
+            )
+            for name, tensor in state_dict_items:
+                if isinstance(tensor, DTensor):
+                    # Convert DTensor to full tensor for streaming
+                    full_tensor = tensor.full_tensor()
+                    # Convert to target dtype
+                    yield (
+                        name,
+                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                    )
+                else:
+                    # Convert to target dtype
+                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+
+        # Use the HTTP implementation
+        stream_weights_via_http_impl(
+            params_generator=dtensor_params_generator(),
+            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rank=self.rank,
+            worker_name=str(self),
+            current_device_uuid=current_device_uuid,
+        )
+
+    @torch.no_grad()
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:

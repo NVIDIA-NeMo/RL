@@ -45,6 +45,18 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# CMake (for sglang build)
+RUN GITHUB_ARTIFACTORY=github.com \
+    && CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
+        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+
 # Install uv and python
 ARG UV_VERSION=0.9.7
 ARG PYTHON_VERSION=3.12
@@ -102,6 +114,7 @@ fi
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
+uv sync --link-mode symlink --locked --extra sglang --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project

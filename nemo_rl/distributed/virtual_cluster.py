@@ -61,6 +61,9 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Use NeMo-RL direct dependencies and SGLang.
+    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:

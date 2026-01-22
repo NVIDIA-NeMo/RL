@@ -520,9 +520,10 @@ def print_performance_metrics(
     ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
-    if is_vllm_metrics_logger_enabled:
-        vllm_logger_metrics = metrics["vllm_logger_metrics"]
-        # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
+    generation_logger_metrics = metrics.get("generation_logger_metrics", {})
+    if is_vllm_metrics_logger_enabled and generation_logger_metrics:
+        vllm_logger_metrics = generation_logger_metrics
+        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
 
         assert "inflight_batch_sizes" in vllm_logger_metrics, (
