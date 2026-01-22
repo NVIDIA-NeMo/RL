@@ -43,6 +43,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "code_jaccard": {
         "actor_class_fqn": "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment",
     },
+    "vlm": {
+        "actor_class_fqn": "nemo_rl.environments.vlm_environment.VLMEnvironment",
+    },
 }
 
 
@@ -93,7 +96,7 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     return chunks
 
 
-def create_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
+def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
     assert env_name in ENV_REGISTRY, (
         f"Env name {env_name} is not registered in ENV_REGISTRY. Please call register_env() to register the environment."
     )
@@ -104,7 +107,7 @@ def create_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
             "py_executable": get_actor_python_env(actor_class_fqn),
             "env_vars": dict(os.environ),
         }
-    ).remote(env_configs[env_name])
+    ).remote(env_config)
     return env
 
 

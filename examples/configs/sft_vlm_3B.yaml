@@ -23,12 +23,20 @@ checkpointing:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "clevr_cogent"
   add_bos: true
   add_eos: true
   add_generation_prompt: false
-  split: trainA
-  prompt_file: null
+
+  # dataset
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: null
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -37,9 +45,9 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
-    name: "sft-dev-${data.dataset_name}"
+    name: "sft-dev-${data.train.dataset_name}"
   tensorboard:
-    log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+    log_dir: "tb_logs-sft-dev-${data.train.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

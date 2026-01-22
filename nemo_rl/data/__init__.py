@@ -15,32 +15,55 @@
 from typing import Literal, NotRequired, TypedDict
 
 
-# TODO: split this typed dict up so it can be PreferenceDataConfig | ResponseDataConfig | etc
+class ResponseDatasetConfig(TypedDict):
+    dataset_name: NotRequired[str]
+    data_path: NotRequired[str]
+    input_key: NotRequired[str]
+    output_key: NotRequired[str]
+    split: NotRequired[str]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
+    download_dir: NotRequired[str]
+    # Size of the validation data
+    split_validation_size: NotRequired[float]
+    # Seed for train/validation split when split_validation_size > 0
+    seed: NotRequired[int]
+
+
+# TODO: split this typed dict up so it can be PreferenceDatasetConfig | ResponseDatasetConfig | etc
 #       so that we can type check the configs more rigorously as opposed to saying everything
 #       is not required.
 class DataConfig(TypedDict):
     max_input_seq_length: int
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    dataset_name: str
-    val_dataset_name: NotRequired[str]
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
-    input_key: NotRequired[str]
-    output_key: NotRequired[str | None]
     add_generation_prompt: NotRequired[bool]
     add_system_prompt: NotRequired[bool]
-    split: NotRequired[str | None]
     shuffle: bool
-    seed: NotRequired[int | None]
-    download_dir: NotRequired[str]
-    train_data_path: NotRequired[str]
-    val_data_paths: NotRequired[dict[str, str]]
     # Number of data loader workers.
     # Set to 8 or 10 for large batches to improve loading speed.
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # dataset configs
+    # TODO: remove NotRequired once preference dataset is refactored
+    train: NotRequired[ResponseDatasetConfig]
+    validation: NotRequired[ResponseDatasetConfig | None]
+    default: NotRequired[ResponseDatasetConfig | None]
+    # TODO: remove once preference dataset is refactored
+    dataset_name: NotRequired[str]
+    val_dataset_name: NotRequired[str]
+    input_key: NotRequired[str]
+    output_key: NotRequired[str | None]
+    split: NotRequired[str]
+    train_data_path: NotRequired[str]
+    val_data_paths: NotRequired[dict[str, str]]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
 
 
 # ===============================================================================
