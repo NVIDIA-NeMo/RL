@@ -1189,19 +1189,22 @@ def grpo_train(
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator based on configuration
-    adv_estimator_config = master_config["grpo"].get("adv_estimator", None)
-    adv_estimator = None
-    if adv_estimator_config is not None:
-        loss_config = master_config["loss_fn"]
-        adv_estimator_name = adv_estimator_config.get("name", "grpo")
-        if adv_estimator_name == "grpo":
-            adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-            print(f"  ✓ Using GRPO advantage estimator")
-        elif adv_estimator_name == "reinforce_plus_plus":
-            adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
-            print(f"  ✓ Using Reinforce++ advantage estimator")
-        else:
-            raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+    # Default to GRPOAdvantageEstimator if not configured
+    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
+    adv_estimator_config.setdefault("name", "grpo")
+    adv_estimator_config.setdefault("use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"])
+    adv_estimator_config.setdefault("normalize_rewards", master_config["grpo"]["normalize_rewards"])
+    loss_config = master_config["loss_fn"]
+
+    adv_estimator_name = adv_estimator_config["name"]
+    if adv_estimator_name == "grpo":
+        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print(f"  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_plus_plus":
+        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
+        print(f"  ✓ Using Reinforce++ advantage estimator")
+    else:
+        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -1463,27 +1466,10 @@ def grpo_train(
                     if not is_batch_complete:
                         continue
 
-                    # Compute advantages using configured adv_estimator or default GRPO
-                    if adv_estimator is not None:
-                        # Create mask for adv_estimator (will be expanded later)
-                        # For now, use a simple mask based on batch size
-                        batch_size = rewards.shape[0]
-                        seq_len = 1  # placeholder, will be expanded later
-                        mask = torch.ones(batch_size, seq_len)
-                        advantages = adv_estimator.compute_advantage(
-                            prompt_ids=input_ids,
-                            rewards=rewards,
-                            mask=mask,
-                        )
-                        # advantages from adv_estimator is already normalized
-                    else:
-                        # Default GRPO advantage calculation
-                        advantages = (rewards - baseline).unsqueeze(-1)
-                        if master_config["grpo"]["normalize_rewards"]:
-                            advantages = normalize_advantages_with_epsilon(
-                                advantages=advantages,
-                                std=std,
-                            )
+                    # Use placeholder advantages here.
+                    # Real advantages will be computed after logprobs are available.
+                    batch_size = rewards.shape[0]
+                    advantages = torch.zeros(batch_size, 1)
 
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,
@@ -1493,6 +1479,8 @@ def grpo_train(
                         advantages=advantages,
                     )
 
+                    # Save prompt_ids for adv_estimator (will be used after logprobs)
+                    prompt_ids_for_adv = input_ids.clone()
                     del input_ids
                     del baseline
                     del std
@@ -1588,6 +1576,23 @@ def grpo_train(
 
                     del logprob_data
                     del extra_multimodal_data
+
+                # Compute advantages with adv_estimator using correct mask and logprobs
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...", flush=True)
+                    # Get token-level mask: token_mask * sample_mask
+                    token_mask = train_data["token_mask"]
+                    sample_mask = train_data["sample_mask"]
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
+                    del prompt_ids_for_adv
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2190,6 +2195,24 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
+    # Initialize advantage estimator based on configuration
+    # Default to GRPOAdvantageEstimator if not configured
+    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
+    adv_estimator_config.setdefault("name", "grpo")
+    adv_estimator_config.setdefault("use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"])
+    adv_estimator_config.setdefault("normalize_rewards", master_config["grpo"]["normalize_rewards"])
+    loss_config = master_config["loss_fn"]
+
+    adv_estimator_name = adv_estimator_config["name"]
+    if adv_estimator_name == "grpo":
+        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print(f"  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_plus_plus":
+        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
+        print(f"  ✓ Using Reinforce++ advantage estimator")
+    else:
+        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
@@ -2481,41 +2504,18 @@ def async_grpo_train(
                             pad_value_dict={"token_ids": tokenizer.pad_token_id},
                         )
                     )
-                    prompt_only_ids = prompt_batched_flat["token_ids"]
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
 
                     rewards = repeated_batch["total_reward"]
-
-                    print("▶ Computing advantages...")
-
-                    baseline, std = calculate_baseline_and_std_per_prompt(
-                        prompt_only_ids,
-                        rewards,
-                        torch.ones_like(rewards),
-                        leave_one_out_baseline=master_config["grpo"][
-                            "use_leave_one_out_baseline"
-                        ],
-                    )
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
-                    print(
-                        f"  📊 Baseline stats: min={baseline.min():.4f}, max={baseline.max():.4f}, mean={baseline.mean():.4f}"
-                    )
-                    print(
-                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                    )
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
-                        )
-
-                        print(
-                            f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                        )
+                    # Use placeholder advantages here.
+                    # Real advantages will be computed after logprobs are available.
+                    batch_size = rewards.shape[0]
+                    advantages = torch.zeros(batch_size, 1)
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
@@ -2573,6 +2573,23 @@ def async_grpo_train(
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
+
+                # Compute advantages with adv_estimator using correct mask and logprobs
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...", flush=True)
+                    # Get token-level mask: token_mask * sample_mask
+                    token_mask = train_data["token_mask"]
+                    sample_mask = train_data["sample_mask"]
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
+                    del prompt_ids_for_adv
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
