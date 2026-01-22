@@ -28,7 +28,6 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -238,7 +237,6 @@ def validate(
     loss_fn,
     step: int,
     master_config: MasterConfig,
-    sft_task_spec: TaskDataSpec,
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
@@ -358,7 +356,6 @@ def sft_train(
     loss_fn,
     master_config,
     logger,
-    sft_task_spec,
     checkpointer,
     sft_save_state: SFTSaveState,
 ) -> None:
@@ -400,7 +397,6 @@ def sft_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            sft_task_spec=sft_task_spec,
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
@@ -474,7 +470,6 @@ def sft_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        sft_task_spec=sft_task_spec,
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],

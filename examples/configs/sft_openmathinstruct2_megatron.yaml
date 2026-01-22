@@ -128,14 +128,6 @@ policy:
   optimizer: null
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "openmathinstruct2"
-  prompt_file: examples/prompts/math.txt
-  split: "train_1M"
-  add_bos: true
-  add_eos: true
-  add_generation_prompt: true
-  output_key: 'generated_solution'
   num_workers: 1
 
 logger:
