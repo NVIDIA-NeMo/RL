@@ -16,6 +16,7 @@ import argparse
 import os
 import pprint
 
+from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup

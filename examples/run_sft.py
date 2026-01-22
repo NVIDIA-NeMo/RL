@@ -69,21 +69,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     task_data_preprocessors = {}
     data_list = []
 
-    # add preprocessor if needed
-    datum_preprocessor_train = None
-    datum_preprocessor_val = None
-    if "dataset_name" in data_config and data_config["dataset_name"] == "clevr_cogent":
-        from nemo_rl.data.datasets.response_datasets.clevr import (
-            format_clevr_cogent_dataset,
-        )
-
-        datum_preprocessor_train = datum_preprocessor_val = partial(format_clevr_cogent_dataset, return_pil=True)
-    elif hasattr(data, "datum_preprocessor"):
-        datum_preprocessor_train = data.datum_preprocessor["train"]
-        datum_preprocessor_val = data.datum_preprocessor["validation"]
-
-    train_dataset = AllTaskProcessedDataset(
-        train_dataset,
+    dataset = AllTaskProcessedDataset(
+        data.dataset,
         tokenizer,
         None,
         task_data_processors,
@@ -136,24 +123,10 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor_train,
-        ),
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-
-    if val_dataset is not None:
-        val_dataset = AllTaskProcessedDataset(
-            val_dataset,
-            tokenizer,
-            sft_task_spec,
-            partial(
-                sft_preprocessor,
-                add_bos=data_config.get("add_bos", True),
-                add_eos=data_config.get("add_eos", True),
-                add_generation_prompt=data_config["add_generation_prompt"],
-                datum_preprocessor=datum_preprocessor_val,
-            ),
-            max_seq_length=data_config["max_input_seq_length"],
+        )
+        val_task_data_processors[val_data.task_name] = (
+            val_data.task_spec,
+            val_data_processor,
         )
 
     val_dataset = None
