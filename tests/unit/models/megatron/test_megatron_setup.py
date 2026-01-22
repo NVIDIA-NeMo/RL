@@ -186,6 +186,7 @@ class TestApplyMoeConfig:
                 "moe_router_load_balancing_type": "none",
                 "moe_router_bias_update_rate": 0.0,
                 "moe_permute_fusion": True,
+                "moe_enable_deepep": False,
             }
         }
 
@@ -197,6 +198,7 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_router_load_balancing_type == "none"
         assert model_cfg.moe_router_bias_update_rate == 0.0
         assert model_cfg.moe_permute_fusion is True
+        assert model_cfg.moe_enable_deepep is False
 
 
 @pytest.mark.mcore
