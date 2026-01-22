@@ -1517,7 +1517,6 @@ def grpo_train(
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
-                    del rollout_metrics
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]

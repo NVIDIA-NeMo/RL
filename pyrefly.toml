@@ -113,6 +113,8 @@ project-includes = [
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
   "nemo_rl/models/generation/vllm/utils.py",
   "nemo_rl/models/generation/vllm/vllm_backend.py",
+  "nemo_rl/models/generation/sglang/__init__.py",
+  "nemo_rl/models/generation/sglang/config.py",
   "nemo_rl/models/huggingface/__init__.py",
   "nemo_rl/models/megatron/__init__.py",
   "nemo_rl/models/policy/__init__.py",
