@@ -621,6 +621,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.pipeline_model_parallel_size = self.cfg["megatron_cfg"][
             "pipeline_model_parallel_size"
         ]
+        model_cfg.microbatch_group_size_per_vp_stage = self.cfg["megatron_cfg"][
+            "pipeline_model_parallel_size"
+        ]
+        model_cfg.virtual_pipeline_model_parallel_size = self.cfg["megatron_cfg"].get(
+            "virtual_pipeline_model_parallel_size", None
+        )
+        model_cfg.pipeline_model_parallel_layout = self.cfg["megatron_cfg"].get(
+            "pipeline_model_parallel_layout", None
+        )
         model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
             "num_layers_in_first_pipeline_stage"
         ]
@@ -641,6 +650,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
             "expert_model_parallel_size"
         ]
+        if (
+            model_cfg.pipeline_model_parallel_size > 1
+            and model_cfg.virtual_pipeline_model_parallel_size is not None
+        ):
+            model_cfg.overlap_p2p_comm = True
+            model_cfg.batch_p2p_comm = False
 
         # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
         # especially when using many experts.
@@ -876,10 +891,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if len(self.model) == 1:
                 self.megatron_cfg.param_sync_func = self.megatron_cfg.param_sync_func[0]
 
-        self.model = self.model[0]  # Get the first model from the list
-
         if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
+            self.model = [self.move_model(model, "cpu") for model in self.model]
             ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
 
             # Create a separate megatron config for the reference model with the correct checkpoint config
@@ -942,10 +955,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             else:
                 print("Reference model not loaded")
 
-            self.model = self.move_model(self.model, "cuda")
+            self.model = [self.move_model(model, "cuda") for model in self.model]
 
         _update_model_config_funcs(
-            [self.model],
+            self.model,
             self.megatron_cfg.model,
             self.megatron_cfg.ddp,
             self.optimizer,
@@ -999,12 +1012,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._held_gather_buffer = None
 
     def enable_forward_pre_hook(self):
-        assert isinstance(self.model, DistributedDataParallel)
-        self.model.enable_forward_pre_hook()
+        assert isinstance(self.model[0], DistributedDataParallel)
+        for model in self.model:
+            model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        assert isinstance(self.model, DistributedDataParallel)
-        self.model.disable_forward_pre_hook(param_sync=param_sync)
+        assert isinstance(self.model[0], DistributedDataParallel)
+        for model in self.model:
+            model.disable_forward_pre_hook(param_sync=param_sync)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -1016,16 +1031,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        self.model.zero_grad_buffer()
-        if hasattr(self.model, "inference_params"):
-            self.model.inference_params = None
+        for model in self.model:
+            model.zero_grad_buffer()
 
-        # Reset any cached attention states
-        for module in self.model.modules():
-            if hasattr(module, "reset_inference_cache"):
-                module.reset_inference_cache()
-            if hasattr(module, "_inference_key_value_memory"):
-                module._inference_key_value_memory = None
+        for model in self.model:
+            if hasattr(model, "inference_params"):
+                model.inference_params = None
+
+            # Reset any cached attention states
+            for module in model.modules():
+                if hasattr(module, "reset_inference_cache"):
+                    module.reset_inference_cache()
+                if hasattr(module, "_inference_key_value_memory"):
+                    module._inference_key_value_memory = None
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -1039,14 +1057,24 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             group=parallel_state.get_data_parallel_group(),
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
+        print(
+            f"rank {get_rank_safe()}: total_dataset_size: {total_dataset_size.item()}"
+        )
+        print(f"rank {get_rank_safe()}: gbs: {gbs}")
+        print(f"rank {get_rank_safe()}: num_global_batches: {num_global_batches}")
+        print(
+            f"rank {get_rank_safe()}: data.elem_counts_per_gb: {data.elem_counts_per_gb}"
+        )
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
+            for model in self.model:
+                model.eval()
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
-            self.model.train()
+            for model in self.model:
+                model.train()
 
         with ctx:
             # dim 1 is always assumed to be the sequence dim, sanity check this here
@@ -1082,6 +1110,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         global_batch["token_mask"][:, 1:]
                         * global_batch["sample_mask"].unsqueeze(-1)
                     )
+                print(f"rank {get_rank_safe()}: local_valid_toks: {local_valid_toks}")
 
                 to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
                 torch.distributed.all_reduce(
@@ -1109,9 +1138,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         batch.get_microbatch_iterator_dynamic_shapes_len()
                     )
                 elif self.cfg["sequence_packing"]["enabled"]:
-                    data_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
+                    vp_size = self.cfg["megatron_cfg"].get(
+                        "virtual_pipeline_model_parallel_size", None
                     )
+                    if vp_size and vp_size > 1:
+                        data_iterator = [
+                            batch.make_microbatch_iterator_for_packable_sequences()
+                            for _ in range(vp_size)
+                        ]
+                    else:
+                        data_iterator = (
+                            batch.make_microbatch_iterator_for_packable_sequences()
+                        )
                     data_iterator_len, seq_dim_size = (
                         batch.get_microbatch_iterator_for_packable_sequences_len()
                     )
@@ -1132,13 +1170,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
 
+                print(f"rank {get_rank_safe()}: data_iterator_len: {data_iterator_len}")
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(data_iterator_len)
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
-                    self.model.zero_grad_buffer()
+                    for model in self.model:
+                        model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
                     # Forward pass.
@@ -1156,7 +1196,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             pad_full_seq_to=pad_full_seq_to,
                             defer_fp32_logits=self.defer_fp32_logits,
                         ),
-                        data_iterator=data_iterator,
+                        data_iterator=data_iterator,  # TODO: fix it
                         model=self.model,
                         num_microbatches=data_iterator_len,
                         seq_length=seq_dim_size,
@@ -2097,7 +2137,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             List of (parameter_name, size_in_bytes) tuples.
         """
         self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-            [self.model]
+            self.model
         )
         param_info = []
 
@@ -2147,7 +2187,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
+            self.model,
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
@@ -2248,10 +2288,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
-        self.model = self.move_model(
-            self.model, "cuda", move_grads=True, move_params=True
-        )
-        self.model.train()
+        self.model = [
+            self.move_model(model, "cuda", move_grads=True, move_params=True)
+            for model in self.model
+        ]
+        for model in self.model:
+            model.train()
 
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
@@ -2434,15 +2476,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             # Ensure model is in eval mode for consistent saving, unless actively training
             # This is a common practice, though NeMo's save might handle this.
             # For safety, if not in training loop, setting to eval.
-            is_training = self.model.training
+            is_training = self.model[0].training
             if not is_training:
-                self.model.eval()
+                for model in self.model:
+                    model.eval()
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             save_checkpoint(
                 state=self.mcore_state,
-                model=[self.model],
+                model=self.model,
                 optimizer=optimizer_to_save,
                 opt_param_scheduler=scheduler_to_save,
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
@@ -2459,7 +2502,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self.enable_forward_pre_hook()
 
             if not is_training:  # Restore training state if it was changed
-                self.model.train()
+                for model in self.model:
+                    model.train()
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
