@@ -127,7 +127,6 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
-    use_kl_in_reward: NotRequired[bool]  # If True, add KL penalty to reward instead of loss
 
 
 class LengthPenaltyConfig(TypedDict):

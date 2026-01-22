@@ -40,7 +40,6 @@ grpo:
     use_leave_one_out_baseline: fasle
     # Reinforce++ specific (used when name="reinforce_plus_plus")
     minus_baseline: true
-    use_kl_in_reward: false  # If true, add KL penalty to reward instead of loss
 
   # ============================================================================
   # Reward Shaping
@@ -86,6 +85,9 @@ loss_fn:
   truncated_importance_sampling_ratio_min: 0.5  # Lower bound (ICE-POP only)
   # Type: "tis" (clamp to max) or "icepop" (filter outside [min, max])
   truncated_importance_sampling_type: "icepop"
+
+  # Reinforce++: add KL penalty to reward instead of loss
+  use_kl_in_reward: false
 
 # ============================================================================
 # Output directories

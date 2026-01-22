@@ -61,6 +61,8 @@ class ClippedPGLossConfig(TypedDict):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: NotRequired[bool]
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
