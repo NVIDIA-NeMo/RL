@@ -61,6 +61,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -486,9 +487,77 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    # Handle backend-specific setup
+    def init_sglang():
+        """Initialize SGLang generation workers."""
+        t0 = time.perf_counter()
+        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg.finish_generation()
+        return pg, time.perf_counter() - t0
+
+    def initialize_generation_with_policy(
+        init_generation_fn,
+        generation_name: str,
+        init_time_key: str,
+        colocated_inference: bool,
+        worker_init_timing_metrics: dict,
+    ):
+        """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
+
+        Args:
+            init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
+            generation_name: Name of the generation engine ("vLLM" or "SGLang")
+            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
+            colocated_inference: Whether inference is colocated with training
+            worker_init_timing_metrics: Dictionary to store timing metrics
+
+        Returns:
+            Tuple of (policy_generation, policy)
+        """
+        # Determine if parallel initialization is possible (non-colocated mode)
+        use_parallel_init = not colocated_inference
+
+        if use_parallel_init:
+            # Parallel initialization: Generation engine and Policy can initialize simultaneously
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated mode)",
+                flush=True,
+            )
+
+            # Execute both initializations in parallel
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                generation_future = executor.submit(init_generation_fn)
+                policy_future = executor.submit(init_policy)
+                policy_generation, generation_time = generation_future.result()
+                policy, policy_time = policy_future.result()
+            parallel_wall_time = time.perf_counter() - parallel_start_time
+
+            # Store timing metrics
+            worker_init_timing_metrics[init_time_key] = generation_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        else:
+            # Sequential initialization: colocated mode (GPU memory requires generation engine first)
+            print(
+                "  ⚙️  Using sequential worker initialization (colocated mode)",
+                flush=True,
+            )
+
+            # Initialize generation engine first (clean GPU memory), then policy
+            policy_generation, generation_time = init_generation_fn()
+            worker_init_timing_metrics[init_time_key] = generation_time
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+
+        return policy_generation, policy
+
+    # Handle generation-specific setup
     if backend == "megatron":
-        # Megatron backend: policy_generation is None, only initialize policy
+        # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -499,7 +568,7 @@ def setup(
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
     elif backend == "vllm":
-        # vLLM backend: setup config, then decide parallel vs sequential init
+        # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config["use_importance_sampling_correction"] is True, (
@@ -527,48 +596,36 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
-
-        if use_parallel_init:
-            # Parallel initialization: vLLM and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
-
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                vllm_future = executor.submit(init_vllm)
-                policy_future = executor.submit(init_policy)
-                policy_generation, vllm_time = vllm_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires vLLM first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize vLLM first (clean GPU memory), then policy
-            policy_generation, vllm_time = init_vllm()
-            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_vllm,
+            generation_name="vLLM",
+            init_time_key="vllm_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+    elif backend == "sglang":
+        generation_config = cast(SGLangConfig, generation_config)
+
+        # Set model_path if not already set
+        if "model_path" not in generation_config["sglang_cfg"]:
+            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_sglang,
+            generation_name="SGLang",
+            init_time_key="sglang_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 
@@ -958,16 +1015,37 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
-            futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
-            )
-            futures_inference = policy_generation.update_weights_via_ipc_zmq()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            if isinstance(policy_generation, SGLangGeneration):
+                sglang_url_to_gpu_uuids = (
+                    policy_generation.get_sglang_url_to_gpu_uuids()
+                )
+                # Stream weights via HTTP
+                flush_success = policy_generation.invalidate_kv_cache()
+                if not flush_success:
+                    print("SGLang KV cache invalidation failed before weight update. ")
+                futures_train = policy.stream_weights_via_http(
+                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                )
+                # Wait for all workers to complete
+                ray.get(futures_train)
+                update_success = True
+            else:
+                # Original ZMQ IPC path for vLLM
+                futures_train = policy.stream_weights_via_ipc_zmq(
+                    buffer_size_bytes=buffer_size_bytes
+                )
+                futures_inference = policy_generation.update_weights_via_ipc_zmq()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
+            # SGLang haven't implemented non-colocated inference mode.
+            if isinstance(policy_generation, SGLangGeneration):
+                raise NotImplementedError(
+                    "SGLang haven't implemented non-colocated inference mode. "
+                )
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
@@ -1201,11 +1279,9 @@ def grpo_train(
 
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-                    # Clear vLLM logger metrics for each generation step
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "clear_vllm_logger_metrics"
-                    ):
-                        policy_generation.clear_vllm_logger_metrics()
+                    # Clear logger metrics for each generation step
+                    if policy_generation is not None:
+                        policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1263,22 +1339,17 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
-                    # Collect vLLM logger metrics for performance reporting after each generation step
-                    # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "get_vllm_logger_metrics"
-                    ):
-                        vllm_logger_metrics = (
-                            policy_generation.get_vllm_logger_metrics()
+                    # Collect generation logger metrics for performance reporting after each generation step
+                    # inflight batch sizes and num pending samples are collected from each worker
+                    if policy_generation is not None:
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
                         )
-                    else:
-                        vllm_logger_metrics = {}
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
-                    del rollout_metrics
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1586,7 +1657,8 @@ def grpo_train(
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
-                metrics["vllm_logger_metrics"] = vllm_logger_metrics
+                metrics.update(rollout_metrics)
+                metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1715,7 +1787,7 @@ def grpo_train(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
-                    vllm_logger_metrics,
+                    generation_logger_metrics,
                     total_steps + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][
                         "vllm_metrics_logger_interval"
@@ -2213,12 +2285,9 @@ def async_grpo_train(
             trajectory_collector.resume.remote()
 
     print("✅ All setup complete, starting buffer wait...")
-
-    # Clear vLLM logger metrics after at start of training
-    if policy_generation is not None and hasattr(
-        policy_generation, "clear_vllm_logger_metrics"
-    ):
-        policy_generation.clear_vllm_logger_metrics()
+    # Clear logger metrics at start of training
+    if policy_generation is not None:
+        policy_generation.clear_logger_metrics()
 
     # Wait for initial buffer fill
     print(
@@ -2458,23 +2527,19 @@ def async_grpo_train(
                     train_results = policy.train(train_data, loss_fn)
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
-                vllm_logger_metrics = None
+                generation_logger_metrics = None
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Collect vLLM logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each vLLM worker
-                    if policy_generation is not None and hasattr(
-                        policy_generation, "get_vllm_logger_metrics"
-                    ):
-                        vllm_logger_metrics = (
-                            policy_generation.get_vllm_logger_metrics()
+                    # Collect generation logger metrics for performance reporting
+                    # inflight batch sizes and num pending samples are collected from each worker
+                    if policy_generation is not None:
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
                         )
-                    else:
-                        vllm_logger_metrics = {}
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -2489,11 +2554,9 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
 
-                # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
-                if policy_generation is not None and hasattr(
-                    policy_generation, "clear_vllm_logger_metrics"
-                ):
-                    policy_generation.clear_vllm_logger_metrics()
+                # Clear logger metrics after each refit (weight sync), starting a new logging cycle
+                if policy_generation is not None:
+                    policy_generation.clear_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None
@@ -2587,8 +2650,8 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
-                if vllm_logger_metrics is not None:
-                    metrics["vllm_logger_metrics"] = vllm_logger_metrics
+                if generation_logger_metrics is not None:
+                    metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Checkpointing (same as sync version)
@@ -2695,7 +2758,7 @@ def async_grpo_train(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
-                    vllm_logger_metrics,
+                    generation_logger_metrics,
                     step + 1,
                     master_config["policy"]["generation"]["vllm_cfg"][
                         "vllm_metrics_logger_interval"
