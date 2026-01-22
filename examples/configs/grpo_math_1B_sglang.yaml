@@ -1,0 +1,25 @@
+defaults: grpo_math_1B.yaml
+
+grpo:
+  val_batch_size: 128
+
+policy:
+  generation:
+    backend: "sglang"
+    sglang_cfg:
+      # SGLang specific configuration
+      model_path: ${policy.model_name} 
+      gpus_per_server: 1 
+      dtype: ${policy.precision}
+      context_length: 512  # Maximum context length
+      allow_auto_truncate: true
+      enable_memory_saver: false
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      max_running_requests: null
+      mem_fraction_static: 0.7
+      skip_server_warmup: true
+
+logger:
+  wandb_enabled: true
