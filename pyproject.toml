@@ -84,6 +84,26 @@ vllm = [
   "vllm==0.11.2",
   "num2words>=0.5.14",
 ]
+sglang = [
+  "sglang==0.5.7",
+  "pybase64",
+  "orjson",
+  "uvloop",
+  "requests",
+  "openai",
+  "partial-json-parser",
+  "sentencepiece",
+  "sgl-kernel",
+  "compressed-tensors",
+  "msgspec",
+  "python-multipart",
+  "torchao",
+  "xgrammar",
+  "interegular",
+  "openai-harmony",
+  "torch-memory-saver",
+  "einops",
+]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
@@ -174,6 +194,7 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
+sgl-kernel = { git = "https://github.com/sgl-project/sglang", tag = "v0.5.7", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
 members = [
@@ -201,6 +222,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
+extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -210,6 +232,7 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  "sgl-kernel",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -229,6 +252,11 @@ override-dependencies = [
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
+  # sglang requires torch 2.9.1, but we need 2.9.0
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
+  # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
+  "llguidance>=1.3.0,<1.4.0",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -238,6 +266,26 @@ constraint-dependencies = [
   "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
   "pyasn1>=0.6.2",     # Address CVE GHSA-63vm-454h-vhhq
 ]
+
+conflicts = [
+  [
+    { extra = "fsdp" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "mcore" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "vllm" },
+    { extra = "sglang" },
+  ],
+]
+
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
@@ -250,6 +298,7 @@ transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
+sgl-kernel = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -286,6 +335,12 @@ name = "nv-grouped-gemm"
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
+[[tool.uv.dependency-metadata]]
+name = "sgl-kernel"
+# This version has to match the version in the commit/rev/tag used
+version = "0.3.20"
+requires-dist = ["torch", "scikit-build-core", "wheel"]
+
 [tool.black]
 line-length = 120
 include = '\.pyi?$'
@@ -307,6 +362,7 @@ markers = [
   "hf_gated: marks tests that require HuggingFace token access for gated models",
   "automodel: marks tests that require the automodel extra",
   "vllm: marks tests that require the vllm extra",
+  "sglang: marks tests that require the sglang extra",
 ]
 
 [tool.pyrefly]
