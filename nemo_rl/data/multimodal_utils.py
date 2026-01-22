@@ -19,6 +19,7 @@ from PIL import Image
 from collections import defaultdict
 from typing import Any, Optional, Union
 
+import requests
 import torch
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
