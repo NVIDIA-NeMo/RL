@@ -187,6 +187,8 @@ class TestApplyMoeConfig:
                 "moe_router_bias_update_rate": 0.0,
                 "moe_permute_fusion": True,
                 "moe_enable_deepep": False,
+                "moe_token_dispatcher_type": "allgather",
+                "moe_shared_expert_overlap": True,
             }
         }
 
@@ -199,6 +201,8 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_router_bias_update_rate == 0.0
         assert model_cfg.moe_permute_fusion is True
         assert model_cfg.moe_enable_deepep is False
+        assert model_cfg.moe_token_dispatcher_type == "allgather"
+        assert model_cfg.moe_shared_expert_overlap is True
 
 
 @pytest.mark.mcore
