@@ -97,6 +97,7 @@ class TestValidateModelPaths:
         assert pt_checkpoint_exists is True
 
 
+@pytest.mark.mcore
 class TestApplyParallelismConfig:
     """Tests for _apply_parallelism_config function."""
 
@@ -168,6 +169,7 @@ class TestApplyParallelismConfig:
         assert model_cfg.context_parallel_size == 4
 
 
+@pytest.mark.mcore
 class TestApplyMoeConfig:
     """Tests for _apply_moe_config function."""
 
@@ -197,6 +199,7 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_permute_fusion is True
 
 
+@pytest.mark.mcore
 class TestApplyPrecisionConfig:
     """Tests for _apply_precision_config function."""
 
@@ -252,6 +255,7 @@ class TestApplyPrecisionConfig:
             assert model_cfg.pipeline_dtype == expected_dtype
 
 
+@pytest.mark.mcore
 class TestApplyPerformanceConfig:
     """Tests for _apply_performance_config function."""
 
@@ -365,6 +369,7 @@ class TestApplyPerformanceConfig:
             _apply_performance_config(model_cfg, config)
 
 
+@pytest.mark.mcore
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
@@ -419,6 +424,7 @@ class TestValidateOptimizerConfig:
         _validate_optimizer_config(config)
 
 
+@pytest.mark.mcore
 class TestValidateChunkingConfig:
     """Tests for _validate_chunking_config function."""
 
@@ -485,6 +491,7 @@ class TestValidateChunkingConfig:
         _validate_chunking_config(config)
 
 
+@pytest.mark.mcore
 class TestCreateCheckpointConfig:
     """Tests for _create_checkpoint_config function."""
 
@@ -506,6 +513,7 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.load_rng is False
 
 
+@pytest.mark.mcore
 class TestValidateTrainingConfig:
     """Tests for _validate_training_config function."""
 
@@ -578,6 +586,7 @@ class TestValidateTrainingConfig:
         _validate_training_config(config, model_cfg)
 
 
+@pytest.mark.mcore
 class TestValidateDtypeConfig:
     """Tests for _validate_dtype_config function."""
 
@@ -710,6 +719,7 @@ class TestValidateDtypeConfig:
         assert "optimizer" in str(exc_info.value).lower()
 
 
+@pytest.mark.mcore
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
@@ -782,6 +792,7 @@ class TestValidateAndSetConfig:
                 assert runtime_config.is_generation_colocated is True
 
 
+@pytest.mark.mcore
 class TestRuntimeConfigNamedTuple:
     """Tests for RuntimeConfig named tuple."""
 
@@ -806,6 +817,7 @@ class TestRuntimeConfigNamedTuple:
         assert runtime_config.final_padded_vocab_size == 32000
 
 
+@pytest.mark.mcore
 class TestModelAndOptimizerStateNamedTuple:
     """Tests for ModelAndOptimizerState named tuple."""
 
@@ -826,6 +838,7 @@ class TestModelAndOptimizerStateNamedTuple:
         assert callable(state.param_sync_func)
 
 
+@pytest.mark.mcore
 class TestHandleModelImport:
     """Tests for handle_model_import function."""
 
@@ -895,6 +908,7 @@ class TestHandleModelImport:
         assert "Reinitializing model parallel" in captured.out
 
 
+@pytest.mark.mcore
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
@@ -980,6 +994,7 @@ class TestSetupModelAndOptimizer:
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 
 
+@pytest.mark.mcore
 class TestSetupReferenceModelState:
     """Tests for setup_reference_model_state function."""
 
@@ -1048,6 +1063,7 @@ class TestSetupReferenceModelState:
         assert "Reference model loaded" in captured.out
 
 
+@pytest.mark.mcore
 class TestFinalizeMegatronSetup:
     """Tests for finalize_megatron_setup function."""
 
