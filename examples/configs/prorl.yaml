@@ -5,7 +5,7 @@
 # - Decoupled Clipping: Asymmetric ratio clipping (clip_max > clip_min)
 # - Token-level Loss: Fine-grained policy gradient
 # - Truncated Importance Sampling (TIS/ICE-POP)
-# - Reinforce++ advantage estimator (optional)
+# - Reinforce++ decoupled advantage normalization estimator
 #
 # Inherits from grpo_math_1B.yaml
 #
@@ -13,9 +13,9 @@
 #   python examples/run_grpo_math.py --config examples/configs/prorl.yaml
 #
 # Reference papers:
-# - REINFORCE++: https://arxiv.org/abs/2402.14740 (Back to Basics: Revisiting REINFORCE Style Optimization)
-# - DAPO: https://arxiv.org/abs/2503.14476 (Decoupled Clip and Dynamic sAmpling Policy Optimization)
-# - ICE-POP: Truncated Importance Sampling from DAPO paper (Section 3.3)
+# ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models
+# REINFORCE++: Stabilizing Critic-Free Policy Optimization with Global Advantage Normalization
+# DAPO: An Open-Source LLM Reinforcement Learning System at Scale
 
 defaults: "grpo_math_1B.yaml"
 
@@ -48,7 +48,7 @@ grpo:
   # ============================================================================
   reward:
     - name: "stop_properly_penalty"
-      penalty_coef: 0  # Set > 0 to enable truncation penalty (e.g., 0.5)
+      penalty_coef: 0  # Set >= 0 to enable truncation penalty (e.g., 0.1)
 
 # ============================================================================
 # Loss Function Configuration
@@ -57,7 +57,7 @@ loss_fn:
   # KL regularization
   reference_policy_kl_penalty: 0.0001
   reference_policy_kl_type: "k2"
-  kl_input_clamp_value: 20.0
+  kl_input_clamp_value: 10.0
   kl_output_clamp_value: 10.0
 
   # ============================================================================
