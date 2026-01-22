@@ -39,6 +39,19 @@ def setup_data_with_envs(
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
+    """Setup data with environments.
+
+    This function is used to setup the data and environments for the training and validation datasets.
+
+    Args:
+        tokenizer: Tokenizer or processor.
+        data_config: Data config.
+        env_configs: Environment configs.
+        is_vlm: Whether to use VLM training or not.
+
+    Returns:
+        A tuple of (train dataset, validation dataset, task to environment, task to validation environment).
+    """
     assert "train" in data_config, (
         "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset "
         "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
