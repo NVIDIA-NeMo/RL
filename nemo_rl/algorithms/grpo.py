@@ -27,6 +27,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossConfig,
@@ -114,6 +118,26 @@ class AsyncGRPOConfig(TypedDict):
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
+class AdvEstimatorConfig(TypedDict):
+    """Configuration for advantage estimator (GRPO or Reinforce++)."""
+
+    name: str  # "grpo" or "reinforce_plus_plus"
+    # GRPO specific
+    normalize_rewards: NotRequired[bool]
+    use_leave_one_out_baseline: NotRequired[bool]
+    # Reinforce++ specific
+    minus_baseline: NotRequired[bool]
+
+
+class RewardConfig(TypedDict):
+    """Configuration for reward shaping functions."""
+
+    name: str  # "stop_properly_penalty" or "length_penalty"
+    penalty_coef: NotRequired[float]
+    penalty_type: NotRequired[str]  # For length_penalty: "linear", "cosine", "instance_linear"
+    max_length: NotRequired[int]
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -143,6 +167,10 @@ class GRPOConfig(TypedDict):
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
+    # Advantage estimator configuration (grpo or reinforce_plus_plus)
+    adv_estimator: NotRequired[AdvEstimatorConfig]
+    # Reward shaping functions (stop_properly_penalty, length_penalty)
+    reward: NotRequired[list[RewardConfig]]
 
 
 class GRPOSaveState(TypedDict):
@@ -1161,6 +1189,21 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
+    # Initialize advantage estimator based on configuration
+    adv_estimator_config = master_config["grpo"].get("adv_estimator", None)
+    adv_estimator = None
+    if adv_estimator_config is not None:
+        loss_config = master_config["loss_fn"]
+        adv_estimator_name = adv_estimator_config.get("name", "grpo")
+        if adv_estimator_name == "grpo":
+            adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
+            print(f"  ✓ Using GRPO advantage estimator")
+        elif adv_estimator_name == "reinforce_plus_plus":
+            adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
+            print(f"  ✓ Using Reinforce++ advantage estimator")
+        else:
+            raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
@@ -1420,13 +1463,28 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
+                    # Compute advantages using configured adv_estimator or default GRPO
+                    if adv_estimator is not None:
+                        # Create mask for adv_estimator (will be expanded later)
+                        # For now, use a simple mask based on batch size
+                        batch_size = rewards.shape[0]
+                        seq_len = 1  # placeholder, will be expanded later
+                        mask = torch.ones(batch_size, seq_len)
+                        advantages = adv_estimator.compute_advantage(
+                            prompt_ids=input_ids,
+                            rewards=rewards,
+                            mask=mask,
                         )
+                        # advantages from adv_estimator is already normalized
+                    else:
+                        # Default GRPO advantage calculation
+                        advantages = (rewards - baseline).unsqueeze(-1)
+                        if master_config["grpo"]["normalize_rewards"]:
+                            advantages = normalize_advantages_with_epsilon(
+                                advantages=advantages,
+                                std=std,
+                            )
 
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,

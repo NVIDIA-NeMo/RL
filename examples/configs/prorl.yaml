@@ -1,0 +1,100 @@
+# ProRL Algorithm Configuration (DAPO-style)
+# 
+# This configuration implements ProRL with DAPO techniques:
+# - Dynamic Sampling: Filter prompts with zero reward variance
+# - Decoupled Clipping: Asymmetric ratio clipping (clip_max > clip_min)
+# - Token-level Loss: Fine-grained policy gradient
+# - Truncated Importance Sampling (TIS/ICE-POP)
+# - Reinforce++ advantage estimator (optional)
+#
+# Inherits from grpo_math_1B.yaml
+#
+# Usage:
+#   python examples/run_grpo_math.py --config examples/configs/prorl.yaml
+#
+# Reference papers:
+# - REINFORCE++: https://arxiv.org/abs/2402.14740 (Back to Basics: Revisiting REINFORCE Style Optimization)
+# - DAPO: https://arxiv.org/abs/2503.14476 (Decoupled Clip and Dynamic sAmpling Policy Optimization)
+# - ICE-POP: Truncated Importance Sampling from DAPO paper (Section 3.3)
+
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  # ============================================================================
+  # DAPO: Dynamic Sampling
+  # Filter out prompts where all generations have the same reward (std=0)
+  # This focuses training on "learnable" examples with mixed outcomes
+  # ============================================================================
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10  # Max batches before error
+  batch_multiplier: 1.5  # Generate more prompts to account for filtering
+
+
+  # ============================================================================
+  # Advantage Estimator
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  # ============================================================================
+  adv_estimator:
+    name: "reinforce_plus_plus"  # Use "grpo" for standard GRPO
+    # GRPO specific
+    normalize_rewards: true
+    use_leave_one_out_baseline: fasle
+    # Reinforce++ specific (used when name="reinforce_plus_plus")
+    minus_baseline: true
+
+  # ============================================================================
+  # Reward Shaping
+  # Applied to rewards before advantage calculation
+  # ============================================================================
+  reward:
+    - name: "stop_properly_penalty"
+      penalty_coef: 0  # Set > 0 to enable truncation penalty (e.g., 0.5)
+
+# ============================================================================
+# Loss Function Configuration
+# ============================================================================
+loss_fn:
+  # KL regularization
+  reference_policy_kl_penalty: 0.0001
+  reference_policy_kl_type: "k2"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+
+  # ============================================================================
+  # DAPO: Decoupled (Asymmetric) Clipping
+  # ratio_clip_max > ratio_clip_min allows more exploration
+  # Standard PPO uses symmetric clipping (both = 0.2)
+  # ============================================================================
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.27  # Slightly larger for exploration
+
+  # Dual-clipping (set to e.g., 3.0 to enable, null to disable)
+  ratio_clip_c: null
+
+  # ============================================================================
+  # DAPO: Token-level Loss
+  # Compute loss per-token instead of per-sequence
+  # ============================================================================
+  token_level_loss: true
+
+  # ============================================================================
+  # Truncated Importance Sampling (TIS / ICE-POP)
+  # Requires use_importance_sampling_correction: true
+  # ============================================================================
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0  # Upper bound
+  truncated_importance_sampling_ratio_min: 0.5  # Lower bound (ICE-POP only)
+  # Type: "tis" (clamp to max) or "icepop" (filter outside [min, max])
+  truncated_importance_sampling_type: "icepop"
+
+  # Set to true for Reinforce++ (add KL penalty to reward instead of loss)
+  use_kl_in_reward: false
+
+# ============================================================================
+# Output directories
+# ============================================================================
+checkpointing:
+  checkpoint_dir: "results/prorl"
+
+logger:
+  log_dir: "logs/prorl"
