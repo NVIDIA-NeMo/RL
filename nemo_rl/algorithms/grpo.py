@@ -127,14 +127,14 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+    use_kl_in_reward: NotRequired[bool]  # If True, add KL penalty to reward instead of loss
 
 
-class RewardConfig(TypedDict):
-    """Configuration for reward shaping functions."""
+class LengthPenaltyConfig(TypedDict):
+    """Configuration for length penalty reward shaping."""
 
-    name: str  # "stop_properly_penalty" or "length_penalty"
     penalty_coef: NotRequired[float]
-    penalty_type: NotRequired[str]  # For length_penalty: "linear", "cosine", "instance_linear"
+    penalty_type: NotRequired[str]  # "linear", "cosine", "instance_linear"
     max_length: NotRequired[int]
 
 
@@ -169,8 +169,8 @@ class GRPOConfig(TypedDict):
     calculate_advantages_on_gpu: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
-    # Reward shaping functions (stop_properly_penalty, length_penalty)
-    reward: NotRequired[list[RewardConfig]]
+    # Length penalty configuration
+    length_penalty: NotRequired[LengthPenaltyConfig]
 
 
 class GRPOSaveState(TypedDict):

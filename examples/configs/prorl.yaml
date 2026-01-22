@@ -13,9 +13,8 @@
 #   python examples/run_grpo_math.py --config examples/configs/prorl.yaml
 #
 # Reference papers:
-# ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models
-# REINFORCE++: Stabilizing Critic-Free Policy Optimization with Global Advantage Normalization
-# DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+# ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
+# REINFORCE++: https://arxiv.org/abs/2501.03262
 
 defaults: "grpo_math_1B.yaml"
 
@@ -41,6 +40,7 @@ grpo:
     use_leave_one_out_baseline: fasle
     # Reinforce++ specific (used when name="reinforce_plus_plus")
     minus_baseline: true
+    use_kl_in_reward: false  # If true, add KL penalty to reward instead of loss
 
   # ============================================================================
   # Reward Shaping
@@ -86,9 +86,6 @@ loss_fn:
   truncated_importance_sampling_ratio_min: 0.5  # Lower bound (ICE-POP only)
   # Type: "tis" (clamp to max) or "icepop" (filter outside [min, max])
   truncated_importance_sampling_type: "icepop"
-
-  # Set to true for Reinforce++ (add KL penalty to reward instead of loss)
-  use_kl_in_reward: false
 
 # ============================================================================
 # Output directories

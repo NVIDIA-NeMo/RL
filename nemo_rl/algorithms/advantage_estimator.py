@@ -17,19 +17,16 @@ Advantage Estimators for RL algorithms.
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
-- ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
+- ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward and KL penalty in reward
 
 Reference papers:
-- ProRL: https://arxiv.org/abs/2505.24864
+- ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
 """
 
 import torch
 
-from nemo_rl.algorithms.utils import (
-    calculate_baseline_and_std_per_prompt,
-    calculate_kl,
-)
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 
 
 class GRPOAdvantageEstimator:
@@ -64,11 +61,12 @@ class ReinforcePlusPlusAdvantageEstimator:
     
     Args:
         minus_baseline: If True, subtract per-prompt mean baseline from rewards.
+        use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
         self.minus_baseline = estimator_config.get("minus_baseline", True)
-        self.use_kl_in_reward = loss_config.get("use_kl_in_reward", False)
+        self.use_kl_in_reward = estimator_config.get("use_kl_in_reward", False)
         self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.01)
         self.kl_type = loss_config.get("reference_policy_kl_type", "k3")
 
