@@ -1101,6 +1101,7 @@ def grpo_train(
             val_task_to_env,
             step=0,
             master_config=master_config,
+            logger=logger,
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
@@ -1510,6 +1511,7 @@ def grpo_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     policy_generation.finish_generation()
                     logger.log_metrics(
@@ -1835,6 +1837,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1960,6 +1963,14 @@ def validate(
     print("\n  ⏱️  Validation Timing:")
     validation_time = timing_metrics.get("total_validation_time", 0)
     print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
+
+    # Log validation data to JSONL file
+    if logger is not None:
+        val_log_data = {
+            "content": all_message_logs,
+            "rewards": total_rewards,
+        }
+        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Make sure to reset the timer after validation
     timer.reset()
@@ -2185,6 +2196,7 @@ def async_grpo_train(
                 val_task_to_env,
                 step=0,
                 master_config=master_config,
+                logger=logger,
             )
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
@@ -2505,6 +2517,7 @@ def async_grpo_train(
                         val_task_to_env,
                         step=step + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     policy_generation.finish_generation()
                     logger.log_metrics(
