@@ -16,5 +16,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	branch = mfathi/multichallenge
 	shallow = true
