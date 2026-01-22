@@ -15,27 +15,24 @@
 import argparse
 import os
 import pprint
-from collections import defaultdict
 from typing import Any, Optional
 
+from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
-from nemo_rl.data.interfaces import (
-    TaskDataProcessFnCallable,
-    TaskDataSpec,
-)
-from nemo_rl.data.processors import math_hf_data_processor
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    extract_necessary_env_names,
+    load_response_dataset,
+    update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.utils import create_env
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -66,65 +63,81 @@ def setup_data(
     tokenizer: TokenizerType,
     data_config: DataConfig,
     env_configs: dict[str, Any],
-    seed: int,
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
+    assert "train" in data_config, (
+        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset "
+        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
+    )
+
+    print("\n▶ Setting up envs...")
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+        for env_name in env_name_list
+    }
+
     print("\n▶ Setting up data...")
-    math_task_spec = TaskDataSpec(
-        task_name="math",
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-
-    # load dataset
-    data: Any = load_response_dataset(data_config, seed)
-    task_name = (
-        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
-    )
-
-    # data processor
-    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (math_task_spec, math_hf_data_processor))
-    )
-    task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
-
-    # setup math environment
-    math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["math"])
+    # setup train dataset
+    if "default" in data_config:
+        update_single_dataset_config(data_config["train"], data_config["default"])
+    data = load_response_dataset(data_config["train"])
+    task_data_processors = {data.task_name: (data.task_spec, data.processor)}
+    task_to_env = {data.task_name: envs[data_config["train"]["env_name"]]}
 
     dataset = AllTaskProcessedDataset(
-        data.formatted_ds["train"],
+        data.dataset,
         tokenizer,
-        math_task_spec,
+        None,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
-    val_dataset: Optional[AllTaskProcessedDataset] = None
-    if data.formatted_ds["validation"]:
+    # setup validation dataset
+    val_task_data_processors = {}
+    val_task_to_env = {}
+    val_data_list = []
+
+    # validation dataset from train dataset (when train dataset's split_validation_size > 0)
+    if hasattr(data, "val_dataset") and data.val_dataset is not None:
+        val_data_list.append(data.val_dataset)
+        val_task_data_processors = task_data_processors.copy()
+        val_task_to_env = task_to_env.copy()
+
+    # validation dataset from config
+    if "validation" in data_config and data_config["validation"] is not None:
+        if "default" in data_config:
+            update_single_dataset_config(
+                data_config["validation"], data_config["default"]
+            )
+        val_data = load_response_dataset(data_config["validation"])
+        val_data_list.append(val_data.dataset)
+        val_task_data_processors[val_data.task_name] = (
+            val_data.task_spec,
+            val_data.processor,
+        )
+        val_task_to_env[val_data.task_name] = envs[
+            data_config["validation"]["env_name"]
+        ]
+
+    val_dataset = None
+    if len(val_data_list) > 0:
+        merged_val_data = concatenate_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
-            data.formatted_ds["validation"],
+            merged_val_data,
             tokenizer,
-            math_task_spec,
-            task_data_processors,
+            None,
+            val_task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
-    else:
-        val_dataset = None
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
-    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: math_env)
-    task_to_env[task_name] = math_env
-    return dataset, val_dataset, task_to_env, task_to_env
+    return dataset, val_dataset, task_to_env, val_task_to_env
 
 
 def main() -> None:
@@ -176,7 +189,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
+    ) = setup_data(tokenizer, config["data"], config["env"])
 
     (
         policy,

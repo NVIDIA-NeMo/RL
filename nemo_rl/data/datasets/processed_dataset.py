@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from typing import Any, Optional, Union
 
 import torch
@@ -55,17 +56,18 @@ class AllTaskProcessedDataset:
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
+        # TODO: will be removed once preference dataset is refactored
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.max_seq_length = max_seq_length
         self._bos_checked = False
 
-        if isinstance(task_data_processors, dict):
+        if (
+            isinstance(task_data_processors, dict)
+            and default_task_data_spec is not None
+        ):
             # apply defaults to all task data specs
-            for task_name, (
-                task_data_spec,
-                task_data_processor,
-            ) in task_data_processors.items():
+            for _, (task_data_spec, _) in task_data_processors.items():
                 task_data_spec.copy_defaults(self.default_task_data_spec)
 
     def __len__(self) -> int:

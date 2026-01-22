@@ -37,8 +37,12 @@ policy:
       use_deep_gemm: true
 data:
   max_input_seq_length: 2048
-  prompt_file: null
-  dataset_name: DAPOMath17K
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
 env:
   dapo:
     num_workers: 16

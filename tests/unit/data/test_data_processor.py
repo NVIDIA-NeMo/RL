@@ -146,7 +146,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
-        dataset=data.formatted_ds["train"],
+        dataset=data.dataset,
         tokenizer=tokenizer,
         default_task_data_spec=math_task_spec,
         task_data_processors=task_data_processors,
