@@ -16,6 +16,7 @@ logger:
   log_dir: logs/grpo-qwen3-235b-32n4g-async-1off
   wandb:
     name: grpo-qwen3-235b-32n4g-async-1off
+  tensorboard_enabled: true
 cluster:
   gpus_per_node: 4
   num_nodes: 32
