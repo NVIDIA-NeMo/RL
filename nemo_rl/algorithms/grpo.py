@@ -1575,10 +1575,15 @@ def grpo_train(
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
+                    # Get token-level mask: token_mask * sample_mask
+                    token_mask = train_data["token_mask"]
+                    sample_mask = train_data["sample_mask"]
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
-                        mask=train_data["token_mask"],
+                        mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
@@ -2590,6 +2595,12 @@ def async_grpo_train(
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     del prompt_ids_for_adv
+
+                    # Log advantages stats
+                    advantages = train_data["advantages"]
+                    print(
+                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):

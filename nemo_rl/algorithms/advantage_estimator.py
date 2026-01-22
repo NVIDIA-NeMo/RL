@@ -26,7 +26,7 @@ Reference papers:
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl
 
 
 class GRPOAdvantageEstimator:
