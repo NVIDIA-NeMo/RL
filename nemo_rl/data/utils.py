@@ -15,7 +15,7 @@
 from typing import Any, Optional
 
 from datasets import concatenate_datasets
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoProcessor, AutoTokenizer
 
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
@@ -27,13 +27,12 @@ from nemo_rl.data.datasets import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
-TokenizerType = PreTrainedTokenizerBase
-
 
 def setup_data_with_envs(
-    tokenizer: TokenizerType,
+    tokenizer: AutoProcessor | AutoTokenizer,
     data_config: DataConfig,
     env_configs: dict[str, Any],
+    is_vlm: bool = False,
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],
@@ -47,10 +46,12 @@ def setup_data_with_envs(
 
     print("\n▶ Setting up envs...")
     env_name_list = extract_necessary_env_names(data_config)
-    envs = {
-        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
-        for env_name in env_name_list
-    }
+    envs = {}
+    for env_name in env_name_list:
+        registered_env_name = "vlm" if is_vlm else env_name
+        envs[env_name] = create_env(
+            env_name=registered_env_name, env_config=env_configs[env_name]
+        )
 
     print("\n▶ Setting up data...")
     # setup train dataset
