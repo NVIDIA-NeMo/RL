@@ -25,7 +25,7 @@ import ray
 import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
-from megatron.bridge.peft.lora import LoRA
+from megatron.bridge.peft.lora import LoRA, LoRAMerge
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
@@ -55,6 +55,7 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -86,6 +87,7 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
@@ -279,11 +281,7 @@ def setup_megatron_model(
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 
-    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-        if use_peft:
-            raise ValueError(
-                "Freezing the MOE router is not currently supported when using PEFT"
-            )
+    if policy_cfg["megatron_cfg"]["freeze_moe_router"] and not use_peft:
 
         def freeze_moe_router(megatron_model):
             if not isinstance(megatron_model, list):
@@ -339,6 +337,7 @@ def setup_megatron_model(
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     if load_optimizer:
@@ -911,6 +910,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
                 mixed_precision_wrapper=ref_mixed_precision_wrapper,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             print("Loading the Reference Model")
             if (
@@ -1178,18 +1178,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
+                pg_collection = get_pg_collection(self.model)
+
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
                 update_successful = logical_and_across_model_parallel_group(
-                    update_successful
+                    update_successful, mp_group=pg_collection.mp
                 )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
-                    grad_norm
+                    grad_norm, mp_group=pg_collection.mp
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
-                    num_zeros_in_grad
+                    num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
                 if update_successful:
@@ -2068,6 +2070,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
+    def merge_peft_weights(self):
+        merge = LoRAMerge()
+        merged_model = merge(self.model, training=False)
+        for m in merged_model.modules():
+            if hasattr(m, "adapter"):
+                delattr(m, "adapter")
+
+        return merged_model
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
@@ -2136,6 +2147,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2146,15 +2159,29 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             get_vllm_qkv_scale_names,
         )
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
+        if refit_base_model_weights:
+            # Converts full megatron model weights to HF weights.
+            base_iter = self.megatron_bridge.export_hf_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            )
 
-        # Yield the original parameters first.
-        for name, tensor in base_iter:
-            yield name, tensor
+            # Yield the original parameters first.
+            for name, tensor in base_iter:
+                yield name, tensor
+
+        elif refit_lora_weights:
+            # Converts megatron LoRA weights to HF weights.
+            lora_iter = self.megatron_bridge.export_adapter_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            )
+
+            # Yield the original parameters first.
+            for name, tensor in lora_iter:
+                yield name, tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -2193,7 +2220,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
@@ -2203,7 +2234,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
             params_generator=self._iter_params_with_optional_kv_scales(
-                kv_scales=kv_scales
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
             ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
@@ -2213,12 +2246,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self, 
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_base_model_weights: bool = True,
+        refit_lora_weights: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication."""
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales,
+                refit_base_model_weights=refit_base_model_weights,
+                refit_lora_weights=refit_lora_weights,
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
