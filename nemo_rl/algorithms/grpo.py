@@ -1705,7 +1705,6 @@ def grpo_train(
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
-                del train_data
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -1893,6 +1892,7 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
+            del train_data
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
@@ -1987,7 +1987,7 @@ def grpo_train(
             # processing rewards
             del repeated_batch
             del rewards
-            del train_data
+            # train_data already deleted after logging above
             # logging
             del metrics
             if "val_metrics" in dir():
@@ -2700,8 +2700,9 @@ def async_grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
+                # Save content for logging before deleting flat_messages
+                flat_messages_content = flat_messages.get("content", [])
                 del flat_messages
-                del train_data
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -2839,7 +2840,7 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
-            log_data = {"content": flat_messages["content"]}
+            log_data = {"content": flat_messages_content}
             log_data["rewards"] = rewards.tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
@@ -2847,6 +2848,8 @@ def async_grpo_train(
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
+            del train_data
+            del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
