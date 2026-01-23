@@ -623,8 +623,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
 
-            # Check if response was truncated (did not stop properly with stop token)
-            is_truncated = generation.finish_reason != "stop"
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation.finish_reason == "length"
             truncated_list.append(is_truncated)
 
             assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
