@@ -1702,9 +1702,10 @@ def grpo_train(
                     )
 
                 # Get flat advantages and token mask for masked metrics computation
-                flat_advantages = flat_messages["advantages"]
+                flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
+                del train_data
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -2697,8 +2698,10 @@ def async_grpo_train(
                     # Resume trajectory collection after validation
                     trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
-                flat_advantages = flat_messages["advantages"]
+                flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
+                del flat_messages
+                del train_data
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
