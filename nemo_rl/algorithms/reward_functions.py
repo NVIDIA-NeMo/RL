@@ -74,12 +74,7 @@ def apply_reward_shaping(
             else:
                 truncated = truncated.to(device=rewards.device)
             # For truncated samples, scale the reward by stop_properly_penalty_coef
-            scale = torch.where(
-                truncated,
-                torch.tensor(stop_properly_penalty_coef, dtype=rewards.dtype, device=rewards.device),
-                torch.tensor(1.0, dtype=rewards.dtype, device=rewards.device),
-            )
-            rewards = rewards * scale
+            rewards = torch.where(truncated, rewards * stop_properly_penalty_coef, rewards)
             batch["total_reward"] = rewards
 
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.

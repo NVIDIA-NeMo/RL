@@ -129,14 +129,6 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
-class LengthPenaltyConfig(TypedDict):
-    """Configuration for length penalty reward shaping."""
-
-    penalty_coef: NotRequired[float]
-    penalty_type: NotRequired[str]  # "linear", "cosine", "instance_linear"
-    max_length: NotRequired[int]
-
-
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -168,8 +160,6 @@ class GRPOConfig(TypedDict):
     calculate_advantages_on_gpu: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
-    # Length penalty configuration
-    length_penalty: NotRequired[LengthPenaltyConfig]
 
 
 class GRPOSaveState(TypedDict):
