@@ -71,8 +71,8 @@ class ReinforcePlusPlusAdvantageEstimator:
     def __init__(self, estimator_config: dict, loss_config: dict):
         self.minus_baseline = estimator_config.get("minus_baseline", True)
         self.use_kl_in_reward = loss_config.get("use_kl_in_reward", False)
-        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.01)
-        self.kl_type = loss_config.get("reference_policy_kl_type", "k3")
+        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.0001)
+        self.kl_type = loss_config.get("reference_policy_kl_type", "k2")
 
     def compute_advantage(
         self, prompt_ids, rewards, mask, logprobs_policy=None, logprobs_reference=None, **kwargs
