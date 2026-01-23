@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Instrumentation: measure import time
+import time as _time_module
+_IMPORT_START_TIME = _time_module.perf_counter()
+
 import copy
 import gc
 import os
@@ -36,6 +40,11 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.fault_injection import FaultPlan, check_workload_exception, dispatch_fault_if_target
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.timer import Timer
+
+# Instrumentation: measure import time
+_IMPORT_END_TIME = _time_module.perf_counter()
+_IMPORT_DURATION = _IMPORT_END_TIME - _IMPORT_START_TIME
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -132,6 +141,12 @@ class BaseVllmGenerationWorker:
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
         """
+        # Timer for init timing - record module import time from file-level measurement
+        self.init_timer = Timer()
+        # Record module import duration measured at file load time
+        self.init_timer._timers["module_imports"] = [_IMPORT_DURATION]
+
+        self.init_timer.start("config_setup")
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -152,17 +167,19 @@ class BaseVllmGenerationWorker:
             self.tokenizer = None
             self.rank = 0
             self.world_size = 1
+            self.init_timer.stop("config_setup")
             return
 
         # In Ray+vLLM setup, each worker process considers itself rank 0
         # vLLM handles the parallelism internally through Ray
         self.rank = 0
         self.world_size = 1
+        self.init_timer.stop("config_setup")
 
         # Monkey patches for vLLM behavior. We avoid importing vllm modules
         # here to prevent side effects during initialization and instead
         # locate the files via importlib metadata.
-
+        self.init_timer.start("vllm_patching")
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_patch")
@@ -287,7 +304,9 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_vit_flash_attn_backend()
         logger.info("Successfully patched vllm vit flash attention backend.")
+        self.init_timer.stop("vllm_patching")
 
+        self.init_timer.start("vllm_kwargs_setup")
         try:
             import vllm
 
@@ -316,9 +335,6 @@ class BaseVllmGenerationWorker:
             # Set bundle indices for parallel workers
             bundle_indices_str = ",".join(map(str, bundle_indices))
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = bundle_indices_str
-            print(
-                f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
-            )
 
             # Use Ray for distributed execution in parallel mode
             vllm_kwargs["distributed_executor_backend"] = "ray"
@@ -412,8 +428,10 @@ class BaseVllmGenerationWorker:
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+        self.init_timer.stop("vllm_kwargs_setup")
 
-        self._create_engine(llm_kwargs)
+        with self.init_timer.time("init_vllm_engine"):
+            self._create_engine(llm_kwargs)
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
@@ -490,6 +508,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+
+    def get_init_timing(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def init_collective(
         self,

@@ -29,6 +29,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
@@ -342,6 +343,7 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+        self.init_timer = Timer()
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -425,6 +427,8 @@ class RayWorkerGroup:
                                 specifies a tied group with its node and local bundle indices. If the local_bundle_indices
                                 spans multiple nodes, the node_idx will be the first node's index in the tied group.
         """
+        self.init_timer.start("total")
+
         self.master_address, self.master_port = (
             self.cluster.get_master_address_and_port()
         )
@@ -435,20 +439,21 @@ class RayWorkerGroup:
                 env_vars[k] = v
 
         # Get the python environment for the actor
-        actor_python_env = get_actor_python_env(
-            remote_worker_builder.ray_actor_class_fqn
-        )
-        if actor_python_env.startswith("uv"):
-            # If the py_executable begins with uv it signals that we need to create a
-            #  local venv first and then replace the py_executable with the local venv's python.
-            #  The directory the venv will be created in is controlled by the env var
-            #  NEMO_RL_VENV_DIR and defaults to $GIT_ROOT/venvs/.
-            py_executable = create_local_venv_on_each_node(
-                py_executable=actor_python_env,
-                venv_name=remote_worker_builder.ray_actor_class_fqn,
+        with self.init_timer.time("env_venv_setup"):
+            actor_python_env = get_actor_python_env(
+                remote_worker_builder.ray_actor_class_fqn
             )
-        else:
-            py_executable = actor_python_env
+            if actor_python_env.startswith("uv"):
+                # If the py_executable begins with uv it signals that we need to create a
+                #  local venv first and then replace the py_executable with the local venv's python.
+                #  The directory the venv will be created in is controlled by the env var
+                #  NEMO_RL_VENV_DIR and defaults to $GIT_ROOT/venvs/.
+                py_executable = create_local_venv_on_each_node(
+                    py_executable=actor_python_env,
+                    venv_name=remote_worker_builder.ray_actor_class_fqn,
+                )
+            else:
+                py_executable = actor_python_env
 
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
@@ -462,16 +467,18 @@ class RayWorkerGroup:
         placement_groups = self.cluster.get_placement_groups()
 
         # Get available address and port for each worker
-        available_addresses = []
-        available_ports = []
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
-            for local_rank, bundle_idx in enumerate(local_bundle_indices):
-                addr, port = self.cluster.get_available_address_and_port(
-                    pg_idx, bundle_idx
-                )
-                available_addresses.append(addr)
-                available_ports.append(port)
+        with self.init_timer.time("addr_port_allocation"):
+            available_addresses = []
+            available_ports = []
+            for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+                for local_rank, bundle_idx in enumerate(local_bundle_indices):
+                    addr, port = self.cluster.get_available_address_and_port(
+                        pg_idx, bundle_idx
+                    )
+                    available_addresses.append(addr)
+                    available_ports.append(port)
 
+        self.init_timer.start("async_worker_creation")
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
 
@@ -564,11 +571,13 @@ class RayWorkerGroup:
 
                 global_rank += 1
 
+        self.init_timer.stop("async_worker_creation")
+
         # Wait for all workers to initialize with timing and progress bar
         num_workers = len(worker_futures)
         worker_refs = [future for future, _ in worker_futures]
 
-        start_time = time.perf_counter()
+        self.init_timer.start("ray_get_wait")
 
         # Use ray.wait() to track individual worker completion times
         remaining_refs = worker_refs.copy()
@@ -591,12 +600,8 @@ class RayWorkerGroup:
 
         # Get all worker results
         workers = ray.get(worker_refs)
-        total_init_time = time.perf_counter() - start_time
-
-        print(
-            f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s",
-            flush=True,
-        )
+        self.init_timer.stop("ray_get_wait")
+        self.init_timer.stop("total")
 
         for idx, (worker, (_, initializer)) in enumerate(zip(workers, worker_futures)):
             worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = initializer

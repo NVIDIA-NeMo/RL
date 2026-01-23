@@ -37,6 +37,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.utils.fault_injection import FaultPlan
+from nemo_rl.utils.timer import Timer
 
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
@@ -54,6 +55,10 @@ class VllmGeneration(GenerationInterface):
         workers_per_node: Optional[Union[int, list[int]]] = None,
     ):
         """Initialize a vLLM policy with distributed workers."""
+        self.init_timer = Timer()
+        self.init_timer.start("total")
+        self.init_timer.start("pre_worker_group")
+
         # Store config
         self.cfg = config
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -182,6 +187,9 @@ class VllmGeneration(GenerationInterface):
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
+        self.init_timer.stop("pre_worker_group")
+
+        self.init_timer.start("worker_group_creation")
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
@@ -206,9 +214,12 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
+        self.init_timer.stop("worker_group_creation")
+
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        self._post_init()
+        with self.init_timer.time("post_init_barrier"):
+            self._post_init()
 
         # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
         self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
@@ -222,7 +233,13 @@ class VllmGeneration(GenerationInterface):
         self.current_generate_dp_shard_idx = 0
 
         # Save the device uuids for the workers
-        self.device_uuids = self._report_device_id()
+        with self.init_timer.time("report_device_id"):
+            self.device_uuids = self._report_device_id()
+
+        self.init_timer.stop("total")
+
+        # Print consolidated timing summary
+        self._print_init_timing_summary()
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -822,6 +839,79 @@ class VllmGeneration(GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    def collect_init_timers(self) -> list[Timer]:
+        """Collect init timing from all workers for aggregation."""
+        futures = self.worker_group.run_all_workers_single_data("get_init_timing")
+        return ray.get(futures)
+
+    def _print_init_timing_summary(self) -> None:
+        """Print a consolidated timing summary for VllmGeneration initialization."""
+        # Collect worker timers
+        worker_timers = self.collect_init_timers()
+        worker_timing = Timer.aggregate_max(worker_timers, reduction_op="sum")
+
+        # Get controller timing
+        controller_timing = self.init_timer.get_timing_metrics(reduction_op="sum")
+
+        # Get RayWorkerGroup timing
+        worker_group_timing = self.worker_group.init_timer.get_timing_metrics(reduction_op="sum")
+
+        total = controller_timing.get("total", 0)
+        num_workers = len(self.worker_group.workers)
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"[VllmGeneration] Init Timing Summary ({num_workers} workers)", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        print(f"Controller phases:", flush=True)
+        print(f"  pre_worker_group:      {controller_timing.get('pre_worker_group', 0):>7.2f}s", flush=True)
+        print(f"  worker_group_creation: {controller_timing.get('worker_group_creation', 0):>7.2f}s", flush=True)
+        print(f"    - env_venv_setup:      {worker_group_timing.get('env_venv_setup', 0):>7.2f}s", flush=True)
+        print(f"    - addr_port_allocation:{worker_group_timing.get('addr_port_allocation', 0):>7.2f}s", flush=True)
+        print(f"    - async_worker_creation:{worker_group_timing.get('async_worker_creation', 0):>7.2f}s", flush=True)
+        print(f"    - ray_get_wait:        {worker_group_timing.get('ray_get_wait', 0):>7.2f}s", flush=True)
+        print(f"  post_init_barrier:     {controller_timing.get('post_init_barrier', 0):>7.2f}s", flush=True)
+        print(f"  report_device_id:      {controller_timing.get('report_device_id', 0):>7.2f}s", flush=True)
+
+        print(f"\nWorker phases (max across {num_workers} workers):", flush=True)
+        print(f"  module_imports:        {worker_timing.get('module_imports', 0):>7.2f}s", flush=True)
+        print(f"  config_setup:          {worker_timing.get('config_setup', 0):>7.2f}s", flush=True)
+        print(f"  vllm_patching:         {worker_timing.get('vllm_patching', 0):>7.2f}s", flush=True)
+        print(f"  vllm_kwargs_setup:     {worker_timing.get('vllm_kwargs_setup', 0):>7.2f}s", flush=True)
+        print(f"  init_vllm_engine:      {worker_timing.get('init_vllm_engine', 0):>7.2f}s", flush=True)
+
+        print(f"\n{'─'*60}", flush=True)
+        print(f"TOTAL:                   {total:>7.2f}s", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+    def save_init_timing(self, log_dir: str) -> None:
+        """Save init timing to JSON files in the log directory."""
+        from pathlib import Path
+
+        # Collect worker timers
+        worker_timers = self.collect_init_timers()
+        worker_timing = Timer.aggregate_max(worker_timers, reduction_op="sum")
+
+        # Save controller timing
+        self.init_timer.save_to_log_dir(
+            name="vllm_generation_controller",
+            log_dir=log_dir,
+            metadata={"num_workers": len(self.worker_group.workers)},
+        )
+
+        # Save RayWorkerGroup timing
+        self.worker_group.init_timer.save_to_log_dir(
+            name="vllm_generation_worker_group",
+            log_dir=log_dir,
+        )
+
+        # Save aggregated worker timing
+        timing_dir = Path(log_dir) / "timing"
+        timing_dir.mkdir(parents=True, exist_ok=True)
+        import json
+        with open(timing_dir / "vllm_generation_workers_max.json", "w") as f:
+            json.dump({"timing_metrics": worker_timing, "metadata": {"num_workers": len(self.worker_group.workers)}}, f, indent=2)
 
     def get_vllm_logger_metrics(self) -> dict[str, Any]:
         """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""

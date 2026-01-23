@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Instrumentation: measure import time
+import time as _time_module
+_IMPORT_START_TIME = _time_module.perf_counter()
+
 import gc
 import os
 import re
@@ -94,6 +99,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.fault_injection import FaultPlan, check_workload_exception, dispatch_fault_if_target
+from nemo_rl.utils.timer import Timer
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -142,6 +148,10 @@ try:
     HAVE_FSDP2 = True
 except ImportError:
     HAVE_FSDP2 = False
+
+# Instrumentation: measure import time
+_IMPORT_END_TIME = _time_module.perf_counter()
+_IMPORT_DURATION = _IMPORT_END_TIME - _IMPORT_START_TIME
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -205,17 +215,19 @@ def setup_megatron_model(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    init_timer: Optional[Timer] = None,
 ):
     state = GlobalState()
     state.cfg = cfg
     # TODO: Freeze state.cfg
 
     cfg.dist.external_gpu_device_mapping = True
-    initialize_megatron(
-        cfg=cfg,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-    )
+    with init_timer.time("initialize_megatron") if init_timer else nullcontext():
+        initialize_megatron(
+            cfg=cfg,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+        )
 
     if cfg.ft and cfg.ft.enable_ft_package:
         fault_tolerance.setup(cfg, state)
@@ -233,11 +245,6 @@ def setup_megatron_model(
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
     state.start_time = start_time_tensor.item()
 
-    print(
-        "time to initialize megatron (seconds): {:.3f}".format(
-            time.time() - state.start_time
-        )
-    )
     torch.distributed.barrier()
 
     # Context used for persisting some state between checkpoint saves.
@@ -277,27 +284,29 @@ def setup_megatron_model(
         pre_wrap_hook.extend([freeze_moe_router])
 
     # Model, optimizer, and learning rate.
-    model = get_model(
-        cfg.model,
-        cfg.ddp,
-        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-    )
-    if load_optimizer:
-        optimizer, scheduler = setup_optimizer(
-            optimizer_config=cfg.optimizer,
-            scheduler_config=cfg.scheduler,
-            model=model,
-            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
+    with init_timer.time("model_init") if init_timer else nullcontext():
+        model = get_model(
+            cfg.model,
+            cfg.ddp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=pre_wrap_hook,
+            mixed_precision_wrapper=mixed_precision_wrapper,
         )
+
+    if load_optimizer:
+        with init_timer.time("optimizer_init") if init_timer else nullcontext():
+            optimizer, scheduler = setup_optimizer(
+                optimizer_config=cfg.optimizer,
+                scheduler_config=cfg.scheduler,
+                model=model,
+                use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
+            )
     else:
         optimizer = None
         scheduler = None
 
-    print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
     # Load checkpoint if applicable
@@ -308,15 +317,15 @@ def setup_megatron_model(
         checkpoint_exists(cfg.checkpoint.load)
         or checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
     ):
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
-        )
-        print("Checkpoint loaded")
+        with init_timer.time("load_checkpoint") if init_timer else nullcontext():
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
+            )
     torch.distributed.barrier()
 
     return state, model, optimizer, scheduler, checkpointing_context
@@ -449,6 +458,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        # Timer for init timing - record module import time from file-level measurement
+        self.init_timer = Timer()
+        self.init_timer._timers["module_imports"] = [_IMPORT_DURATION]
+
+        self.init_timer.start("config_setup")
         apply_transformer_engine_patch()
 
         self.is_generation_colocated = None
@@ -502,21 +516,25 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Set for rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
+        self.init_timer.stop("config_setup")
+
         # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-        torch.distributed.init_process_group("nccl")
+        with self.init_timer.time("nccl_init"):
+            torch.distributed.init_process_group("nccl")
+
         if pt_checkpoint_exists:
-            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
+            pass  # Checkpoint already exists, skip import
         else:
             hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
-            import_model_from_hf_name(
-                hf_model_name,
-                pretrained_path,
-                self.cfg["megatron_cfg"],
-                **hf_config_overrides,
-            )
+            with self.init_timer.time("hf_model_import"):
+                import_model_from_hf_name(
+                    hf_model_name,
+                    pretrained_path,
+                    self.cfg["megatron_cfg"],
+                    **hf_config_overrides,
+                )
 
             if parallel_state.model_parallel_is_initialized():
-                print("Reinitializing model parallel after loading model state.")
                 parallel_state.destroy_model_parallel()
 
         pretrained_run_config = os.path.join(
@@ -792,7 +810,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.scheduler,
             self.checkpointing_context,
         ) = setup_megatron_model(
-            policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
+            policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer, init_timer=self.init_timer
         )
 
         # Set the param sync function for the model
@@ -834,28 +852,30 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
                 ref_mixed_precision_wrapper = CustomFloat16Module
 
-            reference_model = get_model(
-                self.megatron_cfg.model,
-                self.megatron_cfg.ddp,
-                use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
-                overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
-                mixed_precision_wrapper=ref_mixed_precision_wrapper,
-            )
-            print("Loading the Reference Model")
+            with self.init_timer.time("reference_model_init"):
+                reference_model = get_model(
+                    self.megatron_cfg.model,
+                    self.megatron_cfg.ddp,
+                    use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
+                    overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+                    pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
+                    mixed_precision_wrapper=ref_mixed_precision_wrapper,
+                )
+
             if (
                 ref_checkpoint_config.pretrained_checkpoint is not None
                 and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
             ):
-                load_checkpoint(
-                    ref_state,  # Use the separate state object with ref checkpoint config
-                    reference_model,
-                    None,  # no optimizer
-                    None,  # no scheduler
-                    checkpointing_context=ref_ckpt_context,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and self.megatron_cfg.dist.use_torch_fsdp2,
-                )
+                with self.init_timer.time("reference_checkpoint_load"):
+                    load_checkpoint(
+                        ref_state,  # Use the separate state object with ref checkpoint config
+                        reference_model,
+                        None,  # no optimizer
+                        None,  # no scheduler
+                        checkpointing_context=ref_ckpt_context,
+                        skip_load_to_model_and_opt=HAVE_FSDP2
+                        and self.megatron_cfg.dist.use_torch_fsdp2,
+                    )
                 reference_model = reference_model[0]
                 reference_model.eval()
                 self.reference_state_dict = {}
@@ -868,9 +888,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     else:
                         cpu_item = item
                     self.reference_state_dict[name] = cpu_item
-                print("Reference model loaded")
             else:
-                print("Reference model not loaded")
+                pass  # Reference model not loaded from checkpoint
 
             self.model = self.move_model(self.model, "cuda")
 
@@ -927,6 +946,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    def get_init_timing(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)

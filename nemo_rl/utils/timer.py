@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable, Generator, Optional, Sequence, Union
 
 import numpy as np
@@ -246,6 +248,79 @@ class Timer:
         else:
             self._timers = {}
             self._start_times = {}
+
+    def save_to_json(
+        self,
+        filepath: Union[str, Path],
+        reduction_op: str = "sum",
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Save timing metrics to a JSON file.
+
+        Args:
+            filepath: Path to save JSON file
+            reduction_op: Reduction operation to apply ("mean", "sum", "max", etc.)
+            metadata: Optional metadata to include in JSON (e.g., step number, timestamp)
+        """
+        timing_data = {
+            "timing_metrics": self.get_timing_metrics(reduction_op=reduction_op),
+            "metadata": metadata or {},
+        }
+
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(filepath, "w") as f:
+            json.dump(timing_data, f, indent=2)
+
+    def save_to_log_dir(
+        self,
+        name: str,
+        log_dir: Union[str, Path],
+        reduction_op: str = "sum",
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Save timing metrics to log_dir/timing/{name}.json.
+
+        Args:
+            name: Name for the timing file (e.g., "init", "step_0001")
+            log_dir: Base log directory
+            reduction_op: Reduction operation to apply ("mean", "sum", "max", etc.)
+            metadata: Optional metadata to include in JSON
+        """
+        filepath = Path(log_dir) / "timing" / f"{name}.json"
+        self.save_to_json(filepath, reduction_op=reduction_op, metadata=metadata)
+
+    @staticmethod
+    def aggregate_max(timers: list["Timer"], reduction_op: str = "sum") -> dict[str, float]:
+        """Aggregate timing metrics from multiple Timer instances, taking max across them.
+
+        Args:
+            timers: List of Timer instances to aggregate
+            reduction_op: Reduction to apply to each timer's internal list before aggregating
+
+        Returns:
+            Dictionary with max timing across all timers for each label
+        """
+        if not timers:
+            return {}
+
+        # Get metrics from all timers
+        all_metrics = [t.get_timing_metrics(reduction_op=reduction_op) for t in timers]
+
+        # Aggregate max across timers for each label
+        aggregated = {}
+        all_labels = set()
+        for metrics in all_metrics:
+            all_labels.update(metrics.keys())
+
+        for label in all_labels:
+            values = [m.get(label, 0) for m in all_metrics if isinstance(m.get(label), (int, float))]
+            if values:
+                aggregated[label] = max(values)
+
+        return aggregated
+
 
 
 def convert_to_seconds(time_string: str) -> int:

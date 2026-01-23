@@ -24,6 +24,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.utils.fault_injection import FaultPlan
+from nemo_rl.utils.timer import Timer
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -70,6 +71,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
     ):
+        self.init_timer = Timer()
+        self.init_timer.start("total")
+        self.init_timer.start("pre_worker_group")
+
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -180,6 +185,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
+        self.init_timer.stop("pre_worker_group")
+
+        self.init_timer.start("worker_group_creation")
         if cluster._sorted_bundle_indices is not None:
             # The cluster has initialized a unified placemenet group across nodes
             # In this case, we need to create workers based on sorted bundle indices
@@ -208,6 +216,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars=env_vars or {},
             )
 
+        self.init_timer.stop("worker_group_creation")
+
+        self.init_timer.start("post_worker_group")
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
@@ -254,6 +265,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+        self.init_timer.stop("post_worker_group")
+
+        # Collect worker timers - this is the first implicit sync point
+        # where we actually wait for all workers' __init__ to complete
+        with self.init_timer.time("post_init_barrier"):
+            self._worker_timers = self.collect_init_timers()
+
+        self.init_timer.stop("total")
+
+        # Print consolidated timing summary
+        self._print_init_timing_summary()
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -762,6 +785,82 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # minimum free memory from all workers for safety
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
+
+    def collect_init_timers(self) -> list[Timer]:
+        """Collect init timing from all workers for aggregation."""
+        futures = self.worker_group.run_all_workers_single_data("get_init_timing")
+        return ray.get(futures)
+
+    def _print_init_timing_summary(self) -> None:
+        """Print a consolidated timing summary for Policy initialization."""
+        # Use already-collected worker timers from post_init_barrier phase
+        worker_timing = Timer.aggregate_max(self._worker_timers, reduction_op="sum")
+
+        # Get controller timing
+        controller_timing = self.init_timer.get_timing_metrics(reduction_op="sum")
+
+        # Get RayWorkerGroup timing
+        worker_group_timing = self.worker_group.init_timer.get_timing_metrics(reduction_op="sum")
+
+        total = controller_timing.get("total", 0)
+        num_workers = len(self.worker_group.workers)
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Policy] Init Timing Summary ({num_workers} workers)", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        print(f"Controller phases:", flush=True)
+        print(f"  pre_worker_group:      {controller_timing.get('pre_worker_group', 0):>7.2f}s", flush=True)
+        print(f"  worker_group_creation: {controller_timing.get('worker_group_creation', 0):>7.2f}s", flush=True)
+        print(f"    - env_venv_setup:      {worker_group_timing.get('env_venv_setup', 0):>7.2f}s", flush=True)
+        print(f"    - addr_port_allocation:{worker_group_timing.get('addr_port_allocation', 0):>7.2f}s", flush=True)
+        print(f"    - async_worker_creation:{worker_group_timing.get('async_worker_creation', 0):>7.2f}s", flush=True)
+        print(f"    - ray_get_wait:        {worker_group_timing.get('ray_get_wait', 0):>7.2f}s", flush=True)
+        print(f"  post_worker_group:     {controller_timing.get('post_worker_group', 0):>7.2f}s", flush=True)
+        print(f"  post_init_barrier:     {controller_timing.get('post_init_barrier', 0):>7.2f}s", flush=True)
+
+        print(f"\nWorker phases (max across {num_workers} workers):", flush=True)
+        print(f"  module_imports:        {worker_timing.get('module_imports', 0):>7.2f}s", flush=True)
+        print(f"  config_setup:          {worker_timing.get('config_setup', 0):>7.2f}s", flush=True)
+        print(f"  nccl_init:             {worker_timing.get('nccl_init', 0):>7.2f}s", flush=True)
+        print(f"  hf_model_import:       {worker_timing.get('hf_model_import', 0):>7.2f}s", flush=True)
+        print(f"  initialize_megatron:   {worker_timing.get('initialize_megatron', 0):>7.2f}s", flush=True)
+        print(f"  model_init:            {worker_timing.get('model_init', 0):>7.2f}s", flush=True)
+        print(f"  optimizer_init:        {worker_timing.get('optimizer_init', 0):>7.2f}s", flush=True)
+        print(f"  load_checkpoint:       {worker_timing.get('load_checkpoint', 0):>7.2f}s", flush=True)
+        print(f"  reference_model_init:  {worker_timing.get('reference_model_init', 0):>7.2f}s", flush=True)
+        print(f"  reference_checkpoint_load: {worker_timing.get('reference_checkpoint_load', 0):>7.2f}s", flush=True)
+
+        print(f"\n{'─'*60}", flush=True)
+        print(f"TOTAL:                   {total:>7.2f}s", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+    def save_init_timing(self, log_dir: str) -> None:
+        """Save init timing to JSON files in the log directory."""
+        from pathlib import Path
+        import json
+
+        # Use already-collected worker timers from post_init_barrier phase
+        worker_timing = Timer.aggregate_max(self._worker_timers, reduction_op="sum")
+
+        # Save controller timing
+        self.init_timer.save_to_log_dir(
+            name="policy_controller",
+            log_dir=log_dir,
+            metadata={"num_workers": len(self.worker_group.workers)},
+        )
+
+        # Save RayWorkerGroup timing
+        self.worker_group.init_timer.save_to_log_dir(
+            name="policy_worker_group",
+            log_dir=log_dir,
+        )
+
+        # Save aggregated worker timing
+        timing_dir = Path(log_dir) / "timing"
+        timing_dir.mkdir(parents=True, exist_ok=True)
+        with open(timing_dir / "policy_workers_max.json", "w") as f:
+            json.dump({"timing_metrics": worker_timing, "metadata": {"num_workers": len(self.worker_group.workers)}}, f, indent=2)
 
     def stream_weights_via_ipc_zmq(
         self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None

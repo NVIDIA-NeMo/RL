@@ -277,6 +277,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    def get_init_timing(self):
+        """Return init timing for controller aggregation."""
+        from nemo_rl.utils.timer import Timer
+        return self.init_timer
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
