@@ -831,7 +831,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         logits = self.model.lm_head(outputs.last_hidden_state)
                     else:
                         logits = outputs.logits
-                    del outputs
 
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
@@ -1236,7 +1235,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         flash_attn_kwargs=flash_attn_kwargs,
                     )
 
-                    # Get logprobs
+                    # Get logits
                     if isinstance(outputs, (torch.Tensor, DTensor)):
                         # custom models (e.g., those coming from AutoModel) can output logits directly
                         logits = outputs
