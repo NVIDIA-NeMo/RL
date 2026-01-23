@@ -44,10 +44,13 @@ grpo:
   # ============================================================================
   # Reward Shaping
   # Applied to rewards before advantage calculation
+  # Includes DAPO overlong penalty and stop properly penalty
   # ============================================================================
-  reward:
-    - name: "stop_properly_penalty"
-      penalty_coef: 0  # Set >= 0 to enable truncation penalty (e.g., 0.1)
+  reward_shaping:
+    enabled: true
+    # Stop properly penalty: scale factor for truncated responses (0-1)
+    # 0 = zero reward for truncated, 1 = no penalty (default)
+    stop_properly_penalty_coef: 0.0  # Set to e.g., 0.1 to halve truncated rewards
 
 # ============================================================================
 # Loss Function Configuration

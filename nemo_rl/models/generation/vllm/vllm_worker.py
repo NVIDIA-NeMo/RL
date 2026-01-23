@@ -575,6 +575,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
+        truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
@@ -621,6 +622,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
+
+            # Check if response was truncated (hit max_tokens without stop token)
+            is_truncated = generation.finish_reason == "length"
+            truncated_list.append(is_truncated)
+
             assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
                 f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
             )
@@ -639,6 +645,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "unpadded_sequence_lengths": torch.tensor(
                     unpadded_sequence_lengths, dtype=torch.long
                 ),
+                "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
 
