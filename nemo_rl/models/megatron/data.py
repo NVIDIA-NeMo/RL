@@ -31,6 +31,17 @@ from nemo_rl.models.megatron.common import _round_up_to_multiple
 
 
 @dataclass
+class ProcessedInputs:
+    """Processed microbatch inputs used for model forward pass"""
+
+    input_ids: torch.Tensor
+    input_ids_cp_sharded: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    position_ids: Optional[torch.Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+    cu_seqlens_padded: Optional[torch.Tensor]
+
+@dataclass
 class ProcessedMicrobatch:
     """Container for a processed microbatch ready for model forward pass.
 
@@ -89,14 +100,7 @@ def make_processed_microbatch_iterator(
         data_dict = data_dict.to("cuda")
 
         # Process the microbatch
-        (
-            input_ids,
-            input_ids_cp_sharded,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            cu_seqlens_padded,
-        ) = process_microbatch(
+        processed_inputs = process_microbatch(
             data_dict=data_dict,
             seq_length_key=seq_length_key,
             pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
@@ -108,12 +112,12 @@ def make_processed_microbatch_iterator(
 
         yield ProcessedMicrobatch(
             data_dict=data_dict,
-            input_ids=input_ids,
-            input_ids_cp_sharded=input_ids_cp_sharded,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            cu_seqlens_padded=cu_seqlens_padded,
+            input_ids=processed_inputs.input_ids,
+            input_ids_cp_sharded=processed_inputs.input_ids_cp_sharded,
+            attention_mask=processed_inputs.attention_mask,
+            position_ids=processed_inputs.position_ids,
+            packed_seq_params=processed_inputs.packed_seq_params,
+            cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
         )
 
 
@@ -272,13 +276,13 @@ def process_microbatch(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
-    return (
-        input_ids,
-        input_ids_cp_sharded,
-        attention_mask,
-        position_ids,
-        packed_seq_params,
-        cu_seqlens_padded,
+    return ProcessedInputs(
+        input_ids=input_ids,
+        input_ids_cp_sharded=input_ids_cp_sharded,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        packed_seq_params=packed_seq_params,
+        cu_seqlens_padded=cu_seqlens_padded,
     )
 
 
@@ -328,11 +332,11 @@ def process_global_batch(
             "token_mask must be present in the data when using token-level loss"
         )
 
-    return (
-        batch,
-        global_valid_seqs,
-        global_valid_toks,
-    )
+    return {
+        "batch": batch,
+        "global_valid_seqs": global_valid_seqs,
+        "global_valid_toks": global_valid_toks,
+    }
 
 
 def _pack_sequences_for_megatron(

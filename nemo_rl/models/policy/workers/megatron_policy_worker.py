@@ -982,17 +982,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
-                (
-                    batch,
-                    global_valid_seqs,
-                    global_valid_toks,
-                ) = process_global_batch(
+                gb_result = process_global_batch(
                     data,
                     loss_fn=loss_fn,
                     dp_group=parallel_state.get_data_parallel_group(),
                     batch_idx=gb_idx,
                     batch_size=local_gbs,
                 )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
 
                 (
                     data_iterator,
