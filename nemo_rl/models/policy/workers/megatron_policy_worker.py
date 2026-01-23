@@ -988,10 +988,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     global_valid_toks,
                 ) = process_global_batch(
                     data,
-                    gb_idx,
-                    local_gbs,
-                    loss_fn,
+                    loss_fn=loss_fn,
                     dp_group=parallel_state.get_data_parallel_group(),
+                    batch_idx=gb_idx,
+                    batch_size=local_gbs,
                 )
 
                 (

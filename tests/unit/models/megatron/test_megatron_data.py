@@ -74,12 +74,12 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
 
 
-class TestCheckSequenceDim:
-    """Tests for check_sequence_dim function."""
+class TestGetAndValidateSeqlen:
+    """Tests for get_and_validate_seqlen function."""
 
-    def test_check_sequence_dim_valid(self):
-        """Test check_sequence_dim with valid data."""
-        from nemo_rl.models.megatron.data import check_sequence_dim
+    def test_get_and_validate_seqlen_valid(self):
+        """Test get_and_validate_seqlen with valid data."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
 
         # Create mock data with consistent sequence dimension
         data = MagicMock()
@@ -93,14 +93,14 @@ class TestCheckSequenceDim:
             ]
         )
 
-        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
 
         assert sequence_dim == 1
         assert seq_dim_size == 10
 
-    def test_check_sequence_dim_mismatch(self):
-        """Test check_sequence_dim with mismatched sequence dimensions."""
-        from nemo_rl.models.megatron.data import check_sequence_dim
+    def test_get_and_validate_seqlen_mismatch(self):
+        """Test get_and_validate_seqlen with mismatched sequence dimensions."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
 
         # Create mock data with mismatched sequence dimension
         data = MagicMock()
@@ -115,13 +115,13 @@ class TestCheckSequenceDim:
         )
 
         with pytest.raises(AssertionError) as exc_info:
-            check_sequence_dim(data)
+            get_and_validate_seqlen(data)
 
         assert "Dim 1 must be the sequence dim" in str(exc_info.value)
 
-    def test_check_sequence_dim_skips_1d_tensors(self):
-        """Test that check_sequence_dim skips 1D tensors."""
-        from nemo_rl.models.megatron.data import check_sequence_dim
+    def test_get_and_validate_seqlen_skips_1d_tensors(self):
+        """Test that get_and_validate_seqlen skips 1D tensors."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
 
         # Create mock data with 1D tensor (should be skipped)
         data = MagicMock()
@@ -136,7 +136,7 @@ class TestCheckSequenceDim:
         )
 
         # Should not raise
-        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
         assert seq_dim_size == 10
 
 
@@ -291,10 +291,10 @@ class TestProcessGlobalBatch:
         with patch("torch.distributed.all_reduce") as mock_all_reduce:
             batch, global_valid_seqs, global_valid_toks = process_global_batch(
                 data=mock_data,
-                batch_idx=0,
-                batch_size=3,
                 loss_fn=MagicMock(),
                 dp_group=mock_dp_group,
+                batch_idx=0,
+                batch_size=3,
             )
 
             assert torch.equal(batch["sample_mask"], mock_batch["sample_mask"])
@@ -306,7 +306,7 @@ class TestProcessGlobalBatch:
             # Verify all_reduce was called
             mock_all_reduce.assert_called_once()
 
-    def test_process_global_batch_requires_sample_mask(self):
+    def test_process_global_batch_requires_sample_mask_in_data(self):
         """Test that process_global_batch requires sample_mask."""
         from nemo_rl.models.megatron.data import process_global_batch
 
@@ -320,28 +320,28 @@ class TestProcessGlobalBatch:
         with pytest.raises(AssertionError) as exc_info:
             process_global_batch(
                 data=mock_data,
-                batch_idx=0,
-                batch_size=3,
                 loss_fn=MagicMock(),
                 dp_group=MagicMock(),
+                batch_idx=0,
+                batch_size=3,
             )
 
-        assert "sample_mask must be present" in str(exc_info.value)
+        assert "sample_mask must be present in the data!" in str(exc_info.value)
 
 
 class TestGetMicrobatchIterator:
     """Tests for get_microbatch_iterator function."""
 
-    @patch("nemo_rl.models.megatron.data.check_sequence_dim")
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_dynamic_batching(
-        self, mock_make_iterator, mock_check_seq_dim
+        self, mock_make_iterator, mock_get_and_validate_seqlen
     ):
         """Test get_microbatch_iterator with dynamic batching."""
         from nemo_rl.models.megatron.data import get_microbatch_iterator
 
         # Setup mocks
-        mock_check_seq_dim.return_value = (1, 128)
+        mock_get_and_validate_seqlen.return_value = (1, 128)
         mock_iterator = iter([MagicMock()])
         mock_make_iterator.return_value = mock_iterator
 
@@ -373,17 +373,17 @@ class TestGetMicrobatchIterator:
         assert data_iterator_len == 5
         assert seq_dim_size == 128
 
-    @patch("nemo_rl.models.megatron.data.check_sequence_dim")
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     @patch("nemo_rl.models.megatron.data._get_pack_sequence_parameters_for_megatron")
     def test_get_microbatch_iterator_sequence_packing(
-        self, mock_get_params, mock_make_iterator, mock_check_seq_dim
+        self, mock_get_params, mock_make_iterator, mock_get_and_validate_seqlen
     ):
         """Test get_microbatch_iterator with sequence packing."""
         from nemo_rl.models.megatron.data import get_microbatch_iterator
 
         # Setup mocks
-        mock_check_seq_dim.return_value = (1, 256)
+        mock_get_and_validate_seqlen.return_value = (1, 256)
         mock_get_params.return_value = (8, 16, None)
         mock_iterator = iter([MagicMock()])
         mock_make_iterator.return_value = mock_iterator
@@ -427,16 +427,16 @@ class TestGetMicrobatchIterator:
         assert micro_batch_size == 1
         assert data_iterator_len == 10
 
-    @patch("nemo_rl.models.megatron.data.check_sequence_dim")
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_regular(
-        self, mock_make_iterator, mock_check_seq_dim
+        self, mock_make_iterator, mock_get_and_validate_seqlen
     ):
         """Test get_microbatch_iterator with regular batching."""
         from nemo_rl.models.megatron.data import get_microbatch_iterator
 
         # Setup mocks
-        mock_check_seq_dim.return_value = (1, 64)
+        mock_get_and_validate_seqlen.return_value = (1, 64)
         mock_iterator = iter([MagicMock()])
         mock_make_iterator.return_value = mock_iterator
 
@@ -470,16 +470,16 @@ class TestGetMicrobatchIterator:
         assert data_iterator_len == 16 // mbs
         assert seq_dim_size == 64
 
-    @patch("nemo_rl.models.megatron.data.check_sequence_dim")
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_auto_detects_seq_length_key(
-        self, mock_make_iterator, mock_check_seq_dim
+        self, mock_make_iterator, mock_get_and_validate_seqlen
     ):
         """Test that get_microbatch_iterator auto-detects seq_length_key for packing."""
         from nemo_rl.models.megatron.data import get_microbatch_iterator
 
         # Setup mocks
-        mock_check_seq_dim.return_value = (1, 128)
+        mock_get_and_validate_seqlen.return_value = (1, 128)
         mock_iterator = iter([MagicMock()])
         mock_make_iterator.return_value = mock_iterator
 

@@ -174,7 +174,7 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
 
-    _, seq_dim_size = check_sequence_dim(data)
+    _, seq_dim_size = get_and_validate_seqlen(data)
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(
@@ -284,12 +284,27 @@ def process_microbatch(
 
 def process_global_batch(
     data: BatchedDataDict[Any],
-    batch_idx: int,
-    batch_size: int,
     loss_fn: LossFunction,
     dp_group: torch.distributed.ProcessGroup,
+    *,
+    batch_idx: int,
+    batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Process a global batch for Megatron model forward pass."""
+    """Process a global batch and compute normalization factors.
+
+    Args:
+        data: Full dataset
+        batch_idx: Index of batch to extract
+        batch_size: Size of batch to extract
+        loss_fn: Loss function (used to check loss type)
+        dp_mesh: Data parallel mesh
+
+    Returns:
+        Dictionary containing:
+        - batch: The extracted batch
+        - global_valid_seqs: Number of valid sequences across all ranks
+        - global_valid_toks: Number of valid tokens across all ranks
+    """
     batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
 
     assert "sample_mask" in batch, "sample_mask must be present in the data!"
@@ -625,7 +640,7 @@ def _unpack_sequences_from_megatron(
     return unpacked_output
 
 
-def check_sequence_dim(data: BatchedDataDict[Any]):
+def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # dim 1 is always assumed to be the sequence dim, sanity check this here
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
