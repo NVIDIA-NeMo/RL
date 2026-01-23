@@ -30,7 +30,11 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calc
 
 
 class GRPOAdvantageEstimator:
-    """GRPO-style advantage estimator with leave-one-out baseline."""
+    """GRPO-style advantage estimator with leave-one-out baseline.
+    
+    Note: GRPO computes advantages over all responses for each prompt,
+    so valid_mask is always ones (all samples are valid).
+    """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
@@ -47,15 +51,13 @@ class GRPOAdvantageEstimator:
 
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
-            # use epsilon for numerical stability
             epsilon = 1e-8
-            zero_std_mask = std > 0
-            advantages[zero_std_mask] = (
-                advantages[zero_std_mask] / (std.unsqueeze(-1)[zero_std_mask] + epsilon)
+            non_zero_std_mask = std > 0
+            advantages[non_zero_std_mask] = (
+                advantages[non_zero_std_mask] / (std.unsqueeze(-1)[non_zero_std_mask] + epsilon)
             )
 
-        advantages = advantages.expand(mask.shape)
-        return advantages
+        return advantages.expand(mask.shape)
 
 
 class ReinforcePlusPlusAdvantageEstimator:

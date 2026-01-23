@@ -832,8 +832,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
-            # Check if response was truncated (hit max_tokens without stop token)
-            is_truncated = generation_details.finish_reason == "length"
+            # Check if response was truncated (did not stop properly with stop token)
+            is_truncated = generation_details.finish_reason != "stop"
             truncated_tensor = torch.tensor(
                 [is_truncated],
                 dtype=torch.bool,
