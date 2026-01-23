@@ -68,14 +68,27 @@ def apply_reward_shaping(
             f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
         )
         truncated = batch.get("truncated")
-        if truncated is not None:
-            if isinstance(truncated, list):
-                truncated = torch.tensor(truncated, dtype=torch.bool, device=rewards.device)
-            else:
-                truncated = truncated.to(device=rewards.device)
+        assert truncated is not None, "truncated field not found in batch"
+        if isinstance(truncated, list):
+            truncated = torch.tensor(truncated, dtype=torch.bool, device=rewards.device)
+        else:
+            truncated = truncated.to(device=rewards.device)
+        
+        num_truncated = truncated.sum().item()
+        if num_truncated > 0:
+            original_rewards = rewards.clone()
             # For truncated samples, scale the reward by stop_properly_penalty_coef
             rewards = torch.where(truncated, rewards * stop_properly_penalty_coef, rewards)
             batch["total_reward"] = rewards
+            print(
+                f"▶ Stop properly penalty applied: {num_truncated}/{len(truncated)} samples truncated, "
+                f"coef={stop_properly_penalty_coef}, "
+                f"original_reward_mean={original_rewards[truncated].mean().item():.4f}, "
+                f"shaped_reward_mean={rewards[truncated].mean().item():.4f}",
+                flush=True
+            )
+        else:
+            print(f"▶ Stop properly penalty: no truncated samples (truncation_rate=0)", flush=True)
 
         return batch
 
