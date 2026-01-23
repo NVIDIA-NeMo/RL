@@ -35,7 +35,7 @@ grpo:
   # ============================================================================
   adv_estimator:
     name: "reinforce_plus_plus"  # Use "grpo" for standard GRPO
-    # GRPO specific
+    # Global normalization of rewards
     normalize_rewards: true
     use_leave_one_out_baseline: false
     # Reinforce++-Baseline specific
