@@ -393,7 +393,6 @@ class ClippedPGLossFn(LossFunction):
         # Truncated Importance Sampling (TIS / ICE-POP)
         # TIS: Simple clamp to max value
         # ICE-POP: Filter out samples with importance weights outside [min, max]
-        # Reference: DAPO paper https://arxiv.org/abs/2503.14476
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
                 # TIS: Simple clamp to max value
@@ -401,7 +400,7 @@ class ClippedPGLossFn(LossFunction):
                     actor_importance_weights_expanded,
                     max=self.truncated_importance_sampling_ratio,
                 )
-            else:  # icepop
+            elif self.truncated_importance_sampling_type == "icepop":  # icepop
                 # ICE-POP: Filter out samples with importance weights outside [min, max]
                 actor_importance_weights_expanded = torch.where(
                     (actor_importance_weights_expanded >= self.truncated_importance_sampling_ratio_min)
@@ -409,6 +408,9 @@ class ClippedPGLossFn(LossFunction):
                     actor_importance_weights_expanded,
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
+            else:
+                raise ValueError(f"Invalid truncated importance sampling type: {self.truncated_importance_sampling_type}")
+
         actor_importance_weights = actor_importance_weights_expanded
         del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
