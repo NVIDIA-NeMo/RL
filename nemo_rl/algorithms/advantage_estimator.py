@@ -47,9 +47,11 @@ class GRPOAdvantageEstimator:
 
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
+            # use epsilon for numerical stability
+            epsilon = 1e-8
             zero_std_mask = std > 0
             advantages[zero_std_mask] = (
-                advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                advantages[zero_std_mask] / (std.unsqueeze(-1)[zero_std_mask] + epsilon)
             )
 
         advantages = advantages.expand(mask.shape)

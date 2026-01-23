@@ -37,7 +37,7 @@ grpo:
     name: "reinforce_plus_plus"  # Use "grpo" for standard GRPO
     # GRPO specific
     normalize_rewards: true
-    use_leave_one_out_baseline: fasle
+    use_leave_one_out_baseline: false
     # Reinforce++ specific (used when name="reinforce_plus_plus")
     minus_baseline: true
 
