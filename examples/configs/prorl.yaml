@@ -38,7 +38,7 @@ grpo:
     # GRPO specific
     normalize_rewards: true
     use_leave_one_out_baseline: false
-    # Reinforce++ specific (used when name="reinforce_plus_plus")
+    # Reinforce++-Baseline specific
     minus_baseline: true
 
   # ============================================================================
