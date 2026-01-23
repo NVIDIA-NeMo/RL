@@ -55,6 +55,7 @@ def parse_args():
 # =======================================================
 
 
+# TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     assert "train" in data_config, (
         "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
