@@ -998,6 +998,41 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _create_advantage_estimator(master_config: MasterConfig):
+    """Create and return an advantage estimator based on configuration.
+
+    Args:
+        master_config: The master configuration dictionary.
+
+    Returns:
+        An advantage estimator instance (GRPOAdvantageEstimator or ReinforcePlusPlusAdvantageEstimator).
+
+    Raises:
+        ValueError: If the advantage estimator name is not recognized.
+    """
+    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
+    adv_estimator_config.setdefault("name", "grpo")
+    adv_estimator_config.setdefault(
+        "use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"]
+    )
+    adv_estimator_config.setdefault(
+        "normalize_rewards", master_config["grpo"]["normalize_rewards"]
+    )
+    loss_config = master_config["loss_fn"]
+
+    adv_estimator_name = adv_estimator_config["name"]
+    if adv_estimator_name == "grpo":
+        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_plus_plus":
+        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using Reinforce++ advantage estimator")
+    else:
+        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+
+    return adv_estimator
+
+
 def _extract_prompt_only_messages(message_logs: list) -> list:
     """Extract only prompt messages (user/system) from message logs.
 
@@ -1210,23 +1245,8 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
-    # Initialize advantage estimator based on configuration
-    # Default to GRPOAdvantageEstimator if not configured
-    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
-    adv_estimator_config.setdefault("name", "grpo")
-    adv_estimator_config.setdefault("use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"])
-    adv_estimator_config.setdefault("normalize_rewards", master_config["grpo"]["normalize_rewards"])
-    loss_config = master_config["loss_fn"]
-
-    adv_estimator_name = adv_estimator_config["name"]
-    if adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print(f"  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
-        print(f"  ✓ Using Reinforce++ advantage estimator")
-    else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+    # Initialize advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -2222,23 +2242,8 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
-    # Initialize advantage estimator based on configuration
-    # Default to GRPOAdvantageEstimator if not configured
-    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
-    adv_estimator_config.setdefault("name", "grpo")
-    adv_estimator_config.setdefault("use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"])
-    adv_estimator_config.setdefault("normalize_rewards", master_config["grpo"]["normalize_rewards"])
-    loss_config = master_config["loss_fn"]
-
-    adv_estimator_name = adv_estimator_config["name"]
-    if adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print(f"  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
-        print(f"  ✓ Using Reinforce++ advantage estimator")
-    else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+    # Initialize advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
 
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
