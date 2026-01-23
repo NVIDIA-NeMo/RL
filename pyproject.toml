@@ -125,6 +125,7 @@ mcore = [
   "vllm==0.11.2",
 ]
 nemo_gym = ["nemo_gym"]
+resiliency = ["nvidia-resiliency-ext"]
 
 [dependency-groups]
 
