@@ -61,9 +61,9 @@ def apply_reward_shaping(
     if not cfg["enabled"]:
         return batch
 
-    # Apply stop properly penalty if configured (before DAPO shaping)
-    stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef")
-    if stop_properly_penalty_coef is not None and stop_properly_penalty_coef != 1.0:
+    # Apply stop properly penalty if configured
+    stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
+    if stop_properly_penalty_coef is not None:
         assert 0 <= stop_properly_penalty_coef <= 1, (
             f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
         )
@@ -77,15 +77,14 @@ def apply_reward_shaping(
             rewards = torch.where(truncated, rewards * stop_properly_penalty_coef, rewards)
             batch["total_reward"] = rewards
 
+        return batch
+
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     if (
         cfg.get("overlong_buffer_length") is None
         or cfg.get("overlong_buffer_penalty") is None
         or cfg.get("max_response_length") is None
     ):
-        # If stop_properly_penalty was applied, return; otherwise raise error for backward compatibility
-        if stop_properly_penalty_coef is not None:
-            return batch
         raise ValueError(
             "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
         )
