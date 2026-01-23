@@ -750,6 +750,7 @@ class TestValidateAndSetConfig:
                 rank=0,
                 hf_model_name="test-model",
                 pretrained_path="/path/to/model",
+                weights_path=None,
                 tokenizer=MagicMock(),
             )
 
@@ -792,6 +793,7 @@ class TestValidateAndSetConfig:
                     rank=0,
                     hf_model_name="test-model",
                     pretrained_path="/path/to/model",
+                    weights_path=None,
                     tokenizer=MagicMock(),
                 )
 
