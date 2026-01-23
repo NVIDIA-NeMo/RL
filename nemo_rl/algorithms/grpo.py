@@ -998,6 +998,28 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _extract_prompt_only_messages(message_logs: list) -> list:
+    """Extract only prompt messages (user/system) from message logs.
+
+    This is used to get prompt IDs for advantage estimation, excluding
+    any assistant responses.
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+
+    Returns:
+        List of message logs containing only user and system messages.
+    """
+    prompt_only_message_logs = []
+    for message_log in message_logs:
+        prompt_only_log = []
+        for message in message_log:
+            if message["role"] == "user" or message["role"] == "system":
+                prompt_only_log.append(message)
+        prompt_only_message_logs.append(prompt_only_log)
+    return prompt_only_message_logs
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1466,16 +1488,20 @@ def grpo_train(
                     if not is_batch_complete:
                         continue
 
-                    # Use placeholder advantages here.
-                    # Real advantages will be computed after logprobs are available.
-                    batch_size = rewards.shape[0]
-                    advantages = torch.zeros(batch_size, 1)
-
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Save prompt_ids for adv_estimator (will be used after logprobs)
-                    prompt_ids_for_adv = input_ids.clone()
+                    # Extract prompt-only messages for advantage estimation
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
+                    )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
@@ -2491,21 +2517,17 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    prompt_only_message_logs = []
-                    for message_log in repeated_batch["message_log"]:
-                        prompt_only_log = []
-                        for message in message_log:
-                            if message["role"] == "user" or message["role"] == "system":
-                                prompt_only_log.append(message)
-                        prompt_only_message_logs.append(prompt_only_log)
-
-                    prompt_batched_flat, prompt_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            prompt_only_message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
+                    # Extract prompt-only messages for advantage estimation
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
+                    )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
 
