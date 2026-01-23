@@ -44,6 +44,11 @@ class RewardShapingConfig(TypedDict):
     # The maximum response length threshold. Responses exceeding this length will be penalized.
     max_response_length: NotRequired[int]
 
+    # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
+    # When set to 0, truncated responses get zero reward.
+    # When set to 1, no penalty is applied (default behavior).
+    stop_properly_penalty_coef: NotRequired[float]
+
 
 def apply_reward_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
@@ -56,12 +61,36 @@ def apply_reward_shaping(
     if not cfg["enabled"]:
         return batch
 
+    # Apply stop properly penalty if configured (before DAPO shaping)
+    stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef")
+    if stop_properly_penalty_coef is not None and stop_properly_penalty_coef != 1.0:
+        assert 0 <= stop_properly_penalty_coef <= 1, (
+            f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
+        )
+        truncated = batch.get("truncated")
+        if truncated is not None:
+            if isinstance(truncated, list):
+                truncated = torch.tensor(truncated, dtype=torch.bool, device=rewards.device)
+            else:
+                truncated = truncated.to(device=rewards.device)
+            # For truncated samples, scale the reward by stop_properly_penalty_coef
+            scale = torch.where(
+                truncated,
+                torch.tensor(stop_properly_penalty_coef, dtype=rewards.dtype, device=rewards.device),
+                torch.tensor(1.0, dtype=rewards.dtype, device=rewards.device),
+            )
+            rewards = rewards * scale
+            batch["total_reward"] = rewards
+
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     if (
-        cfg["overlong_buffer_length"] is None
-        or cfg["overlong_buffer_penalty"] is None
-        or cfg["max_response_length"] is None
+        cfg.get("overlong_buffer_length") is None
+        or cfg.get("overlong_buffer_penalty") is None
+        or cfg.get("max_response_length") is None
     ):
+        # If stop_properly_penalty was applied, return; otherwise raise error for backward compatibility
+        if stop_properly_penalty_coef is not None:
+            return batch
         raise ValueError(
             "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
         )
