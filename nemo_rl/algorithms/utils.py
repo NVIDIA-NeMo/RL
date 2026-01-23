@@ -80,7 +80,7 @@ def prepare_for_mdlm_train_data(cat_and_padded: BatchedDataDict, mask_token_id: 
 
     return new_cat_and_padded
 
-def prepare_for_mdlm_train_data_blockwise_orig(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
+def prepare_for_mdlm_train_data_blockwise(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
     """
     Two-stage corruption with optional per-block sampling.
     • Stage 1:  m ~ U(eps, 1)   →   k = round(m · len)  (exact budget).
@@ -180,7 +180,7 @@ def prepare_for_mdlm_train_data_blockwise_orig(cat_and_padded: BatchedDataDict, 
 
     return new_cat_and_padded
 
-def prepare_for_mdlm_train_data_blockwise(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
+def prepare_for_mdlm_train_data_blockwise_new(cat_and_padded: BatchedDataDict, mask_token_id: int, eps: float = 1e-3, block_size: int | None = None, half_life_ratio: float = 0.25) -> BatchedDataDict:
     """
     Two-stage corruption with optional per-block sampling.
     • Stage 1:  m ~ U(eps, 1)   →   k = round(m · len)  (exact budget).

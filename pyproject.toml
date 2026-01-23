@@ -25,7 +25,7 @@ dependencies = [
     "triton",
     "colored==2.2.3",
     "ray[default]==2.49.2",
-    "transformers>=4.55.4",
+    "transformers==4.55.4",
     "wandb",
     "numpy",
     "datasets>=4.0.0",

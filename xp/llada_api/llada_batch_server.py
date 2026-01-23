@@ -237,7 +237,7 @@ def detect_model_type(model_path: str = None, base_model: str = None) -> str:
     base_identifier = base_model or ""
     
     if "llada" in model_identifier.lower() or "llada" in base_identifier.lower():
-        return "llada"
+        return "nemotron"
     else:
         return "nemotron"
 

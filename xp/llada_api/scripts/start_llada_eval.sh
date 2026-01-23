@@ -431,6 +431,7 @@ unset UV_CACHE_DIR
 # Environment setup - ensure uv is in PATH
 export PATH="/root/.local/bin:/usr/local/bin:\$PATH"
 export PYTHONPATH="$PROJECT_DIR:\${PYTHONPATH:-}"
+export HF_TOKEN=$HF_TOKEN
 VENV_DIR="/opt/nemo_rl_venv"
 
 echo "===================================================================="

@@ -468,8 +468,14 @@ class NLLLoss(LossFunction):
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
         seq_index = data.get("seq_index", None)
+        input_ids_len = data["input_ids"].shape[1]
 
         next_token_logits = next_token_logits.to(torch.float32)
+        
+        causal_logits = None
+        if next_token_logits.shape[1] > input_ids_len:
+            causal_logits = next_token_logits[:, input_ids_len:]
+            next_token_logits = next_token_logits[:, :input_ids_len]
 
         # Gather the logprobs for the actual next tokens
         if vocab_parallel_group is not None:
@@ -491,6 +497,12 @@ class NLLLoss(LossFunction):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                 next_token_logits, data["input_ids"], seq_index=seq_index, shift_logits=not mdlm_loss
             )
+            
+            if causal_logits is not None:
+                assert isinstance(causal_logits, torch.distributed.tensor.DTensor), "causal_logits is not DTensor!"
+                causal_token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                    causal_logits, data["input_ids"], seq_index=seq_index, shift_logits=True
+                )
         else:
             if not mdlm_loss:
                 next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -507,6 +519,15 @@ class NLLLoss(LossFunction):
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
+            if causal_logits is not None:
+                next_causal_tokens = data["input_ids"][:, 1:].cuda()
+                causal_logprobs = torch.nn.functional.log_softmax(
+                    causal_logits, dim=-1
+                )
+                causal_t_logprobs = causal_logprobs[:, :-1]
+                causal_token_logprobs = causal_t_logprobs.gather(
+                    dim=-1, index=next_causal_tokens.unsqueeze(-1)
+                ).squeeze(-1)
 
         if dpo_loss:
             ## shape: [batch_size]
@@ -518,6 +539,14 @@ class NLLLoss(LossFunction):
         elif mdlm_loss:
             p_mask = data["p_mask"]
             loss = -masked_mean(token_logprobs * torch.nan_to_num(1.0 / p_mask, posinf=1.0, neginf=1.0), mask, global_normalization_factor=global_valid_toks)
+            
+            if causal_logits is not None:
+                ar_loss = -masked_mean(
+                    causal_token_logprobs,
+                    data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1),
+                    global_normalization_factor=global_valid_toks,
+                )
+                loss = loss + ar_loss
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch

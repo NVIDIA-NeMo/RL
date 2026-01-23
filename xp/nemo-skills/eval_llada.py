@@ -162,7 +162,7 @@ def create_parser():
     # Generation algorithm selection
     parser.add_argument(
         "--generation-algorithm",
-        default="dual_cache",
+        default="nemotron",
         choices=["basic", "prefix_cache", "dual_cache", "nemotron", "dinfer_blockwise", "dinfer_hierarchy", "dinfer_credit", "dllm_eval"],
         help="Generation algorithm: LLaDA (basic=no cache, prefix_cache=prefix caching, dual_cache=dual caching) or Nemotron (nemotron=native generation)"
     )

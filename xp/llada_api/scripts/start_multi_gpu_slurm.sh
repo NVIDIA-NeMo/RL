@@ -376,8 +376,8 @@ try:
             token = os.environ.get('HF_TOKEN', None)
             
             # Download config and tokenizer (lightweight)
-            config = AutoConfig.from_pretrained(model_name, token=token)
-            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+            config = AutoConfig.from_pretrained(model_name, token=token, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token, trust_remote_code=True)
             
             print(f"✓ Model metadata cached successfully", flush=True)
             print(f"  Config: {type(config).__name__}", flush=True)

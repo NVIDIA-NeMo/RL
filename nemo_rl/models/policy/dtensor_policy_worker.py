@@ -267,9 +267,16 @@ class DTensorPolicyWorker:
                 print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
                 from transformers import AutoModel
                 model_class = AutoModel
-                model_config.dlm_type = "llada"
                 if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
                     model_config.dlm_paradigm = "block_diff"
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
+                    model_config.block_size = self.cfg["mdlm"]["block_size"]
+            elif model_name in ["nvidia/Nemotron-Diffusion-Exp-Ministral-8B"]:
+                print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
+                from transformers import AutoModel
+                model_class = AutoModel
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
+                    model_config.dlm_paradigm = "sbd_block_diff"
                 if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
                     model_config.block_size = self.cfg["mdlm"]["block_size"]
             else:
@@ -782,6 +789,7 @@ class DTensorPolicyWorker:
                                     "masked_indices": masked_indices,
                                     #"p_mask": mb["p_mask"],
                                     "labels": input_ids,
+                                    "skip_loss": True,
                                 }
 
                             if self._is_reward_model:
@@ -797,14 +805,20 @@ class DTensorPolicyWorker:
                             outputs = self.model(**model_args)
 
                         # Get logprobs
+                        causal_logits = None
                         if not hasattr(outputs, "logits"):
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
+                        if hasattr(outputs, "causal_logits"):
+                            causal_logits = outputs.causal_logits
+                            logits = torch.cat([logits, causal_logits], dim=1)
                         del outputs
 
                         # Apply temperature scaling
                         logits = self._apply_temperature_scaling(logits)
+                        #if causal_logits is not None:
+                        #    causal_logits = self._apply_temperature_scaling(causal_logits)
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (
@@ -876,13 +890,15 @@ class DTensorPolicyWorker:
                             )
                         else:
                             loss_fn_ = loss_fn
+                        #if causal_logits is not None:
+                        #    logits = torch.cat([logits, causal_logits], dim=1)
                         loss, loss_metrics = loss_fn_(
                             logits,
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
                         )
-                        del logits
+                        del logits, causal_logits
 
                         # skip the update for dummy batches
                         if mb_idx < iterator_len:
