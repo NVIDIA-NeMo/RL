@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -21,16 +22,35 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.utils.venvs import create_local_venv
 
 
-def prefetch_venvs():
-    """Prefetch all virtual environments that will be used by workers."""
+def prefetch_venvs(filters=None):
+    """Prefetch all virtual environments that will be used by workers.
+
+    Args:
+        filters: List of strings to match against actor FQNs. If provided, only
+                actors whose FQN contains at least one of the filter strings will
+                be prefetched. If None, all venvs are prefetched.
+    """
     print("Prefetching virtual environments...")
+    if filters:
+        print(f"Filtering for: {filters}")
+
+    # Track statistics for summary
+    skipped_by_filter = []
+    skipped_system_python = []
+    prefetched = []
+    failed = []
 
     # Group venvs by py_executable to avoid duplicating work
     venv_configs = {}
     for actor_fqn, py_executable in ACTOR_ENVIRONMENT_REGISTRY.items():
+        # Apply filters if provided
+        if filters and not any(f in actor_fqn for f in filters):
+            skipped_by_filter.append(actor_fqn)
+            continue
         # Skip system python as it doesn't need a venv
         if py_executable == "python" or py_executable == sys.executable:
             print(f"Skipping {actor_fqn} (uses system Python)")
+            skipped_system_python.append(actor_fqn)
             continue
 
         # Only create venvs for uv-based executables
@@ -47,12 +67,31 @@ def prefetch_venvs():
             try:
                 python_path = create_local_venv(py_executable, actor_fqn)
                 print(f"    Success: {python_path}")
+                prefetched.append(actor_fqn)
             except Exception as e:
                 print(f"    Error: {e}")
+                failed.append(actor_fqn)
                 # Continue with other venvs even if one fails
                 continue
 
-    print("\nVenv prefetching complete!")
+    # Print summary
+    print("\n" + "=" * 50)
+    print("Venv prefetching complete! Summary:")
+    print("=" * 50)
+    print(f"  Prefetched: {len(prefetched)}")
+    for actor_fqn in prefetched:
+        print(f"    - {actor_fqn}")
+    print(f"  Skipped (system Python): {len(skipped_system_python)}")
+    for actor_fqn in skipped_system_python:
+        print(f"    - {actor_fqn}")
+    if filters:
+        print(f"  Skipped (filtered out): {len(skipped_by_filter)}")
+        for actor_fqn in skipped_by_filter:
+            print(f"    - {actor_fqn}")
+    if failed:
+        print(f"  Failed: {len(failed)}")
+        for actor_fqn in failed:
+            print(f"    - {actor_fqn}")
 
     # Create convenience python wrapper scripts for frozen environment support (container-only)
     create_frozen_environment_symlinks(venv_configs)
@@ -150,4 +189,28 @@ exec "$VENV_PATH/bin/python" "$@"
 
 
 if __name__ == "__main__":
-    prefetch_venvs()
+    parser = argparse.ArgumentParser(
+        description="Prefetch virtual environments for Ray actors.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Prefetch all venvs
+  python -m nemo_rl.utils.prefetch_venvs
+
+  # Prefetch only vLLM-related venvs
+  python -m nemo_rl.utils.prefetch_venvs vllm
+
+  # Prefetch multiple specific venvs
+  python -m nemo_rl.utils.prefetch_venvs vllm policy environment
+        """,
+    )
+    parser.add_argument(
+        "filters",
+        nargs="*",
+        help="Filter strings to match against actor FQNs. Only actors whose FQN "
+        "contains at least one of these strings will be prefetched. "
+        "If not provided, all venvs are prefetched.",
+    )
+    args = parser.parse_args()
+
+    prefetch_venvs(filters=args.filters if args.filters else None)

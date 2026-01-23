@@ -28,7 +28,6 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -90,12 +89,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader,
+    Optional[StatefulDataLoader],
     NLLLoss,
     Logger,
     CheckpointManager,
@@ -149,14 +148,17 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    val_dataloader = StatefulDataLoader(
-        val_dataset,
-        batch_size=sft_config["val_global_batch_size"],
-        shuffle=False,
-        collate_fn=rl_collate_fn,
-        drop_last=False,
-        num_workers=data_config["num_workers"],
-    )
+    if val_dataset is not None:
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=sft_config["val_global_batch_size"],
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            drop_last=False,
+            num_workers=data_config["num_workers"],
+        )
+    else:
+        val_dataloader = None
 
     # ==========================
     #          Cluster
@@ -230,23 +232,22 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
     master_config: MasterConfig,
-    sft_task_spec: TaskDataSpec,
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert master_config["sft"]["val_period"] <= 0, (
+            "val_dataloader is None, so sft.val_period must be <= 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
-        return
+        return {}, {}
 
     timer = Timer()
 
@@ -355,7 +356,6 @@ def sft_train(
     loss_fn,
     master_config,
     logger,
-    sft_task_spec,
     checkpointer,
     sft_save_state: SFTSaveState,
 ) -> None:
@@ -397,7 +397,6 @@ def sft_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            sft_task_spec=sft_task_spec,
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
@@ -471,7 +470,6 @@ def sft_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        sft_task_spec=sft_task_spec,
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],
@@ -496,7 +494,7 @@ def sft_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing
                 sft_save_state["consumed_samples"] += master_config["policy"][
@@ -610,9 +608,12 @@ def sft_train(
                 master_config["cluster"]["num_nodes"]
                 * master_config["cluster"]["gpus_per_node"]
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
+            if total_time > 0:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
+                )
+            else:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 

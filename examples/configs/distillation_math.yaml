@@ -107,6 +107,9 @@ policy: &POLICY_BASE
         bias_activation_fusion: True
         defer_fp32_logits: False
         moe_per_layer_logging: False
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "allgather"
+        moe_shared_expert_overlap: false
         
         optimizer:
             optimizer: "adam"
@@ -206,10 +209,19 @@ teacher:
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-    prompt_file: "examples/prompts/cot.txt"
-    system_prompt_file: null
-    dataset_name: "DeepScaler"
     shuffle: true
+
+    # dataset
+    train:
+        dataset_name: DeepScaler
+    validation:
+        dataset_name: AIME2024
+        repeat: 16
+    # default settings for all datasets
+    default:
+        prompt_file: "examples/prompts/cot.txt"
+        system_prompt_file: null
+        env_name: "math"
 
 env:
     math:
@@ -225,12 +237,12 @@ logger:
     monitor_gpus: true
     wandb:
         project: "nemo-distillation"
-        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     swanlab:
         project: "nemo-distillation"
-        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
-        log_dir: "tb_logs-distillation-${data.dataset_name}"
+        log_dir: "tb_logs-distillation-${data.train.dataset_name}"
     mlflow:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"

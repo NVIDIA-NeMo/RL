@@ -168,7 +168,8 @@ class ClippedPGLossFn(LossFunction):
         advantages = data["advantages"][:, 1:]
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
-        reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        if self.reference_policy_kl_penalty != 0:
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
@@ -922,11 +923,12 @@ class SequencePackingLossWrapper:
                 if context_parallel_group is None
                 else torch.distributed.get_world_size(context_parallel_group)
             )
-            logit_slice_idxs = slice(
-                seq_start // cp_size,
-                (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+            logit_start = seq_start // cp_size
+            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+            logit_length = logit_end - logit_start
+            next_token_logits_slice = next_token_logits.narrow(
+                1, logit_start, logit_length
             )
-            next_token_logits_slice = next_token_logits[:, logit_slice_idxs, :]
 
             loss, metrics = self.loss_fn(
                 next_token_logits_slice,

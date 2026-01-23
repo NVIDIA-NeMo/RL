@@ -146,6 +146,9 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -180,13 +183,21 @@ policy:
       data_parallel_sharding_strategy: optim_grads_params
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  prompt_file: examples/prompts/clevr_cogent_cot.txt
-  system_prompt_file: null
-  dataset_name: clevr-cogent
-  env_name: "clevr-cogent"
-  split: trainA
   shuffle: true
   num_workers: 1
+  # dataset
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "clevr-cogent"
 env:
   clevr-cogent:
     num_workers: 8
