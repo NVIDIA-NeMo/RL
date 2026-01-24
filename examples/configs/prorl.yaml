@@ -6,6 +6,7 @@
 # - Token-level Loss: Fine-grained policy gradient
 # - Truncated Importance Sampling (TIS) / IcePop for MoE models
 # - REINFORCE++: Decoupled local and global advantage normalization estimator
+# - Stop properly penalty: Reward scale coefficient for truncated responses
 #
 # Inherits from grpo_math_1B.yaml
 #
