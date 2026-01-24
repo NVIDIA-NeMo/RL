@@ -223,17 +223,35 @@ def get_forward_loop_func(
         return create_forward_loop(dataloader=calib_dataloader)
 
     def _forward_loop(model):
+        original_topk_values = {}
+        original_config_topk = None
         if force_all_expert_routing:
-            for _, module in model.named_modules():
+            for name, module in model.named_modules():
                 if isinstance(module, TopKRouter):
-                    module.topk = module.num_experts
-        for batch in calib_dataloader:
-            megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
+                    # Store original values
+                    original_topk_values[name] = module.topk
+                    if original_config_topk is None:
+                        original_config_topk = module.config.moe_router_topk
 
-        if force_all_expert_routing:
-            for _, module in model.named_modules():
-                if isinstance(module, TopKRouter):
-                    module.topk = module.config.moe_router_topk
+                    # Set router topk to route to all experts
+                    module.topk = module.num_experts
+                    # IMPORTANT: Also update config.moe_router_topk so the token dispatcher
+                    # computes the correct num_out_tokens for all_to_all communication.
+                    # Without this, the token dispatcher uses the original topk value
+                    # which causes "Split sizes doesn't match total dim 0 size" error.
+                    module.config.moe_router_topk = module.num_experts
+
+        try:
+            for batch in calib_dataloader:
+                megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
+        finally:
+            if force_all_expert_routing:
+                for name, module in model.named_modules():
+                    if isinstance(module, TopKRouter):
+                        # Restore original values
+                        module.topk = original_topk_values.get(name, module.topk)
+                        if original_config_topk is not None:
+                            module.config.moe_router_topk = original_config_topk
 
     return _forward_loop
 
@@ -331,6 +349,7 @@ def quantization_layer_spec(config):
     )
     if disable_modelopt_layer_spec:
         return transformer_engine_layer_spec(config)
+    print("Using quantization_layer_spec without arbitrary attention mask")
     return get_gpt_modelopt_spec(
         config=config,
         local_core_attention=False,
