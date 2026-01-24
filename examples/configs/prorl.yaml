@@ -17,6 +17,7 @@
 # ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 # REINFORCE++: https://arxiv.org/abs/2501.03262
 # The Online IcePop Solution for MoE models: https://hijkzzz.notion.site/online-ice-pop
+# DLER (for Stop properly penalty): https://arxiv.org/pdf/2510.15110
 
 defaults: "grpo_math_1B.yaml"
 
