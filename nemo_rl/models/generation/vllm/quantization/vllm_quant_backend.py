@@ -74,14 +74,18 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _fold_weight(self, model: nn.Module):
         """Enable quantizers and fold weight after loading weights."""
         print("folding weight context")
-        for _, module in model.named_children():
-            if (
-                isinstance(module, TensorQuantizer)
-                and hasattr(module, "_is_active")
-                and module._is_active
-            ):
-                module.enable()
+        if hasattr(model, "unwrap"):
+            model = model.unwrap()
+
         try:
+            for _, module in model.named_modules():
+                if (
+                    isinstance(module, TensorQuantizer)
+                    and hasattr(module, "_is_active")
+                    and module._is_active
+                ):
+                    print(f"enabling quantizer: {module}")
+                    module.enable()
             yield
         finally:
             mtq.fold_weight(model, keep_attrs=True)
