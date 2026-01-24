@@ -15,11 +15,15 @@
 
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator
 
 import ray
 import torch
-from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
+from megatron.bridge.training.post_training.checkpointing import (
+    has_modelopt_state,
+    load_modelopt_state,
+)
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
@@ -51,7 +55,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         # Turn on bridge quantization mapping
         os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
         self._patch_setup_megatron_model()
-        super().__init__(config, *args, **kwargs)
+        with self.load_checkpoint_with_modelopt_state():
+            super().__init__(config, *args, **kwargs)
 
         # add quantizer states to reference state dict, so we don't need to modify use_reference_model logic
         if hasattr(self, "reference_state_dict"):
@@ -75,6 +80,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """
         # Check if the checkpoint already exists
         hf_model_subdir = hf_model_name
+        self.rank = get_rank_safe()
         if os.path.exists(hf_model_name):
             hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
@@ -96,17 +102,20 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
         if pre_quantized_model_path is not None and not pt_checkpoint_exists:
             # create a symlink to the pre-quantized model
-            absolute_pre_quantized_model_path = os.path.abspath(
-                pre_quantized_model_path
+            print(f"Using pre-quantized model at: {pre_quantized_model_path}")
+            absolute_pre_quantized_model_path = Path(pre_quantized_model_path).resolve()
+            os.makedirs(pretrained_path, exist_ok=True)
+            os.symlink(
+                absolute_pre_quantized_model_path.as_posix(),
+                iter0_path,
+                target_is_directory=True,
             )
-            os.symlink(absolute_pre_quantized_model_path, iter0_path)
+            assert os.path.exists(iter0_path)
             return pretrained_path
 
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        # Set for rank for non-collocated to check which ranks to broadcast from
-        self.rank = get_rank_safe()
         # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
         torch.distributed.init_process_group("nccl")
         if pt_checkpoint_exists:
@@ -167,30 +176,72 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 cfg.model.restore_modelopt_state = True
                 cfg.model.transformer_layer_spec = quantization_layer_spec
 
-            def _modelopt_pre_wrap_hook(model):
-                from megatron.bridge.training.post_training.checkpointing import (
-                    has_modelopt_state,
-                    load_modelopt_state,
-                )
-
-                # Check which checkpoint path has modelopt state
-                model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
-                if os.path.exists(os.path.join(model_path, "iter_0000000")):
-                    model_path = os.path.join(model_path, "iter_0000000")
-                if has_modelopt_state(model_path):
-                    checkpoint_path = model_path
-                else:
-                    raise RuntimeError(f"No modelopt_state found in {model_path}")
-
-                load_modelopt_state(model, checkpoint_path)
-                return model
-
-            kwargs["pre_wrap_hook"] = [_modelopt_pre_wrap_hook]
             return megatron_policy_worker._original_setup_megatron_model(
                 policy_cfg, cfg, *args, **kwargs
             )
 
         megatron_policy_worker.setup_megatron_model = _setup_megatron_model
+
+    @contextmanager
+    def load_checkpoint_with_modelopt_state(self):
+        """Context manager that temporarily loads the checkpoint with modelopt state."""
+
+        def _load_checkpoint(state, model, *args, **kwargs):
+            cfg = state.cfg
+            model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
+            if os.path.exists(os.path.join(model_path, "iter_0000000")):
+                model_path = os.path.join(model_path, "iter_0000000")
+            if has_modelopt_state(model_path):
+                unwrapped_model = unwrap_model(model)
+                load_modelopt_state(unwrapped_model, model_path)
+            return megatron_policy_worker._original_load_checkpoint(
+                state, model, *args, **kwargs
+            )
+
+        try:
+            megatron_policy_worker._original_load_checkpoint = (
+                megatron_policy_worker.load_checkpoint
+            )
+            megatron_policy_worker.load_checkpoint = _load_checkpoint
+            yield
+        finally:
+            megatron_policy_worker.load_checkpoint = (
+                megatron_policy_worker._original_load_checkpoint
+            )
+            del megatron_policy_worker._original_load_checkpoint
+
+    @contextmanager
+    def hide_tensor_quantizers(self):
+        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+        from megatron.core.distributed import DistributedDataParallel
+
+        if not isinstance(self.model, DistributedDataParallel):
+            yield
+            return
+
+        inner_module = self.model.module
+        original_named_modules = inner_module.named_modules
+
+        def filtered_named_modules(*args, **kwargs):
+            for name, module in original_named_modules(*args, **kwargs):
+                if not isinstance(module, TensorQuantizer):
+                    yield name, module
+
+        try:
+            inner_module.named_modules = filtered_named_modules
+            yield
+        finally:
+            inner_module.named_modules = original_named_modules
+
+    def enable_forward_pre_hook(self):
+        """Enable forward pre-hook, hiding TensorQuantizer modules."""
+        with self.hide_tensor_quantizers():
+            super().enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync=True):
+        """Disable forward pre-hook, hiding TensorQuantizer modules."""
+        with self.hide_tensor_quantizers():
+            super().disable_forward_pre_hook(param_sync=param_sync)
 
     @contextmanager
     def disable_quantization(self):
