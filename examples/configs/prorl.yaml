@@ -1,20 +1,21 @@
-# ProRL Algorithm Configuration (DAPO-style)
+# ProRLv2 Algorithm Configuration
 # 
-# This configuration implements ProRL with DAPO techniques:
+# This configuration implements ProRLv2 with TIS techniques:
 # - Dynamic Sampling: Filter prompts with zero reward variance
 # - Decoupled Clipping: Asymmetric ratio clipping (clip_max > clip_min)
 # - Token-level Loss: Fine-grained policy gradient
-# - Truncated Importance Sampling (TIS/ICE-POP)
-# - Reinforce++ decoupled advantage normalization estimator
+# - Truncated Importance Sampling (TIS) / IcePop for MoE models
+# - REINFORCE++: Decoupled local and global advantage normalization estimator
 #
 # Inherits from grpo_math_1B.yaml
 #
 # Usage:
 #   python examples/run_grpo_math.py --config examples/configs/prorl.yaml
 #
-# Reference papers:
+# Reference papers and blogs:
 # ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 # REINFORCE++: https://arxiv.org/abs/2501.03262
+# The Online IcePop Solution for MoE models: https://hijkzzz.notion.site/online-ice-pop
 
 defaults: "grpo_math_1B.yaml"
 
