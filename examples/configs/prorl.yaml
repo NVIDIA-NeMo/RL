@@ -52,7 +52,7 @@ grpo:
   reward_shaping:
     enabled: true
     # Stop properly penalty: scale factor for truncated responses (0-1)
-    # 0 = zero reward for truncated, 1 = no penalty (default)
+    # 0 = zero reward for truncated (default), 1 = no penalty
     stop_properly_penalty_coef: 0.0  # Set to e.g., 0.1 to halve truncated rewards
 
 # ============================================================================
