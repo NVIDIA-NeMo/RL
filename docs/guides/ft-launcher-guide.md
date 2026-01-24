@@ -1,14 +1,6 @@
 # Fault Tolerance Launcher Guide
 
-The `ft_launcher` is provided by `nvidia-resiliency-ext` and enables automatic fault tolerance and recovery for distributed training runs.
-
-## Installation
-
-Ensure you have the resiliency extra installed:
-
-```bash
-uv sync --extra resiliency
-```
+The `ft_launcher` is provided by `nvidia-resiliency-ext` (included in NeMo RL dependencies) and enables automatic fault tolerance and recovery for distributed training runs.
 
 ## Key Arguments
 
@@ -50,4 +42,17 @@ fault_tolerance:
 
 2. **Timeouts**: Set `--ft-initial-rank-heartbeat-timeout` higher than `--ft-rank-heartbeat-timeout` to allow for model loading/setup time.
 
-3. **Restart Policy**: The `any-failed` restart policy will restart the entire job if any rank fails.
+3. **Restart Policy**: The `any-failed` restart policy will restart the entire job if any rank fails. Look for these log messages to identify when a restart occurs:
+
+   ```
+   [ERROR] [ft_launcher...] failed (exitcode: 1) local_rank: 0 (pid: ...) of binary: ...
+   [INFO] [ft_launcher...] [default] Worker group FAILED. 3/5 attempts left; will restart worker group
+   [INFO] [ft_launcher...] Stopping workers... Timeout = 30 sec.
+   [INFO] [ft_launcher...] The node '...' attempts to join the next round of the rendezvous '...'.
+   [INFO] [ft_launcher...] The node '...' has joined round N of the rendezvous '...' as rank 0 in a world of size 1.
+   ```
+
+   Key indicators:
+   - `Worker group FAILED. X/Y attempts left` - shows a restart is happening and remaining attempts
+   - `will restart worker group` - confirms restart is in progress
+   - `has joined round N` - the round number increases with each restart
