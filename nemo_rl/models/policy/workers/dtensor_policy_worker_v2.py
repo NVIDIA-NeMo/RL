@@ -326,7 +326,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             for gb_idx in range(num_global_batches):
                 # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
-                    data, gb_idx, local_gbs, loss_fn, self.dp_mesh
+                    data,
+                    loss_fn,
+                    self.dp_mesh.get_group(),
+                    batch_idx=gb_idx,
+                    batch_size=local_gbs,
                 )
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
@@ -338,7 +342,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
                     self.cfg,
-                    self.enable_seq_packing,
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
@@ -372,6 +375,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     seq_index = processed_inputs.seq_index
                     seq_len = processed_inputs.seq_len
 
+                    # get_train_context handles both context parallel and autocast
                     with get_train_context(
                         cp_size=self.cp_size,
                         cp_mesh=self.cp_mesh,
@@ -613,7 +617,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             processed_iterator, iterator_len = get_microbatch_iterator(
                 data,
                 self.cfg,
-                self.enable_seq_packing,
                 logprob_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
@@ -846,7 +849,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             processed_iterator, iterator_len = get_microbatch_iterator(
                 data,
                 self.cfg,
-                self.enable_seq_packing,
                 global_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
@@ -951,7 +953,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             processed_iterator, iterator_len = get_microbatch_iterator(
                 data,
                 self.cfg,
-                self.enable_seq_packing,
                 topk_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
@@ -1113,10 +1114,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Replace with unpacked results
                     vals = unpacked_vals
                     idx = unpacked_idx
-
-                    # Update batch_size and seq_len for consistency
-                    batch_size = original_batch_size
-                    seq_len = original_seq_len
 
                 # skip keeping the topk values for the dummy batches
                 if batch_idx >= iterator_len:

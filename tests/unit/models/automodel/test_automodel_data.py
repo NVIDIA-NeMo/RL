@@ -65,16 +65,15 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
         mbs = 4
-        enable_seq_packing = False
         mock_dp_mesh = MagicMock()
 
         processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
-            enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
@@ -130,16 +129,15 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": True},
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
         mbs = 4
-        enable_seq_packing = False
         mock_dp_mesh = MagicMock()
 
         processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
-            enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
@@ -195,10 +193,9 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
-            "sequence_packing": {"train_mb_tokens": 512},
+            "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
         }
         mbs = 4
-        enable_seq_packing = True
         mock_dp_mesh = MagicMock()
 
         # Mock the all_reduce to simulate max_batch_ct = 2 across all ranks
@@ -210,7 +207,6 @@ class TestGetMicrobatchIterator:
         processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
-            enable_seq_packing=enable_seq_packing,
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
@@ -571,13 +567,13 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([batch1, batch2])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -608,13 +604,13 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([batch])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -638,13 +634,13 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([batch])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -673,13 +669,13 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([batch])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=2,  # Context parallel enabled
         )
@@ -694,13 +690,13 @@ class TestMakeProcessedMicrobatchIterator:
         """Test that empty iterator yields nothing."""
         raw_iterator = iter([])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -731,13 +727,13 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([batch1, batch2, batch3])
         cfg = {
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -786,10 +782,10 @@ class TestProcessGlobalBatch:
 
         result = process_global_batch(
             data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
             batch_idx=0,
             batch_size=4,
-            loss_fn=mock_loss_fn,
-            dp_mesh=mock_dp_mesh,
         )
 
         # Verify get_batch was called correctly
@@ -841,10 +837,10 @@ class TestProcessGlobalBatch:
 
         result = process_global_batch(
             data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
             batch_idx=0,
             batch_size=4,
-            loss_fn=mock_loss_fn,
-            dp_mesh=mock_dp_mesh,
         )
 
         # Verify batch has token_mask
@@ -886,10 +882,10 @@ class TestProcessGlobalBatch:
         with pytest.raises(AssertionError, match="token_mask must be present"):
             process_global_batch(
                 data=data,
+                loss_fn=loss_fn,
+                dp_group=mock_dp_mesh.get_group(),
                 batch_idx=0,
                 batch_size=4,
-                loss_fn=loss_fn,
-                dp_mesh=mock_dp_mesh,
             )
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
@@ -915,10 +911,10 @@ class TestProcessGlobalBatch:
         with pytest.raises(AssertionError, match="sample_mask must be present"):
             process_global_batch(
                 data=data,
+                loss_fn=mock_loss_fn,
+                dp_group=mock_dp_mesh.get_group(),
                 batch_idx=0,
                 batch_size=4,
-                loss_fn=mock_loss_fn,
-                dp_mesh=mock_dp_mesh,
             )
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
@@ -958,19 +954,19 @@ class TestProcessGlobalBatch:
         # Process first batch
         result1 = process_global_batch(
             data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
             batch_idx=0,
             batch_size=4,
-            loss_fn=mock_loss_fn,
-            dp_mesh=mock_dp_mesh,
         )
 
         # Process second batch
         result2 = process_global_batch(
             data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
             batch_idx=1,
             batch_size=4,
-            loss_fn=mock_loss_fn,
-            dp_mesh=mock_dp_mesh,
         )
 
         # Verify both batches were processed correctly
@@ -1001,10 +997,10 @@ class TestIntegrationScenarios:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
             "dtensor_cfg": {"sequence_parallel": False},
         }
         mbs = 4
-        enable_seq_packing = False
         cp_size = 1
 
         # Mock get_batch
@@ -1030,10 +1026,10 @@ class TestIntegrationScenarios:
         # Step 1: Process global batch
         global_batch_result = process_global_batch(
             data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
             batch_idx=0,
             batch_size=4,
-            loss_fn=mock_loss_fn,
-            dp_mesh=mock_dp_mesh,
         )
 
         batch = global_batch_result["batch"]
@@ -1042,7 +1038,6 @@ class TestIntegrationScenarios:
         processed_iterator, iterator_len = get_microbatch_iterator(
             data=batch,
             cfg=cfg,
-            enable_seq_packing=enable_seq_packing,
             mbs=2,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,

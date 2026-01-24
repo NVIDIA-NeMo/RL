@@ -98,7 +98,6 @@ class ProcessedMicrobatch:
 def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
     tokenizer: AutoTokenizer,
-    enable_seq_packing: bool,
     cfg: dict[str, Any],
     cp_size: int,
 ) -> Iterator[ProcessedMicrobatch]:
@@ -111,13 +110,15 @@ def make_processed_microbatch_iterator(
     Args:
         raw_iterator: Iterator yielding raw BatchedDataDict microbatches
         tokenizer: Tokenizer for processing
-        enable_seq_packing: Whether sequence packing is enabled
-        cfg: Configuration dictionary
+        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
         cp_size: Context parallel size
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
+    # Infer enable_seq_packing from config to mirror mcore pattern
+    enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
+
     for data_dict in raw_iterator:
         # Store original shapes before processing
         original_batch_size = data_dict.get("input_ids").shape[0]
@@ -143,7 +144,6 @@ def make_processed_microbatch_iterator(
 def get_microbatch_iterator(
     data: BatchedDataDict[Any],
     cfg: dict[str, Any],
-    enable_seq_packing: bool,
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
     tokenizer: AutoTokenizer,
@@ -153,8 +153,7 @@ def get_microbatch_iterator(
 
     Args:
         data: Full dataset to iterate over
-        cfg: Configuration dictionary
-        enable_seq_packing: Whether sequence packing is enabled
+        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
         tokenizer: Tokenizer for processing
@@ -163,6 +162,9 @@ def get_microbatch_iterator(
     Returns:
         Tuple of (processed_microbatch_iterator, iterator_length)
     """
+    # Infer enable_seq_packing from config to mirror mcore pattern
+    enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
+
     dummy_iterator: Iterator[BatchedDataDict[Any]] = iter([])
 
     if cfg["dynamic_batching"]["enabled"]:
@@ -189,7 +191,6 @@ def get_microbatch_iterator(
     processed_iterator = make_processed_microbatch_iterator(
         itertools.chain(mb_iterator, dummy_iterator),
         tokenizer,
-        enable_seq_packing,
         cfg,
         cp_size,
     )
@@ -238,11 +239,17 @@ def process_microbatch(
     else:
         batch_size, seq_len = input_ids.shape
 
+        # DTensor requires the causal attention kernel to hit,
+        # yet our post_attention_mask (used for masking after forward) is not always all 1s.
+        # This is fine because we mask with the actual attention mask later,
+        # but for input it has to be all 1s.
         attention_mask = torch.ones(
             (batch_size, seq_len),
             dtype=torch.bool,
             device=input_ids.device,
         )
+        # Explicitly create position ids for the input, otherwise the sharding
+        # for DTensor will be incorrect.
         position_ids = torch.arange(seq_len, device=input_ids.device).repeat(
             batch_size, 1
         )
@@ -283,19 +290,20 @@ def process_microbatch(
 
 def process_global_batch(
     data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    dp_group: torch.distributed.ProcessGroup,
+    *,
     batch_idx: int,
     batch_size: int,
-    loss_fn: LossFunction,
-    dp_mesh: Any,
 ) -> dict[str, Any]:
     """Process a global batch and compute normalization factors.
 
     Args:
         data: Full dataset
+        loss_fn: Loss function (used to check loss type)
+        dp_group: Data parallel process group (for consistency with Megatron naming)
         batch_idx: Index of batch to extract
         batch_size: Size of batch to extract
-        loss_fn: Loss function (used to check loss type)
-        dp_mesh: Data parallel mesh
 
     Returns:
         Dictionary containing:
@@ -318,7 +326,7 @@ def process_global_batch(
         )
 
     to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-    torch.distributed.all_reduce(to_reduce, group=dp_mesh.get_group())
+    torch.distributed.all_reduce(to_reduce, group=dp_group)
     global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
 
     if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
