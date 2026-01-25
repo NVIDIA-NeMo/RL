@@ -1,0 +1,10 @@
+defaults: ./grpo-deepseek-v3-64n4g-fp8-async-1off.yaml
+grpo:
+  async_grpo: 
+    max_trajectory_age_steps: 4
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-64n4g-fp8-async-8off
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n4g-fp8-async-32T32G-8off
+  wandb:
+    name: grpo-deepseek-v3-64n4g-fp8-async-32T32G-8off

@@ -1,0 +1,37 @@
+defaults: ./grpo-deepseek-v3-64n8g-async-1off.yaml
+grpo:
+  async_grpo:
+    enabled: false
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-64n4g-fp8-noncolocated
+policy:
+  max_total_sequence_length: 4096
+  megatron_cfg:
+    moe_router_dtype: fp32
+    apply_rope_fusion: false
+    moe_router_fusion: false
+    pipeline_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+    vllm_cfg:
+      async_engine: true
+      precision: "fp8"
+      use_deep_gemm: true
+      quantization_ignored_layer_kws: [
+        a_proj,
+        b_proj
+      ]
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.8
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n4g-fp8-noncolocated-32T32G
+  wandb:
+    name: grpo-deepseek-v3-64n4g-fp8-noncolocated-32T32G
+cluster:
+  gpus_per_node: 4
+  num_nodes: 64
