@@ -29,9 +29,12 @@ policy:
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 2
 data:
-  dataset_name: tulu3_sft_mixture
   add_generation_prompt: true
-  seed: 42
+  train:
+    dataset_name: tulu3_sft_mixture
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
 logger:
   log_dir: logs/sft-tmblog-llama3.1-8b
   tensorboard_enabled: false

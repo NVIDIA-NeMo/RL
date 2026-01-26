@@ -37,7 +37,7 @@ SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is e
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
 
 ```python
-def format_squad(data):
+def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
     return {
         "messages": [
             {
@@ -56,7 +56,7 @@ def format_squad(data):
     }
 ```
 
-NeMo RL SFT uses HuggingFace chat templates to format the individual examples. Three types of chat templates are supported, which can be configured via `tokenizer.chat_template` in your yaml config (see [sft.yaml](../../examples/configs/sft.yaml) for an example):
+NeMo RL SFT uses Hugging Face chat templates to format the individual examples. Three types of chat templates are supported, which can be configured using the `tokenizer.chat_template` in your YAML config (see [sft.yaml](../../examples/configs/sft.yaml) for an example):
 
 1. Apply the tokenizer's default chat template. To use the tokenizer's default, either omit `tokenizer.chat_template` from the config altogether, or set `tokenizer.chat_template="default"`.
 2. Use a "passthrough" template which simply concatenates all messages. This is desirable if the chat template has been applied to your dataset as an offline preprocessing step. In this case, you should set `tokenizer.chat_template` to None as follows:
@@ -64,25 +64,49 @@ NeMo RL SFT uses HuggingFace chat templates to format the individual examples. T
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
     custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
 
-By default, NeMo RL has support for [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py) and [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) datasets. All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
+All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: ResponseDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  val_data_path: <PathToValidationDataset>
-  input_key: <QuestionKey>, default is "input"
-  output_key: <AnswerKey>, default is "output"
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # other data settings, see `examples/configs/sft.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # this dataset will override input_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    input_key: question
+    split: train  # used for HuggingFace datasets
+    split_validation_size: 0.05  # use 5% of the training data as validation data
+    seed: 42  # seed for train/validation split when split_validation_size > 0
+  validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
+    dataset_name: ResponseDataset
+    input_key: input
+    output_key: output
+    prompt_file: null
+    system_prompt_file: null
+    processor: "sft_processor"
+```
+
+We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
+[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
+```python
+# `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+self.val_dataset = None
+self.split_train_validation(split_validation_size, seed)
 ```
 
 ### OpenAI Format Datasets (with Tool Calling Support)
@@ -95,14 +119,16 @@ To use an OpenAI format dataset, configure your YAML as follows:
 
 ```yaml
 data:
-  dataset_name: openai_format
-  train_data_path: "/path/to/train.jsonl"  # Path to training data
-  val_data_path: "/path/to/val.jsonl"      # Path to validation data
-  chat_key: "messages"                     # Key for messages in the data (default: "messages")
-  system_key: null                         # Key for system message in the data (optional)
-  system_prompt: null                      # Default system prompt if not in data (optional)
-  tool_key: "tools"                        # Key for tools in the data (default: "tools")
-  use_preserving_dataset: false            # Set to true for heterogeneous tool schemas (see below)
+  train:
+    dataset_name: openai_format
+    data_path: <PathToTrainingDataset>       # Path to training data
+    chat_key: "messages"                     # Key for messages in the data (default: "messages")
+    system_key: null                         # Key for system message in the data (optional)
+    system_prompt: null                      # Default system prompt if not in data (optional)
+    tool_key: "tools"                        # Key for tools in the data (default: "tools")
+    use_preserving_dataset: false            # Set to true for heterogeneous tool schemas (see below)
+  validation:
+    ...
 ```
 
 #### Data Format
@@ -169,7 +195,7 @@ NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
 Notes:
 - LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
-- Triton kernels are only used in the DTensor v2 path. For TP > 1, Automodel currently does not support Triton kernels (see note below).
+- Triton kernels are only used in the DTensor v2 path. For `tensor_parallel_size > 1`, Automodel currently does not support Triton kernels (see note below).
 
 ### DTensor Configuration Parameters
 

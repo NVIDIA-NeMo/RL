@@ -28,7 +28,7 @@ def code_jaccard_env_config():
 
 @pytest.fixture(scope="module")
 def code_jaccard_env(code_jaccard_env_config):
-    env = create_env("code_jaccard", {"code_jaccard": code_jaccard_env_config})
+    env = create_env("code_jaccard", code_jaccard_env_config)
     yield env
     env.shutdown.remote()
     ray.kill(env)
