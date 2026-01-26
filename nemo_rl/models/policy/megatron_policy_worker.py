@@ -1868,6 +1868,10 @@ class MegatronPolicyWorker:
         no_grad.__enter__()
         # Offload as much as possible on the CPU
         self.model = self.move_model(self.model, "cpu")
+        try:
+            self.is_prepared = False
+        except Exception:
+            pass
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
@@ -1935,6 +1939,17 @@ class MegatronPolicyWorker:
                             )
                         new_state_dict[name] = item
                     model.load_state_dict(new_state_dict)
+        # Update prepared flag: only reflect parameter residency when we moved params
+        try:
+            if move_params:
+                any_on_cuda = any(
+                    (hasattr(p, "is_cuda") and p.is_cuda)
+                    for p in model.parameters()
+                    if isinstance(p, torch.Tensor)
+                )
+                self.is_prepared = bool(any_on_cuda)
+        except Exception:
+            pass
         return model
 
     def save_checkpoint(
