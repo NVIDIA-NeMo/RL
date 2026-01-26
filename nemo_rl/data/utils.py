@@ -77,7 +77,8 @@ def setup_data_with_envs(
 
     for cfg in data_config["train"]:
         # load dataset
-        update_single_dataset_config(cfg, data_config["default"])
+        if "default" in data_config and data_config["default"] is not None:
+            update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg)
         data_list.append(data)
         # bind task_name to task_data_processors and task_to_env
@@ -110,13 +111,14 @@ def setup_data_with_envs(
             val_task_to_env[task_name] = task_to_env[task_name]
 
     # validation dataset from config
-    if data_config["validation"] is not None:
+    if "validation" in data_config and data_config["validation"] is not None:
         if isinstance(data_config["validation"], dict):
             data_config["validation"] = [data_config["validation"]]
 
         for cfg in data_config["validation"]:
             # load dataset
-            update_single_dataset_config(cfg, data_config["default"])
+            if "default" in data_config and data_config["default"] is not None:
+                update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors and task_to_env
