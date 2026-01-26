@@ -68,14 +68,26 @@ def setup_data_with_envs(
 
     print("\n▶ Setting up data...")
     # setup train dataset
-    if "default" in data_config:
-        update_single_dataset_config(data_config["train"], data_config["default"])
-    data = load_response_dataset(data_config["train"])
-    task_data_processors = {data.task_name: (data.task_spec, data.processor)}
-    task_to_env = {data.task_name: envs[data_config["train"]["env_name"]]}
+    task_data_processors = {}
+    task_to_env = {}
+    data_list = []
 
+    if isinstance(data_config["train"], dict):
+        data_config["train"] = [data_config["train"]]
+
+    for cfg in data_config["train"]:
+        # load dataset
+        update_single_dataset_config(cfg, data_config["default"])
+        data = load_response_dataset(cfg)
+        data_list.append(data)
+        # bind task_name to task_data_processors and task_to_env
+        task_name = data.task_name
+        task_data_processors[task_name] = (data.task_spec, data.processor)
+        task_to_env[task_name] = envs[cfg["env_name"]]
+
+    merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
-        data.dataset,
+        merged_data,
         tokenizer,
         None,
         task_data_processors,
@@ -89,26 +101,31 @@ def setup_data_with_envs(
     val_data_list = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
-    if hasattr(data, "val_dataset") and data.val_dataset is not None:
-        val_data_list.append(data.val_dataset)
-        val_task_data_processors = task_data_processors.copy()
-        val_task_to_env = task_to_env.copy()
+    for data in data_list:
+        if hasattr(data, "val_dataset") and data.val_dataset is not None:
+            val_data_list.append(data.val_dataset)
+            # bind task_name to task_data_processors and task_to_env
+            task_name = data.task_name
+            val_task_data_processors[task_name] = task_data_processors[task_name]
+            val_task_to_env[task_name] = task_to_env[task_name]
 
     # validation dataset from config
-    if "validation" in data_config and data_config["validation"] is not None:
-        if "default" in data_config:
-            update_single_dataset_config(
-                data_config["validation"], data_config["default"]
+    if data_config["validation"] is not None:
+        if isinstance(data_config["validation"], dict):
+            data_config["validation"] = [data_config["validation"]]
+
+        for cfg in data_config["validation"]:
+            # load dataset
+            update_single_dataset_config(cfg, data_config["default"])
+            val_data = load_response_dataset(cfg)
+            val_data_list.append(val_data.dataset)
+            # bind task_name to task_data_processors and task_to_env
+            task_name = val_data.task_name
+            val_task_data_processors[task_name] = (
+                val_data.task_spec,
+                val_data.processor,
             )
-        val_data = load_response_dataset(data_config["validation"])
-        val_data_list.append(val_data.dataset)
-        val_task_data_processors[val_data.task_name] = (
-            val_data.task_spec,
-            val_data.processor,
-        )
-        val_task_to_env[val_data.task_name] = envs[
-            data_config["validation"]["env_name"]
-        ]
+            val_task_to_env[task_name] = envs[cfg["env_name"]]
 
     val_dataset = None
     if len(val_data_list) > 0:
