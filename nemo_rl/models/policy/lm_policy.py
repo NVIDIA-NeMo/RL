@@ -820,6 +820,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
+        # workers performed a full offload -> this policy is no longer prepared
+        try:
+            self.is_prepared = False
+        except Exception:
+            pass
 
     def save_checkpoint(
         self,

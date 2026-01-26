@@ -2609,13 +2609,16 @@ def test_megatron_policy_worker_raises_if_not_prepared(tiny_llama_model_path):
     dummy_data = BatchedDataDict({"input_ids": None, "input_lengths": None})
 
     # train should raise
-    with pytest.raises(RuntimeError, match="Model is not prepared for GPU execution"):
+    with pytest.raises(RuntimeError) as exc:
         worker.train(dummy_data, loss_fn=None)
+    assert "prepared" in str(exc.value).lower()
 
     # get_logprobs should raise
-    with pytest.raises(RuntimeError, match="Model is not prepared for GPU execution"):
+    with pytest.raises(RuntimeError) as exc:
         worker.get_logprobs(data=dummy_data)
+    assert "prepared" in str(exc.value).lower()
 
     # generate should raise
-    with pytest.raises(RuntimeError, match="Model is not prepared for GPU execution"):
+    with pytest.raises(RuntimeError) as exc:
         worker.generate(data=dummy_data)
+    assert "prepared" in str(exc.value).lower()

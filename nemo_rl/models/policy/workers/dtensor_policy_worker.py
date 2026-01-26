@@ -1850,7 +1850,18 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
-        return model.to(device)
+        model = model.to(device)
+        # Update prepared flag only for parameter moves
+        try:
+            any_on_cuda = any(
+                (hasattr(p, "is_cuda") and p.is_cuda)
+                for p in model.parameters()
+                if isinstance(p, torch.Tensor)
+            )
+            self.is_prepared = bool(any_on_cuda)
+        except Exception:
+            pass
+        return model
 
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
