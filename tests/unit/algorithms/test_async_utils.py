@@ -698,3 +698,181 @@ class TestAsyncUtilsIntegration:
         assert sample_result is None
 
         ray.kill(buffer)
+
+
+class TestMultiEpochCollection:
+    """Tests for multi-epoch trajectory collection."""
+
+    def create_mock_config(self):
+        return {
+            "grpo": {
+                "num_prompts_per_step": 2,
+                "num_generations_per_prompt": 2,
+                "max_rollout_turns": 1,
+                "async_grpo": {
+                    "max_trajectory_age_steps": 2,
+                },
+            },
+            "policy": {
+                "max_total_sequence_length": 512,
+            },
+        }
+
+    def test_epoch_tracking_in_collector(self):
+        """Test that the collector tracks current epoch."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Initially epoch should be 0 (not started)
+        state = ray.get(collector.get_dataloader_state.remote())
+        assert "current_epoch" in state
+        assert state["current_epoch"] == 0
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_epoch_checkpoint_format(self):
+        """Test that get_dataloader_state returns correct format with epoch."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        state = ray.get(collector.get_dataloader_state.remote())
+
+        # Should have current_epoch key
+        assert "current_epoch" in state
+        assert isinstance(state["current_epoch"], int)
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_epoch_restoration(self):
+        """Test that set_dataloader_state correctly restores epoch."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Restore epoch to 5
+        ray.get(collector.set_dataloader_state.remote({"current_epoch": 5}))
+
+        # Verify epoch was restored
+        state = ray.get(collector.get_dataloader_state.remote())
+        assert state["current_epoch"] == 5
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_epoch_restoration_with_dataloader_state(self):
+        """Test restoring both epoch and dataloader state."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Restore state with both epoch and (mock) dataloader state
+        restore_state = {
+            "current_epoch": 3,
+            "dataloader_state": {"mock_key": "mock_value"},
+        }
+        ray.get(collector.set_dataloader_state.remote(restore_state))
+
+        # Verify epoch was restored
+        state = ray.get(collector.get_dataloader_state.remote())
+        assert state["current_epoch"] == 3
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_epoch_increments_correctly(self):
+        """Test that epoch increments when collection loop iterates."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Create a minimal mock dataloader that exhausts quickly
+        mock_dataloader = mock.MagicMock()
+        mock_dataloader.__iter__ = mock.MagicMock(return_value=iter([]))
+        mock_dataloader.state_dict = mock.MagicMock(return_value={})
+
+        # Start collection - it will iterate through empty dataloader and increment epoch
+        ray.get(collector.start_collection.remote(mock_dataloader))
+
+        # Give it time to process
+        import time
+        time.sleep(0.5)
+
+        # Stop collection
+        # Collection will stop when killed
+
+        # The epoch should have incremented (at least once)
+        state = ray.get(collector.get_dataloader_state.remote())
+        # Note: With empty dataloader, it will loop continuously, so epoch should be > 0
+        assert state["current_epoch"] >= 1
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)

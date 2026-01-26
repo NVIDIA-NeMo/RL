@@ -291,6 +291,9 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
+        # Track current epoch for checkpointing (0 means not started)
+        self.current_epoch: int = 0
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -390,54 +393,72 @@ class AsyncTrajectoryCollector:
         print("Collection thread started, start_collection returning")
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
+        """Run the collection loop in background thread.
+
+        This loop runs indefinitely until self.running is set to False,
+        restarting from epoch 0 each time the dataloader is exhausted.
+        """
         try:
-            for batch in self.dataloader:
-                if not self.running:
-                    break
+            while self.running:
+                self.current_epoch += 1
+                print(f"Starting epoch {self.current_epoch} of trajectory collection")
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.get("grpo", {}).get(
-                            "async_grpo", {}
-                        )
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
+                for batch in self.dataloader:
                     if not self.running:
                         break
 
-                if not self.running:
-                    break
+                    # Check if manually paused and wait
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
 
-                self._process_batch(batch)
+                    # Check if refit is in progress and wait
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        print("⏸️ Pausing collection for refit...")
+                        self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+
+                    # Check if generation limits require pausing collection
+                    if self._should_pause_for_generation_limits() and self.running:
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            async_cfg = self.master_config.get("grpo", {}).get(
+                                "async_grpo", {}
+                            )
+                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
+
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
+
+                            self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        self._generation_limit_cleared.wait()
+
+                        # Double-check we're still running after being woken up
+                        if not self.running:
+                            break
+
+                    if not self.running:
+                        break
+
+                    self._process_batch(batch)
+
+                if self.running:
+                    print(
+                        f"Completed epoch {self.current_epoch}, starting next epoch..."
+                    )
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -623,10 +644,34 @@ class AsyncTrajectoryCollector:
             time.sleep(0.5)
 
     def get_dataloader_state(self) -> dict:
-        """Get the current dataloader state for checkpointing."""
+        """Get the current dataloader state for checkpointing.
+
+        Returns a dict containing:
+            - dataloader_state: The StatefulDataLoader's state_dict
+            - current_epoch: The current epoch number (1-indexed)
+        """
+        state = {"current_epoch": self.current_epoch}
         if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
-            return self.dataloader.state_dict()
-        return {}
+            state["dataloader_state"] = self.dataloader.state_dict()
+        return state
+
+    def set_dataloader_state(self, state: dict) -> None:
+        """Restore dataloader state from checkpoint.
+
+        Args:
+            state: Dict containing 'current_epoch' and optionally 'dataloader_state'
+        """
+        if "current_epoch" in state:
+            self.current_epoch = state["current_epoch"]
+            print(f"Restored epoch to {self.current_epoch}")
+
+        if (
+            "dataloader_state" in state
+            and hasattr(self, "dataloader")
+            and hasattr(self.dataloader, "load_state_dict")
+        ):
+            self.dataloader.load_state_dict(state["dataloader_state"])
+            print("Restored dataloader state")
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
