@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=42", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -226,6 +226,7 @@ override-dependencies = [
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
+  "setuptools>=80.10.1",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -234,6 +235,7 @@ constraint-dependencies = [
   "urllib3>=2.6.3",    # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
   "pyasn1>=0.6.2",     # Address CVE GHSA-63vm-454h-vhhq
+  "wheel>=0.46.2",     # Address CVE GHSA-8rrh-rw8j-w5fx
 ]
 
 # Augment build dependencies for packages that need torch at build time
