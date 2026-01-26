@@ -10,7 +10,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 5
   val_at_start: False
-  overlong_filtering: false
+  overlong_filtering: true
   max_val_samples: null
   val_batch_size: 256
   seed: 42
@@ -18,14 +18,14 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
-  
+
   # Best@k training configuration (optional - set use_best_at_k to true to enable)
   use_best_at_k: False  # Enable Best@k training to optimize for best reward among k samples
   best_at_k_k: 8  # Number of samples per bootstrap group (should be <= num_generations_per_prompt)
   best_at_k_m: 1000  # Number of bootstrap groups (will use C(n,k) if smaller)
   # Note: With num_generations_per_prompt=16 and k=8, C(16,8)=12870
   # So m=1000 will use bootstrap sampling (not all combinations)
-  
+
   # Combined training: blend of Best@k and Pass@1
   use_combined_training: false  # Enable combined training
   combined_training_weight_mode: "auto"  # "auto" for adaptive, "fixed" for custom weights
@@ -33,7 +33,7 @@ grpo:
   combined_training_pass_at_1_weight: 1.0  # Used when mode is "fixed"
   # "auto": adaptive weights (N_pos/N) per prompt
   # "fixed": use custom weights specified above
-  
+
   # Dynamic sampling: oversample prompts, keep only those with non-zero advantages
   dynamic_sampling_oversample_ratio: 1.0  # 1.0 = disabled, 2.0 = load 2x and filter, etc.
 
@@ -91,7 +91,7 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-  
+
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
@@ -113,7 +113,7 @@ policy:
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 1e-3
     moe_permute_fusion: true
-    moe_enable_deepep: false 
+    moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_aux_loss_coeff: 0.0
     moe_router_enable_expert_bias: true
@@ -160,7 +160,7 @@ policy:
       lr_decay_style: "constant"
       lr_decay_iters: null
       lr_warmup_iters: 10
-      lr_warmup_init: 0.3e-7
+      lr_warmup_init: 3.0e-7
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -172,7 +172,7 @@ policy:
 
     env_vars: null
 
-  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
