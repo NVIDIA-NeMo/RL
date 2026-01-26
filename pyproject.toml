@@ -50,6 +50,7 @@ dependencies = [
   "swanlab",
   "pyzmq",
   "nvidia-resiliency-ext",
+  "nccl4py",
 ]
 
 [project.optional-dependencies]
