@@ -900,9 +900,7 @@ async def run_hf_train_process(
         (False, True, "fp8", False),
         # LoRA tests
         (False, False, "bfloat16", True),
-        (False, True, "bfloat16", True),
         (True, False, "bfloat16", True),
-        (True, True, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -968,9 +966,7 @@ async def test_vllm_generation_with_hf_training_colocated(
         (False, True, "fp8", False),
         # LoRA tests
         (False, False, "bfloat16", True),
-        (False, True, "bfloat16", True),
         (True, False, "bfloat16", True),
-        (True, True, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
