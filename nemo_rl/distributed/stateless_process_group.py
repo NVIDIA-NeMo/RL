@@ -39,8 +39,19 @@ class StatelessProcessGroup:
                 rank=self.rank,
                 unique_id=unique_id,
             )
+            # warmup and check if broadcast is working
+            stream = torch.cuda.current_stream()
+            if self.rank == 0:
+                data = torch.ones(1, device=device)
+            else:
+                data = torch.zeros(1, device=device)
+            self.broadcast(data, 0, stream=stream)
+            torch.cuda.current_stream().synchronize()
+            assert torch.allclose(data, torch.ones(1, device=device))
 
-    def broadcast(self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None):       
+    def broadcast(self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None):
+        if stream is None:
+            stream = torch.cuda.current_stream()
         self.nccl_communicator.broadcast(
             sendbuf=tensor,
             recvbuf=tensor,
