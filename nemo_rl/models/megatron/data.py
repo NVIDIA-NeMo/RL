@@ -153,6 +153,8 @@ def get_microbatch_iterator(
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
 
+    _, seq_dim_size = get_and_validate_seqlen(data)
+
     # Auto-detect seq_length_key if not provided
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
         seq_length_key = "input_lengths"
@@ -177,8 +179,6 @@ def get_microbatch_iterator(
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
-
-    _, seq_dim_size = get_and_validate_seqlen(data)
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(
