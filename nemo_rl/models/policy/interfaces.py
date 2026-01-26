@@ -20,6 +20,7 @@ import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
@@ -54,7 +55,8 @@ class PolicyInterface(ABC):
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
-        **kwargs: Any,
+        timer: Optional[Timer] = None,
+        timer_tag_prefix: str = "get_logprobs",
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -72,7 +74,8 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
-        **kwargs: Any,
+        timer: Optional[Timer] = None,
+        timer_tag_prefix: str = "get_reference_policy_logprobs",
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -91,6 +94,8 @@ class PolicyInterface(ABC):
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+        timer_tag_prefix: str = "get_topk_logits",
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 
@@ -108,7 +113,8 @@ class PolicyInterface(ABC):
         *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        **kwargs: Any,
+        timer: Optional[Timer] = None,
+        timer_tag_prefix: str = "policy_training",
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
