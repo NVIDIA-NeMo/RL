@@ -139,7 +139,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
         quant_cfg = self.cfg["quant_cfg"]
-        quant_dataset_name = self.cfg.get("quant_dataset_name", "cnn_dailymail")
+        quant_calib_data = self.cfg.get("quant_calib_data", "cnn_dailymail")
         quant_calib_size = self.cfg.get("quant_calib_size", 512)
         quant_batch_size = self.cfg.get("quant_batch_size", 1)
         unwrapped_model = unwrap_model(model)[0]
@@ -152,7 +152,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             calib_size=quant_calib_size,
             is_megatron=True,
             batch_size=quant_batch_size,
-            data=quant_dataset_name,
+            data=quant_calib_data,
             force_all_expert_routing=True,
         )
         return model

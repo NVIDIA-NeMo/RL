@@ -92,7 +92,7 @@ def test_vllm_quant_refit_loads_amax(cluster):
     megatron_config["tokenizer"]["name"] = model_name
     megatron_config["quant_cfg"] = "NVFP4_DEFAULT_CFG"
     megatron_config["quant_calib_size"] = 1
-    megatron_config["quant_dataset_name"] = "random"
+    megatron_config["quant_calib_data"] = "random"
     megatron_config["generation"] = vllm_config
 
     vllm_policy = None
