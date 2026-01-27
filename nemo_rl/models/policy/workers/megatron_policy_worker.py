@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import gc
 import os
 import re
@@ -90,8 +91,10 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
@@ -158,7 +161,6 @@ class MegatronGenerationConfig(TypedDict):
     # Enable CUDA graphs for prefill/context processing
     use_cuda_graphs_for_non_decode_steps: bool
     # Split long prefills into chunks for better memory management
-    enable_chunked_prefill: bool
     # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
     unified_memory_level: int
     # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens.
@@ -526,6 +528,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if not self.is_generation_colocated:
             os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
+        self.dynamic_inference_engine = None
+        self.inference_client = None
+        self.inference_context = None
+        self.inference_wrapped_model = None
+        self._inference_engine_initialized = False
+        self._inference_engine_suspended = True  # Start suspended since we begin with training
+        self._inference_loop = None  # Event loop for inference operations
+        self._inference_thread = None  # Thread running the event loop
+
         self.cfg = config
         dtype_map = {
             "float32": torch.float32,
@@ -618,6 +629,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
 
+        # Ensure make_vocab_size_divisible_by has a reasonable default (128 is standard)
+        if not hasattr(model_cfg, 'make_vocab_size_divisible_by') or model_cfg.make_vocab_size_divisible_by is None:
+            model_cfg.make_vocab_size_divisible_by = 128
+            if get_rank_safe() == 0:
+                print(f"[WARNING] make_vocab_size_divisible_by not found in config, defaulting to 128")
+
         model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
             "tensor_model_parallel_size"
         ]
@@ -648,6 +665,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
         # especially when using many experts.
         model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
+        model_cfg.moe_token_dispatcher_type = "alltoall"
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
 
         # The below two configs (and "freeze_moe_router") are used to stabilize moe training
         # by preventing updates to the moe router. We found that this is helpful in reducing
@@ -764,6 +783,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.calculate_per_token_loss = True
         model_cfg.perform_initialization = True
 
+        model_cfg.cuda_graph_impl = "local"
+        model_cfg.cuda_graph_scope = None
+        model_cfg.use_te_rng_tracker = True
+
         assert (
             "aux_loss" not in model_cfg.moe_router_load_balancing_type
             or model_cfg.moe_aux_loss_coeff == 0
@@ -879,6 +902,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
 
             # Create a separate megatron config for the reference model with the correct checkpoint config
+            self.megatron_cfg.model.cuda_graph_impl = "none"
+            self.megatron_cfg.model.use_te_rng_tracker = True
             ref_megatron_cfg = ConfigContainer(
                 model=self.megatron_cfg.model,
                 checkpoint=ref_checkpoint_config,  # Use the reference checkpoint config
@@ -968,6 +993,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.megatron_cfg.model.make_vocab_size_divisible_by,
             self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
         )
+        # Debug: Print vocab size calculation details
+        if self.rank == 0:
+            print(f"[DEBUG] vocab_size calculation:")
+            print(f"  - raw vocab_size from config: {self.megatron_cfg.model.vocab_size}")
+            print(f"  - make_vocab_size_divisible_by: {self.megatron_cfg.model.make_vocab_size_divisible_by}")
+            print(f"  - tensor_model_parallel_size: {self.cfg['megatron_cfg']['tensor_model_parallel_size']}")
+            print(f"  - final_padded_vocab_size: {self.final_padded_vocab_size}")
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
             hf_model_name, trust_remote_code=True
@@ -1003,6 +1035,342 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         assert isinstance(self.model, DistributedDataParallel)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
 
+    def _get_lang_module(self):
+        """Get the underlying language module from the wrapped model."""
+        return (
+            self.model.module.module
+            if hasattr(self.model.module, "module")
+            else self.model.module
+        )
+
+    def _clear_rotary_pos_emb_caches(self):
+        """Clear rotary position embedding caches to prevent inference-mode tensor reuse.
+        
+        When transitioning from inference (which runs under torch.inference_mode()) to training,
+        cached RoPE tensors created during inference cannot be used for autograd computation.
+        This method clears both:
+        1. The lru_cache on RotaryEmbedding.forward() method
+        2. The rotary_pos_emb_cache dict on the GPTModel
+        
+        This prevents the error:
+        "Inference tensors cannot be saved for backward. Please do not use Tensors created
+        in inference mode in computation tracked by autograd."
+        """
+        try:
+            lang_module = self._get_lang_module()
+            
+            # Clear the lru_cache on RotaryEmbedding.forward if it exists
+            if hasattr(lang_module, 'rotary_pos_emb') and lang_module.rotary_pos_emb is not None:
+                if hasattr(lang_module.rotary_pos_emb.forward, 'cache_clear'):
+                    lang_module.rotary_pos_emb.forward.cache_clear()
+            
+            # Clear the rotary_pos_emb_cache dict on the model
+            if hasattr(lang_module, 'rotary_pos_emb_cache'):
+                lang_module.rotary_pos_emb_cache.clear()
+                
+        except Exception as e:
+            # Log but don't fail - this is a best-effort cache clearing
+            print(f"[Warning] Failed to clear RoPE caches: {e}")
+
+    def _initialize_inference_engine(self):
+        """Initialize the persistent inference engine and client.
+        
+        This method sets up the DynamicInferenceEngine, DynamicInferenceContext,
+        and InferenceClient for coordinator-based inference. The engine is created
+        once and reused across multiple generate() calls.
+        """
+        if self._inference_engine_initialized:
+            return
+
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
+        from megatron.core.inference.inference_client import InferenceClient
+        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+            GPTInferenceWrapper,
+        )
+        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+            TextGenerationController,
+        )
+
+        model_cfg = self.megatron_cfg.model
+        
+        # Debug: Verify padded_vocab_size before creating inference config
+        if self.rank == 0:
+            print(f"[DEBUG] Initializing inference engine with padded_vocab_size: {self.final_padded_vocab_size}")
+            # Also check the model's actual embedding size
+            if hasattr(self.model, 'module'):
+                model_to_check = self.model.module.module if hasattr(self.model.module, 'module') else self.model.module
+            else:
+                model_to_check = self.model
+            if hasattr(model_to_check, 'embedding'):
+                embed_weight = model_to_check.embedding.word_embeddings.weight
+                print(f"[DEBUG] Model embedding weight shape: {embed_weight.shape}")
+                print(f"[DEBUG] Model embedding vocab dimension: {embed_weight.shape[0]}")
+
+        from megatron.core.utils import get_attr_wrapped_model, get_pg_size
+        pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
+        tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
+        pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
+        ep_group = getattr(pg_collection, 'ep', None) if pg_collection is not None else None
+        if tp_group is not None:
+            inference_tp_size = get_pg_size(tp_group)
+        if pp_group is not None:
+            inference_pp_size = get_pg_size(pp_group)  
+        if ep_group is not None:
+            inference_ep_size = get_pg_size(ep_group)  
+
+        print(f'inference_tp_size: {inference_tp_size}, inference_pp_size: {inference_pp_size} , inference_ep_size: {inference_ep_size}')    
+            
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=model_cfg.hidden_size,
+            inference_batch_times_seqlen_threshold=1000000,
+            fp32_residual_connection=model_cfg.fp32_residual_connection,
+            params_dtype=model_cfg.params_dtype,
+            padded_vocab_size=self.final_padded_vocab_size,
+            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],
+            inference_max_requests=self.cfg["generation_batch_size"],
+            moe_pad_experts_for_cuda_graph_inference=True
+        )
+
+        mcore_generation_config = cast(
+            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
+        )
+        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
+        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
+        block_size_tokens = mcore_generation_config["block_size_tokens"]
+        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
+            "use_cuda_graphs_for_non_decode_steps"
+        ]
+        unified_memory_level = mcore_generation_config["unified_memory_level"]
+        max_tokens = mcore_generation_config["max_tokens"]
+
+        model_config = self.model.config
+        # Enable CUDA graphs for inference
+        model_config.cuda_graph_impl = "local"
+
+        # Create inference context
+        self.inference_context = DynamicInferenceContext(
+            params_dtype=inference_wrapper_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
+            buffer_size_gb=buffer_size_gb,
+            materialize_only_last_token_logits=False,
+            num_cuda_graphs=num_cuda_graphs,
+            block_size_tokens=block_size_tokens,
+            pg_collection=pg_collection,
+            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+            use_flashinfer_fused_rope=False,
+            unified_memory_level=unified_memory_level,
+            max_tokens=max_tokens,
+            persist_cuda_graphs=True,  # Keep CUDA graphs across suspend/resume (requires unified_memory_level > 0 for safety)
+        )
+
+        # Create inference wrapper
+        self.inference_wrapped_model = GPTInferenceWrapper(
+            self.model, inference_wrapper_config, self.inference_context, pg_collection=pg_collection
+        )
+        self.inference_wrapped_model.prep_model_for_inference()
+        self.inference_wrapped_model.model_is_pipeline_parallel = (
+            self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        )
+
+        # Create text generation controller
+        pp_group = getattr(pg_collection, "pp", None)
+        text_generation_controller = TextGenerationController(
+            inference_wrapped_model=self.inference_wrapped_model,
+            tokenizer=self.megatron_tokenizer,
+            pp_group=pp_group,
+        )
+
+        # Debug: Verify vocab_size in text generation controller
+        if self.rank == 0:
+            controller_vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+            print(f"[DEBUG] TextGenerationController vocab_size from config: {controller_vocab_size}")
+            print(f"[DEBUG] Expected padded_vocab_size: {self.final_padded_vocab_size}")
+            if controller_vocab_size != self.final_padded_vocab_size:
+                print(f"[ERROR] Vocab size mismatch! Config: {controller_vocab_size}, Expected: {self.final_padded_vocab_size}")
+
+        # Calculate seed based on node and rank
+        local_rank = torch.cuda.current_device()
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        seed = (node_idx * 1024) + local_rank
+
+        # Create the inference engine
+        self.dynamic_inference_engine = DynamicInferenceEngine(
+            text_generation_controller,
+            self.inference_context,
+            random_seed=seed,
+            enable_cuda_graph=True,
+            track_paused_request_events=False,
+            enable_chunked_prefill=False,
+            inference_logging_step_interval=0,
+            pg_collection=pg_collection,
+        )
+
+        self._inference_engine_initialized = True
+        self._inference_engine_suspended = True  # Engine starts in suspended state
+        print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    async def _start_inference_coordinator(self, coordinator_port: int):
+        """Start the inference coordinator and engine loop.
+        
+        This is called once when the inference infrastructure is first needed.
+        """
+        await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=coordinator_port,
+            launch_inference_coordinator=True,
+        )
+
+        dist_rank = torch.distributed.get_rank()
+        if dist_rank == 0:
+            from megatron.core.inference.inference_client import InferenceClient
+            self.inference_client = InferenceClient(coordinator_port)
+            await self.inference_client.start()
+        
+        self._inference_engine_suspended = False
+
+    def suspend_inference_engine(self):
+        """Suspend the inference engine to free GPU memory for training.
+        
+        This method should be called before training to:
+        1. Deallocate KV cache and other inference-specific GPU memory
+        2. Disable CUDA graphs for inference
+        3. Toggle model configuration for training mode
+        
+        Uses the coordinator's suspend mechanism to properly pause the engine loop
+        and then suspend the engine (deallocate tensors, etc.).
+        
+        For coordinator-based inference:
+        - Only rank 0 sends suspend signals via the coordinator
+        - The coordinator broadcasts to all DP engines
+        - Non-rank-0 workers wait for their engine to be paused via the event loop
+        """
+        if not self._inference_engine_initialized:
+            return
+        
+        if self._inference_engine_suspended:
+            return
+
+        dist_rank = torch.distributed.get_rank()
+        
+        # Use the coordinator-based suspend mechanism
+        # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
+        if self._inference_loop is not None:
+            if dist_rank == 0 and self.inference_client is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._suspend_via_coordinator(),
+                    self._inference_loop
+                )
+                future.result()
+            # Non-rank-0 workers: wait for engine to be paused via the event loop
+            # This integrates properly with the async architecture
+            elif self.dynamic_inference_engine is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._wait_for_engine_paused(),
+                    self._inference_loop
+                )
+                future.result()
+        elif self.dynamic_inference_engine is not None:
+            # Fallback to direct suspend if no coordinator/inference loop
+            self.dynamic_inference_engine.suspend()
+        
+        # Synchronize all ranks
+        torch.distributed.barrier()
+        
+        self._inference_engine_suspended = True
+        print(f"[Rank {self.rank}] Suspended inference engine")
+
+    async def _suspend_via_coordinator(self):
+        """Send suspend signals via the coordinator and wait for acknowledgment."""
+        if self.inference_client is not None:
+            # Send PAUSE then SUSPEND signals
+            self.inference_client.suspend_engines()
+            # Wait for the engine to acknowledge the pause
+            await self.dynamic_inference_engine.paused.wait()
+
+    def resume_inference_engine(self):
+        """Resume the inference engine after training.
+        
+        This method should be called before generation to:
+        1. Reallocate KV cache and inference-specific GPU memory
+        2. Enable CUDA graphs for inference
+        3. Toggle model configuration for inference mode
+        
+        Uses the coordinator's resume mechanism to properly resume the engine loop.
+        
+        For coordinator-based inference:
+        - Only rank 0 sends resume signals via the coordinator
+        - The coordinator broadcasts to all DP engines
+        - Non-rank-0 workers wait for their engine to be running via the event loop
+        """
+        if not self._inference_engine_initialized:
+            return
+        
+        if not self._inference_engine_suspended:
+            return
+
+        dist_rank = torch.distributed.get_rank()
+        
+        # Use the coordinator-based resume mechanism
+        # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
+        if self._inference_loop is not None:
+            if dist_rank == 0 and self.inference_client is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._resume_via_coordinator(),
+                    self._inference_loop
+                )
+                future.result()
+            # Non-rank-0 workers: wait for engine to be running via the event loop
+            # This integrates properly with the async architecture
+            elif self.dynamic_inference_engine is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._wait_for_engine_running(),
+                    self._inference_loop
+                )
+                future.result()
+        elif self.dynamic_inference_engine is not None:
+            # Fallback to direct resume if no coordinator/inference loop
+            self.dynamic_inference_engine.resume()
+        
+        # Synchronize all ranks
+        torch.distributed.barrier()
+        
+        self._inference_engine_suspended = False
+        print(f"[Rank {self.rank}] Resumed inference engine")
+
+    async def _resume_via_coordinator(self):
+        """Send resume signals via the coordinator and wait for acknowledgment."""
+        if self.inference_client is not None:
+            # Send RESUME then UNPAUSE signals
+            self.inference_client.resume_engines()
+            # Wait for the engine to acknowledge it's running
+            await self.dynamic_inference_engine.running.wait()
+
+    async def _wait_for_engine_paused(self):
+        """Wait for the engine to be paused (non-rank-0 workers).
+        
+        This is used by non-rank-0 workers to wait for the coordinator's
+        suspend signal to be processed by their engine.
+        """
+        if self.dynamic_inference_engine is not None:
+            await self.dynamic_inference_engine.paused.wait()
+
+    async def _wait_for_engine_running(self):
+        """Wait for the engine to be running (non-rank-0 workers).
+        
+        This is used by non-rank-0 workers to wait for the coordinator's
+        resume signal to be processed by their engine.
+        """
+        if self.dynamic_inference_engine is not None:
+            await self.dynamic_inference_engine.running.wait()
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1013,6 +1381,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        lang_module = (
+            self.model.module.module
+            if hasattr(self.model.module, "module")
+            else self.model.module
+        )
+
+        toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=False)
+        
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1835,17 +2211,32 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def generate(
         self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using huggingface framework generation.
+        """Generate a batch of data using Megatron Core inference with coordinator.
+
+        This method uses the coordinator-based inference pattern from Megatron Core,
+        which enables better parallelism across data-parallel ranks through a central
+        coordinator that routes requests to available engines.
+
+        The inference engine is created once and reused across generate() calls.
+        The engine is suspended between generate() calls to free GPU memory for training.
+
+        For coordinator-based inference:
+        - Only DP rank 0 receives actual data and submits requests to the coordinator
+        - Other DP ranks receive data=None but still participate in the inference engine loop
+        - The coordinator distributes work across all DP engines
+        - Results are broadcast from rank 0 to all ranks
 
         Args:
-            data: BatchedDataDict containing input_ids and input_lengths tensors
+            data: BatchedDataDict containing input_ids and input_lengths tensors,
+                  or None for non-DP-0 workers (they participate in engine loop only)
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
                 - output_ids: input + generated token IDs
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
-        # 512 bATCH SIZE (200 tokens)
+        from megatron.core.inference.sampling_params import SamplingParams
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model.config.flash_decode = False
@@ -1853,113 +2244,47 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-        # Verify input is right padded
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "input_ids" in data and "input_lengths" in data, (
-            f"input_ids and input_lengths must be present in the BatchedDataDict, got keys: {data.keys()}"
-        )
-        is_right_padded, error_msg = verify_right_padding(
-            data, pad_value=self.tokenizer.pad_token_id
-        )
-        if not is_right_padded:
-            warnings.warn(
-                f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
+        
+        dist_rank = torch.distributed.get_rank()
+        is_request_submitter = (dist_rank == 0)
+        
+        # For non-rank-0 workers, data may be None (they participate in engine loop only)
+        if data is not None:
+            # Verify input is right padded
+            assert isinstance(data, BatchedDataDict), (
+                f"data must be a BatchedDataDict, got type: {type(data)}"
             )
+            assert "input_ids" in data and "input_lengths" in data, (
+                f"input_ids and input_lengths must be present in the BatchedDataDict, got keys: {data.keys()}"
+            )
+            is_right_padded, error_msg = verify_right_padding(
+                data, pad_value=self.tokenizer.pad_token_id
+            )
+            if not is_right_padded:
+                warnings.warn(
+                    f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
+                )
 
-        model_cfg = self.megatron_cfg.model
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=model_cfg.hidden_size,
-            inference_batch_times_seqlen_threshold=1000000,
-            fp32_residual_connection=model_cfg.fp32_residual_connection,
-            params_dtype=model_cfg.params_dtype,
-            padded_vocab_size=self.final_padded_vocab_size,  # Use the potentially updated value
-            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],  # type: ignore
-            inference_max_requests=self.cfg["generation_batch_size"],
+        lang_module = (
+            self.model.module.module
+            if hasattr(self.model.module, "module")
+            else self.model.module
         )
 
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
-        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-            GPTInferenceWrapper,
-        )
-        from megatron.core.inference.sampling_params import SamplingParams
+        toggle_cuda_graphs(lang_module, set_to="local", reset_cuda_graphs=False)
 
-        mcore_generation_config = cast(
-            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
-        )
-        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
+        # Initialize the persistent inference engine if not already done (ALL ranks)
+        if not self._inference_engine_initialized:
+            self._initialize_inference_engine()
+            # Start the coordinator and engine loop (first time only)
+            coordinator_port = self.cfg["generation"].get(
+                "inference_coordinator_port", 5995
+            )
+            result = self._run_async_coordinator_start(coordinator_port)
 
-        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
-        block_size_tokens = mcore_generation_config["block_size_tokens"]
-        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
-            "use_cuda_graphs_for_non_decode_steps"
-        ]
-        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
-        unified_memory_level = mcore_generation_config["unified_memory_level"]
-        buffer_guaranteed_fraction = mcore_generation_config[
-            "buffer_guaranteed_fraction"
-        ]
-        max_tokens = mcore_generation_config["max_tokens"]
-
-        model_config = self.model.config
-        model_config.cuda_graph_impl = "local"
-
-        dynamic_context = DynamicInferenceContext(
-            params_dtype=inference_wrapper_config.params_dtype,
-            num_layers=model_config.num_layers,
-            kv_channels=model_config.kv_channels,
-            num_attention_heads=model_config.num_query_groups,
-            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
-            buffer_size_gb=buffer_size_gb,
-            materialize_only_last_token_logits=False,
-            num_cuda_graphs=num_cuda_graphs,
-            block_size_tokens=block_size_tokens,
-            tensor_model_parallel_size=self.cfg["megatron_cfg"][
-                "tensor_model_parallel_size"
-            ],
-            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
-            use_flashinfer_fused_rope=False,
-            unified_memory_level=unified_memory_level,
-            max_tokens_override=max_tokens,
-        )
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, dynamic_context
-        )
-
-        inference_wrapped_model.prep_model_for_inference()
-        # Set pipeline parallel flag
-        inference_wrapped_model.model_is_pipeline_parallel = (
-            self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        )
-
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model,
-            tokenizer=self.megatron_tokenizer,
-        )
-
-        # Calculate seed based on node and rank to ensure reproducibility across workers
-        local_rank = torch.cuda.current_device()  # Local GPU index on the node
-        num_gpus_per_node = torch.cuda.device_count()
-        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        seed = (node_idx * 1024) + local_rank
-
-        # New API: DynamicInferenceEngine has additional parameters
-        dynamic_engine = DynamicInferenceEngine(
-            text_generation_controller,
-            dynamic_context,
-            enable_cuda_graph=True,
-            random_seed=seed,
-            track_paused_request_events=False,
-            enable_chunked_prefill=enable_chunked_prefill,
-            inference_logging_step_interval=0,
-        )
+        # Resume the inference engine if it was suspended (ALL ranks)
+        if self._inference_engine_suspended:
+            self.resume_inference_engine()
 
         # Handle None values for top_k - convert to integer as required by Megatron
         top_k_cfg = self.cfg["generation"]["top_k"]
@@ -1970,7 +2295,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
 
-        # New API: SamplingParams now includes termination_id and uses num_tokens_total
         sampling_params = SamplingParams(
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
@@ -1982,45 +2306,46 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             termination_id=self.megatron_tokenizer.eod,
         )
 
-        input_ids = data["input_ids"]
-        prompt_tokens_tensor = input_ids.cuda()
-        prompt_lengths_tensor = data["input_lengths"]
-        request_id = 0
+        # Only rank 0 has actual data to submit
+        if is_request_submitter and data is not None:
+            input_ids = data["input_ids"]
+            print(f"GPU : {torch.cuda.current_device()}, input_ids: {input_ids.shape}")
+            prompt_tokens_tensor = input_ids.cuda()
+            prompt_lengths_tensor = data["input_lengths"]
+        else:
+            # Non-submitter ranks: create empty tensors (will not be used for submission)
+            print(f"GPU : {torch.cuda.current_device()}, participating in engine loop (no data to submit)")
+            prompt_tokens_tensor = torch.empty(0, dtype=torch.long, device="cuda")
+            prompt_lengths_tensor = torch.empty(0, dtype=torch.long, device="cuda")
 
-        # New API: add_request now takes sampling_params as a parameter
-        for p, prompt_len in zip(
-            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
-        ):
-            dynamic_engine.add_request(
-                request_id,
-                p[:prompt_len],
-                sampling_params=sampling_params,
-            )
-            request_id += 1
+        # Run the coordinator-based generation using the persistent engine
+        # Rank 0 submits requests, other ranks participate in engine loop
+        # Results are broadcast to all ranks inside this method
+        result = self._run_async_generation_with_persistent_engine(
+            prompt_tokens_tensor,
+            prompt_lengths_tensor,
+            sampling_params,
+        )
 
-        result = []
-        while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern(verbose=False)
-            finished_requests = result_step.get("finished_requests", [])
-            for finished_request in finished_requests:
-                result.append(finished_request)
-
-        # Sort results by request_id to maintain original batch order
-        result.sort(key=lambda x: x.request_id)
-
-        out = {
-            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
-        }
+        # Only rank 0 needs to format and return results
+        # Other ranks return None (their results are ignored due to output_is_replicated)
+        if not is_request_submitter or data is None:
+            no_grad.__exit__(None, None, None)
+            # Return empty result for non-submitter ranks
+            # Use BatchedDataDict directly instead of from_batches to avoid padding issues with empty tensors
+            return BatchedDataDict({
+                "output_ids": torch.empty(0, 0, dtype=torch.long),
+                "logprobs": torch.empty(0, 0, dtype=torch.float),
+                "generation_lengths": torch.empty(0, dtype=torch.long),
+                "unpadded_sequence_lengths": torch.empty(0, dtype=torch.long),
+            }).to("cpu")
 
         input_lengths = data["input_lengths"]
-        # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
         max_gen_seq_len = max([len(x.generated_tokens) for x in result])
         padded_input_length = input_ids.size(1)
 
         max_seq_len = padded_input_length + max_gen_seq_len
-        # Create padded tensors for tokens and logprobs
         output_ids_padded = torch.full(
             (batch_size, max_seq_len),
             self.tokenizer.pad_token_id,
@@ -2034,7 +2359,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             device=data["input_ids"].device,
         )
 
-        # Fill in the padded tensors with actual values
         generation_lengths = torch.zeros(
             batch_size, dtype=torch.long, device=data["input_ids"].device
         )
@@ -2042,15 +2366,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             batch_size, dtype=torch.long, device=data["input_ids"].device
         )
         for i in range(batch_size):
-            seq_len = len(out["tokens"][i])
+            tokens = result[i].prompt_tokens.tolist() + result[i].generated_tokens
+            logprobs = result[i].prompt_log_probs + result[i].generated_log_probs
+            seq_len = len(tokens)
             output_ids_padded[i, :seq_len] = torch.tensor(
-                out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
+                tokens, dtype=torch.long, device=data["input_ids"].device
             )
             generation_lengths[i] = seq_len - input_lengths[i].item()
             unpadded_sequence_lengths[i] = seq_len
-            logprob_len = len(out["logprobs"][i])
+            logprob_len = len(logprobs)
             logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
-                out["logprobs"][i],
+                logprobs,
                 dtype=torch.float,
                 device=data["input_ids"].device,
             )
@@ -2063,9 +2389,311 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         }
 
         self.model.config.flash_decode = False
+
+        toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=False)
+
         no_grad.__exit__(None, None, None)
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
+
+    def _start_inference_loop_thread(self):
+        """Start a background thread with a persistent event loop for inference.
+        
+        This thread runs the event loop that hosts the engine loop task.
+        The loop runs forever until explicitly stopped.
+        """
+        import threading
+        
+        def run_loop():
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            self._inference_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._inference_loop)
+            # Run forever - the engine loop task will run in this loop
+            self._inference_loop.run_forever()
+        
+        self._inference_thread = threading.Thread(target=run_loop, daemon=True)
+        self._inference_thread.start()
+        
+        # Wait for the loop to be created
+        while self._inference_loop is None:
+            time.sleep(0.001)
+
+    def _run_async_coordinator_start(self, coordinator_port: int):
+        """Start the coordinator and engine loop in the background thread.
+        
+        This is called once during the first generate() call to initialize
+        the persistent inference infrastructure.
+        """
+        import concurrent.futures
+        
+        # Start the background thread with the event loop if not already running
+        if self._inference_loop is None:
+            self._start_inference_loop_thread()
+        
+        # Schedule the coordinator start in the inference loop
+        future = asyncio.run_coroutine_threadsafe(
+            self._start_inference_coordinator(coordinator_port),
+            self._inference_loop
+        )
+        # Wait for completion
+        return future.result()
+
+    def _run_async_generation_with_persistent_engine(
+        self,
+        prompt_tokens_tensor: torch.Tensor,
+        prompt_lengths_tensor: torch.Tensor,
+        sampling_params: "SamplingParams",
+    ) -> list:
+        """Run generation using the persistent inference engine.
+        
+        This method uses the pre-initialized engine and client to run generation.
+        Unlike the original method, it doesn't start/stop the coordinator each time.
+        The async operation runs in the persistent inference loop.
+        """
+        if self._inference_loop is None:
+            raise RuntimeError("Inference loop not initialized. Call generate() first.")
+        
+        # Schedule the generation in the inference loop
+        future = asyncio.run_coroutine_threadsafe(
+            self._generate_with_persistent_engine(
+                prompt_tokens_tensor,
+                prompt_lengths_tensor,
+                sampling_params,
+            ),
+            self._inference_loop
+        )
+        # Wait for completion and return the result
+        return future.result()
+
+    async def _generate_with_persistent_engine(
+        self,
+        prompt_tokens_tensor: torch.Tensor,
+        prompt_lengths_tensor: torch.Tensor,
+        sampling_params: "SamplingParams",
+    ) -> list:
+        """Run generation using the persistent coordinator-based inference.
+        
+        This method uses the already-running engine and submits requests through
+        the persistent client. The engine loop continues running between calls.
+
+        For coordinator-based inference with centralized request submission:
+        - Only rank 0 (the request submitter) submits requests and collects results
+        - Other ranks return early but their engine loops continue running in the
+          background, processing requests distributed by the coordinator
+        - No broadcast is needed since only rank 0's results are used by the caller
+
+        Args:
+            prompt_tokens_tensor: Tensor of prompt token IDs [batch_size, seq_len]
+            prompt_lengths_tensor: Tensor of prompt lengths [batch_size]
+            sampling_params: Sampling parameters for generation
+
+        Returns:
+            List of completed request records sorted by request_id (rank 0),
+            or empty list (other ranks)
+        """
+        from megatron.core.inference.inference_request import (
+            DynamicInferenceRequest,
+            DynamicInferenceRequestRecord,
+        )
+
+        dist_rank = torch.distributed.get_rank()
+        
+        # Non-rank-0 workers: return immediately with empty results
+        # Their engine loops will continue processing requests from the coordinator
+        # in the background (the engine loop runs as a separate task in _inference_loop)
+        if dist_rank != 0 or self.inference_client is None:
+            print(f"[Rank {dist_rank}] Participating in engine loop only (not submitting requests)")
+            # Return empty results - the caller only uses rank 0's results
+            return []
+        
+        # Rank 0: submit ALL requests and collect results
+        print(f"[Rank {dist_rank}] Submitting {prompt_tokens_tensor.size(0)} requests to coordinator")
+        
+        futures = []
+        for request_id, (prompt_tokens, prompt_len) in enumerate(
+            zip(prompt_tokens_tensor, prompt_lengths_tensor, strict=True)
+        ):
+            # Extract the actual prompt tokens (without padding) and convert to list
+            prompt = prompt_tokens[: prompt_len.item()].tolist()
+            future = self.inference_client.add_request(prompt, sampling_params)
+            futures.append(future)
+
+        # Wait for all requests to complete
+        # The coordinator distributes work to all DP engines, including this one
+        completed_records: list[DynamicInferenceRequestRecord] = await asyncio.gather(
+            *futures
+        )
+
+        # Extract the merged request from each record
+        results = [record.merge() for record in completed_records]
+
+        # Sort by request_id to maintain original batch order
+        results.sort(key=lambda x: x.request_id)
+        
+        print(f"[Rank {dist_rank}] Completed {len(results)} requests")
+
+        return results
+
+    def _run_async_generation(
+        self,
+        engine: "DynamicInferenceEngine",
+        prompt_tokens_tensor: torch.Tensor,
+        prompt_lengths_tensor: torch.Tensor,
+        sampling_params: "SamplingParams",
+        coordinator_port: int,
+    ) -> list:
+        """Run async generation in a separate thread to avoid event loop conflicts.
+
+        Ray uses uvloop which has strict checking about nested event loops.
+        Running the async code in a separate thread with its own standard asyncio
+        event loop (not uvloop) avoids these conflicts.
+        
+        NOTE: This method is kept for backwards compatibility but is no longer
+        used by the main generate() path which uses the persistent engine.
+        """
+        import concurrent.futures
+
+        def run_in_thread():
+            # Explicitly use the standard asyncio event loop policy, not uvloop
+            # This is necessary because uvloop might be set as the global default
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                coro = self._generate_with_coordinator(
+                    engine,
+                    prompt_tokens_tensor,
+                    prompt_lengths_tensor,
+                    sampling_params,
+                    coordinator_port,
+                )
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        # Run in a separate thread to avoid uvloop conflicts
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_in_thread)
+            return future.result()
+
+    async def _generate_with_coordinator(
+        self,
+        engine: "DynamicInferenceEngine",
+        prompt_tokens_tensor: torch.Tensor,
+        prompt_lengths_tensor: torch.Tensor,
+        sampling_params: "SamplingParams",
+        coordinator_port: int,
+    ) -> list:
+        """Run generation using the coordinator-based inference pattern.
+
+        This method starts the inference coordinator (on rank 0) and engine loops
+        on all ranks. Requests are submitted via the InferenceClient on rank 0,
+        and results are gathered and broadcast to all ranks.
+        
+        NOTE: This method is kept for backwards compatibility but is no longer
+        used by the main generate() path which uses the persistent engine.
+
+        Args:
+            engine: The DynamicInferenceEngine instance
+            prompt_tokens_tensor: Tensor of prompt token IDs [batch_size, seq_len]
+            prompt_lengths_tensor: Tensor of prompt lengths [batch_size]
+            sampling_params: Sampling parameters for generation
+            coordinator_port: Port for the inference coordinator
+
+        Returns:
+            List of completed request records sorted by request_id
+        """
+        from megatron.core.inference.inference_client import InferenceClient
+        from megatron.core.inference.inference_request import (
+            DynamicInferenceRequestRecord,
+        )
+
+        dist_rank = torch.distributed.get_rank()
+
+        # Start the coordinator and engine loop on all ranks
+        # launch_inference_coordinator=True only spawns the coordinator process on rank 0
+        # (specifically on the DP coordinator rank which is TP=0, PP=0, DP=0)
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=coordinator_port,
+            launch_inference_coordinator=True,
+        )
+
+        results = []
+        if dist_rank == 0:
+            # Only rank 0 creates the client and submits requests
+            client = InferenceClient(coordinator_port)
+            await client.start()
+
+            # Submit all requests
+            futures = []
+            for request_id, (prompt_tokens, prompt_len) in enumerate(
+                zip(prompt_tokens_tensor, prompt_lengths_tensor, strict=True)
+            ):
+                # Extract the actual prompt tokens (without padding) and convert to list
+                # msgpack cannot serialize tensors, so we need to convert to list
+                prompt = prompt_tokens[: prompt_len.item()].tolist()
+                future = client.add_request(prompt, sampling_params)
+                futures.append(future)
+
+            # Wait for all requests to complete
+            completed_records: list[DynamicInferenceRequestRecord] = await asyncio.gather(
+                *futures
+            )
+
+            # Extract the merged request from each record
+            results = [record.merge() for record in completed_records]
+
+            # Sort by request_id to maintain original batch order
+            results.sort(key=lambda x: x.request_id)
+
+            # Stop the engines gracefully
+            await client.stop_engines()
+            client.stop()
+
+        # Wait for all engine loops to finish
+        await asyncio.gather(engine.engine_loop_task)
+
+        # Serialize results on rank 0 and broadcast to all ranks
+        if dist_rank == 0:
+            serialized_results = [
+                {
+                    "request_id": r.request_id,
+                    "prompt_tokens": r.prompt_tokens.tolist(),
+                    "generated_tokens": r.generated_tokens,
+                    "prompt_log_probs": r.prompt_log_probs,
+                    "generated_log_probs": r.generated_log_probs,
+                }
+                for r in results
+            ]
+        else:
+            serialized_results = None
+
+        # Broadcast results to all ranks
+        result_list = [serialized_results]
+        torch.distributed.broadcast_object_list(result_list, src=0)
+        serialized_results = result_list[0]
+
+        # Reconstruct result objects on non-rank-0 workers
+        if dist_rank != 0:
+            from megatron.core.inference.inference_request import (
+                DynamicInferenceRequest,
+            )
+
+            results = []
+            for r in serialized_results:
+                req = DynamicInferenceRequest(
+                    request_id=r["request_id"],
+                    prompt_tokens=torch.tensor(
+                        r["prompt_tokens"], dtype=torch.int64, device="cuda"
+                    ),
+                    sampling_params=sampling_params,
+                )
+                req.generated_tokens = r["generated_tokens"]
+                req.prompt_log_probs = r["prompt_log_probs"]
+                req.generated_log_probs = r["generated_log_probs"]
+                results.append(req)
+
+        return results
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
@@ -2224,6 +2852,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     def prepare_for_lp_inference(self):
+        # Suspend the inference engine if needed (logprob inference doesn't use dynamic engine)
+        if self._inference_engine_initialized and not self._inference_engine_suspended:
+            self.suspend_inference_engine()
+
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -2246,6 +2878,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
+        # Suspend the inference engine if it was initialized
+        # This deallocates KV cache and disables CUDA graphs for training
+        if self._inference_engine_initialized and not self._inference_engine_suspended:
+            self.suspend_inference_engine()
+
+        # Clear rotary position embedding caches to prevent inference-mode tensor reuse
+        # This must be done after suspending inference but before training forward pass
+        self._clear_rotary_pos_emb_caches()
+
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True

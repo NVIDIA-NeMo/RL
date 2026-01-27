@@ -91,6 +91,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
+            ep_size = config["megatron_cfg"].get("expert_model_parallel_size", 1)
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
 
@@ -126,17 +127,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # Validate world_size compatibility with parallelism configuration
-        model_parallel_size = pp_size * cp_size * tp_size
+        model_parallel_size = pp_size * cp_size * tp_size * ep_size
         actual_world_size = cluster.world_size()
 
         if actual_world_size < model_parallel_size:
             raise ValueError(
                 f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
-                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) * EP({ep_size}) = {model_parallel_size}. "
                 f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
             )
@@ -144,8 +146,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if actual_world_size % model_parallel_size != 0:
             dp_size_float = actual_world_size / model_parallel_size
             raise ValueError(
-                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
-                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP * EP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP * EP)) must be a positive integer. "
                 f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
                 f"Please adjust your cluster size or parallelism parameters."
             )
@@ -154,12 +156,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             layout=np.arange(cluster.world_size()).reshape(
                 pp_size,  # PP
                 -1,  # DP
+                ep_size,  # EP
                 cp_size,  # CP
                 tp_size,  # TP
             ),
             names=[
                 "pipeline_parallel",
                 "data_parallel",
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
             ],
@@ -312,11 +316,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -374,11 +380,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -438,11 +446,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -513,11 +523,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -564,7 +576,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using the policy."""
+        """Generate a batch of data using the policy.
+        
+        For coordinator-based inference (Megatron backend), all data is sent to DP rank 0
+        only, which submits requests to the coordinator. The coordinator then distributes
+        work across all DP engines. Other DP ranks participate in the engine loop but
+        don't receive input data directly.
+        """
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -573,14 +591,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        # For coordinator-based inference: send ALL data to DP rank 0 only.
+        # Other DP ranks are called with data=None but still participate in the
+        # inference engine loop. The coordinator handles load balancing across DP ranks.
+        # 
+        # With in_sharded_axes=[] and data_parallel not in replicate_on_axes,
+        # data_parallel becomes a "free axis". Only workers at DP coord 0 receive data,
+        # while workers at other DP coords get None (via make_dummy_calls_to_free_axes).
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            data=data,  # Full data goes to DP=0 only (free axis behavior)
+            in_sharded_axes=[],  # No sharding - data_parallel is a "free axis"
+            replicate_on_axes=["expert_parallel", "tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=[
+                "data_parallel",  # Only DP rank 0 returns results
+                "expert_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            make_dummy_calls_to_free_axes=True,  # Call all DP ranks, but only DP=0 gets data
             common_kwargs={"greedy": greedy},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
@@ -623,11 +652,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -731,11 +762,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "expert_parallel",
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
