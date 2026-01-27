@@ -32,7 +32,6 @@ class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
     
     Note: GRPO computes advantages over all responses for each prompt.
-    The baseline is computed using all samples (internally uses all-ones mask for baseline calculation).
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
