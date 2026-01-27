@@ -258,6 +258,7 @@ def process_microbatch(
     # Add vlm kwargs to model call
     vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
     if len(vlm_kwargs) > 0:
+        # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None
         assert not enable_seq_packing, (
             "multimodal kwargs are not supported for sequence packing"
