@@ -277,7 +277,9 @@ def test_reward_shaping_mismatched_lengths():
 def test_stop_properly_penalty():
     """Test stop_properly_penalty_coef scales rewards for truncated samples."""
     batch = create_mock_batch_with_responses(
-        num_samples=4, response_lengths=[10, 20, 30, 40], initial_rewards=[1.0, 0.8, 0.6, 0.4]
+        num_samples=4,
+        response_lengths=[10, 20, 30, 40],
+        initial_rewards=[1.0, 0.8, 0.6, 0.4],
     )
     batch["truncated"] = torch.tensor([False, True, False, True])
 

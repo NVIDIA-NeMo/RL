@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Advantage Estimators for RL algorithms.
+"""Advantage Estimators for RL algorithms.
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
@@ -30,7 +29,7 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calc
 
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
-    
+
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
@@ -40,14 +39,14 @@ class GRPOAdvantageEstimator:
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
-        
+
         Args:
             prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
             **kwargs: Additional arguments (unused).
-            
+
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
@@ -63,8 +62,8 @@ class GRPOAdvantageEstimator:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
             non_zero_std_mask = std > 0
-            advantages[non_zero_std_mask] = (
-                advantages[non_zero_std_mask] / (std.unsqueeze(-1)[non_zero_std_mask] + epsilon)
+            advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
+                std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
 
         return advantages.expand(mask.shape)
@@ -72,7 +71,7 @@ class GRPOAdvantageEstimator:
 
 class ReinforcePlusPlusAdvantageEstimator:
     """Reinforce++ advantage estimator with optional baseline subtraction and KL penalty in reward.
-    
+
     Args:
         minus_baseline: If True, subtract per-prompt mean baseline from rewards.
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
@@ -85,10 +84,16 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.kl_type = loss_config["reference_policy_kl_type"]
 
     def compute_advantage(
-        self, prompt_ids, rewards, mask, logprobs_policy=None, logprobs_reference=None, **kwargs
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        logprobs_policy=None,
+        logprobs_reference=None,
+        **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
-        
+
         Args:
             prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
@@ -98,7 +103,7 @@ class ReinforcePlusPlusAdvantageEstimator:
             logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             **kwargs: Additional arguments (unused).
-            
+
         Returns:
             Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
         """
@@ -118,7 +123,11 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv = adv.expand(mask.shape)
 
         # add kl penalty to reward (token-level)
-        if self.use_kl_in_reward and logprobs_policy is not None and logprobs_reference is not None:
+        if (
+            self.use_kl_in_reward
+            and logprobs_policy is not None
+            and logprobs_reference is not None
+        ):
             kl = calculate_kl(
                 logprobs_policy,
                 logprobs_reference,

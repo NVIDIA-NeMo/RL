@@ -981,7 +981,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(adv_estimator_config, loss_config)
+        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
         print("  ✓ Using Reinforce++ advantage estimator")
     else:
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
