@@ -29,7 +29,7 @@ grpo:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
     normalize_rewards: true
     use_leave_one_out_baseline: false
-    minus_baseline: false  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0

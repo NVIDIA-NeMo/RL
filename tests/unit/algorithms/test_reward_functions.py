@@ -272,3 +272,59 @@ def test_reward_shaping_mismatched_lengths():
         match="The number of messages in the batch must match the number of rewards",
     ):
         apply_reward_shaping(batch, config)
+
+
+def test_stop_properly_penalty():
+    """Test stop_properly_penalty_coef scales rewards for truncated samples."""
+    batch = create_mock_batch_with_responses(
+        num_samples=4, response_lengths=[10, 20, 30, 40], initial_rewards=[1.0, 0.8, 0.6, 0.4]
+    )
+    batch["truncated"] = torch.tensor([False, True, False, True])
+
+    config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
+    result_batch = apply_reward_shaping(batch, config)
+
+    # Non-truncated unchanged, truncated scaled by 0.5
+    expected_rewards = torch.tensor([1.0, 0.4, 0.6, 0.2])
+    assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
+
+
+def test_stop_properly_penalty_boundary_coefs():
+    """Test boundary values: coef=0 gives zero reward, coef=1 has no effect."""
+    # Test coef=0: truncated samples get zero reward
+    batch = create_mock_batch_with_responses(
+        num_samples=2, response_lengths=[10, 20], initial_rewards=[1.0, 0.5]
+    )
+    batch["truncated"] = torch.tensor([True, True])
+
+    config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.0)
+    result = apply_reward_shaping(batch, config)
+    assert torch.allclose(result["total_reward"], torch.tensor([0.0, 0.0]), atol=1e-6)
+
+    # Test coef=1: no penalty applied
+    batch["total_reward"] = torch.tensor([1.0, 0.5])
+    config["stop_properly_penalty_coef"] = 1.0
+    result = apply_reward_shaping(batch, config)
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
+
+
+def test_stop_properly_penalty_error_cases():
+    """Test error handling for invalid coef and missing truncated field."""
+    batch = create_mock_batch_with_responses(
+        num_samples=2, response_lengths=[10, 20], initial_rewards=[1.0, 0.5]
+    )
+
+    # Missing truncated field
+    config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
+    with pytest.raises(AssertionError, match="truncated field not found"):
+        apply_reward_shaping(batch, config)
+
+    # Invalid coef values
+    batch["truncated"] = torch.tensor([False, True])
+    config["stop_properly_penalty_coef"] = -0.1
+    with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
+        apply_reward_shaping(batch, config)
+
+    config["stop_properly_penalty_coef"] = 1.5
+    with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
+        apply_reward_shaping(batch, config)
