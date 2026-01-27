@@ -810,7 +810,7 @@ class DTensorPolicyWorker:
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
-                        if hasattr(outputs, "causal_logits"):
+                        if hasattr(outputs, "causal_logits") and outputs.causal_logits is not None:
                             causal_logits = outputs.causal_logits
                             logits = torch.cat([logits, causal_logits], dim=1)
                         del outputs

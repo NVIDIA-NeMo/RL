@@ -445,6 +445,9 @@ class NLLLoss(LossFunction):
     """Negative Log Likelihood Loss function."""
 
     loss_type = LossType.TOKEN_LEVEL
+    
+    def __init__(self, cfg = None):
+        self.alpha = cfg.get("alpha", 0) if cfg is not None else 0
 
     def __call__(
         self,
@@ -498,7 +501,7 @@ class NLLLoss(LossFunction):
                 next_token_logits, data["input_ids"], seq_index=seq_index, shift_logits=not mdlm_loss
             )
             
-            if causal_logits is not None:
+            if causal_logits is not None and self.alpha > 0:
                 assert isinstance(causal_logits, torch.distributed.tensor.DTensor), "causal_logits is not DTensor!"
                 causal_token_logprobs = get_logprobs_from_vocab_parallel_logits(
                     causal_logits, data["input_ids"], seq_index=seq_index, shift_logits=True
@@ -519,7 +522,7 @@ class NLLLoss(LossFunction):
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
-            if causal_logits is not None:
+            if causal_logits is not None and self.alpha > 0:
                 next_causal_tokens = data["input_ids"][:, 1:].cuda()
                 causal_logprobs = torch.nn.functional.log_softmax(
                     causal_logits, dim=-1
@@ -540,13 +543,13 @@ class NLLLoss(LossFunction):
             p_mask = data["p_mask"]
             loss = -masked_mean(token_logprobs * torch.nan_to_num(1.0 / p_mask, posinf=1.0, neginf=1.0), mask, global_normalization_factor=global_valid_toks)
             
-            if causal_logits is not None:
+            if causal_logits is not None and self.alpha > 0:
                 ar_loss = -masked_mean(
                     causal_token_logprobs,
                     data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1),
                     global_normalization_factor=global_valid_toks,
                 )
-                loss = loss + ar_loss
+                loss = loss + self.alpha * ar_loss
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch

@@ -116,6 +116,7 @@ def setup(
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
     sft_config = master_config["sft"]
+    loss_config = master_config.get("loss_fn", None)
 
     # get type of the policy (mdlm or gpt)
     is_mdlm = policy_config.get("is_mdlm", False)
@@ -217,9 +218,9 @@ def setup(
     if is_mdlm and not is_dqwn:
         loss_fn = MDLMCrossEntropyLoss()
     elif is_dqwn:
-        loss_fn = functools.partial(NLLLoss(), mdlm_loss=True)
+        loss_fn = functools.partial(NLLLoss(loss_config), mdlm_loss=True)
     else:
-        loss_fn = NLLLoss()
+        loss_fn = NLLLoss(loss_config)
 
     print("  ✓ Model initialized")
 
