@@ -973,14 +973,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
     Raises:
         ValueError: If the advantage estimator name is not recognized.
     """
-    adv_estimator_config = master_config["grpo"].get("adv_estimator", {})
-    adv_estimator_config.setdefault("name", "grpo")
-    adv_estimator_config.setdefault(
-        "use_leave_one_out_baseline", master_config["grpo"]["use_leave_one_out_baseline"]
-    )
-    adv_estimator_config.setdefault(
-        "normalize_rewards", master_config["grpo"]["normalize_rewards"]
-    )
+    adv_estimator_config = master_config["grpo"]["adv_estimator"]
     loss_config = master_config["loss_fn"]
 
     adv_estimator_name = adv_estimator_config["name"]
