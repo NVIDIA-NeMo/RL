@@ -2569,6 +2569,10 @@ def async_grpo_train(
                     del prompt_ids_for_adv
 
                     # Log advantages stats
+                    # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
+                    # already normalized advantages (equivalent to "Normalized advantages stats"
+                    # in older versions). For ReinforcePlusPlusAdvantageEstimator, advantages
+                    # are globally normalized across valid tokens.
                     advantages = train_data["advantages"]
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
