@@ -302,7 +302,6 @@ def validate(
                     gbs=val_data.size,
                     mbs=val_mbs,
                     timer=timer,
-                    timer_tag_prefix="policy_training",
                 )
 
             if len(val_results["all_mb_metrics"]) == 0:
@@ -459,7 +458,6 @@ def sft_train(
                         train_data,
                         loss_fn,
                         timer=timer,
-                        timer_tag_prefix="policy_training",
                     )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][

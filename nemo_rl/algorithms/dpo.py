@@ -573,7 +573,6 @@ def dpo_train(
                         gbs=master_config["policy"]["train_global_batch_size"] * 2,
                         mbs=master_config["policy"]["train_micro_batch_size"] * 2,
                         timer=timer,
-                        timer_tag_prefix="policy_training",
                     )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][

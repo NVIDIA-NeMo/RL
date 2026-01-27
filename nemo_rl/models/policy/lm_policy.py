@@ -274,7 +274,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_logprobs",
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a data dict.
 
@@ -287,7 +286,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
 
-        with timer.time(f"{timer_tag_prefix}/shard_data") if timer else nullcontext():
+        with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
@@ -314,7 +313,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         with (
-            timer.time(f"{timer_tag_prefix}/submit_logprob_futures")
+            timer.time("get_logprobs/submit_logprob_futures")
             if timer
             else nullcontext()
         ):
@@ -349,7 +348,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_reference_policy_logprobs",
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get the logprobs of the reference policy for a data dict.
 
@@ -358,7 +356,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
-        with timer.time(f"{timer_tag_prefix}/shard_data") if timer else nullcontext():
+        with (
+            timer.time("get_reference_policy_logprobs/shard_data")
+            if timer
+            else nullcontext()
+        ):
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
@@ -384,7 +386,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         with (
-            timer.time(f"{timer_tag_prefix}/submit_reference_policy_logprob_futures")
+            timer.time(
+                "get_reference_policy_logprobs/submit_reference_policy_logprob_futures"
+            )
             if timer
             else nullcontext()
         ):
@@ -423,13 +427,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_topk_logits",
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
-        with timer.time(f"{timer_tag_prefix}/shard_data") if timer else nullcontext():
+        with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
@@ -456,7 +459,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         with (
-            timer.time(f"{timer_tag_prefix}/submit_topk_logits_futures")
+            timer.time("get_topk_logits/submit_topk_logits_futures")
             if timer
             else nullcontext()
         ):
@@ -499,16 +502,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "policy_training",
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        with (
-            timer.time(f"{timer_tag_prefix}/sharding_data") if timer else nullcontext()
-        ):
+        with timer.time("policy_training/sharding_data") if timer else nullcontext():
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
@@ -541,7 +541,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # Train each shard in parallel
         with (
-            timer.time(f"{timer_tag_prefix}/submit_training_futures")
+            timer.time("policy_training/submit_training_futures")
             if timer
             else nullcontext()
         ):

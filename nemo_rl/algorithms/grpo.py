@@ -1517,7 +1517,7 @@ def grpo_train(
                         }
                     )
                     train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer, timer_tag_prefix="policy_logprobs"
+                        logprob_data, timer=timer
                     )["logprobs"]
 
                     if not master_config["grpo"].get(
@@ -1527,7 +1527,6 @@ def grpo_train(
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
                                 timer=timer,
-                                timer_tag_prefix="reference_logprobs",
                             )["reference_logprobs"]
                         )
 
@@ -1546,7 +1545,6 @@ def grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
-                        timer_tag_prefix="policy_training",
                     )
 
                 # Recompute KV scales after policy training if needed
@@ -2520,12 +2518,10 @@ def async_grpo_train(
                     fprop_logprobs = policy.get_logprobs(
                         train_data,
                         timer=timer,
-                        timer_tag_prefix="policy_logprob_inference",
                     )["logprobs"]
                     reference_logprobs = policy.get_reference_policy_logprobs(
                         train_data,
                         timer=timer,
-                        timer_tag_prefix="reference_logprob_inference",
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
@@ -2541,7 +2537,6 @@ def async_grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
-                        timer_tag_prefix="policy_training",
                     )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")

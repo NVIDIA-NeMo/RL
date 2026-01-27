@@ -698,7 +698,6 @@ def distillation_train(
                         train_data,
                         k=master_config["distillation"]["topk_logits_k"],
                         timer=timer,
-                        timer_tag_prefix="teacher_logprob_inference",
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
@@ -715,7 +714,6 @@ def distillation_train(
                         train_data,
                         loss_fn,
                         timer=timer,
-                        timer_tag_prefix="policy_training",
                     )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (

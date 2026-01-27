@@ -56,7 +56,6 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_logprobs",
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -75,7 +74,6 @@ class PolicyInterface(ABC):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_reference_policy_logprobs",
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -95,7 +93,6 @@ class PolicyInterface(ABC):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "get_topk_logits",
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 
@@ -114,7 +111,6 @@ class PolicyInterface(ABC):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        timer_tag_prefix: str = "policy_training",
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
