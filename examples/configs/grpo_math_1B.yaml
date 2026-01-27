@@ -21,7 +21,7 @@ grpo:
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
-    stop_properly_penalty_coef: 0.0
+    stop_properly_penalty_coef: null
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"
