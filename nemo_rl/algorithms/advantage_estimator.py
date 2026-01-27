@@ -50,7 +50,7 @@ class GRPOAdvantageEstimator:
 
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
-            epsilon = 1e-8
+            epsilon = 1e-6
             non_zero_std_mask = std > 0
             advantages[non_zero_std_mask] = (
                 advantages[non_zero_std_mask] / (std.unsqueeze(-1)[non_zero_std_mask] + epsilon)
@@ -68,10 +68,10 @@ class ReinforcePlusPlusAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
-        self.minus_baseline = estimator_config.get("minus_baseline", True)
-        self.use_kl_in_reward = loss_config.get("use_kl_in_reward", False)
-        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.0001)
-        self.kl_type = loss_config.get("reference_policy_kl_type", "k2")
+        self.minus_baseline = estimator_config["minus_baseline"]
+        self.use_kl_in_reward = loss_config["use_kl_in_reward"]
+        self.kl_coef = loss_config["reference_policy_kl_penalty"]
+        self.kl_type = loss_config["reference_policy_kl_type"]
 
     def compute_advantage(
         self, prompt_ids, rewards, mask, logprobs_policy=None, logprobs_reference=None, **kwargs

@@ -27,6 +27,10 @@ from nemo_rl.algorithms.grpo import (
     normalize_advantages_with_epsilon,
     validate,
 )
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1529,52 +1533,76 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
 
 
 # ============================================================================
-# Tests for normalize_advantages_with_epsilon function
+# Tests for GRPOAdvantageEstimator class
 # ============================================================================
 
 
-def test_normalize_advantages_with_epsilon_basic():
-    """Test basic functionality of normalize_advantages_with_epsilon."""
-    # Test case with normal values
-    advantages = torch.tensor([[2.0], [4.0], [6.0]])
-    std = torch.tensor([1.0, 2.0, 3.0])
-    epsilon = 1e-6
+def test_grpo_advantage_estimator_zero_std():
+    """Test GRPOAdvantageEstimator when std contains zeros (all rewards same for a prompt).
 
-    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+    This test verifies that:
+    1. When std=0 (all rewards identical for a prompt), normalization is skipped and advantage=0
+    2. When std>0, advantages are properly normalized by std
+    """
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
-    expected = torch.tensor([[2.0], [2.0], [2.0]])
-    assert torch.allclose(result, expected, rtol=1e-5)
+    # prompt 0: all same rewards -> std=0; prompt 1: different rewards -> std>0
+    prompt_ids = torch.tensor([[0], [0], [1], [1]])  # Shape (4, 1) for unique prompt matching
+    rewards = torch.tensor([2.0, 2.0, 1.0, 3.0])  # prompt 0: std=0; prompt 1: std=sqrt(2)
+    mask = torch.ones(4, 5)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+
+    # prompt 0: std=0 -> skip normalization, advantage=0 (reward - mean = 0)
+    # prompt 1: With Bessel correction for 2 samples, std = sqrt(2), normalized = ±1/sqrt(2) ≈ ±0.7071
+    expected_prompt_0 = torch.zeros(2, 5)  # advantage=0 for all same rewards
+    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    expected_prompt_1 = torch.tensor([-sqrt2_inv, sqrt2_inv]).unsqueeze(-1).expand(2, 5)
+
+    assert torch.allclose(result[:2], expected_prompt_0, rtol=1e-5)
+    assert torch.allclose(result[2:], expected_prompt_1, rtol=1e-4)
 
 
-def test_normalize_advantages_with_epsilon_zero_std():
-    """Test normalize_advantages_with_epsilon when std contains zeros."""
-    advantages = torch.tensor([[1.0], [2.0], [3.0]])
-    std = torch.tensor([0.0, 1.0, 0.0])  # Zero std for indices 0 and 2
-    epsilon = 1e-6
-
-    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
-
-    # When std=0 AND advantage!=0, normalization is skipped (advantages unchanged)
-    # When std>0, normal normalization occurs
-    expected = torch.tensor(
-        [[1.0], [2.0], [3.0]]
-    )  # Samples 0,2 unchanged; sample 1 normalized
-    assert torch.allclose(result, expected, rtol=1e-5)
+# ============================================================================
+# Tests for ReinforcePlusPlusAdvantageEstimator class
+# ============================================================================
 
 
-def test_normalize_advantages_with_epsilon_all_zero_std():
-    """Test normalize_advantages_with_epsilon when all std values are zero."""
-    advantages = torch.tensor([[1.5], [2.5], [3.5]])
-    std = torch.tensor([0.0, 0.0, 0.0])
-    epsilon = 1e-8
+def test_reinforce_plus_plus_global_normalization():
+    """Test that ReinforcePlusPlusAdvantageEstimator applies global normalization.
 
-    # Save expected values BEFORE calling function (since it modifies in-place)
-    expected = advantages.clone()
+    This test verifies that:
+    1. After global normalization, the mean of advantages is approximately 0
+    2. The advantages are properly scaled by the global std
+    """
+    estimator_config = {
+        "minus_baseline": True,
+    }
+    loss_config = {
+        "use_kl_in_reward": False,
+        "reference_policy_kl_penalty": 0.0001,
+        "reference_policy_kl_type": "k2",
+    }
+    estimator = ReinforcePlusPlusAdvantageEstimator(estimator_config, loss_config)
 
-    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+    prompt_ids = torch.tensor([[0], [0], [0], [0]])  # Shape (4, 1) for unique prompt matching
+    rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])  # mean=1.5
+    mask = torch.ones(4, 5)
 
-    # When std=0 AND advantage!=0, normalization is skipped (all unchanged)
-    assert torch.allclose(result, expected, rtol=1e-5)
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+
+    # After global normalization, mean should be ~0
+    result_mean = (result * mask).sum() / mask.sum()
+    assert torch.abs(result_mean) < 1e-5
+
+    # Check the normalized advantages have correct relative ordering
+    # Lower rewards should have negative advantages, higher should have positive
+    assert result[0, 0] < result[1, 0] < result[2, 0] < result[3, 0]
 
 
 def test_normalize_advantages_with_epsilon_tensor_shapes():

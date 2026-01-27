@@ -62,7 +62,7 @@ loss_fn:
   # KL regularization
   reference_policy_kl_penalty: 0.0001
   reference_policy_kl_type: "k2"
-  kl_input_clamp_value: 10.0
+  kl_input_clamp_value: 20.0
   kl_output_clamp_value: 10.0
 
   # ============================================================================
