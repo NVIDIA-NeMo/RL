@@ -1567,6 +1567,132 @@ def test_grpo_advantage_estimator_zero_std():
     assert torch.allclose(result[2:], expected_prompt_1, rtol=1e-4)
 
 
+def test_grpo_advantage_estimator_tensor_shapes():
+    """Test GRPOAdvantageEstimator with different tensor shapes.
+
+    This test verifies that the estimator works correctly with:
+    1. Small batch size (batch=2, single prompt)
+    2. Larger batch size (batch=10, single prompt)
+    """
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
+
+    # Test with batch size 2
+    prompt_ids = torch.tensor([[0], [0]])
+    rewards = torch.tensor([1.0, 3.0])  # mean=2, std=sqrt(2) with Bessel
+    mask = torch.ones(2, 3)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    assert result.shape == (2, 3)
+
+    # Verify normalized values: (reward - mean) / std
+    # With Bessel correction for 2 samples: std = sqrt(2)
+    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    expected = torch.tensor([[-sqrt2_inv], [sqrt2_inv]]).expand(2, 3)
+    assert torch.allclose(result, expected, rtol=1e-4)
+
+    # Test with larger batch (10 samples, single prompt)
+    prompt_ids = torch.tensor([[0]] * 10)
+    rewards = torch.arange(10, dtype=torch.float32)  # 0, 1, 2, ..., 9
+    mask = torch.ones(10, 5)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    assert result.shape == (10, 5)
+
+    # After normalization, mean should be ~0
+    result_mean = result.mean()
+    assert torch.abs(result_mean) < 1e-5
+
+
+def test_grpo_advantage_estimator_negative_advantages():
+    """Test GRPOAdvantageEstimator with rewards that produce negative advantages.
+
+    This test verifies that negative advantages are handled correctly.
+    """
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
+
+    # Rewards with values below and above mean
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    rewards = torch.tensor([0.0, 2.0, 4.0])  # mean=2, deviations: -2, 0, +2
+    mask = torch.ones(3, 4)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+
+    # Verify ordering: first should be negative, middle ~0, last positive
+    assert result[0, 0] < 0  # below mean -> negative advantage
+    assert torch.abs(result[1, 0]) < 1e-5  # at mean -> ~0 advantage
+    assert result[2, 0] > 0  # above mean -> positive advantage
+
+    # Verify symmetry
+    assert torch.allclose(result[0], -result[2], rtol=1e-5)
+
+
+def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
+    """Test GRPOAdvantageEstimator when all rewards are identical (std=0, advantage=0).
+
+    This test verifies that when all rewards for a prompt are the same:
+    1. The advantages are all zero (since reward - mean = 0)
+    2. No division by zero occurs (normalization is skipped when std=0)
+    """
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
+
+    # All rewards identical -> std=0, all advantages=0
+    prompt_ids = torch.tensor([[0], [0], [0], [0]])
+    rewards = torch.tensor([5.0, 5.0, 5.0, 5.0])  # all same
+    mask = torch.ones(4, 3)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+
+    # All advantages should be exactly 0
+    expected = torch.zeros(4, 3)
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_grpo_advantage_estimator_small_nonzero_std():
+    """Test GRPOAdvantageEstimator with small but non-zero std values.
+
+    This test verifies that small but non-zero std values are still normalized
+    (no arbitrary threshold that would skip normalization).
+    """
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
+
+    # Small reward differences -> small std but non-zero
+    # Use larger difference to avoid floating point precision issues in std calculation
+    prompt_ids = torch.tensor([[0], [0]])
+    rewards = torch.tensor([1.0, 1.01])  # small but detectable difference
+    mask = torch.ones(2, 3)
+
+    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+
+    # Even with small std, normalization should still happen
+    # After normalization, the values should be ±1/sqrt(2) (for 2 samples with Bessel)
+    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    assert torch.allclose(torch.abs(result[0, 0]), torch.tensor(sqrt2_inv), rtol=1e-3)
+    assert torch.allclose(torch.abs(result[1, 0]), torch.tensor(sqrt2_inv), rtol=1e-3)
+
+    # Verify opposite signs
+    assert result[0, 0] * result[1, 0] < 0
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================
