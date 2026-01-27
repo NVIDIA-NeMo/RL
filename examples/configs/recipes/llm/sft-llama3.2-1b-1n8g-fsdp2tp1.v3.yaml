@@ -9,12 +9,16 @@ policy:
     name: meta-llama/Llama-3.2-1B
   make_sequence_length_divisible_by: 1
 data:
-  dataset_name: openmathinstruct2
-  prompt_file: examples/prompts/math.txt
-  split: train_1M
   add_generation_prompt: true
-  output_key: generated_solution
-  seed: 42
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
 logger:
   log_dir: logs/sft-llama3.2-1b-1n8g-fsdp2tp1
   wandb:

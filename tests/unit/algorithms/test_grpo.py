@@ -25,6 +25,7 @@ from nemo_rl.algorithms.grpo import (
     dynamic_sampling,
     grpo_train,
     normalize_advantages_with_epsilon,
+    validate,
 )
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -812,6 +813,321 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+@pytest.mark.parametrize(
+    "colocated_inference, expected_parallel",
+    [(True, 0.0), (False, True)],
+)
+def test_setup_sglang_sets_model_path_and_parallel_flag(
+    monkeypatch, colocated_inference, expected_parallel
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    logged = {}
+
+    class DummyLogger:
+        def log_hyperparams(self, *_args, **_kwargs):
+            pass
+
+        def log_metrics(self, metrics, *_args, **_kwargs):
+            logged["metrics"] = metrics
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+        def load_state_dict(self, _state):
+            pass
+
+    class DummyCluster:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def world_size(self):
+            return 1
+
+        def get_master_address_and_port(self):
+            return "127.0.0.1", 1234
+
+    class DummyPolicy:
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummySGLangGeneration:
+        def finish_generation(self):
+            pass
+
+        def prepare_refit_info(self, _state):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
+    monkeypatch.setattr(
+        grpo_mod,
+        "SGLangGeneration",
+        lambda *_args, **_kwargs: DummySGLangGeneration(),
+    )
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    generation_resources = {
+        "gpus_per_node": 1,
+        "num_nodes": 1,
+    }
+    if colocated_inference:
+        generation_resources = {"gpus_per_node": None, "num_nodes": None}
+
+    master_config = {
+        "policy": {
+            "model_name": "fake-model",
+            "train_global_batch_size": 1,
+            "train_micro_batch_size": 1,
+            "max_total_sequence_length": 8,
+            "make_sequence_length_divisible_by": 1,
+            "dtensor_cfg": {"enabled": False},
+            "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
+            "generation": {
+                "backend": "sglang",
+                "colocated": {
+                    "enabled": colocated_inference,
+                    "resources": generation_resources,
+                },
+                "sglang_cfg": {
+                    "gpus_per_server": 1,
+                    "dp_size": 1,
+                    "pp_size": 1,
+                    "ep_size": 1,
+                },
+            },
+        },
+        "loss_fn": {
+            "force_on_policy_ratio": False,
+            "use_importance_sampling_correction": False,
+        },
+        "env": {},
+        "grpo": {
+            "seed": 1,
+            "num_prompts_per_step": 1,
+            "num_generations_per_prompt": 1,
+            "max_num_steps": 1,
+            "max_num_epochs": 1,
+            "val_period": 0,
+            "val_batch_size": 1,
+            "val_at_start": False,
+            "max_val_samples": 1,
+            "use_dynamic_sampling": False,
+            "batch_multiplier": 1,
+            "normalize_rewards": False,
+            "use_leave_one_out_baseline": False,
+            "reward_scaling": {"enabled": False},
+            "reward_shaping": {"enabled": False},
+            "overlong_filtering": False,
+        },
+        "data": {"shuffle": False, "num_workers": 0, "env_name": None},
+        "logger": {"num_val_samples_to_print": 0},
+        "checkpointing": {"enabled": False},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 4},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+
+    grpo_mod.setup(master_config, tokenizer, dataset, None)
+
+    assert (
+        master_config["policy"]["generation"]["sglang_cfg"]["model_path"]
+        == master_config["policy"]["model_name"]
+    )
+    assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
+
+
+def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = {
+        "prepare_for_generation_tags": [],
+        "invalidate_kv_cache": 0,
+        "stream_weights_via_http": [],
+        "offload_before_refit": 0,
+        "offload_after_refit": 0,
+    }
+
+    class DummySGLangGeneration:
+        def prepare_for_generation(self, tags=None):
+            calls["prepare_for_generation_tags"].append(tags)
+
+        def get_sglang_url_to_gpu_uuids(self):
+            return {"http://localhost:12345": ["gpu-uuid-0"]}
+
+        def invalidate_kv_cache(self):
+            calls["invalidate_kv_cache"] += 1
+            return True
+
+    class DummyPolicy:
+        def offload_before_refit(self):
+            calls["offload_before_refit"] += 1
+
+        def offload_after_refit(self):
+            calls["offload_after_refit"] += 1
+
+        def get_free_memory_bytes(self):
+            return 1024 * 1024 * 1024
+
+        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
+            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
+            return ["ok"]
+
+    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummySGLangGeneration(),
+        colocated_inference=True,
+    )
+
+    assert calls["offload_before_refit"] == 1
+    assert calls["offload_after_refit"] == 1
+    assert calls["invalidate_kv_cache"] == 1
+    assert calls["stream_weights_via_http"] == [
+        {"http://localhost:12345": ["gpu-uuid-0"]}
+    ]
+    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
+
+
+def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    class DummySGLangGeneration:
+        pass
+
+    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
+
+    with pytest.raises(NotImplementedError):
+        grpo_mod.refit_policy_generation(
+            policy=object(),
+            policy_generation=DummySGLangGeneration(),
+            colocated_inference=False,
+        )
+
+
+def test_grpo_train_collects_generation_logger_metrics(
+    monkeypatch, mock_grpo_components
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    policy_generation = MagicMock()
+    policy_generation.clear_logger_metrics = MagicMock()
+    policy_generation.get_logger_metrics = MagicMock(
+        return_value={"pending_requests": 1}
+    )
+    policy_generation.prepare_for_generation = MagicMock()
+    policy_generation.finish_generation = MagicMock()
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"gen_kl_error": 0.0, "mean_gen_tokens_per_sample": 2.0}
+
+    def fake_batched_message_log_to_flat_message(*_args, **_kwargs):
+        flat = BatchedDataDict(
+            {
+                "token_ids": torch.tensor([[1, 2]]),
+                "advantages": torch.tensor([[0.5, 0.5]]),
+                "generation_logprobs": torch.tensor([[0.0, 0.0]]),
+                "token_loss_mask": torch.tensor([[1, 1]]),
+                "content": ["ok"],
+            }
+        )
+        return flat, torch.tensor([2])
+
+    monkeypatch.setattr(
+        grpo_mod,
+        "batched_message_log_to_flat_message",
+        fake_batched_message_log_to_flat_message,
+    )
+    monkeypatch.setattr(
+        grpo_mod, "_should_use_async_rollouts", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "run_async_multi_turn_rollout",
+        lambda *_args, **_kwargs: (mock_batch, mock_rollout_metrics),
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "run_multi_turn_rollout",
+        lambda *_args, **_kwargs: (mock_batch, mock_rollout_metrics),
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "calculate_baseline_and_std_per_prompt",
+        lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
+    )
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config["grpo"]["max_num_steps"] = 1
+    master_config["grpo"]["max_num_epochs"] = 1
+    master_config["grpo"]["val_period"] = 0
+    master_config["grpo"]["val_at_start"] = False
+    master_config["grpo"]["use_dynamic_sampling"] = False
+
+    grpo_mod.grpo_train(
+        mock_grpo_components["policy"],
+        policy_generation,
+        mock_grpo_components["train_dataloader"],
+        mock_grpo_components["val_dataloader"],
+        mock_grpo_components["tokenizer"],
+        mock_grpo_components["loss_fn"],
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+        mock_grpo_components["logger"],
+        mock_grpo_components["checkpointer"],
+        _default_grpo_save_state(),
+        master_config,
+    )
+
+    assert policy_generation.clear_logger_metrics.called
+    assert policy_generation.get_logger_metrics.called
+    assert any(
+        "generation_logger_metrics" in call.args[0]
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+    )
+
+
 @pytest.fixture
 def mock_grpo_components():
     # Create mock components
@@ -1347,3 +1663,238 @@ def test_normalize_advantages_with_small_nonzero_std():
 
     # All should be normalized since std > 0
     assert torch.allclose(result, expected, rtol=1e-5)
+
+
+# ============================================================================
+# Tests for validate function
+# ============================================================================
+
+
+class TestValidateFunction:
+    """Tests for the validate() function."""
+
+    def test_validate_logs_data_when_logger_provided(self, tmp_path):
+        """Test that validation data is logged to JSONL when logger is provided."""
+
+        # Create mock components
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        # Create mock batch
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "test1",
+                            "token_ids": torch.tensor([1, 2, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "response1",
+                            "token_ids": torch.tensor([4, 5, 6]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            "content": "test2",
+                            "token_ids": torch.tensor([7, 8, 9]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "response2",
+                            "token_ids": torch.tensor([10, 11, 12]),
+                        },
+                    ],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([6, 6]),
+                "total_reward": torch.tensor([1.0, 0.5]),
+            }
+        )
+
+        # Create mock dataloader that yields mock_batch
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+
+        # Create mock environment
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
+
+        # Create mock logger that captures calls
+        mock_logger = MagicMock()
+        logged_data = {}
+
+        def capture_log(data, filename):
+            logged_data["data"] = data
+            logged_data["filename"] = filename
+
+        mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
+
+        # Mock config
+        mock_config = {
+            "grpo": {
+                "max_val_samples": 10,
+                "val_batch_size": 2,
+                "max_rollout_turns": 1,
+            },
+            "policy": {
+                "max_total_sequence_length": 2048,
+                "generation": {
+                    "backend": "vllm",
+                    "colocated": {"enabled": True},
+                    "vllm_cfg": {"async_engine": False},
+                },
+            },
+            "logger": {
+                "num_val_samples_to_print": 2,
+            },
+        }
+
+        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+            mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
+            with patch(
+                "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False
+            ):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                    return_value=False,
+                ):
+                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                        val_metrics, timing = validate(
+                            mock_policy_gen,
+                            mock_dataloader,
+                            mock_tokenizer,
+                            {"math": mock_env},
+                            step=5,
+                            master_config=mock_config,
+                            logger=mock_logger,
+                        )
+
+        # Verify log_batched_dict_as_jsonl was called
+        mock_logger.log_batched_dict_as_jsonl.assert_called_once()
+
+        # Verify the filename
+        assert logged_data["filename"] == "val_data_step5.jsonl"
+
+        # Verify the data structure
+        assert "content" in logged_data["data"]
+        assert "rewards" in logged_data["data"]
+
+    def test_validate_works_without_logger(self):
+        """Test that validation works when logger is None (backward compat)."""
+        # Create mock components
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        # Create mock batch
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "test1",
+                            "token_ids": torch.tensor([1, 2, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "response1",
+                            "token_ids": torch.tensor([4, 5, 6]),
+                        },
+                    ],
+                ],
+                "task_name": ["math"],
+                "extra_env_info": [{}],
+                "loss_multiplier": torch.tensor([1.0]),
+                "idx": torch.tensor([0]),
+                "length": torch.tensor([6]),
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+
+        # Create mock dataloader
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+
+        # Create mock environment
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
+
+        # Mock config
+        mock_config = {
+            "grpo": {
+                "max_val_samples": 10,
+                "val_batch_size": 1,
+                "max_rollout_turns": 1,
+            },
+            "policy": {
+                "max_total_sequence_length": 2048,
+                "generation": {
+                    "backend": "vllm",
+                    "colocated": {"enabled": True},
+                    "vllm_cfg": {"async_engine": False},
+                },
+            },
+            "logger": {
+                "num_val_samples_to_print": 1,
+            },
+        }
+
+        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+            mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
+            with patch(
+                "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False
+            ):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                    return_value=False,
+                ):
+                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                        # Call validate without logger (should not raise exception)
+                        val_metrics, timing = validate(
+                            mock_policy_gen,
+                            mock_dataloader,
+                            mock_tokenizer,
+                            {"math": mock_env},
+                            step=5,
+                            master_config=mock_config,
+                            logger=None,
+                        )
+
+        # Verify metrics are returned correctly
+        assert "accuracy" in val_metrics
+        assert "avg_length" in val_metrics
+
+    def test_validate_returns_empty_when_no_dataloader(self):
+        """Test that validate returns empty dicts when no dataloader is provided."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+
+        mock_config = {
+            "dpo": {"val_period": 0},  # Required for the assertion
+        }
+
+        val_metrics, timing = validate(
+            mock_policy_gen,
+            None,  # No dataloader
+            mock_tokenizer,
+            None,
+            step=0,
+            master_config=mock_config,
+            logger=None,
+        )
+
+        assert val_metrics == {}
+        assert timing == {}
