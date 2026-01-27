@@ -19,16 +19,16 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     async_grpo_train,
     dynamic_sampling,
     grpo_train,
     validate,
-)
-from nemo_rl.algorithms.advantage_estimator import (
-    GRPOAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -1551,8 +1551,12 @@ def test_grpo_advantage_estimator_zero_std():
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # prompt 0: all same rewards -> std=0; prompt 1: different rewards -> std>0
-    prompt_ids = torch.tensor([[0], [0], [1], [1]])  # Shape (4, 1) for unique prompt matching
-    rewards = torch.tensor([2.0, 2.0, 1.0, 3.0])  # prompt 0: std=0; prompt 1: std=sqrt(2)
+    prompt_ids = torch.tensor(
+        [[0], [0], [1], [1]]
+    )  # Shape (4, 1) for unique prompt matching
+    rewards = torch.tensor(
+        [2.0, 2.0, 1.0, 3.0]
+    )  # prompt 0: std=0; prompt 1: std=sqrt(2)
     mask = torch.ones(4, 5)
 
     result = estimator.compute_advantage(prompt_ids, rewards, mask)
@@ -1560,7 +1564,7 @@ def test_grpo_advantage_estimator_zero_std():
     # prompt 0: std=0 -> skip normalization, advantage=0 (reward - mean = 0)
     # prompt 1: With Bessel correction for 2 samples, std = sqrt(2), normalized = ±1/sqrt(2) ≈ ±0.7071
     expected_prompt_0 = torch.zeros(2, 5)  # advantage=0 for all same rewards
-    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    sqrt2_inv = 1.0 / (2.0**0.5)
     expected_prompt_1 = torch.tensor([-sqrt2_inv, sqrt2_inv]).unsqueeze(-1).expand(2, 5)
 
     assert torch.allclose(result[:2], expected_prompt_0, rtol=1e-5)
@@ -1591,7 +1595,7 @@ def test_grpo_advantage_estimator_tensor_shapes():
 
     # Verify normalized values: (reward - mean) / std
     # With Bessel correction for 2 samples: std = sqrt(2)
-    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    sqrt2_inv = 1.0 / (2.0**0.5)
     expected = torch.tensor([[-sqrt2_inv], [sqrt2_inv]]).expand(2, 3)
     assert torch.allclose(result, expected, rtol=1e-4)
 
@@ -1685,7 +1689,7 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
     # Even with small std, normalization should still happen
     # After normalization, the values should be ±1/sqrt(2) (for 2 samples with Bessel)
-    sqrt2_inv = 1.0 / (2.0 ** 0.5)
+    sqrt2_inv = 1.0 / (2.0**0.5)
     assert torch.allclose(torch.abs(result[0, 0]), torch.tensor(sqrt2_inv), rtol=1e-3)
     assert torch.allclose(torch.abs(result[1, 0]), torch.tensor(sqrt2_inv), rtol=1e-3)
 
@@ -1715,7 +1719,9 @@ def test_reinforce_plus_plus_global_normalization():
     }
     estimator = ReinforcePlusPlusAdvantageEstimator(estimator_config, loss_config)
 
-    prompt_ids = torch.tensor([[0], [0], [0], [0]])  # Shape (4, 1) for unique prompt matching
+    prompt_ids = torch.tensor(
+        [[0], [0], [0], [0]]
+    )  # Shape (4, 1) for unique prompt matching
     rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])  # mean=1.5
     mask = torch.ones(4, 5)
 
