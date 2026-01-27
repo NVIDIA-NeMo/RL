@@ -267,9 +267,4 @@ class PolicyConfig(TypedDict):
     quant_calib_data: NotRequired[str | None]
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
-
-
-class QuantPolicyConfig(PolicyConfig):
-    quant_cfg: NotRequired[str | None]
-    dataset_name: NotRequired[str | None]
-    calib_size: NotRequired[int | None]
+    quant_sequence_length: NotRequired[int | None]

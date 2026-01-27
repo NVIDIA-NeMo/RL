@@ -142,6 +142,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         quant_calib_data = self.cfg.get("quant_calib_data", "cnn_dailymail")
         quant_calib_size = self.cfg.get("quant_calib_size", 512)
         quant_batch_size = self.cfg.get("quant_batch_size", 1)
+        quant_sequence_length = self.cfg.get("quant_sequence_length", 2048)
         unwrapped_model = unwrap_model(model)[0]
 
         tokenizer = get_tokenizer(self.cfg["model_name"])
@@ -154,6 +155,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             batch_size=quant_batch_size,
             data=quant_calib_data,
             force_all_expert_routing=True,
+            max_sample_length=quant_sequence_length,
         )
         return model
 
