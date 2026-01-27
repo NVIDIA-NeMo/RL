@@ -1147,7 +1147,9 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                import time
                 with timer.time("generation"):
+                    start = time.time()
                     # Clear vLLM logger metrics for each generation step
                     if policy_generation is not None and hasattr(
                         policy_generation, "clear_vllm_logger_metrics"
@@ -1202,6 +1204,8 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+                    end = time.time()
+                    print(f"SHAN: Generation time: {end - start} seconds")
                     # Collect vLLM logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each vLLM worker
                     if policy_generation is not None and hasattr(
@@ -1221,6 +1225,7 @@ def grpo_train(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config["grpo"]["reward_shaping"]
                     )
+
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
@@ -1335,10 +1340,16 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
+                    start = time.time()
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    end = time.time()
+                    print(f"SHAN: Logprob inference time: {end - start} seconds")
+                    start = time.time()
                     reference_logprobs = policy.get_reference_policy_logprobs(
                         train_data
                     )["reference_logprobs"]
+                    end = time.time()
+                    print(f"SHAN: Reference logprob inference time: {end - start} seconds")
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 
