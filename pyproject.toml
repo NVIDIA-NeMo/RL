@@ -258,7 +258,7 @@ override-dependencies = [
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-  "setuptools>=80.10.1",
+  "setuptools>=80.10.2",
 ]
 # CVE fixes
 constraint-dependencies = [
