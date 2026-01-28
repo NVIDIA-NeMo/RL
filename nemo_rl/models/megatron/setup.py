@@ -51,6 +51,7 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -731,6 +732,7 @@ def setup_model_and_optimizer(
         pre_wrap_hook.extend([composed_peft_hook])
 
     # Model, optimizer, and learning rate.
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
@@ -739,6 +741,7 @@ def setup_model_and_optimizer(
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -872,6 +875,7 @@ def setup_reference_model_state(
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
         pre_wrap_hook=megatron_cfg.rng.data_parallel_random_init,
         mixed_precision_wrapper=ref_mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     print("Loading the Reference Model")
@@ -925,6 +929,7 @@ def finalize_megatron_setup(
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     tokenizer_config = TokenizerConfig(
