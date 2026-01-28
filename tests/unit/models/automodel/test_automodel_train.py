@@ -451,10 +451,10 @@ class TestLogprobsPostProcessor:
 
         result = processor(
             logits=logits,
-            input_ids=input_ids,
             processed_inputs=processed_inputs,
             input_lengths=input_lengths,
-            seq_dim_size=seq_len,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
             enable_seq_packing=False,
         )
 
@@ -493,10 +493,10 @@ class TestLogprobsPostProcessor:
 
         result = processor(
             logits=logits,
-            input_ids=input_ids,
             processed_inputs=processed_inputs,
             input_lengths=input_lengths,
-            seq_dim_size=seq_len,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
             enable_seq_packing=False,
         )
 
@@ -604,12 +604,12 @@ class TestMakeProcessedMicrobatchIterator:
 
         cfg = {
             "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"enabled": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
-            enable_seq_packing=False,
             cfg=cfg,
             cp_size=1,
         )
@@ -924,7 +924,6 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             cfg=base_cfg,
             data_iterator=data_iterator,
-            num_microbatches=1,
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size),
@@ -1003,7 +1002,6 @@ class TestAutomodelForwardBackward:
             model=mock_model,
             cfg=base_cfg,
             data_iterator=data_iterator,
-            num_microbatches=num_microbatches,
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),

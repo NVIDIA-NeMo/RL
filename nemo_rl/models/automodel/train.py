@@ -304,7 +304,9 @@ def forward_with_post_processing_fn(
             global_valid_toks=global_valid_toks,
             sequence_dim=sequence_dim,
         )
-    elif isinstance(post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)):
+    elif isinstance(
+        post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)
+    ):
         result = post_processing_fn(
             logits=logits,
             processed_inputs=processed_inputs,

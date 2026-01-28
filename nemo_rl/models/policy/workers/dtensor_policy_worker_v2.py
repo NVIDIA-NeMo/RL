@@ -45,7 +45,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
-    make_processed_microbatch_iterator,
     process_global_batch,
 )
 from nemo_rl.models.automodel.setup import (
