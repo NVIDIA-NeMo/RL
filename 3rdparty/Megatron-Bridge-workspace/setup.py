@@ -26,9 +26,9 @@ bridge_src_dir = "Megatron-Bridge/src/megatron/bridge"
 bridge_package_name = "megatron.bridge"
 
 CACHED_DEPENDENCIES = [
-    "accelerate",
-    "transformers==4.57.1",
+    "transformers<5.0.0",
     "datasets",
+    "accelerate",
     "omegaconf>=2.3.0",
     "tensorboard>=2.19.0",
     "typing-extensions",

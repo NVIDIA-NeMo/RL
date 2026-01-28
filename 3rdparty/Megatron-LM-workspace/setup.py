@@ -58,6 +58,7 @@ CACHED_DEPENDENCIES = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.3.2",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
