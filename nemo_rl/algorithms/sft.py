@@ -294,15 +294,13 @@ def validate(
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
             ## just run model fwd
-            with timer.time("policy_training"):
-                val_results = policy.train(
-                    val_data,
-                    loss_fn,
-                    eval_mode=True,
-                    gbs=val_data.size,
-                    mbs=val_mbs,
-                    timer=timer,
-                )
+            val_results = policy.train(
+                val_data,
+                loss_fn,
+                eval_mode=True,
+                gbs=val_data.size,
+                mbs=val_mbs,
+            )
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
