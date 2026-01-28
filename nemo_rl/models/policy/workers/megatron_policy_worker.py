@@ -666,7 +666,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # especially when using many experts.
         model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
         model_cfg.moe_token_dispatcher_type = "alltoall"
-        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
 
         # The below two configs (and "freeze_moe_router") are used to stabilize moe training
         # by preventing updates to the moe router. We found that this is helpful in reducing
@@ -993,13 +992,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.megatron_cfg.model.make_vocab_size_divisible_by,
             self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
         )
-        # Debug: Print vocab size calculation details
-        if self.rank == 0:
-            print(f"[DEBUG] vocab_size calculation:")
-            print(f"  - raw vocab_size from config: {self.megatron_cfg.model.vocab_size}")
-            print(f"  - make_vocab_size_divisible_by: {self.megatron_cfg.model.make_vocab_size_divisible_by}")
-            print(f"  - tensor_model_parallel_size: {self.cfg['megatron_cfg']['tensor_model_parallel_size']}")
-            print(f"  - final_padded_vocab_size: {self.final_padded_vocab_size}")
+
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
             hf_model_name, trust_remote_code=True
@@ -1166,7 +1159,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             pg_collection=pg_collection,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=False,
-            unified_memory_level=unified_memory_level,
+            unified_memory_level=1,
             max_tokens=max_tokens,
             persist_cuda_graphs=True,  # Keep CUDA graphs across suspend/resume (requires unified_memory_level > 0 for safety)
         )
@@ -2271,7 +2264,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             else self.model.module
         )
 
-        toggle_cuda_graphs(lang_module, set_to="local", reset_cuda_graphs=False)
+        toggle_cuda_graphs(lang_module, set_to="local", reset_cuda_graphs=True)
 
         # Initialize the persistent inference engine if not already done (ALL ranks)
         if not self._inference_engine_initialized:
