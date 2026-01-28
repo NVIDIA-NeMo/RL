@@ -1,0 +1,12 @@
+defaults: ./dapo-qwen2.5-7b.yaml
+policy:
+  dtensor_cfg:
+    context_parallel_size: 2
+checkpointing:
+  checkpoint_dir: results/dapo-qwen2.5-7b-16n4g-fsdp2cp2
+logger:
+  log_dir: logs/dapo-qwen2.5-7b-16n4g-fsdp2cp2
+  wandb:
+    name: dapo-qwen2.5-7b-16n4g-fsdp2cp2
+cluster:
+  gpus_per_node: 4

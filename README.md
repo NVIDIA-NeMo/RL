@@ -286,6 +286,10 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docs/docker.md).
 
 #### GRPO Qwen2.5-32B
@@ -312,6 +316,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 #### GRPO Multi-Turn
 
@@ -361,6 +368,9 @@ sbatch \
     ray.sub
 ```
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 ## Supervised Fine-Tuning (SFT)
 
 We provide example SFT experiments using various datasets including [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/), OpenAI format datasets (with tool calling support), and custom JSONL datasets. For detailed documentation on supported datasets and configurations, see the [SFT documentation](docs/guides/sft.md).
@@ -405,6 +415,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## DPO
 
@@ -464,6 +477,9 @@ sbatch \
     ray.sub
 ```
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 ## RM
 
 We provide a sample RM experiment that uses the [HelpSteer3 dataset](https://huggingface.co/datasets/nvidia/HelpSteer3) for preference-based training.
@@ -507,6 +523,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## Evaluation
 
@@ -590,7 +609,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
   at **either** one of the following places:
   1. Launch training with:
   ```sh

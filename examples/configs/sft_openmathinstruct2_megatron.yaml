@@ -92,6 +92,9 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
@@ -125,14 +128,6 @@ policy:
   optimizer: null
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "openmathinstruct2"
-  prompt_file: examples/prompts/math.txt
-  split: "train_1M"
-  add_bos: true
-  add_eos: true
-  add_generation_prompt: true
-  output_key: 'generated_solution'
   num_workers: 1
 
 logger:

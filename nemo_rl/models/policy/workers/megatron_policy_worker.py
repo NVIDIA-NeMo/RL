@@ -19,49 +19,19 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypedDict, TypeVar, cast
+from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
-from megatron.bridge import AutoBridge
-from megatron.bridge.models.model_provider import get_model
-from megatron.bridge.peft.lora import LoRA
-from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
-    checkpoint_exists,
-    init_checkpointing_context,
-    load_checkpoint,
     maybe_finalize_async_save,
     save_checkpoint,
 )
-from megatron.bridge.training.config import (
-    CheckpointConfig,
-    ConfigContainer,
-    DistributedDataParallelConfig,
-    LoggerConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    TokenizerConfig,
-    TrainingConfig,
-)
-from megatron.bridge.training.initialize import (
-    initialize_megatron,
-    set_jit_fusion_options,
-)
-from megatron.bridge.training.optim import setup_optimizer
-from megatron.bridge.training.setup import (
-    _create_peft_pre_wrap_hook,
-    _update_model_config_funcs,
-)
-from megatron.bridge.training.state import GlobalState
-from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
-from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
@@ -87,11 +57,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
@@ -116,53 +82,28 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
+from nemo_rl.models.megatron.config import MegatronGenerationConfig
+from nemo_rl.models.megatron.setup import (
+    finalize_megatron_setup,
+    handle_model_import,
+    setup_distributed,
+    setup_model_and_optimizer,
+    setup_reference_model_state,
+    validate_and_set_config,
+    validate_model_paths,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import (
-    configure_dynamo_cache,
-    get_megatron_checkpoint_dir,
-    get_runtime_env_for_policy_worker,
-)
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
-try:
-    from megatron.core.distributed import (
-        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
-    )
-
-    HAVE_FSDP2 = True
-except ImportError:
-    HAVE_FSDP2 = False
-
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-class MegatronGenerationConfig(TypedDict):
-    # Total GPU memory (in GB) allocated for KV cache buffers
-    buffer_size_gb: int
-    # Fraction of buffer reserved for guaranteed active requests
-    buffer_guaranteed_fraction: float
-    # Number of CUDA graphs to pre-compile for different batch sizes
-    num_cuda_graphs: int
-    # Size of each KV cache block in tokens (affects memory granularity)
-    block_size_tokens: int
-    # Enable CUDA graphs for prefill/context processing
-    use_cuda_graphs_for_non_decode_steps: bool
-    # Split long prefills into chunks for better memory management
-    enable_chunked_prefill: bool
-    # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-    unified_memory_level: int
-    # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens.
-    # Can cause OOM if set too high so should be tuned with buffer_size_gb if OOMing. If set too
-    # low, then will only do 512 tokens at a time, which can be slow.
-    max_tokens: int
 
 
 def broadcast_object_across_pp_ranks(obj):
@@ -218,273 +159,6 @@ def broadcast_object_across_pp_ranks(obj):
     return obj_list[0]
 
 
-def setup_megatron_model(
-    policy_cfg: PolicyConfig,
-    cfg: ConfigContainer,
-    load_optimizer: bool = True,
-    get_embedding_ranks=None,  # TODO @sahilj: What is this?
-    get_position_embedding_ranks=None,
-):
-    state = GlobalState()
-    state.cfg = cfg
-    # TODO: Freeze state.cfg
-
-    cfg.dist.external_gpu_device_mapping = True
-    initialize_megatron(
-        cfg=cfg,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-    )
-
-    if cfg.ft and cfg.ft.enable_ft_package:
-        fault_tolerance.setup(cfg, state)
-        fault_tolerance.maybe_setup_simulated_fault(cfg.ft)
-
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options(cfg.model, cfg.train.micro_batch_size)
-
-    # Adjust the startup time so it reflects the largest value.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    start_time_tensor = torch.tensor(
-        [state.start_time], dtype=torch.double, device="cuda"
-    )
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    state.start_time = start_time_tensor.item()
-
-    print(
-        "time to initialize megatron (seconds): {:.3f}".format(
-            time.time() - state.start_time
-        )
-    )
-    torch.distributed.barrier()
-
-    # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = init_checkpointing_context(cfg.checkpoint)
-
-    # Tokenizer
-    build_tokenizer(
-        cfg.tokenizer,
-        make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
-        // cfg.model.tensor_model_parallel_size,
-        tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
-        trust_remote_code=True,
-    )
-    assert cfg.model.vocab_size, "vocab size must be specified in model config"
-
-    torch.distributed.barrier()
-
-    pre_wrap_hook = []
-    mixed_precision_wrapper = Float16Module
-
-    use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
-
-    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-        if use_peft:
-            raise ValueError(
-                "Freezing the MOE router is not currently supported when using PEFT"
-            )
-
-        def freeze_moe_router(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
-                # Handle both wrapped (Float16Module) and unwrapped models
-                if isinstance(model_module, Float16Module):
-                    model_module = model_module.module
-                # Handle VLM models
-                if hasattr(model_module, "language_model"):
-                    model_module = model_module.language_model
-                for layer in model_module.decoder.layers:
-                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
-                        layer.mlp.router.weight.requires_grad = False
-
-        mixed_precision_wrapper = CustomFloat16Module
-        pre_wrap_hook.extend([freeze_moe_router])
-
-    if use_peft:
-        peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
-        peft = LoRA(
-            target_modules=peft_cfg["target_modules"],
-            exclude_modules=peft_cfg["exclude_modules"],
-            dim=peft_cfg["dim"],
-            alpha=peft_cfg["alpha"],
-            dropout=peft_cfg["dropout"],
-            dropout_position=peft_cfg["dropout_position"],
-            lora_A_init_method=peft_cfg["lora_A_init_method"],
-            lora_B_init_method=peft_cfg["lora_B_init_method"],
-            a2a_experimental=peft_cfg["a2a_experimental"],
-            lora_dtype=peft_cfg["lora_dtype"],
-        )
-    else:
-        peft = None
-    cfg.peft = peft
-
-    if cfg.peft is not None:
-        pre_peft_hook = _create_peft_pre_wrap_hook(cfg, state)
-        cfg.model.register_pre_wrap_hook(pre_peft_hook)
-
-        def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
-            model = pre_peft_hook(model)
-            return model
-
-        pre_wrap_hook.extend([composed_peft_hook])
-
-    # Model, optimizer, and learning rate.
-    model = get_model(
-        cfg.model,
-        cfg.ddp,
-        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-    )
-
-    if load_optimizer:
-        optimizer, scheduler = setup_optimizer(
-            optimizer_config=cfg.optimizer,
-            scheduler_config=cfg.scheduler,
-            model=model,
-            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-        )
-    else:
-        optimizer = None
-        scheduler = None
-
-    print("Model, optimizer, and learning rate scheduler built")
-    torch.distributed.barrier()
-    if cfg.peft is not None:
-        should_load_checkpoint = cfg.checkpoint.load is not None and checkpoint_exists(
-            cfg.checkpoint.load
-        )
-        if should_load_checkpoint:
-            # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
-            # This is switched off here in order to load these states from the checkpoint
-            cfg.checkpoint.finetune = False
-    else:
-        should_load_checkpoint = (
-            cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load)
-        ) or (
-            cfg.checkpoint.pretrained_checkpoint is not None
-            and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
-        )
-
-    if should_load_checkpoint:
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
-        )
-        print("Checkpoint loaded")
-    torch.distributed.barrier()
-
-    return state, model, optimizer, scheduler, checkpointing_context
-
-
-def destroy_parallel_state():
-    """Safely destroy parallel state and reset async call tracking.
-
-    This function is called during initialization to clean up temporary distributed
-    state from model import operations. Resetting async call tracking ensures that
-    when the main Megatron distributed context is created, all ranks start with
-    consistent call_idx values for async checkpointing.
-    """
-    if torch.distributed.is_initialized():
-        try:
-            torch.distributed.barrier()
-            torch.distributed.destroy_process_group()
-        except:
-            pass  # Ignore errors if already destroyed
-    if hasattr(parallel_state, "destroy_model_parallel"):
-        try:
-            parallel_state.destroy_model_parallel()
-        except:
-            pass  # Ignore errors if already destroyed
-
-    # Reset async calls queue to prevent call_idx mismatches after distributed context recreation
-    try:
-        import nemo.tron.utils.async_utils as nemo_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(nemo_async_utils._async_calls_queue, "call_idx", None)
-        num_unfinalized = (
-            nemo_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            nemo_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the global async calls queue by creating a new instance
-        nemo_async_utils._async_calls_queue = AsyncCallsQueue()
-        print(f"[DEBUG] Reset NeMo async calls queue (old call_idx: {old_call_idx})")
-    except ImportError:
-        pass
-
-    # Also reset the Megatron async calls queue if it exists
-    try:
-        import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(
-            megatron_async_utils._async_calls_queue, "call_idx", None
-        )
-        num_unfinalized = (
-            megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            megatron_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
-        print(
-            f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
-        )
-    except ImportError:
-        pass
-
-    # Reset the third global async_calls instance in base strategy module
-    try:
-        import megatron.core.dist_checkpointing.strategies.base as base_strategy
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up and reset the global async_calls in base strategy
-        old_call_idx = getattr(base_strategy.async_calls, "call_idx", None)
-        num_unfinalized = base_strategy.async_calls.get_num_unfinalized_calls()
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting base strategy async_calls with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            base_strategy.async_calls.close()
-        except:
-            pass
-        base_strategy.async_calls = AsyncCallsQueue()
-        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
-    except ImportError:
-        pass
-
-
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -509,471 +183,100 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         *,
         worker_sharding_annotations: NamedSharding,
-        pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        """Initialize the MegatronPolicyWorker."""
+        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
-        self.is_generation_colocated = None
-        if "generation" in config and config["generation"] is not None:
-            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
-
-        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-        if not self.is_generation_colocated:
-            os.environ["NCCL_CUMEM_ENABLE"] = "1"
-
         self.cfg = config
-        dtype_map = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-        }
-        self.dtype = dtype_map[self.cfg["precision"]]
 
-        self.optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
-            "optimizer_cpu_offload"
-        ]
-        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
-
-        # Reward models are not yet supported with Megatron.
-        if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
-            raise NotImplementedError(
-                "Reward models are not yet supported with the Megatron backend, this issue is "
-                "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
-            )
-
-        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
-        # with different order of node_bundles
-        configure_dynamo_cache()
-
-        # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
-        # check if hf_model_name is a path
-        hf_model_name = self.cfg["model_name"]
-        # Check if the checkpoint already exists
-        hf_model_subdir = hf_model_name
-        if os.path.exists(hf_model_name):
-            hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
-
-        pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
-        pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-            os.path.join(pretrained_path, "iter_0000000")
-        )
-
-        # Ensure clean slate before import
-        destroy_parallel_state()
-
-        # Set for rank for non-collocated to check which ranks to broadcast from
+        # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
-        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-        torch.distributed.init_process_group("nccl")
-        if pt_checkpoint_exists:
-            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
-        else:
-            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
-            import_model_from_hf_name(
-                hf_model_name,
-                pretrained_path,
-                self.cfg["megatron_cfg"],
-                **hf_config_overrides,
-            )
 
-            if parallel_state.model_parallel_is_initialized():
-                print("Reinitializing model parallel after loading model state.")
-                parallel_state.destroy_model_parallel()
+        # Step 1: Setup distributed
+        setup_distributed()
 
-        pretrained_run_config = os.path.join(
-            pretrained_path, "iter_0000000/run_config.yaml"
+        # Step 2: Validate and setup model paths
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+        # Handle model import if needed
+        handle_model_import(
+            config, hf_model_name, pretrained_path, pt_checkpoint_exists
         )
 
+        # Store tokenizer
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if not os.path.exists(pretrained_run_config):
-            raise FileNotFoundError(
-                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. Please check "
-            )
+        # Step 3: Setup model configuration
+        runtime_config = validate_and_set_config(
+            config,
+            self.rank,
+            hf_model_name,
+            pretrained_path,
+            weights_path,
+            tokenizer,
+        )
 
-        try:
-            cfg_from_pretrained = ConfigContainer.from_yaml(
-                pretrained_run_config, mode=InstantiationMode.STRICT
-            )
-        except Exception as e:
-            # Add helpful context as a note to the exception
-            e.add_note(
-                f"\n{'=' * 80}\n"
-                f"NOTE: A common cause of this error is when the HF->mcore converted checkpoint is\n"
-                f"created with an older version of megatron-bridge.\n"
-                f"If this checkpoint is old or was generated by a different code version,\n"
-                f"try deleting it and rerunning the code.\n"
-                f"The checkpoint will be automatically regenerated with the current version.\n\n"
-                f"Checkpoint location: {pretrained_path}\n"
-                f"{'=' * 80}"
-            )
-            raise
-        model_cfg = cfg_from_pretrained.model
-        cfg_from_pretrained.logger = LoggerConfig()
+        self.megatron_cfg = runtime_config.megatron_cfg
+        self.dtype = runtime_config.dtype
+        self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
+        self.offload_optimizer_for_logprob = (
+            runtime_config.offload_optimizer_for_logprob
+        )
+        self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
-        model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
-            "tensor_model_parallel_size"
-        ]
-        model_cfg.pipeline_model_parallel_size = self.cfg["megatron_cfg"][
-            "pipeline_model_parallel_size"
-        ]
-        model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
-            "num_layers_in_first_pipeline_stage"
-        ]
-        model_cfg.num_layers_in_last_pipeline_stage = self.cfg["megatron_cfg"][
-            "num_layers_in_last_pipeline_stage"
-        ]
-        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
-        model_cfg.context_parallel_size = self.cfg["megatron_cfg"][
-            "context_parallel_size"
-        ]
-        if model_cfg.context_parallel_size > 1:
-            assert self.cfg["sequence_packing"]["enabled"], (
-                "Sequence Packing must be enabled to use Context Parallelism with MCore"
-            )
-        model_cfg.expert_tensor_parallel_size = self.cfg["megatron_cfg"][
-            "expert_tensor_parallel_size"
-        ]
-        model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
-            "expert_model_parallel_size"
-        ]
-
-        # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
-        # especially when using many experts.
-        model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
-
-        # The below two configs (and "freeze_moe_router") are used to stabilize moe training
-        # by preventing updates to the moe router. We found that this is helpful in reducing
-        # logprob error during training.
-
-        # Set this to "none" to disable load balancing loss.
-        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
-            "moe_router_load_balancing_type"
-        ]
-        # Set this to 0.0 to disable updates to the moe router expert bias
-        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
-            "moe_router_bias_update_rate"
-        ]
-
-        model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
-        if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
-            model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
-
-        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
-        model_cfg.bf16 = self.dtype == torch.bfloat16
-        model_cfg.fp16 = self.dtype == torch.float16
-        if model_cfg.fp16:
-            assert not model_cfg.bf16, "fp16 and bf16 cannot be used together"
-            model_cfg.params_dtype = torch.float16
-        elif model_cfg.bf16:
-            assert not model_cfg.fp16, "fp16 and bf16 cannot be used together"
-            model_cfg.params_dtype = torch.bfloat16
-        else:
-            model_cfg.params_dtype = torch.float32
-        model_cfg.pipeline_dtype = dtype_map[self.cfg["megatron_cfg"]["pipeline_dtype"]]
-        model_cfg.parallel_output = True
-        if self.cfg["megatron_cfg"]["activation_checkpointing"]:
-            model_cfg.recompute_granularity = "full"
-            model_cfg.recompute_method = "uniform"
-            model_cfg.recompute_num_layers = 1
-        if not model_cfg.gated_linear_unit:
-            assert model_cfg.activation_func is not None, (
-                "activation_func must be set if not using gated_linear_unit. This likely "
-                "indicates an issue in configuration conversion (e.g. activation func was "
-                "a lambda and couldn't be serialized). This is based on this check "
-                "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
-            )
-        model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
-        model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
-            "bias_activation_fusion"
-        ]
-        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
-        self.fp8_cfg = fp8_cfg
-        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
-            try:
-                model_cfg.fp8 = fp8_cfg["fp8"]
-                model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
-                model_cfg.fp8_param = fp8_cfg["fp8_param"]
-            except KeyError as e:
-                raise KeyError(f"Missing key in fp8_cfg: {e}")
-            if model_cfg.fp8_param:
-                warnings.warn(
-                    "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
-                    "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
-                )
-
-        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
-            "optimizer_cpu_offload"
-        ]
-        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"][
-            "optimizer_offload_fraction"
-        ]
-        if optimizer_cpu_offload:
-            # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-            # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-            assert optimizer_offload_fraction == 1.0, (
-                "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
-            )
-        if (
-            "logprob_chunk_size" in self.cfg
-            and self.cfg["logprob_chunk_size"] is not None
-            and self.cfg["logprob_chunk_size"] > 0
-        ):
-            assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
-                "defer_fp32_logits must be True if logprob_chunk_size is set"
-            )
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
-        ) and (model_cfg.fp16 or model_cfg.bf16)
+        ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
-        checkpoint_config = CheckpointConfig(
-            save_interval=100,
-            save=weights_path,
-            load=weights_path,
-            pretrained_checkpoint=pretrained_path,  # This is the path to the pretrained ckpt for the SFT case
-            async_save=False,  # This doesn't work right now.
-            fully_parallel_save=True,
-            fully_parallel_load=True,  # Enable fully parallel load
-            load_rng=False,
-        )
-        ref_checkpoint_config = CheckpointConfig(
-            pretrained_checkpoint=pretrained_path,  # This is the path to the pretrained ckpt for the SFT case
-            save=None,
-            load=None,
-            fully_parallel_load=True,  # Enable fully parallel load
-            load_rng=False,
-        )
+        # Store FP8 config for later use
+        self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
 
-        assert "train_iters" in self.cfg["megatron_cfg"], (
-            "train_iters must be set in megatron_cfg. For an example, see "
-            "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
-        )
-
-        ## These settings are required for correct gradient computations in mcore
-        ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
-        ## so we handle the scaling in nemo-rl.
-        ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
-        ## on the TP-sharded parameters.
-        model_cfg.calculate_per_token_loss = True
-        model_cfg.perform_initialization = True
-
-        assert (
-            "aux_loss" not in model_cfg.moe_router_load_balancing_type
-            or model_cfg.moe_aux_loss_coeff == 0
-        ), (
-            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-        )
-
-        self.megatron_cfg = ConfigContainer(
-            model=model_cfg,
-            checkpoint=checkpoint_config,
-            logger=LoggerConfig(logging_level=0),
-            train=TrainingConfig(
-                micro_batch_size=1,  # ignored
-                global_batch_size=self.cfg["train_global_batch_size"],  # ignored
-                train_iters=self.cfg["megatron_cfg"][
-                    "train_iters"
-                ],  # Set by algorithm setup
-            ),
-            optimizer=OptimizerConfig(
-                **self.cfg["megatron_cfg"]["optimizer"],
-            ),
-            ddp=DistributedDataParallelConfig(
-                check_for_nan_in_grad=True,
-                grad_reduce_in_fp32=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["grad_reduce_in_fp32"],
-                overlap_grad_reduce=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["overlap_grad_reduce"],
-                overlap_param_gather=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["overlap_param_gather"],
-                # we need to set average_in_collective=False with calculate_per_token_loss=True.
-                # otherwise, mcore throws an assertion error.
-                average_in_collective=False,
-                use_distributed_optimizer=self.cfg["megatron_cfg"]["optimizer"][
-                    "use_distributed_optimizer"
-                ],
-                data_parallel_sharding_strategy=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["data_parallel_sharding_strategy"],
-            ),
-            scheduler=SchedulerConfig(
-                **self.cfg["megatron_cfg"]["scheduler"],
-            ),
-            dataset=None,
-            tokenizer=TokenizerConfig(
-                tokenizer_type="HuggingFaceTokenizer",
-                tokenizer_model=hf_model_name,
-            ),
-        )
-        # TODO: this validation should happen inside mbridge: https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/1665
-        if self.dtype == torch.bfloat16:
-            assert self.megatron_cfg.model.bf16 == True, (
-                "policy.megatron_cfg.model.bf16=True must be set if policy.precision=bfloat16. This is handled by nemo-rl so this indicates something is misconfigured."
-            )
-            assert (
-                self.megatron_cfg.optimizer.use_precision_aware_optimizer == False
-                or self.megatron_cfg.optimizer.bf16 == True
-            ), (
-                "policy.megatron_cfg.optimizer.bf16=True must be set if policy.precision=bfloat16 when using use_precision_aware_optimizer=True"
-            )
-        elif self.dtype == torch.float16:
-            assert self.megatron_cfg.model.fp16 == True, (
-                "policy.megatron_cfg.model.fp16=True must be set if policy.precision=float16. This is handled by nemo-rl so this indicates something is misconfigured."
-            )
-            assert (
-                self.megatron_cfg.optimizer.use_precision_aware_optimizer == False
-                or self.megatron_cfg.optimizer.fp16 == True
-            ), (
-                "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16 when using use_precision_aware_optimizer=True"
-            )
-        elif self.dtype == torch.float32:
-            assert (
-                self.megatron_cfg.model.bf16 == False
-                and self.megatron_cfg.model.fp16 == False
-            ), (
-                "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
-            )
-            assert (
-                self.megatron_cfg.optimizer.bf16 == False
-                and self.megatron_cfg.optimizer.fp16 == False
-            ), (
-                "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
-            )
+        # Validate configuration
         self.megatron_cfg.validate()
-        (
-            self.mcore_state,
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.checkpointing_context,
-        ) = setup_megatron_model(
-            policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
+
+        # Step 4: Setup Megatron model and components
+        model_and_optimizer_state = setup_model_and_optimizer(
+            config, self.megatron_cfg, init_optimizer
         )
 
-        # Set the param sync function for the model
-        if (
-            self.megatron_cfg.ddp.overlap_param_gather
-            and self.megatron_cfg.ddp.align_param_gather
-        ):
-            self.megatron_cfg.param_sync_func = [
-                model_chunk.start_param_sync for model_chunk in self.model
-            ]
-            if len(self.model) == 1:
-                self.megatron_cfg.param_sync_func = self.megatron_cfg.param_sync_func[0]
+        self.mcore_state = model_and_optimizer_state.state
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.checkpointing_context = model_and_optimizer_state.checkpointing_context
+        param_sync_func = model_and_optimizer_state.param_sync_func
 
-        self.model = self.model[0]  # Get the first model from the list
+        # Set the param sync function for the model if needed
+        if param_sync_func is not None:
+            self.megatron_cfg.param_sync_func = param_sync_func
 
+        # Step 5: Setup reference model if needed
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
-            ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
-
-            # Create a separate megatron config for the reference model with the correct checkpoint config
-            ref_megatron_cfg = ConfigContainer(
-                model=self.megatron_cfg.model,
-                checkpoint=ref_checkpoint_config,  # Use the reference checkpoint config
-                logger=self.megatron_cfg.logger,
-                train=self.megatron_cfg.train,
-                optimizer=self.megatron_cfg.optimizer,
-                ddp=self.megatron_cfg.ddp,
-                scheduler=self.megatron_cfg.scheduler,
-                dataset=self.megatron_cfg.dataset,
-                tokenizer=self.megatron_cfg.tokenizer,
+            self.reference_state_dict = setup_reference_model_state(
+                config, self.megatron_cfg, pretrained_path
             )
-
-            # Create a separate state object for the reference model
-            ref_state = GlobalState()
-            ref_state.cfg = ref_megatron_cfg
-
-            # Configure mixed precision wrapper for reference model
-            ref_mixed_precision_wrapper = Float16Module
-            if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
-                ref_mixed_precision_wrapper = CustomFloat16Module
-
-            reference_model = get_model(
-                self.megatron_cfg.model,
-                self.megatron_cfg.ddp,
-                use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
-                overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
-                mixed_precision_wrapper=ref_mixed_precision_wrapper,
-            )
-            print("Loading the Reference Model")
-            if (
-                ref_checkpoint_config.pretrained_checkpoint is not None
-                and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
-            ):
-                load_checkpoint(
-                    ref_state,  # Use the separate state object with ref checkpoint config
-                    reference_model,
-                    None,  # no optimizer
-                    None,  # no scheduler
-                    checkpointing_context=ref_ckpt_context,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and self.megatron_cfg.dist.use_torch_fsdp2,
-                )
-                reference_model = reference_model[0]
-                reference_model.eval()
-                self.reference_state_dict = {}
-                for name, item in reference_model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        cpu_item = item.detach().to(
-                            device="cpu", non_blocking=True, copy=True
-                        )
-                        del item
-                    else:
-                        cpu_item = item
-                    self.reference_state_dict[name] = cpu_item
-                print("Reference model loaded")
-            else:
-                print("Reference model not loaded")
-
             self.model = self.move_model(self.model, "cuda")
 
-        _update_model_config_funcs(
-            [self.model],
-            self.megatron_cfg.model,
-            self.megatron_cfg.ddp,
+        # Step 6: Finalize setup
+        (
+            self.megatron_tokenizer,
+            self.megatron_bridge,
+            self.should_disable_forward_pre_hook,
+            self.dp_size,
+        ) = finalize_megatron_setup(
+            config,
+            self.megatron_cfg,
+            hf_model_name,
+            worker_sharding_annotations,
+            self.model,
             self.optimizer,
-            align_grad_reduce=self.megatron_cfg.dist.align_grad_reduce,
-        )
-
-        tokenizer_config = TokenizerConfig(
-            tokenizer_type="HuggingFaceTokenizer",
-            tokenizer_model=hf_model_name,
-        )
-
-        self.megatron_tokenizer = build_tokenizer(
-            tokenizer_config,
-            make_vocab_size_divisible_by=self.megatron_cfg.model.make_vocab_size_divisible_by
-            // self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
-            tensor_model_parallel_size=self.cfg["megatron_cfg"][
-                "tensor_model_parallel_size"
-            ],
-            trust_remote_code=True,
-        )
-        self.final_padded_vocab_size = calculate_padded_vocab_size(
-            self.megatron_cfg.model.vocab_size,
-            self.megatron_cfg.model.make_vocab_size_divisible_by,
-            self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
-        )
-        self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-        self.megatron_bridge = AutoBridge.from_hf_pretrained(
-            hf_model_name, trust_remote_code=True
-        )
-
-        self.should_disable_forward_pre_hook = (
-            self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
-            and self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
-                "overlap_param_gather"
-            ]
         )
 
         # vars used for refit
@@ -982,9 +285,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # [(mcore_param_name, estimated_memory), ...]
         # Note: here param name is local param name, with local layer number and
         # local expert id etc.
-        self.refit_conversion_tasks = (
-            None  # Meta data for conversion params from megatron bridge
-        )
+        self.refit_conversion_tasks = None
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
 
@@ -2715,40 +2016,3 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
-
-
-class CustomFloat16Module(Float16Module):
-    """Float 16 Module.
-
-    Attributes:
-        config (TransformerConfig): Transformer config
-        fp16 (bool) : Specifies if the model runs in fp16 mode
-        bf16 (bool) : Specifies if the model runs in bf16 mode
-
-    Args:
-        config (TransformerConfig): The transformer config used to initalize the model
-    """
-
-    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
-        super(CustomFloat16Module, self).__init__(config, module)
-        self.re_enable_float32_expert_bias()
-
-    def re_enable_float32_expert_bias(self) -> None:
-        """Ensure MoE router expert bias stays in float32 for numerical stability.
-
-        Walks the wrapped module to find MoE routers and invokes the
-        `_maintain_float32_expert_bias()` helper which recreates or casts the
-        expert bias tensors to float32 as required by Megatron-LM.
-        """
-        module = self.module
-        # Handle VLM models where language model is nested
-        if hasattr(module, "language_model"):
-            module = module.language_model
-        if hasattr(module, "decoder") and hasattr(module.decoder, "layers"):
-            for layer in module.decoder.layers:
-                mlp = getattr(layer, "mlp", None)
-                router = getattr(mlp, "router", None) if mlp is not None else None
-                if router is not None and hasattr(
-                    router, "_maintain_float32_expert_bias"
-                ):
-                    router._maintain_float32_expert_bias()
