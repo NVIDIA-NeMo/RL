@@ -981,8 +981,15 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    is_validation: bool = False,
+    num_generations_per_prompt: Optional[int] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    if is_validation:
+        do_on_policy_fixes = policy_generation.prepare_http_server_for_validation()
+    else:
+        do_on_policy_fixes = policy_generation.prepare_http_server_for_training()
+
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
 
@@ -1021,13 +1028,14 @@ def run_async_nemo_gym_rollout(
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
 
+        # This is used later down the line to sort the Gym rollout results.
         row["_rowidx"] = rowidx
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
         results, rollout_loop_timing_metrics = ray.get(
             nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
+                nemo_gym_rows, tokenizer, timer_prefix, do_on_policy_fixes
             )
         )
 
@@ -1092,9 +1100,14 @@ def run_async_nemo_gym_rollout(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
+        agent_to_rowidxs: dict[str, list[int]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
             agent_name = nemo_gym_row["agent_ref"]["name"]
             agent_to_results[agent_name].append(result["full_result"])
+
+            # We assume that the order of results returned by the run_rollouts logic above matches that of the input i.e. they are sorted.
+            # This is also leveraged downstream in the group-level metric calculations
+            agent_to_rowidxs[agent_name].append(nemo_gym_row["_rowidx"])
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1111,6 +1124,61 @@ def run_async_nemo_gym_rollout(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
+
+            if num_generations_per_prompt is not None:
+                agent_rowidxs = agent_to_rowidxs[agent_name]
+
+                group_level_rewards = []
+                assert len(agent_results) % num_generations_per_prompt == 0, (
+                    f"The number of rollouts `{len(agent_results)}` for agent `{agent_name}` isn't divisible by the number of generations per prompt `{num_generations_per_prompt}`"
+                )
+                for start_idx in range(
+                    0, len(agent_results), num_generations_per_prompt
+                ):
+                    group_full_results = agent_results[
+                        start_idx : start_idx + num_generations_per_prompt
+                    ]
+                    group_row_idxs = agent_rowidxs[
+                        start_idx : start_idx + num_generations_per_prompt
+                    ]
+
+                    # Check that the row_idxs are aligned properly
+                    assert min(group_row_idxs) % num_generations_per_prompt == 0, (
+                        group_row_idxs
+                    )
+                    assert (
+                        max(group_row_idxs) + 1
+                    ) % num_generations_per_prompt == 0, group_row_idxs
+
+                    # Check that the row_idxs are contiguous
+                    assert set(group_row_idxs) == set(
+                        range(min(group_row_idxs), max(group_row_idxs) + 1)
+                    ), group_row_idxs
+
+                    group_rewards = [r["reward"] for r in group_full_results]
+                    group_level_rewards.append(
+                        sum(group_rewards) / num_generations_per_prompt
+                    )
+
+                # Calculate mixed rewards. This logic currently only works with 0/1 binary rewards.
+                per_agent_metrics[f"{agent_name}/group_level_reward/histogram"] = (
+                    Histogram(group_level_rewards)
+                )
+                per_agent_metrics[f"{agent_name}/group_level_reward/pct_0"] = (
+                    100
+                    * sum(r == 0 for r in group_level_rewards)
+                    / len(group_level_rewards)
+                )
+                per_agent_metrics[f"{agent_name}/group_level_reward/pct_1"] = (
+                    100
+                    * sum(r == 1 for r in group_level_rewards)
+                    / len(group_level_rewards)
+                )
+                per_agent_metrics[f"{agent_name}/group_level_reward/pct_mixed"] = (
+                    100
+                    - per_agent_metrics[f"{agent_name}/group_level_reward/pct_0"]
+                    - per_agent_metrics[f"{agent_name}/group_level_reward/pct_1"]
+                )
 
             # Log the full result
             to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
