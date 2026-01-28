@@ -46,6 +46,10 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.data import (
+    get_microbatch_iterator,
+    process_global_batch,
+)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
