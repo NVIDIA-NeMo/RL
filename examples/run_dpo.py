@@ -17,18 +17,10 @@ import os
 import pprint
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.dpo import MasterConfig, dpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import (
-    AllTaskProcessedDataset,
-    load_preference_dataset,
-    update_single_dataset_config,
-)
-from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
-from nemo_rl.data.processors import preference_preprocessor
+from nemo_rl.data.utils import setup_preference_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -45,72 +37,6 @@ def parse_args():
     args, overrides = parser.parse_known_args()
 
     return args, overrides
-
-
-# =======================================================
-# Data Processing
-# =======================================================
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
-    print("\n▶ Setting up data...")
-    # setup train dataset
-    if "default" in data_config:
-        update_single_dataset_config(data_config["train"], data_config["default"])
-    data = load_preference_dataset(data_config["train"])
-    task_data_processors = {data.task_name: (data.task_spec, preference_preprocessor)}
-
-    dataset = AllTaskProcessedDataset(
-        data.dataset,
-        tokenizer,
-        None,
-        task_data_processors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
-
-    # setup validation dataset
-    # TODO @yukih: unify the code when support multiple datasets for other algorithms
-    val_dataset = {}
-    if "val_data_paths" in data_config and data_config["val_data_paths"]:
-        assert isinstance(data_config["val_data_paths"], dict), (
-            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
-        )
-        val_data_paths = data_config["val_data_paths"]
-
-        for val_dataset_name, val_dataset_path in val_data_paths.items():
-            assert val_dataset_name not in val_dataset
-            val_data = PreferenceDataset(val_dataset_path)
-            print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.dataset)} samples."
-            )
-            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
-                val_data.dataset,
-                tokenizer,
-                val_data.task_spec,
-                preference_preprocessor,
-                max_seq_length=data_config["max_input_seq_length"],
-            )
-    elif "validation" in data_config and data_config["validation"] is not None:
-        if "default" in data_config:
-            update_single_dataset_config(
-                data_config["validation"], data_config["default"]
-            )
-        val_data = load_preference_dataset(data_config["validation"])
-        val_task_data_processors = {
-            val_data.task_name: (val_data.task_spec, preference_preprocessor)
-        }
-
-        val_dataset["default"] = AllTaskProcessedDataset(
-            val_data.dataset,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-        print(
-            f"  ✓ Validation dataset loaded with {len(val_dataset['default'])} samples."
-        )
-
-    return dataset, val_dataset
 
 
 def main():
@@ -147,7 +73,7 @@ def main():
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
     # setup data
-    dataset, val_dataset = setup_data(tokenizer, config["data"])
+    dataset, val_dataset = setup_preference_data(tokenizer, config["data"])
 
     (
         policy,
