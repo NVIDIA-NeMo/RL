@@ -485,22 +485,6 @@ def setup_model_and_optimizer(
     else:
         model = distributed_manager.parallelize(model)
 
-    if lora_enabled:
-        # If the model uses quantized weights, we want to use orig_linear's forward
-        try:
-            import bitsandbytes as bnb
-        except Exception:  # pragma: no cover - optional dependency
-            bnb = None
-
-        if bnb is not None:
-            quant_state_cls = bnb.functional.QuantState
-            for module in model.modules():
-                if (
-                    getattr(module, "quant_state", None) is not None
-                    and module.quant_state.__class__ == quant_state_cls
-                ):
-                    assert False, "Quantized modules are not supported with LoRA"
-
     print(model)
 
     # Set model state dict keys in checkpoint manager

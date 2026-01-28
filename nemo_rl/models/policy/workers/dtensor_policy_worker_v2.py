@@ -69,7 +69,6 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
-    apply_lora_linear_forward_patch,
     apply_torch_aten_alias_tensor_patch,
     apply_transformer_engine_patch,
 )
@@ -222,8 +221,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         apply_transformer_engine_patch()
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
         apply_torch_aten_alias_tensor_patch()
-        # Apply patch to LinearLoRA forward to use merged weights instead of sequential layers
-        apply_lora_linear_forward_patch()
 
         # Store configuration and tokenizer/processor
         self.cfg = config
