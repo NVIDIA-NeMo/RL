@@ -564,7 +564,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using the policy."""
+        """Generate a batch of data using the policy.
+        
+        For coordinator-based inference (Megatron backend), all data is sent to DP rank 0
+        only, which submits requests to the coordinator. The coordinator then distributes
+        work across all DP engines. Other DP ranks participate in the engine loop but
+        don't receive input data directly.
+        """
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -573,14 +579,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        # For coordinator-based inference: send ALL data to DP rank 0 only.
+        # Other DP ranks are called with data=None but still participate in the
+        # inference engine loop. The coordinator handles load balancing across DP ranks.
+        # 
+        # With in_sharded_axes=[] and data_parallel not in replicate_on_axes,
+        # data_parallel becomes a "free axis". Only workers at DP coord 0 receive data,
+        # while workers at other DP coords get None (via make_dummy_calls_to_free_axes).
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
+            data=data,  # Full data goes to DP=0 only (free axis behavior)
+            in_sharded_axes=[],  # No sharding - data_parallel is a "free axis"
             replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=[
+                "data_parallel",  # Only DP rank 0 returns results
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            make_dummy_calls_to_free_axes=True,  # Call all DP ranks, but only DP=0 gets data
             common_kwargs={"greedy": greedy},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
