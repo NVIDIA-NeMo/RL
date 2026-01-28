@@ -221,6 +221,71 @@ class TestGetMicrobatchIterator:
         # Verify all_reduce was called to synchronize batch counts
         mock_all_reduce.assert_called_once()
 
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_sequence_packing_with_dummy_batches(self, mock_all_reduce, mock_tokenizer):
+        """Test sequence packing with dummy batches when local batch count < max batch count."""
+        # Create test data
+        batch1 = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "input_lengths": torch.tensor([64, 80, 90, 100]),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)),
+                "input_lengths": torch.tensor([64, 80, 90, 100]),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+
+        # Create a call counter for the iterator
+        call_count = [0]
+
+        def make_iterator():
+            call_count[0] += 1
+            return iter([batch1])
+
+        # Mock the microbatch iterator methods
+        data.make_microbatch_iterator_for_packable_sequences = MagicMock(
+            side_effect=make_iterator
+        )
+        data.get_microbatch_iterator_for_packable_sequences_len = MagicMock(
+            return_value=(1, 100)  # Local rank has only 1 batch
+        )
+
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
+        }
+        mbs = 4
+        mock_dp_mesh = MagicMock()
+
+        # Mock the all_reduce to simulate max_batch_ct = 3 across all ranks
+        # This means local rank needs 2 dummy batches
+        def side_effect(tensor, *args, **kwargs):
+            tensor[0] = 3  # Simulate max batch count > local count
+
+        mock_all_reduce.side_effect = side_effect
+
+        processed_iterator, iterator_len = get_microbatch_iterator(
+            data=data,
+            cfg=cfg,
+            mbs=mbs,
+            dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+            cp_size=1,
+        )
+
+        # Verify local iterator_len is still 1 (not modified)
+        assert iterator_len == 1
+
+        # Verify make_microbatch_iterator_for_packable_sequences was called twice
+        # (once for main iterator, once for dummy iterator)
+        assert data.make_microbatch_iterator_for_packable_sequences.call_count == 2
+
 
 @pytest.mark.automodel
 class TestProcessMicrobatch:
@@ -476,6 +541,105 @@ class TestProcessMicrobatch:
                 cfg=cfg,
                 cp_size=cp_size,
             )
+
+
+@pytest.mark.automodel
+class TestProcessedInputsProperties:
+    """Test ProcessedInputs dataclass properties."""
+
+    def test_has_context_parallel_true(self):
+        """Test has_context_parallel returns True when cp_buffers is non-empty."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            cp_buffers=[torch.randn(2, 64), torch.randn(2, 64)],
+        )
+        assert processed_inputs.has_context_parallel is True
+
+    def test_has_context_parallel_false(self):
+        """Test has_context_parallel returns False when cp_buffers is empty."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            cp_buffers=[],
+        )
+        assert processed_inputs.has_context_parallel is False
+
+    def test_has_context_parallel_default(self):
+        """Test has_context_parallel returns False by default."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+        )
+        assert processed_inputs.has_context_parallel is False
+
+    def test_has_flash_attention_true_with_dict(self):
+        """Test has_flash_attention returns True when flash_attn_kwargs has data."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            flash_attn_kwargs={"cu_seqlens": torch.tensor([0, 32, 64])},
+        )
+        assert processed_inputs.has_flash_attention is True
+
+    def test_has_flash_attention_false_with_empty_dict(self):
+        """Test has_flash_attention returns False when flash_attn_kwargs is empty."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            flash_attn_kwargs={},
+        )
+        assert processed_inputs.has_flash_attention is False
+
+    def test_has_flash_attention_default(self):
+        """Test has_flash_attention returns False by default."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+        )
+        assert processed_inputs.has_flash_attention is False
+
+    def test_is_multimodal_true(self):
+        """Test is_multimodal returns True when vlm_kwargs has data."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            vlm_kwargs={"pixel_values": torch.randn(2, 3, 224, 224)},
+        )
+        assert processed_inputs.is_multimodal is True
+
+    def test_is_multimodal_false_with_empty_dict(self):
+        """Test is_multimodal returns False when vlm_kwargs is empty."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            vlm_kwargs={},
+        )
+        assert processed_inputs.is_multimodal is False
+
+    def test_is_multimodal_default(self):
+        """Test is_multimodal returns False by default."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+        )
+        assert processed_inputs.is_multimodal is False
+
+    def test_combined_properties(self):
+        """Test all properties together on a fully configured ProcessedInputs."""
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            attention_mask=torch.ones(2, 64, dtype=torch.bool),
+            position_ids=torch.arange(64).unsqueeze(0).expand(2, -1),
+            flash_attn_kwargs={"cu_seqlens": torch.tensor([0, 32, 64])},
+            vlm_kwargs={"pixel_values": torch.randn(2, 3, 224, 224)},
+            cp_buffers=[torch.randn(2, 64)],
+            seq_index=torch.arange(64).unsqueeze(0),
+        )
+        assert processed_inputs.has_context_parallel is True
+        assert processed_inputs.has_flash_attention is True
+        assert processed_inputs.is_multimodal is True
 
 
 @pytest.mark.automodel
@@ -749,6 +913,86 @@ class TestMakeProcessedMicrobatchIterator:
         for processed_mb in processed_mbs:
             assert processed_mb.original_seq_len == 32
 
+    @patch("nemo_rl.models.automodel.data.pack_sequences")
+    @patch("nemo_rl.models.automodel.data.get_flash_attention_kwargs")
+    def test_with_sequence_packing_enabled(
+        self, mock_get_flash_attn, mock_pack_sequences, mock_tokenizer
+    ):
+        """Test iteration with sequence packing enabled via config."""
+        input_ids = torch.randint(0, 1000, (4, 64))
+        input_lengths = torch.tensor([32, 48, 60, 64])
+        batch = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch])
+        cfg = {
+            "sequence_packing": {"enabled": True, "train_mb_tokens": 256},
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        # Mock pack_sequences to return packed inputs
+        packed_input_ids = torch.randint(0, 1000, (1, 204))
+        packed_position_ids = torch.arange(204).unsqueeze(0)
+        mock_pack_sequences.return_value = (packed_input_ids, packed_position_ids, None)
+
+        # Mock flash attention kwargs
+        mock_get_flash_attn.return_value = {
+            "cu_seqlens": torch.tensor([0, 32, 80, 140, 204])
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mbs = list(processed_iterator)
+
+        # Verify sequence packing was applied
+        assert len(processed_mbs) == 1
+        processed_mb = processed_mbs[0]
+        assert processed_mb.original_batch_size == 4  # Original batch size preserved
+        assert processed_mb.original_seq_len == 64  # Original seq len preserved
+        assert processed_mb.processed_inputs.seq_len == 204  # Packed seq len
+        assert "cu_seqlens" in processed_mb.processed_inputs.flash_attn_kwargs
+
+        # Verify pack_sequences was called
+        mock_pack_sequences.assert_called_once()
+
+    def test_config_without_sequence_packing_key(self, mock_tokenizer):
+        """Test iteration when sequence_packing key is missing from config."""
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 32)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+
+        raw_iterator = iter([batch])
+        cfg = {
+            # No "sequence_packing" key
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+
+        processed_iterator = make_processed_microbatch_iterator(
+            raw_iterator=raw_iterator,
+            tokenizer=mock_tokenizer,
+            cfg=cfg,
+            cp_size=1,
+        )
+
+        processed_mbs = list(processed_iterator)
+
+        # Should work with default (no sequence packing)
+        assert len(processed_mbs) == 1
+        assert processed_mbs[0].processed_inputs.flash_attn_kwargs == {}
+
 
 @pytest.mark.automodel
 class TestProcessGlobalBatch:
@@ -977,6 +1221,98 @@ class TestProcessGlobalBatch:
         assert data.get_batch.call_count == 2
         data.get_batch.assert_any_call(batch_idx=0, batch_size=4)
         data.get_batch.assert_any_call(batch_idx=1, batch_size=4)
+
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_loss_fn_without_loss_type_attribute(self, mock_all_reduce, mock_dp_mesh):
+        """Test that process_global_batch works when loss_fn has no loss_type attribute."""
+        # Create test data
+        input_ids = torch.randint(0, 1000, (8, 64))
+        sample_mask = torch.ones(8, dtype=torch.bool)
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "sample_mask": sample_mask,
+            }
+        )
+
+        # Mock get_batch
+        batch_data = BatchedDataDict(
+            {
+                "input_ids": input_ids[:4],
+                "sample_mask": sample_mask[:4],
+            }
+        )
+        data.get_batch = MagicMock(return_value=batch_data)
+
+        # Create loss_fn WITHOUT loss_type attribute
+        loss_fn_without_type = MagicMock(spec=[])  # Empty spec means no attributes
+
+        # Mock all_reduce
+        def side_effect(tensor, *args, **kwargs):
+            tensor[0] = 8
+            tensor[1] = 512
+
+        mock_all_reduce.side_effect = side_effect
+
+        # Should not raise any error
+        result = process_global_batch(
+            data=data,
+            loss_fn=loss_fn_without_type,
+            dp_group=mock_dp_mesh.get_group(),
+            batch_idx=0,
+            batch_size=4,
+        )
+
+        # Verify results are still correct
+        assert "batch" in result
+        assert result["batch"]["input_ids"].shape == (4, 64)
+        assert result["global_valid_seqs"] == 8
+        assert result["global_valid_toks"] == 512
+
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_with_partial_sample_mask(
+        self, mock_all_reduce, mock_loss_fn, mock_dp_mesh
+    ):
+        """Test processing with some samples masked out."""
+        # Create test data with some samples masked
+        input_ids = torch.randint(0, 1000, (8, 64))
+        sample_mask = torch.tensor(
+            [True, True, False, False, True, True, True, False], dtype=torch.bool
+        )  # 5 valid samples
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "sample_mask": sample_mask,
+            }
+        )
+
+        # Mock get_batch
+        batch_data = BatchedDataDict(
+            {
+                "input_ids": input_ids[:4],
+                "sample_mask": sample_mask[:4],  # [True, True, False, False] = 2 valid
+            }
+        )
+        data.get_batch = MagicMock(return_value=batch_data)
+
+        # Mock all_reduce - local has 2 valid seqs, assume another rank has 3
+        def side_effect(tensor, *args, **kwargs):
+            tensor[0] = 5  # Global valid seqs (2 + 3)
+            tensor[1] = 320  # Global valid tokens
+
+        mock_all_reduce.side_effect = side_effect
+
+        result = process_global_batch(
+            data=data,
+            loss_fn=mock_loss_fn,
+            dp_group=mock_dp_mesh.get_group(),
+            batch_idx=0,
+            batch_size=4,
+        )
+
+        # Verify results
+        assert result["global_valid_seqs"] == 5
+        assert result["global_valid_toks"] == 320
 
 
 @pytest.mark.automodel
