@@ -482,6 +482,7 @@ def sft_train(
 
                     pad_block_size = 1
                     if is_mdlm:
+                        assert "mask_token_id" in policy.get_model_config() and policy.get_model_config()["mask_token_id"] is not None, "`mask_token_id` must be in config.json if doing MDLM training"
                         # TODO(mfathi): here we assume single turn instruction tuning. need to make this more general.
                         # we train on padding tokens as well similar to LLaDA and SMDM
                         #pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 1}
@@ -511,9 +512,9 @@ def sft_train(
 
                     if is_dqwn:
                         if tok_mask_half_life_ratio is not None:
-                            cat_and_padded = prepare_for_mdlm_train_data_blockwise(cat_and_padded, mask_token_id=151662, block_size=policy.get_model_config()["block_size"], half_life_ratio=tok_mask_half_life_ratio)
+                            cat_and_padded = prepare_for_mdlm_train_data_blockwise(cat_and_padded, mask_token_id=policy.get_model_config()["mask_token_id"], block_size=policy.get_model_config()["block_size"], half_life_ratio=tok_mask_half_life_ratio)
                         else:
-                            cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=151662)
+                            cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=policy.get_model_config()["mask_token_id"])
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass

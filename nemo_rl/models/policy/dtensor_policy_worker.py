@@ -271,6 +271,7 @@ class DTensorPolicyWorker:
                     model_config.dlm_paradigm = "block_diff"
                 if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
                     model_config.block_size = self.cfg["mdlm"]["block_size"]
+                #model_config.seq_length = self.cfg["max_total_sequence_length"]
             elif model_name in ["nvidia/Nemotron-Diffusion-Exp-Ministral-8B"]:
                 print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
                 from transformers import AutoModel
@@ -279,6 +280,7 @@ class DTensorPolicyWorker:
                     model_config.dlm_paradigm = "sbd_block_diff"
                 if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
                     model_config.block_size = self.cfg["mdlm"]["block_size"]
+                #model_config.seq_length = self.cfg["max_total_sequence_length"]
             else:
                 # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
                 model_class = resolve_model_class(model_config.model_type)
