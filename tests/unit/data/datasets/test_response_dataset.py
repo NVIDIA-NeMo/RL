@@ -39,10 +39,10 @@ def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".
         # If file_ext is provided, use it. If not provided but is_save_to_disk is False, default to .json
         if file_ext is None:
             file_ext = ".json"
-            
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=file_ext, delete=False) as f:
             data_path = f.name
-        
+
         if file_ext == ".json":
             with open(data_path, "w") as f:
                 json.dump(data, f)
