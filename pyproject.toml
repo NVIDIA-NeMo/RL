@@ -49,6 +49,7 @@ dependencies = [
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "nvidia-resiliency-ext",
 ]
 
 [project.optional-dependencies]
