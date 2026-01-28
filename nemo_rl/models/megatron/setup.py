@@ -733,6 +733,7 @@ def setup_model_and_optimizer(
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    setattr(megatron_cfg.model, "_pg_collection", pg_collection)
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
