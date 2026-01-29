@@ -6,7 +6,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = mxin/nano-3-qat
+	branch = mxin/nano3-qad
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
