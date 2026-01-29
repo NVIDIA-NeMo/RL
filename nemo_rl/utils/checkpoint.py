@@ -49,6 +49,7 @@ class CheckpointingConfig(TypedDict):
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
+    save_optimizer (bool): Whether to save optimizer state with checkpoints.
     """
 
     enabled: bool
@@ -58,6 +59,7 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    save_optimizer: NotRequired[bool]  # Default: True
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[bool]  # Default: False
@@ -105,6 +107,31 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
+        self.save_optimizer = config.get("save_optimizer", True)
+
+    def get_resume_paths(
+        self, last_checkpoint_path: Optional[PathLike]
+    ) -> tuple[Optional[Path], Optional[Path]]:
+        """Get weights and optimizer paths for resuming from a checkpoint.
+
+        Args:
+            last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+
+        Returns:
+            Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
+            optimizer_path is None if checkpoint exists but optimizer state was not saved.
+        """
+        if last_checkpoint_path:
+            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+            if not optimizer_path.exists():
+                warnings.warn(
+                    f"Optimizer state not found at {optimizer_path}. "
+                    "Optimizer will be freshly initialized."
+                )
+                optimizer_path = None
+            return weights_path, optimizer_path
+        return None, None
 
     def init_tmp_checkpoint(
         self,

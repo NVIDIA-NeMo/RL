@@ -190,17 +190,15 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
     )
@@ -552,14 +550,14 @@ def sft_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, sft_save_state, master_config
                         )
-
                         policy.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
