@@ -53,7 +53,7 @@ class VllmInternalWorkerExtension:
         # Place vLLM ranks after all training ranks so all training workers can join
         rank = train_world_size + rank_prefix + local_rank
 
-        self.model_update_group = StatelessProcessGroup(
+        self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
