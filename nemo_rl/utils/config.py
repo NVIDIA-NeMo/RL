@@ -27,6 +27,23 @@ def resolve_path(base_path: Path, path: str) -> Path:
     return base_path / path
 
 
+def merge_with_override(
+    base_config: DictConfig, override_config: DictConfig
+) -> DictConfig:
+    """Merge configs with support for _override_ marker to completely override sections."""
+    for key in list(override_config.keys()):
+        if isinstance(override_config[key], DictConfig):
+            if override_config[key].get("_override_", False):
+                # remove the _override_ marker
+                override_config[key].pop("_override_")
+                # remove the key from base_config so it won't be merged
+                if key in base_config:
+                    base_config.pop(key)
+
+    merged_config = cast(DictConfig, OmegaConf.merge(base_config, override_config))
+    return merged_config
+
+
 def load_config_with_inheritance(
     config_path: Union[str, Path],
     base_dir: Optional[Union[str, Path]] = None,
@@ -63,10 +80,12 @@ def load_config_with_inheritance(
         for default in defaults:
             parent_path = resolve_path(base_dir, str(default))
             parent_config = load_config_with_inheritance(parent_path, base_dir)
-            base_config = cast(DictConfig, OmegaConf.merge(base_config, parent_config))
+            base_config = cast(
+                DictConfig, merge_with_override(base_config, parent_config)
+            )
 
         # Merge with current config
-        config = cast(DictConfig, OmegaConf.merge(base_config, config))
+        config = cast(DictConfig, merge_with_override(base_config, config))
 
     return config
 
