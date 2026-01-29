@@ -145,21 +145,15 @@ policy:
     mcore_generation_config:
       buffer_size_gb: 25  # Total GPU memory (in GB) allocated for KV cache buffers
       buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
-      num_cuda_graphs: 6  # Number of CUDA graphs to pre-compile for different batch sizes
+      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       unified_memory_level: 1  # Unified memory usage level (0=disabled, 1+=enables unified memory with static tensor addresses)
-      persist_cuda_graphs: false  # When false, CUDA graphs are deleted on suspend to free memory for training (recommended for large models)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      # KV cache memory management during training (saves GPU memory for training)
-      # Option 1: offload_kv_cache_during_training - moves KV cache to CPU during training
-      #   - With unified_memory_level>=1: Can keep CUDA graphs (UVM maintains static addresses)
-      #   - With unified_memory_level=0: MUST recreate CUDA graphs (addresses change on cpu->gpu)
-      # Option 2: remove_kv_cache_during_training - completely deallocates KV cache
-      #   - Maximum memory savings, but must rebuild buffer each time
-      offload_kv_cache_during_training: true  # Move KV cache to CPU during training
-      remove_kv_cache_during_training: false  # Remove KV cache entirely during training
+      reset_cuda_graphs: false
+      offload_kv_cache_during_training: false  # Move KV cache to CPU during training
+      enable_cuda_graph: true
+      enable_chunked_prefill: false
       
     vllm_cfg:
       tensor_parallel_size: 1

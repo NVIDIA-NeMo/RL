@@ -665,9 +665,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # especially when using many experts.
         model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
         model_cfg.moe_token_dispatcher_type = "alltoall"
-        model_cfg.moe_router_topk = 8
-        model_cfg.moe_ffn_hidden_size = 768
-
 
         # The below two configs (and "freeze_moe_router") are used to stabilize moe training
         # by preventing updates to the moe router. We found that this is helpful in reducing
@@ -788,11 +785,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # The toggle_cuda_graphs() function will switch between "local" (inference) and "none" (training).
         # This is required because cudagraph_manager is only created if cuda_graph_impl=="local" at model init.
         model_cfg.cuda_graph_impl = "local"
-        model_cfg.cuda_graph_scope = None
+        model_cfg.cuda_graph_scope = "full_iteration"
         model_cfg.use_te_rng_tracker = True
         model_cfg.inference_rng_tracker = True
-        # Set warmup steps for CUDA graph capture
-        model_cfg.cuda_graph_warmup_steps = 2
 
         assert (
             "aux_loss" not in model_cfg.moe_router_load_balancing_type
@@ -910,7 +905,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             # Create a separate megatron config for the reference model with the correct checkpoint config
             self.megatron_cfg.model.cuda_graph_impl = "none"
-            self.megatron_cfg.model.use_te_rng_tracker = True
+            self.megatron_cfg.model.use_te_rng_tracker = False
+            self.megatron_cfg.model.inference_rng_tracker = False
             ref_megatron_cfg = ConfigContainer(
                 model=self.megatron_cfg.model,
                 checkpoint=ref_checkpoint_config,  # Use the reference checkpoint config
@@ -1044,36 +1040,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             else self.model.module
         )
 
-    def _clear_rotary_pos_emb_caches(self):
-        """Clear rotary position embedding caches to prevent inference-mode tensor reuse.
-        
-        When transitioning from inference (which runs under torch.inference_mode()) to training,
-        cached RoPE tensors created during inference cannot be used for autograd computation.
-        This method clears both:
-        1. The lru_cache on RotaryEmbedding.forward() method
-        2. The rotary_pos_emb_cache dict on the GPTModel
-        
-        This prevents the error:
-        "Inference tensors cannot be saved for backward. Please do not use Tensors created
-        in inference mode in computation tracked by autograd."
-        """
-        try:
-            lang_module = self._get_lang_module()
-            
-            # Clear the lru_cache on RotaryEmbedding.forward if it exists
-            if hasattr(lang_module, 'rotary_pos_emb') and lang_module.rotary_pos_emb is not None:
-                if hasattr(lang_module.rotary_pos_emb.forward, 'cache_clear'):
-                    lang_module.rotary_pos_emb.forward.cache_clear()
-            
-            # Clear the rotary_pos_emb_cache dict on the model
-            if hasattr(lang_module, 'rotary_pos_emb_cache'):
-                lang_module.rotary_pos_emb_cache.clear()
-                
-        except Exception as e:
-            # Log but don't fail - this is a best-effort cache clearing
-            print(f"[Warning] Failed to clear RoPE caches: {e}")
-
-    def _initialize_inference_engine(self):
+    def _initialize_inference_engine(self, mcore_generation_config: dict):
         """Initialize the persistent inference engine and client.
         
         This method sets up the DynamicInferenceEngine, DynamicInferenceContext,
@@ -1099,24 +1066,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         model_cfg = self.megatron_cfg.model
         
-        # Debug: Verify padded_vocab_size before creating inference config
-        if self.rank == 0:
-            print(f"[DEBUG] Initializing inference engine with padded_vocab_size: {self.final_padded_vocab_size}")
-            # Also check the model's actual embedding size
-            if hasattr(self.model, 'module'):
-                model_to_check = self.model.module.module if hasattr(self.model.module, 'module') else self.model.module
-            else:
-                model_to_check = self.model
-            if hasattr(model_to_check, 'embedding'):
-                embed_weight = model_to_check.embedding.word_embeddings.weight
-                print(f"[DEBUG] Model embedding weight shape: {embed_weight.shape}")
-                print(f"[DEBUG] Model embedding vocab dimension: {embed_weight.shape[0]}")
 
         from megatron.core.utils import get_attr_wrapped_model, get_pg_size
         pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
         tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
         pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
         ep_group = getattr(pg_collection, 'ep', None) if pg_collection is not None else None
+        
         if tp_group is not None:
             inference_tp_size = get_pg_size(tp_group)
         if pp_group is not None:
@@ -1148,12 +1104,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             moe_pad_experts_for_cuda_graph_inference=moe_pad_for_cuda_graphs or is_moe_model
         )
 
-        mcore_generation_config = cast(
-            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
-        )
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
         block_size_tokens = mcore_generation_config["block_size_tokens"]
+        enable_cuda_graph = mcore_generation_config["enable_cuda_graph"]
+        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
         use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
             "use_cuda_graphs_for_non_decode_steps"
         ]
@@ -1161,28 +1116,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Read unified_memory_level from config (default to 0 for compatibility)
         # Level 0: No unified memory, CUDA graphs are deleted/recreated on suspend/resume
         # Level 1+: Unified memory enabled, tensors maintain static addresses
-        unified_memory_level = mcore_generation_config.get("unified_memory_level", 0)
-        # Read persist_cuda_graphs from config (default to False for better memory management)
-        # When True: CUDA graphs persist during suspend, saving recreation time but using more memory
-        # When False: CUDA graphs are deleted on suspend, freeing memory for training
-        persist_cuda_graphs = mcore_generation_config.get("persist_cuda_graphs", False)
-        
-        # KV cache memory management during training (following Megatron RL's pattern)
-        # offload_kv_cache_during_training: Move KV cache to CPU during training, restore to GPU for inference
-        #   - Saves GPU memory during training
-        #   - With unified_memory_level=0: MUST reset CUDA graphs (addresses change)
-        #   - With unified_memory_level>=1: Can keep CUDA graphs (addresses stay static with UVM)
-        # remove_kv_cache_during_training: Completely deallocate KV cache during training
-        #   - Maximum memory savings, but must rebuild buffer each time
-        offload_kv_cache_during_training = mcore_generation_config.get("offload_kv_cache_during_training", False)
-        remove_kv_cache_during_training = mcore_generation_config.get("remove_kv_cache_during_training", False)
-        
-        # Store these settings as instance variables for use in inference_mode context manager
-        self._unified_memory_level = unified_memory_level
-        self._persist_cuda_graphs = persist_cuda_graphs
-        self._offload_kv_cache_during_training = offload_kv_cache_during_training
-        self._remove_kv_cache_during_training = remove_kv_cache_during_training
-
+        unified_memory_level = mcore_generation_config["unified_memory_level"]
         model_config = self.model.config
         # Enable CUDA graphs for inference
         model_config.cuda_graph_impl = "local"
@@ -1203,7 +1137,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             use_flashinfer_fused_rope=False,
             unified_memory_level=unified_memory_level,
             max_tokens=max_tokens,
-            persist_cuda_graphs=persist_cuda_graphs, 
+            persist_cuda_graphs=False, 
         )
 
         # Create inference wrapper
@@ -1223,14 +1157,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             pp_group=pp_group,
         )
 
-        # Debug: Verify vocab_size in text generation controller
-        if self.rank == 0:
-            controller_vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
-            print(f"[DEBUG] TextGenerationController vocab_size from config: {controller_vocab_size}")
-            print(f"[DEBUG] Expected padded_vocab_size: {self.final_padded_vocab_size}")
-            if controller_vocab_size != self.final_padded_vocab_size:
-                print(f"[ERROR] Vocab size mismatch! Config: {controller_vocab_size}, Expected: {self.final_padded_vocab_size}")
-
         # Calculate seed based on node and rank
         local_rank = torch.cuda.current_device()
         num_gpus_per_node = torch.cuda.device_count()
@@ -1242,9 +1168,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             text_generation_controller,
             self.inference_context,
             random_seed=seed,
-            enable_cuda_graph=True,
+            enable_cuda_graph=enable_cuda_graph,
             track_paused_request_events=False,
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=enable_chunked_prefill,
             inference_logging_step_interval=0,
             pg_collection=pg_collection,
         )
@@ -1407,7 +1333,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             await self.dynamic_inference_engine.running.wait()
 
     @contextmanager
-    def inference_mode(self, reset_cuda_graphs: bool = True):
+    def inference_mode(self, mcore_generation_config: dict):
         """Context manager for inference mode, following Megatron RL's pattern.
         
         This mirrors megatron_rl_inference_mode from megatron/rl/rl_utils.py
@@ -1415,7 +1341,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ENTER order:
         1. Put model in eval mode
         2. Clear rotary cache
-        3. Toggle CUDA graphs ON (only if not persist_cuda_graphs)
+        3. Toggle CUDA graphs ON 
         4. Initialize/get inference engine
         5. Restore KV cache from CPU (if offloaded)
         6. Resume engine (engine handles CUDA graph creation internally if needed)
@@ -1423,7 +1349,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         EXIT order (matching Megatron RL):
         1. Suspend engine
         2. Offload KV cache to CPU
-        3. Toggle CUDA graphs OFF (only if not persist_cuda_graphs)
+        3. Toggle CUDA graphs OFF 
         4. Clear rotary cache
         5. Put model back in train mode
         
@@ -1441,17 +1367,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         
         # Get config settings
-        persist_cuda_graphs = getattr(self, '_persist_cuda_graphs', False)
-        offload_kv_cache = getattr(self, '_offload_kv_cache_during_training', False)
-        remove_kv_cache = getattr(self, '_remove_kv_cache_during_training', False)
+        offload_kv_cache = mcore_generation_config.get("offload_kv_cache_during_training", False)
+        reset_cuda_graphs = mcore_generation_config.get("reset_cuda_graphs", False)
         
         # Critical assertion from Megatron RL:
         # If offloading KV cache, MUST reset CUDA graphs (addresses change on CPU->GPU)
-        if offload_kv_cache:
-            assert reset_cuda_graphs, (
-                "reset_cuda_graphs must be True when offloading kv cache during training. "
-                "Memory addresses change when moving CPU->GPU, invalidating captured CUDA graphs."
-            )
+        #if offload_kv_cache:
+        #    assert reset_cuda_graphs, (
+        #        "reset_cuda_graphs must be True when offloading kv cache during training. "
+        #         "Memory addresses change when moving CPU->GPU, invalidating captured CUDA graphs."
+        #    )
         
         # Save training state
         was_training = lang_module.training
@@ -1467,15 +1392,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if has_lru_cache:
             rotary_module.forward.cache_clear()
         
-        # 3. Toggle CUDA graphs ON - ONLY if not persist_cuda_graphs (matching Megatron RL)
-        # In Megatron RL: if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-        #                     toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
-        if not persist_cuda_graphs:
-            toggle_cuda_graphs(lang_module, set_to="local", reset_cuda_graphs=reset_cuda_graphs)
+        toggle_cuda_graphs(lang_module, set_to="local", reset_cuda_graphs=reset_cuda_graphs)
         
         # 4. Initialize inference engine if not already done
         if not self._inference_engine_initialized:
-            self._initialize_inference_engine()
+            self._initialize_inference_engine(mcore_generation_config)
             # Start the coordinator and engine loop (first time only)
             coordinator_port = self.cfg["generation"].get(
                 "inference_coordinator_port", 5995
@@ -1491,22 +1412,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         cache_size_gb = kv_cache.numel() * kv_cache.element_size() / (1024**3)
                         print(f"[INFO] Restoring KV cache ({cache_size_gb:.2f} GB) to GPU")
                     self.inference_context.memory_buffer = kv_cache.cuda()
-        elif remove_kv_cache and hasattr(self, 'inference_context'):
-            if self.inference_context.memory_buffer is None:
-                if self.rank == 0:
-                    print("[INFO] Rebuilding KV cache memory buffer")
-                self.inference_context.build_memory_buffer()
-        
-        # 6. Resume engine if it was suspended
-        # Note: DynamicInferenceEngine.resume() handles CUDA graph creation internally
-        # for unified_memory_level=0. For unified_memory_level>=1 with persist_cuda_graphs=False,
-        # CUDA graphs are NOT recreated by resume() because it assumes UVM addresses are stable.
-        # 
-        # IMPORTANT: We do NOT call create_cuda_graphs() explicitly here because:
-        # 1. resume() resets context and may add pending requests
-        # 2. Calling create_cuda_graphs() after resume causes state mismatch (assertion error)
-        # 3. The engine will create CUDA graphs on-demand during first inference if needed,
-        #    or run in eager mode if graphs don't exist
+
         if self._inference_engine_suspended:
             self.resume_inference_engine()
         
@@ -1515,8 +1421,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             yield self.dynamic_inference_engine
             
         finally:
-            # === EXIT INFERENCE MODE ===
-            # Order matches Megatron RL: suspend -> offload KV cache -> toggle CUDA graphs off
             
             # 1. Suspend the inference engine
             if self._inference_engine_initialized and not self._inference_engine_suspended:
@@ -1531,14 +1435,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             cache_size_gb = kv_cache.numel() * kv_cache.element_size() / (1024**3)
                             print(f"[INFO] Offloading KV cache ({cache_size_gb:.2f} GB) to CPU")
                         self.inference_context.memory_buffer = kv_cache.cpu()
-            elif remove_kv_cache and hasattr(self, 'inference_context'):
-                if self.rank == 0:
-                    print("[INFO] Removing KV cache memory buffer")
-                self.inference_context.memory_buffer = None
             
-            # 3. Toggle CUDA graphs OFF - ONLY if not persist_cuda_graphs (matching Megatron RL)
-            if not persist_cuda_graphs:
-                toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=reset_cuda_graphs)
+            # 3. Toggle CUDA graphs OFF 
+            toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=reset_cuda_graphs)
             
             # 4. Clear rotary embedding cache again (Megatron RL does this on exit too)
             if has_lru_cache:
@@ -1562,19 +1461,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        """ 
         lang_module = (
             self.model.module.module
             if hasattr(self.model.module, "module")
             else self.model.module
         )
 
-        # Safety guard: ensure CUDA graphs are OFF during training
-        # Only toggle if not persist_cuda_graphs (matching Megatron RL's pattern)
-        # In Megatron RL: if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-        #                     toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=False)
-        persist_cuda_graphs = getattr(self, '_persist_cuda_graphs', False)
-        if not persist_cuda_graphs:
-            toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=False)
+        toggle_cuda_graphs(lang_module, set_to="none", reset_cuda_graphs=False)
+        """
         
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -2449,10 +2344,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 warnings.warn(
                     f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
                 )
+        
 
+        mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
         # Use inference_mode context manager (mirrors megatron_rl_inference_mode from Megatron RL)
         # This handles: eval mode, CUDA graph toggle, engine init/resume, and cleanup
-        with torch.no_grad(), self.inference_mode(reset_cuda_graphs=True) as inference_engine:
+        with torch.no_grad(), self.inference_mode(mcore_generation_config) as inference_engine:
             # Handle None values for top_k - convert to integer as required by Megatron
             top_k_cfg = self.cfg["generation"]["top_k"]
             top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
@@ -2474,7 +2371,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
             # Only rank 0 has actual data to submit
-            if is_request_submitter and data is not None:
+            if is_request_submitter:
                 input_ids = data["input_ids"]
                 print(f"GPU : {torch.cuda.current_device()}, input_ids: {input_ids.shape}")
                 prompt_tokens_tensor = input_ids.cuda()
@@ -2494,11 +2391,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 sampling_params,
             )
 
+        self.model.config.flash_decode = False
+
         # Context manager has exited - CUDA graphs are now disabled, model is back in train mode
 
         # Only rank 0 needs to format and return results
         # Other ranks return None (their results are ignored due to output_is_replicated)
-        if not is_request_submitter or data is None:
+        if not is_request_submitter:
             # Return empty result for non-submitter ranks
             # Use BatchedDataDict directly instead of from_batches to avoid padding issues with empty tensors
             return BatchedDataDict({
@@ -2555,8 +2454,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "generation_lengths": generation_lengths,
             "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
-
-        self.model.config.flash_decode = False
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
@@ -2660,12 +2557,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             DynamicInferenceRequestRecord,
         )
 
+        if dist_rank == 0:
+            assert self.inference_client is not None, "Inference client not initialized"
+
         dist_rank = torch.distributed.get_rank()
         
         # Non-rank-0 workers: return immediately with empty results
         # Their engine loops will continue processing requests from the coordinator
         # in the background (the engine loop runs as a separate task in _inference_loop)
-        if dist_rank != 0 or self.inference_client is None:
+        if dist_rank != 0:
             print(f"[Rank {dist_rank}] Participating in engine loop only (not submitting requests)")
             # Return empty results - the caller only uses rank 0's results
             return []
@@ -3016,9 +2916,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     def prepare_for_lp_inference(self):
-        # Suspend the inference engine if needed (logprob inference doesn't use dynamic engine)
-        if self._inference_engine_initialized and not self._inference_engine_suspended:
-            self.suspend_inference_engine()
 
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -3042,15 +2939,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
-        # Suspend the inference engine if it was initialized
-        # This deallocates KV cache and disables CUDA graphs for training
-        if self._inference_engine_initialized and not self._inference_engine_suspended:
-            self.suspend_inference_engine()
-
-        # Clear rotary position embedding caches to prevent inference-mode tensor reuse
-        # This must be done after suspending inference but before training forward pass
-        self._clear_rotary_pos_emb_caches()
-
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
