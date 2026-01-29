@@ -814,8 +814,10 @@ class DTensorPolicyWorker:
                             logits = outputs.logits
                         if hasattr(outputs, "causal_logits") and outputs.causal_logits is not None:
                             causal_logits = outputs.causal_logits
+                            del outputs
                             logits = torch.cat([logits, causal_logits], dim=1)
-                        del outputs
+                        else:
+                            del outputs
 
                         # Apply temperature scaling
                         logits = self._apply_temperature_scaling(logits)
