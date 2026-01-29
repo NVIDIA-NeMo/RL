@@ -453,7 +453,11 @@ def sft_train(
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -620,11 +624,7 @@ def sft_train(
                             key=lambda item: item[1],
                             reverse=True,
                         ):
-                            sub_pct = (
-                                (sv / policy_time * 100)
-                                if policy_time > 0
-                                else 0
-                            )
+                            sub_pct = (sv / policy_time * 100) if policy_time > 0 else 0
                             print(f"      - {sk}: {sv:.2f}s ({sub_pct:.1f}%)")
                         if unaccounted > 0:
                             unaccounted_pct = (

@@ -1339,9 +1339,11 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    fprop_logprobs = policy.get_logprobs(train_data, timer=timer)[
+                        "logprobs"
+                    ]
                     reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
+                        train_data, timer=timer
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
@@ -1417,7 +1419,11 @@ def grpo_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -2361,9 +2367,13 @@ def async_grpo_train(
 
                 print("▶ Computing logprobs...")
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    fprop_logprobs = policy.get_logprobs(
+                        train_data,
+                        timer=timer,
+                    )["logprobs"]
                     reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
+                        train_data,
+                        timer=timer,
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
@@ -2439,7 +2449,11 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 vllm_logger_metrics = None
