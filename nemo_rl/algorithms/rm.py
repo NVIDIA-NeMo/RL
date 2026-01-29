@@ -429,7 +429,6 @@ def rm_train(
     loss_fn,
     master_config,
     logger,
-    rm_task_spec,
     checkpointer,
     rm_save_state,
 ):

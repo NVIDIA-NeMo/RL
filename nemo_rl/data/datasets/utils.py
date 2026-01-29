@@ -90,25 +90,6 @@ def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
     return raw_dataset
 
 
-def get_extra_kwargs(data_config: dict, keys: list[str]) -> dict:
-    """Get extra kwargs from the data config.
-
-    If the key is not in the data config, it will be ignored.
-
-    Args:
-        data_config: The data config.
-        keys: The keys to get from the data config.
-
-    Returns:
-        The extra kwargs.
-    """
-    extra_kwargs = {}
-    for key in keys:
-        if key in data_config:
-            extra_kwargs[key] = data_config[key]
-    return extra_kwargs
-
-
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
     """Fill the single dataset config with default dataset config."""
     for key in default_data_config.keys():

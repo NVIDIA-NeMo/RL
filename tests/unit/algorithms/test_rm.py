@@ -78,7 +78,6 @@ def mock_components():
     loss_fn = PreferenceLoss()
     logger = MagicMock()
     checkpointer = MagicMock()
-    rm_task_spec = MagicMock()
 
     # Create mock master config
     master_config = {
@@ -119,7 +118,6 @@ def mock_components():
         "loss_fn": loss_fn,
         "logger": logger,
         "checkpointer": checkpointer,
-        "rm_task_spec": rm_task_spec,
         "master_config": master_config,
     }
 
@@ -140,7 +138,6 @@ def test_exit_on_max_steps(mock_components):
         mock_components["loss_fn"],
         mock_components["master_config"],
         mock_components["logger"],
-        mock_components["rm_task_spec"],
         mock_components["checkpointer"],
         rm_save_state,
     )
@@ -166,7 +163,6 @@ def test_exit_on_max_epochs(mock_components):
         mock_components["loss_fn"],
         mock_components["master_config"],
         mock_components["logger"],
-        mock_components["rm_task_spec"],
         mock_components["checkpointer"],
         rm_save_state,
     )
@@ -200,7 +196,6 @@ def test_exit_on_timeout(mock_components, capsys):
             mock_components["loss_fn"],
             mock_components["master_config"],
             mock_components["logger"],
-            mock_components["rm_task_spec"],
             mock_components["checkpointer"],
             rm_save_state,
         )

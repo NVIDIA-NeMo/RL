@@ -33,7 +33,7 @@ uv run examples/run_dpo.py \
 ## Datasets
 
 Each DPO dataset class is expected to have the following attributes:
-1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
+1. `dataset`: The formatted dataset, which should be formatted like
 ```json
 {
   "context": [], // list of dicts - The prompt message (including previous turns, if any)
@@ -49,7 +49,7 @@ Each DPO dataset class is expected to have the following attributes:
   ]
 }
 ```
-2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
+2. `task_name`: The unique task identifier for this dataset. This should specify the name you choose for this dataset.
 
 DPO training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```json
@@ -96,27 +96,50 @@ By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/pre
 We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
-  dataset_name: PreferenceDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  # multiple validation sets is supported
+  # other data settings, see `examples/configs/dpo.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # this dataset will override prompt_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    split: train  # used for HuggingFace datasets
+  validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
+    dataset_name: PreferenceDataset
+    prompt_file: null
+    system_prompt_file: null
+  # multiple validation sets is supported by using val_data_paths
+  # this will be removed after refactor
   val_data_paths:
-    <NameOfValidationDataset>: <PathToValidationDataset1>
-    <NameOfValidationDataset2>: <PathToValidationDataset2>
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+    <NameOfValidationDataset1>: /path/to/local/val_dataset_1.jsonl
+    <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
 ```
 
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: BinaryPreferenceDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  val_data_path: <PathToValidationDataset>
-  prompt_key: <PromptKey>, default is "prompt"
-  chosen_key: <ChosenKey>, default is "chosen"
-  rejected_key: <RejectedKey>, default is "rejected"
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # other data settings, see `examples/configs/dpo.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # this dataset will override prompt_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    prompt_key: context
+    split: train  # used for HuggingFace datasets
+  validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
+    dataset_name: BinaryPreferenceDataset
+    prompt_key: prompt
+    chosen_key: chosen
+    rejected_key: rejected
+    prompt_file: null
+    system_prompt_file: null
 ```
 
 Please note:
