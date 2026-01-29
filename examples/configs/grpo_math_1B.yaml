@@ -27,6 +27,7 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  seq_logprob_error_threshold: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
