@@ -20,6 +20,7 @@ import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
@@ -52,7 +53,9 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def get_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -70,6 +73,7 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -88,6 +92,7 @@ class PolicyInterface(ABC):
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 
@@ -105,6 +110,7 @@ class PolicyInterface(ABC):
         *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
