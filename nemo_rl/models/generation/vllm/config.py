@@ -40,7 +40,7 @@ class VllmSpecificArgs(TypedDict):
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
     # Ensures message history over multiple turns remains constant. Useful for on-policy training, but sometimes
-    # we may want to drop previous reasoning (like Qwen3), agent context management, 
+    # we may want to drop previous reasoning (like Qwen3), agent context management,
     # sliding window, or drop past environment state observations, etc
     enforce_monotonicity: NotRequired[bool]
 
