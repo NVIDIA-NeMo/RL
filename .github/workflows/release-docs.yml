@@ -20,19 +20,10 @@ on:
         required: true
         type: boolean
         default: true
-      version-number:
-        description: Version number to release this as (use `latest` for main branch)
-        required: true
-        type: string
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: true
         type: string
-      aws-region:
-        description: AWS region
-        required: false
-        type: string
-        default: us-east-1
 
 jobs:
   build-docs:
@@ -62,7 +53,7 @@ jobs:
           overwrite-latest-on-tag: false
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: rl-publish-docs-${{ github.run_id }}
-          aws-region: ${{ inputs.aws-region }}
+          aws-region: ${{ var.DOCS_AWS_REGION }}
           aws-role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
