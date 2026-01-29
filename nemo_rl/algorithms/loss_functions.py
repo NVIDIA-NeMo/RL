@@ -46,9 +46,9 @@ class ClippedPGLossConfig(TypedDict):
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
     # Type of truncated importance sampling: "tis" (clamp max) or "icepop" (filter [min, max])
-    truncated_importance_sampling_type: NotRequired[str]
+    truncated_importance_sampling_type: NotRequired[str | None]
     # Lower bound for ICE-POP filtering (default 0.5)
-    truncated_importance_sampling_ratio_min: NotRequired[float]
+    truncated_importance_sampling_ratio_min: NotRequired[float | None]
     token_level_loss: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
