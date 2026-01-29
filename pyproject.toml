@@ -51,6 +51,7 @@ dependencies = [
   "pyzmq",
   "nvidia-resiliency-ext",
   "nccl4py",
+  "cuda-bindings",
 ]
 
 [project.optional-dependencies]

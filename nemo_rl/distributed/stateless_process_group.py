@@ -68,5 +68,5 @@ class StatelessProcessGroup:
         if stream is None:
             stream = torch.cuda.current_stream()
         self.nccl_communicator.broadcast(
-            sendbuf=tensor, recvbuf=tensor, root=src, stream=stream
+            sendbuf=tensor, recvbuf=tensor, root=src, stream=int(stream.cuda_stream)
         )
