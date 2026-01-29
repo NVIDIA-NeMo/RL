@@ -167,20 +167,24 @@ Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
+            # Decode token IDs to strings for content fields
+            user_token_ids = output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
+            user_content = tokenizer.decode(user_token_ids)
+            assistant_token_ids = output_item_dict["generation_token_ids"]
+            assistant_content = tokenizer.decode(assistant_token_ids)
+
             nemo_rl_message_log.append(
                 {
                     "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "content": user_content,
+                    "token_ids": torch.tensor(user_token_ids),
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                    "content": assistant_content,
+                    "token_ids": torch.tensor(assistant_token_ids),
                     "generation_logprobs": torch.tensor(
                         output_item_dict["generation_log_probs"]
                     ),

@@ -17,9 +17,13 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
+import modelopt.torch.quantization as mtq
 import ray
 import torch
-from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
+from megatron.bridge.training.post_training.checkpointing import (
+    has_modelopt_state,
+    load_modelopt_state,
+)
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
@@ -51,7 +55,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         # Turn on bridge quantization mapping
         os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
         self._patch_setup_megatron_model()
-        super().__init__(config, *args, **kwargs)
+        # self._patch_get_model()
+        with self.load_checkpoint_with_modelopt_state():
+            super().__init__(config, *args, **kwargs)
 
         # add quantizer states to reference state dict, so we don't need to modify use_reference_model logic
         if hasattr(self, "reference_state_dict"):
@@ -60,6 +66,17 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
+        print("actor: {}".format(self.model))
+        mtq.print_quant_summary(self.model)
+        for name, module in self.model.named_modules():
+            if isinstance(module, TensorQuantizer) and not module.is_enabled:
+                if hasattr(module, "_amax"):
+                    print(
+                        "quantizer disabled but has amax: {}, amax: {}".format(
+                            name, module.amax
+                        )
+                    )
+                    delattr(module, "_amax")
 
     def _import_model_from_hf(self, hf_model_name: str):
         """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
@@ -130,10 +147,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
         quant_cfg = self.cfg["quant_cfg"]
-        quant_dataset_name = self.cfg.get("quant_dataset_name", "cnn_dailymail")
+        quant_calib_data = self.cfg.get("quant_calib_data", "cnn_dailymail")
         quant_calib_size = self.cfg.get("quant_calib_size", 512)
         quant_batch_size = self.cfg.get("quant_batch_size", 1)
+        quant_sequence_length = self.cfg.get("quant_sequence_length", 2048)
         unwrapped_model = unwrap_model(model)[0]
+        print("quant_calib_data:", quant_calib_data)
+        print("quant_calib_size:", quant_calib_size)
+        print("quant_sequence_length:", quant_sequence_length)
 
         tokenizer = get_tokenizer(self.cfg["model_name"])
         quantize_model(
@@ -143,8 +164,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             calib_size=quant_calib_size,
             is_megatron=True,
             batch_size=quant_batch_size,
-            data=quant_dataset_name,
+            data=quant_calib_data,
             force_all_expert_routing=True,
+            max_sample_length=quant_sequence_length,
         )
         return model
 
@@ -167,30 +189,88 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 cfg.model.restore_modelopt_state = True
                 cfg.model.transformer_layer_spec = quantization_layer_spec
 
-            def _modelopt_pre_wrap_hook(model):
-                from megatron.bridge.training.post_training.checkpointing import (
-                    has_modelopt_state,
-                    load_modelopt_state,
-                )
+            # def _modelopt_pre_wrap_hook(model):
+            #     # Check which checkpoint path has modelopt state
+            #     model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
+            #     if os.path.exists(os.path.join(model_path, "iter_0000000")):
+            #         model_path = os.path.join(model_path, "iter_0000000")
+            #     if has_modelopt_state(model_path):
+            #         checkpoint_path = model_path
+            #     else:
+            #         raise RuntimeError(f"No modelopt_state found in {model_path}")
 
-                # Check which checkpoint path has modelopt state
-                model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
-                if os.path.exists(os.path.join(model_path, "iter_0000000")):
-                    model_path = os.path.join(model_path, "iter_0000000")
-                if has_modelopt_state(model_path):
-                    checkpoint_path = model_path
-                else:
-                    raise RuntimeError(f"No modelopt_state found in {model_path}")
+            #     load_modelopt_state(model, checkpoint_path)
+            #     return model
 
-                load_modelopt_state(model, checkpoint_path)
-                return model
-
-            kwargs["pre_wrap_hook"] = [_modelopt_pre_wrap_hook]
+            # kwargs["pre_wrap_hook"] = [_modelopt_pre_wrap_hook]
             return megatron_policy_worker._original_setup_megatron_model(
                 policy_cfg, cfg, *args, **kwargs
             )
 
         megatron_policy_worker.setup_megatron_model = _setup_megatron_model
+
+    @contextmanager
+    def load_checkpoint_with_modelopt_state(self):
+        """Context manager that temporarily loads the checkpoint with modelopt state."""
+
+        def _load_checkpoint(state, model, *args, **kwargs):
+            cfg = state.cfg
+            model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
+            print("model_path:", model_path)
+            if os.path.exists(os.path.join(model_path, "iter_0000000")):
+                model_path = os.path.join(model_path, "iter_0000000")
+            if has_modelopt_state(model_path):
+                print("setting restore_modelopt_state to True")
+                unwrapped_model = unwrap_model(model)
+                load_modelopt_state(unwrapped_model, model_path)
+            return megatron_policy_worker._original_load_checkpoint(
+                state, model, *args, **kwargs
+            )
+
+        try:
+            megatron_policy_worker._original_load_checkpoint = (
+                megatron_policy_worker.load_checkpoint
+            )
+            megatron_policy_worker.load_checkpoint = _load_checkpoint
+            yield
+        finally:
+            megatron_policy_worker.load_checkpoint = (
+                megatron_policy_worker._original_load_checkpoint
+            )
+            del megatron_policy_worker._original_load_checkpoint
+
+    @contextmanager
+    def hide_tensor_quantizers(self):
+        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+        from megatron.core.distributed import DistributedDataParallel
+
+        if not isinstance(self.model, DistributedDataParallel):
+            yield
+            return
+
+        inner_module = self.model.module
+        original_named_modules = inner_module.named_modules
+
+        def filtered_named_modules(*args, **kwargs):
+            for name, module in original_named_modules(*args, **kwargs):
+                if not isinstance(module, TensorQuantizer):
+                    yield name, module
+
+        try:
+            inner_module.named_modules = filtered_named_modules
+            yield
+        finally:
+            inner_module.named_modules = original_named_modules
+
+    def enable_forward_pre_hook(self):
+        """Enable forward pre-hook, hiding TensorQuantizer modules."""
+        with self.hide_tensor_quantizers():
+            super().enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync=True):
+        """Disable forward pre-hook, hiding TensorQuantizer modules."""
+        with self.hide_tensor_quantizers():
+            super().disable_forward_pre_hook(param_sync=param_sync)
 
     @contextmanager
     def disable_quantization(self):

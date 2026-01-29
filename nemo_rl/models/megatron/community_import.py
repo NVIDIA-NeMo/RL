@@ -176,3 +176,225 @@ def export_model_from_megatron(
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
+
+
+def mp_overrides_model_from_megatron(
+    hf_model_name: str,
+    input_path: str,
+    output_path: str,
+    hf_tokenizer_path: str,
+    overwrite: bool = False,
+    hf_overrides: Optional[dict[str, Any]] = {},
+    strict: bool = True,
+    mp_overrides: Optional[dict[str, Any]] = {},
+    quant_cfg: Optional[str] = None,
+    quant_calib_data: str = "random",
+    quant_calib_size: int = 1,
+    quant_batch_size: int = 1,
+    quant_sequence_length: int = 5,
+    save_hf=False,
+    restore_modelopt_state=False,
+):
+    """Convert a Megatron checkpoint to a format that can be loaded with different parallelism.
+
+    This function loads a Megatron checkpoint (which may have been saved with custom tokenizers
+    like SFTTokenizer that aren't supported by Megatron Bridge) and re-saves it in a format
+    that can be loaded with different TP/PP settings.
+
+    The process:
+    1. Load checkpoint with TP=1, PP=1 using the checkpoint's model config
+    2. Re-import weights using the HuggingFace bridge (avoids tokenizer issues)
+    3. Save as Megatron checkpoint with TP=1, PP=1 (loadable with any parallelism via resharding)
+
+    NOTE: This runs in single-process mode. The output checkpoint is saved with TP=1, PP=1.
+    When you load this checkpoint with multiple GPUs and different parallelism (e.g., TP=4),
+    Megatron's dist_checkpointing will automatically reshard the weights.
+
+    Args:
+        hf_model_name: HuggingFace model name for bridge configuration
+        input_path: Path to input Megatron checkpoint
+        output_path: Path to save the converted checkpoint
+        hf_tokenizer_path: Path to tokenizer for the output checkpoint
+        overwrite: Whether to overwrite existing output
+        hf_overrides: HuggingFace config overrides
+        strict: Whether to use strict mode for weight loading
+        mp_overrides: Dict with parallelism overrides (stored in config, actual resharding
+            happens when loading with multiple GPUs)
+    """
+    if os.path.exists(output_path) and not overwrite:
+        raise FileExistsError(
+            f"Checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
+        )
+
+    try:
+        from megatron.bridge.training.checkpointing import (
+            _load_model_weights_from_checkpoint,
+            get_checkpoint_run_config_filename,
+            read_run_config,
+        )
+        from megatron.bridge.training.model_load_save import (
+            file_exists,
+            temporary_distributed_context,
+        )
+        from megatron.bridge.training.post_training.checkpointing import (
+            has_modelopt_state,
+            load_modelopt_state,
+        )
+        from megatron.bridge.utils.instantiate_utils import instantiate
+    except ImportError:
+        raise ImportError("megatron.bridge.training is not available.")
+
+    # Create bridge from HuggingFace model (this gives us the correct model structure
+    # and avoids issues with unsupported tokenizer types in the checkpoint)
+    bridge = AutoBridge.from_hf_pretrained(
+        hf_model_name, trust_remote_code=True, **hf_overrides
+    )
+    print("bridge:", bridge)
+
+    with temporary_distributed_context(backend="gloo"):
+        from pathlib import Path
+
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(0)
+
+        # Find the actual checkpoint path (handle iter_* subdirectories)
+        checkpoint_path = Path(input_path)
+        iter_folders = [
+            f
+            for f in checkpoint_path.iterdir()
+            if f.is_dir() and f.name.startswith("iter_")
+        ]
+        if iter_folders:
+
+            def get_iter_number(folder_name):
+                try:
+                    return int(folder_name.replace("iter_", ""))
+                except ValueError:
+                    return -1
+
+            latest_iter = max(iter_folders, key=lambda f: get_iter_number(f.name))
+            checkpoint_path = checkpoint_path / latest_iter.name
+
+        # Load model config from checkpoint's run_config.yaml
+        run_config_filename = get_checkpoint_run_config_filename(str(checkpoint_path))
+
+        if not file_exists(run_config_filename):
+            raise RuntimeError(
+                f"Checkpoint at {checkpoint_path} does not have run_config.yaml. "
+                "This converter only supports Megatron Bridge checkpoints."
+            )
+
+        run_config = read_run_config(run_config_filename)
+        model_cfg = instantiate(run_config["model"])
+
+        # Load checkpoint with TP=1, PP=1 (single process) to gather all weights
+        print("Loading checkpoint with TP=1, PP=1...")
+        model_cfg.tensor_model_parallel_size = 1
+        model_cfg.pipeline_model_parallel_size = 1
+        model_cfg.context_parallel_size = 1
+        model_cfg.expert_model_parallel_size = 1
+        model_cfg.expert_tensor_parallel_size = 1
+        model_cfg.sequence_parallel = False
+        model_cfg.virtual_pipeline_model_parallel_size = None
+        has_modelopt = has_modelopt_state(str(checkpoint_path))
+        if has_modelopt and restore_modelopt_state:
+            #     if hasattr(model_cfg, "mamba_stack_spec"):
+            #         pass
+            #         # from megatron.core.post_training.modelopt.mamba.model_specs import (
+            #         #     get_mamba_stack_modelopt_spec,
+            #         # )
+
+            #         # model_cfg.mamba_stack_spec = lambda: get_mamba_stack_modelopt_spec(
+            #         #     remap_te_layernorm=False
+            #         # )
+            #     else:
+            #         from nemo_rl.models.policy.workers.quantization.utils import (
+            #             quantization_layer_spec,
+            #         )
+
+            #         model_cfg.transformer_layer_spec = quantization_layer_spec
+            model_cfg.restore_modelopt_state = True
+        else:
+            model_cfg.restore_modelopt_state = False
+
+        if hasattr(model_cfg, "finalize"):
+            model_cfg.finalize()
+
+        model_post_wrap_hook = None
+        if quant_cfg is not None:
+            from megatron.core.utils import unwrap_model
+
+            from nemo_rl.models.policy.workers.quantization.utils import (
+                get_tokenizer,
+                quantize_model,
+            )
+
+            def _quantize(model):
+                print("Quantizing model with config:", quant_cfg)
+                print("quant_calib_data:", quant_calib_data)
+                print("quant_calib_size:", quant_calib_size)
+                print("quant_sequence_length:", quant_sequence_length)
+                tokenizer = get_tokenizer(
+                    hf_tokenizer_path,
+                    max_seq_len=quant_sequence_length,
+                    trust_remote_code=True,
+                )
+                unwrapped_model = unwrap_model(model)[0]
+                quantize_model(
+                    model=unwrapped_model,
+                    quant_cfg=quant_cfg,  # pyrefly: ignore[bad-argument-type]
+                    tokenizer=tokenizer,
+                    calib_size=quant_calib_size,
+                    is_megatron=True,
+                    batch_size=quant_batch_size,
+                    data=quant_calib_data,
+                    force_all_expert_routing=True,
+                    max_sample_length=quant_sequence_length,
+                )
+                return model
+
+            model_post_wrap_hook = _quantize
+
+        megatron_model = model_cfg.provide_distributed_model(
+            wrap_with_ddp=False,
+            use_cpu_initialization=True,
+            post_wrap_hook=model_post_wrap_hook,
+        )
+
+        # Load modelopt state if present (e.g., quantization metadata)
+        if has_modelopt and restore_modelopt_state:
+            # pass
+            # print('load_modelopt_state:', load_modelopt_state)
+            print(f"Loading modelopt_state from {checkpoint_path}...")
+            load_modelopt_state(megatron_model, str(checkpoint_path))
+        # print('model after load_modelopt_state:', megatron_model)
+
+        # Load weights from the original checkpoint
+        print(f"Loading weights from {checkpoint_path}...")
+        _load_model_weights_from_checkpoint(
+            str(checkpoint_path), megatron_model, return_state_dict=False
+        )
+
+        # Save the checkpoint with HuggingFace bridge (this ensures proper config format)
+        # The checkpoint is saved with TP=1, PP=1 weights but can be loaded with any parallelism
+        if save_hf:
+            print(f"Saving HF checkpoint to {output_path}...")
+            bridge.save_hf_pretrained(megatron_model, output_path)
+        else:
+            print(f"Saving Megatron checkpoint to {output_path}...")
+            bridge.save_megatron_model(
+                megatron_model, output_path, hf_tokenizer_path=hf_tokenizer_path
+            )
+
+        print(f"Done! Checkpoint saved to {output_path}")
+        print("This checkpoint can be loaded with any TP/PP configuration.")
+        if mp_overrides:
+            print(
+                f"Note: mp_overrides {mp_overrides} will take effect when loading with multiple GPUs."
+            )
+
+    # resetting mcore state
+    import megatron.core.rerun_state_machine
+
+    megatron.core.rerun_state_machine.destroy_rerun_state_machine()

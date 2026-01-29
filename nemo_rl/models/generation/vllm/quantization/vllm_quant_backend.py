@@ -56,9 +56,18 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         buf.weight_loader = input_amax_loader
                     elif "weight_quantizer" in name:
                         buf.weight_loader = weight_amax_loader
-                    # print("buf", name, buf.shape)
+                    # print("buf", name, buf.item())
                     buffers_with_loader.append(buf)
                 yield name, buf
+
+        # module.module.decoder.layers.6.mlp.shared_experts.linear_fc1.weight_quantizer    TensorQuantizer((2, 1) bit fake block_sizes={-1: 16, 'type': 'dynamic
+        # ', 'scale_bits': (4, 3)}, amax=0.6406 calibrator=MaxCalibrator quant)
+        # (MegatronQuantPolicyWorker pid=927455) module.module.decoder.layers.6.mlp.shared_experts.linear_fc1.output_quantizer    TensorQuantizer(disabled)
+        # (MegatronQuantPolicyWorker pid=927455) module.module.decoder.layers.6.mlp.shared_experts.linear_fc2.input_quantizer     TensorQuantizer((2, 1) bit fake block_sizes={-1: 16, 'type': 'dynamic
+        # ', 'scale_bits': (4, 3)}, amax=17.2500 calibrator=MaxCalibrator quant)
+        # (MegatronQuantPolicyWorker pid=927455) module.module.decoder.layers.6.mlp.shared_experts.linear_fc2.weight_quantizer    TensorQuantizer((2, 1) bit fake block_sizes={-1: 16, 'type': 'dynamic
+        # ', 'scale_bits': (4, 3)}, amax=0.9336 calibrator=MaxCalibrator quant)
+        # (MegatronQuantPolicyWorker pid=927455) module.module.decoder.layers.6.mlp.shared_experts.linear_fc2.output_quantizer
 
         model.named_parameters = types.MethodType(new_named_parameters, model)
         try:
@@ -74,17 +83,34 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _fold_weight(self, model: nn.Module):
         """Enable quantizers and fold weight after loading weights."""
         print("folding weight context")
-        for _, module in model.named_children():
-            if (
-                isinstance(module, TensorQuantizer)
-                and hasattr(module, "_is_active")
-                and module._is_active
-            ):
-                module.enable()
+        if hasattr(model, "unwrap"):
+            model = model.unwrap()
+
         try:
+            for _, module in model.named_modules():
+                if (
+                    isinstance(module, TensorQuantizer)
+                    and hasattr(module, "_is_active")
+                    and module._is_active
+                ):
+                    # print(f"enabling quantizer: {module}")
+                    module.enable()
+            # print(f"vllm model before fold: {model}")
             yield
         finally:
+            for name, module in model.named_modules():
+                if (
+                    isinstance(module, TensorQuantizer)
+                    and hasattr(module, "_is_active")
+                    and module._is_active
+                    and module.amax is not None
+                    and module.amax.item() <= 0.0
+                ):
+                    print(
+                        f"quantizer {name} is active but has amax <= 0.0, amax:{module.amax}"
+                    )
             mtq.fold_weight(model, keep_attrs=True)
+            print(f"vllm model after fold: {model}")
 
     def _load_weights(self, weights):
         """Load weights and fold weight after loading weights."""

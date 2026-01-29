@@ -207,9 +207,10 @@ class PolicyConfig(TypedDict):
 
     # quantization configs
     quant_cfg: NotRequired[str | None]
-    quant_dataset_name: NotRequired[str | None]
+    quant_calib_data: NotRequired[str | None]
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
+    quant_sequence_length: NotRequired[int | None]
 
 
 class QuantPolicyConfig(PolicyConfig):

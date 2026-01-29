@@ -1,0 +1,252 @@
+# On-Policy Distillation Configuration for training Nano v3 with NeMo Gym
+# This config combines distillation settings with NeMo Gym environment
+
+# Resolver for multiplication
+# OmegaConf.register_new_resolver("mul", lambda a, b: a * b) is needed in the script
+
+distillation:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1  # for multi-turn rollouts. Math Environments just have 1 turn
+  max_num_steps: 1000
+  max_num_epochs: 10
+  val_batch_size: 32
+  val_period: 10
+  val_at_start: false
+  max_val_samples: null  # Will be set to validation dataset length by run_distill_gym.py
+  topk_logits_k: 64
+  seed: 42
+
+loss_fn:
+  kl_type: "reverse"  # forward, reverse, mixed
+  mixed_kl_weight: 0.5  # when kl_type is "mixed", this is the weight of the forward KL
+  zero_outside_topk: false  # zero out the teacher logits outside the top k when calculate forward KL loss
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/opd-nano3"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  checkpoint_must_save_by: "00:03:40:00"
+
+# Student policy configuration (base for teacher to inherit)
+policy: &POLICY_BASE
+  model_name: "/path/to/student_hf_checkpoint"
+  tokenizer:
+    name: ${..model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 49152
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+
+  dtensor_cfg: &DTENSOR_BASE
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg: &MEGATRON_BASE
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 4
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    apply_rope_fusion: true
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3e-6
+      min_lr: 3e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      clip_grad: ${policy.max_grad_norm}
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 0.3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null  # remove default FSDP optimizer (using megatron_cfg.optimizer)
+  scheduler: null  # remove default scheduler (using megatron_cfg.scheduler)
+
+  offload_optimizer_for_logprob: false
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${..max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      kv_cache_dtype: auto
+      precision: ${...precision}
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${...max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        use_inductor: false
+
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+# Teacher policy configuration - inherits from policy, only override what's different
+teacher:
+  <<: *POLICY_BASE
+  model_name: "/path/to/teacher_hf_checkpoint"  # Must use same tokenizer as student
+
+  dtensor_cfg:
+    <<: *DTENSOR_BASE
+
+  megatron_cfg:
+    <<: *MEGATRON_BASE
+    pipeline_dtype: ${teacher.precision}
+    # Disable metrics tracking for teacher
+    track_moe_metrics: false
+    moe_per_layer_logging: false
+
+data:
+  train_jsonl_fpath: "/path/to/train.jsonl"
+  validation_jsonl_fpath: "/path/to/validation.jsonl"
+  shuffle: false
+  num_workers: 1
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+
+logger:
+  log_dir: "logs/opd-nano3"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "opd-dev"
+    name: "nano3-dev-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "opd-nano3-dev"
+    run_name: "opd-nano3-dev-logger"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32

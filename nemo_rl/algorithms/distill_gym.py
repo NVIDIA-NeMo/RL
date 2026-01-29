@@ -482,6 +482,19 @@ def distillation_gym_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
+            # Log training data to JSONL
+            log_data = {"content": flat_messages["content"]}
+            if "agent_ref" in repeated_batch:
+                log_data["agent_ref"] = repeated_batch["agent_ref"]
+            log_data["total_reward"] = repeated_batch["total_reward"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            # log_data["token_ids"] = train_data["input_ids"].tolist()
+            # log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+            # log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            logger.log_batched_dict_as_jsonl(
+                log_data, f"train_data_step{total_steps + 1}.jsonl"
+            )
+
             # Logging
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
             total_time = timing_metrics.get("total_step_time", 0)

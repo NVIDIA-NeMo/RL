@@ -32,30 +32,47 @@ from modelopt.torch.utils.plugins import megatron_prefill
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
+from nemo_rl.models.modelopt.quant_config import CUSTOM_CONFIG
+
 MAX_SEQ_LEN = 2048
 MAX_OUTPUT_LEN = 512
 
-# This is an example to customize the quantization config.
-# Modify your custom config for debugging or research purposes.
-CUSTOM_CONFIG = {
-    "MY_QUANT_CONFIG": {
-        "quant_cfg": {
-            "*weight_quantizer": {
-                "num_bits": 4,
-                "block_sizes": {-1: 128},
-                "enable": True,
-            },
-            "*input_quantizer": {
-                "num_bits": 8,
-                "type": "dynamic",
-                "block_sizes": {-1: None},
-            },
-            # Disable sensitive layers such as \`lm_head\`, gate layers in MoE etc.
-            **mtq.config._default_disabled_quantizer_cfg,
-        },
-        "algorithm": "max",
-    },
-}
+# nano3_config = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+# # disable all attention layers
+# nano3_config['quant_cfg']["*.[q|k|v|o]_proj.*"] = {"enable": False}
+# # vllm
+# nano3_config['quant_cfg']["*.qkv_proj.*"] = {"enable": False}
+# # disable all preceding layers of attention layers
+# bf16_layers = [4, 11, 18, 25, 32, 41]
+# for i in bf16_layers:
+#     attention_preceding_layer_spec = "*.layers." + str(i) +".*"
+#     nano3_config["quant_cfg"][attention_preceding_layer_spec] = {"enable": False}
+#     # print_rank_0(f"The layer {i} with {hybrid_model_config[i]} that precedes a self-attention layer {hybrid_model_config[i+1]} is kept unquantized")
+
+# nano3_config["quant_cfg"]["*mixer.conv1d*"] = {"enable": False} # quantize only linear layers within mamba
+
+# # This is an example to customize the quantization config.
+# # Modify your custom config for debugging or research purposes.
+# CUSTOM_CONFIG = {
+#     "MY_QUANT_CONFIG": {
+#         "quant_cfg": {
+#             "*weight_quantizer": {
+#                 "num_bits": 4,
+#                 "block_sizes": {-1: 128},
+#                 "enable": True,
+#             },
+#             "*input_quantizer": {
+#                 "num_bits": 8,
+#                 "type": "dynamic",
+#                 "block_sizes": {-1: None},
+#             },
+#             # Disable sensitive layers such as \`lm_head\`, gate layers in MoE etc.
+#             **mtq.config._default_disabled_quantizer_cfg,
+#         },
+#         "algorithm": "max",
+#     },
+#     "NANO3_NVFP4_CFG": nano3_config
+# }
 
 
 def get_tokenizer(ckpt_path, max_seq_len=MAX_SEQ_LEN, trust_remote_code=False):
@@ -223,17 +240,35 @@ def get_forward_loop_func(
         return create_forward_loop(dataloader=calib_dataloader)
 
     def _forward_loop(model):
+        original_topk_values = {}
+        original_config_topk = None
+
         if force_all_expert_routing:
-            for _, module in model.named_modules():
+            for name, module in model.named_modules():
                 if isinstance(module, TopKRouter):
+                    # Store original values
+                    original_topk_values[name] = module.topk
+                    if original_config_topk is None:
+                        original_config_topk = module.config.moe_router_topk
+
+                    # Set router topk to route to all experts
                     module.topk = module.num_experts
+                    # IMPORTANT: Also update config.moe_router_topk so the token dispatcher
+                    # computes the correct num_out_tokens for all_to_all communication.
+                    # Without this, the token dispatcher uses the original topk value
+                    # which causes "Split sizes doesn't match total dim 0 size" error.
+                    module.config.moe_router_topk = module.num_experts
+
         for batch in calib_dataloader:
             megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
 
         if force_all_expert_routing:
-            for _, module in model.named_modules():
+            for name, module in model.named_modules():
                 if isinstance(module, TopKRouter):
-                    module.topk = module.config.moe_router_topk
+                    # Restore original values
+                    module.topk = original_topk_values.get(name, module.topk)
+                    if original_config_topk is not None:
+                        module.config.moe_router_topk = original_config_topk
 
     return _forward_loop
 

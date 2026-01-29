@@ -128,7 +128,9 @@ def check_vocab_equality(
     tokenizer: TokenizerType, student_model_name: str, teacher_model_name: str
 ) -> None:
     """Check if the vocab of the tokenizer (student) and the teacher tokenizer are equal."""
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
+    teacher_tokenizer = AutoTokenizer.from_pretrained(
+        teacher_model_name, trust_remote_code=True
+    )
 
     skip_hint = "Set NRL_SKIP_DISTILLATION_TOKENIZER_CHECK=true to skip this check."
 
@@ -145,8 +147,12 @@ def check_vocab_equality(
     )
 
     # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
-    student_config = AutoConfig.from_pretrained(student_model_name)
-    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    student_config = AutoConfig.from_pretrained(
+        student_model_name, trust_remote_code=True
+    )
+    teacher_config = AutoConfig.from_pretrained(
+        teacher_model_name, trust_remote_code=True
+    )
     assert student_config.vocab_size == teacher_config.vocab_size, (
         f"Model config vocab sizes differ between student and teacher. {skip_hint}"
     )

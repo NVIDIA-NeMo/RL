@@ -195,6 +195,7 @@ name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
