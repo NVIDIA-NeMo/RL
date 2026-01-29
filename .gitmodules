@@ -15,6 +15,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://github.com/NVIDIA-NeMo/Gym.git
+	url = https://github.com/owkin/Owkin-Gym.git
 	branch = main
 	shallow = true
