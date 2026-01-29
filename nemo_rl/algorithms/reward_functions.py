@@ -47,7 +47,7 @@ class RewardShapingConfig(TypedDict):
     # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
     # When set to 0, truncated responses get zero reward.
     # When set to 1, no penalty is applied (default behavior).
-    stop_properly_penalty_coef: NotRequired[float]
+    stop_properly_penalty_coef: NotRequired[float | None]
 
 
 def apply_reward_shaping(

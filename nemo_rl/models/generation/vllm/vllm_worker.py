@@ -543,6 +543,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                    "truncated": torch.zeros(0, dtype=torch.bool),
                 }
             )
 
