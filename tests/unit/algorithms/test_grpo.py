@@ -22,6 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     async_grpo_train,
+    compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
     normalize_advantages_with_epsilon,
@@ -1898,3 +1899,317 @@ class TestValidateFunction:
 
         assert val_metrics == {}
         assert timing == {}
+
+
+# ============================================================================
+# Tests for compute_and_apply_seq_logprob_error_masking function
+# ============================================================================
+
+
+class TestComputeAndApplySeqLogprobErrorMasking:
+    """Tests for the compute_and_apply_seq_logprob_error_masking function."""
+
+    def _create_train_data(
+        self,
+        batch_size: int,
+        seq_length: int,
+        prev_logprobs: torch.Tensor,
+        generation_logprobs: torch.Tensor,
+        token_mask: torch.Tensor = None,
+        sample_mask: torch.Tensor = None,
+    ) -> BatchedDataDict:
+        """Helper to create mock train_data for testing."""
+        if token_mask is None:
+            token_mask = torch.ones(batch_size, seq_length)
+        if sample_mask is None:
+            sample_mask = torch.ones(batch_size)
+
+        return BatchedDataDict(
+            {
+                "token_mask": token_mask,
+                "sample_mask": sample_mask,
+                "prev_logprobs": prev_logprobs,
+                "generation_logprobs": generation_logprobs,
+            }
+        )
+
+    def test_no_threshold_only_computes_metrics(self):
+        """Test that when threshold is None, only metrics are computed (no masking)."""
+        batch_size, seq_length = 4, 10
+
+        # Create logprobs with varying errors
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Add small errors to sequences
+        generation_logprobs[0, 1:5] = 0.1  # Small error
+        generation_logprobs[1, 1:5] = 0.5  # Medium error
+        generation_logprobs[2, 1:5] = 1.0  # Large error
+        generation_logprobs[3, 1:5] = 2.0  # Very large error
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        original_sample_mask = train_data["sample_mask"].clone()
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=None
+        )
+
+        # Verify metrics are computed
+        assert max_error > 0.0, "Should compute max error"
+        assert num_masked == 0, "Should not mask any sequences when threshold is None"
+        assert masked_pct == 0.0, "Should have 0% masked"
+        # Verify sample_mask is unchanged
+        assert torch.equal(train_data["sample_mask"], original_sample_mask)
+
+    def test_masking_with_threshold(self):
+        """Test that sequences exceeding threshold are masked."""
+        batch_size, seq_length = 4, 10
+
+        # Create logprobs with specific errors
+        # Note: The metric is averaged over all tokens, so errors get diluted.
+        # Formula: seq_mult_prob_error = sum(exp(error) * mask) / sum(mask)
+        # With seq_length=10 and slicing [:, 1:], we have 9 tokens per sequence.
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Sequence 0: small error -> avg ≈ 1.047 (below threshold 1.2)
+        generation_logprobs[0, 1:5] = 0.1
+        # Sequence 1: small error -> avg ≈ 1.047 (below threshold 1.2)
+        generation_logprobs[1, 1:5] = 0.1
+        # Sequence 2: medium error -> avg ≈ 1.288 (above threshold 1.2)
+        # 4 tokens with exp(0.5)≈1.649, 5 tokens with exp(0)=1 -> (4*1.649+5)/9≈1.288
+        generation_logprobs[2, 1:5] = 0.5
+        # Sequence 3: large error -> avg ≈ 1.764 (above threshold 1.2)
+        # 4 tokens with exp(1.0)≈2.718, 5 tokens with exp(0)=1 -> (4*2.718+5)/9≈1.764
+        generation_logprobs[3, 1:5] = 1.0
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+        # Use threshold 1.2 which should mask sequences 2 and 3
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.2
+        )
+
+        # Verify masking occurred
+        assert num_masked == 2, "Should mask 2 sequences (indices 2 and 3)"
+        # Sequence 2 had reward=1, sequence 3 had reward=0, so 50% correct
+        assert masked_pct == 0.5, "50% of masked sequences should be correct"
+
+        # Verify sample_mask is updated correctly
+        expected_mask = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        assert torch.allclose(train_data["sample_mask"], expected_mask), (
+            "Should mask sequences 2 and 3"
+        )
+
+    def test_no_sequences_masked_when_all_below_threshold(self):
+        """Test that no sequences are masked when all are below threshold."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs with small errors (all below threshold)
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 0.05  # Very small error for all
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 1.0, 1.0])
+        original_sample_mask = train_data["sample_mask"].clone()
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=2.0
+        )
+
+        # Verify no masking occurred
+        assert num_masked == 0, "Should not mask any sequences"
+        assert masked_pct == 0.0
+        # All sequences should remain in sample_mask
+        assert torch.equal(train_data["sample_mask"], original_sample_mask)
+
+    def test_all_sequences_masked_when_all_above_threshold(self):
+        """Test that all sequences are masked when all exceed threshold."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs with large errors (all above threshold)
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 1.0  # Large error for all (exp(1) ~ 2.7)
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0])  # 2 correct, 1 incorrect
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.0
+        )
+
+        # Verify all sequences are masked
+        assert num_masked == 3, "Should mask all 3 sequences"
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of masked should be correct"
+        )
+        # All sequences should be zeroed in sample_mask
+        assert torch.equal(train_data["sample_mask"], torch.zeros(batch_size))
+
+    def test_respects_existing_sample_mask(self):
+        """Test that masking respects already-masked sequences in sample_mask."""
+        batch_size, seq_length = 4, 8
+
+        # Create logprobs with large errors
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 1.0  # Large error for all
+
+        # Pre-mask sequence 1 (it's already excluded)
+        sample_mask = torch.tensor([1.0, 0.0, 1.0, 1.0])
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            sample_mask=sample_mask,
+        )
+        rewards = torch.tensor([1.0, 1.0, 0.0, 1.0])
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.0
+        )
+
+        # Only 3 sequences were originally unmasked, all should be masked now
+        assert num_masked == 3, "Should mask 3 sequences (indices 0, 2, 3)"
+        # Sequences 0 and 3 had reward=1, sequence 2 had reward=0
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of newly masked should be correct"
+        )
+        # All should be zeroed (including already-masked seq 1)
+        assert torch.equal(train_data["sample_mask"], torch.zeros(batch_size))
+
+    def test_masked_correct_pct_calculation(self):
+        """Test that masked_correct_pct is calculated correctly."""
+        batch_size, seq_length = 5, 8
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Make sequences 2, 3, 4 have high error (will be masked)
+        generation_logprobs[2:5, 1:4] = 1.5
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        # Rewards: seq 2 correct, seq 3 incorrect, seq 4 correct
+        rewards = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0])
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
+        )
+
+        assert num_masked == 3, "Should mask 3 sequences"
+        # 2 out of 3 masked sequences were correct (reward=1)
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of masked should be correct"
+        )
+
+    def test_token_mask_is_respected(self):
+        """Test that token_mask affects the error calculation correctly."""
+        batch_size, seq_length = 2, 8
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Add large error to both sequences at positions 1:6
+        generation_logprobs[:, 1:6] = 1.0
+
+        # But mask out tokens 3-5 for sequence 0 (reducing its effective error)
+        # After slicing [:, 1:], this affects positions 2-4 in the 7-token sequence
+        token_mask = torch.ones(batch_size, seq_length)
+        token_mask[0, 3:6] = 0.0  # Mask out high-error tokens for seq 0
+
+        # After slicing [:, 1:] and accounting for token_mask:
+        # Seq 0: 4 valid tokens (positions 0,1,5,6), 2 have error -> avg ≈ 1.859
+        # Seq 1: 7 valid tokens, 5 have error -> avg ≈ 2.227
+        # Use threshold 2.0 so seq 0 passes but seq 1 fails
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([1.0, 0.0])
+
+        # Sequence 0 should have lower error due to masked tokens
+        # Sequence 1 should have higher error
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=2.0
+        )
+
+        # Only sequence 1 should be masked (seq 0 has reduced error due to token_mask)
+        assert num_masked == 1, "Should mask only sequence 1"
+        assert masked_pct == 0.0, "Masked sequence had reward=0"
+        assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should remain unmasked"
+        assert train_data["sample_mask"][1] == 0.0, "Sequence 1 should be masked"
+
+    def test_empty_batch_returns_zero_metrics(self):
+        """Test handling of edge case with empty batch."""
+        # Create empty train_data
+        train_data = BatchedDataDict(
+            {
+                "token_mask": torch.zeros(0, 8),
+                "sample_mask": torch.zeros(0),
+                "prev_logprobs": torch.zeros(0, 8),
+                "generation_logprobs": torch.zeros(0, 8),
+            }
+        )
+        rewards = torch.zeros(0)
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
+        )
+
+        assert max_error == 0.0, "Empty batch should have max_error=0"
+        assert num_masked == 0, "Empty batch should have no masked sequences"
+        assert masked_pct == 0.0, "Empty batch should have 0% masked"
+
+    def test_threshold_boundary_values(self):
+        """Test behavior at exact threshold boundary."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs where error is exactly at threshold
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+
+        # Set up specific errors: sequence-level mult_prob_error will be approximately:
+        # exp(error * 1) * 1 (for 1 token with error)
+        # So if error=0.4, mult_prob_error ~ exp(0.4) ~ 1.49
+        # If error=0.41, mult_prob_error ~ exp(0.41) ~ 1.51
+        generation_logprobs[0, 1] = 0.4  # Below threshold 1.5
+        generation_logprobs[1, 1] = 0.405  # Very close to threshold
+        generation_logprobs[2, 1] = 0.41  # Just above threshold 1.5
+
+        # Only consider position 1 as valid token
+        token_mask = torch.zeros(batch_size, seq_length)
+        token_mask[:, 1] = 1.0
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([1.0, 1.0, 1.0])
+
+        # Threshold of 1.5 should mask sequence 2 (exp(0.41) > 1.5)
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
+        )
+
+        # At least sequence 2 should be masked
+        assert num_masked >= 1, "At least one sequence should be masked"
+        assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"
