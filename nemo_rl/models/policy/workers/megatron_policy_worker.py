@@ -765,7 +765,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            processed_mb = next(data_iterator).to("cuda")
+            processed_mb = next(data_iterator)
             # Extract the processed components
             data_dict = processed_mb.data_dict
             input_ids = processed_mb.input_ids

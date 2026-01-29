@@ -32,7 +32,7 @@ from nemo_rl.models.megatron.common import _round_up_to_multiple
 
 @dataclass
 class ProcessedInputs:
-    """Processed microbatch inputs used for model forward pass"""
+    """Processed microbatch inputs used for model forward pass."""
 
     input_ids: torch.Tensor
     input_ids_cp_sharded: torch.Tensor
@@ -40,6 +40,7 @@ class ProcessedInputs:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+
 
 @dataclass
 class ProcessedMicrobatch:

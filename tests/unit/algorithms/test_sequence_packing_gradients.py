@@ -324,8 +324,10 @@ class SequencePackingGradientTestActor:
 
                 self.straggler_timer = DummyStragglerTimer()
 
+        mock_mcore_state = MockMcoreState()
+
         output_tensor, wrapped_loss_fn = forward_step_arbitrary_loss(
-            MockMcoreState(),
+            mock_mcore_state,
             global_valid_seqs,
             global_valid_toks,
             data_iterator=make_processed_microbatch_iterator(
@@ -343,6 +345,7 @@ class SequencePackingGradientTestActor:
                 seq_length_key="input_lengths",
                 pad_individual_seqs_to_multiple_of=pad_to_multiple,
                 pad_packed_seq_to_multiple_of=1,
+                straggler_timer=mock_mcore_state.straggler_timer,
                 pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             ),
             model=MockModel(),
