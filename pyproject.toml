@@ -54,11 +54,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fsdp = [
-  "flash-attn==2.8.1",
-  "mamba-ssm",
-  "causal-conv1d",
-]
+fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
 automodel = [
   "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
