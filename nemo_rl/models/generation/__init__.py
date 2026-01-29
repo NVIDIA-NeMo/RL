@@ -41,7 +41,7 @@ def configure_generation_config(
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         # set load_format
-        is_spec = "speculative_config" in config["vllm_kwargs"]
+        is_spec = "speculative_config" in config.get("vllm_kwargs", {})
         config["vllm_cfg"]["load_format"] = "auto" if is_eval or is_spec else "dummy"
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
