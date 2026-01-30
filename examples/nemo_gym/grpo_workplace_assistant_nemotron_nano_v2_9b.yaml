@@ -61,7 +61,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 12288
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
@@ -231,10 +231,22 @@ policy:
 data:
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+
+  max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+    repeat: 1
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+  default:
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
 
 env:
   should_use_nemo_gym: true

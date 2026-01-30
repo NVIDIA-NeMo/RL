@@ -35,7 +35,7 @@ class NemoGymDataset(RawDataset):
         self.dataset = load_dataset_from_path(data_path)
 
         # format the dataset
-        # HuggingFace Dataset 在 map/写入 Arrow 时不会持久化 torch.Tensor，会把它序列化成 Python 列表。因此下游在取样时读到的是 []（list），触发断言
+        # HuggingFace Dataset does not persist torch.Tensor during map/Arrow writes; it serializes to Python lists.
         self.dataset = self.dataset.map(
             self.format_data,
             with_indices=True,

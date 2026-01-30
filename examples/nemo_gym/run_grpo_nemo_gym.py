@@ -102,7 +102,7 @@ def setup_data(
         data_config["train"] = [data_config["train"]]
     for cfg in data_config["train"]:
         update_single_dataset_config(cfg, data_config["default"])
-        data = load_response_dataset(cfg, seed)
+        data = load_response_dataset(cfg)
         data_list.append(data)
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
@@ -141,7 +141,7 @@ def setup_data(
 
         for cfg in data_config["validation"]:
             update_single_dataset_config(cfg, data_config["default"])
-            val_data = load_response_dataset(cfg, seed)
+            val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors
             task_name = val_data.task_name
