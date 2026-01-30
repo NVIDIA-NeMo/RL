@@ -63,15 +63,23 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
 
 
 def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
-    """Load a dataset from a json, huggingface dataset, or Arrow dataset (saved with save_to_disk).
+    """Load a dataset from a local file, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
     Args:
         data_path: The path to the dataset.
         data_split: The split to load from the dataset.
     """
+    FILEEXT2TYPE = {
+        ".arrow": "arrow",
+        ".csv": "csv",
+        ".json": "json",
+        ".jsonl": "json",
+        ".parquet": "parquet",
+        ".txt": "text",
+    }
     suffix = os.path.splitext(data_path)[-1]
-    if suffix in [".json", ".jsonl"]:
-        raw_dataset = load_dataset("json", data_files=data_path)
+    if dataset_type := FILEEXT2TYPE.get(suffix):
+        raw_dataset = load_dataset(dataset_type, data_files=data_path)
     else:
         try:
             raw_dataset = load_dataset(data_path)
