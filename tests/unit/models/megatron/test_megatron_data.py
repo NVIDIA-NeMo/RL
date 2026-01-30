@@ -163,22 +163,17 @@ class TestProcessMicrobatch:
         )
         data_dict.__getitem__ = MagicMock(return_value=input_ids)
 
-        (
-            result_input_ids,
-            input_ids_cp_sharded,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            cu_seqlens_padded,
-        ) = process_microbatch(data_dict, pack_sequences=False)
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
 
         # Verify results
-        assert torch.equal(result_input_ids, input_ids)
-        assert torch.equal(input_ids_cp_sharded, input_ids)
-        assert attention_mask is not None
-        assert position_ids is not None
-        assert packed_seq_params is None
-        assert cu_seqlens_padded is None
+        assert torch.equal(result.input_ids, input_ids)
+        assert torch.equal(result.input_ids_cp_sharded, input_ids)
+        assert result.attention_mask is not None
+        assert result.position_ids is not None
+        assert result.packed_seq_params is None
+        assert result.cu_seqlens_padded is None
 
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
@@ -216,24 +211,20 @@ class TestProcessMicrobatch:
         )
         data_dict.__contains__ = MagicMock(return_value=True)
 
-        (
-            result_input_ids,
-            input_ids_cp_sharded,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            cu_seqlens_padded,
-        ) = process_microbatch(
-            data_dict, seq_length_key="input_lengths", pack_sequences=True
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            straggler_timer=MagicMock(),
         )
 
         # Verify results
-        assert torch.equal(result_input_ids, mock_packed_input_ids)
-        assert packed_seq_params == mock_packed_seq_params
+        assert torch.equal(result.input_ids, mock_packed_input_ids)
+        assert result.packed_seq_params == mock_packed_seq_params
         # For packed sequences, attention_mask and position_ids are None
-        assert attention_mask is None
-        assert position_ids is None
-        assert cu_seqlens_padded is not None
+        assert result.attention_mask is None
+        assert result.position_ids is None
+        assert result.cu_seqlens_padded is not None
 
         # Verify pack was called
         mock_pack.assert_called_once()
@@ -247,7 +238,12 @@ class TestProcessMicrobatch:
         data_dict.__getitem__ = MagicMock(return_value=input_ids)
 
         with pytest.raises(AssertionError) as exc_info:
-            process_microbatch(data_dict, seq_length_key=None, pack_sequences=True)
+            process_microbatch(
+                data_dict,
+                seq_length_key=None,
+                pack_sequences=True,
+                straggler_timer=MagicMock(),
+            )
 
         assert "seq_length_key must be provided" in str(exc_info.value)
 
@@ -262,7 +258,10 @@ class TestProcessMicrobatch:
 
         with pytest.raises(AssertionError) as exc_info:
             process_microbatch(
-                data_dict, seq_length_key="input_lengths", pack_sequences=True
+                data_dict,
+                seq_length_key="input_lengths",
+                pack_sequences=True,
+                straggler_timer=MagicMock(),
             )
 
         assert "input_lengths not found in data_dict" in str(exc_info.value)
@@ -293,7 +292,7 @@ class TestProcessGlobalBatch:
 
         # Mock torch.distributed.all_reduce
         with patch("torch.distributed.all_reduce") as mock_all_reduce:
-            batch, global_valid_seqs, global_valid_toks = process_global_batch(
+            result = process_global_batch(
                 data=mock_data,
                 loss_fn=MagicMock(),
                 dp_group=mock_dp_group,
@@ -301,6 +300,7 @@ class TestProcessGlobalBatch:
                 batch_size=3,
             )
 
+            batch = result["batch"]
             assert torch.equal(batch["sample_mask"], mock_batch["sample_mask"])
             assert torch.equal(batch["input_ids"], mock_batch["input_ids"])
 
@@ -369,6 +369,7 @@ class TestGetMicrobatchIterator:
             data=mock_data,
             cfg=cfg,
             mbs=4,
+            straggler_timer=MagicMock(),
         )
 
         # Verify dynamic batching path was taken
@@ -423,6 +424,7 @@ class TestGetMicrobatchIterator:
             data=mock_data,
             cfg=cfg,
             mbs=4,
+            straggler_timer=MagicMock(),
         )
 
         # Verify sequence packing path was taken
@@ -466,6 +468,7 @@ class TestGetMicrobatchIterator:
             data=mock_data,
             cfg=cfg,
             mbs=mbs,
+            straggler_timer=MagicMock(),
         )
 
         # Verify regular batching path was taken
@@ -512,6 +515,7 @@ class TestGetMicrobatchIterator:
             data=mock_data,
             cfg=cfg,
             mbs=4,
+            straggler_timer=MagicMock(),
             seq_length_key=None,  # Should be auto-detected
         )
 
@@ -528,6 +532,7 @@ class TestMakeProcessedMicrobatchIterator:
     def test_make_processed_microbatch_iterator_basic(self, mock_process):
         """Test make_processed_microbatch_iterator yields ProcessedMicrobatch."""
         from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
             ProcessedMicrobatch,
             make_processed_microbatch_iterator,
         )
@@ -540,13 +545,13 @@ class TestMakeProcessedMicrobatchIterator:
         mock_packed_seq_params = None
         mock_cu_seqlens_padded = None
 
-        mock_process.return_value = (
-            mock_input_ids,
-            mock_input_ids_cp_sharded,
-            mock_attention_mask,
-            mock_position_ids,
-            mock_packed_seq_params,
-            mock_cu_seqlens_padded,
+        mock_process.return_value = ProcessedInputs(
+            input_ids=mock_input_ids,
+            input_ids_cp_sharded=mock_input_ids_cp_sharded,
+            attention_mask=mock_attention_mask,
+            position_ids=mock_position_ids,
+            packed_seq_params=mock_packed_seq_params,
+            cu_seqlens_padded=mock_cu_seqlens_padded,
         )
 
         # Create mock data dict
@@ -581,16 +586,19 @@ class TestMakeProcessedMicrobatchIterator:
     @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_with_packing(self, mock_process):
         """Test make_processed_microbatch_iterator with sequence packing."""
-        from nemo_rl.models.megatron.data import make_processed_microbatch_iterator
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
 
         # Setup mocks
-        mock_process.return_value = (
-            MagicMock(),  # input_ids
-            MagicMock(),  # input_ids_cp_sharded
-            None,  # attention_mask (None for packed)
-            None,  # position_ids (None for packed)
-            MagicMock(),  # packed_seq_params
-            MagicMock(),  # cu_seqlens_padded
+        mock_process.return_value = ProcessedInputs(
+            input_ids=MagicMock(),
+            input_ids_cp_sharded=MagicMock(),
+            attention_mask=None,  # None for packed
+            position_ids=None,  # None for packed
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=MagicMock(),
         )
 
         mock_data_dict = MagicMock()
@@ -622,6 +630,7 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_full_seq_to"] == 1024
 
 
+@pytest.mark.mcore
 @ray.remote(num_gpus=1)
 class PackSequencesTestActor:
     def __init__(self, cp_size):
