@@ -66,7 +66,7 @@ policy:
 
 ### FLAKY STUFF 
 * Not sure why with uvm 1 alone it doesnt work. (You need not set offload kv cache) This is very inefficient and this does cuda warmup every iteration (reset cuda graphs deletes cuda graphs and so maybe that clears the memory , but it also recomputes cuda graphs). so this flaky
-* cuda_graph_scope only if i set it to `full` I see cuda graphs used properly (I added assert in `transformer_block.py ___call__ function` ). Cuda graph documentation says full, full_iteratoin and asks me to leave it None or [] if you want to capture for full iteration
+* cuda_graph_scope  if i set it to `full_iteration` I see cuda graphs used properly (I added assert in `transformer_block.py ___call__ function` ). Its significantly faster (1 min) vs if I leave it to None it gets called at the `transformer_layer.py __call_ function` (1 min 46 seconds)
 * Sometimes I get this engine suspended error 
 ```========================= Step 9/10 =========================
 ▶ Preparing batch...
@@ -96,6 +96,7 @@ policy:
 (MegatronPolicyWorker[rank=9] pid=4154537)     raise EngineSuspendedError(self.step_count)
 (MegatronPolicyWorker[rank=9] pid=4154537) megatron.core.inference.engines.dynamic_engine.EngineSuspendedError: 7782
 ```
+* Sometimes I see timeout issues (Maybe due to improper synchronization)
 
 ### CHANGES TO BE DONE IN OTHER LIBRARIES
 1. Megatron bridge - remove import statement
@@ -158,6 +159,42 @@ FILE: megatron/core/tokenizers/text/libraries/huggingface_tokenizer.py
  
          # Force synchronize parameters.
          if param_sync:
+```
+5. Sometimes I see a timeout issue (Timeout issue. Need to add proper synchronization I think)
+
+I got this issue in step 6 :
+```
+========================= Step 6/50 =========================
+▶ Preparing batch...
+▶ Generating responses for batch of size 128...
+(MegatronPolicyWorker[rank=11] pid=3098847) GPU Memory before optimizer offload: 18.42GB allocated, 67.79GB reserved
+(MegatronPolicyWorker[rank=15] pid=3098871) [Rank 15] paused inference engine [repeated 15x across cluster]
+(MegatronPolicyWorker[rank=1] pid=1892466, ip=10.65.5.217) GPU Memory after optimizer offload: 0.65GB allocated, 32.23GB reserved
+(MegatronPolicyWorker[rank=1] pid=1892466, ip=10.65.5.217) GPU Memory after refit complete: 0.65GB allocated, 32.23GB reserved
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) [INFO] Restoring KV cache (30.00 GB) to GPU
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) [Rank 0] Resumed inference engine
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) GPU : 0, input_ids: torch.Size([128, 495])
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) [Rank 0] Submitting 128 requests to coordinator
+(MegatronPolicyWorker[rank=3] pid=1892419, ip=10.65.5.217) GPU Memory before optimizer offload: 18.43GB allocated, 67.83GB reserved [repeated 15x across cluster]
+(MegatronPolicyWorker[rank=10] pid=3098492) GPU Memory after optimizer offload: 0.65GB allocated, 32.22GB reserved [repeated 15x across cluster]
+(MegatronPolicyWorker[rank=10] pid=3098492) GPU Memory after refit complete: 0.65GB allocated, 32.22GB reserved [repeated 15x across cluster]
+(MegatronPolicyWorker[rank=3] pid=1892419, ip=10.65.5.217) GPU : 0, participating in engine loop (no data to submit)
+(MegatronPolicyWorker[rank=3] pid=1892419, ip=10.65.5.217) [Rank 3] Participating in engine loop only (not submitting requests)
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.714693059 ProcessGroupNCCL.cpp:683] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=49387, OpType=_ALLGATHER_BASE, NumelIn=442368, NumelOut=884736, Timeout(ms)=600000) ran for 600002 milliseconds before timing out.
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.714849575 ProcessGroupNCCL.cpp:2241] [PG ID 5 PG GUID 37(TENSOR_MODEL_PARALLEL_GROUP) Rank 1]  failure detected by watchdog at work sequence id: 49387 PG status: last enqueued work: 49406, last completed work: 49386
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.714860440 ProcessGroupNCCL.cpp:730] Stack trace of the failed collective not found, potentially because FlightRecorder is disabled. You can enable it by setting TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.714884178 ProcessGroupNCCL.cpp:2573] [PG ID 5 PG GUID 37(TENSOR_MODEL_PARALLEL_GROUP) Rank 1] First PG on this rank to signal dumping.
+(MegatronPolicyWorker[rank=9] pid=3098846) NCCL version 2.27.5+cuda12.9
+(MegatronPolicyWorker[rank=15] pid=3098871) [Rank 15] Resumed inference engine [repeated 15x across cluster]
+(MegatronPolicyWorker[rank=15] pid=3098871) GPU : 0, participating in engine loop (no data to submit) [repeated 14x across cluster]
+(MegatronPolicyWorker[rank=15] pid=3098871) [Rank 15] Participating in engine loop only (not submitting requests) [repeated 14x across cluster]
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.769817695 ProcessGroupNCCL.cpp:683] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=52229, OpType=ALLTOALL_BASE, NumelIn=56623104, NumelOut=56623104, Timeout(ms)=600000) ran for 600059 milliseconds before timing out.
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.769886452 ProcessGroupNCCL.cpp:2241] [PG ID 12 PG GUID 100(EXPERT_MODEL_PARALLEL_GROUP) Rank 1]  failure detected by watchdog at work sequence id: 52229 PG status: last enqueued work: 52258, last completed work: 52228
+(MegatronPolicyWorker[rank=9] pid=3098846) [rank9]:[E129 16:38:47.769926064 ProcessGroupNCCL.cpp:730] Stack trace of the failed collective not found, potentially because FlightRecorder is disabled. You can enable it by setting TORCH_NCCL_TRACE_BUFFER_SIZE to a non-zero value.
+(MegatronPolicyWorker[rank=8] pid=3098870) [rank8]:[E129 16:38:47.801786726 ProcessGroupNCCL.cpp:1858] [PG ID 0 PG GUID 0(default_pg) Rank 8] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 62, last completed NCCL work: 62.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc.
+(MegatronPolicyWorker[rank=8] pid=3098870) [rank8]:[E129 16:38:47.802073551 ProcessGroupNCCL.cpp:1575] [PG ID 0 PG GUID 0(default_pg) Rank 8] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) [rank0]:[E129 16:38:47.634597716 ProcessGroupNCCL.cpp:1794] [PG ID 0 PG GUID 0(default_pg) Rank 0] Observed flight recorder dump signal from another rank via TCPStore.
+(MegatronPolicyWorker[rank=0] pid=1892406, ip=10.65.5.217) [rank0]:[E129 16:38:47.634726597 ProcessGroupNCCL.cpp:1858] [PG ID 0 PG GUID 0(default_pg) Rank 0] Received a dump signal due to a collective timeout from  rank 8 and we will try our best to dump the debug info. Last enqueued NCCL work: 62, last completed NCCL work: 62.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc.
 ```
 
 ### DDP FIX EXPLANATION

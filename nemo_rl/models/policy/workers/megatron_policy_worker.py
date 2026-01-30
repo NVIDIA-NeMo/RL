@@ -93,7 +93,6 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 # Note: delete_cuda_graphs is called internally by toggle_cuda_graphs when reset_cuda_graphs=True
 from megatron.core.transformer.module import Float16Module
-from contextlib import contextmanager
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.training.utils import get_ltor_masks_and_position_ids
@@ -532,7 +531,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.inference_context = None
         self.inference_wrapped_model = None
         self._inference_engine_initialized = False
-        self._inference_engine_suspended = True  # Start suspended since we begin with training
+        self._inference_engine_paused = True  # Start paused since we begin with training
         self._inference_loop = None  # Event loop for inference operations
         self._inference_thread = None  # Thread running the event loop
 
@@ -785,7 +784,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # The toggle_cuda_graphs() function will switch between "local" (inference) and "none" (training).
         # This is required because cudagraph_manager is only created if cuda_graph_impl=="local" at model init.
         model_cfg.cuda_graph_impl = "local"
-        model_cfg.cuda_graph_scope = "full_iteration"
+        model_cfg.cuda_graph_scope = None
         model_cfg.use_te_rng_tracker = True
         model_cfg.inference_rng_tracker = True
 
@@ -1073,14 +1072,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
         ep_group = getattr(pg_collection, 'ep', None) if pg_collection is not None else None
         
-        if tp_group is not None:
-            inference_tp_size = get_pg_size(tp_group)
-        if pp_group is not None:
-            inference_pp_size = get_pg_size(pp_group)  
-        if ep_group is not None:
-            inference_ep_size = get_pg_size(ep_group)  
+        # Set defaults in case groups are None
+        inference_tp_size = get_pg_size(tp_group) if tp_group is not None else 1
+        inference_pp_size = get_pg_size(pp_group) if pp_group is not None else 1
+        inference_ep_size = get_pg_size(ep_group) if ep_group is not None else 1
 
-        print(f'inference_tp_size: {inference_tp_size}, inference_pp_size: {inference_pp_size} , inference_ep_size: {inference_ep_size}')    
+        print(f'inference_tp_size: {inference_tp_size}, inference_pp_size: {inference_pp_size}, inference_ep_size: {inference_ep_size}')    
         
         # Determine if we need MoE expert padding for CUDA graphs
         # This is required when using CUDA graphs with expert parallelism (EP > 1) for MoE models
@@ -1114,7 +1111,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ]
         max_tokens = mcore_generation_config["max_tokens"]
         # Read unified_memory_level from config (default to 0 for compatibility)
-        # Level 0: No unified memory, CUDA graphs are deleted/recreated on suspend/resume
+        # Level 0: No unified memory, CUDA graphs are deleted/recreated on pause/resume
         # Level 1+: Unified memory enabled, tensors maintain static addresses
         unified_memory_level = mcore_generation_config["unified_memory_level"]
         model_config = self.model.config
@@ -1176,7 +1173,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         self._inference_engine_initialized = True
-        self._inference_engine_suspended = True  # Engine starts in suspended state
+        self._inference_engine_paused = True  # Engine starts in paused state
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     async def _start_inference_coordinator(self, coordinator_port: int):
@@ -1195,66 +1192,43 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.inference_client = InferenceClient(coordinator_port)
             await self.inference_client.start()
         
-        self._inference_engine_suspended = False
+        self._inference_engine_paused = False
 
-    def suspend_inference_engine(self):
-        """Suspend the inference engine to free GPU memory for training.
+    def pause_inference_engine(self):
+        """pause the inference engine to free GPU memory for training.
         
         This method should be called before training to:
         1. Deallocate KV cache and other inference-specific GPU memory
         2. Disable CUDA graphs for inference
         3. Toggle model configuration for training mode
         
-        Uses the coordinator's suspend mechanism to properly pause the engine loop
-        and then suspend the engine (deallocate tensors, etc.).
+        Uses the coordinator's pause mechanism to properly pause the engine loop
+        and then pause the engine (deallocate tensors, etc.).
         
         For coordinator-based inference:
-        - Only rank 0 sends suspend signals via the coordinator
+        - Only rank 0 sends pause signals via the coordinator
         - The coordinator broadcasts to all DP engines
         - Non-rank-0 workers wait for their engine to be paused via the event loop
         """
-        if not self._inference_engine_initialized:
-            return
-        
-        if self._inference_engine_suspended:
-            return
 
-        dist_rank = torch.distributed.get_rank()
-        
-        # Use the coordinator-based suspend mechanism
-        # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
-        if self._inference_loop is not None:
-            if dist_rank == 0 and self.inference_client is not None:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._suspend_via_coordinator(),
-                    self._inference_loop
-                )
-                future.result()
-            # Non-rank-0 workers: wait for engine to be paused via the event loop
-            # This integrates properly with the async architecture
-            elif self.dynamic_inference_engine is not None:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._wait_for_engine_paused(),
-                    self._inference_loop
-                )
-                future.result()
-        elif self.dynamic_inference_engine is not None:
-            # Fallback to direct suspend if no coordinator/inference loop
-            self.dynamic_inference_engine.suspend()
-        
+        future = asyncio.run_coroutine_threadsafe(
+            self.pause_engine(),
+            self._inference_loop
+        )
+        future.result()
         # Synchronize all ranks
         torch.distributed.barrier()
         
-        self._inference_engine_suspended = True
-        print(f"[Rank {self.rank}] Suspended inference engine")
+        self._inference_engine_paused = True
+        print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _suspend_via_coordinator(self):
-        """Send suspend signals via the coordinator and wait for acknowledgment."""
-        if self.inference_client is not None:
-            # Send PAUSE then SUSPEND signals
-            self.inference_client.suspend_engines()
+    async def pause_engine(self):
+        """Send pause signals via the coordinator and wait for acknowledgment."""
+        if torch.distributed.get_rank() == 0:
+            # Send PAUSE  signals
+            self.inference_client.pause_engines()
             # Wait for the engine to acknowledge the pause
-            await self.dynamic_inference_engine.paused.wait()
+        await self.dynamic_inference_engine.paused.wait()
 
     def resume_inference_engine(self):
         """Resume the inference engine after training.
@@ -1271,66 +1245,28 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         - The coordinator broadcasts to all DP engines
         - Non-rank-0 workers wait for their engine to be running via the event loop
         """
-        if not self._inference_engine_initialized:
-            return
-        
-        if not self._inference_engine_suspended:
-            return
-
-        dist_rank = torch.distributed.get_rank()
         
         # Use the coordinator-based resume mechanism
         # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
-        if self._inference_loop is not None:
-            if dist_rank == 0 and self.inference_client is not None:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._resume_via_coordinator(),
-                    self._inference_loop
-                )
-                future.result()
-            # Non-rank-0 workers: wait for engine to be running via the event loop
-            # This integrates properly with the async architecture
-            elif self.dynamic_inference_engine is not None:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._wait_for_engine_running(),
-                    self._inference_loop
-                )
-                future.result()
-        elif self.dynamic_inference_engine is not None:
-            # Fallback to direct resume if no coordinator/inference loop
-            self.dynamic_inference_engine.resume()
-        
+        future = asyncio.run_coroutine_threadsafe(
+            self.resume_engine(),
+            self._inference_loop
+        )
+        future.result()
         # Synchronize all ranks
         torch.distributed.barrier()
         
-        self._inference_engine_suspended = False
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] Resumed inference engine")
 
-    async def _resume_via_coordinator(self):
+    async def resume_engine(self):
         """Send resume signals via the coordinator and wait for acknowledgment."""
-        if self.inference_client is not None:
+        if torch.distributed.get_rank() == 0:
             # Send RESUME then UNPAUSE signals
-            self.inference_client.resume_engines()
+            self.inference_client.unpause_engines()
             # Wait for the engine to acknowledge it's running
-            await self.dynamic_inference_engine.running.wait()
+        await self.dynamic_inference_engine.running.wait()
 
-    async def _wait_for_engine_paused(self):
-        """Wait for the engine to be paused (non-rank-0 workers).
-        
-        This is used by non-rank-0 workers to wait for the coordinator's
-        suspend signal to be processed by their engine.
-        """
-        if self.dynamic_inference_engine is not None:
-            await self.dynamic_inference_engine.paused.wait()
-
-    async def _wait_for_engine_running(self):
-        """Wait for the engine to be running (non-rank-0 workers).
-        
-        This is used by non-rank-0 workers to wait for the coordinator's
-        resume signal to be processed by their engine.
-        """
-        if self.dynamic_inference_engine is not None:
-            await self.dynamic_inference_engine.running.wait()
 
     @contextmanager
     def inference_mode(self, mcore_generation_config: dict):
@@ -1347,7 +1283,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         6. Resume engine (engine handles CUDA graph creation internally if needed)
         
         EXIT order (matching Megatron RL):
-        1. Suspend engine
+        1. Pause engine
         2. Offload KV cache to CPU
         3. Toggle CUDA graphs OFF 
         4. Clear rotary cache
@@ -1413,7 +1349,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         print(f"[INFO] Restoring KV cache ({cache_size_gb:.2f} GB) to GPU")
                     self.inference_context.memory_buffer = kv_cache.cuda()
 
-        if self._inference_engine_suspended:
+        if self._inference_engine_paused:
             self.resume_inference_engine()
         
         try:
@@ -1422,11 +1358,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             
         finally:
             
-            # 1. Suspend the inference engine
-            if self._inference_engine_initialized and not self._inference_engine_suspended:
-                self.suspend_inference_engine()
+            # 1. pause the inference engine
+            if self._inference_engine_initialized and not self._inference_engine_paused:
+                self.pause_inference_engine()
             
-            # 2. Handle KV cache offloading AFTER suspend (matching Megatron RL)
+            # 2. Handle KV cache offloading AFTER pause (matching Megatron RL)
             if offload_kv_cache and hasattr(self, 'inference_context'):
                 if self.inference_context.memory_buffer is not None:
                     kv_cache = self.inference_context.memory_buffer
@@ -2300,7 +2236,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         coordinator that routes requests to available engines.
 
         The inference engine is created once and reused across generate() calls.
-        The engine is suspended between generate() calls to free GPU memory for training.
+        The engine is paused between generate() calls to free GPU memory for training.
 
         For coordinator-based inference:
         - Only DP rank 0 receives actual data and submits requests to the coordinator
@@ -2557,10 +2493,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             DynamicInferenceRequestRecord,
         )
 
+        dist_rank = torch.distributed.get_rank()
+        
         if dist_rank == 0:
             assert self.inference_client is not None, "Inference client not initialized"
-
-        dist_rank = torch.distributed.get_rank()
         
         # Non-rank-0 workers: return immediately with empty results
         # Their engine loops will continue processing requests from the coordinator
@@ -2595,167 +2531,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         results.sort(key=lambda x: x.request_id)
         
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
-
-        return results
-
-    def _run_async_generation(
-        self,
-        engine: "DynamicInferenceEngine",
-        prompt_tokens_tensor: torch.Tensor,
-        prompt_lengths_tensor: torch.Tensor,
-        sampling_params: "SamplingParams",
-        coordinator_port: int,
-    ) -> list:
-        """Run async generation in a separate thread to avoid event loop conflicts.
-
-        Ray uses uvloop which has strict checking about nested event loops.
-        Running the async code in a separate thread with its own standard asyncio
-        event loop (not uvloop) avoids these conflicts.
-        
-        NOTE: This method is kept for backwards compatibility but is no longer
-        used by the main generate() path which uses the persistent engine.
-        """
-        import concurrent.futures
-
-        def run_in_thread():
-            # Explicitly use the standard asyncio event loop policy, not uvloop
-            # This is necessary because uvloop might be set as the global default
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                coro = self._generate_with_coordinator(
-                    engine,
-                    prompt_tokens_tensor,
-                    prompt_lengths_tensor,
-                    sampling_params,
-                    coordinator_port,
-                )
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
-
-        # Run in a separate thread to avoid uvloop conflicts
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_in_thread)
-            return future.result()
-
-    async def _generate_with_coordinator(
-        self,
-        engine: "DynamicInferenceEngine",
-        prompt_tokens_tensor: torch.Tensor,
-        prompt_lengths_tensor: torch.Tensor,
-        sampling_params: "SamplingParams",
-        coordinator_port: int,
-    ) -> list:
-        """Run generation using the coordinator-based inference pattern.
-
-        This method starts the inference coordinator (on rank 0) and engine loops
-        on all ranks. Requests are submitted via the InferenceClient on rank 0,
-        and results are gathered and broadcast to all ranks.
-        
-        NOTE: This method is kept for backwards compatibility but is no longer
-        used by the main generate() path which uses the persistent engine.
-
-        Args:
-            engine: The DynamicInferenceEngine instance
-            prompt_tokens_tensor: Tensor of prompt token IDs [batch_size, seq_len]
-            prompt_lengths_tensor: Tensor of prompt lengths [batch_size]
-            sampling_params: Sampling parameters for generation
-            coordinator_port: Port for the inference coordinator
-
-        Returns:
-            List of completed request records sorted by request_id
-        """
-        from megatron.core.inference.inference_client import InferenceClient
-        from megatron.core.inference.inference_request import (
-            DynamicInferenceRequestRecord,
-        )
-
-        dist_rank = torch.distributed.get_rank()
-
-        # Start the coordinator and engine loop on all ranks
-        # launch_inference_coordinator=True only spawns the coordinator process on rank 0
-        # (specifically on the DP coordinator rank which is TP=0, PP=0, DP=0)
-        await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=coordinator_port,
-            launch_inference_coordinator=True,
-        )
-
-        results = []
-        if dist_rank == 0:
-            # Only rank 0 creates the client and submits requests
-            client = InferenceClient(coordinator_port)
-            await client.start()
-
-            # Submit all requests
-            futures = []
-            for request_id, (prompt_tokens, prompt_len) in enumerate(
-                zip(prompt_tokens_tensor, prompt_lengths_tensor, strict=True)
-            ):
-                # Extract the actual prompt tokens (without padding) and convert to list
-                # msgpack cannot serialize tensors, so we need to convert to list
-                prompt = prompt_tokens[: prompt_len.item()].tolist()
-                future = client.add_request(prompt, sampling_params)
-                futures.append(future)
-
-            # Wait for all requests to complete
-            completed_records: list[DynamicInferenceRequestRecord] = await asyncio.gather(
-                *futures
-            )
-
-            # Extract the merged request from each record
-            results = [record.merge() for record in completed_records]
-
-            # Sort by request_id to maintain original batch order
-            results.sort(key=lambda x: x.request_id)
-
-            # Stop the engines gracefully
-            await client.stop_engines()
-            client.stop()
-
-        # Wait for all engine loops to finish
-        await asyncio.gather(engine.engine_loop_task)
-
-        # Serialize results on rank 0 and broadcast to all ranks
-        if dist_rank == 0:
-            serialized_results = [
-                {
-                    "request_id": r.request_id,
-                    "prompt_tokens": r.prompt_tokens.tolist(),
-                    "generated_tokens": r.generated_tokens,
-                    "prompt_log_probs": r.prompt_log_probs,
-                    "generated_log_probs": r.generated_log_probs,
-                }
-                for r in results
-            ]
-        else:
-            serialized_results = None
-
-        # Broadcast results to all ranks
-        result_list = [serialized_results]
-        torch.distributed.broadcast_object_list(result_list, src=0)
-        serialized_results = result_list[0]
-
-        # Reconstruct result objects on non-rank-0 workers
-        if dist_rank != 0:
-            from megatron.core.inference.inference_request import (
-                DynamicInferenceRequest,
-            )
-
-            results = []
-            for r in serialized_results:
-                req = DynamicInferenceRequest(
-                    request_id=r["request_id"],
-                    prompt_tokens=torch.tensor(
-                        r["prompt_tokens"], dtype=torch.int64, device="cuda"
-                    ),
-                    sampling_params=sampling_params,
-                )
-                req.generated_tokens = r["generated_tokens"]
-                req.prompt_log_probs = r["prompt_log_probs"]
-                req.generated_log_probs = r["generated_log_probs"]
-                results.append(req)
 
         return results
 
