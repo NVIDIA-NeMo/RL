@@ -315,6 +315,7 @@ class BaseVllmGenerationWorker:
 
             with open(file_to_patch, "w") as f:
                 f.write(content)
+            logger.info("Successfully patched vllm speculative decoding post_step.")
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
@@ -323,7 +324,6 @@ class BaseVllmGenerationWorker:
         logger.info("Successfully patched vllm vit flash attention backend.")
 
         _patch_vllm_speculative_decoding_post_step()
-        logger.info("Successfully patched vllm speculative decoding post_step.")
 
         try:
             import vllm
@@ -453,6 +453,7 @@ class BaseVllmGenerationWorker:
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
+            # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
