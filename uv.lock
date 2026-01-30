@@ -195,7 +195,9 @@ members = [
 constraints = [
     { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "brotli", specifier = ">=1.2.0" },
+    { name = "protobuf", specifier = ">=6.33.5" },
     { name = "pyasn1", specifier = ">=0.6.2" },
+    { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "starlette", specifier = ">=0.49.1" },
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "wheel", specifier = ">=0.46.2" },
@@ -6114,16 +6116,17 @@ wheels = [
 
 [[package]]
 name = "protobuf"
-version = "6.32.0"
+version = "6.33.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c0/df/fb4a8eeea482eca989b51cffd274aac2ee24e825f0bf3cbce5281fa1567b/protobuf-6.32.0.tar.gz", hash = "sha256:a81439049127067fc49ec1d36e25c6ee1d1a2b7be930675f919258d03c04e7d2", size = 440614, upload-time = "2025-08-14T21:21:25.015Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/25/7c72c307aafc96fa87062aa6291d9f7c94836e43214d43722e86037aac02/protobuf-6.33.5.tar.gz", hash = "sha256:6ddcac2a081f8b7b9642c09406bc6a4290128fce5f471cddd165960bb9119e5c", size = 444465, upload-time = "2026-01-29T21:51:33.494Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/18/df8c87da2e47f4f1dcc5153a81cd6bca4e429803f4069a299e236e4dd510/protobuf-6.32.0-cp310-abi3-win32.whl", hash = "sha256:84f9e3c1ff6fb0308dbacb0950d8aa90694b0d0ee68e75719cb044b7078fe741", size = 424409, upload-time = "2025-08-14T21:21:12.366Z" },
-    { url = "https://files.pythonhosted.org/packages/e1/59/0a820b7310f8139bd8d5a9388e6a38e1786d179d6f33998448609296c229/protobuf-6.32.0-cp310-abi3-win_amd64.whl", hash = "sha256:a8bdbb2f009cfc22a36d031f22a625a38b615b5e19e558a7b756b3279723e68e", size = 435735, upload-time = "2025-08-14T21:21:15.046Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/5b/0d421533c59c789e9c9894683efac582c06246bf24bb26b753b149bd88e4/protobuf-6.32.0-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:d52691e5bee6c860fff9a1c86ad26a13afbeb4b168cd4445c922b7e2cf85aaf0", size = 426449, upload-time = "2025-08-14T21:21:16.687Z" },
-    { url = "https://files.pythonhosted.org/packages/ec/7b/607764ebe6c7a23dcee06e054fd1de3d5841b7648a90fd6def9a3bb58c5e/protobuf-6.32.0-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:501fe6372fd1c8ea2a30b4d9be8f87955a64d6be9c88a973996cef5ef6f0abf1", size = 322869, upload-time = "2025-08-14T21:21:18.282Z" },
-    { url = "https://files.pythonhosted.org/packages/40/01/2e730bd1c25392fc32e3268e02446f0d77cb51a2c3a8486b1798e34d5805/protobuf-6.32.0-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:75a2aab2bd1aeb1f5dc7c5f33bcb11d82ea8c055c9becbb41c26a8c43fd7092c", size = 322009, upload-time = "2025-08-14T21:21:19.893Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/f2/80ffc4677aac1bc3519b26bc7f7f5de7fce0ee2f7e36e59e27d8beb32dd1/protobuf-6.32.0-py3-none-any.whl", hash = "sha256:ba377e5b67b908c8f3072a57b63e2c6a4cbd18aea4ed98d2584350dbf46f2783", size = 169287, upload-time = "2025-08-14T21:21:23.515Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/79/af92d0a8369732b027e6d6084251dd8e782c685c72da161bd4a2e00fbabb/protobuf-6.33.5-cp310-abi3-win32.whl", hash = "sha256:d71b040839446bac0f4d162e758bea99c8251161dae9d0983a3b88dee345153b", size = 425769, upload-time = "2026-01-29T21:51:21.751Z" },
+    { url = "https://files.pythonhosted.org/packages/55/75/bb9bc917d10e9ee13dee8607eb9ab963b7cf8be607c46e7862c748aa2af7/protobuf-6.33.5-cp310-abi3-win_amd64.whl", hash = "sha256:3093804752167bcab3998bec9f1048baae6e29505adaf1afd14a37bddede533c", size = 437118, upload-time = "2026-01-29T21:51:24.022Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/6b/e48dfc1191bc5b52950246275bf4089773e91cb5ba3592621723cdddca62/protobuf-6.33.5-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:a5cb85982d95d906df1e2210e58f8e4f1e3cdc088e52c921a041f9c9a0386de5", size = 427766, upload-time = "2026-01-29T21:51:25.413Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/b1/c79468184310de09d75095ed1314b839eb2f72df71097db9d1404a1b2717/protobuf-6.33.5-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:9b71e0281f36f179d00cbcb119cb19dec4d14a81393e5ea220f64b286173e190", size = 324638, upload-time = "2026-01-29T21:51:26.423Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/f5/65d838092fd01c44d16037953fd4c2cc851e783de9b8f02b27ec4ffd906f/protobuf-6.33.5-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:8afa18e1d6d20af15b417e728e9f60f3aa108ee76f23c3b2c07a2c3b546d3afd", size = 339411, upload-time = "2026-01-29T21:51:27.446Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/53/a9443aa3ca9ba8724fdfa02dd1887c1bcd8e89556b715cfbacca6b63dbec/protobuf-6.33.5-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:cbf16ba3350fb7b889fca858fb215967792dc125b35c7976ca4818bee3521cf0", size = 323465, upload-time = "2026-01-29T21:51:28.925Z" },
+    { url = "https://files.pythonhosted.org/packages/57/bf/2086963c69bdac3d7cff1cc7ff79b8ce5ea0bec6797a017e1be338a46248/protobuf-6.33.5-py3-none-any.whl", hash = "sha256:69915a973dd0f60f31a08b8318b73eab2bd6a392c79184b3612226b0a3f8ec02", size = 170687, upload-time = "2026-01-29T21:51:32.557Z" },
 ]
 
 [[package]]
@@ -6727,11 +6730,11 @@ wheels = [
 
 [[package]]
 name = "python-multipart"
-version = "0.0.20"
+version = "0.0.22"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f3/87/f44d7c9f274c7ee665a29b885ec97089ec5dc034c7f3fafa03da9e39a09e/python_multipart-0.0.20.tar.gz", hash = "sha256:8dd0cab45b8e23064ae09147625994d090fa46f5b0d1e13af944c331a7fa9d13", size = 37158, upload-time = "2024-12-16T19:45:46.972Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/01/979e98d542a70714b0cb2b6728ed0b7c46792b695e3eaec3e20711271ca3/python_multipart-0.0.22.tar.gz", hash = "sha256:7340bef99a7e0032613f56dc36027b959fd3b30a787ed62d310e951f7c3a3a58", size = 37612, upload-time = "2026-01-25T10:15:56.219Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/58/38b5afbc1a800eeea951b9285d3912613f2603bdf897a4ab0f4bd7f405fc/python_multipart-0.0.20-py3-none-any.whl", hash = "sha256:8a62d3a8335e06589fe01f2a3e178cdcc632f3fbe0d492ad9ee0ec35aab1f104", size = 24546, upload-time = "2024-12-16T19:45:44.423Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/d0/397f9626e711ff749a95d96b7af99b9c566a9bb5129b8e4c10fc4d100304/python_multipart-0.0.22-py3-none-any.whl", hash = "sha256:2b2cd894c83d21bf49d702499531c7bafd057d730c201782048f7945d82de155", size = 24579, upload-time = "2026-01-25T10:15:54.811Z" },
 ]
 
 [[package]]
@@ -8628,21 +8631,21 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-win_amd64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-win_amd64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-win_amd64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-win_amd64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-manylinux_2_28_aarch64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-manylinux_2_28_x86_64.whl" },
-    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-win_amd64.whl" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:106f9619d43edbd7087bc89b5fd1e4d9f491d9ec8ce91e84378a79b0a7c2b586" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:6a2f119afeefe66eef75484f008b1a240952e45b24899d27d281961e8a395458" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp312-cp312-win_amd64.whl", hash = "sha256:890c0d395c529f8161b4e6423e5b2f758984721705cc6895aa3c3852da424d87" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c32735d662f8a2071838ce92ef63678cb4f8c7661cdfcd3d1b06503b7b001626" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:6ba57bef11493397c151d755334092290412904e46c85ed86277a03bb24fd13a" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313-win_amd64.whl", hash = "sha256:4f0cbbd568d76039381711fecd993cac4e500542ef64640b6e2a6d4342c2f381" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:b0c03da4d96576207013ec352636a3911c59830cbb53b93d11a048a4e55ca7c5" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:656404556df5b9509487d2052e3b8ef2c7c1ae0b29690eab617b3716b220a184" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp313-cp313t-win_amd64.whl", hash = "sha256:5f0cf760316c5fca00fcc99320d4454b332bf1b8d338c63012802094cc3895e2" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:1686765f05d11ac1aa33bb16150391182d8fdbd5f73197fd300a0f9d08790dd4" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:3b1537f9b8e0149607d51424c9bf2422d30ece1cf58acbea2f6a1d33831e9436" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314-win_amd64.whl", hash = "sha256:c2905e9ce6411e21ce3854e9bbcdcb44117ae7695abd6e8ac30f905bf00e31a9" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:aff4ff013a21d195a9ee2bc0d069cdfe567b262f641e3981a25114a2e392b170" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:3f7ccb3cf047c33c442622c811a36826f71a7af9c8e19c12d32f941ad5fbfbb5" },
+    { url = "https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp314-cp314t-win_amd64.whl", hash = "sha256:7e50135c1b75befe05fc27250369621c82934afc9680daf1d4a71b7d1f29acd8" },
 ]
 
 [[package]]
