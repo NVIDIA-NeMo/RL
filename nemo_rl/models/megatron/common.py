@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import os
+from collections import defaultdict
 from functools import partial
 from typing import Any, Iterator, Optional
 
@@ -23,6 +26,8 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_data_parallel_rank,
+    get_pipeline_model_parallel_rank,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
@@ -36,6 +41,79 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+
+logger = logging.getLogger(__name__)
+
+
+def log_worker_ranks_and_pid() -> str:
+    """Log worker PID and all parallel ranks (TP, PP, CP, DP).
+
+    Returns:
+        Formatted string with worker information
+    """
+    pid = os.getpid()
+
+    try:
+        if torch.distributed.is_initialized():
+            global_rank = torch.distributed.get_rank()
+            tp_rank = get_tensor_model_parallel_rank()
+            pp_rank = get_pipeline_model_parallel_rank()
+            cp_rank = get_context_parallel_rank()
+            dp_rank = get_data_parallel_rank()
+
+            return (
+                f"PID={pid}, GlobalRank={global_rank}, "
+                f"DP={dp_rank}, TP={tp_rank}, PP={pp_rank}, CP={cp_rank}"
+            )
+    except Exception as e:
+        return f"PID={pid}, Error getting ranks: {e}"
+
+    return f"PID={pid}, Distributed not initialized"
+
+
+def log_sequence_length_distribution(
+    cu_seqlens_padded: torch.Tensor,
+    max_seq_len: int,
+    num_bins: int = 5,
+) -> None:
+    """Log sequence length distribution from cu_seqlens_padded.
+
+    Args:
+        cu_seqlens_padded: Cumulative sequence lengths [batch_size + 1]
+        max_seq_len: Maximum sequence length for binning
+        num_bins: Number of bins (default 5 for 0.2 increments)
+    """
+    # Compute individual sequence lengths from cumulative lengths
+    seq_lengths = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).cpu().tolist()
+
+    # Create bins: 0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0
+    bin_size = max_seq_len / num_bins
+    bins = defaultdict(int)
+
+    for length in seq_lengths:
+        # Determine which bin this length falls into
+        bin_idx = min(int(length / bin_size), num_bins - 1)
+        bin_start = int(bin_idx * bin_size)
+        bin_end = int((bin_idx + 1) * bin_size)
+        bin_key = f"{bin_start}-{bin_end}"
+        bins[bin_key] += 1
+
+    # Get worker info
+    worker_info = log_worker_ranks_and_pid()
+
+    # Log cu_seqlens_padded
+    logger.info(
+        f"[SeqPacking] {worker_info} | "
+        f"cu_seqlens_padded: {cu_seqlens_padded.cpu().tolist()}"
+    )
+
+    # Log distribution
+    total_seqs = len(seq_lengths)
+    dist_str = ", ".join([f"{k}: {v}" for k, v in sorted(bins.items())])
+    logger.info(
+        f"[SeqPacking] {worker_info} | "
+        f"Sequence length distribution (total={total_seqs}): {dist_str}"
+    )
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -439,6 +517,14 @@ def forward_step_arbitrary_loss(
                 pad_full_seq_to,
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
+            )
+
+            # Log sequence packing information
+            max_seq_len = pad_full_seq_to if pad_full_seq_to is not None else original_seq_length
+            log_sequence_length_distribution(
+                cu_seqlens_padded,
+                max_seq_len=max_seq_len,
+                num_bins=5,
             )
 
             # For packed sequences, position_ids and attention_mask are typically None
