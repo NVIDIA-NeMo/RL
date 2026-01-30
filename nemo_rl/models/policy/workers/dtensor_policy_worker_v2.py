@@ -661,6 +661,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         sequence_dim=sequence_dim,
                     )
 
+                # skip keeping the scores for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
                 all_rm_scores.append(rm_scores)
 
         all_rm_scores = torch.cat(all_rm_scores, dim=0)
@@ -745,6 +749,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         allow_flash_attn_args=self.allow_flash_attn_args,
                         sequence_dim=sequence_dim,
                     )
+
+                # skip keeping the topk values for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
 
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
