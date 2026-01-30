@@ -2,7 +2,7 @@ grpo:
   max_num_epochs: 1
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
-  max_rollout_turns: 1 # for multi-turn rollouts. Workplace assistant has 1 turn but can have up to 6 tool-calling steps
+  max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -41,17 +41,19 @@ loss_fn:
   truncated_importance_sampling_ratio: null
   use_importance_sampling_correction: false
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 
 checkpointing:
   enabled: true
+  checkpoint_dir: "results/grpo"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 6  # Save checkpoint every 6 steps (aligned with val_period)
+  save_period: 1
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+  model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
@@ -60,13 +62,14 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 12288
+  max_total_sequence_length: 32768
   precision: "bfloat16"
-  logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
     _v2: false
-    enabled: false
+    enabled: true
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true
@@ -74,16 +77,14 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
-
+  
   megatron_cfg:
-    enabled: true
-    bias_activation_fusion: false
-    tensor_model_parallel_size: 2
+    enabled: false
     # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true
-    # train_iters needs to be large enough to cover all training steps
-    train_iters: 100000
+    converter_type: "Qwen2ForCausalLM"  # Apparently this is comptible with Qwen 3 dense models.
+    tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
@@ -98,11 +99,10 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: false
+    defer_fp32_logits: true
     moe_permute_fusion: false
-    moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
-    moe_shared_expert_overlap: false
+    bias_activation_fusion: True
+    moe_per_layer_logging: False
 
     optimizer:
       optimizer: "adam"
@@ -136,10 +136,9 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: 100000  # Must be greater than lr_warmup_iters
+      lr_decay_iters: null
       lr_warmup_iters: 13
       lr_warmup_init: 5.0e-7
-      override_opt_param_scheduler: true
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -167,11 +166,20 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
-  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
-  optimizer: null
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
 
   scheduler:
     - name: "torch.optim.lr_scheduler.ConstantLR"
@@ -201,23 +209,21 @@ policy:
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
-      kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
-      # tool_parser_plugin: ???  # This is set to the path for Nemotron Nano v2
+      kv_cache_dtype: ${policy.precision}
       http_server_serving_chat_kwargs:
-        # Workplace assistant uses 26 tools, so we enable auto_tools.
-        # For Nemotron Nano v2, we use the dedicated `nemotron_json` tool parser
+        # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
         enable_auto_tools: true
-        tool_parser: nemotron_json
+        tool_parser: hermes
+        # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
+        # reasoning_parser: deepseek_r1
     vllm_kwargs:
       compilation_config:
         # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
         # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
         # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
         use_inductor: False
-      # We need the Mamba cache to be set to fp32 for Nemotron Nano v2
-      mamba_ssm_cache_dtype: "float32"
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources
@@ -228,19 +234,16 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
-  # Train: 1129 samples, Validation: 126 samples
-
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
   train:
     dataset_name: NemoGymDataset
-    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+    data_path: 3rdparty/Gym-workspace/Gym/data/train.jsonl
     repeat: 1
   validation:
     dataset_name: NemoGymDataset
-    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+    data_path: 3rdparty/Gym-workspace/Gym/data/validation.jsonl
   default:
     env_name: "nemo_gym"
     prompt_file: null
@@ -251,31 +254,18 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
-    is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
-    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
-    # You can uncomment these during `ng_prepare_data` and here to train on multiple environments at once!
-    # - resources_servers/math_with_judge/configs/math_with_judge.yaml
-    # - resources_servers/code_gen/configs/code_gen.yaml
-    # - resources_servers/mcqa/configs/mcqa.yaml
-    # - resources_servers/instruction_following/configs/instruction_following.yaml
-    # - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
-    policy_model:
-      responses_api_models:
-        vllm_model:
-          # Disable reasoning!
-          uses_reasoning_parser: false
-          extra_body:
-            chat_template_kwargs:
-              enable_thinking: false
-    code_gen:
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    math_with_judge:
       resources_servers:
-        code_gen:
-          num_processes: ${mul:64, ${cluster.num_nodes}}
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
 
 logger:
-  log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b"  # Base directory for all logs
+  log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: true
   tensorboard_enabled: false
@@ -283,16 +273,19 @@ logger:
   swanlab_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "grpo-workplace-assistant"
-    name: "nemotron-nano-v2-9b-workplace-assistant"
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  swanlab:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
   tensorboard: {}
   mlflow:
-    experiment_name: "grpo-workplace-assistant"
-    run_name: "nemotron-nano-v2-9b-workplace-assistant"
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-logger"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1  # Single node by default; set to 2+ for multi-node training
+  num_nodes: 8

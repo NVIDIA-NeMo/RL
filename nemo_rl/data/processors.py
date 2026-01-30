@@ -538,6 +538,26 @@ def multichoice_qa_processor(
     return output
 
 
+def nemo_gym_data_processor(
+    datum_dict: dict[str, Any],
+    *args,
+    **kwargs,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
+    # Ensure message_log exists and contains tensor token_ids so downstream padding works
+    if "message_log" not in datum_dict or not datum_dict["message_log"]:
+        datum_dict["message_log"] = [
+            {"role": "user", "content": "", "token_ids": torch.tensor([])}
+        ]
+    else:
+        for msg in datum_dict["message_log"]:
+            if "token_ids" not in msg:
+                msg["token_ids"] = torch.tensor([])
+            elif not isinstance(msg["token_ids"], torch.Tensor):
+                msg["token_ids"] = torch.tensor(msg["token_ids"])
+    return cast(DatumSpec, datum_dict)
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -554,6 +574,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
+        "nemo_gym_data_processor": nemo_gym_data_processor,
     },
 )
 

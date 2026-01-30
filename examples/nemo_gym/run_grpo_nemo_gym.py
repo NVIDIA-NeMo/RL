@@ -13,11 +13,9 @@
 # limitations under the License.
 
 import argparse
-import json
 import os
 import pprint
-from itertools import chain, repeat
-from typing import Optional
+from typing import Dict, Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -25,6 +23,7 @@ import wandb.util
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
 import ray
+from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from wandb import Table
 
@@ -42,18 +41,18 @@ from nemo_rl.algorithms.grpo import (
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    extract_necessary_env_names,
+    load_response_dataset,
+    update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGym,
     NemoGymConfig,
-    nemo_gym_example_to_nemo_rl_datum_spec,
     setup_nemo_gym_config,
 )
+from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -75,38 +74,97 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
-def setup_single_nemo_gym_dataset(
-    jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None
-):
-    with open(jsonl_fpath) as f:
-        nemo_gym_examples = list(map(json.loads, f))
+def setup_data(
+    tokenizer: TokenizerType,
+    data_config: Dict,
+    env_configs: Dict,
+    seed: int,
+) -> tuple[
+    AllTaskProcessedDataset,
+    Optional[AllTaskProcessedDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
+    print("\n▶ Setting up envs...")
+    env_name_list = extract_necessary_env_names(data_config)
+    envs = {
+        env_name: create_env(env_name=env_name, env_config=env_configs[env_name])
+        for env_name in env_name_list
+        if env_name != "nemo_gym"
+    }
+    print("\n▶ Setting up data...")
+    # setup train dataset
+    task_data_processors = {}
+    task_to_env = {}
+    data_list = []
 
-    print(f"Loaded data at {jsonl_fpath}. Found {len(nemo_gym_examples)} examples")
+    if isinstance(data_config["train"], dict):
+        data_config["train"] = [data_config["train"]]
+    for cfg in data_config["train"]:
+        update_single_dataset_config(cfg, data_config["default"])
+        data = load_response_dataset(cfg)
+        data_list.append(data)
+        # bind task_name to task_data_processors and task_to_env
+        task_name = data.task_name
+        task_data_processors[task_name] = (data.task_spec, data.processor)
+        # Skip binding nemo_gym env to task_to_env, nemo_gym env need to initialize policy first
+        if cfg["env_name"] != "nemo_gym":
+            task_to_env[task_name] = envs[cfg["env_name"]]
 
-    if num_repeats:
-        previous_length = len(nemo_gym_examples)
-        nemo_gym_examples = list(
-            chain.from_iterable(
-                repeat(nemo_gym_example, num_repeats)
-                for nemo_gym_example in nemo_gym_examples
-            )
-        )
-        print(
-            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(nemo_gym_examples)}!"
-        )
-
-    nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
-    ]
-
-    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
-    return AllTaskProcessedDataset(
-        nemo_rl_compatible_examples,
+    merged_data = concatenate_datasets([data.dataset for data in data_list])
+    dataset = AllTaskProcessedDataset(
+        merged_data,
         tokenizer,
         None,
-        passthrough_task_processor,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
     )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+
+    # setup validation dataset
+    val_task_data_processors = {}
+    val_task_to_env = {}
+    val_data_list = []
+
+    for data in data_list:
+        if hasattr(data, "val_dataset") and data.val_dataset is not None:
+            val_data_list.append(data.val_dataset)
+            # bind task_name to task_data_processors
+            task_name = data.task_name
+            val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_to_env:
+                val_task_to_env[task_name] = task_to_env[task_name]
+
+    if data_config["validation"] is not None:
+        if isinstance(data_config["validation"], dict):
+            data_config["validation"] = [data_config["validation"]]
+
+        for cfg in data_config["validation"]:
+            update_single_dataset_config(cfg, data_config["default"])
+            val_data = load_response_dataset(cfg)
+            val_data_list.append(val_data.dataset)
+            # bind task_name to task_data_processors
+            task_name = val_data.task_name
+            val_task_data_processors[task_name] = (
+                val_data.task_spec,
+                val_data.processor,
+            )
+            if cfg["env_name"] != "nemo_gym":
+                val_task_to_env[task_name] = envs[cfg["env_name"]]
+
+    val_dataset = None
+    if len(val_data_list) > 0:
+        merged_val_data = concatenate_datasets(val_data_list)
+        val_dataset = AllTaskProcessedDataset(
+            merged_val_data,
+            tokenizer,
+            None,
+            val_task_data_processors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+
+    return dataset, val_dataset, task_to_env, val_task_to_env
 
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
@@ -202,13 +260,11 @@ def main() -> None:
     assert _should_use_nemo_gym(config)
 
     print("\n▶ Setting up data...")
-    train_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["train_jsonl_fpath"],
+    train_dataset, val_dataset, task_to_env, val_task_to_env = setup_data(
         tokenizer=tokenizer,
-    )
-    val_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["validation_jsonl_fpath"],
-        tokenizer=tokenizer,
+        data_config=config["data"],
+        env_configs=config["env"],
+        seed=config["grpo"]["seed"],
     )
 
     # Validation dataset config setup.
@@ -254,17 +310,12 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    nemo_gym = NemoGym.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.nemo_gym.NemoGym"
-            ),
-        }
-    ).remote(nemo_gym_config)
+    # Default nemo_gym env is used for trajectory collection
+    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
-    task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = task_to_env
+    task_to_env["nemo_gym"] = nemo_gym
+    val_task_to_env["nemo_gym"] = nemo_gym
 
     if is_trajectory_collection:
         collect_trajectories(

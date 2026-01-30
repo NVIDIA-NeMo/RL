@@ -46,6 +46,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "vlm": {
         "actor_class_fqn": "nemo_rl.environments.vlm_environment.VLMEnvironment",
     },
+    "nemo_gym": {
+        "actor_class_fqn": "nemo_rl.environments.nemo_gym.NemoGym",
+    },
 }
 
 
