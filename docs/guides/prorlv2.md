@@ -11,7 +11,7 @@ ProRLv2 (as used in this repo) is best thought of as **GRPO + a bundle of stabil
 - **Reinforce++: Decoupled local / global advantage normalization** (`reinforce_plus_plus`)
 - **“Stop properly” penalty** for truncated responses
 
-This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation of dynamic sampling / overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
+This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation behind dynamic sampling / overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
 
 ## Quickstart: Launch a ProRLv2 Run
 
@@ -36,7 +36,27 @@ Standard GRPO will train on all generated responses, even when a prompt’s `num
 
 ## Advantage Estimator: Reinforce++
 
-ProRLv2 can switch the advantage estimator from standard GRPO-style group baseline to **Reinforce++**:
+ProRLv2 can switch the advantage estimator from standard GRPO-style group baseline to **Reinforce++**.
+
+Quick intuition:
+
+- Reinforce++ uses **decoupled local + global normalization**.
+- Compared to GRPO-style **local-only normalization**, this decoupling can be **more stable** in longer runs (less sensitivity to per-batch scale/variance shifts).
+
+Computation (as implemented in this repo, with the ProRLv2 example defaults):
+
+```text
+Defaults in examples/configs/prorl.yaml:
+  grpo.adv_estimator.minus_baseline = true
+  loss_fn.use_kl_in_reward          = false
+
+Steps:
+  1) Per prompt-group, compute mean reward, then subtract it:
+       a_i = r_i - mean_{j in same prompt} r_j
+
+  2) Global normalize across *all valid response tokens* in the batch:
+       A <- (A - mean(A)) / sqrt(max(var(A), 1e-8))
+```
 
 ```yaml
 grpo:
@@ -83,7 +103,7 @@ loss_fn:
   ratio_clip_max: 0.27
 ```
 
-This keeps PPO/GRPO-style clipping behavior but allows a larger expansion region than contraction region, which can help exploration and reduce early collapse.
+This keeps PPO/GRPO-style clipping behavior but allows a larger expansion region than the contraction region, which can help exploration and reduce early collapse.
 
 - **Implementation**: `ClippedPGLossFn` documents decoupled clipping in [`nemo_rl/algorithms/loss_functions.py`](../../nemo_rl/algorithms/loss_functions.py).
 
@@ -96,16 +116,25 @@ loss_fn:
   token_level_loss: true
 ```
 
-This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is commonly important for long CoT / variable-length rollouts.
+This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is often helpful for long CoT / variable-length rollouts.
 
-## TIS / ICE-POP: Truncated Importance Sampling
+## Truncated Importance Sampling
 
 When training and generation backends differ (e.g., numerics, precision, MoE routing, or vLLM vs training framework), you may see a mismatch between:
 
 - `generation_logprobs` (logprobs under the generation backend that produced samples)
 - `prev_logprobs` (logprobs under the training framework policy)
 
-NeMo RL supports **importance sampling correction**, and ProRLv2’s example config turns it on together with **truncated importance sampling**:
+NeMo RL supports **importance sampling correction**, and ProRLv2’s example config turns it on together with **truncated importance sampling**.
+
+Quick intuition:
+
+- This is mainly useful for **MoE / backend mismatch** cases, where the generation backend and the training policy can disagree on logprobs.
+- We compute an importance weight from `prev_logprobs` (training policy) vs `generation_logprobs` (generator). **ICE-POP** drops outliers by zeroing weights outside \([min, max]\).
+- In the common setup of **one policy update per rollout batch** (i.e., minibatch equals the per-step rollout batch; no PPO multi-epoch reuse), the PPO/GRPO likelihood ratio term is effectively **1.0** at update time, so the main stability issue is the MoE/backend-mismatch importance weights.
+- “Online ICE-POP” here just means applying that ICE-POP filtering **during loss computation** on the current training batch.
+
+- **Reference**: [The Online IcePop Solution for MoE models](https://hijkzzz.notion.site/online-ice-pop)
 
 ```yaml
 loss_fn:
@@ -120,10 +149,9 @@ loss_fn:
 - **`truncated_importance_sampling_ratio_min`**: lower bound used by ICE-POP filtering
 - **`truncated_importance_sampling_type`**:
   - `"tis"`: clamp weights to `<= truncated_importance_sampling_ratio`
-  - `"icepop"`: filter samples outside \([min, max]\)
+  - `"icepop"`: set weights outside \([min, max]\) to zero (filter outliers)
 
 - **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss_functions.py`](../../nemo_rl/algorithms/loss_functions.py).
-- **Reference**: [The Online IcePop Solution for MoE models](https://hijkzzz.notion.site/online-ice-pop)
 
 ## Full Example Config (Annotated)
 
@@ -141,9 +169,9 @@ uv run examples/run_grpo_math.py \
   --config examples/configs/prorl.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   logger.wandb_enabled=true \
-  logger.wandb.project="prorv2-dev" \
-  checkpointing.checkpoint_dir="results/prorv2" \
-  logger.log_dir="logs/prorv2"
+  logger.wandb.project="prorlv2-dev" \
+  checkpointing.checkpoint_dir="results/prorlv2" \
+  logger.log_dir="logs/prorlv2"
 ```
 
 If you want to enable DAPO overlong reward shaping instead of stop-properly:
