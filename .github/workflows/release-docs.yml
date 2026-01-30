@@ -53,7 +53,7 @@ jobs:
           overwrite-latest-on-tag: false
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: rl-publish-docs-${{ github.run_id }}
-          aws-region: ${{ var.DOCS_AWS_REGION }}
+          aws-region: ${{ vars.DOCS_AWS_REGION }}
           aws-role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
