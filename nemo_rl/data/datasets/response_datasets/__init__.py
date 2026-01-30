@@ -71,6 +71,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
+    # bind prompt, system prompt and data processor
     dataset.set_task_spec(data_config)
     # Remove this after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658
     dataset.set_processor()

@@ -32,9 +32,17 @@ class ResponseDatasetConfig(TypedDict):
     seed: NotRequired[int]
 
 
-# TODO: split this typed dict up so it can be PreferenceDatasetConfig | ResponseDatasetConfig | etc
-#       so that we can type check the configs more rigorously as opposed to saying everything
-#       is not required.
+class PreferenceDatasetConfig(TypedDict):
+    dataset_name: NotRequired[str]
+    data_path: NotRequired[str]
+    prompt_key: NotRequired[str]
+    chosen_key: NotRequired[str]
+    rejected_key: NotRequired[str]
+    split: NotRequired[str]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+
+
 class DataConfig(TypedDict):
     max_input_seq_length: int
     add_bos: NotRequired[bool]
@@ -48,22 +56,10 @@ class DataConfig(TypedDict):
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
     # dataset configs
-    # TODO: remove NotRequired once preference dataset is refactored
-    train: NotRequired[ResponseDatasetConfig]
-    validation: NotRequired[ResponseDatasetConfig | None]
-    default: NotRequired[ResponseDatasetConfig | None]
-    # TODO: remove once preference dataset is refactored
-    dataset_name: NotRequired[str]
-    val_dataset_name: NotRequired[str]
-    input_key: NotRequired[str]
-    output_key: NotRequired[str | None]
-    split: NotRequired[str]
-    train_data_path: NotRequired[str]
-    val_data_paths: NotRequired[dict[str, str]]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    env_name: NotRequired[str]
-    processor: NotRequired[str]  # remove once processor is refactored
+    train: ResponseDatasetConfig | PreferenceDatasetConfig
+    validation: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
+    # default settings for all datasets, will be overridden by dataset-specific settings
+    default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
 
 
 # ===============================================================================
