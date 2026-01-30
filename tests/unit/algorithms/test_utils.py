@@ -19,9 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.utils import (
-    aggregate_spec_decode_counters,
     calculate_baseline_and_std_per_prompt,
-    compute_spec_decode_metrics,
     get_tokenizer,
     maybe_pad_last_batch,
     print_performance_metrics,
@@ -595,54 +593,3 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
-
-
-def test_aggregate_spec_decode_counters():
-    """Test aggregation of speculative decoding counters from multiple workers."""
-    worker_metrics = [
-        {
-            "vllm:spec_decode_num_drafts": 100.0,
-            "vllm:spec_decode_num_draft_tokens": 300.0,
-            "vllm:spec_decode_num_accepted_tokens": 240.0,
-            "other_metric": 999.0,  # Should be ignored
-        },
-        {
-            "vllm:spec_decode_num_drafts": 150.0,
-            "vllm:spec_decode_num_draft_tokens": 450.0,
-            "vllm:spec_decode_num_accepted_tokens": 360.0,
-        },
-    ]
-
-    counters = aggregate_spec_decode_counters(worker_metrics)
-
-    assert counters["vllm:spec_decode_num_drafts"] == 250.0
-    assert counters["vllm:spec_decode_num_draft_tokens"] == 750.0
-    assert counters["vllm:spec_decode_num_accepted_tokens"] == 600.0
-    assert "other_metric" not in counters
-
-
-def test_compute_spec_decode_metrics():
-    """Test computation of speculative decoding metrics from counter snapshots."""
-    start_counters = {
-        "vllm:spec_decode_num_drafts": 100.0,
-        "vllm:spec_decode_num_draft_tokens": 300.0,
-        "vllm:spec_decode_num_accepted_tokens": 200.0,
-    }
-    end_counters = {
-        "vllm:spec_decode_num_drafts": 200.0,
-        "vllm:spec_decode_num_draft_tokens": 600.0,
-        "vllm:spec_decode_num_accepted_tokens": 440.0,
-    }
-
-    metrics = compute_spec_decode_metrics(start_counters, end_counters)
-
-    # Delta values
-    assert metrics["vllm/spec_num_drafts"] == 100.0
-    assert metrics["vllm/spec_num_draft_tokens"] == 300.0
-    assert metrics["vllm/spec_num_accepted_tokens"] == 240.0
-
-    # Derived metrics
-    # acceptance_length = 1 + (accepted / drafts) = 1 + (240 / 100) = 3.4
-    assert math.isclose(metrics["vllm/spec_acceptance_length"], 3.4, rel_tol=1e-6)
-    # acceptance_rate = accepted / draft_tokens = 240 / 300 = 0.8
-    assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)

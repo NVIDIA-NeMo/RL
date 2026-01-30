@@ -524,7 +524,7 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
-    def get_metrics(self) -> dict[str, float | list[float]]:
+    def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
 
         Collects spec decode counters including number of drafts,

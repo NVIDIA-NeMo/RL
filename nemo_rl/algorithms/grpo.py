@@ -38,9 +38,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
-    aggregate_spec_decode_counters,
     calculate_baseline_and_std_per_prompt,
-    compute_spec_decode_metrics,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
@@ -1291,12 +1289,8 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
-                spec_metrics = {}
-                spec_counters_start = {}
-                if hasattr(policy_generation, "get_metrics"):
-                    spec_counters_start = aggregate_spec_decode_counters(
-                        policy_generation.get_metrics()
-                    )
+                if hasattr(policy_generation, "snapshot_step_metrics"):
+                    policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1439,14 +1433,9 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
-
-                    if hasattr(policy_generation, "get_metrics"):
-                        spec_counters_end = aggregate_spec_decode_counters(
-                            policy_generation.get_metrics()
-                        )
-                        spec_metrics = compute_spec_decode_metrics(
-                            spec_counters_start, spec_counters_end
-                        )
+                    spec_metrics = {}
+                    if hasattr(policy_generation, "get_step_metrics"):
+                        spec_metrics = policy_generation.get_step_metrics()
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
