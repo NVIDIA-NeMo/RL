@@ -50,8 +50,9 @@ dependencies = [
   "swanlab",
   "pyzmq",
   "nvidia-resiliency-ext",
-  "nccl4py",
-  "cuda-bindings",
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
 ]
 
 [project.optional-dependencies]
@@ -80,7 +81,6 @@ vllm = [
 ]
 sglang = [
   "sglang==0.5.7",
-  "pybase64",
   "orjson",
   "uvloop",
   "requests",
