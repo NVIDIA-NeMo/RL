@@ -36,6 +36,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.utils import (
+    aggregate_spec_decode_counters,
+    compute_spec_decode_metrics,
+)
 
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
@@ -223,6 +227,8 @@ class VllmGeneration(GenerationInterface):
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
 
+        self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
+
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
     ) -> list[tuple[int, list[int]]]:
@@ -381,20 +387,54 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def get_metrics(self) -> list[dict[str, float | list[float]]]:
-        """Get speculative decoding metrics from all vLLM workers.
-
-        Collects spec decode counters from DP rank 0 workers for
-        monitoring acceptance rates during training.
-
-        Returns:
-            List of metric dictionaries, one per DP group.
-        """
+    def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
+        """Collect raw spec decode counters from workers."""
         futures = self.worker_group.run_all_workers_single_data(
-            "get_metrics",
+            "_get_raw_spec_counters",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        return ray.get(futures)
+        worker_metrics = ray.get(futures)
+
+        # Aggregate across workers
+        return aggregate_spec_decode_counters(worker_metrics)
+
+    def snapshot_step_metrics(self) -> None:
+        """Snapshot current spec decode counters to begin tracking a training step.
+
+        Call this before generation to establish a baseline for metrics delta.
+
+        Raises:
+            RuntimeWarning: If called twice without get_step_metrics() in between.
+        """
+        if self._step_metrics_snapshot is not None:
+            import warnings
+
+            warnings.warn(
+                "snapshot_step_metrics() called again without get_step_metrics(). "
+                "Previous snapshot will be overwritten.",
+                RuntimeWarning,
+            )
+        self._step_metrics_snapshot = self._get_raw_spec_counters()
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Get speculative decoding metrics delta since snapshot_step_metrics().
+
+        Returns:
+            Dictionary of delta metrics with 'vllm/' prefix.
+            Returns empty dict if snapshot_step_metrics() was not called.
+        """
+        if self._step_metrics_snapshot is None:
+            return {}
+
+        counters_end = self._get_raw_spec_counters()
+        step_metrics = compute_spec_decode_metrics(
+            self._step_metrics_snapshot, counters_end
+        )
+
+        # Reset snapshot for next step
+        self._step_metrics_snapshot = None
+
+        return step_metrics
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
