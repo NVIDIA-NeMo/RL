@@ -502,7 +502,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     for x in losses_reduced:
                         loss_metrics = {}
                         for k in x.keys():
-                            loss_metrics[k] = x[k] / num_global_batches
+                            if "_min" in k or "_max" in k:
+                                loss_metrics[k] = x[k]
+                            else:
+                                loss_metrics[k] = x[k] / num_global_batches
                         gb_loss_metrics.append(loss_metrics)
                         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
                         curr_wd = self.scheduler.get_wd()
