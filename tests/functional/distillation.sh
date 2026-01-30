@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_distillation_math.py \
+    $PROJECT_ROOT/examples/run_distillation.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     teacher.model_name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
