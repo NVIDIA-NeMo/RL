@@ -75,7 +75,8 @@ def validate_and_prepare_config(
     if "generation" in config and config["generation"] is not None:
         is_generation_colocated = config["generation"]["colocated"]["enabled"]
 
-    # Set NCCL environment variable
+    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
     if not is_generation_colocated:
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
@@ -282,6 +283,11 @@ def setup_distributed(
 
     # Force setup distributed for world size 1 as FSDP2Manager skips it
     if world_size == 1:
+        if cpu_offload:
+            raise NotImplementedError(
+                "CPUOffload doesn't work on single GPU for AutoModel. "
+                "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
+            )
         manager._setup_distributed()
 
     return manager
