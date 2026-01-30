@@ -20,6 +20,7 @@ To use Muon with NeMo RL, you need to configure the optimizer through the Megatr
 ```bash
 uv run examples/run_sft.py \
     policy.megatron_cfg.enabled=true \
+    policy.dtensor_cfg.enabled=true \
     ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
     ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
     ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \

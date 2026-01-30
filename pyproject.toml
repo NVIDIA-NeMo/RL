@@ -102,7 +102,7 @@ mcore = [
   "flash-attn==2.8.1",
   # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
   "vllm==0.11.2",
-  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@cf9909b777ffac18e05b67a6708282cadc000942",
+  "emerging-optimizers==0.1.0",
 ]
 nemo_gym = ["nemo_gym"]
 
