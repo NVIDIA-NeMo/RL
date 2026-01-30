@@ -11,7 +11,8 @@ data:
   # dataset
   train:
     - dataset_name: OpenMathInstruct-2
-      split_validation_size: 0.05
+      split_validation_size: 0.05 # use 5% of the training data as validation data
+      seed: ${grpo.seed} # seed for train/validation split when split_validation_size > 0
     - dataset_name: DeepScaler
   validation:
     - dataset_name: AIME2024
