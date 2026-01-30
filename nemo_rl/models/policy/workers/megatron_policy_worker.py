@@ -27,6 +27,28 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.config import (
+    CheckpointConfig,
+    ConfigContainer,
+    DistributedDataParallelConfig,
+    LoggerConfig,
+    OptimizerConfig,
+    SchedulerConfig,
+    TokenizerConfig,
+    TrainingConfig,
+)
+from megatron.bridge.training.initialize import (
+    initialize_megatron,
+    set_jit_fusion_options,
+)
+from megatron.bridge.training.optim import setup_optimizer
+from megatron.bridge.training.setup import (
+    _create_peft_pre_wrap_hook,
+    _update_model_config_funcs,
+)
+from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -56,6 +78,7 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from transformers import PreTrainedTokenizerBase
@@ -472,18 +495,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
+                pg_collection = get_pg_collection(self.model)
+
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
                 update_successful = logical_and_across_model_parallel_group(
-                    update_successful
+                    update_successful, mp_group=pg_collection.mp
                 )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
-                    grad_norm
+                    grad_norm, mp_group=pg_collection.mp
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
-                    num_zeros_in_grad
+                    num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
                 if update_successful:
