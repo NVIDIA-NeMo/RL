@@ -107,6 +107,24 @@ data:
     <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
 ```
 
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "context": [{"role": "user", "content": "What is 2+2?"}], // list of dicts - The prompt message (including previous turns, if any)
+  "completions": [ // list of dicts — The list of completions
+    {
+      "rank": 0, // int — The rank of the completion (lower rank is preferred)
+      "completion": [{"role": "assistant", "content": "The answer is 4."}] // list of dicts — The completion message(s)
+    },
+    {
+      "rank": 1, // int — The rank of the completion (lower rank is preferred)
+      "completion": [{"role": "assistant", "content": "I don't know."}] // list of dicts — The completion message(s)
+    }
+  ]
+}
+```
+
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
@@ -129,6 +147,16 @@ data:
     rejected_key: rejected
     prompt_file: null
     system_prompt_file: null
+```
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "prompt": "What is 2+2?",     // <prompt_key>: <prompt_content>
+  "chosen": "The answer is 4.", // <chosen_key>: <chosen_content>
+  "rejected": "I don't know."   // <rejected_key>: <rejected_content>
+}
 ```
 
 Please note:

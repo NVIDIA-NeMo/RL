@@ -29,6 +29,7 @@ class BinaryPreferenceDataset(RawDataset):
         chosen_key: str,    # The preferred/winning response
         rejected_key: str,  # The non-preferred/losing response
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets for more details.
 
     Args:
         data_path: Path to the dataset JSON file
