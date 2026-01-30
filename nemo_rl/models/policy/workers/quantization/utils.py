@@ -259,7 +259,8 @@ def get_forward_loop_func(
                     # which causes "Split sizes doesn't match total dim 0 size" error.
                     module.config.moe_router_topk = module.num_experts
 
-        for batch in calib_dataloader:
+        for i, batch in enumerate(calib_dataloader):
+            print(f"Processing batch {i} of {len(calib_dataloader)}")
             megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
 
         if force_all_expert_routing:

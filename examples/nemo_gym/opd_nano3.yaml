@@ -46,7 +46,7 @@ policy: &POLICY_BASE
   logprob_chunk_size: 2048
 
   dtensor_cfg: &DTENSOR_BASE
-    _v2: true
+    _v2: false
     enabled: false
     cpu_offload: false
     sequence_parallel: false

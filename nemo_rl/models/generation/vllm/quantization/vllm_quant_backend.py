@@ -110,7 +110,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         f"quantizer {name} is active but has amax <= 0.0, amax:{module.amax}"
                     )
             mtq.fold_weight(model, keep_attrs=True)
-            print(f"vllm model after fold: {model}")
+            # print(f"vllm model after fold: {model}")
 
     def _load_weights(self, weights):
         """Load weights and fold weight after loading weights."""

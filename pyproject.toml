@@ -168,7 +168,7 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.4" }
 mamba-ssm = { git = "https://github.com/yfw/mamba", branch = "stride_fix_revert" }
-nvidia-modelopt = { path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/modelopt-nano3", editable = true }
+nvidia-modelopt = { path = "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer", editable = true }
 
 
 [tool.uv.workspace]

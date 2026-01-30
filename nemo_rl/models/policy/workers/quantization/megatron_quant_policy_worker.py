@@ -165,7 +165,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             is_megatron=True,
             batch_size=quant_batch_size,
             data=quant_calib_data,
-            force_all_expert_routing=True,
+            force_all_expert_routing=False,
             max_sample_length=quant_sequence_length,
         )
         return model
