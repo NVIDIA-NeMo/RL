@@ -111,3 +111,31 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+
+def test_vllm_speculative_decoding_patch_still_needed():
+    # This test reminds to remove the vLLM patch when no longer needed.
+    # The patch was fixed upstream: https://github.com/vllm-project/vllm/pull/30319
+    # When this test fails, remove _patch_vllm_speculative_decoding_post_step()
+    # from nemo_rl/models/generation/vllm/vllm_worker.py
+    import os
+    from importlib.util import find_spec
+
+    spec = find_spec("vllm")
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, "v1", "engine", "core_client.py")
+
+    with open(file_path, "r") as f:
+        content = f.read()
+
+    old_snippet = (
+        "    def get_output(self) -> EngineCoreOutputs:\n"
+        "        outputs, _ = self.engine_core.step_fn()\n"
+        "        return outputs and outputs.get(0) or EngineCoreOutputs()"
+    )
+
+    assert old_snippet in content, (
+        "vLLM has been updated to include the speculative decoding fix from "
+        "https://github.com/vllm-project/vllm/pull/30319. "
+        "Please remove the _patch_vllm_speculative_decoding_post_step() function "
+        "from nemo_rl/models/generation/vllm/vllm_worker.py"
+    )
