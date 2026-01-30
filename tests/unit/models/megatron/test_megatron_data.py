@@ -630,7 +630,6 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_full_seq_to"] == 1024
 
 
-@pytest.mark.mcore
 @ray.remote(num_gpus=1)
 class PackSequencesTestActor:
     def __init__(self, cp_size):
