@@ -40,6 +40,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
 
+@pytest.mark.mcore
 class TestProcessedMicrobatchDataclass:
     """Tests for ProcessedMicrobatch dataclass."""
 
@@ -74,6 +75,7 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
 
 
+@pytest.mark.mcore
 class TestGetAndValidateSeqlen:
     """Tests for get_and_validate_seqlen function."""
 
@@ -140,6 +142,7 @@ class TestGetAndValidateSeqlen:
         assert seq_dim_size == 10
 
 
+@pytest.mark.mcore
 class TestProcessMicrobatch:
     """Tests for process_microbatch function."""
 
@@ -265,6 +268,7 @@ class TestProcessMicrobatch:
         assert "input_lengths not found in data_dict" in str(exc_info.value)
 
 
+@pytest.mark.mcore
 class TestProcessGlobalBatch:
     """Tests for process_global_batch function."""
 
@@ -329,6 +333,7 @@ class TestProcessGlobalBatch:
         assert "sample_mask must be present in the data!" in str(exc_info.value)
 
 
+@pytest.mark.mcore
 class TestGetMicrobatchIterator:
     """Tests for get_microbatch_iterator function."""
 
@@ -515,6 +520,7 @@ class TestGetMicrobatchIterator:
         assert call_kwargs["seq_length_key"] == "input_lengths"
 
 
+@pytest.mark.mcore
 class TestMakeProcessedMicrobatchIterator:
     """Tests for make_processed_microbatch_iterator function."""
 
@@ -557,6 +563,7 @@ class TestMakeProcessedMicrobatchIterator:
             seq_length_key=None,
             pad_individual_seqs_to_multiple_of=1,
             pad_packed_seq_to_multiple_of=1,
+            straggler_timer=MagicMock(),
             pad_full_seq_to=None,
         )
 
@@ -599,6 +606,7 @@ class TestMakeProcessedMicrobatchIterator:
             seq_length_key="input_lengths",
             pad_individual_seqs_to_multiple_of=8,
             pad_packed_seq_to_multiple_of=16,
+            straggler_timer=MagicMock(),
             pad_full_seq_to=1024,
         )
 
