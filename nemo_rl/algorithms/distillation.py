@@ -695,7 +695,9 @@ def distillation_train(
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data, k=master_config["distillation"]["topk_logits_k"]
+                        train_data,
+                        k=master_config["distillation"]["topk_logits_k"],
+                        timer=timer,
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
@@ -708,7 +710,11 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(train_data, loss_fn)
+                    train_results = student_policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
