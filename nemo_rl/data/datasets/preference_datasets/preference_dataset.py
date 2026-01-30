@@ -23,13 +23,20 @@ class PreferenceDataset(RawDataset):
     This class handles loading of preference data for DPO and RM training.
     The input JSONL files should contain valid JSON objects formatted like this:
     {
-        "context": list of dicts, # The prompt message (including previous turns, if any)
-        "completions": list of dicts, # The list of completions
+        "context": list[dict],              # The prompt message (including previous turns, if any)
+        "completions": [                    # The list of completions
             {
-                "rank": int, # The rank of the completion (lower rank is preferred)
-                "completion": list of dicts, # The completion message(s)
-            }
+                "rank": 0,                  # The rank of the completion (lower rank is preferred)
+                "completion": list[dict],   # The completion message(s)
+            },
+            {
+                "rank": 1,                  # The rank of the completion (lower rank is preferred)
+                "completion": list[dict],   # The completion message(s)
+            },
+            ...                             # More completions can be added if needed
+        ]
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets for more details.
 
     Args:
         data_path: Path to the dataset JSON file

@@ -95,6 +95,7 @@ class OpenAIFormatDataset(RawDataset):
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#openai-format-datasets-with-tool-calling-support for more details.
 
     Args:
         data_path: Path to the dataset JSON file
