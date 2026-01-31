@@ -42,8 +42,11 @@ class SequencePackingGradientTestActor:
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
         from nemo_rl.models.megatron.common import (
-            _pack_sequences_for_megatron,
             forward_step_arbitrary_loss,
+        )
+        from nemo_rl.models.megatron.data import (
+            _pack_sequences_for_megatron,
+            make_processed_microbatch_iterator,
         )
 
         # Initialize process group
@@ -321,17 +324,33 @@ class SequencePackingGradientTestActor:
 
                 self.straggler_timer = DummyStragglerTimer()
 
+        mock_mcore_state = MockMcoreState()
+
         output_tensor, wrapped_loss_fn = forward_step_arbitrary_loss(
-            MockMcoreState(),
+            mock_mcore_state,
             global_valid_seqs,
             global_valid_toks,
-            data_iterator=iter([packed_data_dict]),
+            data_iterator=make_processed_microbatch_iterator(
+                iter([packed_data_dict]),
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "dynamic_batching": {"enabled": False},
+                    "megatron_cfg": {
+                        "tensor_model_parallel_size": 1,
+                        "sequence_parallel": False,
+                        "pipeline_model_parallel_size": 1,
+                        "context_parallel_size": cp_size,
+                    },
+                },
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=pad_to_multiple,
+                pad_packed_seq_to_multiple_of=1,
+                straggler_timer=mock_mcore_state.straggler_timer,
+                pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
+            ),
             model=MockModel(),
             loss_fn=base_loss_fn,
             pack_sequences=True,
-            seq_length_key="input_lengths",
-            pad_individual_seqs_to_multiple_of=pad_to_multiple,
-            pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             cp_normalize=True,
         )
         loss, metrics = wrapped_loss_fn(output_tensor)
