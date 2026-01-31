@@ -36,14 +36,13 @@ class AbstractPolicyWorker:
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
         """
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=self.rank, world_size=world_size
+        self.model_update_group = StatelessProcessGroup(
+            master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
+        self.model_update_group.init_nccl_communicator(device=device)
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
