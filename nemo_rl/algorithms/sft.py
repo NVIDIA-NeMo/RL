@@ -452,7 +452,11 @@ def sft_train(
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
