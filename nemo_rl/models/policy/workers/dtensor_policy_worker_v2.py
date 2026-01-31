@@ -683,7 +683,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                     outputs = self.model(**model_args)
 
-                    logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                    # Get logits
+                    if isinstance(outputs, (torch.Tensor, DTensor)):
+                        # custom models (e.g., those coming from AutoModel) can output logits directly
+                        logits = outputs
+                    elif not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
 
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
@@ -888,16 +895,21 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     )
                     outputs = self.model(**model_args)
 
-                    if not hasattr(outputs, "logits"):
+                    # Get logits
+                    if isinstance(outputs, (torch.Tensor, DTensor)):
+                        # custom models (e.g., those coming from AutoModel) can output logits directly
+                        logits = outputs
+                    elif not hasattr(outputs, "logits"):
                         logits = self.model.lm_head(outputs.last_hidden_state)
                     else:
                         logits = outputs.logits
+                    del outputs
+
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
-                if isinstance(logits, DTensor):
-                    logits = logits.to(torch.float32)
-                else:
-                    logits = outputs.logits.to(torch.float32)
+
+                # Convert to float32
+                logits = logits.to(torch.float32)
 
                 rm_scores = to_local_if_dtensor(logits)
                 rm_scores = rm_scores.squeeze(-1)
@@ -1002,7 +1014,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         flash_attn_kwargs=flash_attn_kwargs,
                     )
 
-                    if not hasattr(outputs, "logits"):
+                    # Get logits
+                    if isinstance(outputs, (torch.Tensor, DTensor)):
+                        # custom models (e.g., those coming from AutoModel) can output logits directly
+                        logits = outputs
+                    elif not hasattr(outputs, "logits"):
                         logits = self.model.lm_head(outputs.last_hidden_state)
                     else:
                         logits = outputs.logits
