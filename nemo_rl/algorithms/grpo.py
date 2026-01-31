@@ -1289,7 +1289,9 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
-                if dynamic_sampling_num_gen_batches == 1 and hasattr(policy_generation, "snapshot_step_metrics"):
+                if dynamic_sampling_num_gen_batches == 1 and hasattr(
+                    policy_generation, "snapshot_step_metrics"
+                ):
                     policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
