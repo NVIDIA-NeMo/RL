@@ -21,6 +21,7 @@ from typing import (
     Optional,
     Union,
 )
+import warnings
 
 import numpy as np
 import ray
@@ -407,8 +408,6 @@ class VllmGeneration(GenerationInterface):
             RuntimeWarning: If called twice without get_step_metrics() in between.
         """
         if self._step_metrics_snapshot is not None:
-            import warnings
-
             warnings.warn(
                 "snapshot_step_metrics() called again without get_step_metrics(). "
                 "Previous snapshot will be overwritten.",
@@ -422,8 +421,16 @@ class VllmGeneration(GenerationInterface):
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
             Returns empty dict if snapshot_step_metrics() was not called.
+
+        Raises:
+            RuntimeWarning: If called without snapshot_step_metrics() first.
         """
         if self._step_metrics_snapshot is None:
+            warnings.warn(
+                "get_step_metrics() called without snapshot_step_metrics(). "
+                "Call snapshot_step_metrics() before generation to track metrics.",
+                RuntimeWarning,
+            )
             return {}
 
         counters_end = self._get_raw_spec_counters()
