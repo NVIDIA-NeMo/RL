@@ -220,6 +220,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/dtensor-tp-accuracy.md
+guides/ft-launcher-guide.md
 ```
 
 ```{toctree}
