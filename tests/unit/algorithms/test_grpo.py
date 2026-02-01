@@ -243,6 +243,14 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
         patch("nemo_rl.algorithms.grpo.print_performance_metrics", return_value={})
     )
 
+    # Mock compute_and_apply_seq_logprob_error_masking to avoid needing real logprob data
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=(0.0, 0, 0.0),
+        )
+    )
+
     return stack
 
 
@@ -1098,6 +1106,11 @@ def test_grpo_train_collects_generation_logger_metrics(
     monkeypatch.setattr(
         grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
     )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: (0.0, 0, 0.0),
+    )
 
     master_config = mock_grpo_components["master_config"]
     master_config["grpo"]["max_num_steps"] = 1
@@ -1260,6 +1273,7 @@ def mock_grpo_components():
                 "enabled": False,
                 "max_trajectory_age_steps": 1,
             },
+            "seq_logprob_error_threshold": None,
         },
         "policy": {
             "train_global_batch_size": 1,
@@ -1351,20 +1365,24 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
                 "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
             ):
-                train_func(
-                    mock_grpo_components["policy"],
-                    None,  # policy_generation
-                    mock_grpo_components["train_dataloader"],
-                    mock_grpo_components["val_dataloader"],
-                    mock_grpo_components["tokenizer"],
-                    mock_grpo_components["loss_fn"],
-                    mock_grpo_components["task_to_env"],
-                    mock_grpo_components["val_task_to_env"],
-                    mock_grpo_components["logger"],
-                    mock_grpo_components["checkpointer"],
-                    grpo_save_state,
-                    mock_grpo_components["master_config"],
-                )
+                with patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=(0.0, 0, 0.0),
+                ):
+                    train_func(
+                        mock_grpo_components["policy"],
+                        None,  # policy_generation
+                        mock_grpo_components["train_dataloader"],
+                        mock_grpo_components["val_dataloader"],
+                        mock_grpo_components["tokenizer"],
+                        mock_grpo_components["loss_fn"],
+                        mock_grpo_components["task_to_env"],
+                        mock_grpo_components["val_task_to_env"],
+                        mock_grpo_components["logger"],
+                        mock_grpo_components["checkpointer"],
+                        grpo_save_state,
+                        mock_grpo_components["master_config"],
+                    )
 
     # Verify we trained for exactly 12 steps
     assert mock_grpo_components["policy"].train.call_count == 12
@@ -1399,21 +1417,25 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
         ) as mock_async_rollout:
             mock_async_rollout.return_value = (mock_batch, mock_rollout_metrics)
 
-            # Run training
-            train_func(
-                mock_grpo_components["policy"],
-                None,  # policy_generation
-                mock_grpo_components["train_dataloader"],
-                mock_grpo_components["val_dataloader"],
-                mock_grpo_components["tokenizer"],
-                mock_grpo_components["loss_fn"],
-                mock_grpo_components["task_to_env"],
-                mock_grpo_components["val_task_to_env"],
-                mock_grpo_components["logger"],
-                mock_grpo_components["checkpointer"],
-                grpo_save_state,
-                mock_grpo_components["master_config"],
-            )
+            with patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=(0.0, 0, 0.0),
+            ):
+                # Run training
+                train_func(
+                    mock_grpo_components["policy"],
+                    None,  # policy_generation
+                    mock_grpo_components["train_dataloader"],
+                    mock_grpo_components["val_dataloader"],
+                    mock_grpo_components["tokenizer"],
+                    mock_grpo_components["loss_fn"],
+                    mock_grpo_components["task_to_env"],
+                    mock_grpo_components["val_task_to_env"],
+                    mock_grpo_components["logger"],
+                    mock_grpo_components["checkpointer"],
+                    grpo_save_state,
+                    mock_grpo_components["master_config"],
+                )
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
@@ -1474,20 +1496,24 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
                     "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
                     return_value=(mock_batch, mock_rollout_metrics),
                 ):
-                    train_func(
-                        mock_grpo_components["policy"],
-                        None,  # policy_generation
-                        mock_grpo_components["train_dataloader"],
-                        mock_grpo_components["val_dataloader"],
-                        mock_grpo_components["tokenizer"],
-                        mock_grpo_components["loss_fn"],
-                        mock_grpo_components["task_to_env"],
-                        mock_grpo_components["val_task_to_env"],
-                        mock_grpo_components["logger"],
-                        mock_grpo_components["checkpointer"],
-                        grpo_save_state,
-                        mock_grpo_components["master_config"],
-                    )
+                    with patch(
+                        "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                        return_value=(0.0, 0, 0.0),
+                    ):
+                        train_func(
+                            mock_grpo_components["policy"],
+                            None,  # policy_generation
+                            mock_grpo_components["train_dataloader"],
+                            mock_grpo_components["val_dataloader"],
+                            mock_grpo_components["tokenizer"],
+                            mock_grpo_components["loss_fn"],
+                            mock_grpo_components["task_to_env"],
+                            mock_grpo_components["val_task_to_env"],
+                            mock_grpo_components["logger"],
+                            mock_grpo_components["checkpointer"],
+                            grpo_save_state,
+                            mock_grpo_components["master_config"],
+                        )
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_grpo_components["policy"].train.call_count == 8
