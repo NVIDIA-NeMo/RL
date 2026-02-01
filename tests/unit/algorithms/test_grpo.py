@@ -1262,6 +1262,11 @@ def mock_grpo_components():
                 "enabled": False,
                 "max_trajectory_age_steps": 1,
             },
+            "adv_estimator": {
+                "name": "grpo",
+                "use_leave_one_out_baseline": False,
+                "normalize_rewards": True,
+            },
         },
         "policy": {
             "train_global_batch_size": 1,
