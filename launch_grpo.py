@@ -47,14 +47,16 @@ CLUSTER_CONFIGS = {
         "gpus_per_node": 8,
         "container_name": "nemo_rl_v0.4.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "h100",
-        "default_partition": "batch_long",
+        "default_partition": "batch",
+        "default_time": "04:00:00",
         "use_gres": True,
     },
     "gb200": {
         "gpus_per_node": 4,
         "container_name": "nemo_rl_nightly.sqsh",  # Container filename (path set dynamically)
         "wandb_project_suffix": "gb200",
-        "default_partition": "batch",
+        "default_partition": "batch_long",
+        "default_time": "05:00:00",
         "use_gres": True,  # GB200 also needs GRES
     },
 }
@@ -214,6 +216,20 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "num_prompts": 64, "num_generations": 32,
                 "generation": {"tp": 2, "pp": 1},
                 "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 2}
+            },
+            # H100 variant: RolloutGBS=512, MaxLen=4096
+            "h100_r512": {
+                "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 512, "train_gbs": 512,
+                "num_prompts": 16, "num_generations": 32,  # 16×32 = 512
+                "generation": {"tp": 4, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 8}
+            },
+            # H100 variant: RolloutGBS=2048, MaxLen=16384 (high sequence length)
+            "h100_highseq": {
+                "num_gpus": 32, "max_seqlen": 16384, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 4, "pp": 1},
+                "training": {"tp": 4, "cp": 1, "ep": 1, "pp": 8}
             }
         },
         "qwen32b": {
@@ -271,6 +287,20 @@ def get_fallback_configs() -> Dict[str, Any]:
                 "num_gpus": 16, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
                 "num_prompts": 64, "num_generations": 32,
                 "generation": {"tp": 1, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 8, "pp": 1}
+            },
+            # H100 EP4: 32 GPUs with EP=4, TP=8 (8*4=32)
+            "h100_ep4": {
+                "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 4, "pp": 1},
+                "training": {"tp": 1, "cp": 1, "ep": 4, "pp": 1}
+            },
+            # H100 EP8: 32 GPUs with EP=8, TP=4 (4*8=32)
+            "h100_ep8": {
+                "num_gpus": 32, "max_seqlen": 4096, "rollout_gbs": 2048, "train_gbs": 512,
+                "num_prompts": 64, "num_generations": 32,
+                "generation": {"tp": 4, "pp": 1},
                 "training": {"tp": 1, "cp": 1, "ep": 8, "pp": 1}
             }
         },
@@ -372,7 +402,7 @@ def build_command(model_cfg: Dict[str, Any],
                   cluster_config: dict,
                   wandb_project: str = "sync-grpo-benchmark",
                   max_steps: int = 20,
-                  time_limit: str = "04:00:00",
+                  time_limit: Optional[str] = None,
                   account: Optional[str] = None,
                   partition: Optional[str] = None,
                   enable_vllm_metrics: bool = False,
@@ -390,7 +420,11 @@ def build_command(model_cfg: Dict[str, Any],
     
     # Use cluster-specific default partition if not specified
     if partition is None:
-        partition = cluster_config.get("default_partition", "batch_long")
+        partition = cluster_config.get("default_partition", "batch")
+    
+    # Use cluster-specific default time limit if not specified
+    if time_limit is None:
+        time_limit = cluster_config.get("default_time", "04:00:00")
     
     # Use cluster-specific default account if not specified
     if account is None:
@@ -414,21 +448,23 @@ def build_command(model_cfg: Dict[str, Any],
     # Sequence parallel (enabled if TP > 1)
     t_sp = "True" if t_tp > 1 else "False"
     
-    # Segment for sbatch (GB200 NVLink topology aware)
+    # Segment for sbatch (GB200 NVLink topology aware, H100 doesn't use segment)
     # - num_nodes <= 16: use num_nodes as segment
     # - num_nodes > 16 and divisible by 16: use 16
     # - otherwise: find largest divisor from 18 down to 1
-    if num_nodes <= 16:
-        segment = num_nodes
-    elif num_nodes % 16 == 0:
-        segment = 16
-    else:
-        # Find largest divisor starting from 18
-        segment = num_nodes  # fallback
-        for seg in range(18, 0, -1):
-            if num_nodes % seg == 0:
-                segment = seg
-                break
+    segment = None
+    if cluster_type == "gb200":
+        if num_nodes <= 16:
+            segment = num_nodes
+        elif num_nodes % 16 == 0:
+            segment = 16
+        else:
+            # Find largest divisor starting from 18
+            segment = num_nodes  # fallback
+            for seg in range(18, 0, -1):
+                if num_nodes % seg == 0:
+                    segment = seg
+                    break
     
     # Calculate Data Parallelism (Megatron-compatible: DP = world_size / (TP × PP × CP))
     # Note: EP is NOT included as it operates within the DP group
@@ -540,6 +576,9 @@ policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"
     # Build GRES option only for clusters that use it (H100 uses GRES, GB200 doesn't)
     gres_line = f"--gres=gpu:{gpus_per_node} \\\n    " if use_gres else ""
     
+    # Build segment option only for GB200 (H100 doesn't use --segment)
+    segment_line = f"--segment {segment} \\\n    " if segment is not None else ""
+    
     # Check required environment variables
     env_warnings = []
     hf_home = os.environ.get("HF_HOME", "")
@@ -576,8 +615,7 @@ sbatch \\
     --partition={partition} \\
     --time={time_limit} \\
     --output={base_log_dir}/%j-logs/slurm-%j.out \\
-    {gres_line}--segment {segment} \\
-    ray.sub"""
+    {gres_line}{segment_line}ray.sub"""
     
     return sbatch_cmd
 
@@ -706,19 +744,25 @@ def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None,
     
     os.chmod(script_path, 0o755)
     
+    success = False
     try:
         result = subprocess.run(['bash', script_path], capture_output=True, text=True)
         if result.returncode == 0:
             print(f"✅ Job submitted successfully!")
             print(f"   {result.stdout.strip()}")
+            success = True
         else:
             print(f"❌ Job submission failed:")
             print(f"   {result.stderr.strip()}")
+            sys.exit(1)  # Exit with error code for caller scripts
     except Exception as e:
         print(f"❌ Error: {e}")
+        sys.exit(1)  # Exit with error code for caller scripts
     finally:
         if os.path.exists(script_path):
             os.remove(script_path)
+    
+    return success
 
 
 def main():
@@ -762,7 +806,7 @@ Examples:
     parser.add_argument("--wandb-project", default="sync-grpo-benchmark",
                         help="WandB project name (cluster type appended)")
     parser.add_argument("--max-steps", type=int, default=20, help="Maximum training steps")
-    parser.add_argument("--time", default="05:00:00", help="Job time limit")
+    parser.add_argument("--time", default=None, help="Job time limit (default: auto based on cluster)")
     parser.add_argument("--account", default=None, help="SLURM account (default: auto based on cluster)")
     parser.add_argument("--job-partition", default=None, help="SLURM job partition (default: auto based on cluster)")
     
