@@ -9,6 +9,7 @@ data:
   num_workers: 1
 
   # dataset
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
   train:
     - dataset_name: OpenMathInstruct-2
       split_validation_size: 0.05 # use 5% of the training data as validation data
