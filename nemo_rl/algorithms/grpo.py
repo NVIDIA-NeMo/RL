@@ -296,6 +296,23 @@ def setup(
         )
 
     # ==========================
+    #        Loss Function
+    # ==========================
+    loss_fn = ClippedPGLossFn(loss_config)
+
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
+        print("  ✓ force_on_policy_ratio enabled")
+
+    # ==========================
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
@@ -659,19 +676,6 @@ def setup(
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
-
-    loss_fn = ClippedPGLossFn(loss_config)
-
-    # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
-        assert (
-            grpo_config["num_prompts_per_step"]
-            * grpo_config["num_generations_per_prompt"]
-            == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
-        )
-        print("  ✓ force_on_policy_ratio enabled")
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
