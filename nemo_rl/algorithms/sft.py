@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from pathlib import Path
 from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -557,7 +556,8 @@ def sft_train(
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
                             )
-                            if checkpointer.save_optimizer else None,
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

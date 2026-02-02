@@ -15,7 +15,6 @@ import os
 import warnings
 from collections import defaultdict
 from functools import partial
-from pathlib import Path
 from typing import Optional, TypedDict, cast
 
 import numpy as np
@@ -693,7 +692,8 @@ def dpo_train(
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
                             )
-                            if checkpointer.save_optimizer else None,
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

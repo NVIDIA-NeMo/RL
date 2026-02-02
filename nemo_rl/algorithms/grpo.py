@@ -17,7 +17,6 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -1729,7 +1728,8 @@ def grpo_train(
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
                             )
-                            if checkpointer.save_optimizer else None,
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -2715,7 +2715,8 @@ def async_grpo_train(
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
                             )
-                            if checkpointer.save_optimizer else None,
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
