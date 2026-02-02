@@ -234,6 +234,7 @@ policy:
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
+For a full configuration example, see the reference recipe: [sft-nanov3-30BA3B-2n4g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
 ### Megatron Configuration Parameters
 
