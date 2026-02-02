@@ -73,7 +73,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.4_
+✅ _Available now_ | 🔜 _Coming in v0.6_
 - 🔜 **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - 🔜 **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
 - 🔜 **SGLang Inference** - SGLang rollout suport for optimized inference.
