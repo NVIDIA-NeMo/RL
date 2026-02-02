@@ -213,7 +213,7 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
-    truncated: NotRequired[torch.Tensor]  # Whether each sequence was truncated
+    truncated: NotRequired[torch.Tensor]  # Whether each sequence was truncated and hit max_tokens without stop token
     __extra__: Any
 
 
