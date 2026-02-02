@@ -66,6 +66,9 @@ tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
 tests/test_suites/llm/grpo-nano-v2-12b-1n8g-megatron.sh
 tests/test_suites/llm/grpo-nano-v2-12b-2n8g-fsdp2tp1.sh
 
+# lora
+tests/test_suites/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh
+
 #######
 # SFT #
 #######
