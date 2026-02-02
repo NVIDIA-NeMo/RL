@@ -24,6 +24,7 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 import ray
 import torch
 from accelerate import init_empty_weights
+from hydra.utils import get_class
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -72,10 +73,10 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
-    import_class_from_path,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -157,6 +158,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
+        apply_torch_aten_alias_tensor_patch()
+
         """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
@@ -296,10 +300,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             print(
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
-        elif sequence_parallel_enabled and tp_size > 1:
-            raise RuntimeError(
-                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
-            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
@@ -397,7 +397,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         if init_optimizer:
-            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
                 self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
             )
@@ -406,9 +406,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         if "scheduler" in self.cfg and self.optimizer is not None:
             if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = import_class_from_path(
-                    cast(str, self.cfg["scheduler"]["name"])
-                )
+                scheduler_cls = get_class(cast(str, self.cfg["scheduler"]["name"]))
                 self.scheduler = scheduler_cls(
                     self.optimizer, **self.cfg["scheduler"]["kwargs"]
                 )
@@ -417,7 +415,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for scheduler_cfg in self.cfg["scheduler"]:
                     if "name" in scheduler_cfg:
                         schedulers.append(
-                            import_class_from_path(scheduler_cfg["name"])(
+                            get_class(scheduler_cfg["name"])(
                                 self.optimizer, **scheduler_cfg["kwargs"]
                             )
                         )
@@ -1841,7 +1839,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> nn.Module:
         # FSDP modules do not move buffers to the device automatically
         for v in model.buffers():
-            v.data = v.data.to(device)
+            torch.utils.swap_tensors(v, v.to(device))
 
         return model
 

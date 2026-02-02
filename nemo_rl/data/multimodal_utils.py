@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import re
-import inspect
+import base64
 import decord
+import inspect
 from PIL import Image
+from io import BytesIO
 from collections import defaultdict
 from typing import Any, Optional, Union
 
+import requests
 import torch
 from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
@@ -246,6 +249,33 @@ def get_dim_to_pack_along(processor, key: str) -> int:
     return 0
 
 
+def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
+    """Resolve the image path to a PIL.Image object.
+
+    image_path can be either:
+    - path to local file
+    - url to image
+    - base64 encoded image
+    """
+    if isinstance(image_path_or_image, Image.Image):
+        return image_path_or_image
+
+    if image_path_or_image.startswith(("http://", "https://")):
+        # Handle URL
+        response = requests.get(image_path_or_image)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    elif image_path_or_image.startswith("data:"):
+        # Handle base64 encoded image
+        # Format: data:image/jpeg;base64,/9j/4AAQSkZJRg...
+        header, encoded = image_path_or_image.split(",", 1)
+        image_data = base64.b64decode(encoded)
+        return Image.open(BytesIO(image_data)).convert("RGB")
+    else:
+        # Handle local file path
+        return Image.open(image_path_or_image).convert("RGB")
+
+
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
     """Get all media from a message log item."""
     # Handle None or missing content (e.g., assistant messages with only tool_calls)
@@ -280,7 +310,7 @@ def load_media_from_message(
         multimodal_load_kwargs = get_multimodal_default_settings_from_processor(processor)
 
     if "image" in media_in_message:
-        loaded_media["image"] += [Image.open(img) if isinstance(img, str) else img for img in media_in_message["image"]]
+        loaded_media["image"] += [resolve_to_image(img) for img in media_in_message["image"]]
     if "audio" in media_in_message:
         for aud in media_in_message["audio"]:
             if isinstance(aud, str):

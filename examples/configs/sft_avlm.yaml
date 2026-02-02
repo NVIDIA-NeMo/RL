@@ -7,8 +7,14 @@ policy:
       num_frames: 16
 
 data:
-  dataset_name: GeneralConversationsJsonlDataset
-  train_data_path: /lustre/fsw/portfolios/llmservice/users/yuanhangs/codes/megatron-lm-omcat/megatron-lm-vlm2/examples/multimodal/avlm/test/datasets/miradata_bat1_filtered_vision_5min_10000.jsonl
-  val_data_path: /lustre/fsw/portfolios/llmservice/users/yuanhangs/codes/megatron-lm-omcat/megatron-lm-vlm2/examples/multimodal/avlm/test/datasets/miradata_bat1_filtered_vision_5min_100.jsonl
-  train_media_data_dir: /lustre/fsw/portfolios/edgeai/projects/edgeai_riva_rivamlops/data/videomme/MiraData/video/batch1/5min
-  val_media_data_dir: /lustre/fsw/portfolios/edgeai/projects/edgeai_riva_rivamlops/data/videomme/MiraData/video/batch1/5min
+  # dataset
+  train:
+    dataset_name: daily-omni
+    split: train
+    split_validation_size: 0.05  # use 5% of the training data as validation data
+    seed: 42  # seed for train/validation split when split_validation_size > 0
+  validation:
+    dataset_name: null
+  # default settings for all datasets
+  default:
+    prompt_file: null

@@ -14,11 +14,11 @@
 
 from typing import Any, Optional
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class ResponseDataset:
+class ResponseDataset(RawDataset):
     """Dataset class for response data which can be loaded from a JSON file.
 
     This class handles loading of response data for SFT and RL training.
@@ -29,52 +29,51 @@ class ResponseDataset:
     }
 
     Args:
-        train_data_path: Path to the JSON file containing training data
-        val_data_path: Path to the JSON file containing validation data
-        input_key: Key for the input text
-        output_key: Key for the output text
-        train_split: Split name for the training data, used for HuggingFace datasets, default is None
-        val_split: Split name for the validation data, used for HuggingFace datasets, default is None
+        data_path: Path to the dataset JSON file
+        input_key: Key for the input text, default is "input"
+        output_key: Key for the output text, default is "output"
+        split: Optional split name for the dataset, used for HuggingFace datasets
+        split_validation_size: Size of the validation data, default is 0
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
 
     def __init__(
         self,
-        train_data_path: str,
-        val_data_path: Optional[str] = None,
+        data_path: str,
         input_key: str = "input",
         output_key: str = "output",
-        train_split: Optional[str] = None,
-        val_split: Optional[str] = None,
+        split: Optional[str] = None,
+        split_validation_size: float = 0,
+        seed: int = 42,
+        **kwargs,
     ):
         self.input_key = input_key
         self.output_key = output_key
+        self.task_name = data_path.split("/")[-1].split(".")[0]
 
-        # load from json file or huggingface
-        train_ds = load_dataset_from_path(train_data_path, train_split)
-        if val_data_path:
-            val_ds = load_dataset_from_path(val_data_path, val_split)
-        else:
-            val_ds = None
+        # load from local or huggingface
+        self.dataset = load_dataset_from_path(data_path, split)
 
         # format the dataset
-        train_ds = train_ds.map(self.add_messages_key)
-        if val_ds:
-            val_ds = val_ds.map(self.add_messages_key)
+        if "messages" not in self.dataset.column_names:
+            self.dataset = self.dataset.map(
+                self.format_data,
+                remove_columns=self.dataset.column_names,
+            )
+        else:
+            self.dataset = self.dataset.add_column(
+                "task_name", [self.task_name] * len(self.dataset)
+            )
 
-        # store the formatted dataset
-        self.formatted_ds = {
-            "train": train_ds,
-            "validation": val_ds,
-        }
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
 
-        self.task_spec = TaskDataSpec(task_name="ResponseDataset")
-
-    def add_messages_key(
-        self, example: dict[str, Any]
-    ) -> dict[str, list[dict[str, Any]]]:
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "messages": [
-                {"role": "user", "content": example[self.input_key]},
-                {"role": "assistant", "content": example[self.output_key]},
-            ]
+                {"role": "user", "content": data[self.input_key]},
+                {"role": "assistant", "content": data[self.output_key]},
+            ],
+            "task_name": self.task_name,
         }

@@ -24,12 +24,14 @@ time bash ./tests/functional/grpo_frozen_env.sh
 time bash ./tests/functional/test_frozen_env.sh
 
 time uv run --no-sync bash ./tests/functional/sft.sh
+time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
+time uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 time uv run --no-sync bash ./tests/functional/dpo.sh
 time uv run --no-sync bash ./tests/functional/rm.sh
 time uv run --no-sync bash ./tests/functional/eval.sh
@@ -39,6 +41,8 @@ time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_cor
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 time uv run --no-sync bash ./tests/functional/distillation.sh
 time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+time uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
+time uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 
 # Research functional tests (self-discovery)
 for test_script in research/*/tests/functional/*.sh; do

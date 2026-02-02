@@ -178,6 +178,9 @@ def get_basic_megatron_test_config(
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "allgather",
+            "moe_shared_expert_overlap": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
@@ -1164,6 +1167,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
@@ -1199,6 +1203,11 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("created")
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        message = d["choices"][0]["message"]
+        if "reasoning" in message:
+            message.pop("reasoning")
 
         return d
 
@@ -1368,6 +1377,9 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
 def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
+
+        def decode(self, *args, **kwargs):
+            pass
 
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
@@ -1655,7 +1667,9 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-def test_vllm_weight_update_memory(cluster, tokenizer):
+# megatron still holds little memory after refit, so we only test dtensor now
+@pytest.mark.parametrize("train_backend", ["dtensor_v1", "dtensor_v2"])
+def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1676,9 +1690,17 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
 
-    print("Creating DTensor policy...")
-    dtensor_config = basic_dtensor_test_config
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    print("Creating Training Policy...")
+    if train_backend == "dtensor_v1":
+        train_config = basic_dtensor_test_config
+    elif train_backend == "dtensor_v2":
+        train_config = deepcopy(basic_dtensor_test_config)
+        train_config["dtensor_cfg"]["_v2"] = True
+    elif train_backend == "megatron":
+        train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    else:
+        raise ValueError(f"Invalid train backend: {train_backend}")
+    lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
     state_dict_info = lm_policy.prepare_refit_info()

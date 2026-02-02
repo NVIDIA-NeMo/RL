@@ -116,6 +116,9 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
 
     optimizer:
       optimizer: "adam"
@@ -216,6 +219,15 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    mcore_generation_config:
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
+      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
+      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
@@ -246,31 +258,44 @@ policy:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
   shuffle: true
   num_workers: 1
 
-  dataset_name: "OpenMathInstruct-2"
+  # dataset
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05 # use 5% of the training data as validation data
+    seed: ${grpo.seed} # seed for train/validation split when split_validation_size > 0
+  validation: null
+  # default settings for all datasets
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
   # You can use custom response datasets for training and validation. For example:
-  #   data:
-  #     dataset_name: ResponseDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
-  #     input_key: <QuestionKey>, default is "input"
-  #     output_key: <AnswerKey>, default is "output"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # train:
+  #   # this dataset will override input_key and use the default values for other vars
+  #   data_path: /path/to/local/train_dataset.jsonl
+  #   input_key: question
+  # validation:
+  #   # this dataset will use the default values for other vars except data_path
+  #   data_path: /path/to/local/val_dataset.jsonl
+  # default:
+  #   # will use below vars as default values if dataset doesn't specify it
+  #   dataset_name: ResponseDataset
+  #   input_key: input
+  #   output_key: output
+  #   prompt_file: null
+  #   system_prompt_file: null
+  #   processor: "math_hf_data_processor"
+  #   env_name: math
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
 
 env:
   math:
     num_workers: 8
     math_verify_impl: "hf_math_verify"
-  ## unused in this config but needed for DAPO recipe
-  dapo:
-    num_workers: 8
-    math_verify_impl: "dapo_math_verify"
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -281,6 +306,9 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
   tensorboard: {}

@@ -90,6 +90,10 @@ def create_megatron_test_config(
                 "buffer_size_gb": 20,
                 "buffer_guaranteed_fraction": 0.1,
                 "num_cuda_graphs": 16,
+                "block_size_tokens": 256,
+                "use_cuda_graphs_for_non_decode_steps": True,
+                "enable_chunked_prefill": True,
+                "unified_memory_level": 0,
                 "max_tokens": 16384,
             },
             "colocated": {
@@ -131,6 +135,9 @@ def create_megatron_test_config(
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "allgather",
+            "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
