@@ -45,6 +45,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
+  checkpoint_dir: "results/grpo"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
@@ -61,7 +62,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 12288
+  max_total_sequence_length: 8192
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
@@ -229,16 +230,15 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
-  # Train: 1129 samples, Validation: 126 samples
-
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 0
+
+  # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
+  # Train: 1129 samples, Validation: 126 samples
   train:
     dataset_name: NemoGymDataset
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
-    repeat: 1
   validation:
     dataset_name: NemoGymDataset
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
