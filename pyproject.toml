@@ -67,7 +67,9 @@ automodel = [
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch]==2.8.0",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # HybridEP branch for MoE expert parallelism
+  # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@hybrid-ep",
 ]
 vllm = [
   "cuda-python",
@@ -75,7 +77,9 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # HybridEP branch for MoE expert parallelism
+  # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@hybrid-ep",
   "vllm==0.11.2",
   "num2words>=0.5.14",
 ]
@@ -115,7 +119,9 @@ mcore = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # HybridEP branch for MoE expert parallelism
+  # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@hybrid-ep",
 ]
 nemo_gym = ["nemo_gym"]
 
