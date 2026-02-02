@@ -8,6 +8,7 @@ distillation:
     val_batch_size: 64
     val_period: 20
     val_at_start: false
+    val_at_end: false
     max_val_samples: 512
     topk_logits_k: 64
     seed: 42

@@ -67,6 +67,9 @@ class RMConfig(TypedDict):
     val_global_batch_size: int
     val_micro_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     seed: int
 
 
@@ -459,6 +462,7 @@ def rm_train(
     # Validation configuration
     val_period = rm_config["val_period"]
     val_at_start = rm_config["val_at_start"]
+    val_at_end = rm_config["val_at_end"]
     max_num_epochs = rm_config["max_num_epochs"]
 
     # Run validation at the start if configured
@@ -515,8 +519,10 @@ def rm_train(
                     and current_step + 1 == len(train_dataloader)
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
