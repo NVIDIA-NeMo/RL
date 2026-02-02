@@ -15,25 +15,13 @@
 import argparse
 import os
 import pprint
-from collections import defaultdict
-from typing import Any, Optional
 
 from omegaconf import OmegaConf
-from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
-from nemo_rl.data.interfaces import (
-    TaskDataProcessFnCallable,
-    TaskDataSpec,
-)
-from nemo_rl.data.processors import math_hf_data_processor
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.data.utils import setup_data_with_envs
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -58,75 +46,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
-
-
-# ===============================================================================
-#                             Math Data Processor
-# ===============================================================================
-TokenizerType = PreTrainedTokenizerBase
-
-
-def setup_data(
-    tokenizer: TokenizerType,
-    data_config: DataConfig,
-    env_configs: dict[str, Any],
-    seed: int,
-) -> tuple[
-    AllTaskProcessedDataset,
-    Optional[AllTaskProcessedDataset],
-    dict[str, EnvironmentInterface],
-    dict[str, EnvironmentInterface],
-]:
-    print("\n▶ Setting up data...")
-    # load dataset
-    data: Any = load_response_dataset(data_config, seed)
-    task_name = (
-        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
-    )
-
-    reward_model_task_spec = TaskDataSpec(
-        task_name=task_name,
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-    # data processor
-    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (reward_model_task_spec, math_hf_data_processor))
-    )
-    task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
-
-    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["reward_model"])
-
-    dataset = AllTaskProcessedDataset(
-        data.formatted_ds["train"],
-        tokenizer,
-        reward_model_task_spec,
-        task_data_processors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-
-    val_dataset: Optional[AllTaskProcessedDataset] = None
-    if data.formatted_ds["validation"]:
-        val_dataset = AllTaskProcessedDataset(
-            data.formatted_ds["validation"],
-            tokenizer,
-            reward_model_task_spec,
-            task_data_processors,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-    else:
-        val_dataset = None
-
-    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: reward_model_env)
-    task_to_env[task_name] = reward_model_env
-    return dataset, val_dataset, task_to_env, task_to_env
 
 
 def main() -> None:
@@ -178,7 +97,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
+    ) = setup_data_with_envs(tokenizer, config["data"], config["env"])
 
     (
         policy,

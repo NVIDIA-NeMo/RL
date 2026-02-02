@@ -16,17 +16,19 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any, Callable, Optional
 
+from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
-from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
-from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_response_dataset,
+    update_single_dataset_config,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -51,104 +53,78 @@ def parse_args():
 # =======================================================
 # Data Processing
 # =======================================================
-def sft_preprocessor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer,
-    max_seq_length: int,
-    idx: int,
-    add_bos: bool = True,
-    add_eos: bool = True,
-    add_generation_prompt: bool = False,
-    datum_preprocessor: Optional[Callable] = None,
-) -> DatumSpec:
-    """Process a datum dictionary for SFT training."""
-    # optional preprocessor
-    if datum_preprocessor is not None:
-        datum_dict = datum_preprocessor(datum_dict)
 
-    message_log = get_formatted_message_log(
-        datum_dict["messages"],
-        tokenizer,
-        task_data_spec,
-        add_bos_token=add_bos,
-        add_eos_token=add_eos,
-        add_generation_prompt=add_generation_prompt,
-        tools=datum_dict.get("tools", None),  # Pass tools from data if present
+
+# TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+    assert "train" in data_config, (
+        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
+        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
     )
 
-    length = sum(len(m["token_ids"]) for m in message_log)
-
-    loss_multiplier = 1.0
-    if length > max_seq_length:
-        # make smaller and mask out
-        for message in message_log:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    output = {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": None,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
-    return output
-
-
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
-
-    # load dataset
-    data = load_response_dataset(data_config, seed)
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
-    sft_task_spec = data.task_spec
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset) if val_dataset else 0} samples, respectively."
+    # setup train dataset
+    if "default" in data_config:
+        update_single_dataset_config(data_config["train"], data_config["default"])
+    data = load_response_dataset(data_config["train"])
+    data_processor = partial(
+        data.processor,
+        add_bos=data_config["add_bos"],
+        add_eos=data_config["add_eos"],
+        add_generation_prompt=data_config["add_generation_prompt"],
     )
+    task_data_processors = {data.task_name: (data.task_spec, data_processor)}
 
-    # add preprocessor if needed
-    datum_preprocessor = None
-    if "dataset_name" in data_config and data_config["dataset_name"] == "clevr_cogent":
-        from nemo_rl.data.datasets.response_datasets.clevr import (
-            format_clevr_cogent_dataset,
-        )
-
-        datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
-
-    train_dataset = AllTaskProcessedDataset(
-        train_dataset,
+    dataset = AllTaskProcessedDataset(
+        data.dataset,
         tokenizer,
-        sft_task_spec,
-        partial(
-            sft_preprocessor,
+        None,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+
+    # setup validation dataset
+    val_task_data_processors = {}
+    val_data_list = []
+
+    # validation dataset from train dataset (when train dataset's split_validation_size > 0)
+    if hasattr(data, "val_dataset") and data.val_dataset is not None:
+        val_data_list.append(data.val_dataset)
+        val_task_data_processors = task_data_processors.copy()
+
+    # validation dataset from config
+    if "validation" in data_config and data_config["validation"] is not None:
+        if "default" in data_config:
+            update_single_dataset_config(
+                data_config["validation"], data_config["default"]
+            )
+        val_data = load_response_dataset(data_config["validation"])
+        val_data_list.append(val_data.dataset)
+        val_data_processor = partial(
+            val_data.processor,
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
-            datum_preprocessor=datum_preprocessor,
-        ),
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-
-    if val_dataset is not None:
-        val_dataset = AllTaskProcessedDataset(
-            val_dataset,
-            tokenizer,
-            sft_task_spec,
-            partial(
-                sft_preprocessor,
-                add_bos=data_config.get("add_bos", True),
-                add_eos=data_config.get("add_eos", True),
-                add_generation_prompt=data_config["add_generation_prompt"],
-                datum_preprocessor=datum_preprocessor,
-            ),
-            max_seq_length=data_config["max_input_seq_length"],
+        )
+        val_task_data_processors[val_data.task_name] = (
+            val_data.task_spec,
+            val_data_processor,
         )
 
-    return train_dataset, val_dataset, sft_task_spec
+    val_dataset = None
+    if len(val_data_list) > 0:
+        merged_val_data = concatenate_datasets(val_data_list)
+        val_dataset = AllTaskProcessedDataset(
+            merged_val_data,
+            tokenizer,
+            None,
+            val_task_data_processors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+
+    return dataset, val_dataset
 
 
 def main(is_vlm: bool = False):
@@ -186,11 +162,7 @@ def main(is_vlm: bool = False):
     tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
 
     # setup data
-    (
-        dataset,
-        val_dataset,
-        sft_task_spec,
-    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
+    dataset, val_dataset = setup_data(tokenizer, config["data"])
 
     (
         policy,
@@ -212,7 +184,6 @@ def main(is_vlm: bool = False):
         loss_fn,
         master_config,
         logger,
-        sft_task_spec,
         checkpointer,
         sft_save_state,
     )

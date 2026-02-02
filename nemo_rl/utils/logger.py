@@ -99,6 +99,7 @@ class LoggerInterface(ABC):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log a dictionary of metrics."""
         pass
@@ -121,12 +122,30 @@ class TensorboardLogger(LoggerInterface):
         self.writer = SummaryWriter(log_dir=log_dir)
         print(f"Initialized TensorboardLogger at {log_dir}")
 
+    @staticmethod
+    def _coerce_to_scalar(value: Any) -> int | float | bool | str | None:
+        """Coerce a value to a Python scalar for TensorBoard logging.
+
+        Returns the coerced value, or None if it can't be converted to a scalar.
+        """
+        if isinstance(value, (int, float, bool, str)):
+            return value
+        if isinstance(value, (np.floating, np.integer, np.bool_)):
+            return value.item()
+        if isinstance(value, np.ndarray) and (value.ndim == 0 or value.size == 1):
+            return value.item()
+        if isinstance(value, torch.Tensor) and (value.ndim == 0 or value.numel() == 1):
+            return value.item()
+        # dict, list, multi-element arrays/tensors, or incompatible types
+        return None
+
     def log_metrics(
         self,
         metrics: dict[str, Any],
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,  # ignored in TensorBoard
+        step_finished: bool = False,  # ignored in TensorBoard
     ) -> None:
         """Log metrics to Tensorboard.
 
@@ -137,23 +156,19 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
-            # NeMo-Gym will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
-            # This logic catches non-compatible objects being logged.
-            if not isinstance(value, (int, float, bool, str)):
-                continue
-
             if prefix:
                 name = f"{prefix}/{name}"
 
-            # Skip non-scalar values that TensorBoard can't handle
-            if isinstance(value, (dict, list)):
+            scalar = self._coerce_to_scalar(value)
+            if scalar is None:
                 print(
-                    f"Warning: Skipping non-scalar metric '{name}' for TensorBoard logging (type: {type(value).__name__})"
+                    f"Warning: Skipping metric '{name}' for TensorBoard logging "
+                    f"(unsupported type: {type(value).__name__})"
                 )
                 continue
 
             try:
-                self.writer.add_scalar(name, value, step)
+                self.writer.add_scalar(name, scalar, step)
             except Exception as e:
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
@@ -186,6 +201,14 @@ class WandbLogger(LoggerInterface):
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         self.run = wandb.init(**cfg, dir=log_dir)
+
+        if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
+            print(
+                "Uploading raylet.out and raylet.err files to W&B since environment variable RAY_BACKEND_LOG_LEVEL=debug"
+            )
+            wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
+            wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
+
         self._log_code()
         self._log_diffs()
         print(
@@ -319,6 +342,7 @@ class WandbLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to wandb.
 
@@ -339,6 +363,10 @@ class WandbLogger(LoggerInterface):
         if step_metric and step_metric in metrics:
             # commit=False so the step does not get incremented
             self.run.log(metrics, commit=False)
+        elif step_finished:
+            # Commit param defaults to None. By default if step is set, then commit defaults to False
+            # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
+            self.run.log(metrics, step=step, commit=True)
         else:
             self.run.log(metrics, step=step)
 
@@ -391,6 +419,7 @@ class SwanlabLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to the associated Swanlab run.
 
@@ -768,6 +797,7 @@ class MLflowLogger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to MLflow.
 
@@ -893,6 +923,7 @@ class Logger(LoggerInterface):
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
+        step_finished: bool = False,
     ) -> None:
         """Log metrics to all enabled backends.
 
@@ -904,7 +935,7 @@ class Logger(LoggerInterface):
                          of the provided step value (currently only needed for wandb)
         """
         for logger in self.loggers:
-            logger.log_metrics(metrics, step, prefix, step_metric)
+            logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
@@ -938,6 +969,24 @@ class Logger(LoggerInterface):
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
+
+        print(f"Logged data to {filepath}")
+
+    def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
+        """Log a list of strings to a JSONL file.
+
+        Args:
+            to_log: list of strings to log
+            filename: Filename to log to (within the log directory)
+        """
+        # Create full path within log directory
+        filepath = os.path.join(self.base_log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        # Write to JSONL file
+        with open(filepath, "a") as f:
+            for sample in to_log:
+                f.write(sample + "\n")
 
         print(f"Logged data to {filepath}")
 

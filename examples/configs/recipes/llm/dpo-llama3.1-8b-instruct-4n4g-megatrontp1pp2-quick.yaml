@@ -1,0 +1,11 @@
+defaults: ./dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.yaml
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    sequence_parallel: false
+logger:
+  wandb:
+    name: dpo-llama3.1-8b-instruct-4n4g-megatrontp1pp2-quick
+cluster:
+  gpus_per_node: 4
+

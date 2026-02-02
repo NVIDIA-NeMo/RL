@@ -19,7 +19,7 @@ uv run examples/run_sft.py \
     sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=ruit_personal_debug \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
@@ -40,4 +40,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["50"] < 0.8' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 50' \
         'mean(data["timing/train/total_step_time"], 2) < 10'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi

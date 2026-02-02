@@ -100,6 +100,9 @@ policy:
     apply_rope_fusion: True
     defer_fp32_logits: false
     moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
 
     optimizer:
       optimizer: "adam"
@@ -201,7 +204,7 @@ policy:
       kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
-      tool_parser_plugin: ???
+      # tool_parser_plugin: ???  # This is set to the path for Nemotron Nano v2
       http_server_serving_chat_kwargs:
         # Workplace assistant uses 26 tools, so we enable auto_tools.
         # For Nemotron Nano v2, we use the dedicated `nemotron_json` tool parser
@@ -227,9 +230,8 @@ policy:
 data:
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/validation.jsonl
-  agent_name: workplace_assistant_simple_agent
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
   shuffle: true
   num_workers: 0
 
@@ -237,13 +239,16 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
+    is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
-    workplace_assistant_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 6  # Workplace assistant allows up to 6 tool-calling steps per task
+    # You can uncomment these during `ng_prepare_data` and here to train on multiple environments at once!
+    # - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    # - resources_servers/code_gen/configs/code_gen.yaml
+    # - resources_servers/mcqa/configs/mcqa.yaml
+    # - resources_servers/instruction_following/configs/instruction_following.yaml
+    # - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
     policy_model:
       responses_api_models:
         vllm_model:
@@ -252,6 +257,10 @@ env:
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: ${mul:64, ${cluster.num_nodes}}
 
 logger:
   log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b"  # Base directory for all logs

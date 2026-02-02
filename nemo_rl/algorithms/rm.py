@@ -343,6 +343,7 @@ def validate_one_dataset(
                 # NOTE: we double the batch size because each preference example corresponds to a pair of
                 # examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                 mbs=val_mbs * 2,
+                timer=timer,
             )
 
             if len(val_results["all_mb_metrics"]) == 0:
@@ -503,6 +504,7 @@ def rm_train(
                     ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                     gbs=master_config["policy"]["train_global_batch_size"] * 2,
                     mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    timer=timer,
                 )
 
                 is_last_step = (

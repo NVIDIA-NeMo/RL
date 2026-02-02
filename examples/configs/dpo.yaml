@@ -49,7 +49,7 @@ policy:
 
   dtensor_cfg:
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
+      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -119,6 +119,9 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     
     optimizer:
       optimizer: "adam"
