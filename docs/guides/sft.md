@@ -191,7 +191,7 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, including Nano‑v3 models. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
 
 Notes:
 - LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
@@ -234,7 +234,7 @@ policy:
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
-For a full configuration example, see the reference recipe: [sft-nanov3-30BA3B-2n4g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
+For the Nano‑v3 SFT LoRA recipe, see:[sft-nanov3-30BA3B-2n4g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
 ### Megatron Configuration Parameters
 
