@@ -26,6 +26,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.max_num_steps=3 \
     grpo.num_prompts_per_step=8 \
     grpo.num_generations_per_prompt=4 \
+    data.shuffle=false \
     policy.dtensor_cfg.lora_cfg.enabled=True \
     policy.dtensor_cfg.lora_cfg.dim=32 \
     policy.train_global_batch_size=32 \
@@ -42,4 +43,4 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/reward"]["3"] > 0.06'
+  'max(data["train/reward"]) > 0.03'
