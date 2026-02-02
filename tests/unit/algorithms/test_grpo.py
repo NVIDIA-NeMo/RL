@@ -2016,8 +2016,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
 
         # Use threshold 1.2 which should mask sequences 2 and 3
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.2
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.2
+            )
         )
 
         # Verify masking occurred
@@ -2046,8 +2048,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 1.0, 1.0])
         original_sample_mask = train_data["sample_mask"].clone()
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=2.0
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=2.0
+            )
         )
 
         # Verify no masking occurred
@@ -2070,8 +2074,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         )
         rewards = torch.tensor([1.0, 0.0, 1.0])  # 2 correct, 1 incorrect
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.0
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.0
+            )
         )
 
         # Verify all sequences are masked
@@ -2103,8 +2109,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         )
         rewards = torch.tensor([1.0, 1.0, 0.0, 1.0])
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.0
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.0
+            )
         )
 
         # Only 3 sequences were originally unmasked, all should be masked now
@@ -2131,8 +2139,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # Rewards: seq 2 correct, seq 3 incorrect, seq 4 correct
         rewards = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0])
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=1.5
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.5
+            )
         )
 
         assert num_masked == 3, "Should mask 3 sequences"
@@ -2171,8 +2181,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 
         # Sequence 0 should have lower error due to masked tokens
         # Sequence 1 should have higher error
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
-            train_data, rewards, seq_logprob_error_threshold=2.0
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=2.0
+            )
         )
 
         # Only sequence 1 should be masked (seq 0 has reduced error due to token_mask)
