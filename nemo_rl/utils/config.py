@@ -62,7 +62,10 @@ def load_config_with_inheritance(
         base_config = OmegaConf.create({})
         for default in defaults:
             parent_path = resolve_path(base_dir, str(default))
-            parent_config = load_config_with_inheritance(parent_path, base_dir)
+            # Use parent's directory as base_dir for resolving its own defaults
+            parent_config = load_config_with_inheritance(
+                parent_path, parent_path.parent
+            )
             base_config = cast(DictConfig, OmegaConf.merge(base_config, parent_config))
 
         # Merge with current config
