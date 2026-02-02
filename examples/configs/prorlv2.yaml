@@ -11,7 +11,7 @@
 # Inherits from grpo_math_1B.yaml
 #
 # Usage:
-#   python examples/run_grpo_math.py --config examples/configs/prorl.yaml
+#   python examples/run_grpo_math.py --config examples/configs/prorlv2.yaml
 #
 # Reference papers and blogs:
 # ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -93,6 +93,7 @@ loss_fn:
   truncated_importance_sampling_type: "icepop"
 
   # Reinforce++: add KL penalty to reward instead of loss
+  # Set to false to use external KL loss (reference_policy_kl_penalty) for better stability
   use_kl_in_reward: false
 
 # ============================================================================

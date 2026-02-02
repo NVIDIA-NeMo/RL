@@ -162,15 +162,26 @@ class ClippedPGLossFn(LossFunction):
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
             )
-            assert not self.sequence_level_importance_ratios, (
-                "truncated_importance_sampling_ratio is only supported for token-level importance sampling"
-            )
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
             )
             assert self.truncated_importance_sampling_type in ("tis", "icepop"), (
                 f"truncated_importance_sampling_type must be 'tis' or 'icepop', got {self.truncated_importance_sampling_type}"
             )
+        else:
+            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
+            ignored_params = []
+            if cfg.get("truncated_importance_sampling_type") is not None:
+                ignored_params.append("truncated_importance_sampling_type")
+            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
+                ignored_params.append("truncated_importance_sampling_ratio_min")
+            if ignored_params:
+                print(
+                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
+                    f"parameters are ignored: {', '.join(ignored_params)}. "
+                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
+                    flush=True,
+                )
 
     def __call__(
         self,

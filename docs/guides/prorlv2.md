@@ -1,6 +1,6 @@
 # An in-depth Walkthrough of ProRLv2 in NeMo RL
 
-This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorl.yaml`](../../examples/configs/prorl.yaml).
+This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml).
 
 ProRLv2 (as used in this repo) is best thought of as **GRPO + a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning:
 
@@ -15,13 +15,13 @@ This document focuses on ProRLv2-specific knobs and gotchas. For foundational co
 
 ## Quickstart: Launch a ProRLv2 Run
 
-Use the example configuration [`examples/configs/prorl.yaml`](../../examples/configs/prorl.yaml):
+Use the example configuration [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml):
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/prorl.yaml {overrides}
+uv run examples/run_grpo_math.py --config examples/configs/prorlv2.yaml {overrides}
 ```
 
-`prorl.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
+`prorlv2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
 
 **Reminder**: Don’t forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You’ll need to do a `huggingface-cli login` as well for gated models.
 
@@ -36,7 +36,7 @@ Standard GRPO will train on all generated responses, even when a prompt’s `num
 
 ## Advantage Estimator: Reinforce++
 
-ProRLv2 can switch the advantage estimator from standard GRPO-style group baseline to **Reinforce++**.
+The ProRLv2 recipe uses **Reinforce++** advantage estimation instead of the standard GRPO-style group baseline.
 
 Quick intuition:
 
@@ -46,7 +46,7 @@ Quick intuition:
 Computation (as implemented in this repo, with the ProRLv2 example defaults):
 
 ```text
-Defaults in examples/configs/prorl.yaml:
+Defaults in examples/configs/prorlv2.yaml:
   grpo.adv_estimator.minus_baseline = true
   loss_fn.use_kl_in_reward          = false
 
@@ -157,7 +157,7 @@ loss_fn:
 
 The ProRLv2 example config is intentionally small and relies on defaults from `grpo_math_1B.yaml`.
 
-- **Example config**: [`examples/configs/prorl.yaml`](../../examples/configs/prorl.yaml)
+- **Example config**: [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml)
 - **Base defaults**: [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml)
 
 ## Practical Overrides
@@ -166,7 +166,7 @@ A few common overrides when launching:
 
 ```bash
 uv run examples/run_grpo_math.py \
-  --config examples/configs/prorl.yaml \
+  --config examples/configs/prorlv2.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   logger.wandb_enabled=true \
   logger.wandb.project="prorlv2-dev" \
@@ -178,7 +178,7 @@ If you want to enable DAPO overlong reward shaping instead of stop-properly:
 
 ```bash
 uv run examples/run_grpo_math.py \
-  --config examples/configs/prorl.yaml \
+  --config examples/configs/prorlv2.yaml \
   grpo.reward_shaping.stop_properly_penalty_coef=null \
   grpo.reward_shaping.overlong_buffer_length=4096 \
   grpo.reward_shaping.overlong_buffer_penalty=1.0 \

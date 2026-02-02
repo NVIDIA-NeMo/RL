@@ -67,6 +67,21 @@ def apply_reward_shaping(
         assert 0 <= stop_properly_penalty_coef <= 1, (
             f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
         )
+        # Warn user that DAPO overlong parameters are ignored when stop_properly_penalty_coef is set
+        ignored_params = []
+        if cfg.get("overlong_buffer_length") is not None:
+            ignored_params.append("overlong_buffer_length")
+        if cfg.get("overlong_buffer_penalty") is not None:
+            ignored_params.append("overlong_buffer_penalty")
+        if cfg.get("max_response_length") is not None:
+            ignored_params.append("max_response_length")
+        if ignored_params:
+            print(
+                f"[WARN] stop_properly_penalty_coef is set, so the following DAPO overlong "
+                f"parameters are ignored: {', '.join(ignored_params)}. "
+                f"Set stop_properly_penalty_coef=null to use DAPO overlong reward shaping instead.",
+                flush=True,
+            )
         truncated = batch.get("truncated")
         assert truncated is not None, "truncated field not found in batch"
         if isinstance(truncated, list):
@@ -83,7 +98,7 @@ def apply_reward_shaping(
             )
             batch["total_reward"] = rewards
             print(
-                f"▶ Stop properly penalty applied: {num_truncated}/{len(truncated)} samples truncated, "
+                f"[INFO] stop properly penalty applied: {num_truncated}/{len(truncated)} samples truncated, "
                 f"coef={stop_properly_penalty_coef}, "
                 f"original_reward_mean={original_rewards[truncated].mean().item():.4f}, "
                 f"shaped_reward_mean={rewards[truncated].mean().item():.4f}",
@@ -91,7 +106,7 @@ def apply_reward_shaping(
             )
         else:
             print(
-                "▶ Stop properly penalty: no truncated samples (truncation_rate=0)",
+                "[INFO] stop properly penalty: no truncated samples (truncation_rate=0)",
                 flush=True,
             )
 
