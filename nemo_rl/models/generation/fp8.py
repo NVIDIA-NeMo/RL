@@ -270,6 +270,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+    if vllm_cfg.get("use_deep_gemm_e8m0", False):
+        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1"
+    else:
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
@@ -445,7 +448,10 @@ def load_weights(weights, model_runner):
         )
         param_scale = torch.squeeze(param_scale, dim=-1)
         weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
+        if ".experts." in k:
+            weights_quantized.append([k + "_scale_inv_from_checkpoint", param_scale])
+        else:
+            weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 
@@ -582,22 +588,39 @@ def process_weights_after_loading(self, layer) -> None:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         process_fp8_weight_block_strategy,
     )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+    from vllm.utils.deep_gemm import (
+        is_deep_gemm_e8m0_used,
+        should_use_deepgemm_for_fp8_linear,
+    )
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
     weight_scale = layer.weight_scale_inv
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
-    layer.weight.data = weight.data
+    
+    should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
+        layer.orig_dtype, layer.weight
+    )
+    if should_use_deepgemm:
+        dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=weight.data,
+            ws=weight_scale.data,
+            quant_block_shape=tuple(layer.weight_block_size),
+            use_e8m0=is_deep_gemm_e8m0_used(),
+        )
+    
+    layer.weight.data.copy_(dg_weight)
     if hasattr(layer, "weight_scale"):
         # Not the first time to call this function, just need to update the data
-        layer.weight_scale.copy_(weight_scale.data)
+        layer.weight_scale.copy_(dg_weight_scale)
     else:
         # The first time to call this function, create a new parameter and update the tp status
-        layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(dg_weight_scale, requires_grad=False)
         layer.update_param_tp_status()
-
-    maybe_post_process_fp8_weight_block(layer)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
@@ -617,20 +640,38 @@ def process_weights_after_loading_moe(self, layer) -> None:
     from vllm.utils.deep_gemm import (
         is_deep_gemm_e8m0_used,
     )
-
     self.rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
-    if self.flashinfer_moe_backend is not None:
-        w13_weight = swap_w13_to_w31(layer.w13_weight.data)
-        w13_weight_scale_inv = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
+    def _copy_missing_attrs(old_param, new_param):
+        from vllm.model_executor.utils import set_weight_attrs
+        new_attrs = set(dir(new_param))
+        attrs_to_set = {}
+        for attr in dir(old_param):
+            if attr not in new_attrs:
+                attrs_to_set[attr] = getattr(old_param, attr)
+        set_weight_attrs(new_param, attrs_to_set)
+
+    if hasattr(layer, "w13_weight_scale_inv_from_checkpoint"):
+        if self.flashinfer_moe_backend is not None:
+            w13_weight = swap_w13_to_w31(layer.w13_weight.data)
+            w13_weight_scale_inv = swap_w13_to_w31(layer.w13_weight_scale_inv_from_checkpoint.data)
+        else:
+            w13_weight = layer.w13_weight.data
+            w13_weight_scale_inv = layer.w13_weight_scale_inv_from_checkpoint.data
+        w2_weight = layer.w2_weight.data
+        w2_weight_scale_inv = layer.w2_weight_scale_inv_from_checkpoint.data
     else:
-        w13_weight = layer.w13_weight.data
-        w13_weight_scale_inv = layer.w13_weight_scale_inv.data
-    w2_weight = layer.w2_weight.data
-    w2_weight_scale_inv = layer.w2_weight_scale_inv.data
+        if self.flashinfer_moe_backend is not None:
+            w13_weight = swap_w13_to_w31(layer.w13_weight.data)
+            w13_weight_scale_inv = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
+        else:
+            w13_weight = layer.w13_weight.data
+            w13_weight_scale_inv = layer.w13_weight_scale_inv.data
+        w2_weight = layer.w2_weight.data
+        w2_weight_scale_inv = layer.w2_weight_scale_inv.data
 
     # DeepGemm scales need to be transposed and aligned. We try to do
     # it ahead of time for performance reasons.
@@ -648,9 +689,17 @@ def process_weights_after_loading_moe(self, layer) -> None:
             use_e8m0=is_deep_gemm_e8m0_used(),
         )
     layer.w13_weight.copy_(w13_weight)
-    layer.w13_weight_scale_inv.copy_(w13_weight_scale_inv)
     layer.w2_weight.copy_(w2_weight)
-    layer.w2_weight_scale_inv.copy_(w2_weight_scale_inv)
+    if not hasattr(layer, "w13_weight_scale_inv_from_checkpoint"):
+        layer.w13_weight_scale_inv_from_checkpoint = torch.nn.Parameter(layer.w13_weight_scale_inv.data, requires_grad=False)
+        _copy_missing_attrs(layer.w13_weight_scale_inv, layer.w13_weight_scale_inv_from_checkpoint)
+        layer.w2_weight_scale_inv_from_checkpoint = torch.nn.Parameter(layer.w2_weight_scale_inv.data, requires_grad=False)
+        _copy_missing_attrs(layer.w2_weight_scale_inv, layer.w2_weight_scale_inv_from_checkpoint)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_weight_scale_inv, requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_weight_scale_inv, requires_grad=False)
+    else:
+        layer.w13_weight_scale_inv.copy_(w13_weight_scale_inv)
+        layer.w2_weight_scale_inv.copy_(w2_weight_scale_inv)
 
 
 def process_weights_after_loading_kv(self, layer) -> None:
