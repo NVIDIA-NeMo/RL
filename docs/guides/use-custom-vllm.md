@@ -56,7 +56,7 @@ uv pip install setuptools_scm
 
 Then run your application:
 ```sh
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 ## Re-building the NeMo RL Docker Image
@@ -138,12 +138,12 @@ When using a container built with custom vLLM, **use the frozen environment work
 
 ```sh
 # Recommended: use bare python (frozen environment)
-python examples/run_grpo_math.py
+python examples/run_grpo.py
 
 # NOT recommended with custom vLLM containers:
-# uv run examples/run_grpo_math.py
+# uv run examples/run_grpo.py
 # or
-# NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo_math.py
+# NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py
 ```
 
 ### Why Not Use `uv run` or Rebuild Venvs?

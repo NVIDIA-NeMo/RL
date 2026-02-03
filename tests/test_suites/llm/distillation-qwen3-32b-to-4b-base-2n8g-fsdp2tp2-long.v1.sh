@@ -14,7 +14,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_distillation_math.py \
+uv run examples/run_distillation.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
