@@ -19,7 +19,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.num_prompts_per_step=64 \
     grpo.num_generations_per_prompt=8 \

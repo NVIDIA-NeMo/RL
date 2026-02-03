@@ -19,7 +19,7 @@ uv run ft_launcher \
     --ft-rank-heartbeat-timeout 450 \
     --ft-initial-rank-heartbeat-timeout 1200 \
     --max-restarts 5 \
-    examples/run_grpo_math.py \
+    examples/run_grpo.py \
     --config <your_config.yaml>
 ```
 

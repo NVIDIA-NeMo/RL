@@ -125,7 +125,6 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-        processor,
     )
 
 
