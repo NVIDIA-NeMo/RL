@@ -25,7 +25,6 @@ from nemo_rl.data.datasets import (
     load_response_dataset,
     update_single_dataset_config,
 )
-from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
@@ -193,17 +192,25 @@ def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
         for val_dataset_name, val_dataset_path in val_data_paths.items():
             assert val_dataset_name not in val_dataset
-            val_data = PreferenceDataset(val_dataset_path)
-            print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.dataset)} samples."
+
+            val_data = load_preference_dataset(
+                {"dataset_name": "PreferenceDataset", "data_path": val_dataset_path}
             )
+            val_task_data_processors = {
+                val_data.task_name: (val_data.task_spec, preference_preprocessor)
+            }
+
             val_dataset[val_dataset_name] = AllTaskProcessedDataset(
                 val_data.dataset,
                 tokenizer,
-                val_data.task_spec,
-                preference_preprocessor,
+                None,
+                val_task_data_processors,
                 max_seq_length=data_config["max_input_seq_length"],
             )
+            print(
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_dataset[val_dataset_name])} samples."
+            )
+
     elif "validation" in data_config and data_config["validation"] is not None:
         if "default" in data_config:
             update_single_dataset_config(
