@@ -11,6 +11,10 @@ This module provides a suite of tools to enable FP8 quantization for large langu
 - Uses **TransformerEngine** for linear layer implementation.
 - Supports both **Deepseek-style sub-channel scaling** and **per-tensor scaling**.
 
+### Recommended recipe
+- For Hopper GPUs we recommend to use FP8 (Deepseek-style) precision for both generation and training for best convergence and speedup
+- For Blackwell GPUs, FP8 (deepseek-style) with FP32 scaling factor is not supported in training. Currently we recommend to use FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
+
 ## Integration with NeMo RL
 
 NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  

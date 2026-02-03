@@ -47,7 +47,6 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_context_parallel_rank,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
     get_pipeline_model_parallel_world_size,
@@ -57,10 +56,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.training.utils import get_ltor_masks_and_position_ids
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -76,13 +74,15 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
-    _get_pack_sequence_parameters_for_megatron,
-    _pack_sequences_for_megatron,
     broadcast_tensor,
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
+from nemo_rl.models.megatron.data import (
+    get_microbatch_iterator,
+    process_global_batch,
+)
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -343,15 +343,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model.train()
 
         with ctx:
-            # dim 1 is always assumed to be the sequence dim, sanity check this here
-            sequence_dim = 1
-            seq_dim_size = data["input_ids"].shape[sequence_dim]
-            for k, v in data.items():
-                if torch.is_tensor(v) and len(v.shape) > 1:
-                    assert v.shape[sequence_dim] == seq_dim_size, (
-                        f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                    )
-
             forward_step = partial(
                 forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
             )
@@ -359,75 +350,31 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
-                global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-
-                assert "sample_mask" in global_batch, (
-                    "sample_mask must be present in the data!"
+                gb_result = process_global_batch(
+                    data,
+                    loss_fn=loss_fn,
+                    dp_group=parallel_state.get_data_parallel_group(),
+                    batch_idx=gb_idx,
+                    batch_size=local_gbs,
                 )
-                ## get the normalization factor for the loss
-                local_valid_seqs = torch.sum(global_batch["sample_mask"])
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
 
-                if not "token_mask" in global_batch:
-                    local_valid_toks = (
-                        local_valid_seqs * global_batch["input_ids"].shape[1]
-                    )
-                else:
-                    local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
-                    )
-
-                to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-                torch.distributed.all_reduce(
-                    to_reduce, group=parallel_state.get_data_parallel_group()
+                (
+                    data_iterator,
+                    num_microbatches,
+                    micro_batch_size,
+                    seq_length,
+                    padded_seq_length,
+                ) = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    mbs,
+                    straggler_timer=self.mcore_state.straggler_timer,
                 )
-                global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
-
-                if (
-                    hasattr(loss_fn, "loss_type")
-                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
-                ):
-                    assert "token_mask" in global_batch, (
-                        "token_mask must be present in the data when using token-level loss"
-                    )
-
-                batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-                pack_seqs = False
-                seqlen_key = None
-                pad_factor = 1
-                pad_full_seq_to = None
-                pad_packed_seq_to_multiple_of = 1
-                if self.cfg["dynamic_batching"]["enabled"]:
-                    data_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
-                    data_iterator_len = (
-                        batch.get_microbatch_iterator_dynamic_shapes_len()
-                    )
-                elif self.cfg["sequence_packing"]["enabled"]:
-                    data_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
-                    )
-                    data_iterator_len, seq_dim_size = (
-                        batch.get_microbatch_iterator_for_packable_sequences_len()
-                    )
-                    mbs = 1
-                    pack_seqs = True
-                    seqlen_key = "input_lengths"
-                    (
-                        pad_factor,
-                        pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
-                    ) = _get_pack_sequence_parameters_for_megatron(
-                        self.cfg["megatron_cfg"],
-                        seq_dim_size,
-                    )
-                    # if pad_full_seq_to is not None, we need to use it as the sequence length
-                    seq_dim_size = pad_full_seq_to or seq_dim_size
-                else:
-                    data_iterator = batch.make_microbatch_iterator(mbs)
-                    data_iterator_len = local_gbs // mbs
-
                 # Track total microbatches for MoE aux-loss averaging
-                total_num_microbatches += int(data_iterator_len)
+                total_num_microbatches += int(num_microbatches)
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -443,19 +390,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             self.mcore_state,
                             global_valid_seqs,
                             global_valid_toks,
-                            pack_sequences=pack_seqs,
-                            seq_length_key=seqlen_key,
-                            pad_individual_seqs_to_multiple_of=pad_factor,
-                            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                            pad_full_seq_to=pad_full_seq_to,
+                            pack_sequences=self.cfg["sequence_packing"]["enabled"],
                             defer_fp32_logits=self.defer_fp32_logits,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,
-                        num_microbatches=data_iterator_len,
-                        seq_length=seq_dim_size,
+                        num_microbatches=num_microbatches,
+                        seq_length=padded_seq_length,
                         micro_batch_size=mbs,
-                        decoder_seq_length=seq_dim_size,
+                        decoder_seq_length=padded_seq_length,
                         forward_only=eval_mode,
                         do_not_average_loss=True,
                     )
@@ -502,7 +445,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     for x in losses_reduced:
                         loss_metrics = {}
                         for k in x.keys():
-                            loss_metrics[k] = x[k] / num_global_batches
+                            if "_min" in k or "_max" in k:
+                                loss_metrics[k] = x[k]
+                            else:
+                                loss_metrics[k] = x[k] / num_global_batches
                         gb_loss_metrics.append(loss_metrics)
                         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
                         curr_wd = self.scheduler.get_wd()
@@ -595,74 +541,36 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             else self.cfg["logprob_batch_size"]
         )
 
-        # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        input_seq_dim_size = data["input_ids"].shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == input_seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={input_seq_dim_size} but got shape {v.shape}"
-                )
-
         self.model.eval()
 
-        pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
-        if self.cfg["sequence_packing"]["enabled"]:
-            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
-            (
-                pad_factor,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-            ) = _get_pack_sequence_parameters_for_megatron(
-                self.cfg["megatron_cfg"],
-                seq_dim_size,
-            )
-            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
+
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
-            data_dict = next(data_iterator).to("cuda")
-            if self.cfg["sequence_packing"]["enabled"]:
-                original_seq_length = data_dict["input_ids"].shape[1]
-                cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                cp_rank = get_context_parallel_rank()
-                (
-                    input_ids,
-                    input_ids_cp_sharded,
-                    packed_seq_params,
-                    cu_seqlens,
-                    cu_seqlens_padded,
-                ) = _pack_sequences_for_megatron(
-                    data_dict["input_ids"].clone(),
-                    data_dict["input_lengths"],
-                    pad_individual_seqs_to_multiple_of=pad_factor,
-                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                    pad_packed_seq_to=pad_full_seq_to,
-                    cp_rank=cp_rank,
-                    cp_size=cp_size,
-                )
-                attention_mask, position_ids = None, None
-                unpacked_input_ids = data_dict["input_ids"]
-            else:
-                input_ids = data_dict["input_ids"]
-                input_ids_cp_sharded = input_ids
-                attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                    data=input_ids,
-                    eod_token=0,  # used for loss_mask, which we don't use
-                    pad_token=0,  # used for loss_mask, which we don't use
-                    reset_position_ids=False,
-                    reset_attention_mask=False,
-                    eod_mask_loss=False,
-                    pad_mask_loss=False,
-                )
-                packed_seq_params = None
-                unpacked_input_ids = input_ids
+            processed_mb = next(data_iterator)
+            # Extract the processed components
+            data_dict = processed_mb.data_dict
+            input_ids = processed_mb.input_ids
+            input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
+            attention_mask = processed_mb.attention_mask
+            position_ids = processed_mb.position_ids
+            packed_seq_params = processed_mb.packed_seq_params
+            cu_seqlens_padded = processed_mb.cu_seqlens_padded
+            unpacked_input_ids = data_dict["input_ids"]
 
             multimodal_data = data_dict.get_multimodal_dict(
                 as_tensors=True, device=input_ids.device
@@ -701,7 +609,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         output_tensor,
                         target=input_ids,
                         cu_seqlens_padded=cu_seqlens_padded,
-                        unpacked_seqlen=original_seq_length,
+                        unpacked_seqlen=seq_length,
                         vocab_start_index=tp_rank * output_tensor.shape[-1],
                         vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                         group=tp_grp,
@@ -730,37 +638,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             return output_tensor, collection_fn
 
-        if self.cfg["dynamic_batching"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-            data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            micro_batch_size = logprob_batch_size
-        elif self.cfg["sequence_packing"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-            data_iterator_len, _ = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
-            )
-            micro_batch_size = 1
-        else:
-            mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
-            data_iterator_len = max(1, data.size // logprob_batch_size)
-            micro_batch_size = logprob_batch_size
-
         forward_backward_func = get_forward_backward_func()
         list_of_logprobs = forward_backward_func(
             forward_step_func=forward_step_fn,
             data_iterator=mb_iterator,
             model=self.model,
-            num_microbatches=data_iterator_len,
-            seq_length=pp_seq_dim_size,
+            num_microbatches=num_microbatches,
+            seq_length=padded_seq_length,
             micro_batch_size=micro_batch_size,
-            decoder_seq_length=pp_seq_dim_size,
+            decoder_seq_length=padded_seq_length,
             forward_only=True,
         )
         if is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
             for lp in all_logprobs:
-                padding_needed = input_seq_dim_size - lp.shape[1]
+                padding_needed = seq_length - lp.shape[1]
                 if padding_needed > 0:
                     lp = torch.nn.functional.pad(
                         lp, (0, padding_needed), mode="constant", value=0.0
@@ -855,77 +748,36 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             else self.cfg["logprob_batch_size"]
         )
 
-        sequence_dim = 1
-        input_seq_dim_size = data["input_ids"].shape[sequence_dim]
-        # Avoid shadowing the function argument `k` by using a distinct variable name
-        for tensor_name, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == input_seq_dim_size, (
-                    f"Tensor {tensor_name} must have sequence dimension {sequence_dim} of size {input_seq_dim_size}, but got shape {v.shape}"
-                )
-
         self.model.eval()
 
-        pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
-        pad_factor = 1
-        pad_packed_seq_to_multiple_of = 1
-        pad_full_seq_to = None
-        if self.cfg["sequence_packing"]["enabled"]:
-            _, seq_dim_size = data.get_microbatch_iterator_for_packable_sequences_len()
-            (
-                pad_factor,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-            ) = _get_pack_sequence_parameters_for_megatron(
-                self.cfg["megatron_cfg"],
-                seq_dim_size,
-            )
-            pp_seq_dim_size = pad_full_seq_to or pp_seq_dim_size
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
 
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
-            data_dict = next(data_iterator).to("cuda")
-
-            pack = self.cfg["sequence_packing"]["enabled"]
-            if pack:
-                original_seq_length = data_dict["input_ids"].shape[1]
-                cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                cp_rank = get_context_parallel_rank()
-
-                (
-                    input_ids_unpacked,
-                    input_ids_cp_sharded,
-                    packed_seq_params,
-                    cu_seqlens,
-                    cu_seqlens_padded,
-                ) = _pack_sequences_for_megatron(
-                    data_dict["input_ids"].clone(),
-                    data_dict["input_lengths"],
-                    pad_individual_seqs_to_multiple_of=pad_factor,
-                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                    pad_packed_seq_to=pad_full_seq_to,
-                    cp_rank=cp_rank,
-                    cp_size=cp_size,
-                )
-                attention_mask, position_ids = None, None
-                seq_lengths = data_dict["input_lengths"]
-                unpacked_seqlen = original_seq_length
-            else:
-                input_ids_cp_sharded = data_dict["input_ids"]
-                attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                    data=input_ids_cp_sharded,
-                    eod_token=0,
-                    pad_token=0,
-                    reset_position_ids=False,
-                    reset_attention_mask=False,
-                    eod_mask_loss=False,
-                    pad_mask_loss=False,
-                )
-                packed_seq_params = None
+            processed_mb = next(data_iterator)
+            # Extract the processed components
+            data_dict = processed_mb.data_dict
+            input_ids = processed_mb.input_ids
+            input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
+            attention_mask = processed_mb.attention_mask
+            position_ids = processed_mb.position_ids
+            packed_seq_params = processed_mb.packed_seq_params
+            cu_seqlens_padded = processed_mb.cu_seqlens_padded
+            unpacked_input_ids = data_dict["input_ids"]
 
             multimodal_data = data_dict.get_multimodal_dict(
                 as_tensors=True, device=input_ids_cp_sharded.device
@@ -973,7 +825,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                     cp_grp = get_context_parallel_group()
-                    if pack:
+                    if self.cfg["sequence_packing"]["enabled"]:
+                        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                         # Per-sequence CP allgather following packed-sequence logic
                         batch_size = data_dict["input_ids"].shape[0]
                         total_packed_len = int(cu_seqlens_padded[-1].item())
@@ -1033,15 +886,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     topk_vals_full = topk_vals_local
                     topk_idx_full = topk_idx_local
 
-                if pack:
+                if self.cfg["sequence_packing"]["enabled"]:
                     batch_size = data_dict["input_ids"].shape[0]
+                    seq_lengths = data_dict["input_lengths"]
                     out_vals = torch.zeros(
-                        (batch_size, unpacked_seqlen, k),
+                        (batch_size, seq_length, k),
                         dtype=topk_vals_full.dtype,
                         device=topk_vals_full.device,
                     )
                     out_idx = torch.zeros(
-                        (batch_size, unpacked_seqlen, k),
+                        (batch_size, seq_length, k),
                         dtype=topk_idx_full.dtype,
                         device=topk_idx_full.device,
                     )
@@ -1067,30 +921,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             return output_tensor, collection_fn
 
-        if self.cfg["dynamic_batching"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-            data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            micro_batch = logprob_batch_size
-        elif self.cfg["sequence_packing"]["enabled"]:
-            mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-            data_iterator_len, _ = (
-                data.get_microbatch_iterator_for_packable_sequences_len()
-            )
-            micro_batch = 1
-        else:
-            mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
-            data_iterator_len = max(1, data.size // logprob_batch_size)
-            micro_batch = logprob_batch_size
-
         forward_backward_func = get_forward_backward_func()
         list_of_outputs = forward_backward_func(
             forward_step_func=forward_step_fn,
             data_iterator=mb_iterator,
             model=self.model,
-            num_microbatches=data_iterator_len,
-            seq_length=pp_seq_dim_size,
-            micro_batch_size=micro_batch,
-            decoder_seq_length=pp_seq_dim_size,
+            num_microbatches=num_microbatches,
+            seq_length=padded_seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=padded_seq_length,
             forward_only=True,
         )
 
@@ -1100,7 +939,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
-                pad_len = input_seq_dim_size - tk.shape[1]
+                pad_len = padded_seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
