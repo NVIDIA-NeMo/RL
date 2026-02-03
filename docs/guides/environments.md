@@ -137,12 +137,11 @@ In the future, the resource control part will be refactored to enable fine-grain
 
 ### Complete GRPO Training with Reward Model Environments
 
-See [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) for a complete example of using the reward model environment with GRPO training.
+See [examples/run_grpo.py](../../examples/run_grpo.py) with [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) for a complete example of using the reward model environment with GRPO training.
 
-### Configuration Examples
-
-See [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) for a complete configuration example.
-
+```bash
+uv run examples/run_grpo.py --config examples/configs/grpo_rm_1B.yaml
+```
 
 ## Registering Custom Environments
 
