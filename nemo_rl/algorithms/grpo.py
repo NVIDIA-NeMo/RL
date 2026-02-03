@@ -67,15 +67,15 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import (
-    Logger,
-    LoggerConfig,
-    print_message_log_samples,
-)
 from nemo_rl.utils.fault_injection import (
     FaultInjector,
     FaultToleranceConfig,
     set_global_fault_injector,
+)
+from nemo_rl.utils.logger import (
+    Logger,
+    LoggerConfig,
+    print_message_log_samples,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step

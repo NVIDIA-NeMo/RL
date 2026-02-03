@@ -14,10 +14,10 @@
 
 """Tests for fault injection utilities."""
 
-import pytest
 from unittest.mock import patch
 
 from nvidia_resiliency_ext.inprocess.tools.inject_fault import Fault
+import pytest
 
 from nemo_rl.utils.fault_injection import (
     FaultInjector,
@@ -32,8 +32,6 @@ from nemo_rl.utils.fault_injection import (
 # =============================================================================
 # Fixtures
 # =============================================================================
-
-
 @pytest.fixture(autouse=True)
 def clear_global_injector():
     """Clear global injector before and after each test."""
