@@ -49,8 +49,8 @@ class DataConfig(TypedDict):
     num_workers: NotRequired[int]
     # dataset configs
     # TODO: remove NotRequired once preference dataset is refactored
-    train: NotRequired[ResponseDatasetConfig]
-    validation: NotRequired[ResponseDatasetConfig | None]
+    train: NotRequired[ResponseDatasetConfig | list[ResponseDatasetConfig]]
+    validation: NotRequired[ResponseDatasetConfig | list[ResponseDatasetConfig] | None]
     default: NotRequired[ResponseDatasetConfig | None]
     # TODO: remove once preference dataset is refactored
     dataset_name: NotRequired[str]
