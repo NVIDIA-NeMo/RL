@@ -57,7 +57,12 @@ class DataConfig(TypedDict):
     num_workers: NotRequired[int]
     # dataset configs
     train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
-    validation: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig] | None]
+    validation: NotRequired[
+        ResponseDatasetConfig
+        | PreferenceDatasetConfig
+        | list[ResponseDatasetConfig]
+        | None
+    ]
     # default settings for all datasets, will be overridden by dataset-specific settings
     default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
 
