@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Optional
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -50,7 +51,7 @@ class ResponseDataset(RawDataset):
     ):
         self.input_key = input_key
         self.output_key = output_key
-        self.task_name = data_path.split("/")[-1].split(".")[0]
+        self.task_name = os.path.basename(data_path).split(".")[0]
 
         # load from local or huggingface
         self.dataset = load_dataset_from_path(data_path, split)

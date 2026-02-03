@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 import warnings
 from typing import Any, Callable, Union
 
@@ -133,7 +134,7 @@ class OpenAIFormatDataset(RawDataset):
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
-        self.task_name = data_path.split("/")[-1].split(".")[0]
+        self.task_name = os.path.basename(data_path).split(".")[0]
 
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
