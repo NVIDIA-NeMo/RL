@@ -16,8 +16,8 @@ from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import (
-	load_dataset_from_path,
-	get_huggingface_cache_path,
+    load_dataset_from_path,
+    get_huggingface_cache_path,
 )
 
 
@@ -42,33 +42,33 @@ class DailyOmniDataset(RawDataset):
 
         self.hf_cache_dir = get_huggingface_cache_path(SPLIT_TO_HF_NAME[split])
         if not self.hf_cache_dir:
-        	# download the dataset
-        	self.hf_cache_dir = snapshot_download(repo_id=SPLIT_TO_HF_NAME[split], repo_type='dataset')
+            # download the dataset
+            self.hf_cache_dir = snapshot_download(repo_id=SPLIT_TO_HF_NAME[split], repo_type='dataset')
         if not self.hf_cache_dir:
-        	raise ValueError(f"Cannot download DailyOmniDataset.")
+            raise ValueError(f"Cannot download DailyOmniDataset.")
 
         json_file = os.path.join(self.hf_cache_dir, "qa.json")
         
         if not os.path.isfile(json_file):
-        	raise ValueError(f"{json_file} cannot be found.")
+            raise ValueError(f"{json_file} cannot be found.")
 
         files_folder = os.path.join(self.hf_cache_dir, 'Videos')
         if not os.path.isdir(files_folder):
-        	# prepare the dataset
-        	# TODO: move untar, unzip func to utils?
-        	import tarfile
-        	archive_filename = os.path.join(self.hf_cache_dir, "Videos.tar")
-        	if not os.path.isfile(archive_filename):
-        		raise ValueError(f"{archive_filename} cannot be found.")
-			try:
-			    with tarfile.open(archive_filename, "r:*") as tar:
-			        # Extract all contents to the specified path
-			        tar.extractall()
-			    print(f"Successfully extracted '{archive_filename}' to '{files_folder}'")
-			except tarfile.ReadError:
-			    raise tarfile.ReadErro(f"Error: Could not read the tar file. It might be corrupted or not a tar file.")
-			except Exception as e:
-			    raise Exception(f"An unexpected error occurred: {e}")
+            # prepare the dataset
+            # TODO: move untar, unzip func to utils?
+            import tarfile
+            archive_filename = os.path.join(self.hf_cache_dir, "Videos.tar")
+            if not os.path.isfile(archive_filename):
+                raise ValueError(f"{archive_filename} cannot be found.")
+            try:
+                with tarfile.open(archive_filename, "r:*") as tar:
+                    # Extract all contents to the specified path
+                    tar.extractall()
+                print(f"Successfully extracted '{archive_filename}' to '{files_folder}'")
+            except tarfile.ReadError:
+                raise tarfile.ReadErro(f"Error: Could not read the tar file. It might be corrupted or not a tar file.")
+            except Exception as e:
+                raise Exception(f"An unexpected error occurred: {e}")
 
         self.dataset = load_dataset_from_path(json_file)
 
@@ -80,7 +80,7 @@ class DailyOmniDataset(RawDataset):
 
     @classmethod
     def get_prompt(cls, data: dict[str, Any]) -> str:
-    	# WARNING: model could have preference of a different prompt
+        # WARNING: model could have preference of a different prompt
         prompt = data["Question"] + '\n' + '\n'.join(data["Choice"])
         candidate_answers = [chr(ord("A")+idx) for idx in range(len(data["Choice"]))]
         candidate_answers_all_but_last = ",".join(candidate_answers[:-1])
@@ -89,21 +89,21 @@ class DailyOmniDataset(RawDataset):
         return prompt
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-    	user_content = [
-	    	{
-	            "type": "video",
-	            "video": os.path.join(
-	            	self.hf_cache_dir, 
-	            	"Videos", 
-	            	data["video_id"], 
-	            	data["video_id"]+"_video.mp4"
-	            ),
-	        },
-	        {
-	            "type": "text",
-	            "text": self.get_prompt(data),
-	        },
-    	]
+        user_content = [
+            {
+                "type": "video",
+                "video": os.path.join(
+                    self.hf_cache_dir, 
+                    "Videos", 
+                    data["video_id"], 
+                    data["video_id"]+"_video.mp4"
+                ),
+            },
+            {
+                "type": "text",
+                "text": self.get_prompt(data),
+            },
+        ]
         return {
             "messages": [
                 {"role": "user", "content": user_content},
