@@ -286,6 +286,10 @@ data:
     system_prompt_file: null
     processor: "math_hf_data_processor"
     env_name: "math"
+
+  # You can also use multiple datasets by using a list of datasets.
+  # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
+
   # You can use custom response datasets for training and validation. For example:
   # train:
   #   # this dataset will override input_key and use the default values for other vars
