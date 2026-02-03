@@ -34,6 +34,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.fault_injection import Section, with_fault_injection
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -517,6 +518,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    @with_fault_injection(Section.GENERATION)
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

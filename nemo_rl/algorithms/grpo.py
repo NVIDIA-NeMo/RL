@@ -72,6 +72,11 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.fault_injection import (
+    FaultInjector,
+    FaultToleranceConfig,
+    set_global_fault_injector,
+)
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -180,6 +185,7 @@ class MasterConfig(TypedDict):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    fault_tolerance: NotRequired[FaultToleranceConfig]
 
 
 # ===============================================================================
@@ -1119,6 +1125,15 @@ def grpo_train(
     )
     timeout.start_iterations()
     memory_tracker = MemoryTracker()
+
+    # Initialize fault injector for testing FT mechanisms
+    ft_config = master_config.get("fault_tolerance", {})
+    if ft_config:
+        fi_config = ft_config.get("fault_injection", {})
+        if fi_config.get("enabled", False):
+            injector = FaultInjector(fi_config)
+            set_global_fault_injector(injector)
+            print(f"  ✓ Fault injection enabled: {fi_config}", flush=True)
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 

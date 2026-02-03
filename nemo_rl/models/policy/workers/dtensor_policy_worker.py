@@ -77,6 +77,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
+from nemo_rl.utils.fault_injection import Section, with_fault_injection
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -502,6 +503,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             yield
 
+    @with_fault_injection(Section.TRAINING)
     @wrap_with_nvtx_name("dtensor_policy_worker/train")
     def train(
         self,
