@@ -79,19 +79,6 @@ def mock_worker_class():
     [
         ({"enabled": False}, "disabled"),
         ({"enabled": True, "fault_type": "GPU_SLEEP"}, "no_timing"),
-        (
-            {"enabled": True, "fault_type": "INVALID", "delay_seconds": 5.0},
-            "invalid_fault",
-        ),
-        (
-            {
-                "enabled": True,
-                "target_section": "invalid",
-                "fault_type": "GPU_SLEEP",
-                "delay_seconds": 5.0,
-            },
-            "invalid_section",
-        ),
     ],
 )
 def test_injector_disabled_cases(config, reason):
@@ -99,6 +86,25 @@ def test_injector_disabled_cases(config, reason):
     injector = FaultInjector(config)
     assert injector.enabled is False
     assert injector.get_plan(Section.TRAINING) is None
+
+
+def test_injector_invalid_fault_type_raises():
+    """FaultInjector raises ValueError for invalid fault_type."""
+    config = {"enabled": True, "fault_type": "INVALID", "delay_seconds": 5.0}
+    with pytest.raises(ValueError, match="Unknown fault type: INVALID"):
+        FaultInjector(config)
+
+
+def test_injector_invalid_target_section_raises():
+    """FaultInjector raises ValueError for invalid target_section."""
+    config = {
+        "enabled": True,
+        "target_section": "invalid",
+        "fault_type": "GPU_SLEEP",
+        "delay_seconds": 5.0,
+    }
+    with pytest.raises(ValueError, match="Unknown target_section: invalid"):
+        FaultInjector(config)
 
 
 def test_injector_section_targeting_and_oneshot(base_config):

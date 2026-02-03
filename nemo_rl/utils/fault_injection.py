@@ -133,11 +133,10 @@ class FaultInjector:
             try:
                 self.target_section = Section(target_section_str)
             except ValueError:
-                logger.error(
+                raise ValueError(
                     f"Unknown target_section: {target_section_str}. "
                     f"Valid values: {[s.value for s in Section]}"
                 )
-                self.enabled = False
 
         # Parse fault_type as Fault enum
         self.fault_type: Optional[Fault] = None
@@ -145,11 +144,10 @@ class FaultInjector:
             try:
                 self.fault_type = Fault[self.fault_type_str]
             except KeyError:
-                logger.error(
+                raise ValueError(
                     f"Unknown fault type: {self.fault_type_str}. "
                     f"Valid values: {[f.name for f in Fault]}"
                 )
-                self.enabled = False
 
         if self.enabled and self.fixed_delay is None and self.mtti_seconds is None:
             logger.warning(
