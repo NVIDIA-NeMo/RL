@@ -141,11 +141,11 @@ reward_env = RewardModelEnvironment.remote(env_config)
 
 ### Integration with GRPO
 
-To use your trained reward model with GRPO, you can use the [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) script:
+To use your trained reward model with GRPO, you can use the [examples/run_grpo.py](../../examples/run_grpo.py) script with the [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) config:
 
 ```bash
 # Run GRPO training with your trained reward model
-uv run examples/run_grpo_rm.py --config examples/configs/grpo_rm_1B.yaml
+uv run examples/run_grpo.py --config examples/configs/grpo_rm_1B.yaml
 ```
 
 ### Configuration

@@ -77,10 +77,10 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 
 ```sh
 # Example: Run GRPO with DTensor backend
-uv run python examples/run_grpo_math.py
+uv run python examples/run_grpo.py
 
 # Example: Run GRPO with Megatron backend
-uv run python examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml
+uv run python examples/run_grpo.py --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
 > [!NOTE]
