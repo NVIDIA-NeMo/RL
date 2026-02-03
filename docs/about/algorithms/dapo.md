@@ -15,7 +15,7 @@ To run DAPO on a single GPU, use the GRPO script with asymmetric clip parameters
 
 ```sh
 # Run DAPO with asymmetric clipping
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   grpo.ratio_clip_min=0.15 \
   grpo.ratio_clip_max=0.25 \
@@ -27,7 +27,7 @@ uv run python examples/run_grpo_math.py \
 For multi-GPU setups:
 
 ```sh
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   cluster.gpus_per_node=8 \
   grpo.ratio_clip_min=0.15 \
   grpo.ratio_clip_max=0.25 \
@@ -44,7 +44,7 @@ DAPO can be run on multiple nodes using the same approach as GRPO:
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_grpo_math.py \
+COMMAND="uv run ./examples/run_grpo.py \
   --config examples/configs/grpo_math_8B.yaml \
   cluster.num_nodes=2 \
   grpo.ratio_clip_min=0.15 \
