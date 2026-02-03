@@ -58,6 +58,18 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
+    # LoRA (Low-Rank Adaptation) Configuration
+    lora_cfg:
+      enabled: False  # Set to True to enable LoRA fine-tuning
+      target_modules: []  # List of module names to apply LoRA (empty list with match_all_linear=true applies to all linear layers)
+      exclude_modules: []  # List of module names to exclude from LoRA
+      match_all_linear: true  # If True, applies LoRA to all linear layers (overrides target_modules)
+      dim: 8  # LoRA rank (r): lower rank = fewer parameters but less capacity. Typical values: 4, 8, 16, 32, 64
+      alpha: 32  # LoRA scaling factor: effective learning rate multiplier = alpha/dim. Typical values: 16, 32, 64
+      dropout: 0.0  # Dropout probability applied to LoRA layers (0.0 = no dropout)
+      dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
+      lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
+      use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
 
   dynamic_batching:
     enabled: false
