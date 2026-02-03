@@ -69,8 +69,27 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     task_data_preprocessors = {}
     data_list = []
 
+    if isinstance(data_config["train"], dict):
+        data_config["train"] = [data_config["train"]]
+
+    for cfg in data_config["train"]:
+        # load dataset
+        if "default" in data_config and data_config["default"] is not None:
+            update_single_dataset_config(cfg, data_config["default"])
+        data = load_response_dataset(cfg)
+        data_list.append(data)
+        # bind task_name to task_data_processors
+        data_processor = partial(
+            data.processor,
+            add_bos=data_config["add_bos"],
+            add_eos=data_config["add_eos"],
+            add_generation_prompt=data_config["add_generation_prompt"],
+        )
+        task_data_processors[data.task_name] = (data.task_spec, data_processor)
+
+    merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
-        data.dataset,
+        merged_data,
         tokenizer,
         None,
         task_data_processors,
@@ -116,18 +135,6 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                 val_data.task_spec,
                 val_data_processor,
             )
-        val_data = load_response_dataset(data_config["validation"])
-        val_data_list.append(val_data.dataset)
-        val_data_processor = partial(
-            val_data.processor,
-            add_bos=data_config["add_bos"],
-            add_eos=data_config["add_eos"],
-            add_generation_prompt=data_config["add_generation_prompt"],
-        )
-        val_task_data_processors[val_data.task_name] = (
-            val_data.task_spec,
-            val_data_processor,
-        )
 
     val_dataset = None
     if len(val_data_list) > 0:
