@@ -20,6 +20,16 @@ on:
         required: true
         type: boolean
         default: true
+      override-latest:
+        description: Whether to also publish the docs as the "latest" version. This is the default behavior if the commit is not tagged.
+        required: false
+        type: boolean
+        default: false
+      docs-version-override:
+        description: Version to override the docs version to. If not provided, defaults to the version of the commit's tag.
+        required: false
+        type: string
+        default: ""
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: true
@@ -27,7 +37,7 @@ on:
 
 jobs:
   build-docs:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
+    uses: NVDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
 
   publish-docs:
     runs-on: ubuntu-latest
@@ -36,7 +46,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.67.2
+          ref: 3d21a8f9dd5830f344e0b592d78beeeb14a948e5
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
@@ -50,7 +60,8 @@ jobs:
           artifacts-name: docs-html
           artifacts-path: _build/html
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
-          overwrite-latest-on-tag: false
+          overwrite-latest-on-tag: ${{ inputs.override-latest }}
+          docs-version-override: ${{ inputs.docs-version-override }}
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: rl-publish-docs-${{ github.run_id }}
           aws-region: ${{ vars.DOCS_AWS_REGION }}
