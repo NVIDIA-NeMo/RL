@@ -14,6 +14,7 @@
 
 import math
 
+import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -117,6 +118,7 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
 
 
+@pytest.mark.vllm
 def test_vllm_speculative_decoding_patch_still_needed():
     # This test reminds to remove the vLLM patch when no longer needed.
     # The patch was fixed upstream: https://github.com/vllm-project/vllm/pull/30319
