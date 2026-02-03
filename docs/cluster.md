@@ -12,7 +12,7 @@ This guide explains how to run NeMo RL with Ray on Slurm or Kubernetes.
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=1  # Total nodes requested (head is colocated on ray-worker-0)
 
-COMMAND="uv run ./examples/run_grpo_math.py" \
+COMMAND="uv run ./examples/run_grpo.py" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -75,7 +75,7 @@ bash 1980204-attach.sh
 ```
 Now that you are on the head node, you can launch the command as follows:
 ```sh
-uv run ./examples/run_grpo_math.py
+uv run ./examples/run_grpo.py
 ```
 
 ### Slurm Environment Variables
@@ -490,7 +490,7 @@ export HF_TOKEN=...
 export WANDB_API_KEY=...
 
 # Run the job
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/grpo_math_1B.yaml
 ```
 
