@@ -4,12 +4,12 @@ This guide details the Group Relative Policy Optimization (GRPO) implementation 
 
 ## Quickstart: Launch a GRPO Run
 
-To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
+To get started quickly, use the script [examples/run_grpo.py](../../examples/run_grpo.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
 We recommend launching the job using `uv`:
 
 ```bash
-uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
+uv run examples/run_grpo.py --config <PATH TO YAML CONFIG> {overrides}
 ```
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
@@ -66,6 +66,31 @@ data:
     system_prompt_file: null
     processor: "math_hf_data_processor"
     env_name: "math"
+```
+
+We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
+```yaml
+data:
+  _override_: true # override the data config instead of merging with it
+  # other data settings, see `examples/configs/sft.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # train dataset 1
+    - dataset_name: OpenMathInstruct-2
+      split_validation_size: 0.05 # use 5% of the training data as validation data
+      seed: 42  # seed for train/validation split when split_validation_size > 0
+    # train dataset 2
+    - dataset_name: DeepScaler
+  validation:
+    # validation dataset 1
+    - dataset_name: AIME2024
+      repeat: 16
+    # validation dataset 2
+    - dataset_name: DAPOMathAIME2024
+  # default settings for all datasets
+  default:
+    ...
 ```
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
