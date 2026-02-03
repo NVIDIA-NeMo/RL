@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 NRL_FORCE_REBUILD_VENVS=true uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo_math.py\
+    $PROJECT_ROOT/examples/run_grpo.py\
     grpo.max_num_steps=3 \
     grpo.num_prompts_per_step=8 \
     grpo.num_generations_per_prompt=4 \
