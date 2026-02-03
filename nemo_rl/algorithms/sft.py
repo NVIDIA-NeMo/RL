@@ -521,6 +521,7 @@ def sft_train(
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,
                                 "token_mask": cat_and_padded["noise_mask"],
+                                "token_mask_ar": cat_and_padded["token_loss_mask"],
                                 "sample_mask": batch["loss_multiplier"],
                             }
                         )

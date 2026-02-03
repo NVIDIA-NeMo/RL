@@ -635,6 +635,16 @@ class DTensorPolicyWorker:
                 to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
                 torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
                 global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+                
+                global_valid_toks_ar = None
+                if self._is_dqwn and "token_mask_ar" in global_batch:
+                    local_valid_toks_ar = torch.sum(
+                        global_batch["token_mask_ar"]
+                        * global_batch["sample_mask"].unsqueeze(-1)
+                    )
+                    to_reduce = torch.tensor([local_valid_toks_ar]).cuda()
+                    torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+                    global_valid_toks_ar = to_reduce[0]
 
                 if (
                     hasattr(loss_fn, "loss_type")
@@ -894,13 +904,13 @@ class DTensorPolicyWorker:
                             )
                         else:
                             loss_fn_ = loss_fn
-                        #if causal_logits is not None:
-                        #    logits = torch.cat([logits, causal_logits], dim=1)
+                        #if causal_logits is not None and global_valid_toks_ar is not None:
+                        #    global_valid_toks = torch.cat([global_valid_toks.unsqueeze(0), global_valid_toks_ar.unsqueeze(0)], dim=0)
                         loss, loss_metrics = loss_fn_(
                             logits,
                             mb,
                             global_valid_seqs,
-                            global_valid_toks,
+                            torch.cat([global_valid_toks.unsqueeze(0), global_valid_toks_ar.unsqueeze(0)], dim=0) if (causal_logits is not None and global_valid_toks_ar is not None) else global_valid_toks,
                         )
                         del logits, causal_logits
 

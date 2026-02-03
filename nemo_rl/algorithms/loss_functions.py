@@ -472,6 +472,9 @@ class NLLLoss(LossFunction):
         mask = token_mask * sample_mask.unsqueeze(-1)
         seq_index = data.get("seq_index", None)
         input_ids_len = data["input_ids"].shape[1]
+        global_valid_toks_ar = None
+        if global_valid_toks.ndim > 0 and global_valid_toks.shape[0] == 2:
+            global_valid_toks, global_valid_toks_ar = global_valid_toks
 
         next_token_logits = next_token_logits.to(torch.float32)
         
@@ -547,7 +550,7 @@ class NLLLoss(LossFunction):
                 ar_loss = -masked_mean(
                     causal_token_logprobs,
                     data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1),
-                    global_normalization_factor=global_valid_toks,
+                    global_normalization_factor=global_valid_toks_ar,
                 )
                 loss = loss + self.alpha * ar_loss
         else:
