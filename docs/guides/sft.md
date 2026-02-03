@@ -100,6 +100,31 @@ data:
     processor: "sft_processor"
 ```
 
+We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
+```yaml
+data:
+  _override_: true # override the data config instead of merging with it
+  # other data settings, see `examples/configs/sft.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # train dataset 1
+    - dataset_name: OpenMathInstruct-2
+      split_validation_size: 0.05 # use 5% of the training data as validation data
+      seed: 42  # seed for train/validation split when split_validation_size > 0
+    # train dataset 2
+    - dataset_name: DeepScaler
+  validation:
+    # validation dataset 1
+    - dataset_name: AIME2024
+      repeat: 16
+    # validation dataset 2
+    - dataset_name: DAPOMathAIME2024
+  # default settings for all datasets
+  default:
+    ...
+```
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
@@ -191,7 +216,7 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, including Nano‑v3 models. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
 
 Notes:
 - LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
@@ -234,6 +259,7 @@ policy:
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
+For the Nano‑v3 SFT LoRA recipe, see:[sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
 ### Megatron Configuration Parameters
 

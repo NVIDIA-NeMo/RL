@@ -187,7 +187,7 @@ uv run --group test mypy {program}.py
 
 For example,
 ```sh
-uv run --group test mypy examples/run_grpo_math.py
+uv run --group test mypy examples/run_grpo.py
 uv run --group test mypy examples/run_sft.py
 ```
 

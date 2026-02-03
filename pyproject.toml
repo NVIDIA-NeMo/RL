@@ -49,17 +49,14 @@ dependencies = [
   "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "nvidia-resiliency-ext",
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
 ]
 
 [project.optional-dependencies]
-fsdp = [
-  "flash-attn==2.8.1",
-  "mamba-ssm",
-  "causal-conv1d",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; platform_machine == 'x86_64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; platform_machine == 'aarch64'",
-]
+fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
 automodel = [
   "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -72,9 +69,6 @@ automodel = [
   "transformer-engine[pytorch,core_cu13]==2.9.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/Autumn1998/DeepEP.git@df375b40f24e5c495e2db36e808125266661652c ; platform_machine == 'aarch64'",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; platform_machine == 'x86_64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; platform_machine == 'aarch64'",
 ]
 vllm = [
   "cuda-python",
@@ -90,7 +84,6 @@ vllm = [
 ]
 sglang = [
   "sglang==0.5.7",
-  "pybase64",
   "orjson",
   "uvloop",
   "requests",
@@ -127,9 +120,6 @@ mcore = [
   "flash-attn==2.8.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/Autumn1998/DeepEP.git@df375b40f24e5c495e2db36e808125266661652c ; platform_machine == 'aarch64'",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; platform_machine == 'x86_64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; platform_machine == 'aarch64'",
 ]
 nemo_gym = ["nemo_gym"]
 
@@ -265,18 +255,20 @@ override-dependencies = [
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-  "setuptools>=80.10.1",
+  "setuptools>=80.10.2",
   # default is triton 3.5.0 which has a bug with gb300 gpu (https://github.com/triton-lang/triton/issues/8473)
   "triton==3.5.1",
 ]
 # CVE fixes
 constraint-dependencies = [
-  "brotli>=1.2.0",     # Address CVE GHSA-2qfp-q593-8484
-  "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
-  "urllib3>=2.6.3",    # Address CVE GHSA-38jv-5279-wg99
-  "aiohttp>=3.13.3",   # Address CVE GHSA-mqqc-3gqh-h2x8
-  "pyasn1>=0.6.2",     # Address CVE GHSA-63vm-454h-vhhq
-  "wheel>=0.46.2",     # Address CVE GHSA-8rrh-rw8j-w5fx
+  "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
+  "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
+  "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
+  "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
+  "pyasn1>=0.6.2",            # Address CVE GHSA-63vm-454h-vhhq
+  "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
+  "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
+  "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
 ]
 
 conflicts = [
