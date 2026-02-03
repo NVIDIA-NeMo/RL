@@ -549,7 +549,7 @@ class NLLLoss(LossFunction):
             if causal_logits is not None and self.alpha > 0:
                 ar_loss = -masked_mean(
                     causal_token_logprobs,
-                    data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1),
+                    data["token_mask_ar"][:, 1:] * sample_mask.unsqueeze(-1),
                     global_normalization_factor=global_valid_toks_ar,
                 )
                 loss = loss + self.alpha * ar_loss

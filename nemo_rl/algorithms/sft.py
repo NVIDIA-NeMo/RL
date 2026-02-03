@@ -265,6 +265,7 @@ def validate(
         return
 
     timer = Timer()
+    tok_mask_half_life_ratio = master_config["policy"].get("mdlm", {}).get("tok_mask_half_life_ratio", None)
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
@@ -295,13 +296,17 @@ def validate(
             is_dqwn = master_config["policy"].get("is_dqwn", False)
 
             if is_dqwn:
-                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
+                if tok_mask_half_life_ratio is not None:
+                    cat_and_padded = prepare_for_mdlm_train_data_blockwise(cat_and_padded, mask_token_id=policy.get_model_config()["mask_token_id"], block_size=policy.get_model_config()["block_size"], half_life_ratio=tok_mask_half_life_ratio)
+                else:
+                    cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=policy.get_model_config()["mask_token_id"])
                 val_data: BatchedDataDict = BatchedDataDict(
                     {
                         "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
                         "p_mask": cat_and_padded["p_mask"],
                         "input_lengths": input_lengths,
                         "token_mask": cat_and_padded["noise_mask"],
+                        "token_mask_ar": cat_and_padded["token_loss_mask"],
                         "sample_mask": val_batch["loss_multiplier"],
                     }
                 )
