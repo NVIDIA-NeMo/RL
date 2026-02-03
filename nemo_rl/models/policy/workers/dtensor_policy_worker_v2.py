@@ -21,6 +21,7 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
 )
@@ -85,19 +86,66 @@ def dtensor_params_generator(
     Args:
         model: The model whose parameters to generate.
         target_dtype: The dtype to convert tensors to.
+        peft_config: Optional LoRA config for filtering which layers to merge.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
+    module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
+        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, full_tensor)
+        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
             # Convert to target dtype
             yield (
                 adapted_fqn,
                 adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
             )
+            del adapted_tensor
+        del adapted_fqn_tensors
+        del merged_tensor
+        del full_tensor
+
+
+@torch.no_grad()
+def _maybe_merge_lora_weight(
+    module_map: dict[str, nn.Module],
+    fqn: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if not fqn.endswith(".weight"):
+        return tensor
+    module_name = fqn[: -len(".weight")]
+    module = module_map.get(module_name)
+    if not isinstance(module, LinearLoRA):
+        return tensor
+    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+        return tensor
+
+    lora_a = (
+        module.lora_A.weight.full_tensor()
+        if isinstance(module.lora_A.weight, DTensor)
+        else module.lora_A.weight
+    )
+    lora_b = (
+        module.lora_B.weight.full_tensor()
+        if isinstance(module.lora_B.weight, DTensor)
+        else module.lora_B.weight
+    )
+    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
+    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
+    scale = getattr(module, "scale", None)
+
+    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
+        scale = module.alpha / module.dim
+    if scale is None:
+        scale = 1.0
+
+    return tensor + torch.matmul(lora_b, lora_a) * scale
 
 
 def _maybe_adapt_tensor_to_hf(
@@ -493,6 +541,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
                             for k in loss_metrics.keys():
+                                if "_min" in k or "_max" in k:
+                                    continue
                                 loss_metrics[k] /= num_global_batches
                             num_valid_samples = loss_metrics["num_valid_samples"]
                             loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
@@ -1208,6 +1258,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
+            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
