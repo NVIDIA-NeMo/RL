@@ -8,7 +8,7 @@ This guide outlines how to test NeMo RL using unit and functional tests, detaili
 > Unit tests require 2 GPUs to test the full suite.
 
 > [!TIP]
-> Some unit tests require setting up test assets which you can download with 
+> Some unit tests require setting up test assets which you can download with: 
 > ```sh
 > uv run tests/unit/prepare_unit_test_assets.py
 > ```
@@ -30,7 +30,7 @@ uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only
 uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only --hf-gated
 ```
 
-### Experimental: Faster local test iteration with pytest-testmon
+### Experimental: Faster Local Test Iteration with pytest-testmon
 
 We support `pytest-testmon` to speed up local unit test runs by re-running only impacted tests. This works for both regular in-process code and out-of-process `@ray.remote` workers via a lightweight, test-only selection helper.
 
@@ -56,7 +56,7 @@ Limitations and tips:
 - The helper is test-only and does not alter library behavior. It activates automatically when you pass `--testmon`.
 
 Refreshing remote-selection artifacts
--------------------------------------
+### Refreshing Remote-Selection Artifacts
 If you change test layout or significantly refactor imports, the remote-selection artifacts may become stale.
 To rebuild them, delete the following files at the repo root and re-run with `--testmon` to seed again:
 
@@ -156,7 +156,7 @@ uv run bash tests/functional/sft.sh
 ```
 
 At the end of each functional test, the metric checks will be printed as well as
-whether they pass or fail. Here is an example:
+At the end of each functional test, the metric checks will be printed as well as whether they pass or fail. Here is an example:
 
 ```text
                               Metric Checks
@@ -171,7 +171,7 @@ whether they pass or fail. Here is an example:
 
 For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`)
 or where environmental configuration may be problematic, tests can be run
-in Docker with this script:
+For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`) or where environmental configuration may be problematic, tests can be run in Docker with this script:
 
 ```sh
 CONTAINER=... bash run_functional_in_docker.sh functional/sft.sh
@@ -225,7 +225,7 @@ BISECT_REPLAY_LOG=/abs/path/to/bisect-2025....log \
   tools.bisect/bisect-run.sh uv run --group test pytest tests/unit/test_foobar.py
 ```
 
-### Bisecting nightlies
+### Bisecting Nightlies
 
 Nightly training scripts can be bisected using the same driver plus a helper that sets up hermetic runs on Slurm.
 
