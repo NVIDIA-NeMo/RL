@@ -503,7 +503,7 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir=temp_dir)
 
         mock_mlflow.set_experiment.assert_called_once_with("test-experiment")
-        mock_mlflow.start_run.assert_called_once_with(run_name="test-run", run_id=None)
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_full_config(self, mock_mlflow, temp_dir):
@@ -522,7 +522,7 @@ class TestMLflowLogger:
 
         mock_mlflow.set_tracking_uri.assert_called_once_with("http://localhost:5000")
         mock_mlflow.set_experiment.assert_called_once_with("test-experiment")
-        mock_mlflow.start_run.assert_called_once_with(run_name="test-run", run_id=None)
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_metrics(self, mock_mlflow, temp_dir):
@@ -619,6 +619,9 @@ class TestMLflowLogger:
         }
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
+        # Reset mocks to avoid counting calls from init
+        mock_mlflow.end_run.reset_mock()
+
         # Trigger cleanup
         logger.__del__()
 
@@ -641,8 +644,10 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir=None)
 
         # Verify create_experiment was called without artifact_location
-        mock_mlflow.create_experiment.assert_called_once_with(name="test-experiment")
-        mock_mlflow.start_run.assert_called_once_with(run_name="test-run", run_id=None)
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name="test-experiment", artifact_location=None
+        )
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_custom_log_dir(self, mock_mlflow):
@@ -663,7 +668,7 @@ class TestMLflowLogger:
         mock_mlflow.create_experiment.assert_called_once_with(
             name="test-experiment", artifact_location="/custom/path"
         )
-        mock_mlflow.start_run.assert_called_once_with(run_name="test-run", run_id=None)
+        mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_in_config(self, mock_mlflow):
@@ -689,12 +694,12 @@ class TestMLflowLogger:
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"], run_id=None
+            run_name=cfg["run_name"]
         )
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_none_in_config(self, mock_mlflow):
-        """Test initialization with artifact_location=None in config uses server default."""
+        """Test initialization with artifact_location=None in config uses log_dir."""
         # Ensure active_run returns None so initialization logic runs
         mock_mlflow.active_run.return_value = None
         # Mock is_tracking_uri_set to return False so set_tracking_uri is called
@@ -710,14 +715,13 @@ class TestMLflowLogger:
 
         MLflowLogger(cfg, log_dir="/fallback/path")
 
-        # Verify create_experiment was called without artifact_location
-        # (None is explicitly set, so we don't pass it to MLflow)
+        # Verify create_experiment was called with log_dir since config is None
         mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
+            name=cfg["experiment_name"], artifact_location="/fallback/path"
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"], run_id=None
+            run_name=cfg["run_name"]
         )
 
     @patch("nemo_rl.utils.logger.mlflow")
@@ -744,7 +748,7 @@ class TestMLflowLogger:
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"], run_id=None
+            run_name=cfg["run_name"]
         )
 
 

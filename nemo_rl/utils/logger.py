@@ -783,8 +783,21 @@ class MLflowLogger(LoggerInterface):
         run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
 
         run = mlflow.active_run()
-        # Start a new run if there is no active run, or if the active run doesn't match the requested run_id
-        if run is None or (run_id and run.info.run_id != run_id):
+        
+        # If run_id is provided, try to use it directly
+        if run_id:
+            # If there is an active run but it's not the one we want, end it
+            if run and run.info.run_id != run_id:
+                mlflow.end_run()
+                run = None
+            
+            # Start/resume the specified run
+            if run is None:
+                run = mlflow.start_run(run_id=run_id)
+        
+        # If no run_id provided, fall back to experiment name logic
+        else:
+            # End any existing active run to start fresh or ensure correct context
             if run:
                 mlflow.end_run()
 
@@ -794,14 +807,13 @@ class MLflowLogger(LoggerInterface):
                 if experiment is None:
                     mlflow.create_experiment(
                         name=experiment_name,
-                        **{"artifact_location": cfg.get("artifact_location", log_dir)}
-                        if "artifact_location" in cfg or log_dir
-                        else {},
+                        artifact_location=cfg.get("artifact_location") or log_dir,
                     )
                 # set the experiment context manager
                 mlflow.set_experiment(experiment_name)
-            # if run_id is set explicitly, will use. Otherwise, from env var. Otherwise, new run with run name
-            run = mlflow.start_run(run_name=run_name, run_id=run_id)
+            # Start a new run
+            run = mlflow.start_run(run_name=run_name)
+
         self.run = run
         self.run_id = run.info.run_id
         print(
