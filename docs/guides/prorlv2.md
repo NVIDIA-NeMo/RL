@@ -8,7 +8,7 @@ ProRLv2 (as used in this repo) is best thought of as **GRPO and a bundle of stab
 - **Decoupled (asymmetric) clipping**: `ratio_clip_max > ratio_clip_min`
 - **Token-level policy gradient loss**
 - **Importance sampling correction and TIS/CE-POP** (especially helpful for MoE/backend-mismatch scenarios)
-- **Reinforce++: Decoupled local / global advantage normalization** (`reinforce_plus_plus`)
+- **Reinforce++: Decoupled local/global advantage normalization** (`reinforce_plus_plus`)
 - **“Stop properly” penalty** for truncated responses
 
 This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation behind dynamic sampling/overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
