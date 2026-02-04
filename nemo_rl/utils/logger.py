@@ -114,6 +114,11 @@ class LoggerInterface(ABC):
         """Log histogram metrics."""
         pass
 
+    @abstractmethod
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a matplotlib figure."""
+        pass
+
 
 class TensorboardLogger(LoggerInterface):
     """Tensorboard logger backend."""
@@ -1049,8 +1054,7 @@ class Logger(LoggerInterface):
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
 
-        for logger in self.loggers:
-            logger.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        self.log_plot(fig, step, f"{prefix}/per_worker_{name}")
         plt.close(fig)
 
         # Plot the average of the metrics
@@ -1067,8 +1071,7 @@ class Logger(LoggerInterface):
         ax.set_title(name)
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
-        for logger in self.loggers:
-            logger.log_plot(fig, step, f"{prefix}/average_{name}")
+        self.log_plot(fig, step, f"{prefix}/average_{name}")
         plt.close(fig)
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
@@ -1081,6 +1084,17 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_histogram(histogram, step, name)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a matplotlib figure to all backends.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+            name: Name of the plot
+        """
+        for logger in self.loggers:
+            logger.log_plot(figure, step, name)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str
@@ -1177,8 +1191,7 @@ class Logger(LoggerInterface):
         plt.legend()
         plt.tight_layout()
 
-        for logger in self.loggers:
-            logger.log_plot(fig, step, name)
+        self.log_plot(fig, step, name)
 
         plt.close(fig)
 

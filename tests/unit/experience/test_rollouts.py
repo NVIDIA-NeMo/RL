@@ -34,6 +34,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.environments.nemo_gym import nemo_gym_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
+    _calculate_single_metric,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -59,6 +60,42 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+class TestCalculateSingleMetric:
+    """Unit tests for _calculate_single_metric function."""
+
+    def test_single_value_returns_nan_for_stddev(self):
+        """Test that stddev returns nan when given a single value (GitHub issue #1411)."""
+        import math
+
+        result = _calculate_single_metric([42.0], batch_size=1, key_name="test")
+
+        assert result["test/mean"] == 42.0
+        assert result["test/max"] == 42.0
+        assert result["test/min"] == 42.0
+        assert result["test/median"] == 42.0
+        assert math.isnan(result["test/stddev"]), (
+            "stddev should be nan for single value"
+        )
+
+    def test_multiple_values_computes_stddev(self):
+        """Test that stddev is computed correctly for multiple values."""
+        result = _calculate_single_metric(
+            [1.0, 2.0, 3.0], batch_size=3, key_name="test"
+        )
+
+        assert result["test/mean"] == 2.0
+        assert result["test/max"] == 3.0
+        assert result["test/min"] == 1.0
+        assert result["test/median"] == 2.0
+        assert abs(result["test/stddev"] - 1.0) < 1e-9  # stdev of [1,2,3] is 1.0
+
+    def test_two_identical_values_returns_zero_stddev(self):
+        """Test that stddev is 0 when all values are identical."""
+        result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
+
+        assert result["test/stddev"] == 0.0
 
 
 @pytest.fixture(scope="function")
