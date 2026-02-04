@@ -129,10 +129,10 @@ class FaultInjector:
         self.fault_type = Fault[config.fault_type] if self.enabled else None
 
         if self.enabled and self.fixed_delay is None and self.mtti_seconds is None:
-            logger.warning(
-                "No timing specified (delay_seconds or mtti_seconds). Disabling."
+            raise ValueError(
+                "Fault injection enabled but no timing specified. "
+                "Set either delay_seconds or mtti_seconds."
             )
-            self.enabled = False
 
     def get_plan(self, section: Section) -> Optional[FaultPlan]:
         """Get fault plan for a given section.

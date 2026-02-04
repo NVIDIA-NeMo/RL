@@ -82,12 +82,11 @@ def test_injector_disabled_when_not_enabled():
     assert injector.get_plan(Section.TRAINING) is None
 
 
-def test_injector_disabled_when_no_timing():
-    """FaultInjector disables when no timing is specified."""
+def test_injector_raises_when_no_timing():
+    """FaultInjector raises ValueError when enabled but no timing specified."""
     config = FaultInjectionConfig(enabled=True, fault_type="GPU_SLEEP")
-    injector = FaultInjector(config)
-    assert injector.enabled is False
-    assert injector.get_plan(Section.TRAINING) is None
+    with pytest.raises(ValueError, match="no timing specified"):
+        FaultInjector(config)
 
 
 def test_injector_section_targeting_and_oneshot(base_config):
