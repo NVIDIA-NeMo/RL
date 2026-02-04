@@ -51,6 +51,7 @@ DATASET_REGISTRY = {
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
     # load from local JSONL file or HuggingFace
     "openai_format": OpenAIFormatDataset,
+    "NemoGymDataset": NemoGymDataset,
     "ResponseDataset": ResponseDataset,
 }
 
@@ -65,8 +66,6 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
         dataset = dataset_class(
             **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
-    elif dataset_name == "NemoGymDataset":
-        dataset = NemoGymDataset(**data_config)
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "

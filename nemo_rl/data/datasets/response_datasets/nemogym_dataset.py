@@ -12,48 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+import json
+from typing import Optional
 
-import torch
+from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
-from nemo_rl.data.datasets.utils import load_dataset_from_path
 
 
 class NemoGymDataset(RawDataset):
     """Simple wrapper around the Nemo Gym dataset."""
 
-    def __init__(self, data_path: Optional[str] = None, **kwargs) -> None:
-        self.task_name = "NemoGymDataset"
+    def __init__(
+        self, data_path: Optional[str] = None, repeat: int = 1, **kwargs
+    ) -> None:
+        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if self.task_name[0] == "-":
+            self.task_name = self.task_name[1:]
 
         # load from jsonl
-        if data_path is None:
-            # Allow optional at type level for config validation; enforce at runtime for clarity
-            raise ValueError(
-                "NemoGymDataset requires `data_path` in data_config to load examples."
-            )
-        self.dataset = load_dataset_from_path(data_path)
+        with open(data_path) as f:
+            self.dataset = list(map(json.loads, f))
 
         # format the dataset
-        # HuggingFace Dataset does not persist torch.Tensor during map/Arrow writes; it serializes to Python lists.
-        self.dataset = self.dataset.map(
-            self.format_data,
-            with_indices=True,
+        self.dataset = Dataset.from_dict(
+            {
+                "extra_env_info": self.dataset,
+                "task_name": [self.task_name] * len(self.dataset),
+            }
         )
-        if "repeat" in kwargs:
-            self.dataset = self.dataset.repeat(kwargs["repeat"])
 
-    def format_data(self, data: dict[str, Any], idx: int) -> dict[str, Any]:
-        return {
-            "message_log": [
-                {"role": "user", "content": "", "token_ids": torch.tensor([])}
-            ],
-            "task_name": self.task_name,
-            "length": 0,
-            "extra_env_info": data,
-            "loss_multiplier": 1.0,  # Fix to 1.0 to backprop on all examples
-            "idx": idx,
-            "stop_strings": None,
-            # Extra vars
-            "token_ids": [],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
-        }
+        # repeat the dataset
+        if repeat > 1:
+            self.dataset = self.dataset.repeat(repeat)

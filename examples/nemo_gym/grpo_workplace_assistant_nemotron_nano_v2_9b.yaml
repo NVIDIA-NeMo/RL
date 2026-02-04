@@ -230,7 +230,7 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
+  max_input_seq_length: null  # nemogym processor doesn't use this parameter
   shuffle: true
   num_workers: 0
 
