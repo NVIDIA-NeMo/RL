@@ -1365,10 +1365,12 @@ def grpo_train(
 
     # Wrap dataloader if using multiple dataloaders
     if master_config["data"]["use_multiple_dataloader"]:
+        num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
+        batch_multiplier = master_config["grpo"]["batch_multiplier"]
         dataloader = MultipleDataloaderWrapper(
-            master_config["grpo"]["num_prompts_per_step"],
-            master_config["data"],
-            dataloader,
+            expected_num_prompts=num_prompts_per_step * batch_multiplier,
+            data_config=master_config["data"],
+            dataloaders=dataloader,
         )
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
@@ -1794,10 +1796,12 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = (total_steps + 1 >= max_num_steps) or (
-                    (current_epoch + 1 == max_num_epochs)
-                    and (current_step + 1 == len(dataloader))
-                )
+                is_last_step = total_steps + 1 >= max_num_steps
+                if not master_config["data"]["use_multiple_dataloader"]:
+                    is_last_step = is_last_step or (
+                        (current_epoch + 1 == max_num_epochs)
+                        and (current_step + 1 == len(dataloader))
+                    )
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
