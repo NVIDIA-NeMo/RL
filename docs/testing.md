@@ -174,7 +174,7 @@ or where environmental configuration may be problematic, tests can be run
 For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`) or where environmental configuration may be problematic, tests can be run in Docker with this script:
 
 ```sh
-CONTAINER=... bash run_functional_in_docker.sh functional/sft.sh
+CONTAINER=... bash tests/run_functional_in_docker.sh tests/functional/sft.sh
 ```
 
 The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
