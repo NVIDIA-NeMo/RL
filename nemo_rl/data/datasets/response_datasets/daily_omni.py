@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from typing import Any
 from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -63,8 +65,11 @@ class DailyOmniDataset(RawDataset):
             try:
                 with tarfile.open(archive_filename, "r:*") as tar:
                     # Extract all contents to the specified path
-                    tar.extractall()
-                print(f"Successfully extracted '{archive_filename}' to '{files_folder}'")
+                    tar.extractall(path=self.hf_cache_dir)
+                if os.path.isdir(files_folder):
+                    print(f"Successfully extracted '{archive_filename}' to '{files_folder}'")
+                else:
+                    raise ValueError(f"Cannot find the extracted folder {files_folder}. Extraction failed.")
             except tarfile.ReadError:
                 raise tarfile.ReadErro(f"Error: Could not read the tar file. It might be corrupted or not a tar file.")
             except Exception as e:
@@ -72,11 +77,12 @@ class DailyOmniDataset(RawDataset):
 
         self.dataset = load_dataset_from_path(json_file)
 
-        # format the dataset
-        self.dataset = self.dataset.map(
-            self.format_data,
-            remove_columns=self.dataset.column_names,
+        # format - disable features to avoid schema conflicts
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
         )
+
+        self.preprocessor = self.format_data
 
     @classmethod
     def get_prompt(cls, data: dict[str, Any]) -> str:
