@@ -18,7 +18,6 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer

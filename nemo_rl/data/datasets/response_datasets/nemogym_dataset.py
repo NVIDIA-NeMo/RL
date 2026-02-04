@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from typing import Optional
 
 from datasets import Dataset
@@ -30,9 +29,10 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # load from jsonl
+        # load raw line from jsonl
+        # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
         with open(data_path) as f:
-            self.dataset = list(map(json.loads, f))
+            self.dataset = [raw_line for raw_line in f]
 
         # format the dataset
         self.dataset = Dataset.from_dict(

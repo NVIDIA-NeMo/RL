@@ -14,6 +14,7 @@
 
 """Contains data processors for evaluation."""
 
+import json
 import logging
 from typing import Any, Dict, cast
 
@@ -672,7 +673,8 @@ def nemo_gym_data_processor(
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
     output: DatumSpec = {
-        "extra_env_info": datum_dict["extra_env_info"],
+        # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
+        "extra_env_info": json.loads(datum_dict["extra_env_info"]),
         "loss_multiplier": 1.0,
         "idx": idx,
         "task_name": datum_dict["task_name"],
