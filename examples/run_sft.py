@@ -65,6 +65,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     data_list = []
 
     # add preprocessor if needed
@@ -85,6 +86,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
