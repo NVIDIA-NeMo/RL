@@ -33,9 +33,9 @@ from sphinx import addnodes
 from sphinx.application import Sphinx
 
 project = "NeMo-RL"
-copyright = "2025, NVIDIA Corporation"
+copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "0.5.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
