@@ -1226,7 +1226,7 @@ class Logger(LoggerInterface):
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
-        if hasattr(self, "gpu_monitor") and self.gpu_monitor:
+        if self.gpu_monitor:
             self.gpu_monitor.stop()
 
 
