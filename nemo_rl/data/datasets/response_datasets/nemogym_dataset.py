@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
 from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -22,9 +20,7 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 class NemoGymDataset(RawDataset):
     """Simple wrapper around the Nemo Gym dataset."""
 
-    def __init__(
-        self, data_path: Optional[str] = None, repeat: int = 1, **kwargs
-    ) -> None:
+    def __init__(self, data_path: str, repeat: int = 1, **kwargs) -> None:
         self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]

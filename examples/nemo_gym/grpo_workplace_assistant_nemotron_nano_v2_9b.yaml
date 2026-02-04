@@ -230,7 +230,7 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  max_input_seq_length: null  # nemogym processor doesn't use this parameter
+  max_input_seq_length: null  # nemogym dataset doesn't use this parameter
   shuffle: true
   num_workers: 0
 
@@ -244,8 +244,8 @@ data:
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
   default:
     env_name: "nemo_gym"
-    prompt_file: null
-    system_prompt_file: null
+    prompt_file: null  # nemogym dataset doesn't use this parameter
+    system_prompt_file: null  # nemogym dataset doesn't use this parameter
     processor: "nemo_gym_data_processor"
 
 env:

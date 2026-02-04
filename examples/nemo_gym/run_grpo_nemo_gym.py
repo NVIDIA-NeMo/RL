@@ -123,7 +123,7 @@ def main() -> None:
     if not args.config:
         args.config = os.path.join(
             os.path.dirname(__file__),
-            "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml",
+            "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml",
         )
 
     config = load_config(args.config)
@@ -216,7 +216,7 @@ The validation set you pass in will directly be used for validation with no addi
     # Bind task_to_env and val_task_to_env for nemo_gym env
     # Hardcode here to match `run_async_nemo_gym_rollout`
     task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = {"nemo_gym": nemo_gym}
+    val_task_to_env = task_to_env
 
     if is_trajectory_collection:
         collect_trajectories(
