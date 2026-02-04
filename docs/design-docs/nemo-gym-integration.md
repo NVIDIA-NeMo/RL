@@ -4,7 +4,7 @@ This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvid
 
 ## Overview
 
-NeMo Gym provides HTTP-based training environments for LLMs. NeMo RL exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
+NeMo Gym provides HTTP-based training environments for LLMs. **NeMo Gym is CPU-only**—it runs no inference engines and holds no GPU memory. NeMo RL exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
 
 - **Decoupled architecture**: Environments don't need direct access to model internals
 - **Multi-step/multi-turn support**: Agents can orchestrate complex interactions with tools
@@ -19,8 +19,8 @@ policy:
   generation:
     backend: vllm
     vllm_cfg:
-      async_engine: true          # Required for HTTP server support
-      expose_http_server: true    # Exposes /v1/chat/completions endpoint
+      async_engine: true          # Both required for HTTP server support:
+      expose_http_server: true    # async_engine enables the async worker; expose_http_server starts the server
 
 env:
   should_use_nemo_gym: true       # Enables NeMo Gym integration
@@ -31,24 +31,26 @@ env:
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
 ```
 
+For a complete example, see `examples/nemo_gym/` and its associated configs.
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.
 
 ## Architecture Overview
 
-```{mermaid}
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
         GRPO["GRPO Loop"]
         vLLM["vLLM + HTTP"]
-        Bridge["NemoGym<br/>Actor"]
+        Bridge["NemoGym Actor"]
     end
     
     subgraph Gym["NeMo Gym"]
         Agent["Agent"]
-        Model["Model<br/>(Proxy)"]
+        Model["Model (Proxy)"]
         Resources["Resources"]
     end
     
@@ -63,7 +65,9 @@ flowchart LR
     style Gym fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
 
-**Color coding**: Blue = NeMo RL code (`nemo_rl/`), Orange = NeMo Gym code (`nemo_gym/`)
+**Color coding**:
+- Blue = NeMo RL code (`nemo_rl/`)
+- Orange = NeMo Gym code (`3rdparty/Gym-workspace/Gym/nemo_gym/`)
 
 ## The NemoGym Actor
 
@@ -73,30 +77,37 @@ The integration is handled by the `NemoGym` Ray actor at `nemo_rl/environments/n
 2. **Joins the existing Ray cluster** that NeMo RL already initialized
 3. **Spawns NeMo Gym servers** as OS subprocesses (Head, Agent, Model, Resources)
 4. **Injects vLLM base URLs** so NeMo Gym's Model Server knows where to proxy requests
-5. **Exposes `run_rollouts()`** as the entry point for the training loop
+5. **Exposes `run_rollouts()`** as the entry point for the training loop to call
 
-```{mermaid}
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
-        GRPO["GRPO Loop<br/><i>grpo.py</i>"]
-        Actor["NemoGym Actor<br/><i>nemo_rl/environments/nemo_gym.py</i>"]
+        GRPO["GRPO Loop"]
+        Actor["NemoGym Actor"]
     end
     
     subgraph Gym["NeMo Gym"]
-        RCH["RolloutCollectionHelper<br/><i>nemo_gym/rollout_collection.py</i>"]
-        Agent["Agent Server<br/><i>responses_api_agents/*/app.py</i>"]
+        RCH["RolloutCollectionHelper"]
+        Agent["Agent Server"]
     end
     
-    GRPO -->|"1. run_rollouts.remote(batch)"| Actor
-    Actor -->|"2. POST /run"| Agent
-    Agent -->|"3. orchestrates rollout"| RCH
-    RCH -->|"4. returns results"| Actor
-    Actor -->|"5. returns to training"| GRPO
+    GRPO --> Actor
+    Actor --> Agent
+    Agent --> RCH
+    RCH --> Actor
+    Actor --> GRPO
 
     style RL fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style Gym fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
+
+The flow is:
+1. GRPO Loop calls `run_rollouts.remote(batch)` on the NemoGym Actor
+2. Actor sends `POST /run` to the Agent Server
+3. Agent Server orchestrates the rollout via RolloutCollectionHelper
+4. Results return to the Actor
+5. Actor returns results to the training loop
 
 ## vLLM HTTP Server
 
@@ -113,7 +124,7 @@ Data parallel vLLM workers each expose their own HTTP server. NeMo Gym's Model S
 
 ## Initialization Sequence
 
-```{mermaid}
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 sequenceDiagram
     autonumber
@@ -139,7 +150,7 @@ sequenceDiagram
 
 ## Training Loop Control Flow
 
-```{mermaid}
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 sequenceDiagram
     autonumber
@@ -152,19 +163,28 @@ sequenceDiagram
     box rgb(255, 243, 224) NeMo Gym
         participant Agent as Agent Server
         participant Model as Model Server
+        participant Resource as Resource Server
     end
     
-    GRPO->>vLLM: Refit (sync weights)
+    GRPO->>Policy: Refit (trigger weight sync)
+    Policy->>vLLM: Sync weights to vLLM
     GRPO->>Bridge: run_rollouts.remote(batch)
     Bridge->>Agent: POST /run
     Agent->>Model: POST /v1/responses
     Model->>vLLM: POST /v1/chat/completions
     vLLM-->>Model: Response
     Model-->>Agent: Responses API format
+    Agent->>Resource: Execute tool / compute reward
+    Resource-->>Agent: Tool result / reward
     Agent-->>Bridge: Results + rewards
     Bridge-->>GRPO: Token IDs, logprobs, rewards
     GRPO->>Policy: Compute loss and train
 ```
+
+> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/latest/about/concepts/core-components.html)):
+> - **Agent Server**: Orchestrates the rollout loop
+> - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
+> - **Resource Server**: Provides tools and rewards
 
 ### Key Steps
 
@@ -181,7 +201,7 @@ sequenceDiagram
 
 The NemoGym actor uses an **as-completed** pattern to overlap waiting with post-processing:
 
-1. **Results return out of order**: Rollouts complete at different times depending on conversation length and tool calls. Rather than waiting for all results, the actor processes each result as soon as it completes.
+1. **Results return out of order**: Single steps of the rollouts (the "assistant" + "tool" turns) complete at different times depending on conversation length and tool calls. Rather than waiting for all results, the actor processes each result as soon as it completes. Note: this is pipelining within NeMo Gym, not asynchronous processing of global batch steps by NeMo RL.
 
 2. **Immediate post-processing**: As each rollout completes, the actor immediately extracts token IDs and logprobs. This overlaps CPU work with network I/O from slower rollouts still in flight.
 
@@ -191,10 +211,10 @@ This pattern maximizes throughput by keeping the CPU busy while waiting for netw
 
 ## Data Format Translation
 
-```{mermaid}
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
-    subgraph RL1["NeMo RL (Input)"]
+    subgraph RL1["NeMo RL Input"]
         Datum["DatumSpec"]
     end
     
@@ -204,35 +224,29 @@ flowchart LR
         ReqChat["Chat Completions"]
     end
     
-    subgraph RL2["NeMo RL (Output)"]
+    subgraph RL2["NeMo RL Output"]
         Result["Result"]
     end
     
-    Datum -->|"convert"| Example
+    Datum --> Example
     Example --> ReqResp
-    ReqResp -->|"translate"| ReqChat
-    ReqChat -->|"vLLM"| ReqResp
+    ReqResp --> ReqChat
+    ReqChat --> ReqResp
     ReqResp --> Example
-    Example -->|"extract"| Result
+    Example --> Result
 
     style RL1 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style RL2 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style Gym fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
 
-### Format Differences
+**Formats**:
+- **DatumSpec** (NeMo RL): Training-focused format with `prompt`, `prompt_token_ids`, and task metadata
+- **Example Dict** (NeMo Gym): Environment-focused format containing `responses_create_params` and `expected` answer
+- **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
+- **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-| Format | Owner | Contents |
-|--------|-------|----------|
-| **DatumSpec** | NeMo RL | Training-focused: `prompt`, `prompt_token_ids`, task metadata for loss computation |
-| **Example Dict** | NeMo Gym | Environment-focused: `responses_create_params` (OpenAI format), `expected` answer for verification |
-| **Responses API** | NeMo Gym | OpenAI Responses API format with `input`, `tools`, multi-turn conversation |
-| **Chat Completions** | NeMo RL vLLM | OpenAI Chat Completions format, the actual inference call |
-
-The Model Server handles Responses API ↔ Chat Completions translation, including:
-- Converting message formats
-- Extracting reasoning content from think tags
-- Attaching token ID information for training
+**Data flow**: DatumSpec is converted to Example Dict, which passes through to the Responses API with generation parameters (`temperature`, `top_p`) added for on-policy sampling. The Model Server translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). Results flow back with token IDs and logprobs extracted into the final Result.
 
 ## Tokenization and On-Policy Corrections
 
