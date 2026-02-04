@@ -117,7 +117,7 @@ loss_fn:
   token_level_loss: true
 ```
 
-This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is often helpful for long CoT / variable-length rollouts.
+This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is often helpful for long CoT/variable-length rollouts.
 
 ## Truncated Importance Sampling
 
