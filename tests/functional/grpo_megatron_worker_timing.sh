@@ -12,13 +12,7 @@ EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
-# TIMING_FILE will be set dynamically after run (see below)
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
-# Override UV cache directories to use writable locations
-export UV_CACHE_DIR=/tmp/uv-cache-$$
-export UV_TOOL_DIR=/tmp/uv-cache-$$/tools
-export UV_TOOL_BIN_DIR=/tmp/uv-cache-$$/bin
-mkdir -p $UV_CACHE_DIR $UV_TOOL_DIR $UV_TOOL_BIN_DIR
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR

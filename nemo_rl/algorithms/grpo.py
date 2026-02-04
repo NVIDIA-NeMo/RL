@@ -197,7 +197,9 @@ def _collect_worker_timing(
     metadata: dict[str, Any] = {"timestamp": time.time()}
 
     # Policy workers
-    policy_timers = ray.get([w.get_init_timer.remote() for w in policy.worker_group.workers])
+    policy_timers = ray.get(
+        [w.get_init_timer.remote() for w in policy.worker_group.workers]
+    )
     for k, v in Timer.aggregate_max(policy_timers, reduction_op="sum").items():
         timings[f"policy/{k}"] = v
     metadata["num_policy_workers"] = len(policy_timers)
@@ -211,7 +213,9 @@ def _collect_worker_timing(
             timings[f"vllm/{k}"] = v
         metadata["num_vllm_workers"] = len(vllm_timers)
 
-    Timer.save_aggregated_to_json(timings, log_dir / "worker_init_timing.json", metadata)
+    Timer.save_aggregated_to_json(
+        timings, log_dir / "worker_init_timing.json", metadata
+    )
     print(f"✅ Saved worker init timing to {log_dir / 'worker_init_timing.json'}")
 
 

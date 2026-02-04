@@ -11,12 +11,6 @@ EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 RUN_LOG=$EXP_DIR/run.log
-# Override UV cache directories to use writable locations
-export UV_CACHE_DIR=/tmp/uv-cache-$$
-export UV_TOOL_DIR=/tmp/uv-cache-$$/tools
-export UV_TOOL_BIN_DIR=/tmp/uv-cache-$$/bin
-mkdir -p $UV_CACHE_DIR $UV_TOOL_DIR $UV_TOOL_BIN_DIR
-# TIMING_FILE will be set dynamically after run (see below)
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
@@ -60,12 +54,11 @@ with open('$TIMING_FILE') as f:
 # Check top-level structure
 assert 'timings' in data, 'Missing timings key'
 assert 'metadata' in data, 'Missing metadata key'
-assert 'num_workers' in data['metadata'], 'Missing num_workers in metadata'
+assert 'num_policy_workers' in data['metadata'], 'Missing num_policy_workers in metadata'
 assert len(data['timings']) > 0, 'No timing data found'
 
-# Check for at least some expected timing labels (may vary by worker type)
-# Note: Different worker types (DTensor, Megatron, vLLM) may have different timing labels
-common_labels = ['total_init']  # This should always be present
+# Check for at least some expected timing labels (prefixed with 'policy/' or 'vllm/')
+common_labels = ['policy/total_init', 'vllm/total_init']
 has_common_label = any(label in data['timings'] for label in common_labels)
 if not has_common_label:
     print(f'WARNING: No common timing labels found. Available labels: {list(data[\"timings\"].keys())}', file=sys.stderr)
@@ -78,7 +71,7 @@ for label, value in data['timings'].items():
 
 print('✅ Worker init timing file validated successfully')
 print(f'  - Number of timing labels: {len(data[\"timings\"])}')
-print(f'  - Number of workers: {data[\"metadata\"][\"num_workers\"]}')
+print(f'  - Number of policy workers: {data[\"metadata\"][\"num_policy_workers\"]}')
 print('  - Timing breakdown:')
 for label, value in sorted(data['timings'].items()):
     print(f'    • {label}: {value:.4f}s')
