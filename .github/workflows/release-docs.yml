@@ -21,18 +21,18 @@ on:
         type: boolean
         default: true
       override-latest:
-        description: Whether to also publish the docs as the "latest" version. This is the default behavior if the commit is not tagged.
+        description: Whether to also publish the docs as the "latest" version.
         required: false
         type: boolean
         default: false
       docs-version-override:
-        description: Version to override the docs version to. If not provided, defaults to the version of the commit's tag.
+        description: Docs version override. If not provided, defaults to the version of the commit's tag.
         required: false
         type: string
         default: ""
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
-        required: true
+        required: false
         type: string
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: 3d21a8f9dd5830f344e0b592d78beeeb14a948e5
+          ref: d4aa52be7bffec81ef8a9c703fbbd38a7d946b9a
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
