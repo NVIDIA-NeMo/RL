@@ -23,9 +23,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.loss_functions import (
-    DPOLossFn,
-)
+from nemo_rl.algorithms.loss_functions import DPOLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
