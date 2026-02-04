@@ -275,13 +275,12 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    # Validate dataloader batch size
-    dataloader_batch_size = data_config["num_prompts_per_dataloader"]
-    if not data_config["use_multiple_dataloader"]:
-        assert dataloader_batch_size == grpo_config["num_prompts_per_step"], (
-            "data.num_prompts_per_dataloader must be equal to grpo.num_prompts_per_step if not using multiple dataloaders (data.use_multiple_dataloader=false)"
-        )
+    if data_config["use_multiple_dataloader"]:
+        dataloader_batch_size = data_config["num_prompts_per_dataloader"]
+    else:
+        dataloader_batch_size = grpo_config["num_prompts_per_step"]
 
+    # Validate batch_multiplier
     batch_multiplier = grpo_config["batch_multiplier"]
     if not grpo_config["use_dynamic_sampling"]:
         assert batch_multiplier == 1, (
@@ -1367,10 +1366,25 @@ def grpo_train(
 
     # Wrap dataloader if using multiple dataloaders
     if master_config["data"]["use_multiple_dataloader"]:
+        # Validate expected number of prompts
         num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
         batch_multiplier = master_config["grpo"]["batch_multiplier"]
+        expected_num_prompts = int(num_prompts_per_step * batch_multiplier)
+
+        num_prompts_per_dataloader = master_config["data"]["num_prompts_per_dataloader"]
+        real_num_prompts_per_dataloader = int(
+            num_prompts_per_dataloader * batch_multiplier
+        )
+
+        assert expected_num_prompts % real_num_prompts_per_dataloader == 0, (
+            "Expected int(num_prompts_per_step * batch_multiplier) to be a multiple of int(num_prompts_per_dataloader * batch_multiplier), "
+            f"but got {expected_num_prompts} and {real_num_prompts_per_dataloader}. "
+            "Please check the configuration of num_prompts_per_step, num_prompts_per_dataloader, and batch_multiplier."
+        )
+
+        # Wrap dataloader
         dataloader = MultipleDataloaderWrapper(
-            expected_num_prompts=num_prompts_per_step * batch_multiplier,
+            expected_num_prompts=expected_num_prompts,
             data_config=master_config["data"],
             dataloaders=dataloader,
         )
