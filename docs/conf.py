@@ -42,15 +42,18 @@ release = "latest"
 
 extensions = [
     "myst_parser",  # For our markdown docs
-    "autodoc2",  # Generates API docs
+    "autodoc2",  # For automatic API documentation generation
     "sphinx.ext.viewcode",  # For adding a link to view source code in docs
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
-    "sphinx_copybutton",  # For copy button in code blocks
+    "sphinx_copybutton",  # For copy button in code blocks,
+    "sphinx_design",  # For grid layout
+    "sphinx.ext.ifconfig",  # For conditional content
+    "sphinxcontrib.mermaid",  # For Mermaid diagrams
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", ".venv"]
 
 # -- Options for MyST Parser (Markdown) --------------------------------------
 # MyST Parser settings
@@ -63,6 +66,7 @@ myst_enable_extensions = [
     "tasklist",  # Adds support for GitHub-style task lists with [ ] and [x]
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
+myst_fence_as_directive = ["mermaid"]  # Treat ```mermaid blocks as directives
 
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))

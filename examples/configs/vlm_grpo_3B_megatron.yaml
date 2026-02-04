@@ -42,6 +42,7 @@ loss_fn:
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 checkpointing:
   enabled: true
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
@@ -106,6 +107,7 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -143,6 +145,10 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -177,12 +183,21 @@ policy:
       data_parallel_sharding_strategy: optim_grads_params
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  prompt_file: examples/prompts/clevr_cogent_cot.txt
-  system_prompt_file: null
-  dataset_name: clevr-cogent
-  split: trainA
   shuffle: true
   num_workers: 1
+  # dataset
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "clevr-cogent"
 env:
   clevr-cogent:
     num_workers: 8
@@ -216,6 +231,9 @@ logger:
   mlflow_enabled: false
   monitor_gpus: false
   wandb:
+    project: grpo-dev
+    name: vlm-grpo-3b-megatron
+  swanlab:
     project: grpo-dev
     name: vlm-grpo-3b-megatron
   tensorboard: {}

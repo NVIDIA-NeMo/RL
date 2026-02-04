@@ -572,6 +572,7 @@ def dpo_train(
                         ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                         gbs=master_config["policy"]["train_global_batch_size"] * 2,
                         mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                        timer=timer,
                     )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][
@@ -603,6 +604,10 @@ def dpo_train(
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update(
+                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
                     if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
