@@ -347,3 +347,33 @@ def test_get_latest_checkpoint_path_across_digits(checkpoint_manager, checkpoint
     )
     assert len(all_checkpoints) == checkpoint_manager.keep_top_k
     assert all_checkpoints[-1].name == f"step_{max(steps)}"
+
+
+def test_save_optimizer_flag_initialization(checkpoint_config):
+    # Test that save_optimizer defaults to True
+    manager = CheckpointManager(checkpoint_config)
+    assert manager.save_optimizer is True
+
+    # Test that save_optimizer respects explicit False
+    checkpoint_config["save_optimizer"] = False
+    manager = CheckpointManager(checkpoint_config)
+    assert manager.save_optimizer is False
+
+
+def test_get_resume_paths_missing_optimizer(checkpoint_manager, checkpoint_dir):
+    # Create a checkpoint
+    step = 1
+    training_info = {"loss": 0.5}
+    tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+    checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Create checkpoint structure with weights but no optimizer (simulates save_optimizer=False)
+    checkpoint_path = checkpoint_dir / f"step_{step}"
+    (checkpoint_path / "policy" / "weights").mkdir(parents=True)
+
+    # Get resume paths
+    weights_path, optimizer_path = checkpoint_manager.get_resume_paths(checkpoint_path)
+
+    # Verify weights path is returned but optimizer path is None
+    assert weights_path is not None
+    assert optimizer_path is None
