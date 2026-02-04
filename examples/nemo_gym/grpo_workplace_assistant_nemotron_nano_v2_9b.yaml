@@ -237,12 +237,11 @@ data:
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples
   train:
-    dataset_name: NemoGymDataset
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
   validation:
-    dataset_name: NemoGymDataset
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
   default:
+    dataset_name: NemoGymDataset
     env_name: "nemo_gym"
     prompt_file: null  # nemogym dataset doesn't use this parameter
     system_prompt_file: null  # nemogym dataset doesn't use this parameter
