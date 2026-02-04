@@ -43,7 +43,7 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 64 # Only used when generating using megatron backend
-  logprob_batch_size: 8
+  logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 512
   precision: "bfloat16"
 
