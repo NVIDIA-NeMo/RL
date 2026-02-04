@@ -278,11 +278,16 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
+        # Limit in-flight generator requests to num_prompts_per_step * max_num_in_flight_batches_in_generation
+        # By default, max_num_in_flight_batches_in_generation is set to max_trajectory_age_steps
         # This value limits the parallelism of the generation requests.
         max_inflight = (
             int(self.master_config["grpo"]["num_prompts_per_step"])
-            * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
+            * int(
+                self.master_config["grpo"]["async_grpo"][
+                    "max_num_in_flight_batches_in_generation"
+                ]
+            )
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
