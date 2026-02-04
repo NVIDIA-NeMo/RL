@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: ""
+      run-on-version-tag-only
+        description: Whether to only run the workflow on version tags.
+        required: false
+        type: boolean
+        default: true
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: true
@@ -62,7 +67,7 @@ jobs:
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
           overwrite-latest-on-tag: ${{ inputs.override-latest }}
           docs-version-override: ${{ inputs.docs-version-override }}
-          run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+          run-on-version-tag-only: ${{ github.ref_name != 'main' || inputs.run-on-version-tag-only }}
           request-name: rl-publish-docs-${{ github.run_id }}
           aws-region: ${{ vars.DOCS_AWS_REGION }}
           aws-role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
