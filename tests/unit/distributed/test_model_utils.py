@@ -610,7 +610,7 @@ class DistributedLogprobTestActor:
         log_softmax = torch.nn.functional.log_softmax(full_logits, dim=-1)
 
         # Gather log probabilities for target tokens
-        target_mask = target >= 0  # Valid targets (assuming -1 or similar for padding) 
+        target_mask = target >= 0  # Valid targets (assuming -1 or similar for padding)
         log_probs = torch.gather(log_softmax, -1, target.unsqueeze(-1)).squeeze(-1)
         log_probs = log_probs * target_mask.float()
 
