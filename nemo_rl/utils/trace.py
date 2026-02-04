@@ -46,11 +46,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator, Optional
 
-try:
-    import ray
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
+import ray
 
 from nemo_rl.utils.timer import Timer
 
