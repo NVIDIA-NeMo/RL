@@ -16,8 +16,8 @@
 
 from unittest.mock import patch
 
-from nvidia_resiliency_ext.inprocess.tools.inject_fault import Fault
 import pytest
+from nvidia_resiliency_ext.inprocess.tools.inject_fault import Fault
 
 from nemo_rl.utils.fault_injection import (
     FaultInjector,
