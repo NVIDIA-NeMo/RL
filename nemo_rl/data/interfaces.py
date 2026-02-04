@@ -43,7 +43,7 @@ class DatumSpec(TypedDict):
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 
-class DPODatumSpec(TypedDict):
+class PreferenceDatumSpec(TypedDict):
     message_log_chosen: LLMMessageLogType
     message_log_rejected: LLMMessageLogType
     length_chosen: int
