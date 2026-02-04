@@ -28,6 +28,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.trace import define_collect_trace, new_tracer, Tracer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -52,6 +53,12 @@ class ReplayBuffer:
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
 
+        self._tracer = new_tracer("replay_buffer")
+
+    @define_collect_trace
+    def collect_trace(self):
+        return self._tracer.get_events()
+
     def push_with_wait_signal(
         self,
         trajectory: dict[str, Any],
@@ -65,7 +72,14 @@ class ReplayBuffer:
             weight_version: version of the model weights used for generation
             target_weight_version: version of the model weights this trajectory is intended for training
         """
-        with self._lock:
+        span = self._tracer.span(
+            "push_with_wait_signal",
+            metadata={
+                "weight_version": weight_version,
+                "target_weight_version": target_weight_version,
+            }
+        )
+        with span, self._lock:
             if len(self.trajectories) >= self.max_size:
                 return "full"
 
@@ -115,7 +129,7 @@ class ReplayBuffer:
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
         """
-        with self._lock:
+        with self._tracer.span("sample"), self._lock:
             if not self.trajectories:
                 return None
 
@@ -291,6 +305,18 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
+        self._tracer = new_tracer("trajectory_collector")
+        self._loop_tracer = new_tracer("trajectory_collector_loop")
+        self._worker_tracers = []
+
+    @define_collect_trace
+    def collect_trace(self):
+        events = self._tracer.get_events()
+        events.extend(self._loop_tracer.get_events())
+        for worker_tracer in self._worker_tracers:
+            events.extend(worker_tracer.get_events())
+        return events
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -351,6 +377,13 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}, resuming collection")
         else:
             print(f"🔄 Updated weight version to {version}")
+        self._tracer.add_instant_event(
+            "set_weight_version",
+            metadata={
+                "version": version,
+                "was_paused": was_paused,
+            }
+        )
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
@@ -454,6 +487,14 @@ class AsyncTrajectoryCollector:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
             num_prompts = batch.size
+            self._loop_tracer.start_span(
+                "process_batch",
+                metadata={
+                    "generation_weight_version": generation_weight_version,
+                    "num_generations": num_generations,
+                    "num_prompts": num_prompts,
+                },
+            )
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -491,6 +532,9 @@ class AsyncTrajectoryCollector:
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
                 self._inflight_sema.acquire()
+                worker_tracer = new_tracer(f"trajectory_collector_worker_prompt{prompt_idx}")
+                if self._tracer.enabled:
+                    self._worker_tracers.append(worker_tracer)
                 worker = _threading.Thread(
                     target=self._run_prompt_group_worker,
                     args=(
@@ -498,12 +542,21 @@ class AsyncTrajectoryCollector:
                         generation_weight_version,
                         target_weight,
                         prompt_idx,
+                        worker_tracer,
                     ),
                     daemon=True,
                 )
                 with self._threads_lock:
                     self._inflight_threads.add(worker)
                 worker.start()
+                self._loop_tracer.add_instant_event(
+                    "launch run_prompt_group_worker",
+                    metadata={
+                        "generation_weight_version": generation_weight_version,
+                        "target_weight_version": target_weight,
+                        "prompt_idx": prompt_idx,
+                    },
+                )
 
             self._cleanup_finished_threads()
 
@@ -512,6 +565,9 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+
+        finally:
+            self._loop_tracer.end_span("process_batch")
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -577,50 +633,52 @@ class AsyncTrajectoryCollector:
 
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
-        print("🔄 Resuming generation starts after refit")
+        with self._tracer.span("resume_after_refit"):
+            print("🔄 Resuming generation starts after refit")
 
-        # Invalidate&recompute vLLM caches after the in-flight weight updates if
-        # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
-        # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
-        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
-            "recompute_kv_cache_after_weight_updates", False
-        ):
-            try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
-                invalidated = self.policy_generation.invalidate_kv_cache()
-                if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
-                else:
-                    print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
-                    )
-            except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+            # Invalidate&recompute vLLM caches after the in-flight weight updates if
+            # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
+            # Otherwise, keep using the stale KV caches (Magistral-style implementation).
+            async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
+            if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
+                "recompute_kv_cache_after_weight_updates", False
+            ):
+                try:
+                    print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                    invalidated = self.policy_generation.invalidate_kv_cache()
+                    if invalidated:
+                        print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    else:
+                        print(
+                            "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                        )
+                except Exception as e:
+                    print(f"⚠️ Failed to invalidate vLLM caches: {e}")
 
-        self._refit_pause_cleared.set()
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
-        start_time = time.time()
+        with self._tracer.span("wait_for_pending_generations"):
+            start_time = time.time()
 
-        while True:
-            with self._threads_lock:
-                finished = {t for t in self._inflight_threads if not t.is_alive()}
-                for t in finished:
-                    self._inflight_threads.remove(t)
+            while True:
+                with self._threads_lock:
+                    finished = {t for t in self._inflight_threads if not t.is_alive()}
+                    for t in finished:
+                        self._inflight_threads.remove(t)
 
-                pending_count = len(self._inflight_threads)
+                    pending_count = len(self._inflight_threads)
 
-            if pending_count == 0:
-                print("✅ All generation threads completed")
-                break
+                if pending_count == 0:
+                    print("✅ All generation threads completed")
+                    break
 
-            elapsed = time.time() - start_time
-            print(
-                f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
-            )
-            time.sleep(0.5)
+                elapsed = time.time() - start_time
+                print(
+                    f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
+                )
+                time.sleep(0.5)
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
@@ -640,19 +698,29 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
+        worker_tracer: Tracer,
     ) -> None:
+        worker_tracer.start_span(
+            "run_prompt_group_worker",
+            metadata={
+                "generation_weight_version": generation_weight_version,
+                "target_weight_version": target_weight_version,
+                "prompt_idx": prompt_idx,
+            }
+        )
         try:
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
-            final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                policy_generation=self.policy_generation,
-                input_batch=repeated_batch,
-                tokenizer=self.tokenizer,
-                task_to_env=self.task_to_env,
-                max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
-                greedy=False,
-            )
+            with worker_tracer.span("run_async_multi_turn_rollout"):
+                final_batch, rollout_metrics = run_async_multi_turn_rollout(
+                    policy_generation=self.policy_generation,
+                    input_batch=repeated_batch,
+                    tokenizer=self.tokenizer,
+                    task_to_env=self.task_to_env,
+                    max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
@@ -728,3 +796,5 @@ class AsyncTrajectoryCollector:
                 import traceback
 
                 traceback.print_exc()
+
+            worker_tracer.end_span("run_prompt_group_worker")

@@ -17,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -75,6 +76,8 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.trace import new_tracer, save_trace
+from nemo_rl.utils.trace import trace_and_time as _trace_and_time
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # ===============================================================================
@@ -1497,7 +1500,6 @@ def grpo_train(
                     )
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
-
                     metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
@@ -2111,7 +2113,9 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
+    tracer = new_tracer()
     timer = Timer()
+    trace_and_time = partial(_trace_and_time, tracer, timer)
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -2235,7 +2239,8 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            with tracer.span("refit"):
+                refit_policy_generation(policy, policy_generation, colocated_inference)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2322,10 +2327,10 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
-            with timer.time("total_step_time"):
+            with trace_and_time("step", time_label="total_step_time", metadata={"step": step}):
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
-                with timer.time("exposed_generation"):
+                with trace_and_time("sample", time_label="exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
                         f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
@@ -2413,7 +2418,7 @@ def async_grpo_train(
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
                 print("▶ Processing rewards...")
-                with timer.time("reward_calculation"):
+                with trace_and_time("reward_calculation"):
                     prompt_only_message_logs = []
                     for message_log in repeated_batch["message_log"]:
                         prompt_only_log = []
@@ -2465,7 +2470,7 @@ def async_grpo_train(
                         )
 
                 # Prepare training data (same as sync version)
-                with timer.time("data_processing"):
+                with trace_and_time("data_processing"):
                     # Add loss mask and advantages to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2508,42 +2513,47 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
+                tracer.start_span("training")
                 print("▶ Preparing for logprob inference...")
-                with timer.time("logprob_inference_prep"):
+                with trace_and_time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...")
-                with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["reference_logprobs"]
+                with trace_and_time("policy_and_reference_logprobs"):
+                    with tracer.span("policy_logprobs"):
+                        fprop_logprobs = policy.get_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["logprobs"]
+
+                    with tracer.span("reference_policy_logprobs"):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...")
-                with timer.time("training_prep"):
+                with trace_and_time("training_prep"):
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...")
-                with timer.time("policy_training"):
+                with trace_and_time("policy_training"):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
                         timer=timer,
                     )
+                tracer.end_span("training")
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
-                    with timer.time("exposed_generation"):
+                    with trace_and_time("prepare_for_refit", time_label="exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
                     # Collect generation logger metrics for performance reporting
@@ -2555,7 +2565,7 @@ def async_grpo_train(
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
-                    with timer.time("weight_sync"):
+                    with trace_and_time("weight_sync"):
                         refit_policy_generation(
                             policy, policy_generation, colocated_inference
                         )
@@ -2574,6 +2584,7 @@ def async_grpo_train(
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
 
+                tracer.start_span("validation")
                 if val_period > 0 and (step + 1) % val_period == 0:
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
@@ -2608,6 +2619,8 @@ def async_grpo_train(
 
                     # Resume trajectory collection after validation
                     trajectory_collector.resume.remote()
+                tracer.end_span("validation")
+
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = flat_messages["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -2720,7 +2733,7 @@ def async_grpo_train(
                                 metric_name
                             ]
 
-                    with timer.time("checkpointing"):
+                    with trace_and_time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, grpo_save_state, master_config
@@ -2843,6 +2856,12 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        try:
+            ray.get(trajectory_collector.pause.remote())
+            save_trace(tracer.get_events(), (replay_buffer, trajectory_collector))
+        except Exception as e:
+            print(f"Error saving tracer events: {e}")
+
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:
