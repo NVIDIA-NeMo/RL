@@ -195,7 +195,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
-        # Initialize timing for worker initialization
         self.init_timer = Timer()
         self.init_timer.start("total_init")
 

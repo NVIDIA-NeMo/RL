@@ -657,15 +657,13 @@ def setup(
 
     # Collect worker initialization timing if enabled
     if master_config["logger"].get("collect_worker_init_timing", False):
-        # Collect timing from all workers (barrier already exists, just fetching data)
         worker_timers = ray.get(
             [w.get_init_timing.remote() for w in policy.worker_group.workers]
         )
 
-        # Aggregate max timing across workers
         max_timing = Timer.aggregate_max(worker_timers, reduction_op="sum")
 
-        # Save to log directory
+        log_dir = Path(master_config["logger"]["log_dir"])
         log_dir = Path(master_config["logger"]["log_dir"])
         log_dir.mkdir(parents=True, exist_ok=True)
         timing_file = log_dir / "worker_init_timing.json"
