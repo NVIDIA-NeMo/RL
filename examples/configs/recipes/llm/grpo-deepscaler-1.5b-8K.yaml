@@ -16,7 +16,6 @@ policy:
   max_total_sequence_length: 8192
   dtensor_cfg:
     cpu_offload: true
-    sequence_parallel: true
     activation_checkpointing: true
     _v2: false
   sequence_packing:
@@ -29,7 +28,11 @@ policy:
       compilation_config:
         use_inductor: false
 data:
-  dataset_name: DeepScaler
+  train:
+    dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
 env:
   math:
     num_workers: 16

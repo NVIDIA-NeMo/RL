@@ -89,7 +89,7 @@ class VllmGeneration(GenerationInterface):
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
         # However, we allow values above certain thresholds for token filtering purposes.
-        top_k: int | None = self.cfg.get("top_k")
+        top_k = self.cfg["top_k"]
         if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
             raise ValueError(
                 (
@@ -117,6 +117,10 @@ class VllmGeneration(GenerationInterface):
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
         ]
+        # Also check for model_name which is required by VllmGenerationWorker but marked as NotRequired in GenerationConfig because it's not expected to be set in the job yaml.
+        if "model_name" not in self.cfg:
+            missing_keys.append("model_name")
+
         assert not missing_keys, (
             f"VLLM Configuration Error: Missing required keys in VllmConfig.\n"
             f"Missing keys: {', '.join(missing_keys)}\n"
@@ -446,7 +450,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields
@@ -497,7 +501,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields
@@ -815,6 +819,71 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            future = self.worker_group.run_single_worker_single_data(
+                "get_vllm_logger_metrics",
+                worker_idx=worker_idx,
+            )
+            futures.append(future)
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+            "inflight_batch_sizes": {},  # dp_idx -> list[int]
+            "num_pending_samples": {},  # dp_idx -> list[int]
+            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
+            "generation_tokens": {},  # dp_idx -> list[int]
+        }
+
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight_batch_sizes = stats.get("inflight_batch_sizes")
+            if inflight_batch_sizes:
+                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
+                    inflight_batch_sizes
+                )
+            num_pending_samples = stats.get("num_pending_samples")
+            if num_pending_samples:
+                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
+            if kv_cache_usage_perc:
+                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
+            generation_tokens = stats.get("generation_tokens")
+            if generation_tokens:
+                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+
+        return vllm_logger_metrics
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_vllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting."""
+        self.clear_vllm_logger_metrics()
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics for performance reporting."""
+        return self.get_vllm_logger_metrics()
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
@@ -823,3 +892,35 @@ class VllmGeneration(GenerationInterface):
         user calls shutdown().
         """
         self.shutdown()
+
+    def invalidate_kv_cache(self) -> bool:
+        """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
+
+        For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
+        Returns True if all workers report success.
+        """
+        try:
+            method_name = (
+                "reset_prefix_cache_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "reset_prefix_cache"
+            )
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            print(f"Error invalidating vLLM caches: {e}")
+            return False
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Check if KV cache scales should be synchronized during refit.
+
+        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        """
+        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
+            "kv_cache_dtype"
+        ].startswith("fp8")

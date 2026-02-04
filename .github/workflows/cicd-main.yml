@@ -155,6 +155,18 @@ jobs:
     needs: [pre-flight]
     runs-on: ubuntu-latest
     steps:
+      - name: Free up disk space
+        run: |
+          # Remove unnecessary packages and files on Ubuntu
+          sudo apt-get clean
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/az || true
+          # Clear pip and npm caches
+          pip cache purge || true
+          sudo npm cache clean --force || true
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -162,7 +174,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.7.2"
+          version: "0.9.1"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
@@ -204,11 +216,11 @@ jobs:
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
-      target: hermetic
+      target: release
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
-        MAX_JOBS=32
+        MAX_JOBS=4
         NEMO_RL_COMMIT=${{ github.sha }}
 
   cicd-doc-tests:

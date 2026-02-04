@@ -57,7 +57,11 @@ policy: &POLICY_BASE
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
         bias_activation_fusion: True
-        defer_fp32_logits: null
+        moe_per_layer_logging: False
+        defer_fp32_logits: False
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "allgather"
+        moe_shared_expert_overlap: false
         
         optimizer:
             optimizer: "adam"
@@ -99,7 +103,6 @@ policy: &POLICY_BASE
             grad_reduce_in_fp32: false
             overlap_grad_reduce: true
             overlap_param_gather: true
-            average_in_collective: true
             use_custom_fsdp: false
             data_parallel_sharding_strategy: "optim_grads_params"
 
@@ -147,11 +150,11 @@ logger:
     wandb_enabled: true
     wandb:
         project: "nemo-distillation"
-        name: "distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-megatron-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
-        log_dir: "tb_logs-distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        log_dir: "tb_logs-distillation-megatron-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     mlflow:
-        run_name: "distillation-math-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        run_name: "distillation-math-megatron-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
 
 cluster:
     gpus_per_node: 8

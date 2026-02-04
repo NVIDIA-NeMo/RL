@@ -24,7 +24,7 @@ from nemo_rl.algorithms.loss_functions import (
     DPOLossFn,
     NLLLoss,
 )
-from nemo_rl.algorithms.utils import masked_mean
+from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
@@ -33,11 +33,15 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_c": None,
     "disable_ppo_ratio": False,
     "reference_policy_kl_penalty": 0.0,  # Disable KL
+    "reference_policy_kl_type": "k3",
+    "kl_input_clamp_value": 20.0,
+    "kl_output_clamp_value": 10.0,
     "use_on_policy_kl_approximation": False,
     "use_importance_sampling_correction": False,
     "truncated_importance_sampling_ratio": None,  # Disable TIS
     "sequence_level_importance_ratios": False,
     "token_level_loss": True,
+    "force_on_policy_ratio": False,
 }
 
 
@@ -557,6 +561,102 @@ def test_clipped_pg_loss_reinforce_mode():
         ),
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+def test_clipped_pg_loss_force_on_policy_ratio():
+    """Tests that force_on_policy_ratio forces ratios to 1.0 while keeping gradients."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["force_on_policy_ratio"] = True
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Use same logprob pattern as PPO clipping test to ensure
+    # that without the flag, ratios would be [0.5, 1.0, 1.5]
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.59453]], device=device
+    )  # approx log(0.5)-1, log(1)-1, log(1.5)-1
+
+    # Fill full tensors (only need first dim for B=1)
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # Hand-calculated expected loss when ratios are forced to 1.0
+    ratios = torch.ones_like(adv_masked, device=device)
+    loss_per_token = -adv_masked * ratios  # [-1.0, 1.0, -2.0]
+    expected_loss = torch.mean(loss_per_token)  # (-1 + 1 - 2) / 3 = -0.6666...
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+
+    actual_loss, metrics = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Loss should match the on-policy expectation
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
+
+    # Ratios and their metrics should all be exactly 1.0
+    assert metrics["probs_ratio"] == 1.0
+    assert metrics["probs_ratio_clamped"] == 1.0
+    assert metrics["probs_ratio_min"] == 1.0
+    assert metrics["probs_ratio_max"] == 1.0
+    assert metrics["probs_ratio_clamped_min"] == 1.0
+    assert metrics["probs_ratio_clamped_max"] == 1.0
+
+
+@pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
+def test_calculate_kl(kl_type):
+    """Tests KL calculations."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    logprobs = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    logprobs_reference = torch.tensor([[-0.0, -15.0, -30.0]], device=device)
+
+    # test un-clamped KL
+    expected_kl = {
+        "k1": torch.tensor([[-1.0, 14.0, 29.0]], device=device),
+        "k2": torch.tensor([[0.5, 98.0, 420.5]], device=device),
+        "k3": torch.tensor([[0.7183, 13.0, 28.0]], device=device),
+    }
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type=kl_type,
+        input_clamp_value=None,
+        output_clamp_value=None,
+    )
+    assert torch.allclose(kl, expected_kl[kl_type], rtol=1e-3)
+
+    # test clamped KL
+    expected_kl_clamped = {
+        "k1": torch.tensor([[-1.0, 10.0, 10.0]], device=device),
+        "k2": torch.tensor([[0.5, 10.0, 10.0]], device=device),
+        "k3": torch.tensor([[0.7183, 10.0, 10.0]], device=device),
+    }
+    kl_clamped = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type=kl_type,
+        input_clamp_value=20.0,
+        output_clamp_value=10.0,
+    )
+    assert torch.allclose(kl_clamped, expected_kl_clamped[kl_type], rtol=1e-3)
 
 
 # Simplified KL Penalty Test using original Loss

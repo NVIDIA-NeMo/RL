@@ -572,6 +572,7 @@ def dpo_train(
                         ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                         gbs=master_config["policy"]["train_global_batch_size"] * 2,
                         mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                        timer=timer,
                     )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][
@@ -603,6 +604,10 @@ def dpo_train(
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update(
+                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
                     if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
@@ -650,15 +655,34 @@ def dpo_train(
                     if val_metrics is not None:
                         dpo_save_state.update(val_metrics)
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in dpo_save_state
-                        ):
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
                             warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "This checkpoint will not be saved as top-k."
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
                             )
+                            if full_metric_name in dpo_save_state:
+                                del dpo_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            dpo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")

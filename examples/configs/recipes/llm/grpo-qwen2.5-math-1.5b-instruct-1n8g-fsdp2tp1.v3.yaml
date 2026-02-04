@@ -14,8 +14,6 @@ policy:
   make_sequence_length_divisible_by: 1
   generation:
     max_new_tokens: 512
-    stop_token_ids:
-    - 151645
     vllm_cfg:
       max_model_len: 512
 data:

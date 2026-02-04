@@ -69,6 +69,11 @@ if [ "${RAY_DEBUG:-}" = "legacy" ]; then
   RAY_DEBUGGER_ARGS="--ray-debugger-external"
 fi
 
+# After ray>=2.47, this feature is enabled by default which creates uv venvs for any py_executable starting with `uv run`.
+# There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
+# need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script
@@ -273,6 +278,8 @@ ray start --head \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
+    --dashboard-host="$head_node_ip" \
+    --include-dashboard=True \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
     --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \

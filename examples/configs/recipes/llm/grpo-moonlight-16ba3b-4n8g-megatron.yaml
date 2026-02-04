@@ -22,7 +22,6 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
     expert_model_parallel_size: 4
     pipeline_model_parallel_size: 4
     num_layers_in_first_pipeline_stage: 7
@@ -32,6 +31,8 @@ policy:
       lr: 1.0e-06
     scheduler:
       lr_warmup_iters: 50
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
 logger:
   monitor_gpus: false
   wandb:

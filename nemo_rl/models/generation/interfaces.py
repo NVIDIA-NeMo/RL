@@ -104,9 +104,15 @@ class ResourcesConfig(TypedDict):
     num_nodes: int
 
 
+class OptionalResourcesConfig(TypedDict):
+    # Same as ResourcesConfig, but fields can be null and are validated in grpo.py
+    gpus_per_node: int | None
+    num_nodes: int | None
+
+
 class ColocationConfig(TypedDict):
     enabled: bool
-    resources: NotRequired[ResourcesConfig]
+    resources: OptionalResourcesConfig
 
 
 class GenerationConfig(TypedDict):
@@ -116,12 +122,13 @@ class GenerationConfig(TypedDict):
     max_new_tokens: int
     temperature: float
     top_p: float
-    top_k: int
-    model_name: str
-    stop_token_ids: list[int]
-    stop_strings: NotRequired[list[str]]
-    pad_token_id: NotRequired[int]
+    top_k: int | None
+    model_name: NotRequired[str]  # Not Required b/c GRPO writes this
+    stop_token_ids: list[int] | None
+    stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
+    # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
+    _pad_token_id: NotRequired[int]
 
 
 class GenerationDatumSpec(TypedDict):
@@ -229,6 +236,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether the generation backend requires KV cache scales synchronization."""
+        return False
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         raise NotImplementedError
@@ -240,3 +252,27 @@ class GenerationInterface(ABC):
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError
+
+    # Optional hook; backends may override to invalidate any reusable caches
+    # (e.g., vLLM prefix/KV caches) after weight updates.
+    def invalidate_kv_cache(self) -> bool:
+        return False
+
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting.
+
+        This is an optional method that backends can implement to clear
+        telemetry metrics. Default implementation does nothing.
+        """
+        pass
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics for performance reporting.
+
+        This is an optional method that backends can implement to collect
+        telemetry metrics. Default implementation returns empty dict.
+
+        Returns:
+            Dictionary of metrics. Format may vary by backend.
+        """
+        return {}

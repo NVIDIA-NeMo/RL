@@ -35,7 +35,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _replace_prefix_tokens,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -70,6 +70,7 @@ basic_vllm_test_config: VllmConfig = {
         "skip_tokenizer_init": False,
         "load_format": "auto",
         "enforce_eager": "False",
+        "kv_cache_dtype": "auto",
     },
     "colocated": {
         "enabled": True,
@@ -94,6 +95,7 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_new_tokens": 16,
     "do_sample": False,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -104,6 +106,7 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
+        "_v2": False,
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
@@ -124,6 +127,19 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_grad_norm": 1.0,
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
+}
+
+basic_lora_test_config: LoRAConfig = {
+    "enabled": False,
+    "target_modules": [],
+    "exclude_modules": [],
+    "match_all_linear": True,
+    "dim": 8,
+    "alpha": 32,
+    "dropout": 0.0,
+    "dropout_position": "post",
+    "lora_A_init": "xavier",
+    "use_triton": False,
 }
 
 
@@ -148,6 +164,7 @@ def get_basic_megatron_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -176,8 +193,12 @@ def get_basic_megatron_test_config(
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "allgather",
+            "moe_shared_expert_overlap": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -209,7 +230,6 @@ def get_basic_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
@@ -230,6 +250,20 @@ def cluster():
         max_colocated_worker_groups=2,
         num_gpus_per_node=2,  # Use available GPUs
         name="vllm-test-cluster",
+    )
+    yield virtual_cluster
+    virtual_cluster.shutdown()
+
+
+@pytest.fixture(scope="function")
+def moe_cluster():
+    """Create a virtual cluster for testing MoE models."""
+    virtual_cluster = RayVirtualCluster(
+        bundle_ct_per_node_list=[2],  # 1 node with 8 GPU bundle
+        use_gpus=True,
+        max_colocated_worker_groups=2,
+        num_gpus_per_node=2,
+        name="vllm-test-moe-cluster",
     )
     yield virtual_cluster
     virtual_cluster.shutdown()
@@ -438,7 +472,7 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
 
     # Extract in correct order
     outputs = [item for _, item in collected_indexed_outputs]
-    pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    pad_token_id = vllm_policy.cfg.get("_pad_token_id", tokenizer.pad_token_id)
     outputs = BatchedDataDict.from_batches(
         outputs,
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
@@ -672,7 +706,13 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
+    lm_policy,
+    vllm_policy,
+    tokenizer,
+    async_engine,
+    colocated,
+    vllm_precision,
+    enable_lora,
 ):
     """Validates that the two policies can work together.
 
@@ -852,16 +892,19 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        # LoRA tests
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
 
@@ -878,6 +921,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
 
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -887,6 +932,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
@@ -897,23 +945,37 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        True,
+        vllm_precision,
+        enable_lora,
     )
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        # LoRA tests
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
-    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
+    policy_cluster_separate,
+    tokenizer,
+    async_engine,
+    cpu_offload,
+    vllm_precision,
+    enable_lora,
 ):
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -929,19 +991,30 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
     vllm_config["colocated"]["enabled"] = False
+    if vllm_precision == "fp8":
+        vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
     vllm_policy.finish_generation()
 
+    assert not (enable_lora and vllm_precision == "fp8"), (
+        "LoRA is not supported with FP8"
+    )
     # Create Policy
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["generation"]["colocated"]["enabled"] = False
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["train_global_batch_size"] = 4
+    # lora must use dtensor v2
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
     # Refit
@@ -964,7 +1037,13 @@ async def test_vllm_generation_with_hf_training_non_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        False,
+        vllm_precision,
+        enable_lora,
     )
 
 
@@ -1112,6 +1191,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert len(base_urls) == cluster.num_gpus_per_node
 
     body = dict(
+        model=generation_config["model_name"],
         messages=[
             {"role": "user", "content": "count to 5"},
         ],
@@ -1147,6 +1227,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
@@ -1160,6 +1241,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 },
                 "finish_reason": "length",
                 "stop_reason": None,
+                "token_ids": None,
             }
         ],
         "service_tier": None,
@@ -1171,6 +1253,7 @@ def test_vllm_http_server(cluster, tokenizer):
             "prompt_tokens_details": None,
         },
         "prompt_logprobs": None,
+        "prompt_token_ids": None,
         "kv_transfer_params": None,
     }
 
@@ -1180,6 +1263,11 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("created")
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        message = d["choices"][0]["message"]
+        if "reasoning" in message:
+            message.pop("reasoning")
 
         return d
 
@@ -1349,6 +1437,9 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
 def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
+
+        def decode(self, *args, **kwargs):
+            pass
 
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
@@ -1636,7 +1727,9 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-def test_vllm_weight_update_memory(cluster, tokenizer):
+# megatron still holds little memory after refit, so we only test dtensor now
+@pytest.mark.parametrize("train_backend", ["dtensor_v1", "dtensor_v2"])
+def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1657,9 +1750,17 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
 
-    print("Creating DTensor policy...")
-    dtensor_config = basic_dtensor_test_config
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    print("Creating Training Policy...")
+    if train_backend == "dtensor_v1":
+        train_config = basic_dtensor_test_config
+    elif train_backend == "dtensor_v2":
+        train_config = deepcopy(basic_dtensor_test_config)
+        train_config["dtensor_cfg"]["_v2"] = True
+    elif train_backend == "megatron":
+        train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    else:
+        raise ValueError(f"Invalid train backend: {train_backend}")
+    lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
     state_dict_info = lm_policy.prepare_refit_info()
@@ -1916,13 +2017,18 @@ async def test_vllm_refit_non_colocated_update_weights(
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
+@pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size, vllm_precision
+    cluster, tokenizer, tensor_parallel_size, vllm_precision, kv_cache_dtype
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
     This test validates that vLLM and Megatron policies can work together.
     """
+
+    # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
+    if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
+        pytest.skip("kv_cache_dtype='fp8' requires precision='fp8'")
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -1947,6 +2053,8 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    if kv_cache_dtype is not None:
+        vllm_config["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
@@ -1992,6 +2100,173 @@ def test_vllm_generation_with_megatron_training(
 
         print("Creating Megatron policy...")
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
+
+        print("preparing refit info...")
+        state_dict_info = megatron_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
+
+        print("Refitting vLLM policy with Megatron weights...")
+        refit_policy_generation(
+            megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
+        )
+
+        # Step 1: Use vLLM for generation
+        print("Using vLLM policy for fast generation...")
+        generation_results = vllm_policy.generate(test_input_data, greedy=True)
+        vllm_policy.finish_generation()
+
+        # Validate generation outputs
+        assert "output_ids" in generation_results, (
+            "output_ids not found in vLLM generation output"
+        )
+        assert "logprobs" in generation_results, (
+            "logprobs not found in vLLM generation output"
+        )
+
+        # Decode generations
+        generated_texts = test_tokenizer.batch_decode(
+            generation_results["output_ids"], skip_special_tokens=True
+        )
+        print(f"vLLM generated texts: {generated_texts}")
+
+        # Step 2: Prepare training data for Megatron (convert tokens to Megatron tokenizer space)
+        # Re-tokenize with Megatron tokenizer for training
+        megatron_tokenized = test_tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=32,
+            return_tensors="pt",
+            padding_side="right",
+        )
+
+        max_seq_len = min(32, megatron_tokenized["input_ids"].shape[1])
+        train_input_ids = megatron_tokenized["input_ids"][:, :max_seq_len]
+        token_loss_mask = torch.ones_like(train_input_ids)
+
+        # Only compute loss on generated tokens, not input
+        input_len = megatron_tokenized["input_ids"].size(1)
+        token_loss_mask[:, :input_len] = 0
+
+        train_data = BatchedDataDict(
+            {
+                "input_ids": train_input_ids,
+                "input_lengths": megatron_tokenized["attention_mask"]
+                .sum(dim=1)
+                .to(torch.int32),
+                "token_mask": token_loss_mask,
+                "sample_mask": torch.ones(train_input_ids.shape[0]),
+            }
+        )
+
+        # Step 3: Train with Megatron policy
+        print("Training with Megatron policy...")
+        megatron_policy.prepare_for_training()
+
+        # Do one training step to verify it works
+        results = megatron_policy.train(train_data, NLLLoss())
+        print(f"Training loss: {results['loss']}")
+
+        megatron_policy.finish_training()
+        megatron_policy.offload_after_refit()
+
+        # Step 4: Use vLLM for generation again
+        print("Using vLLM for generation again...")
+        vllm_policy.prepare_for_generation()
+        final_generation = vllm_policy.generate(test_input_data)
+
+        assert "output_ids" in final_generation, (
+            "Final generation should contain output_ids"
+        )
+
+        print("Successfully demonstrated vLLM generation + Megatron training workflow!")
+
+    finally:
+        # Clean up resources
+        print("Cleaning up resources...")
+        if vllm_policy:
+            vllm_policy.shutdown()
+        if megatron_policy and hasattr(megatron_policy, "shutdown"):
+            megatron_policy.shutdown()
+
+
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
+def test_vllm_generation_with_megatron_training_moe_model(
+    moe_cluster, tokenizer, vllm_precision
+):
+    """Test that uses vLLM for generation and Megatron policy for training and logprob computation for a MoE model.
+
+    This test validates that vLLM and Megatron policies can work together.
+    """
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
+    model_name = "moonshotai/Moonlight-16B-A3B-Instruct"
+    expert_parallel_size = 8
+
+    if moe_cluster.num_gpus_per_node < expert_parallel_size:
+        pytest.skip(f"Need at least {expert_parallel_size} GPUs for this test")
+
+    # Create tokenizer for both policies
+    test_tokenizer = get_tokenizer({"name": model_name})
+
+    # vLLM config with MoE model
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["model_name"] = model_name
+    vllm_config["tokenizer"]["name"] = model_name
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["expert_parallel_size"] = expert_parallel_size
+    vllm_config = configure_generation_config(vllm_config, test_tokenizer)
+
+    # Megatron config with same model
+    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    megatron_config["model_name"] = model_name
+    megatron_config["tokenizer"]["name"] = model_name
+    megatron_config["expert_model_parallel_size"] = expert_parallel_size
+
+    vllm_policy = None
+    megatron_policy = None
+
+    try:
+        prompts = [
+            "Hello, how are you?",
+            "The capital of France is",
+            "Write a short story about",
+            "Explain quantum physics in simple terms:",
+        ]
+
+        # Tokenize the prompts with the shared tokenizer
+        tokenized = test_tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=32,  # Smaller for faster testing
+            return_tensors="pt",
+            padding_side="right",
+        )
+        input_lengths = tokenized["attention_mask"].sum(dim=1).to(torch.int32)
+
+        test_input_data = BatchedDataDict(
+            {
+                "input_ids": tokenized["input_ids"],
+                "input_lengths": input_lengths,
+            }
+        )
+
+        # Create both policies
+        print("Creating vLLM policy...")
+        vllm_policy = VllmGeneration(moe_cluster, vllm_config)
+        vllm_policy.finish_generation()
+
+        print("Creating Megatron policy...")
+        megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
         state_dict_info = megatron_policy.prepare_refit_info()

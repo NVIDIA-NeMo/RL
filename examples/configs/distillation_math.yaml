@@ -20,7 +20,7 @@ loss_fn:
 checkpointing:
     enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
-    metric_name: "val_reward"
+    metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
     higher_is_better: true
     keep_top_k: 3
     save_period: 10
@@ -40,6 +40,8 @@ policy: &POLICY_BASE
     max_total_sequence_length: 8192
     precision: "bfloat16"
     logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
@@ -103,7 +105,11 @@ policy: &POLICY_BASE
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
         bias_activation_fusion: True
-        defer_fp32_logits: null
+        defer_fp32_logits: False
+        moe_per_layer_logging: False
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "allgather"
+        moe_shared_expert_overlap: false
         
         optimizer:
             optimizer: "adam"
@@ -145,7 +151,6 @@ policy: &POLICY_BASE
             grad_reduce_in_fp32: false
             overlap_grad_reduce: true
             overlap_param_gather: true
-            average_in_collective: true
             use_custom_fsdp: false
             data_parallel_sharding_strategy: "optim_grads_params"
 
@@ -172,6 +177,7 @@ policy: &POLICY_BASE
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
+            kv_cache_dtype: "auto"
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -203,10 +209,19 @@ teacher:
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-    prompt_file: "examples/prompts/cot.txt"
-    system_prompt_file: null
-    dataset_name: "DeepScaler"
     shuffle: true
+
+    # dataset
+    train:
+        dataset_name: DeepScaler
+    validation:
+        dataset_name: AIME2024
+        repeat: 16
+    # default settings for all datasets
+    default:
+        prompt_file: "examples/prompts/cot.txt"
+        system_prompt_file: null
+        env_name: "math"
 
 env:
     math:
@@ -222,9 +237,12 @@ logger:
     monitor_gpus: true
     wandb:
         project: "nemo-distillation"
-        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    swanlab:
+        project: "nemo-distillation"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
-        log_dir: "tb_logs-distillation-${data.dataset_name}"
+        log_dir: "tb_logs-distillation-${data.train.dataset_name}"
     mlflow:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"

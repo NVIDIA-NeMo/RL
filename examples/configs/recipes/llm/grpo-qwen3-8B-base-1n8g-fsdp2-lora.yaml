@@ -1,0 +1,25 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_at_start: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8B-base-1n8g-fsdp2-lora
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    activation_checkpointing: true
+    lora_cfg:
+      enabled: True
+      dim: 128
+      alpha: 128
+  sequence_packing:
+    enabled: false
+logger:
+  log_dir: logs/grpo-qwen3-8B-base-1n8g-fsdp2-lora
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-8B-base-1n8g-fsdp2-lora
+cluster:
+  gpus_per_node: 8
