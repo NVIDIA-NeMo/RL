@@ -1,4 +1,4 @@
-# An in-depth Walkthrough of ProRLv2 in NeMo RL
+# An In-Depth Walkthrough of ProRLv2 in NeMo RL
 
 This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml).
 
