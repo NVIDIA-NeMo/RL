@@ -24,7 +24,7 @@ from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_da
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
 
 
-def create_sample_data(input_key, output_key, is_save_to_disk=False):
+def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".json"):
     data = [
         {input_key: "Hello", output_key: "Hi there!"},
         {input_key: "How are you?", output_key: "I'm good, thanks!"},
@@ -36,9 +36,22 @@ def create_sample_data(input_key, output_key, is_save_to_disk=False):
         dataset = Dataset.from_list(data)
         dataset.save_to_disk(data_path)
     else:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(data, f)
+        # If file_ext is provided, use it. If not provided but is_save_to_disk is False, default to .json
+        if file_ext is None:
+            file_ext = ".json"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=file_ext, delete=False) as f:
             data_path = f.name
+
+        if file_ext == ".json":
+            with open(data_path, "w") as f:
+                json.dump(data, f)
+        elif file_ext == ".parquet":
+            dataset = Dataset.from_list(data)
+            dataset.to_parquet(data_path)
+        elif file_ext == ".csv":
+            dataset = Dataset.from_list(data)
+            dataset.to_csv(data_path)
 
     return data_path
 
@@ -53,10 +66,18 @@ def tokenizer():
 @pytest.mark.parametrize(
     "input_key,output_key", [("input", "output"), ("question", "answer")]
 )
-@pytest.mark.parametrize("is_save_to_disk", [True, False])
-def test_response_dataset(input_key, output_key, is_save_to_disk, tokenizer):
+@pytest.mark.parametrize(
+    "is_save_to_disk,file_ext",
+    [
+        (True, None),
+        (False, ".json"),
+        (False, ".parquet"),
+        (False, ".csv"),
+    ],
+)
+def test_response_dataset(input_key, output_key, is_save_to_disk, file_ext, tokenizer):
     # load the dataset
-    data_path = create_sample_data(input_key, output_key, is_save_to_disk)
+    data_path = create_sample_data(input_key, output_key, is_save_to_disk, file_ext)
     data_config = {
         "dataset_name": "ResponseDataset",
         "data_path": data_path,

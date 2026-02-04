@@ -803,6 +803,8 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
                             for k in loss_metrics.keys():
+                                if "_min" in k or "_max" in k:
+                                    continue
                                 loss_metrics[k] /= num_global_batches
                             num_valid_samples = loss_metrics["num_valid_samples"]
                             loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
