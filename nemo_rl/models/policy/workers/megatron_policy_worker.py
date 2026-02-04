@@ -15,7 +15,7 @@
 # Measure module import time (import time first for measurement)
 import time
 
-_module_import_start_time = time.perf_counter()
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
 
 import gc
 import os
@@ -110,7 +110,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 # Calculate module import duration after all imports
-_module_import_duration = time.perf_counter() - _module_import_start_time
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -199,8 +199,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.init_timer.start("total_init")
 
         # Record module import time
-        if "_module_import_duration" in globals():
-            self.init_timer._timers["module_import"] = [_module_import_duration]
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -316,7 +316,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Stop total init timing
         self.init_timer.stop("total_init")
 
-    def get_init_timing(self) -> Timer:
+    def get_init_timer(self) -> Timer:
         """Return init timing for controller aggregation."""
         return self.init_timer
 

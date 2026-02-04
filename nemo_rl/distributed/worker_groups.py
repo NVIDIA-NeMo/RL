@@ -1038,28 +1038,22 @@ class RayWorkerGroup:
             dict[str, float]: Dictionary mapping timing labels to aggregated max values.
                              Returns empty dict if workers don't have timing or on error.
         """
-        try:
-            # Check if workers support get_init_timing
-            if not self._workers:
-                return {}
-
-            # Collect timing from all workers
-            timing_futures = []
-            for worker in self._workers:
-                if hasattr(worker, "get_init_timing"):
-                    timing_futures.append(worker.get_init_timing.remote())
-
-            if not timing_futures:
-                return {}
-
-            # Get all timers
-            timers = ray.get(timing_futures)
-
-            # Aggregate using max across workers, sum within each worker
-            aggregated = Timer.aggregate_max(timers, reduction_op="sum")
-
-            return aggregated
-
-        except Exception:
-            # Return empty dict on any error
+        if not self._workers:
             return {}
+
+        # Collect timing from all workers
+        timing_futures = []
+        for worker in self._workers:
+            if hasattr(worker, "get_init_timer"):
+                timing_futures.append(worker.get_init_timer.remote())
+
+        if not timing_futures:
+            return {}
+
+        # Get all timers
+        timers = ray.get(timing_futures)
+
+        # Aggregate using max across workers, sum within each worker
+        aggregated = Timer.aggregate_max(timers, reduction_op="sum")
+
+        return aggregated

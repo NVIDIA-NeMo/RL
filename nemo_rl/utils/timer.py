@@ -16,7 +16,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Generator, Optional, Sequence, Union
+from typing import Any, Callable, Generator, Optional, Sequence, Union
 
 import numpy as np
 
@@ -234,47 +234,11 @@ class Timer:
 
         return results
 
-    def save_to_json(
-        self,
-        filepath: Union[str, Path],
-        reduction_op: str = "sum",
-        metadata: Optional[dict] = None,
-    ) -> None:
-        """Save timing measurements to a JSON file.
-
-        Args:
-            filepath: Path where the JSON file will be saved
-            reduction_op: Reduction operation to apply to all timing measurements.
-                         Valid options are: "mean", "median", "min", "max", "std", "sum", "count"
-            metadata: Optional dictionary of metadata to include in the JSON file
-
-        Raises:
-            ValueError: If an invalid reduction operation is provided
-        """
-        filepath = Path(filepath)
-
-        # Get timing metrics with the specified reduction
-        timing_metrics = self.get_timing_metrics(reduction_op=reduction_op)
-
-        # Build the output dictionary
-        output = {
-            "timings": timing_metrics,
-            "reduction_op": reduction_op,
-        }
-
-        if metadata is not None:
-            output["metadata"] = metadata
-
-        # Write to JSON file
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w") as f:
-            json.dump(output, f, indent=2)
-
     @staticmethod
     def aggregate_max(
         timers: list["Timer"],
         reduction_op: str = "sum",
-    ) -> dict[str, float | list[float]]:
+    ) -> dict[str, float]:
         """Aggregate multiple timers by taking the maximum value for each label.
 
         Args:
@@ -297,7 +261,7 @@ class Timer:
             all_labels.update(timer._timers.keys())
 
         # Aggregate by taking max for each label
-        aggregated: dict[str, float | list[float]] = {}
+        aggregated: dict[str, float] = {}
         for label in all_labels:
             max_value = float("-inf")
             for timer in timers:
@@ -308,6 +272,29 @@ class Timer:
             aggregated[label] = max_value
 
         return aggregated
+
+    @staticmethod
+    def save_aggregated_to_json(
+        timings: dict[str, float],
+        filepath: Union[str, Path],
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Save aggregated timing dict to a JSON file.
+
+        Args:
+            timings: Dictionary mapping labels to timing values
+            filepath: Path where the JSON file will be saved
+            metadata: Optional dictionary of metadata to include
+        """
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        output: dict[str, Any] = {"timings": timings}
+        if metadata is not None:
+            output["metadata"] = metadata
+
+        with open(filepath, "w") as f:
+            json.dump(output, f, indent=2)
 
     def reset(self, label: Optional[str] = None) -> None:
         """Reset timings for the specified label or all labels.

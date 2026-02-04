@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Measure module import time (import time first for measurement)
+import time
+
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
+
 import copy
 import gc
 import os
@@ -36,6 +41,9 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.timer import Timer
+
+# Calculate module import duration after all imports
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -145,6 +153,10 @@ class BaseVllmGenerationWorker:
 
         # Initialize timer for tracking initialization stages
         self.init_timer = Timer()
+
+        # Record module import time
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -438,13 +450,9 @@ class BaseVllmGenerationWorker:
         """Check if the worker is alive."""
         return True
 
-    def get_init_timing(self) -> dict[str, float]:
-        """Get initialization timing metrics.
-
-        Returns:
-            Dictionary mapping timing labels to elapsed times in seconds
-        """
-        return self.init_timer.get_timing_metrics(reduction_op="sum")
+    def get_init_timer(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()

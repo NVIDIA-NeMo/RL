@@ -247,77 +247,44 @@ class TestTimerExtensions:
     def tmp_path(self, tmp_path):
         return tmp_path
 
-    def test_save_to_json_basic(self, timer, tmp_path):
-        """Test basic JSON saving functionality."""
-        # Record some measurements
-        timer._timers["operation1"] = [1.0, 2.0, 3.0]
-        timer._timers["operation2"] = [4.0, 5.0]
-
-        # Save to JSON
+    def test_save_aggregated_to_json_basic(self, tmp_path):
+        """Test basic save_aggregated_to_json functionality."""
+        timings = {"operation1": 6.0, "operation2": 9.0}
         filepath = tmp_path / "timings.json"
-        timer.save_to_json(filepath, reduction_op="sum")
 
-        # Verify file exists and contains expected data
+        Timer.save_aggregated_to_json(timings, filepath)
+
         assert filepath.exists()
-
         with open(filepath) as f:
             data = json.load(f)
 
         assert "timings" in data
-        assert "reduction_op" in data
-        assert data["reduction_op"] == "sum"
-        assert data["timings"]["operation1"] == 6.0  # sum of [1, 2, 3]
-        assert data["timings"]["operation2"] == 9.0  # sum of [4, 5]
+        assert data["timings"]["operation1"] == 6.0
+        assert data["timings"]["operation2"] == 9.0
 
-    def test_save_to_json_with_metadata(self, timer, tmp_path):
-        """Test JSON saving with metadata."""
-        timer._timers["test_op"] = [1.0, 2.0]
-
-        # Save with metadata
-        filepath = tmp_path / "timings_with_meta.json"
+    def test_save_aggregated_to_json_with_metadata(self, tmp_path):
+        """Test save_aggregated_to_json with metadata."""
+        timings = {"test_op": 1.5}
         metadata = {"worker_id": 0, "hostname": "test-node"}
-        timer.save_to_json(filepath, reduction_op="mean", metadata=metadata)
+        filepath = tmp_path / "timings_with_meta.json"
 
-        # Verify metadata is included
+        Timer.save_aggregated_to_json(timings, filepath, metadata=metadata)
+
         with open(filepath) as f:
             data = json.load(f)
 
         assert "metadata" in data
         assert data["metadata"]["worker_id"] == 0
         assert data["metadata"]["hostname"] == "test-node"
-        assert data["timings"]["test_op"] == 1.5  # mean of [1, 2]
+        assert data["timings"]["test_op"] == 1.5
 
-    def test_save_to_json_different_reductions(self, timer, tmp_path):
-        """Test JSON saving with different reduction operations."""
-        timer._timers["values"] = [1.0, 2.0, 3.0, 4.0, 5.0]
-
-        # Test different reductions
-        for reduction_op in ["mean", "max", "min", "sum"]:
-            filepath = tmp_path / f"timings_{reduction_op}.json"
-            timer.save_to_json(filepath, reduction_op=reduction_op)
-
-            with open(filepath) as f:
-                data = json.load(f)
-
-            assert data["reduction_op"] == reduction_op
-            if reduction_op == "mean":
-                assert data["timings"]["values"] == 3.0
-            elif reduction_op == "max":
-                assert data["timings"]["values"] == 5.0
-            elif reduction_op == "min":
-                assert data["timings"]["values"] == 1.0
-            elif reduction_op == "sum":
-                assert data["timings"]["values"] == 15.0
-
-    def test_save_to_json_creates_directory(self, timer, tmp_path):
-        """Test that save_to_json creates parent directories if they don't exist."""
-        timer._timers["test"] = [1.0]
-
-        # Use a nested path that doesn't exist yet
+    def test_save_aggregated_to_json_creates_directory(self, tmp_path):
+        """Test that save_aggregated_to_json creates parent directories."""
+        timings = {"test": 1.0}
         filepath = tmp_path / "nested" / "dir" / "timings.json"
-        timer.save_to_json(filepath, reduction_op="sum")
 
-        # Verify file was created along with parent directories
+        Timer.save_aggregated_to_json(timings, filepath)
+
         assert filepath.exists()
         assert filepath.parent.exists()
 
