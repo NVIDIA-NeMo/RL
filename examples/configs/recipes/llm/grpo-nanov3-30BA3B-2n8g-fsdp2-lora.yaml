@@ -5,7 +5,9 @@ grpo:
 checkpointing:
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-fsdp2-lora
 policy:
-  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
   train_micro_batch_size: 1
   logprob_batch_size: 1

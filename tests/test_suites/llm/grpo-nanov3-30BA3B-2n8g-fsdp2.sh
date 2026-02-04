@@ -15,7 +15,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
@@ -35,8 +35,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/reward"]["10"] > 0.8' \
+        'mean(data["train/gen_kl_error"]) < 0.02' \
+        'max(data["train/reward"]) > 0.05' \
         'mean(data["timing/train/total_step_time"], -6, -1) < 120'
 
     # Clean up checkpoint directory after successful run to save space.
