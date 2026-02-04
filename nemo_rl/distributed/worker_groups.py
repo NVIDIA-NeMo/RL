@@ -29,6 +29,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
@@ -1029,3 +1030,36 @@ class RayWorkerGroup:
         self._worker_metadata = []
 
         return success
+
+    def collect_init_timing(self) -> dict[str, float]:
+        """Collect and aggregate initialization timing from all workers.
+
+        Returns:
+            dict[str, float]: Dictionary mapping timing labels to aggregated max values.
+                             Returns empty dict if workers don't have timing or on error.
+        """
+        try:
+            # Check if workers support get_init_timing
+            if not self._workers:
+                return {}
+
+            # Collect timing from all workers
+            timing_futures = []
+            for worker in self._workers:
+                if hasattr(worker, "get_init_timing"):
+                    timing_futures.append(worker.get_init_timing.remote())
+
+            if not timing_futures:
+                return {}
+
+            # Get all timers
+            timers = ray.get(timing_futures)
+
+            # Aggregate using max across workers, sum within each worker
+            aggregated = Timer.aggregate_max(timers, reduction_op="sum")
+
+            return aggregated
+
+        except Exception:
+            # Return empty dict on any error
+            return {}

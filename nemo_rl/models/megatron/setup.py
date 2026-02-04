@@ -15,6 +15,7 @@
 import os
 import time
 import warnings
+from contextlib import nullcontext
 from typing import Any, Optional, TypeVar
 
 import torch
@@ -73,6 +74,7 @@ from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
 )
+from nemo_rl.utils.timer import Timer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -624,17 +626,23 @@ def setup_model_and_optimizer(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    init_timer: Optional[Timer] = None,
 ):
+    def timer_context(label: str):
+        """Helper to conditionally use timer context."""
+        return init_timer.time(label) if init_timer is not None else nullcontext()
+
     state = GlobalState()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
     megatron_cfg.dist.external_gpu_device_mapping = True
-    initialize_megatron(
-        cfg=megatron_cfg,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-    )
+    with timer_context("initialize_megatron"):
+        initialize_megatron(
+            cfg=megatron_cfg,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+        )
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
         fault_tolerance.setup(megatron_cfg, state)
@@ -731,22 +739,24 @@ def setup_model_and_optimizer(
         pre_wrap_hook.extend([composed_peft_hook])
 
     # Model, optimizer, and learning rate.
-    model = get_model(
-        megatron_cfg.model,
-        megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-    )
-    if load_optimizer:
-        optimizer, scheduler = setup_optimizer(
-            optimizer_config=megatron_cfg.optimizer,
-            scheduler_config=megatron_cfg.scheduler,
-            model=model,
-            use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+    with timer_context("model_init"):
+        model = get_model(
+            megatron_cfg.model,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=pre_wrap_hook,
+            mixed_precision_wrapper=mixed_precision_wrapper,
         )
+    if load_optimizer:
+        with timer_context("optimizer_init"):
+            optimizer, scheduler = setup_optimizer(
+                optimizer_config=megatron_cfg.optimizer,
+                scheduler_config=megatron_cfg.scheduler,
+                model=model,
+                use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            )
     else:
         optimizer = None
         scheduler = None
@@ -774,14 +784,16 @@ def setup_model_and_optimizer(
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
-        )
+        with timer_context("load_checkpoint"):
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
         print("Checkpoint loaded")
     torch.distributed.barrier()
 

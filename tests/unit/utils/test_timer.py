@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import time
 from unittest.mock import patch
 
@@ -233,3 +234,163 @@ class TestTimeoutChecker:
         checker.mark_iteration()
         assert len(checker.iteration_times) == 1
         assert checker.iteration_times[0] > 0
+
+
+class TestTimerExtensions:
+    """Test suite for save_to_json and aggregate_max methods."""
+
+    @pytest.fixture
+    def timer(self):
+        return Timer()
+
+    @pytest.fixture
+    def tmp_path(self, tmp_path):
+        return tmp_path
+
+    def test_save_to_json_basic(self, timer, tmp_path):
+        """Test basic JSON saving functionality."""
+        # Record some measurements
+        timer._timers["operation1"] = [1.0, 2.0, 3.0]
+        timer._timers["operation2"] = [4.0, 5.0]
+
+        # Save to JSON
+        filepath = tmp_path / "timings.json"
+        timer.save_to_json(filepath, reduction_op="sum")
+
+        # Verify file exists and contains expected data
+        assert filepath.exists()
+
+        with open(filepath) as f:
+            data = json.load(f)
+
+        assert "timings" in data
+        assert "reduction_op" in data
+        assert data["reduction_op"] == "sum"
+        assert data["timings"]["operation1"] == 6.0  # sum of [1, 2, 3]
+        assert data["timings"]["operation2"] == 9.0  # sum of [4, 5]
+
+    def test_save_to_json_with_metadata(self, timer, tmp_path):
+        """Test JSON saving with metadata."""
+        timer._timers["test_op"] = [1.0, 2.0]
+
+        # Save with metadata
+        filepath = tmp_path / "timings_with_meta.json"
+        metadata = {"worker_id": 0, "hostname": "test-node"}
+        timer.save_to_json(filepath, reduction_op="mean", metadata=metadata)
+
+        # Verify metadata is included
+        with open(filepath) as f:
+            data = json.load(f)
+
+        assert "metadata" in data
+        assert data["metadata"]["worker_id"] == 0
+        assert data["metadata"]["hostname"] == "test-node"
+        assert data["timings"]["test_op"] == 1.5  # mean of [1, 2]
+
+    def test_save_to_json_different_reductions(self, timer, tmp_path):
+        """Test JSON saving with different reduction operations."""
+        timer._timers["values"] = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+        # Test different reductions
+        for reduction_op in ["mean", "max", "min", "sum"]:
+            filepath = tmp_path / f"timings_{reduction_op}.json"
+            timer.save_to_json(filepath, reduction_op=reduction_op)
+
+            with open(filepath) as f:
+                data = json.load(f)
+
+            assert data["reduction_op"] == reduction_op
+            if reduction_op == "mean":
+                assert data["timings"]["values"] == 3.0
+            elif reduction_op == "max":
+                assert data["timings"]["values"] == 5.0
+            elif reduction_op == "min":
+                assert data["timings"]["values"] == 1.0
+            elif reduction_op == "sum":
+                assert data["timings"]["values"] == 15.0
+
+    def test_save_to_json_creates_directory(self, timer, tmp_path):
+        """Test that save_to_json creates parent directories if they don't exist."""
+        timer._timers["test"] = [1.0]
+
+        # Use a nested path that doesn't exist yet
+        filepath = tmp_path / "nested" / "dir" / "timings.json"
+        timer.save_to_json(filepath, reduction_op="sum")
+
+        # Verify file was created along with parent directories
+        assert filepath.exists()
+        assert filepath.parent.exists()
+
+    def test_aggregate_max_basic(self):
+        """Test basic aggregate_max functionality."""
+        # Create multiple timers with different measurements
+        timer1 = Timer()
+        timer1._timers["init"] = [1.0, 2.0]  # sum = 3.0
+        timer1._timers["load"] = [5.0]  # sum = 5.0
+
+        timer2 = Timer()
+        timer2._timers["init"] = [3.0, 4.0]  # sum = 7.0
+        timer2._timers["load"] = [2.0]  # sum = 2.0
+
+        timer3 = Timer()
+        timer3._timers["init"] = [1.5, 1.5]  # sum = 3.0
+        timer3._timers["process"] = [10.0]  # sum = 10.0
+
+        # Aggregate using max
+        result = Timer.aggregate_max([timer1, timer2, timer3], reduction_op="sum")
+
+        # Verify max values are selected for each label
+        assert result["init"] == 7.0  # max of [3.0, 7.0, 3.0]
+        assert result["load"] == 5.0  # max of [5.0, 2.0]
+        assert result["process"] == 10.0  # only in timer3
+
+    def test_aggregate_max_empty_list(self):
+        """Test aggregate_max with empty timer list."""
+        result = Timer.aggregate_max([])
+        assert result == {}
+
+    def test_aggregate_max_single_timer(self):
+        """Test aggregate_max with a single timer."""
+        timer = Timer()
+        timer._timers["operation"] = [1.0, 2.0, 3.0]
+
+        result = Timer.aggregate_max([timer], reduction_op="mean")
+        assert result["operation"] == 2.0  # mean of [1, 2, 3]
+
+    def test_aggregate_max_different_reduction_ops(self):
+        """Test aggregate_max with different reduction operations."""
+        timer1 = Timer()
+        timer1._timers["op"] = [1.0, 2.0, 3.0]  # mean=2.0, max=3.0, min=1.0
+
+        timer2 = Timer()
+        timer2._timers["op"] = [4.0, 5.0, 6.0]  # mean=5.0, max=6.0, min=4.0
+
+        # Test with mean reduction
+        result_mean = Timer.aggregate_max([timer1, timer2], reduction_op="mean")
+        assert result_mean["op"] == 5.0  # max of [2.0, 5.0]
+
+        # Test with max reduction
+        result_max = Timer.aggregate_max([timer1, timer2], reduction_op="max")
+        assert result_max["op"] == 6.0  # max of [3.0, 6.0]
+
+        # Test with min reduction
+        result_min = Timer.aggregate_max([timer1, timer2], reduction_op="min")
+        assert result_min["op"] == 4.0  # max of [1.0, 4.0]
+
+    def test_aggregate_max_disjoint_labels(self):
+        """Test aggregate_max when timers have completely different labels."""
+        timer1 = Timer()
+        timer1._timers["operation_a"] = [1.0]
+
+        timer2 = Timer()
+        timer2._timers["operation_b"] = [2.0]
+
+        timer3 = Timer()
+        timer3._timers["operation_c"] = [3.0]
+
+        result = Timer.aggregate_max([timer1, timer2, timer3], reduction_op="sum")
+
+        # All labels should be present with their respective values
+        assert result["operation_a"] == 1.0
+        assert result["operation_b"] == 2.0
+        assert result["operation_c"] == 3.0

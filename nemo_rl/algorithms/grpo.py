@@ -655,6 +655,33 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
+    # Collect worker initialization timing if enabled
+    if master_config["logger"].get("collect_worker_init_timing", False):
+        # Collect timing from all workers (barrier already exists, just fetching data)
+        worker_timers = ray.get(
+            [w.get_init_timing.remote() for w in policy.worker_group.workers]
+        )
+
+        # Aggregate max timing across workers
+        max_timing = Timer.aggregate_max(worker_timers, reduction_op="sum")
+
+        # Save to log directory
+        log_dir = Path(master_config["logger"]["log_dir"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timing_file = log_dir / "worker_init_timing.json"
+
+        aggregated_timer = Timer()
+        aggregated_timer._timers = {k: [v] for k, v in max_timing.items()}
+        aggregated_timer.save_to_json(
+            timing_file,
+            reduction_op="sum",
+            metadata={
+                "num_workers": len(worker_timers),
+                "timestamp": time.time(),
+            },
+        )
+        print(f"✅ Saved worker init timing to {timing_file}")
+
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:

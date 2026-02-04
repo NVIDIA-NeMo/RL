@@ -35,6 +35,7 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.timer import Timer
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -141,6 +142,9 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+
+        # Initialize timer for tracking initialization stages
+        self.init_timer = Timer()
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -420,7 +424,8 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        self._create_engine(llm_kwargs)
+        with self.init_timer.time("create_engine"):
+            self._create_engine(llm_kwargs)
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
@@ -432,6 +437,14 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    def get_init_timing(self) -> dict[str, float]:
+        """Get initialization timing metrics.
+
+        Returns:
+            Dictionary mapping timing labels to elapsed times in seconds
+        """
+        return self.init_timer.get_timing_metrics(reduction_op="sum")
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
