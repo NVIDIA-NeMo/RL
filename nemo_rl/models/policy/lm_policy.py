@@ -71,6 +71,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
     ):
+        self.is_prepared = False
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -301,6 +302,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training()?"
+            )
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -523,6 +529,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training()?"
+            )
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
@@ -620,6 +631,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training()?"
+            )
         """Generate a batch of data using the policy."""
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
@@ -710,11 +726,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return True
 
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        self.is_prepared = True
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
+        self.is_prepared = True
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"
         )
@@ -858,6 +876,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
+        # workers performed a full offload -> this policy is no longer prepared
+        try:
+            self.is_prepared = False
+        except Exception:
+            pass
 
     def save_checkpoint(
         self,
