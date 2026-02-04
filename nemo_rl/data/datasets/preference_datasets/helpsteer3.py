@@ -16,53 +16,58 @@ from typing import Any
 from absl import logging
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-def to_preference_data_format(data: dict[str, Any]) -> dict:
-    response_1 = data["response1"]
-    response_2 = data["response2"]
-    overall_preference = data["overall_preference"]
+class HelpSteer3Dataset(RawDataset):
+    """HelpSteer3 preference dataset for DPO training.
 
-    if overall_preference < 0:
-        chosen = response_1
-        rejected = response_2
-    elif overall_preference == 0:
-        logging.log_every_n(
-            logging.WARNING,
-            "Preference is 0 for some examples! Setting chosen and rejected to response 1 since we don't know which response is better",
-            1000,
-        )
-        chosen = response_1
-        rejected = response_1
-    else:
-        chosen = response_2
-        rejected = response_1
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
 
-    if isinstance(data["context"], str):
-        context = [{"role": "user", "content": data["context"]}]
-    else:
-        context = data["context"]
-
-    return {
-        "context": context,
-        "completions": [
-            {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
-            {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},
-        ],
-    }
-
-
-class HelpSteer3Dataset:
-    """HelpSteer3 preference dataset for DPO training."""
-
-    def __init__(self) -> None:
-        ds = load_dataset("nvidia/HelpSteer3", "preference")
+    def __init__(self, split: str = "train", **kwargs):
         self.task_name = "HelpSteer3"
-        self.formatted_ds = ds.map(to_preference_data_format)
-        self.formatted_ds = self.formatted_ds.map(
-            lambda _: {"task_name": self.task_name}
+
+        # load from huggingface
+        self.dataset = load_dataset("nvidia/HelpSteer3", "preference")[split]
+
+        # format the dataset
+        self.dataset = self.dataset.map(
+            self.format_data,
+            remove_columns=self.dataset.column_names,
         )
-        self.task_spec = TaskDataSpec(
-            task_name=self.task_name,
-        )
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        response_1 = data["response1"]
+        response_2 = data["response2"]
+        overall_preference = data["overall_preference"]
+
+        if overall_preference < 0:
+            chosen = response_1
+            rejected = response_2
+        elif overall_preference == 0:
+            logging.log_every_n(
+                logging.WARNING,
+                "Preference is 0 for some examples! Setting chosen and rejected to response 1 since we don't know which response is better",
+                1000,
+            )
+            chosen = response_1
+            rejected = response_1
+        else:
+            chosen = response_2
+            rejected = response_1
+
+        if isinstance(data["context"], str):
+            context = [{"role": "user", "content": data["context"]}]
+        else:
+            context = data["context"]
+
+        return {
+            "context": context,
+            "completions": [
+                {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
+                {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},
+            ],
+            "task_name": self.task_name,
+        }

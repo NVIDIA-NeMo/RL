@@ -25,7 +25,9 @@ policy:
   - milestones:
     - 211
 data:
-  dataset_name: Tulu3Preference
+  train:
+    dataset_name: Tulu3Preference
+  validation: null
 dpo:
   max_num_steps: 2110
   val_period: -1

@@ -27,6 +27,7 @@ class ResponseDataset(RawDataset):
         input_key: str,     # The input prompt/context
         output_key: str,    # The output response/answer
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
     Args:
         data_path: Path to the dataset JSON file
@@ -49,7 +50,10 @@ class ResponseDataset(RawDataset):
     ):
         self.input_key = input_key
         self.output_key = output_key
-        self.task_name = data_path.split("/")[-1].split(".")[0]
+
+        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if self.task_name[0] == "-":
+            self.task_name = self.task_name[1:]
 
         # load from local or huggingface
         self.dataset = load_dataset_from_path(data_path, split)
