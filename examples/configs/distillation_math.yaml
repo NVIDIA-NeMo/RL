@@ -4,6 +4,7 @@ distillation:
     num_generations_per_prompt: 1
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
+    max_num_epochs: 10
     val_batch_size: 64
     val_period: 20
     val_at_start: false
@@ -19,7 +20,7 @@ loss_fn:
 checkpointing:
     enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
-    metric_name: "val_reward"
+    metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
     higher_is_better: true
     keep_top_k: 3
     save_period: 10
@@ -31,6 +32,7 @@ policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
+        chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
     train_global_batch_size: 64
     train_micro_batch_size: 1
     generation_batch_size: 64
@@ -38,6 +40,8 @@ policy: &POLICY_BASE
     max_total_sequence_length: 8192
     precision: "bfloat16"
     logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
@@ -79,8 +83,76 @@ policy: &POLICY_BASE
             foreach: False
             fused: False
 
-    megatron_cfg: # [TODO]
+    megatron_cfg: &MEGATRON_BASE
         enabled: false
+        empty_unused_memory_level: 0
+        activation_checkpointing: false
+        converter_type: "Qwen3ForCausalLM"
+        tensor_model_parallel_size: 2
+        expert_tensor_parallel_size: 1
+        expert_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
+        num_layers_in_first_pipeline_stage: null
+        num_layers_in_last_pipeline_stage: null
+        context_parallel_size: 2
+        pipeline_dtype: ${policy.precision}
+        sequence_parallel: false
+        freeze_moe_router: true
+        moe_router_dtype: "fp64"
+        moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+        moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+        moe_permute_fusion: false
+        #gives ~20% training perf speedup with sequence packing 
+        apply_rope_fusion: True
+        bias_activation_fusion: True
+        defer_fp32_logits: False
+        moe_per_layer_logging: False
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "allgather"
+        moe_shared_expert_overlap: false
+        
+        optimizer:
+            optimizer: "adam"
+            lr: 2.00001e-5
+            min_lr: 2.0e-5
+            weight_decay: 0.01
+            bf16: true
+            fp16: false
+            params_dtype: "float32"
+
+            #adam
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            adam_eps: 1e-8
+
+            #sgd
+            sgd_momentum: 0.9
+
+            #distributed optimizer
+            use_distributed_optimizer: true
+            use_precision_aware_optimizer: true
+
+            # optimizer cpu offload
+            optimizer_cpu_offload: false
+            optimizer_offload_fraction: 0.0
+
+            clip_grad: ${policy.max_grad_norm}
+
+        scheduler:
+            start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            weight_decay_incr_style: "constant"
+            lr_decay_style: "constant"
+            lr_decay_iters: 1000
+            lr_warmup_iters: 10
+            lr_warmup_init: 2.0e-6
+
+        distributed_data_parallel_config:
+            grad_reduce_in_fp32: false
+            overlap_grad_reduce: true
+            overlap_param_gather: true
+            use_custom_fsdp: false
+            data_parallel_sharding_strategy: "optim_grads_params"
 
     scheduler:
         - name: "torch.optim.lr_scheduler.LinearLR"
@@ -105,6 +177,7 @@ policy: &POLICY_BASE
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
+            kv_cache_dtype: "auto"
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -136,10 +209,19 @@ teacher:
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-    prompt_file: "examples/prompts/cot.txt"
-    system_prompt_file: null
-    dataset_name: "DeepScaler"
     shuffle: true
+
+    # dataset
+    train:
+        dataset_name: DeepScaler
+    validation:
+        dataset_name: AIME2024
+        repeat: 16
+    # default settings for all datasets
+    default:
+        prompt_file: "examples/prompts/cot.txt"
+        system_prompt_file: null
+        env_name: "math"
 
 env:
     math:
@@ -155,9 +237,12 @@ logger:
     monitor_gpus: true
     wandb:
         project: "nemo-distillation"
-        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    swanlab:
+        project: "nemo-distillation"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
-        log_dir: "tb_logs-distillation-${data.dataset_name}"
+        log_dir: "tb_logs-distillation-${data.train.dataset_name}"
     mlflow:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"

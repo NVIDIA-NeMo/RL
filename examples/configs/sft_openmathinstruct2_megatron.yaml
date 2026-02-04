@@ -14,7 +14,7 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft_openmathinstruct2"
-  metric_name: "val_loss"
+  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
@@ -35,11 +35,11 @@ policy:
     activation_checkpointing: false
     context_parallel_size: 1
     distributed_data_parallel_config:
-      average_in_collective: true
       data_parallel_sharding_strategy: optim_grads_params
       grad_reduce_in_fp32: true
       overlap_grad_reduce: true
       overlap_param_gather: true
+      use_custom_fsdp: false
     empty_unused_memory_level: 1
     enabled: true
     expert_tensor_parallel_size: 1
@@ -61,6 +61,10 @@ policy:
       use_distributed_optimizer: true
       use_precision_aware_optimizer: false #true ## TODO: precision aware optim not working with fp8. Is this expected?
       weight_decay: 0.01
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
 
       ## recently introduced, our current mcore commit doesn't have this
       #fp8_recipe: delayed
@@ -85,6 +89,12 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
@@ -118,14 +128,7 @@ policy:
   optimizer: null
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "openmathinstruct2"
-  prompt_file: examples/prompts/math.txt
-  split: "train_1M"
-  add_bos: true
-  add_eos: true
-  add_generation_prompt: true
-  output_key: 'generated_solution'
+  num_workers: 1
 
 logger:
   log_dir: "logs"  # Base directory for all logs

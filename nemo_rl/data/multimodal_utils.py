@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+from io import BytesIO
 from typing import Optional, Union
 
+import requests
 import torch
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
 
@@ -179,3 +183,30 @@ def get_dim_to_pack_along(processor, key: str) -> int:
         return 1
     # return zero by default
     return 0
+
+
+def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
+    """Resolve the image path to a PIL.Image object.
+
+    image_path can be either:
+    - path to local file
+    - url to image
+    - base64 encoded image
+    """
+    if isinstance(image_path_or_image, Image.Image):
+        return image_path_or_image
+
+    if image_path_or_image.startswith(("http://", "https://")):
+        # Handle URL
+        response = requests.get(image_path_or_image)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    elif image_path_or_image.startswith("data:"):
+        # Handle base64 encoded image
+        # Format: data:image/jpeg;base64,/9j/4AAQSkZJRg...
+        header, encoded = image_path_or_image.split(",", 1)
+        image_data = base64.b64decode(encoded)
+        return Image.open(BytesIO(image_data)).convert("RGB")
+    else:
+        # Handle local file path
+        return Image.open(image_path_or_image).convert("RGB")

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -29,7 +29,7 @@ def mock_components():
     policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
-        "all_mb_metrics": {},
+        "all_mb_metrics": {"global_valid_toks": [10]},
     }
 
     # Create a proper message log structure with token_ids
@@ -61,7 +61,6 @@ def mock_components():
     loss_fn = NLLLoss()
     logger = MagicMock()
     checkpointer = MagicMock()
-    sft_task_spec = MagicMock()
 
     # Create mock master config
     master_config = {
@@ -83,6 +82,10 @@ def mock_components():
             "checkpoint_must_save_by": None,
             "save_period": 10,
         },
+        "cluster": {
+            "num_nodes": 1,
+            "gpus_per_node": 2,
+        },
     }
 
     return {
@@ -93,7 +96,6 @@ def mock_components():
         "loss_fn": loss_fn,
         "logger": logger,
         "checkpointer": checkpointer,
-        "sft_task_spec": sft_task_spec,
         "master_config": master_config,
     }
 
@@ -114,7 +116,6 @@ def test_exit_on_max_steps(mock_components):
         mock_components["loss_fn"],
         mock_components["master_config"],
         mock_components["logger"],
-        mock_components["sft_task_spec"],
         mock_components["checkpointer"],
         sft_save_state,
     )
@@ -140,10 +141,108 @@ def test_exit_on_max_epochs(mock_components):
         mock_components["loss_fn"],
         mock_components["master_config"],
         mock_components["logger"],
-        mock_components["sft_task_spec"],
         mock_components["checkpointer"],
         sft_save_state,
     )
 
     # Verify we trained for exactly two epochs (20 batches).
     assert mock_components["policy"].train.call_count == 20
+
+
+def test_exit_on_timeout(mock_components, capsys):
+    """Test that training loop exits when timeout is reached"""
+    # Set max steps and epochs to large numbers
+    mock_components["master_config"]["sft"]["max_num_steps"] = 100
+    mock_components["master_config"]["sft"]["max_num_epochs"] = 10
+
+    sft_save_state = _default_sft_save_state()
+
+    # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
+    with patch("nemo_rl.algorithms.sft.TimeoutChecker") as mock_timeout_class:
+        mock_timeout_instance = MagicMock()
+        # Create a side_effect that returns False 7 times, then True
+        check_results = [False] * 7 + [True]
+        mock_timeout_instance.check_save.side_effect = check_results
+        mock_timeout_class.return_value = mock_timeout_instance
+
+        # Run training
+        sft_train(
+            mock_components["policy"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["master_config"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            sft_save_state,
+        )
+
+        # Verify training stopped at 8 steps (when check_save returned True)
+        assert mock_components["policy"].train.call_count == 8
+
+        # Verify the timeout message was printed and is near the end (not followed by more training)
+        captured = capsys.readouterr()
+        output_lines = captured.out.strip().split("\n")
+
+        # Find the timeout message
+        timeout_line_idx = None
+        for i, line in enumerate(output_lines):
+            if "Timeout has been reached, stopping training early" in line:
+                timeout_line_idx = i
+                break
+
+        assert timeout_line_idx is not None, "Timeout message not found in output"
+
+        # Verify no new epoch started after timeout (which would indicate a bug where break was used instead of return)
+        remaining_lines = output_lines[timeout_line_idx:]
+        for line in remaining_lines:
+            assert "Epoch" not in line or "Epoch 1/10" in line, (
+                f"Training continued to next epoch after timeout: {line}"
+            )
+
+
+def test_training_with_disabled_validation(mock_components):
+    """Test that training works when validation is disabled (val_dataloader=None, val_period<=0)"""
+    mock_components["master_config"]["sft"]["val_period"] = 0
+    mock_components["master_config"]["sft"]["max_num_steps"] = 5
+    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+
+    sft_save_state = _default_sft_save_state()
+
+    sft_train(
+        mock_components["policy"],
+        mock_components["train_dataloader"],
+        None,  # val_dataloader is None
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["master_config"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        sft_save_state,
+    )
+
+    assert mock_components["policy"].train.call_count == 5
+
+
+def test_training_with_negative_val_period(mock_components):
+    """Test that training works when val_period is negative (validation disabled)"""
+    mock_components["master_config"]["sft"]["val_period"] = -1
+    mock_components["master_config"]["sft"]["max_num_steps"] = 3
+    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+
+    sft_save_state = _default_sft_save_state()
+
+    sft_train(
+        mock_components["policy"],
+        mock_components["train_dataloader"],
+        None,  # val_dataloader is None
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["master_config"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        sft_save_state,
+    )
+
+    assert mock_components["policy"].train.call_count == 3

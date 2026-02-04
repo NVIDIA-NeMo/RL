@@ -16,11 +16,18 @@ import tempfile
 import time
 from typing import Optional
 
+import numpy as np
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
+from nemo_rl.algorithms.loss_functions import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    DPOLossFn,
+    NLLLoss,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -28,6 +35,23 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLoss
+
+basic_pg_loss_test_config: ClippedPGLossConfig = {
+    "ratio_clip_min": 0.2,
+    "ratio_clip_max": 0.2,
+    "ratio_clip_c": None,
+    "reference_policy_kl_penalty": 0.1,
+    "reference_policy_kl_type": "k3",
+    "kl_input_clamp_value": 20.0,
+    "kl_output_clamp_value": 10.0,
+    "disable_ppo_ratio": False,
+    "use_on_policy_kl_approximation": False,
+    "use_importance_sampling_correction": False,
+    "truncated_importance_sampling_ratio": None,
+    "sequence_level_importance_ratios": False,
+    "token_level_loss": True,
+    "force_on_policy_ratio": False,
+}
 
 
 def create_megatron_test_config(
@@ -53,6 +77,7 @@ def create_megatron_test_config(
         "logprob_batch_size": 2,
         "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,
@@ -61,6 +86,16 @@ def create_megatron_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
+            "mcore_generation_config": {
+                "buffer_size_gb": 20,
+                "buffer_guaranteed_fraction": 0.1,
+                "num_cuda_graphs": 16,
+                "block_size_tokens": 256,
+                "use_cuda_graphs_for_non_decode_steps": True,
+                "enable_chunked_prefill": True,
+                "unified_memory_level": 0,
+                "max_tokens": 16384,
+            },
             "colocated": {
                 "enabled": True,
                 "resources": {
@@ -98,6 +133,11 @@ def create_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "allgather",
+            "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
@@ -114,6 +154,8 @@ def create_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -128,7 +170,6 @@ def create_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
             "fp8_cfg": {
@@ -446,6 +487,7 @@ def generation_setup(request, tiny_llama_model_path):
             tiny_llama_model_path,
             tp=tp,
             pp=pp,
+            precision="bfloat16",  # FlashAttention requires fp16 or bf16
             generation_backend=generation_backend,
         )
 
@@ -512,7 +554,6 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping megatron generation tests for now")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",
@@ -785,18 +826,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
 
     # Test loss functions
     nll_loss_fn = NLLLoss()
-    pg_loss_fn = ClippedPGLossFn(
-        {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "reference_policy_kl_penalty": 0.1,
-            "disable_ppo_ratio": False,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "token_level_loss": True,
-        }
-    )
+    pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     policy1.prepare_for_training()
     mbs1_nll_results = policy1.train(data, nll_loss_fn)
@@ -840,6 +870,96 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     # Verify both loss functions are independent of microbatch size
     torch.testing.assert_close(mbs1_nll_loss, mbs2_nll_loss, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(mbs1_pg_loss, mbs2_pg_loss, rtol=1e-5, atol=1e-5)
+
+    policy2.shutdown()
+    cluster2.shutdown()
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.hf_gated
+def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model_path):
+    """Verify grad_norm is invariant to number of microbatches."""
+    num_gpus = 2
+    global_batch_size = 4
+    seq_len = 64
+    vocab_size = 32000
+
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, vocab_size, (global_batch_size, seq_len))
+    attention_mask = torch.ones(global_batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": torch.triu(
+                torch.ones(global_batch_size, seq_len), diagonal=1
+            ),
+            "sample_mask": torch.ones((global_batch_size,)),
+            "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
+        }
+    )
+
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+    nll_loss_fn = NLLLoss()
+
+    cluster1 = RayVirtualCluster(
+        name="test-gradnorm-mbs1",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=1, num_microbatches=4
+    config1 = create_megatron_test_config(tiny_llama_model_path)
+    config1["train_global_batch_size"] = global_batch_size
+    config1["train_micro_batch_size"] = 1
+    config1["generation"] = configure_generation_config(
+        config1["generation"], tokenizer
+    )
+
+    policy1 = Policy(
+        cluster=cluster1,
+        config=config1,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy1.prepare_for_training()
+    res1 = policy1.train(data, nll_loss_fn, gbs=global_batch_size, mbs=1)
+    grad_norm_1 = res1["grad_norm"].cpu()
+    policy1.shutdown()
+    cluster1.shutdown()
+
+    cluster2 = RayVirtualCluster(
+        name="test-gradnorm-mbs2",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=2, num_microbatches=2
+    config2 = create_megatron_test_config(tiny_llama_model_path)
+    config2["train_global_batch_size"] = global_batch_size
+    config2["train_micro_batch_size"] = 2
+    config2["generation"] = configure_generation_config(
+        config2["generation"], tokenizer
+    )
+
+    policy2 = Policy(
+        cluster=cluster2,
+        config=config2,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy2.prepare_for_training()
+    res2 = policy2.train(data, nll_loss_fn, gbs=global_batch_size, mbs=2)
+    grad_norm_2 = res2["grad_norm"].cpu()
+
+    torch.testing.assert_close(grad_norm_1, grad_norm_2, rtol=1e-5, atol=1e-5)
 
     policy2.shutdown()
     cluster2.shutdown()
@@ -1318,6 +1438,363 @@ def test_megatron_dpo_training(tiny_llama_model_path):
         cluster.shutdown()
 
 
+@pytest.fixture
+def topk_setup(request):
+    """Setup and teardown specifically for top-k logits tests."""
+    # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
+    if hasattr(request, "param") and request.param is not None:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = request.param
+    else:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    cluster = None
+    data = None
+
+    try:
+        cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
+        print(
+            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        # Determine converter type based on model
+        converter_type = "LlamaForCausalLM"
+        if "qwen" in model_name.lower():
+            converter_type = "Qwen2ForCausalLM"
+        elif "gemma" in model_name.lower():
+            converter_type = "GemmaForCausalLM"
+
+        config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            converter_type=converter_type,
+            logprob_chunk_size=logprob_chunk_size,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron topk Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create test data
+        print("Creating test batch...")
+        torch.manual_seed(77)
+
+        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
+        attention_mask = torch.ones(4, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        yield policy, cluster, data
+
+    except Exception as e:
+        print(f"Error during topk setup: {e}")
+        pytest.skip(f"Topk setup failed: {e}")
+    finally:
+        print("Cleaning up topk resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "topk_setup",
+    [
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        (2, 1, 1, None, None, "tiny_llama_model_path"),
+        (2, 2, 1, None, None, "tiny_llama_model_path"),
+        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 1, 1, None, True, "tiny_llama_model_path"),
+        (2, 2, 1, None, True, "tiny_llama_model_path"),
+        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, True, "tiny_llama_model_path"),
+        (2, 2, 1, 16, True, "tiny_llama_model_path"),
+        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+    ],
+    indirect=True,
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
+)
+def test_megatron_policy_topk_logits(topk_setup):
+    """Test Megatron policy top-k logits computation."""
+    policy, cluster, data = topk_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Generate top-k logits
+    print("\nGenerating top-k logits...")
+    policy.prepare_for_lp_inference()
+    k = 5
+    outputs = policy.get_topk_logits(data, k=k)
+
+    # Basic validation
+    assert "topk_logits" in outputs and "topk_indices" in outputs, (
+        "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+    )
+    topk_logits = outputs["topk_logits"]
+    topk_indices = outputs["topk_indices"]
+
+    assert isinstance(topk_logits, torch.Tensor)
+    assert isinstance(topk_indices, torch.Tensor)
+    assert topk_logits.dtype == torch.float32
+    assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
+
+    # Shape checks
+    B, S = data.get("input_ids").shape
+    assert topk_logits.shape == (B, S, k)
+    assert topk_indices.shape == (B, S, k)
+
+    # Mask invalid positions and check for NaN/Inf
+    valid_mask = (
+        data.get("attention_mask")
+        .unsqueeze(-1)
+        .bool()
+        .expand(-1, -1, topk_logits.shape[-1])
+    )
+    valid_logits = topk_logits[valid_mask]
+    assert not torch.isnan(valid_logits).any(), "Top-k logits should not contain NaN"
+    assert not torch.isinf(valid_logits).any(), "Top-k logits should not contain Inf"
+
+    # Check descending order within top-k for valid positions
+    if S > 1:
+        diffs = topk_logits[..., :-1] - topk_logits[..., 1:]
+        valid_mask_diffs = (
+            data.get("attention_mask")
+            .unsqueeze(-1)
+            .bool()
+            .expand(-1, -1, topk_logits.shape[-1] - 1)
+        )
+        diffs = diffs[valid_mask_diffs]
+        assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
+    """Test that CP and non-CP models produce identical top-k logits with sequence packing enabled."""
+    num_gpus = 2
+    batch_size = 4
+    seq_len = 64
+
+    # Create test data with varying sequence lengths to test sequence packing
+    torch.manual_seed(123)
+    input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
+        batch_size, seq_len
+    )
+    input_lengths = torch.tensor([31, 21, 29, 56], dtype=torch.int32)
+    attention_mask = torch.zeros(batch_size, seq_len)
+    for i, length in enumerate(input_lengths):
+        attention_mask[i, :length] = 1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+        }
+    )
+
+    k = 5
+
+    # Test 1: Non-CP model (context_parallel_size=1) with sequence packing
+    print(
+        "=== Testing Non-CP model (context_parallel_size=1) with sequence packing for top-k ==="
+    )
+    cluster_no_cp = RayVirtualCluster(
+        name="test-no-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_no_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Ensure context parallel is disabled
+    config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+
+    # Enable sequence packing
+    config_no_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    tokenizer = get_tokenizer(config_no_cp["tokenizer"])
+    config_no_cp["generation"] = configure_generation_config(
+        config_no_cp["generation"], tokenizer
+    )
+
+    policy_no_cp = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Get top-k from non-CP model with sequence packing
+    policy_no_cp.prepare_for_lp_inference()
+    out_no_cp = policy_no_cp.get_topk_logits(data, k=k)
+    logits_no_cp = out_no_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp = out_no_cp["topk_indices"]
+    print(f"Non-CP topk logits shape: {logits_no_cp.shape}")
+
+    # Cleanup non-CP resources and run without packing
+    policy_no_cp.shutdown()
+    config_no_cp_no_packing = config_no_cp.copy()
+    config_no_cp_no_packing["sequence_packing"] = {"enabled": False}
+    policy_no_cp_no_packing = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp_no_packing,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy_no_cp_no_packing.prepare_for_lp_inference()
+    out_no_cp_np = policy_no_cp_no_packing.get_topk_logits(data, k=k)
+    logits_no_cp_np = out_no_cp_np["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp_np = out_no_cp_np["topk_indices"]
+    print(f"Non-CP (no packing) topk logits shape: {logits_no_cp_np.shape}")
+    cluster_no_cp.shutdown()
+
+    # Compare non-CP packing vs non-packing
+    print("=== Comparing non-CP packing vs non-packing top-k ===")
+    assert logits_no_cp.shape == logits_no_cp_np.shape
+    assert indices_no_cp.shape == indices_no_cp_np.shape
+    torch.testing.assert_close(logits_no_cp, logits_no_cp_np, rtol=1e-3, atol=1e-2)
+    valid_mask = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_no_cp.shape[-1])
+    )
+    assert torch.equal(indices_no_cp[valid_mask], indices_no_cp_np[valid_mask]), (
+        "Top-k indices should match between packing and non-packing"
+    )
+
+    # Test 2: CP model (context_parallel_size=2) with sequence packing
+    print(
+        "=== Testing CP model (context_parallel_size=2) with sequence packing for top-k ==="
+    )
+    cluster_cp = RayVirtualCluster(
+        name="test-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Enable context parallel
+    config_cp["megatron_cfg"]["context_parallel_size"] = 2
+
+    # Enable sequence packing
+    config_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config_cp["generation"] = configure_generation_config(
+        config_cp["generation"], tokenizer
+    )
+
+    policy_cp = Policy(
+        cluster=cluster_cp,
+        config=config_cp,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy_cp.prepare_for_lp_inference()
+    out_cp = policy_cp.get_topk_logits(data, k=k)
+    logits_cp = out_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_cp = out_cp["topk_indices"]
+
+    # Cleanup CP resources
+    policy_cp.shutdown()
+    cluster_cp.shutdown()
+
+    # Compare CP vs non-CP (no packing)
+    print("=== Comparing CP vs non-CP (no packing) top-k ===")
+    assert logits_no_cp_np.shape == logits_cp.shape
+    assert indices_no_cp_np.shape == indices_cp.shape
+    assert not torch.isnan(logits_cp).any()
+    assert not torch.isinf(logits_cp).any()
+    torch.testing.assert_close(logits_no_cp_np, logits_cp, rtol=1e-3, atol=1e-2)
+    # since there are close logits, we only check the index match ratio
+    valid_mask_idx = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_cp.shape[-1])
+    )
+    cp_idx_flat = indices_cp[valid_mask_idx]
+    nocp_idx_flat = indices_no_cp_np[valid_mask_idx]
+    match_ratio = (cp_idx_flat == nocp_idx_flat).float().mean().item()
+    print(f"Top-k index match ratio (CP vs non-CP): {match_ratio:.4f}")
+    assert match_ratio >= 0.95, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.95)"
+    )
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_sft_training(tiny_llama_model_path):
@@ -1692,18 +2169,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
 
     # Create ClippedPG loss function
-    loss_fn = ClippedPGLossFn(
-        {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "reference_policy_kl_penalty": 0.1,
-            "disable_ppo_ratio": False,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "token_level_loss": True,
-        }
-    )
+    loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     # Train non-CP model
     policy_no_cp.prepare_for_training()
@@ -1818,6 +2284,202 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
 
     print(
         "✓ SUCCESS: CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing"
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_path):
+    """Test that gradient norms are consistent across different TP and DP configurations.
+
+    This test validates that the same model produces identical gradient norms
+    regardless of tensor parallelism (TP) and data parallelism (DP) settings.
+    """
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create reproducible test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones_like(input_ids),
+        }
+    )
+
+    # Test configurations: (num_gpus, tp, pp, description)
+    test_configs = [
+        (1, 1, 1, "DP1TP1"),
+        (2, 1, 1, "DP2"),  # Data parallel with 2 GPUs
+        (2, 2, 1, "TP2"),  # Tensor parallel with 2 GPUs
+    ]
+
+    grad_norms = {}
+    losses = {}
+
+    for num_gpus, tp, pp, desc in test_configs:
+        print(
+            f"\n=== Testing {desc} configuration (GPUs={num_gpus}, TP={tp}, PP={pp}) ==="
+        )
+
+        cluster = RayVirtualCluster(
+            name=f"test-grad-norm-{desc.lower()}",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        config = create_megatron_test_config(
+            model_name=tiny_llama_model_path,
+            tp=tp,
+            pp=pp,
+            precision="float32",  # Use float32 for more stable gradient comparisons
+        )
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Use SimpleLoss for consistent comparison
+        loss_fn = NLLLoss()
+
+        try:
+            # Prepare for training
+            policy.prepare_for_training()
+
+            # Perform one forward/backward step
+            print(f"Performing forward/backward pass for {desc}...")
+            results = policy.train(data, loss_fn)
+
+            # Extract metrics
+            loss_tensor = results["loss"]
+            grad_norm = results["grad_norm"]
+
+            # Verify loss is valid
+            assert not torch.isnan(loss_tensor).any(), (
+                f"Loss should not be NaN for {desc}"
+            )
+            assert not torch.isinf(loss_tensor).any(), (
+                f"Loss should not be Inf for {desc}"
+            )
+
+            # Store results for comparison
+            grad_norms[desc] = grad_norm
+            losses[desc] = loss_tensor.cpu().numpy()
+
+            print(f"{desc} - Loss: {loss_tensor}")
+            print(f"{desc} - Grad norm: {grad_norm}")
+
+            # Check tensor parallel attributes on model parameters
+            print(f"Checking tensor parallel attributes for {desc}...")
+            tp_check_futures = policy.worker_group.run_all_workers_single_data(
+                "check_tensor_parallel_attributes"
+            )
+            tp_check_results = [ray.get(future) for future in tp_check_futures]
+
+            # Analyze the first worker's results (all workers should have the same structure)
+            tp_info = tp_check_results[0]
+
+            print(f"{desc} - TP size: {tp_info['tp_size']}")
+            print(f"{desc} - Total params: {tp_info['total_params']}")
+            print(f"{desc} - TP params: {len(tp_info['tp_params'])}")
+            print(f"{desc} - Non-TP params: {len(tp_info['non_tp_params'])}")
+
+            # Validate tensor parallel attributes
+            expected_tp_size = tp
+            assert tp_info["tp_size"] == expected_tp_size, (
+                f"Expected TP size {expected_tp_size}, got {tp_info['tp_size']}"
+            )
+
+            if tp > 1:
+                tp_sharded_names = [item["name"] for item in tp_info["tp_params"]]
+                # When tensor parallelism is enabled, we should have some TP parameters
+                assert "module.embedding.word_embeddings.weight" in tp_sharded_names, (
+                    f"Expected module.embedding.word_embeddings.weight to be TP-sharded when TP={tp}"
+                )
+
+        finally:
+            policy.shutdown()
+            cluster.shutdown()
+
+    # Compare gradient norms across configurations
+    print("\n=== Comparing gradient norms across configurations ===")
+
+    # Get reference values from DP2 configuration
+    # NOTE: even if TP2 config passes these tests, it doesn't necessarily imply
+    # there are no bugs. That's why we also check that TP attributes are set correctly above
+    reference_config = "DP1TP1"
+    reference_grad_norm = grad_norms[reference_config]
+    reference_loss = losses[reference_config]
+
+    for config_name, grad_norm in grad_norms.items():
+        if config_name == reference_config:
+            continue
+
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+
+        print(f"\nComparing {config_name} with {reference_config}:")
+        print(f"  {reference_config} grad norm: {reference_grad_norm}")
+        print(f"  {config_name} grad norm: {grad_norm}")
+
+        # Compare gradient norms
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+            reference_grad_norm = [reference_grad_norm]
+        if isinstance(grad_norm, list) and isinstance(reference_grad_norm, list):
+            # Handle case where grad_norm is a list (multiple microbatches)
+            assert len(grad_norm) == len(reference_grad_norm), (
+                f"Number of gradient norm values should match: {len(grad_norm)} vs {len(reference_grad_norm)}"
+            )
+
+            for i, (gn, ref_gn) in enumerate(zip(grad_norm, reference_grad_norm)):
+                grad_diff = abs(gn - ref_gn)
+                relative_diff = grad_diff / (ref_gn + 1e-8)
+                print(
+                    f"    Microbatch {i}: {ref_gn} vs {gn}, diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f}"
+                )
+
+                # Allow small differences due to floating point precision and parallelization
+                assert relative_diff < 0.01 or grad_diff < 1e-6, (
+                    f"Gradient norm difference too large for microbatch {i}: "
+                    f"{ref_gn} vs {gn} (diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f})"
+                )
+
+        # Compare losses (should also be identical for same computation)
+        loss_diff = np.max(np.abs(reference_loss - losses[config_name]))
+        relative_loss_diff = loss_diff / (np.mean(np.abs(reference_loss)) + 1e-8)
+        print(
+            f"    Loss diff: {loss_diff:.6f}, relative loss diff: {relative_loss_diff:.6f}"
+        )
+
+        # Allow small differences in loss as well
+        assert relative_loss_diff < 0.01 or loss_diff < 1e-6, (
+            f"Loss difference too large: "
+            f"max diff={loss_diff:.6f}, rel_diff={relative_loss_diff:.6f}"
+        )
+
+    print(
+        "\n✓ SUCCESS: Gradient norms are consistent across all parallelization configurations!"
     )
 
 

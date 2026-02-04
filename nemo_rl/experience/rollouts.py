@@ -17,11 +17,17 @@
 
 import asyncio
 import copy
-from typing import Any
+import json
+import math
+import statistics
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
+from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -38,10 +44,12 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -158,10 +166,9 @@ async def generate_responses_async(
         "Generation returned no outputs for a non-empty batch."
     )
 
-    pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
     )
 
     # Extract everything we need from the generation outputs
@@ -648,6 +655,8 @@ async def run_sample_multi_turn_rollout(
 
     # Track per-turn metrics
     turn_gen_tokens = []
+    turn_input_tokens = []
+    turn_total_tokens = []
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
 
@@ -679,6 +688,8 @@ async def run_sample_multi_turn_rollout(
             assistant_token_count += gen_token_count
             token_count += gen_token_count
             turn_gen_tokens.append(gen_token_count)
+            turn_input_tokens.append(int(input_lengths))
+            turn_total_tokens.append(int(input_lengths) + gen_token_count)
             # Per-worker load accounting
             if "gen_leader_worker_idx" in gen_metrics:
                 worker_idx = int(gen_metrics["gen_leader_worker_idx"])
@@ -764,6 +775,8 @@ async def run_sample_multi_turn_rollout(
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
         "turn_gen_tokens": turn_gen_tokens,
+        "turn_input_tokens": turn_input_tokens,
+        "turn_total_tokens": turn_total_tokens,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -924,6 +937,229 @@ def run_async_multi_turn_rollout(
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
+        # Collect ISL, OSL, and ISL+OSL metrics for all samples
+        rollout_metrics["histogram/gen_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
+        ]
+        rollout_metrics["histogram/input_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_input_tokens"]
+        ]
+        rollout_metrics["histogram/total_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_total_tokens"]
+        ]
+
         return final_batch, rollout_metrics
 
     return asyncio.run(_async_rollout_implementation())
+
+
+@dataclass
+class AsyncNemoGymRolloutResult:
+    input_ids: torch.Tensor
+    final_batch: BatchedDataDict[DatumSpec]
+    rollout_metrics: dict[str, Any]
+
+
+def _calculate_single_metric(
+    values: list[float], batch_size: int, key_name: str
+) -> dict:
+    return {
+        f"{key_name}/mean": sum(values) / batch_size,
+        f"{key_name}/max": max(values),
+        f"{key_name}/min": min(values),
+        f"{key_name}/median": statistics.median(values),
+        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
+        f"{key_name}/histogram": Histogram(values),
+    }
+
+
+def run_async_nemo_gym_rollout(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    generation_config: GenerationConfig,
+    max_seq_len: Optional[int] = None,
+    max_rollout_turns: Optional[int] = None,
+    greedy: bool = False,
+) -> AsyncNemoGymRolloutResult:
+    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
+    nemo_gym_rows = input_batch["extra_env_info"]
+
+    # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
+    # NeMo-Gym policy is "What you see is what you get".
+    assert not greedy, "`greedy` is not supported in NeMo-Gym path!"
+    assert max_rollout_turns is None, (
+        "`max_rollout_turns` is not supported in NeMo-Gym path!"
+    )
+    assert max_seq_len is None, "`max_seq_len` is not supported in NeMo-Gym path!"
+    # We don't use these stop criteria
+    assert not generation_config["stop_strings"], (
+        "Stop strings is not supported in the generation config in NeMo-Gym path!"
+    )
+    assert not generation_config["stop_token_ids"], (
+        "Stop strings is not supported in the generation config in NeMo-Gym path!"
+    )
+    # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
+    assert not generation_config["top_k"], (
+        "Top k is not supported in the generation config in NeMo-Gym path!"
+    )
+
+    timer = Timer()
+    timer_prefix = "timing/rollout"
+    timer.start(f"{timer_prefix}/total")
+
+    for rowidx, row in enumerate(nemo_gym_rows):
+        # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
+        # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
+        # row["max_tokens"] = max_seq_len
+
+        responses_create_params = row["responses_create_params"]
+        responses_create_params["temperature"] = generation_config["temperature"]
+        responses_create_params["top_p"] = generation_config["top_p"]
+
+        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
+        # generation_config["max_new_tokens"]
+
+        row["_rowidx"] = rowidx
+
+    with timer.time(f"{timer_prefix}/run_rollouts"):
+        nemo_gym_environment = task_to_env["nemo_gym"]
+        results, rollout_loop_timing_metrics = ray.get(
+            nemo_gym_environment.run_rollouts.remote(
+                nemo_gym_rows, tokenizer, timer_prefix
+            )
+        )
+
+    # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
+    with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
+        batch_size = len(nemo_gym_rows)
+        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        all_sample_metrics = [
+            {
+                "total_reward": r["full_result"]["reward"],
+                "assistant_tokens": sum(
+                    len(m["token_ids"])
+                    for m in r["message_log"]
+                    if m["role"] == "assistant"
+                ),
+                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
+                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
+                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
+                == max_total_tokens_per_sample,
+            }
+            for r in results
+        ]
+
+    # Aggregate metrics across all samples
+    with timer.time(f"{timer_prefix}/aggregate_metrics"):
+        rollout_metrics = {
+            **rollout_loop_timing_metrics,
+            **_calculate_single_metric(
+                [m["turn_count"] for m in all_sample_metrics],
+                batch_size,
+                "turns_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["total_tokens"] for m in all_sample_metrics],
+                batch_size,
+                "total_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["assistant_tokens"] for m in all_sample_metrics],
+                batch_size,
+                "gen_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["total_reward"] for m in all_sample_metrics],
+                batch_size,
+                "total_reward",
+            ),
+            "natural_termination_rate": sum(
+                not m["hit_max_tokens"] for m in all_sample_metrics
+            )
+            / batch_size,
+            "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
+            / batch_size,
+            # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
+            # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
+            # "mean_env_tokens_per_sample": sum(
+            #     m["env_tokens"] for m in all_sample_metrics
+            # )
+            # / batch_size,
+        }
+
+    # Per-agent misc metrics
+    with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
+        agent_to_results: dict[str, list[dict]] = defaultdict(list)
+        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            agent_name = nemo_gym_row["agent_ref"]["name"]
+            agent_to_results[agent_name].append(result["full_result"])
+
+        per_agent_metrics = {}
+        for agent_name, agent_results in agent_to_results.items():
+            keys = agent_results[0].keys()
+            for key in keys:
+                values = [
+                    float(r[key])
+                    for r in agent_results
+                    if isinstance(r.get(key), (bool, int, float))
+                ]
+                if values:
+                    per_agent_metrics.update(
+                        _calculate_single_metric(
+                            values, len(agent_results), f"{agent_name}/{key}"
+                        )
+                    )
+
+            # Log the full result
+            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
+            per_agent_metrics[f"{agent_name}/full_result"] = Table(
+                data=to_log, columns=["Full result"]
+            )
+
+        rollout_metrics.update(per_agent_metrics)
+
+    # Necessary for downstream nemo rl logging/printing.
+    rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+        "gen_tokens_per_sample/mean"
+    ]
+    timer.stop(f"{timer_prefix}/total")
+    rollout_metrics.update(timer.get_timing_metrics("sum"))
+
+    # Convert LLMMessageLogType to FlatMessagesType for generation
+    input_batch_for_input_ids = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["input_message_log"] for r in results],
+        }
+    )
+    batched_flat, _ = batched_message_log_to_flat_message(
+        input_batch_for_input_ids["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    input_ids = batched_flat["token_ids"]
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["message_log"] for r in results],
+            # length is used downstream for mean_prompt_length
+            "length": torch.tensor(
+                [len(r["input_message_log"][0]["token_ids"]) for r in results]
+            ),
+            "loss_multiplier": input_batch["loss_multiplier"],
+            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+            # extra_env_info: dict[str, Any]
+            # idx: int
+            # task_name: NotRequired[str]
+            # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+            # Extra information not in the DatumSpec used by the GRPO algorithm
+            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+        }
+    )
+
+    return AsyncNemoGymRolloutResult(
+        input_ids=input_ids,
+        final_batch=final_batch,
+        rollout_metrics=rollout_metrics,
+    )

@@ -17,6 +17,7 @@ from types import FunctionType
 from typing import Callable, Optional, Union, cast
 
 import torch
+from hydra.utils import get_class
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -65,8 +66,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
-
-from nemo_rl.models.policy.utils import import_class_from_path
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -614,7 +613,7 @@ def _parallelize_model(
                 model_parallel_plan = custom_parallel_plan
             else:
                 try:
-                    model_parallel_plan = import_class_from_path(custom_parallel_plan)
+                    model_parallel_plan = get_class(custom_parallel_plan)
                     if isinstance(model_parallel_plan, FunctionType):
                         model_parallel_plan = model_parallel_plan()
                     assert isinstance(model_parallel_plan, dict)
@@ -719,7 +718,6 @@ def clip_grad_by_total_norm_(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     max_grad_norm: Union[int, float],
     total_norm: float,
-    dtype: torch.dtype = torch.float32,
 ):
     """Clips gradient of an iterable of parameters by total norm.
 
@@ -737,17 +735,17 @@ def clip_grad_by_total_norm_(
     if isinstance(parameters, (torch.Tensor, DTensor)):
         parameters = [parameters]
 
-    # Grads.
-    grads = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
-    ]
-
     # Scale.
     clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
 
     if clip_coeff < 1.0:
+        # Grads.
+        grads = [
+            to_local_if_dtensor(p.grad.detach())
+            for p in parameters
+            if p.grad is not None
+        ]
+
         for g in grads:
             g.mul_(clip_coeff)
 

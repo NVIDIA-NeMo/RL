@@ -1,16 +1,37 @@
-# Nemo RL: A Scalable and Efficient Post-Training Library
+<div align="center">
+
+   # NeMo RL: A Scalable and Efficient Post-Training Library
 
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
+[![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/RL.svg?style=social&label=Star&cacheSeconds=14400)](https://github.com/NVIDIA-NeMo/RL/stargazers/)
+
+[Documentation](https://docs.nvidia.com/nemo/rl/latest/index.html) | [Discussions](https://github.com/NVIDIA-NeMo/RL/discussions/categories/announcements) | [Contributing](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
+
+</div>
 
 ## 📣 News
-* [9/25/2025] On-policy Distillation (Qwen3-style)
+* [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
+    * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
+    * NeMo-Gym + NeMo-RL support
+    * 📊 [Coming soon] release run
+* [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
+* [10/10/2025] **DAPO Algorithm Support**  
+  NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm that extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
+* [9/27/2025] [FP8 Quantization in NeMo RL](https://github.com/NVIDIA-NeMo/RL/discussions/1216)
+* [9/25/2025] On-policy Distillation 
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
-* [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
-    * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
-    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
 
 <details>
 <summary>Previous News</summary>
+* [12/1/2025] [Release v0.4.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.4.0)
+    * First release with official NGC Container [nvcr.io/nvidia/nemo-rl:v0.4.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1u5lmjHOsYpJqXaeYstjw7Qbzvbo67U0v?usp=sharing) to get a head start on your experimentation.  
+* [9/30/2025] [Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
+* [8/15/2025] [NeMo-RL: Journey of Optimizing Weight Transfer in Large MoE Models by 10x](https://github.com/NVIDIA-NeMo/RL/discussions/1189)
+* [7/31/2025] [NeMo-RL V0.3: Scalable and Performant Post-training with Nemo-RL via Megatron-Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
+* [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
+    * 📝 [v0.3.0 Announcement](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
 
 * [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
 * [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
@@ -20,7 +41,9 @@
 
 ## Overview
 
-**Nemo RL** is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+**NeMo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+
+![NeMo RL Architecture Diagram](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/main/docs/assets/RL_diagram.png)
 
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
@@ -50,30 +73,34 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.4_
-
-- 🔜 **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
-- 🔜 **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
-- 🔜 **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path.
+✅ _Available now_ | 🔜 _Coming in v0.6_
+- 🔜 **Muon Optimizer** - Emerging Optimizer support for SFT/RL
+- 🔜 **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
+- 🔜 **SGLang Inference** - SGLang rollout suport for optimized inference.
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
-- 🔜 **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
-- 🔜 **Megatron Bridge Integration** - Integrate Megatron Bridge to enable training features from Megatron Core.
-- 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
-- 🔜 **New Models** - gpt-oss.
-- 🔜 **Expand Algorithms** - DAPO, GSPO, On-policy Distillation.
-- 🔜 **GB200** - Add container support for GB200.
+- 🔜 **New Models** -  Qwen3-Next, Nemotron-Super.
+- 🔜 **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
+- 🔜 **Resiliency** - Fault tolerance and auto-scaling support
+- 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
+- 🔜 **Speculaive Decoding** - Speculative Decoding support for rollout acceleration
+
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Learning Algorithms** - GRPO/GSPO, SFT, and DPO.
+- ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
-- ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
-- ✅ **MoE Models** - Support for DeepSeekV3 and Qwen-3 MoE models (Megatron).
+- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
+- ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **Hugging Face Integration** - Works with 1B to 70B models (Qwen, Llama).
+- ✅ **Hugging Face Integration** - OOB support in the DTensor path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
+- ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
+- ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
+- ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
+- ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
+- ✅ **Nemo-Gym Integration** - RL Environment Integration.
+- ✅ **GB200** - container support for GB200.
 
 ## Table of Contents
   - [Prerequisites](#prerequisites)
@@ -86,7 +113,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
+    |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
 
@@ -121,9 +148,8 @@ For more examples and setup details, continue to the [Prerequisites](#prerequisi
     <tr>
       <td colspan="2" style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Clone and create the environment</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
-git submodule update --init --recursive
 uv venv</code></pre>
         <em>Note:</em> If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
       </td>
@@ -131,11 +157,11 @@ uv venv</code></pre>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (DTensor)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo_math.py</code></pre>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py</code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (Megatron)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo_math.py &#92;
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo.py &#92;
 --config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
       </td>
     </tr>
@@ -193,23 +219,10 @@ uv venv
 > Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
 > This ensures that the version of python used is always what we prescribe.
 
-If working outside a container, it can help to build [flash-attn](https://github.com/Dao-AILab/flash-attention) and warm the uv cache before your first run.
-```sh
-bash tools/build-flash-attn-in-uv-cache.sh
-```
-> [!NOTE]
-> On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache directory, making subsequent installs much quicker.
-
-> [!TIP]
-> The NeMo RL Dockerfile will warm the uv cache with flash-attn.
-> See https://docs.nvidia.com/nemo/rl/latest/docker.html for instructions if you are looking for the NeMo RL container.
-
-If successful, you should see `✅ flash-attn successfully added to uv cache`.
-
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 > [!NOTE]
 > - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
->   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo_math.py`
+>   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`
 > - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 > - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
@@ -227,21 +240,21 @@ To run GRPO on a single GPU for `Qwen/Qwen2.5-1.5B`:
 
 ```sh
 # Run the GRPO math example using a 1B parameter model
-uv run python examples/run_grpo_math.py
+uv run python examples/run_grpo.py
 ```
 
 By default, this uses the configuration in `examples/configs/grpo_math_1B.yaml`. You can customize parameters with command-line overrides. For example, to run on 8 GPUs,
 
 ```sh
 # Run the GRPO math example using a 1B parameter model using 8 GPUs
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   cluster.gpus_per_node=8
 ```
 
 You can override any of the parameters listed in the YAML configuration file. For example,
 
 ```sh
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   policy.model_name="meta-llama/Llama-3.2-1B-Instruct" \
   checkpointing.checkpoint_dir="results/llama1b_math" \
   logger.wandb_enabled=True \
@@ -255,7 +268,7 @@ To train using this config on a single GPU:
 
 ```sh
 # Run a GRPO math example on 1 GPU using the Megatron backend
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
@@ -268,7 +281,7 @@ For additional details on supported backends and how to configure the training b
 NUM_ACTOR_NODES=2
 
 # grpo_math_8b uses Llama-3.1-8B-Instruct model
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml cluster.num_nodes=2 checkpointing.checkpoint_dir='results/llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='grpo-llama8b_math'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml cluster.num_nodes=2 checkpointing.checkpoint_dir='results/llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='grpo-llama8b_math'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -280,6 +293,10 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docs/docker.md).
 
 #### GRPO Qwen2.5-32B
@@ -294,7 +311,7 @@ HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -306,6 +323,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 #### GRPO Multi-Turn
 
@@ -319,21 +339,18 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
 
-> [!NOTE]
-> Distillation currently supports the DTensor and vLLM generation backend. Megatron generation/training paths are not supported yet.
-
 ### On-policy Distillation Single Node
 
 To run on-policy distillation on a single GPU using `Qwen/Qwen3-1.7B-Base` as the student and `Qwen/Qwen3-4B` as the teacher:
 
 ```sh
-uv run python examples/run_distillation_math.py
+uv run python examples/run_distillation.py
 ```
 
 Customize parameters with command-line overrides. For example:
 
 ```sh
-uv run python examples/run_distillation_math.py \
+uv run python examples/run_distillation.py \
   policy.model_name="Qwen/Qwen3-1.7B-Base" \
   teacher.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
@@ -345,7 +362,7 @@ uv run python examples/run_distillation_math.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_distillation_math.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
+COMMAND="uv run ./examples/run_distillation.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -357,6 +374,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## Supervised Fine-Tuning (SFT)
 
@@ -402,6 +422,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## DPO
 
@@ -461,6 +484,9 @@ sbatch \
     ray.sub
 ```
 
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
 ## RM
 
 We provide a sample RM experiment that uses the [HelpSteer3 dataset](https://huggingface.co/datasets/nvidia/HelpSteer3) for preference-based training.
@@ -504,6 +530,9 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## Evaluation
 
@@ -587,7 +616,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
   at **either** one of the following places:
   1. Launch training with:
   ```sh
@@ -616,9 +645,13 @@ note = {GitHub repository},
 }
 ```
 
-## Contributing
+## Acknowledgement and Contribution Guide
 
-We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
+NeMo RL would like to acknowledge the adoption and contribution by the following community partners - Google, Argonne National Labs, Atlassian, Camfer, Domyn, Future House, Inflection AI, Lila, Paypal, Pegatron, PyTorch, Radical AI, Samsung, SB Instituition, Shanghai AI Lab, Speakleash, Sword Health, TII, NVIDIA Nemotron team, and many others.
+
+NeMo RL is the re-architected repo of [NeMo Aligner](https://github.com/NVIDIA/NeMo-Aligner), which was one of the earliest LLM Reinforcement Learning libraries, and has inspired other open-source libraries such as [VeRL](https://github.com/volcengine/verl), [SkyRL](https://github.com/NovaSky-AI/SkyRL) and [ROLL](https://github.com/alibaba/ROLL).
+
+We welcome contributions to NeMo RL! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
 
 ## Licenses
 

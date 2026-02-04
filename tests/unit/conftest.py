@@ -51,6 +51,18 @@ def pytest_addoption(parser):
         default=False,
         help="Run ONLY automodel tests",
     )
+    parser.addoption(
+        "--vllm-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY vllm tests",
+    )
+    parser.addoption(
+        "--sglang-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY sglang tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -58,9 +70,21 @@ def pytest_collection_modifyitems(config, items):
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
     run_automodel_only = config.getoption("--automodel-only")
-    assert not (run_mcore_only and run_automodel_only), (
-        "--mcore-only and --automodel-only are mutually exclusive"
-    )
+    run_vllm_only = config.getoption("--vllm-only")
+    run_sglang_only = config.getoption("--sglang-only")
+
+    # Check for mutually exclusive options
+    exclusive_options = [
+        run_mcore_only,
+        run_automodel_only,
+        run_vllm_only,
+        run_sglang_only,
+    ]
+    if sum(exclusive_options) > 1:
+        raise ValueError(
+            "--mcore-only, --automodel-only, --vllm-only, and --sglang-only are mutually exclusive"
+        )
+
     marker_expr = config.getoption("-m", default="")
 
     # If user specified -m marker expressions, still prioritize run_first tests
@@ -80,6 +104,14 @@ def pytest_collection_modifyitems(config, items):
 
     # Filter by mcore marker
     if run_mcore_only:
+        # Validate that megatron.core is available
+        try:
+            import megatron.core  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run mcore tests: megatron.core is not available.\n"
+                "Please run tests with: uv run --extra mcore --group test pytest ..."
+            )
         # Include only mcore tests
         new_items = [item for item in new_items if item.get_closest_marker("mcore")]
     else:
@@ -88,12 +120,54 @@ def pytest_collection_modifyitems(config, items):
 
     # Filter by automodel marker
     if run_automodel_only:
+        # Validate that nemo_automodel is available
+        try:
+            import nemo_automodel  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run automodel tests: nemo_automodel is not available.\n"
+                "Please run tests with: uv run --extra automodel --group test pytest ..."
+            )
         # Include only automodel tests
-        new_items = [item for item in items if item.get_closest_marker("automodel")]
+        new_items = [item for item in new_items if item.get_closest_marker("automodel")]
     else:
         # Exclude automodel tests by default
         new_items = [
             item for item in new_items if not item.get_closest_marker("automodel")
+        ]
+
+    # Filter by vllm marker
+    if run_vllm_only:
+        # Validate that vllm is available
+        try:
+            import vllm  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run vllm tests: vllm is not available.\n"
+                "Please run tests with: uv run --extra vllm --group test pytest ..."
+            )
+        # Include only vllm tests
+        new_items = [item for item in new_items if item.get_closest_marker("vllm")]
+    else:
+        # Exclude vllm tests by default
+        new_items = [item for item in new_items if not item.get_closest_marker("vllm")]
+
+    # Filter by sglang marker
+    if run_sglang_only:
+        # Validate that sglang is available
+        try:
+            import sglang  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run sglang tests: sglang is not available.\n"
+                "Please run tests with: uv run --extra sglang --group test pytest ..."
+            )
+        # Include only sglang tests
+        new_items = [item for item in new_items if item.get_closest_marker("sglang")]
+    else:
+        # Exclude sglang tests by default
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("sglang")
         ]
 
     # Ensure run_first tests are prioritized

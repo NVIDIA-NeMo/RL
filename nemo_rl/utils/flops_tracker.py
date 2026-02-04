@@ -24,8 +24,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.models.policy.utils import sliding_window_overwrite
-from nemo_rl.utils.flops_formulas import FLOPSConfig, llama, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -38,7 +37,6 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
         model_name,
         torch_dtype=torch.float32,
         trust_remote_code=True,
-        **sliding_window_overwrite(model_name),
     )
 
 
@@ -77,6 +75,27 @@ def convert_config_to_flops_config(
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
         ), llama
+    elif config.__class__.model_type == "deepseek_v3":
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            moe_router_topk=config.num_experts_per_tok,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_head_dim=config.qk_nope_head_dim,
+            qk_pos_emb_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            moe_layer_freq=1,
+            moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            mtp_num_layers=0,
+            causal_self_attn=True,
+        ), deepseekv3
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
@@ -94,6 +113,8 @@ THEORETICAL_TFLOPS = {
     ("NVIDIA A100 80GB PCIe", torch.float32): 312 / 2 if is_using_tf32() else 19.5,
     ("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2,
     ("NVIDIA H100 80GB HBM3", torch.float32): 989 / 2 if is_using_tf32() else 67.0,
+    ("NVIDIA H200", torch.bfloat16): 1979 / 2,
+    ("NVIDIA H200", torch.float32): 989 / 2 if is_using_tf32() else 67.0,
     ("NVIDIA B200", torch.bfloat16): 4500 / 2,
     ("NVIDIA B200", torch.float32): 2200 / 2 if is_using_tf32() else 80.0,
     ("NVIDIA B300", torch.bfloat16): 4500 / 2,

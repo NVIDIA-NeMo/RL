@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -37,7 +37,7 @@ def mock_components():
     student_policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
-        "all_mb_metrics": {},
+        "all_mb_metrics": {"global_valid_toks": [10]},
     }
     # Add generate method since student_generation will be set to student_policy
     student_policy.generate.return_value = {
@@ -124,6 +124,7 @@ def mock_components():
     master_config = {
         "distillation": {
             "max_num_steps": 5,
+            "max_num_epochs": 10,
             "val_period": 100,
             "val_batch_size": 1,
             "val_at_start": False,
@@ -210,6 +211,63 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+
+
+def test_exit_on_timeout(mock_components, capsys):
+    """Test that training loop exits when timeout is reached"""
+    # Set max steps to large number
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 100
+
+    distillation_save_state = _default_distillation_save_state()
+
+    # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
+    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+        mock_timeout_instance = MagicMock()
+        # Create a side_effect that returns False 7 times, then True
+        check_results = [False] * 7 + [True]
+        mock_timeout_instance.check_save.side_effect = check_results
+        mock_timeout_class.return_value = mock_timeout_instance
+
+        # Run training
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
+
+        # Verify training stopped at 8 steps (when check_save returned True)
+        assert mock_components["student_policy"].train.call_count == 8
+
+        # Verify the timeout message was printed and training actually stopped
+        captured = capsys.readouterr()
+        output_lines = captured.out.strip().split("\n")
+
+        # Find the timeout message
+        timeout_line_idx = None
+        for i, line in enumerate(output_lines):
+            if "Timeout has been reached, stopping training early" in line:
+                timeout_line_idx = i
+                break
+
+        assert timeout_line_idx is not None, "Timeout message not found in output"
+
+        # For distillation, verify we don't see more step messages after timeout
+        remaining_lines = output_lines[timeout_line_idx:]
+        for line in remaining_lines:
+            # Distillation doesn't have epochs, but check for step markers
+            assert not line.startswith("Step ") or "Step 8" in line, (
+                f"Training continued after timeout: {line}"
+            )
 
 
 def test_validate_function(mock_components):
@@ -349,3 +407,247 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
 
     with pytest.raises(AssertionError):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes=1."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.distillation import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": None,
+                    },
+                },
+            },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "teacher": {
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,  # Config extraction requires this key
+            "val_period": 0,  # Config extraction requires this key
+            "val_at_start": False,  # Config extraction requires this key
+        },
+        "data": {"shuffle": False},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
+        "cluster": {
+            "num_nodes": 1,  # Single node
+            "gpus_per_node": 8,
+        },
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
+    ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_distillation_setup_non_colocated_smoke(monkeypatch):
+    """Smoke test: calling setup with a non-colocated config should succeed."""
+    from unittest.mock import MagicMock, patch
+
+    import nemo_rl.algorithms.distillation as distil_mod
+
+    # Single node cluster; inference uses a subset of GPUs on same node
+    master_config = {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,
+                    "resources": {
+                        "gpus_per_node": 8,  # inference on 8 GPU
+                        "num_nodes": 1,
+                    },
+                },
+            },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+            "model_name": "test-policy",
+        },
+        "teacher": {
+            "model_name": "test-teacher",
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 10,
+            "max_num_steps": 100,
+            "val_period": 0,
+            "val_at_start": False,
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+
+    # Skip tokenizer/vocab equality check inside setup
+    monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "1")
+
+    ip_port = ("127.0.0.1", 12345)
+
+    class DummyCluster:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def world_size(self):
+            return 1
+
+        def get_master_address_and_port(self):
+            return ip_port
+
+    class DummyPolicy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare_refit_info(self):
+            return {}
+
+        def offload_after_refit(self):
+            return None
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    class DummyVllmGeneration:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def finish_generation(self):
+            return None
+
+        def prepare_refit_info(self, *args, **kwargs):
+            return None
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    with (
+        patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
+        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
+        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(distil_mod, "Policy", DummyPolicy),
+        patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(distil_mod, "ray") as mock_ray,
+    ):
+        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ray.get = MagicMock(return_value=None)
+
+        # Should not raise
+        result = distil_mod.setup(master_config, tokenizer, dataset, None)
+
+        # Basic shape check of returned tuple
+        assert isinstance(result, tuple)
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes>1."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.distillation import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": 1,  # Use 1 node for inference
+                    },
+                },
+            },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "teacher": {
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "max_num_epochs": 10,
+            "max_num_steps": 100,
+            "num_prompts_per_step": 1,  # Config extraction requires this key
+            "val_period": 0,  # Config extraction requires this key
+            "val_at_start": False,  # Config extraction requires this key
+        },
+        "data": {"shuffle": False},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
+        "cluster": {
+            "num_nodes": 2,  # Multi-node
+            "gpus_per_node": 8,
+        },
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
+    ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)

@@ -34,14 +34,13 @@ policy:
     - 13
   generation:
     max_new_tokens: 4096
-    stop_token_ids:
-    - 128009
     vllm_cfg:
       async_engine: true
       max_model_len: 4096
     colocated:
       enabled: false
       resources:
+        gpus_per_node: 8
         num_nodes: 1
 data:
   max_input_seq_length: 4096

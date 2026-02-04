@@ -89,7 +89,7 @@ class VllmGeneration(GenerationInterface):
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
         # However, we allow values above certain thresholds for token filtering purposes.
-        top_k: int | None = self.cfg.get("top_k")
+        top_k = self.cfg["top_k"]
         if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
             raise ValueError(
                 (
@@ -117,6 +117,10 @@ class VllmGeneration(GenerationInterface):
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
         ]
+        # Also check for model_name which is required by VllmGenerationWorker but marked as NotRequired in GenerationConfig because it's not expected to be set in the job yaml.
+        if "model_name" not in self.cfg:
+            missing_keys.append("model_name")
+
         assert not missing_keys, (
             f"VLLM Configuration Error: Missing required keys in VllmConfig.\n"
             f"Missing keys: {', '.join(missing_keys)}\n"
@@ -162,6 +166,16 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
+
+        if needs_cross_node_parallelism:
+            # When using cross-node model parallelism with non-colocated inference,
+            # we are disabling NCCL_NVLS_ENABLE to avoid the NCCL error.
+            # See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details.
+            env_vars["NCCL_NVLS_ENABLE"] = "0"
+            print(
+                "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
+                "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
+            )
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.ep_size > self.tp_size:
@@ -368,7 +382,7 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         if not self.worker_group or not self.worker_group.workers:
@@ -395,7 +409,12 @@ class VllmGeneration(GenerationInterface):
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+            common_kwargs={
+                "ip": ip,
+                "port": port,
+                "world_size": world_size,
+                "train_world_size": train_world_size,
+            },
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
@@ -431,7 +450,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields
@@ -482,7 +501,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields
@@ -748,49 +767,26 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
-        """Update weights of the policy using IPC handles, considering tensor parallelism.
-
-        For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
-            return False
+            raise RuntimeError("Worker group is not initialized")
 
         # Choose the appropriate method based on async_engine setting
         method_name = (
-            "update_weights_from_ipc_handles_async"
+            "update_weights_via_ipc_zmq_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "update_weights_from_ipc_handles"
+            else "update_weights_via_ipc_zmq"
         )
 
-        # Only send the ipc handles required by the current worker
-        ipc_handles_list = []
-        for worker_device_uuids in self.device_uuids:
-            worker_ipc_handles = {
-                device_uuid: ipc_handles[device_uuid]
-                for device_uuid in worker_device_uuids
-            }
-            ipc_handles_list.append(worker_ipc_handles)
+        # Use run_all_workers_single_data since no data needs to be passed
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
 
-        try:
-            # Directly pass ipc_handles to the method
-            futures = self.worker_group.run_all_workers_multiple_data(
-                method_name,
-                ipc_handles=ipc_handles_list,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
-            # Wait for all futures to complete
-            results = ray.get(futures)
-            return all(result for result in results if result is not None)
-        except Exception as e:
-            print(f"Error during update weights: {e}")
-            return False
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
@@ -823,6 +819,71 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            future = self.worker_group.run_single_worker_single_data(
+                "get_vllm_logger_metrics",
+                worker_idx=worker_idx,
+            )
+            futures.append(future)
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+            "inflight_batch_sizes": {},  # dp_idx -> list[int]
+            "num_pending_samples": {},  # dp_idx -> list[int]
+            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
+            "generation_tokens": {},  # dp_idx -> list[int]
+        }
+
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight_batch_sizes = stats.get("inflight_batch_sizes")
+            if inflight_batch_sizes:
+                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
+                    inflight_batch_sizes
+                )
+            num_pending_samples = stats.get("num_pending_samples")
+            if num_pending_samples:
+                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
+            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
+            if kv_cache_usage_perc:
+                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
+            generation_tokens = stats.get("generation_tokens")
+            if generation_tokens:
+                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+
+        return vllm_logger_metrics
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_vllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting."""
+        self.clear_vllm_logger_metrics()
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics for performance reporting."""
+        return self.get_vllm_logger_metrics()
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
@@ -831,3 +892,35 @@ class VllmGeneration(GenerationInterface):
         user calls shutdown().
         """
         self.shutdown()
+
+    def invalidate_kv_cache(self) -> bool:
+        """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
+
+        For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
+        Returns True if all workers report success.
+        """
+        try:
+            method_name = (
+                "reset_prefix_cache_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "reset_prefix_cache"
+            )
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            print(f"Error invalidating vLLM caches: {e}")
+            return False
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Check if KV cache scales should be synchronized during refit.
+
+        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        """
+        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
+            "kv_cache_dtype"
+        ].startswith("fp8")

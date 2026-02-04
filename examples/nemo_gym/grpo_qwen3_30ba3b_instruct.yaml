@@ -1,0 +1,155 @@
+defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+grpo:
+  max_num_epochs: 10
+  # We observe MoE likes more data per optimization step. Here we increase the num prompts per step from the dense 64 to 256.
+  # We retain the 16 generations per prompt for now. Later on this may change for agentic tasks as the action/sample space grows.
+  # We take up to 16 steps off policy, which is 256 * 16 = 4096
+  num_prompts_per_step: 4096
+  num_generations_per_prompt: 16
+  # Each "step" in NeMo RL is all 16 minibatch steps we want to take. So we val and save every step.
+  val_period: 1
+  # The advantages are much larger and this becomes non-trivially expensive.
+  calculate_advantages_on_gpu: true
+
+# We use GSPO rather than GRPO for MoE models
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_min: 3e-4
+  ratio_clip_max: 3e-4
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  # We observe importance sampling correction here to have very interesting effects on training dynamics. Usually it is fine to leave this off.
+  use_importance_sampling_correction: false
+  # sequence_level_importance_ratios turns GRPO -> GSPO
+  sequence_level_importance_ratios: true
+  # As of Mon Oct 13, token level loss as formulated in the GSPO paper is not yet supported in NeMo RL.
+  token_level_loss: false
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  logprob_chunk_size: null
+
+  # This is one minibatch, which is 256 prompts per step * 16 rollouts per prompt.
+  train_global_batch_size: 4096
+
+  # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
+  max_total_sequence_length: 32768
+
+  # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
+  dtensor_cfg:
+    enabled: False
+  optimizer: null
+  scheduler: null
+
+  # As of Thu Oct 02, 2025, we need sequence packing enabled to use context parallelism (CP) in mcore.
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      # This is a very low GPU mem utilization. We GPU OOM in two places:
+      # Refit after train, refit before validation.
+      gpu_memory_utilization: 0.7
+
+      http_server_serving_chat_kwargs:
+        # This is the tool parser for Qwen 3 30B A3B Instruct. This needs to be changed for other models.
+        enable_auto_tools: true
+        tool_parser: hermes
+        # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
+        # reasoning_parser: deepseek_r1
+
+  # Needs to be set to whatever backend TP size.
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    # We set this to 8, the number of GPUs in one node
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    # The context parallel size times the tensor model parallel size should equal 8.
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.precision}
+    # Sequence parallel is required for expert parallel
+    sequence_parallel: true
+    # Apparently freezing the MoE router and using fp64 here stabilizes training
+    # This is possibly related to some refit issues.
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none # "seq_aux_loss" causes logprob error divergence for grpo. As of Jan 06, 2025, global_aux_loss is also not supported properly in mcore.
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing
+    moe_permute_fusion: true
+    apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+
+    optimizer:
+      optimizer: "adam"
+      # As of Mon Oct 13, we default to 2e-6 here, but it's possible this value may increase/decrease depending on our subsequent observations.
+      lr: 2.0e-6
+      min_lr: ${policy.megatron_cfg.optimizer.lr}
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: ${policy.megatron_cfg.optimizer.lr}
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+checkpointing:
+  # This assumes a slurm job timeout of 4 hours.
+  # 1. It will usually take a 10-15 minutes to spin up the training job and for the timeout iterations to start.
+  # 2. The next step may also be a validation step which takes extra long.
+  #     1. For this config Qwen 3 30BA3B on math with 32k context length, the validation could take up to 10 mins.
+  # 3. The step time for this config on 32 nodes takes around 30 mins.
+  # 4. The checkpoint time for this model is around 10 mins.
+  checkpoint_must_save_by: "00:03:30:00"
+  save_period: 1

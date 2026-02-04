@@ -39,7 +39,10 @@ policy:
 ```yaml
 grpo:
   async_grpo:
+    enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
+    in_flight_weight_updates: false  # Enable for faster weight synchronization
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
 ```
 
 ### Complete Example Config
@@ -62,7 +65,10 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 4
   async_grpo:
+    enabled: true
     max_trajectory_age_steps: 1
+    in_flight_weight_updates: false  # Enable for faster weight synchronization
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
 
 cluster:
   num_nodes: 2
@@ -122,7 +128,7 @@ Example with `max_trajectory_age_steps: 1`:
 
 The following sequence diagram illustrates the interactions between the three main components:
 
-```
+```mermaid
 sequenceDiagram
     participant Training as Training Loop
     participant Collector as Trajectory Collector
@@ -155,6 +161,11 @@ sequenceDiagram
 2. **Age Limits**: Start with `max_trajectory_age_steps: 1` and increase if needed for higher throughput
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
+
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
+
+5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
+KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
 
 ## Why Importance Sampling Correction Is Required for Async
 

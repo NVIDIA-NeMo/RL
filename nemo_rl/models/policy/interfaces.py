@@ -20,6 +20,7 @@ import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
@@ -52,7 +53,9 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def get_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -67,7 +70,10 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -86,6 +92,7 @@ class PolicyInterface(ABC):
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 
@@ -100,8 +107,10 @@ class PolicyInterface(ABC):
         data: BatchedDataDict,
         loss_fn: LossFunction,
         eval_mode: bool = False,
+        *,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -115,10 +124,26 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
-    def score(
-        self, data: BatchedDataDict[GenerationDatumSpec]
-    ) -> BatchedDataDict[ScoreOutputSpec]:
-        """Score a batch of data using the policy."""
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Calibrate FP8 scales for Q/K/V activations used by KV cache.
+
+        Args:
+            data: BatchedDataDict containing input_ids and input_lengths.
+            micro_batch_size: Optional override for micro batch size during calibration.
+            percentile: Percentile for per-tensor amax estimation.
+            margin: Safety margin multiplier applied to amax.
+            include_q: Whether to also compute scale for Q in addition to K/V.
+
+        Returns:
+            Dict with overall configuration and per-layer scales.
+        """
         pass
 
     @abstractmethod
@@ -141,7 +166,7 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -158,13 +183,29 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
+    def stream_weights_via_ipc_zmq(
+        self, *args: Any, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    def stream_weights_via_http(
+        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+    ) -> list[ray.ObjectRef]:
+        """Stream model weights to SGLang servers via HTTP API.
+
+        Args:
+            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        """
+        raise NotImplementedError(
+            "stream_weights_via_http is not implemented for this policy worker"
+        )
+
+    @abstractmethod
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         pass
 
     @abstractmethod
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
-        pass
-
-    @abstractmethod
-    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+    def prepare_for_lp_inference(self) -> None:
         pass
