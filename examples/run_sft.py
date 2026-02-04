@@ -86,6 +86,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_generation_prompt=data_config["add_generation_prompt"],
         )
         task_data_processors[data.task_name] = (data.task_spec, data_processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[data.task_name] = data.preprocessor
+
 
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
