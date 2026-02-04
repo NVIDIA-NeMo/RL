@@ -65,6 +65,8 @@ def create_megatron_test_config(
     converter_type: str = "LlamaForCausalLM",
     logprob_chunk_size: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = None,
+    enable_cuda_graph: Optional[bool] = None,
+    cuda_graph_scope: Optional[str] = None,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     return {
@@ -139,6 +141,8 @@ def create_megatron_test_config(
             "moe_token_dispatcher_type": "allgather",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
+            **({"enable_cuda_graph": enable_cuda_graph} if enable_cuda_graph is not None else {}),
+            **({"cuda_graph_scope": cuda_graph_scope} if cuda_graph_scope is not None else {}),
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -2591,3 +2595,37 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def test_cuda_graph_config_parsing():
+    """Test CUDA graph configuration options are properly included in test configs."""
+    # Test config without CUDA graph options (default)
+    config_default = create_megatron_test_config(
+        model_name="test-model",
+    )
+    assert "enable_cuda_graph" not in config_default["megatron_cfg"]
+    assert "cuda_graph_scope" not in config_default["megatron_cfg"]
+
+    # Test config with CUDA graph enabled
+    config_enabled = create_megatron_test_config(
+        model_name="test-model",
+        enable_cuda_graph=True,
+    )
+    assert config_enabled["megatron_cfg"]["enable_cuda_graph"] is True
+    assert "cuda_graph_scope" not in config_enabled["megatron_cfg"]
+
+    # Test config with CUDA graph enabled and scope set
+    config_with_scope = create_megatron_test_config(
+        model_name="test-model",
+        enable_cuda_graph=True,
+        cuda_graph_scope="full_model",
+    )
+    assert config_with_scope["megatron_cfg"]["enable_cuda_graph"] is True
+    assert config_with_scope["megatron_cfg"]["cuda_graph_scope"] == "full_model"
+
+    # Test config with CUDA graph disabled
+    config_disabled = create_megatron_test_config(
+        model_name="test-model",
+        enable_cuda_graph=False,
+    )
+    assert config_disabled["megatron_cfg"]["enable_cuda_graph"] is False
