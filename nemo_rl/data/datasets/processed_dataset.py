@@ -23,6 +23,7 @@ from nemo_rl.data.interfaces import (
     DatumSpec,
     TaskDataProcessFnCallable,
     TaskDataSpec,
+    TaskDataPreProcessFnCallable,
 )
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
@@ -52,6 +53,9 @@ class AllTaskProcessedDataset:
             dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]]
             | TaskDataProcessFnCallable
         ),
+        task_data_preprocessors: Optional[Union[
+            dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable
+        ]] = None,
         max_seq_length: Optional[int] = None,
     ):
         self.dataset = dataset
@@ -59,6 +63,7 @@ class AllTaskProcessedDataset:
         # TODO: will be removed once preference dataset is refactored
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
+        self.task_data_preprocessors = task_data_preprocessors
         self.max_seq_length = max_seq_length
         self._bos_checked = False
 
@@ -95,6 +100,20 @@ class AllTaskProcessedDataset:
         """Return a single prompt."""
         entry = self.dataset[idx]
 
+        # preprocessing
+        task_data_preprocessor = None
+        if self.task_data_preprocessors:
+            if isinstance(self.task_data_preprocessors, dict):
+                task_name = entry["task_name"]
+                if task_name in self.task_data_preprocessors:
+                    task_data_preprocessor = self.task_data_preprocessors[task_name]
+            else:
+                task_data_preprocessor = self.task_data_preprocessors
+
+        if task_data_preprocessor is not None:
+            entry = task_data_preprocessor(entry)
+
+        # processing
         if isinstance(self.task_data_processors, dict):
             task_name = entry["task_name"]
 
