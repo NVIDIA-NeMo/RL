@@ -258,7 +258,7 @@ Progressively more advanced cases:
 
 1) Adjusting the test case on the fly with `SED_CLAUSES`
 
-- If a test script needs small textual edits during bisect (e.g., relax a threshold; drop a noisy metric you don’t care to bisect over when focusing on convergence vs. perf), provide a sed script via `SED_CLAUSES`. You can also use this to adjust runtime controls like `MAX_STEPS`, `STEPS_PER_RUN`, or `NUM_MINUTES` when a perf regression slows runs down so they still complete and emit metrics. The helper applies it and automatically restores the test script after the run.
+- If a test script needs small textual edits during bisect (e.g., to relax a threshold or drop a noisy metric you don't care to bisect over when focusing on convergence vs. performance), provide a sed script via `SED_CLAUSES`. You can also use this to adjust runtime controls like `MAX_STEPS`, `STEPS_PER_RUN`, or `NUM_MINUTES` when a performance regression slows runs down, ensuring they still complete and emit metrics. The helper applies it and automatically restores the test script after the run.
 
 ```sh
 SED_CLAUSES=$(cat <<'SED'
