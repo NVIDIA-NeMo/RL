@@ -16,7 +16,10 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    from nemo_rl.distributed.worker_groups import RayWorkerGroup
 
 import numpy as np
 
@@ -273,29 +276,6 @@ class Timer:
 
         return aggregated
 
-    @staticmethod
-    def save_aggregated_to_json(
-        timings: dict[str, float],
-        filepath: Union[str, Path],
-        metadata: Optional[dict] = None,
-    ) -> None:
-        """Save aggregated timing dict to a JSON file.
-
-        Args:
-            timings: Dictionary mapping labels to timing values
-            filepath: Path where the JSON file will be saved
-            metadata: Optional dictionary of metadata to include
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        output: dict[str, Any] = {"timings": timings}
-        if metadata is not None:
-            output["metadata"] = metadata
-
-        with open(filepath, "w") as f:
-            json.dump(output, f, indent=2)
-
     def reset(self, label: Optional[str] = None) -> None:
         """Reset timings for the specified label or all labels.
 
@@ -310,6 +290,31 @@ class Timer:
         else:
             self._timers = {}
             self._start_times = {}
+
+
+def save_worker_init_timing(
+    worker_groups: dict[str, "RayWorkerGroup"],
+    output_path: Union[str, Path],
+) -> None:
+    """Collect and save initialization timing from multiple worker groups.
+
+    Args:
+        worker_groups: Dict mapping prefix to worker_group.
+        output_path: Path to save the JSON file.
+    """
+    timings: dict[str, float] = {}
+    metadata: dict[str, Any] = {"timestamp": time.time()}
+
+    for prefix, worker_group in worker_groups.items():
+        for k, v in worker_group.collect_init_timing().items():
+            timings[f"{prefix}/{k}"] = v
+        metadata[f"num_{prefix}_workers"] = len(worker_group.workers)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"timings": timings, "metadata": metadata}, f, indent=2)
+    print(f"✅ Saved worker init timing to {output_path}")
 
 
 def convert_to_seconds(time_string: str) -> int:

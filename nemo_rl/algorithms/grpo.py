@@ -74,7 +74,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer, save_worker_init_timing
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # ===============================================================================
@@ -187,30 +187,6 @@ class MasterConfig(TypedDict):
 # ===============================================================================
 
 
-def _collect_worker_timing(
-    policy: Policy,
-    policy_generation: Optional[VllmGeneration],
-    log_dir: Path,
-) -> None:
-    """Collect and save worker initialization timing from policy and vLLM workers."""
-    timings: dict[str, float] = {}
-    metadata: dict[str, Any] = {"timestamp": time.time()}
-
-    # Policy workers - use worker_group's collect_init_timing method
-    for k, v in policy.worker_group.collect_init_timing().items():
-        timings[f"policy/{k}"] = v
-    metadata["num_policy_workers"] = len(policy.worker_group.workers)
-
-    # vLLM workers (if present)
-    if policy_generation is not None:
-        for k, v in policy_generation.worker_group.collect_init_timing().items():
-            timings[f"vllm/{k}"] = v
-        metadata["num_vllm_workers"] = len(policy_generation.worker_group.workers)
-
-    Timer.save_aggregated_to_json(
-        timings, log_dir / "worker_init_timing.json", metadata
-    )
-    print(f"✅ Saved worker init timing to {log_dir / 'worker_init_timing.json'}")
 
 
 def setup(
@@ -683,8 +659,12 @@ def setup(
 
     # Collect worker initialization timing if enabled
     if master_config["logger"].get("collect_worker_init_timing", False):
-        _collect_worker_timing(
-            policy, policy_generation, Path(master_config["logger"]["log_dir"])
+        worker_groups = {"policy": policy.worker_group}
+        if policy_generation is not None:
+            worker_groups["vllm"] = policy_generation.worker_group
+        save_worker_init_timing(
+            worker_groups,
+            Path(master_config["logger"]["log_dir"]) / "worker_init_timing.json",
         )
 
     # prepare refit info

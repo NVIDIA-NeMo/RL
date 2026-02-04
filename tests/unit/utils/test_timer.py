@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import time
 from unittest.mock import patch
 
@@ -237,56 +236,7 @@ class TestTimeoutChecker:
 
 
 class TestTimerExtensions:
-    """Test suite for save_to_json and aggregate_max methods."""
-
-    @pytest.fixture
-    def timer(self):
-        return Timer()
-
-    @pytest.fixture
-    def tmp_path(self, tmp_path):
-        return tmp_path
-
-    def test_save_aggregated_to_json_basic(self, tmp_path):
-        """Test basic save_aggregated_to_json functionality."""
-        timings = {"operation1": 6.0, "operation2": 9.0}
-        filepath = tmp_path / "timings.json"
-
-        Timer.save_aggregated_to_json(timings, filepath)
-
-        assert filepath.exists()
-        with open(filepath) as f:
-            data = json.load(f)
-
-        assert "timings" in data
-        assert data["timings"]["operation1"] == 6.0
-        assert data["timings"]["operation2"] == 9.0
-
-    def test_save_aggregated_to_json_with_metadata(self, tmp_path):
-        """Test save_aggregated_to_json with metadata."""
-        timings = {"test_op": 1.5}
-        metadata = {"worker_id": 0, "hostname": "test-node"}
-        filepath = tmp_path / "timings_with_meta.json"
-
-        Timer.save_aggregated_to_json(timings, filepath, metadata=metadata)
-
-        with open(filepath) as f:
-            data = json.load(f)
-
-        assert "metadata" in data
-        assert data["metadata"]["worker_id"] == 0
-        assert data["metadata"]["hostname"] == "test-node"
-        assert data["timings"]["test_op"] == 1.5
-
-    def test_save_aggregated_to_json_creates_directory(self, tmp_path):
-        """Test that save_aggregated_to_json creates parent directories."""
-        timings = {"test": 1.0}
-        filepath = tmp_path / "nested" / "dir" / "timings.json"
-
-        Timer.save_aggregated_to_json(timings, filepath)
-
-        assert filepath.exists()
-        assert filepath.parent.exists()
+    """Test suite for aggregate_max method."""
 
     def test_aggregate_max_basic(self):
         """Test basic aggregate_max functionality."""
