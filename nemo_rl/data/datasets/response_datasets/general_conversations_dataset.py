@@ -187,17 +187,16 @@ class GeneralConversationsJsonlDataset(RawDataset):
     def __init__(
         self,
         data_path: str,
-        split: Optional[str] = "train",
         media_data_dir: Optional[str] = None,
         **kwargs
     ):
         self.media_data_dir = media_data_dir
-        self.dataset = load_dataset_from_path(data_path, split)
+        self.dataset = load_dataset_from_path(data_path)
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)
         )
 
-        self.datum_preprocessor = partial(self._datum_preprocessor, media_directory=media_data_dir)
+        self.preprocessor = partial(self._datum_preprocessor, media_directory=media_data_dir)
 
     @classmethod
     def process_message_fragment(cls, tag: str, fragment: Any, media_directory: Optional[str] = None) -> dict[str, Any]:

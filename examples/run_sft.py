@@ -102,6 +102,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
     # setup validation dataset
     val_task_data_processors = {}
+    val_task_data_preprocessors = {}
     val_data_list = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
@@ -111,6 +112,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             # bind task_name to task_data_processors
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[task_name]
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
@@ -134,6 +137,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                 val_data.task_spec,
                 val_data_processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[val_data.task_name] = val_data.preprocessor
 
     val_dataset = None
     if len(val_data_list) > 0:
@@ -143,6 +148,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
