@@ -3,12 +3,12 @@
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
 
 ## 📣 News
-* [10/10/2025] **DAPO Algorithm Support**  
-  NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm.  
+* [10/10/2025] **DAPO Algorithm Support**
+  NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm.
   DAPO extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
-* [9/30/2025] [Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
+* [9/30/2025] [Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4)
 * [9/27/2025] [FP8 Quantization in NeMo RL](https://github.com/NVIDIA-NeMo/RL/discussions/1216)
-* [9/25/2025] On-policy Distillation 
+* [9/25/2025] On-policy Distillation
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 * [8/15/2025] [NeMo-RL: Journey of Optimizing Weight Transfer in Large MoE Models by 10x](https://github.com/NVIDIA-NeMo/RL/discussions/1189)
 * [7/31/2025] [NeMo-RL V0.3: Scalable and Performant Post-training with Nemo-RL via Megatron-Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
@@ -90,7 +90,7 @@ For detailed information on backend selection, configuration, and examples, see 
   - Support Matrix
 
     <p></p>
-    
+
     |Algorithms|Single Node|Multi-node|
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
@@ -112,7 +112,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends. 
+Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -578,7 +578,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   ```sh
   ModuleNotFoundError: No module named 'megatron'
   ```
-  
+
   If you see this error, there is likely an issue with your virtual environments. To fix this, first initialize the submodules:
 
   ```sh
@@ -593,7 +593,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
   at **either** one of the following places:
   1. Launch training with:
   ```sh
