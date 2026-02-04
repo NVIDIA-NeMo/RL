@@ -125,6 +125,9 @@ class GRPOConfig(TypedDict):
     val_period: int
     val_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
@@ -279,7 +282,11 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if grpo_config["val_period"] > 0 or grpo_config["val_at_start"]:
+    if (
+        grpo_config["val_period"] > 0
+        or grpo_config["val_at_start"]
+        or grpo_config["val_at_end"]
+    ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -1161,6 +1168,7 @@ def grpo_train(
         "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
@@ -1568,8 +1576,10 @@ def grpo_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -2139,6 +2149,7 @@ def async_grpo_train(
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     assert not colocated_inference, (
@@ -2578,7 +2589,10 @@ def async_grpo_train(
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
 
-                if val_period > 0 and (step + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 

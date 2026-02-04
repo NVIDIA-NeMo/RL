@@ -128,6 +128,7 @@ def mock_components():
             "val_period": 100,
             "val_batch_size": 1,
             "val_at_start": False,
+            "val_at_end": False,
             "max_val_samples": 10,
             "topk_logits_k": 64,
             "num_prompts_per_step": 1,
@@ -444,6 +445,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "num_prompts_per_step": 1,  # Config extraction requires this key
             "val_period": 0,  # Config extraction requires this key
             "val_at_start": False,  # Config extraction requires this key
+            "val_at_end": False,  # Config extraction requires this key
         },
         "data": {"shuffle": False},
         "logger": {},  # Config extraction requires this key
@@ -516,6 +518,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             "max_num_steps": 100,
             "val_period": 0,
             "val_at_start": False,
+            "val_at_end": False,
         },
         "data": {"shuffle": False},
         "logger": {},
@@ -624,6 +627,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "num_prompts_per_step": 1,  # Config extraction requires this key
             "val_period": 0,  # Config extraction requires this key
             "val_at_start": False,  # Config extraction requires this key
+            "val_at_end": False,  # Config extraction requires this key
         },
         "data": {"shuffle": False},
         "logger": {},  # Config extraction requires this key
