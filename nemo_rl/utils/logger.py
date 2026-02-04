@@ -837,7 +837,8 @@ class MLflowLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in MLflow)
         """
         metrics_to_log = {}
-        for name, value in metrics.items():
+        flattened_metrics = flatten_dict(metrics)
+        for name, value in flattened_metrics.items():
             if prefix:
                 name = f"{prefix}/{name}"
             metrics_to_log[name] = value
