@@ -130,7 +130,7 @@ NeMo RL supports **importance sampling correction**, and ProRLv2’s example con
 
 Quick intuition:
 
-- This is mainly useful for **MoE / backend mismatch** cases, where the generation backend and the training policy can disagree on logprobs.
+- This is mainly useful for **MoE/backend mismatch** cases, where the generation backend and the training policy can disagree on logprobs.
 - We compute an importance weight from `prev_logprobs` (training policy) vs `generation_logprobs` (generator). **ICE-POP** drops outliers by zeroing weights outside \([min, max]\).
 - In the common setup of **one policy update per rollout batch** (i.e., minibatch equals the per-step rollout batch; no PPO multi-epoch reuse), the PPO/GRPO likelihood ratio term is effectively **1.0** at update time, so the main stability issue is the MoE/backend-mismatch importance weights.
 - “Online ICE-POP” here just means applying that ICE-POP filtering **during loss computation** on the current training batch.
