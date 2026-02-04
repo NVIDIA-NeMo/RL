@@ -37,7 +37,7 @@ on:
 
 jobs:
   build-docs:
-    uses: NVDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
 
   publish-docs:
     runs-on: ubuntu-latest
