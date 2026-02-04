@@ -187,6 +187,34 @@ class MasterConfig(TypedDict):
 # ===============================================================================
 
 
+def _collect_worker_timing(
+    policy: Policy,
+    policy_generation: Optional[VllmGeneration],
+    log_dir: Path,
+) -> None:
+    """Collect and save worker initialization timing from policy and vLLM workers."""
+    timings: dict[str, float] = {}
+    metadata: dict[str, Any] = {"timestamp": time.time()}
+
+    # Policy workers
+    policy_timers = ray.get([w.get_init_timer.remote() for w in policy.worker_group.workers])
+    for k, v in Timer.aggregate_max(policy_timers, reduction_op="sum").items():
+        timings[f"policy/{k}"] = v
+    metadata["num_policy_workers"] = len(policy_timers)
+
+    # vLLM workers (if present)
+    if policy_generation is not None:
+        vllm_timers = ray.get(
+            [w.get_init_timer.remote() for w in policy_generation.worker_group.workers]
+        )
+        for k, v in Timer.aggregate_max(vllm_timers, reduction_op="sum").items():
+            timings[f"vllm/{k}"] = v
+        metadata["num_vllm_workers"] = len(vllm_timers)
+
+    Timer.save_aggregated_to_json(timings, log_dir / "worker_init_timing.json", metadata)
+    print(f"✅ Saved worker init timing to {log_dir / 'worker_init_timing.json'}")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -657,20 +685,9 @@ def setup(
 
     # Collect worker initialization timing if enabled
     if master_config["logger"].get("collect_worker_init_timing", False):
-        worker_timers = ray.get(
-            [w.get_init_timer.remote() for w in policy.worker_group.workers]
+        _collect_worker_timing(
+            policy, policy_generation, Path(master_config["logger"]["log_dir"])
         )
-
-        max_timing = Timer.aggregate_max(worker_timers, reduction_op="sum")
-        timing_file = (
-            Path(master_config["logger"]["log_dir"]) / "worker_init_timing.json"
-        )
-        Timer.save_aggregated_to_json(
-            max_timing,
-            timing_file,
-            metadata={"num_workers": len(worker_timers), "timestamp": time.time()},
-        )
-        print(f"✅ Saved worker init timing to {timing_file}")
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()

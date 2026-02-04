@@ -153,6 +153,7 @@ class BaseVllmGenerationWorker:
 
         # Initialize timer for tracking initialization stages
         self.init_timer = Timer()
+        self.init_timer.start("total_init")
 
         # Record module import time
         if "G_MODULE_IMPORT_DURATION" in globals():
@@ -167,6 +168,7 @@ class BaseVllmGenerationWorker:
             self.tokenizer = None
             self.rank = 0
             self.world_size = 1
+            self.init_timer.stop("total_init")
             return
 
         # In Ray+vLLM setup, each worker process considers itself rank 0
@@ -442,6 +444,8 @@ class BaseVllmGenerationWorker:
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+
+        self.init_timer.stop("total_init")
 
     def llm(self):
         return self.llm
