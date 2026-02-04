@@ -16,6 +16,8 @@ from typing import Iterator
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
 
 def example_custom_dataloader(
     data_iterators: dict[str, Iterator],
@@ -35,6 +37,7 @@ def example_custom_dataloader(
         Data from the dataloaders.
         Updated data iterators (may update if the data iterator is exhausted).
     """
+    # sample data from each dataloader
     result = []
     for task_name, data_iterator in data_iterators.items():
         try:
@@ -42,4 +45,7 @@ def example_custom_dataloader(
         except:
             data_iterators[task_name] = iter(dataloaders[task_name])
             result.append(next(data_iterators[task_name]))
+
+    # merge results
+    result = BatchedDataDict.from_batches(result)
     return result, data_iterators
