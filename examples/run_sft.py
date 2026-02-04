@@ -138,6 +138,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                 val_data.task_spec,
                 val_data_processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[val_data.task_name] = val_data.preprocessor
 
     val_dataset = None
     if len(val_data_list) > 0:

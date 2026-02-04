@@ -186,33 +186,17 @@ class GeneralConversationsJsonlDataset:
 
     def __init__(
         self,
-        train_data_path: str,
-        val_data_path: Optional[str] = None,
-        train_split: Optional[str] = None,
-        val_split: Optional[str] = None,
-        train_media_data_dir: Optional[str] = None,
-        val_media_data_dir: Optional[str] = None,
+        data_path: str,
+        media_data_dir: Optional[str] = None,
+        **kwargs
     ):
-        self.train_media_data_dir = train_media_data_dir
-        self.val_media_data_dir = val_media_data_dir
-        train_ds = load_dataset_from_path(train_data_path, train_split)
-        if val_data_path:
-            val_ds = load_dataset_from_path(val_data_path, val_split)
-        else:
-            val_ds = None
+        self.media_data_dir = media_data_dir
+        self.dataset = load_dataset_from_path(data_path)
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
+        )
 
-        # store the formatted dataset
-        self.formatted_ds = {
-            "train": train_ds,
-            "validation": val_ds,
-        }
-
-        self.datum_preprocessor = {
-            "train": partial(self._datum_preprocessor, media_directory=train_media_data_dir),
-            "validation": partial(self._datum_preprocessor, media_directory=val_media_data_dir)
-        }
-        
-        self.task_spec = TaskDataSpec(task_name="GeneralConversationsJsonlDataset")
+        self.preprocessor = partial(self._datum_preprocessor, media_directory=media_data_dir)
 
         # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
         self.val_dataset = None
