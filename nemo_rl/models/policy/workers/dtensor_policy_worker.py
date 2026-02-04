@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Measure module import time (import time first for measurement)
+import time
+
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
+
 import contextlib
 import gc
 import itertools
@@ -83,6 +88,10 @@ from nemo_rl.utils.native_checkpoint import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
+
+# Calculate module import duration after all imports
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 
 @contextmanager
@@ -158,10 +167,17 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        """Initialize the DTensorPolicyWorker."""
+        self.init_timer = Timer()
+        self.init_timer.start("total_init")
+
+        # Record module import time
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
+
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
         apply_torch_aten_alias_tensor_patch()
 
-        """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -183,7 +199,8 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
-        torch.distributed.init_process_group(backend="nccl")
+        with self.init_timer.time("setup_distributed_nccl"):
+            torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
@@ -260,26 +277,27 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
             model_class = resolve_model_class(model_config.model_type)
 
-        full_state_dict = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = model_class.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-            )
-            full_state_dict = model.state_dict()
-            del model
+        with self.init_timer.time("model_loading"):
+            full_state_dict = None
+            if self.rank == 0:
+                print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+                model = model_class.from_pretrained(
+                    model_name,
+                    device_map="cpu",  # load weights onto CPU initially
+                    trust_remote_code=True,
+                    config=model_config,
+                )
+                full_state_dict = model.state_dict()
+                del model
 
-        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
-        # All ranks initialize model on meta device, so FSDP can shard it.
-        # The actual weights will be broadcast from rank 0.
-        with init_empty_weights():
-            self.model = model_class.from_config(
-                model_config,
-                trust_remote_code=True,
-            )
+            print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+            # All ranks initialize model on meta device, so FSDP can shard it.
+            # The actual weights will be broadcast from rank 0.
+            with init_empty_weights():
+                self.model = model_class.from_config(
+                    model_config,
+                    trust_remote_code=True,
+                )
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -344,30 +362,32 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
         # ------------------------------------------------
-        self.model = _parallelize_model(
-            self.model,
-            self.dp_cp_mesh,
-            self.tp_mesh,
-            param_dtype=self.dtype,
-            sequence_parallel=sequence_parallel_enabled,
-            cpu_offload=self.cpu_offload,
-            activation_checkpointing=self.cfg["dtensor_cfg"][
-                "activation_checkpointing"
-            ],
-            custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
-        )
+        with self.init_timer.time("model_parallelization"):
+            self.model = _parallelize_model(
+                self.model,
+                self.dp_cp_mesh,
+                self.tp_mesh,
+                param_dtype=self.dtype,
+                sequence_parallel=sequence_parallel_enabled,
+                cpu_offload=self.cpu_offload,
+                activation_checkpointing=self.cfg["dtensor_cfg"][
+                    "activation_checkpointing"
+                ],
+                custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            )
 
-        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
-        # This will broadcast the state dict from rank 0 to all other ranks
-        # and load it into the FSDP model.
-        set_model_state_dict(
-            self.model,
-            model_state_dict=full_state_dict,
-            options=StateDictOptions(
-                full_state_dict=True,
-                broadcast_from_rank0=True,
-            ),
-        )
+        with self.init_timer.time("state_dict_broadcast"):
+            print(f"[Rank {self.rank}] Loading state dict from rank 0...")
+            # This will broadcast the state dict from rank 0 to all other ranks
+            # and load it into the FSDP model.
+            set_model_state_dict(
+                self.model,
+                model_state_dict=full_state_dict,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    broadcast_from_rank0=True,
+                ),
+            )
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
@@ -392,15 +412,17 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model = self.move_to_device(self.model, "cpu")
 
         if init_reference_model:
-            self.reference_model_state_dict = get_cpu_state_dict(
-                self.model.state_dict().items(), pin_memory=True
-            )
+            with self.init_timer.time("reference_model_setup"):
+                self.reference_model_state_dict = get_cpu_state_dict(
+                    self.model.state_dict().items(), pin_memory=True
+                )
 
         if init_optimizer:
-            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
-            self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
-            )
+            with self.init_timer.time("optimizer_setup"):
+                optimizer_cls = get_class(self.cfg["optimizer"]["name"])
+                self.optimizer = optimizer_cls(
+                    self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
+                )
         else:
             self.optimizer = None
 
@@ -443,6 +465,13 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
+
+        # Stop total init timing
+        self.init_timer.stop("total_init")
+
+    def get_init_timer(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     # Refer to nemo impl. Below is original comment.
     # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113

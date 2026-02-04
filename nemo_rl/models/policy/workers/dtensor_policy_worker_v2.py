@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Measure module import time (import time first for measurement)
+import time
+
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
+
 import contextlib
 import gc
 import warnings
@@ -76,6 +81,10 @@ from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
+
+# Calculate module import duration after all imports
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 
 def dtensor_params_generator(
@@ -217,6 +226,13 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
+        self.init_timer = Timer()
+        self.init_timer.start("total_init")
+
+        # Record module import time
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
+
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
@@ -244,10 +260,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         # Set up distributed environment (returns FSDP2Manager)
-        distributed_manager = setup_distributed(
-            config=config,
-            runtime_config=runtime_config,
-        )
+        with self.init_timer.time("setup_distributed_nccl"):
+            distributed_manager = setup_distributed(
+                config=config,
+                runtime_config=runtime_config,
+            )
         # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
         self.rank = torch.distributed.get_rank()
         self.device_mesh = distributed_manager.device_mesh
@@ -272,17 +289,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         # Set up model and optimizer
-        model_and_optimizer_state = setup_model_and_optimizer(
-            config=config,
-            tokenizer=tokenizer,
-            runtime_config=runtime_config,
-            distributed_manager=distributed_manager,
-            checkpoint_manager=self.checkpoint_manager,
-            is_vlm=self.is_vlm,
-            init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        with self.init_timer.time("model_and_optimizer_setup"):
+            model_and_optimizer_state = setup_model_and_optimizer(
+                config=config,
+                tokenizer=tokenizer,
+                runtime_config=runtime_config,
+                distributed_manager=distributed_manager,
+                checkpoint_manager=self.checkpoint_manager,
+                is_vlm=self.is_vlm,
+                init_optimizer=init_optimizer,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+            )
 
         # Set instance attributes from model and optimizer state (tuple unpacking)
         (
@@ -302,7 +320,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Initialize reference model if requested
         self.reference_model_state_dict = None
         if init_reference_model:
-            self.reference_model_state_dict = setup_reference_model_state(self.model)
+            with self.init_timer.time("reference_model_setup"):
+                self.reference_model_state_dict = setup_reference_model_state(
+                    self.model
+                )
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
@@ -319,6 +340,13 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.is_generation_colocated,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+        # Stop total init timing
+        self.init_timer.stop("total_init")
+
+    def get_init_timer(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
