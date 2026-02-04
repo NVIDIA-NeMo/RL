@@ -30,7 +30,7 @@ on:
         required: false
         type: string
         default: ""
-      run-on-version-tag-only
+      run-on-version-tag-only:
         description: Whether to only run the workflow on version tags.
         required: false
         type: boolean
