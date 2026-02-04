@@ -196,22 +196,16 @@ def _collect_worker_timing(
     timings: dict[str, float] = {}
     metadata: dict[str, Any] = {"timestamp": time.time()}
 
-    # Policy workers
-    policy_timers = ray.get(
-        [w.get_init_timer.remote() for w in policy.worker_group.workers]
-    )
-    for k, v in Timer.aggregate_max(policy_timers, reduction_op="sum").items():
+    # Policy workers - use worker_group's collect_init_timing method
+    for k, v in policy.worker_group.collect_init_timing().items():
         timings[f"policy/{k}"] = v
-    metadata["num_policy_workers"] = len(policy_timers)
+    metadata["num_policy_workers"] = len(policy.worker_group.workers)
 
     # vLLM workers (if present)
     if policy_generation is not None:
-        vllm_timers = ray.get(
-            [w.get_init_timer.remote() for w in policy_generation.worker_group.workers]
-        )
-        for k, v in Timer.aggregate_max(vllm_timers, reduction_op="sum").items():
+        for k, v in policy_generation.worker_group.collect_init_timing().items():
             timings[f"vllm/{k}"] = v
-        metadata["num_vllm_workers"] = len(vllm_timers)
+        metadata["num_vllm_workers"] = len(policy_generation.worker_group.workers)
 
     Timer.save_aggregated_to_json(
         timings, log_dir / "worker_init_timing.json", metadata
