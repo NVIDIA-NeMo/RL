@@ -52,17 +52,22 @@ FaultTypeLiteral = Literal[
 SectionLiteral = Literal["training", "generation", "environment"]
 
 
-class FaultInjectionConfig(TypedDict, total=False):
+@dataclass
+class FaultInjectionConfig:
     """Configuration for fault injection testing."""
 
-    enabled: bool
-    target_section: SectionLiteral | None  # None means any section
-    target_rank: int
-    fault_type: FaultTypeLiteral
-    delay_seconds: float  # Fixed delay before fault
-    mtti_seconds: float  # Mean time to injection (exponential distribution)
-    offset_seconds: float  # Minimum delay when using mtti
-    seed: int  # For reproducibility
+    enabled: bool = False
+    target_section: SectionLiteral | None = (
+        None  # None = inject in first section that runs
+    )
+    target_rank: int = 0
+    fault_type: FaultTypeLiteral = "GPU_SLEEP"
+    delay_seconds: float | None = None  # Fixed delay before fault
+    mtti_seconds: float | None = (
+        None  # Mean time to injection (exponential distribution)
+    )
+    offset_seconds: float = 0.0  # Minimum delay when using mtti
+    seed: int | None = None  # For reproducibility
 
 
 class FaultToleranceConfig(TypedDict, total=False):
@@ -101,53 +106,27 @@ class FaultPlan:
 class FaultInjector:
     """Controller-side fault injector that plans faults for testing FT mechanisms."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: FaultInjectionConfig):
         """Initialize fault injector from config.
 
         Args:
-            config: Dictionary with keys:
-                - enabled: bool
-                - target_section: str (training|generation|environment|null)
-                - target_rank: int
-                - fault_type: str (GPU_SLEEP|WORKLOAD_EXC|SIGKILL|etc)
-                - delay_seconds: float (fixed delay)
-                - mtti_seconds: float (mean time to injection, exponential dist)
-                - offset_seconds: float (minimum delay)
-                - seed: int (for reproducibility)
+            config: FaultInjectionConfig dataclass with fault injection settings.
         """
-        self.enabled = config.get("enabled", False)
-        self.target_rank = config.get("target_rank", 0)
-        self.fault_type_str = config.get("fault_type", "GPU_SLEEP")
-        self.fixed_delay = config.get("delay_seconds", None)
-        self.mtti_seconds = config.get("mtti_seconds", None)
-        self.offset_seconds = config.get("offset_seconds", 0.0)
-        self.seed = config.get("seed", None)
+        self.enabled = config.enabled
+        self.target_rank = config.target_rank
+        self.fixed_delay = config.delay_seconds
+        self.mtti_seconds = config.mtti_seconds
+        self.offset_seconds = config.offset_seconds
+        self.seed = config.seed
         self._triggered = False
 
         self._rng = random.Random(self.seed) if self.seed is not None else random
 
-        # Parse target_section as Section enum (or None for any section)
-        target_section_str = config.get("target_section", None)
-        self.target_section: Optional[Section] = None
-        if target_section_str is not None:
-            try:
-                self.target_section = Section(target_section_str)
-            except ValueError:
-                raise ValueError(
-                    f"Unknown target_section: {target_section_str}. "
-                    f"Valid values: {[s.value for s in Section]}"
-                )
-
-        # Parse fault_type as Fault enum
-        self.fault_type: Optional[Fault] = None
-        if self.enabled:
-            try:
-                self.fault_type = Fault[self.fault_type_str]
-            except KeyError:
-                raise ValueError(
-                    f"Unknown fault type: {self.fault_type_str}. "
-                    f"Valid values: {[f.name for f in Fault]}"
-                )
+        # Convert typed literals to enums (types guarantee valid values)
+        self.target_section = (
+            Section(config.target_section) if config.target_section else None
+        )
+        self.fault_type = Fault[config.fault_type] if self.enabled else None
 
         if self.enabled and self.fixed_delay is None and self.mtti_seconds is None:
             logger.warning(

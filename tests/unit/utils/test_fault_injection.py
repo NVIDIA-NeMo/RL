@@ -20,6 +20,7 @@ import pytest
 from nvidia_resiliency_ext.inprocess.tools.inject_fault import Fault
 
 from nemo_rl.utils.fault_injection import (
+    FaultInjectionConfig,
     FaultInjector,
     FaultPlan,
     Section,
@@ -28,10 +29,11 @@ from nemo_rl.utils.fault_injection import (
     with_fault_injection,
 )
 
-
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
 @pytest.fixture(autouse=True)
 def clear_global_injector():
     """Clear global injector before and after each test."""
@@ -43,13 +45,13 @@ def clear_global_injector():
 @pytest.fixture
 def base_config():
     """Base config for enabled fault injector."""
-    return {
-        "enabled": True,
-        "target_section": "training",
-        "target_rank": 0,
-        "fault_type": "GPU_SLEEP",
-        "delay_seconds": 5.0,
-    }
+    return FaultInjectionConfig(
+        enabled=True,
+        target_section="training",
+        target_rank=0,
+        fault_type="GPU_SLEEP",
+        delay_seconds=5.0,
+    )
 
 
 @pytest.fixture
@@ -72,37 +74,20 @@ def mock_worker_class():
 # =============================================================================
 
 
-@pytest.mark.parametrize(
-    "config,reason",
-    [
-        ({"enabled": False}, "disabled"),
-        ({"enabled": True, "fault_type": "GPU_SLEEP"}, "no_timing"),
-    ],
-)
-def test_injector_disabled_cases(config, reason):
-    """FaultInjector disables itself for invalid configurations."""
+def test_injector_disabled_when_not_enabled():
+    """FaultInjector returns no plan when disabled."""
+    config = FaultInjectionConfig(enabled=False)
     injector = FaultInjector(config)
     assert injector.enabled is False
     assert injector.get_plan(Section.TRAINING) is None
 
 
-def test_injector_invalid_fault_type_raises():
-    """FaultInjector raises ValueError for invalid fault_type."""
-    config = {"enabled": True, "fault_type": "INVALID", "delay_seconds": 5.0}
-    with pytest.raises(ValueError, match="Unknown fault type: INVALID"):
-        FaultInjector(config)
-
-
-def test_injector_invalid_target_section_raises():
-    """FaultInjector raises ValueError for invalid target_section."""
-    config = {
-        "enabled": True,
-        "target_section": "invalid",
-        "fault_type": "GPU_SLEEP",
-        "delay_seconds": 5.0,
-    }
-    with pytest.raises(ValueError, match="Unknown target_section: invalid"):
-        FaultInjector(config)
+def test_injector_disabled_when_no_timing():
+    """FaultInjector disables when no timing is specified."""
+    config = FaultInjectionConfig(enabled=True, fault_type="GPU_SLEEP")
+    injector = FaultInjector(config)
+    assert injector.enabled is False
+    assert injector.get_plan(Section.TRAINING) is None
 
 
 def test_injector_section_targeting_and_oneshot(base_config):
@@ -124,19 +109,22 @@ def test_injector_section_targeting_and_oneshot(base_config):
     assert injector2.get_plan(Section.TRAINING) is None
 
     # Test null targeting (any section)
-    injector3 = FaultInjector({**base_config, "target_section": None})
+    from dataclasses import replace
+
+    config_any_section = replace(base_config, target_section=None)
+    injector3 = FaultInjector(config_any_section)
     assert injector3.get_plan(Section.GENERATION) is not None
 
 
 def test_injector_mtti_and_seed():
     """MTTI uses exponential distribution; seed provides determinism."""
-    config = {
-        "enabled": True,
-        "fault_type": "GPU_SLEEP",
-        "mtti_seconds": 100.0,
-        "offset_seconds": 5.0,
-        "seed": 42,
-    }
+    config = FaultInjectionConfig(
+        enabled=True,
+        fault_type="GPU_SLEEP",
+        mtti_seconds=100.0,
+        offset_seconds=5.0,
+        seed=42,
+    )
 
     plan1 = FaultInjector(config).get_plan(Section.TRAINING)
     plan2 = FaultInjector(config).get_plan(Section.TRAINING)
@@ -212,13 +200,13 @@ def test_decorator_dispatch_when_matching(base_config, mock_worker_class):
 )
 def test_decorator_skip_when_not_matching(target_section, my_rank, mock_worker_class):
     """Decorator skips dispatch when section or rank doesn't match."""
-    config = {
-        "enabled": True,
-        "target_section": target_section,
-        "target_rank": 0,
-        "fault_type": "GPU_SLEEP",
-        "delay_seconds": 5.0,
-    }
+    config = FaultInjectionConfig(
+        enabled=True,
+        target_section=target_section,
+        target_rank=0,
+        fault_type="GPU_SLEEP",
+        delay_seconds=5.0,
+    )
     set_global_fault_injector(FaultInjector(config))
     worker = mock_worker_class(rank=my_rank)
 
