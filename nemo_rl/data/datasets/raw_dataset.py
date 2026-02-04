@@ -14,7 +14,7 @@
 
 from datasets import Dataset
 
-from nemo_rl.data import ResponseDatasetConfig
+from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataPreProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
