@@ -11,7 +11,7 @@ ProRLv2 (as used in this repo) is best thought of as **GRPO + a bundle of stabil
 - **Reinforce++: Decoupled local / global advantage normalization** (`reinforce_plus_plus`)
 - **“Stop properly” penalty** for truncated responses
 
-This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation behind dynamic sampling / overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
+This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation behind dynamic sampling/overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
 
 ## Quickstart: Launch a ProRLv2 Run
 
