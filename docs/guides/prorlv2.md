@@ -2,7 +2,7 @@
 
 This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml).
 
-ProRLv2 (as used in this repo) is best thought of as **GRPO + a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning:
+ProRLv2 (as used in this repo) is best thought of as **GRPO and a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning
 
 - **DAPO dynamic sampling**: skip prompt-groups with zero reward variance
 - **Decoupled (asymmetric) clipping**: `ratio_clip_max > ratio_clip_min`
