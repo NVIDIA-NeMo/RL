@@ -773,7 +773,6 @@ class MLflowLogger(LoggerInterface):
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
         tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
-        mlflow.get_tracking_uri()
         if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 
@@ -784,7 +783,11 @@ class MLflowLogger(LoggerInterface):
         run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
 
         run = mlflow.active_run()
-        if run is None or run_id:
+        # Start a new run if there is no active run, or if the active run doesn't match the requested run_id
+        if run is None or (run_id and run.info.run_id != run_id):
+            if run:
+                mlflow.end_run()
+
             if experiment_name is not None:
                 experiment = mlflow.get_experiment_by_name(experiment_name)
                 # if name is set but experiment is not found, create it
