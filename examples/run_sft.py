@@ -65,6 +65,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     data_list = []
 
     if isinstance(data_config["train"], dict):
@@ -84,6 +85,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_generation_prompt=data_config["add_generation_prompt"],
         )
         task_data_processors[data.task_name] = (data.task_spec, data_processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[data.task_name] = data.preprocessor
+
 
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
@@ -91,6 +95,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")

@@ -15,6 +15,7 @@
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
+from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMath17KDataset,
     DAPOMathAIME2024Dataset,
@@ -31,6 +32,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 )
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
+from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import GeneralConversationsJsonlDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
@@ -38,6 +40,7 @@ DATASET_REGISTRY = {
     # built-in datasets
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
+    "daily-omni": DailyOmniDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
@@ -64,6 +67,25 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
         dataset = dataset_class(
             **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
+    elif dataset_name == "GeneralConversationsJsonlDataset":
+        if "train_data_path" not in data_config:
+            raise ValueError(
+                "train_data_path is required when dataset_name is not one of the built-ins."
+            )
+        extra_kwargs = get_extra_kwargs(
+            data_config,
+            [
+                "val_data_path",
+                "train_split",
+                "val_split",
+                "train_media_data_dir",
+                "val_media_data_dir",
+            ],
+        )
+        base_dataset = GeneralConversationsJsonlDataset(
+            train_data_path=data_config["train_data_path"],
+            **extra_kwargs,
+        )
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
@@ -81,6 +103,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 __all__ = [
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",
+    "DailyOmniDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
     "DeepScalerDataset",
