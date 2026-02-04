@@ -693,9 +693,7 @@ class TestMLflowLogger:
             name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"]
-        )
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_none_in_config(self, mock_mlflow):
@@ -720,9 +718,7 @@ class TestMLflowLogger:
             name=cfg["experiment_name"], artifact_location="/fallback/path"
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"]
-        )
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_without_artifact_location_uses_log_dir(self, mock_mlflow):
@@ -747,9 +743,7 @@ class TestMLflowLogger:
             name=cfg["experiment_name"], artifact_location=log_dir
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(
-            run_name=cfg["run_name"]
-        )
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
 
 
 class TestRayGpuMonitorLogger:
