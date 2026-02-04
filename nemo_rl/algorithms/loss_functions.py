@@ -140,11 +140,11 @@ class ClippedPGLossFn(LossFunction):
         ]
         # Type of truncated importance sampling: "tis" (clamp max) or "icepop" (filter [min, max])
         self.truncated_importance_sampling_type = cfg.get(
-            "truncated_importance_sampling_type", "tis"
+            "truncated_importance_sampling_type"
         )
         # Lower bound for ICE-POP filtering (default 0.5)
         self.truncated_importance_sampling_ratio_min = cfg.get(
-            "truncated_importance_sampling_ratio_min", 0.5
+            "truncated_importance_sampling_ratio_min"
         )
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(

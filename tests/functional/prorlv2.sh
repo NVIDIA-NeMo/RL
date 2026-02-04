@@ -25,6 +25,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
+    grpo.use_dynamic_sampling=false \
+    grpo.batch_multiplier=1 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
