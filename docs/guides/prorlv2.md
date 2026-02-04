@@ -5,7 +5,7 @@ This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the exa
 ProRLv2 (as used in this repo) is best thought of as **GRPO + a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning:
 
 - **DAPO Dynamic Sampling**: skip prompt-groups with zero reward variance
-- **Decoupled (Asymmetric) Clipping**: `ratio_clip_max > ratio_clip_min`
+- **Decoupled (asymmetric) clipping**: `ratio_clip_max > ratio_clip_min`
 - **Token-level policy gradient loss**
 - **Importance sampling correction and TIS/CE-POP** (especially helpful for MoE/backend-mismatch scenarios)
 - **Reinforce++: Decoupled local / global advantage normalization** (`reinforce_plus_plus`)
