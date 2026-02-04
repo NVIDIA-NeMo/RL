@@ -27,7 +27,7 @@ class RawDataset:
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
     task_spec: TaskDataSpec
-    preprocessor: TaskDataPreProcessFnCallable | None
+    preprocessor: TaskDataPreProcessFnCallable | None = None
 
     def split_train_validation(self, test_size: float, seed: int):
         if test_size > 0:
@@ -46,7 +46,6 @@ class RawDataset:
         assert processor_name in PROCESSOR_REGISTRY, (
             f"Processor {processor_name} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."
         )
-        self.preprocessor = None
         self.processor = PROCESSOR_REGISTRY[processor_name]
 
     def set_task_spec(self, data_config: ResponseDatasetConfig):
