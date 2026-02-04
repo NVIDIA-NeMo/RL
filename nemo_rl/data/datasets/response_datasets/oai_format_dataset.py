@@ -95,6 +95,7 @@ class OpenAIFormatDataset(RawDataset):
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#openai-format-datasets-with-tool-calling-support for more details.
 
     Args:
         data_path: Path to the dataset JSON file
@@ -132,7 +133,10 @@ class OpenAIFormatDataset(RawDataset):
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
-        self.task_name = data_path.split("/")[-1].split(".")[0]
+
+        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if self.task_name[0] == "-":
+            self.task_name = self.task_name[1:]
 
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
