@@ -15,7 +15,6 @@
 import contextlib
 import gc
 import warnings
-from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional
 
@@ -58,6 +57,7 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
 )
@@ -347,7 +347,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        sequence_dim, _ = check_sequence_dim(data)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -385,7 +385,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         if empty_cache_steps:
             warnings.warn(
-                f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
+                f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
             )
 
         def on_microbatch_start(mb_idx):
@@ -394,7 +394,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with ctx:
             # Get data from batch and move to device
-            data.to("cuda")
+            data = data.to("cuda")
 
             losses = []
             all_mb_metrics = []
@@ -440,9 +440,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     num_global_batches=num_global_batches,
                     train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start
-                    if empty_cache_steps
-                    else None,
+                    on_microbatch_start=on_microbatch_start,
                 )
 
                 # Extract losses and metrics from results
@@ -450,7 +448,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
-                        num_valid_samples = loss_metrics.get("num_valid_samples", 0)
+                        num_valid_samples = loss_metrics["num_valid_samples"]
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
@@ -495,30 +493,17 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             # the memory allocator before moving on
             torch.cuda.empty_cache()
 
-            # Compute global loss across all ranks
-            with torch.no_grad():
-                global_loss = torch.tensor(losses, device="cuda")
-                torch.distributed.all_reduce(
-                    global_loss, group=self.dp_mesh.get_group()
-                )
-            # Aggregate metrics across all microbatches
-            mb_metrics = defaultdict(list)
-            for m in all_mb_metrics:
-                for k, v in m.items():
-                    mb_metrics[k].append(v)
-
-            metrics = {
-                "global_loss": global_loss.cpu(),
-                "grad_norm": grad_norm,
-                "rank": torch.distributed.get_rank(),
-                "gpu_name": torch.cuda.get_device_name(),
-                "model_dtype": self.dtype,
-                "all_mb_metrics": dict(mb_metrics),
-            }
+            # Aggregate training statistics across microbatches and ranks
+            metrics = aggregate_training_statistics(
+                losses=losses,
+                all_mb_metrics=all_mb_metrics,
+                grad_norm=grad_norm,
+                dp_group=self.dp_mesh.get_group(),
+                dtype=self.dtype,
+            )
 
             return metrics
 
-    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
@@ -581,7 +566,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    token_logprobs, metrics, _ = forward_with_post_processing_fn(
+                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         cfg=self.cfg,
                         post_processing_fn=logprobs_post_processor,
@@ -612,13 +597,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return return_data
 
-    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
-        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        sequence_dim, _ = check_sequence_dim(data)
 
         self.model.eval()
         print("Begin to batch datas")
@@ -651,7 +635,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    rm_scores, metrics, _ = forward_with_post_processing_fn(
+                    rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         cfg=self.cfg,
                         post_processing_fn=score_post_processor,
@@ -719,6 +703,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with torch.no_grad():
             data.to("cuda")
+            # Get microbatch iterator based on batching strategy
             processed_iterator, iterator_len = get_microbatch_iterator(
                 data,
                 self.cfg,
@@ -740,7 +725,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    (vals, idx), metrics, _ = forward_with_post_processing_fn(
+                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         cfg=self.cfg,
                         post_processing_fn=topk_post_processor,

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -763,9 +763,6 @@ class TestForwardWithPostProcessingFn:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -782,7 +779,7 @@ class TestForwardWithPostProcessingFn:
             model=mock_model,
             cfg=base_cfg,
             post_processing_fn=loss_post_processor,
-            data_iterator=data_iterator,
+            processed_mb=processed_mb,
             global_valid_seqs=torch.tensor(batch_size),
             global_valid_toks=torch.tensor(batch_size * seq_len),
         )
@@ -838,9 +835,6 @@ class TestForwardWithPostProcessingFn:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create score post-processor
         score_post_processor = ScorePostProcessor(cfg=base_cfg)
 
@@ -849,7 +843,7 @@ class TestForwardWithPostProcessingFn:
             model=mock_model,
             cfg=base_cfg,
             post_processing_fn=score_post_processor,
-            data_iterator=data_iterator,
+            processed_mb=processed_mb,
             is_reward_model=True,
         )
 
@@ -911,9 +905,6 @@ class TestAutomodelForwardBackward:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -929,7 +920,7 @@ class TestAutomodelForwardBackward:
         results = automodel_forward_backward(
             model=mock_model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size),
@@ -938,7 +929,7 @@ class TestAutomodelForwardBackward:
 
         # Verify results
         assert len(results) == 1
-        result, metrics = results[0]
+        _result, _metrics = results[0]
 
         # Verify loss function was called
         mock_loss_fn.assert_called_once()
@@ -989,9 +980,6 @@ class TestAutomodelForwardBackward:
                 )
             )
 
-        # Create iterator
-        data_iterator = iter(processed_mbs)
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -1007,7 +995,7 @@ class TestAutomodelForwardBackward:
         results = automodel_forward_backward(
             model=mock_model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
@@ -1067,9 +1055,6 @@ class TestAutomodelForwardBackward:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -1100,7 +1085,7 @@ class TestAutomodelForwardBackward:
         results = automodel_forward_backward(
             model=mock_model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size),
@@ -1159,9 +1144,6 @@ class TestAutomodelForwardBackward:
                 )
             )
 
-        # Create iterator
-        data_iterator = iter(processed_mbs)
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -1183,7 +1165,7 @@ class TestAutomodelForwardBackward:
         results = automodel_forward_backward(
             model=mock_model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
@@ -1243,9 +1225,6 @@ class TestAutomodelForwardBackward:
                 )
             )
 
-        # Create iterator
-        data_iterator = iter(processed_mbs)
-
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=mock_loss_fn,
@@ -1261,7 +1240,7 @@ class TestAutomodelForwardBackward:
         results = automodel_forward_backward(
             model=mock_model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_valid_microbatches),
@@ -1327,9 +1306,6 @@ class TestForwardWithPostProcessingFnAdditional:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=base_cfg,
@@ -1344,7 +1320,7 @@ class TestForwardWithPostProcessingFnAdditional:
             model=mock_model,
             cfg=base_cfg,
             post_processing_fn=logprobs_post_processor,
-            data_iterator=data_iterator,
+            processed_mb=processed_mb,
         )
 
         # Verify model was called
@@ -1403,9 +1379,6 @@ class TestForwardWithPostProcessingFnAdditional:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create topk post-processor
         topk_post_processor = TopkLogitsPostProcessor(
             cfg=base_cfg,
@@ -1421,7 +1394,7 @@ class TestForwardWithPostProcessingFnAdditional:
             model=mock_model,
             cfg=base_cfg,
             post_processing_fn=topk_post_processor,
-            data_iterator=data_iterator,
+            processed_mb=processed_mb,
         )
 
         # Verify model was called
@@ -1476,9 +1449,6 @@ class TestForwardWithPostProcessingFnAdditional:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create unknown post-processor (not a valid type)
         class UnknownPostProcessor:
             pass
@@ -1491,39 +1461,7 @@ class TestForwardWithPostProcessingFnAdditional:
                 model=mock_model,
                 cfg=base_cfg,
                 post_processing_fn=unknown_post_processor,
-                data_iterator=data_iterator,
-            )
-
-    def test_forward_requires_iterator_or_processed_mb(
-        self,
-        mock_model,
-        base_cfg,
-        mock_device_mesh,
-        mock_cp_mesh,
-        mock_tp_mesh,
-        mock_loss_fn,
-    ):
-        """Test forward_with_post_processing_fn raises ValueError when neither iterator nor processed_mb provided."""
-        loss_post_processor = LossPostProcessor(
-            loss_fn=mock_loss_fn,
-            cfg=base_cfg,
-            device_mesh=mock_device_mesh,
-            cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
-            cp_size=1,
-            dp_size=1,
-        )
-
-        # Call without data_iterator or processed_mb should raise ValueError
-        with pytest.raises(
-            ValueError, match="Either data_iterator or processed_mb must be provided"
-        ):
-            forward_with_post_processing_fn(
-                model=mock_model,
-                cfg=base_cfg,
-                post_processing_fn=loss_post_processor,
-                data_iterator=None,
-                processed_mb=None,
+                processed_mb=processed_mb,
             )
 
     def test_forward_with_processed_mb_directly(
@@ -1963,9 +1901,6 @@ class TestAutomodelForwardBackwardWithGradients:
             original_seq_len=seq_len,
         )
 
-        # Create iterator
-        data_iterator = iter([processed_mb])
-
         # Create loss function that returns requires_grad tensor
         def loss_fn(logits, mb, global_valid_seqs, global_valid_toks):
             loss = logits.mean()
@@ -1989,7 +1924,7 @@ class TestAutomodelForwardBackwardWithGradients:
         results = automodel_forward_backward(
             model=model,
             cfg=base_cfg,
-            data_iterator=data_iterator,
+            data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=False,  # Enable backward pass
             global_valid_seqs=torch.tensor(batch_size),
@@ -2001,3 +1936,140 @@ class TestAutomodelForwardBackwardWithGradients:
         # Verify gradients were computed
         assert model.proj.weight.grad is not None
         assert len(results) == 1
+
+
+# =====================
+# Test aggregate_training_statistics
+# =====================
+@pytest.mark.automodel
+class TestAggregateTrainingStatistics:
+    """Tests for aggregate_training_statistics function."""
+
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.get_rank", return_value=0)
+    @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
+    def test_basic_aggregation(self, mock_device_name, mock_get_rank, mock_all_reduce):
+        """Test basic statistics aggregation."""
+        from nemo_rl.models.automodel.train import (
+            aggregate_training_statistics,
+        )
+
+        losses = [0.5, 0.4, 0.3]
+        all_mb_metrics = [
+            {"loss": 0.5, "num_valid_samples": 4},
+            {"loss": 0.4, "num_valid_samples": 4},
+            {"loss": 0.3, "num_valid_samples": 4},
+        ]
+        grad_norm = torch.tensor([1.5])
+        mock_dp_group = MagicMock()
+        dtype = torch.bfloat16
+
+        metrics = aggregate_training_statistics(
+            losses=losses,
+            all_mb_metrics=all_mb_metrics,
+            grad_norm=grad_norm,
+            dp_group=mock_dp_group,
+            dtype=dtype,
+        )
+
+        # Verify all_reduce was called
+        mock_all_reduce.assert_called_once()
+
+        # Verify metrics structure
+        assert "global_loss" in metrics
+        assert "grad_norm" in metrics
+        assert "rank" in metrics
+        assert "gpu_name" in metrics
+        assert "model_dtype" in metrics
+        assert "all_mb_metrics" in metrics
+
+        # Verify values
+        assert metrics["rank"] == 0
+        assert metrics["gpu_name"] == "NVIDIA A100"
+        assert metrics["model_dtype"] == torch.bfloat16
+        assert torch.equal(metrics["grad_norm"], grad_norm)
+
+        # Verify metrics aggregation
+        assert metrics["all_mb_metrics"]["loss"] == [0.5, 0.4, 0.3]
+        assert metrics["all_mb_metrics"]["num_valid_samples"] == [4, 4, 4]
+
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.get_rank", return_value=2)
+    @patch("torch.cuda.get_device_name", return_value="NVIDIA H100")
+    def test_with_none_grad_norm(
+        self, mock_device_name, mock_get_rank, mock_all_reduce
+    ):
+        """Test aggregation with None grad_norm (eval mode)."""
+        from nemo_rl.models.automodel.train import (
+            aggregate_training_statistics,
+        )
+
+        losses = [0.5]
+        all_mb_metrics = [{"loss": 0.5}]
+        grad_norm = None
+        mock_dp_group = MagicMock()
+        dtype = torch.float16
+
+        metrics = aggregate_training_statistics(
+            losses=losses,
+            all_mb_metrics=all_mb_metrics,
+            grad_norm=grad_norm,
+            dp_group=mock_dp_group,
+            dtype=dtype,
+        )
+
+        assert metrics["grad_norm"] is None
+        assert metrics["rank"] == 2
+        assert metrics["model_dtype"] == torch.float16
+
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.get_rank", return_value=0)
+    @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
+    def test_empty_metrics(self, mock_device_name, mock_get_rank, mock_all_reduce):
+        """Test aggregation with empty metrics list."""
+        from nemo_rl.models.automodel.train import (
+            aggregate_training_statistics,
+        )
+
+        losses = []
+        all_mb_metrics = []
+        grad_norm = torch.tensor([0.0])
+        mock_dp_group = MagicMock()
+        dtype = torch.bfloat16
+
+        metrics = aggregate_training_statistics(
+            losses=losses,
+            all_mb_metrics=all_mb_metrics,
+            grad_norm=grad_norm,
+            dp_group=mock_dp_group,
+            dtype=dtype,
+        )
+
+        assert metrics["all_mb_metrics"] == {}
+        assert metrics["global_loss"].numel() == 0
+
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.get_rank", return_value=0)
+    @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
+    def test_global_loss_on_cpu(self, mock_device_name, mock_get_rank, mock_all_reduce):
+        """Test that global_loss is moved to CPU."""
+        from nemo_rl.models.automodel.train import (
+            aggregate_training_statistics,
+        )
+
+        losses = [0.5, 0.4]
+        all_mb_metrics = [{"loss": 0.5}, {"loss": 0.4}]
+        grad_norm = torch.tensor([1.0])
+        mock_dp_group = MagicMock()
+        dtype = torch.bfloat16
+
+        metrics = aggregate_training_statistics(
+            losses=losses,
+            all_mb_metrics=all_mb_metrics,
+            grad_norm=grad_norm,
+            dp_group=mock_dp_group,
+            dtype=dtype,
+        )
+
+        # Verify global_loss is on CPU
+        assert metrics["global_loss"].device == torch.device("cpu")

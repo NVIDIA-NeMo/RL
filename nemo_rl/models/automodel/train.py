@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+from collections import defaultdict
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 import torch
@@ -39,6 +40,7 @@ from nemo_rl.distributed.model_utils import (
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -121,7 +123,7 @@ def extract_logits(
 
 def apply_temperature_scaling(
     logits: torch.Tensor,
-    cfg: dict[str, Any],
+    cfg: PolicyConfig,
 ) -> torch.Tensor:
     """Apply temperature scaling to logits.
 
@@ -140,7 +142,7 @@ def apply_temperature_scaling(
 def redistribute_logits_for_cp(
     logits: torch.Tensor,
     device_mesh: Any,
-    cp_mesh: Any,
+    cp_mesh: Any,  # noqa: ARG001
     sequence_dim: int = 1,
 ) -> DTensor:
     """Redistribute logits for context parallel processing.
@@ -151,7 +153,7 @@ def redistribute_logits_for_cp(
     Args:
         logits: Logits tensor (may be DTensor or regular tensor)
         device_mesh: Full device mesh
-        cp_mesh: Context parallel mesh
+        cp_mesh: Context parallel mesh (kept for signature compatibility)
         sequence_dim: Dimension for sequence sharding
 
     Returns:
@@ -229,10 +231,9 @@ def prepare_data_for_cp(
 
 def forward_with_post_processing_fn(
     model: nn.Module,
-    cfg: dict[str, Any],
+    cfg: PolicyConfig,
     post_processing_fn: PostProcessingFunction,
-    data_iterator: Optional[Iterator[ProcessedMicrobatch]] = None,
-    processed_mb: Optional[ProcessedMicrobatch] = None,
+    processed_mb: ProcessedMicrobatch,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
@@ -252,11 +253,7 @@ def forward_with_post_processing_fn(
         model: The model to run forward pass on
         cfg: Configuration dictionary
         post_processing_fn: Post-processing function to apply to the logits
-        data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed).
-            Either data_iterator or processed_mb must be provided.
-        processed_mb: Pre-fetched ProcessedMicrobatch to use directly instead of
-            iterating. Useful when the caller needs to access cp_buffers before
-            entering a context manager. Either data_iterator or processed_mb must be provided.
+        processed_mb: Pre-fetched ProcessedMicrobatch containing data and processed inputs
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
@@ -269,12 +266,6 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
-    # Get the pre-processed microbatch from iterator or use provided one
-    if processed_mb is None:
-        if data_iterator is None:
-            raise ValueError("Either data_iterator or processed_mb must be provided")
-        processed_mb = next(data_iterator)
-
     # Extract the processed components
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
@@ -291,8 +282,10 @@ def forward_with_post_processing_fn(
     logits = extract_logits(model, outputs)
     del outputs
 
-    # Apply temperature scaling
-    logits = apply_temperature_scaling(logits, cfg)
+    # Apply temperature scaling only for sampling-oriented post-processors
+    # Loss and score computations should use unscaled logits
+    if isinstance(post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)):
+        logits = apply_temperature_scaling(logits, cfg)
 
     # Apply the post-processing function directly based on type
     if isinstance(post_processing_fn, LossPostProcessor):
@@ -335,7 +328,7 @@ def forward_with_post_processing_fn(
 
 def automodel_forward_backward(
     model: nn.Module,
-    cfg: dict[str, Any],
+    cfg: PolicyConfig,
     data_iterator: Iterator[ProcessedMicrobatch],
     post_processing_fn: PostProcessingFunction,
     forward_only: bool = False,
@@ -458,7 +451,7 @@ class LossPostProcessor:
     def __init__(
         self,
         loss_fn: LossFunction,
-        cfg: dict[str, Any],
+        cfg: PolicyConfig,
         device_mesh: Any,
         cp_mesh: Any,
         tp_mesh: Any,
@@ -540,7 +533,7 @@ class LogprobsPostProcessor:
 
     def __init__(
         self,
-        cfg: dict[str, Any],
+        cfg: PolicyConfig,
         device_mesh: Any,
         cp_mesh: Any,
         tp_mesh: Any,
@@ -660,6 +653,7 @@ class LogprobsPostProcessor:
                 device=token_logprobs.device,
             )
             for i, length in enumerate(input_lengths):
+                # For right-padded sequence, set 1s at the beginning of the sequence
                 post_attention_mask[i, :length] = 1
             token_logprobs = token_logprobs * post_attention_mask
 
@@ -700,7 +694,13 @@ class LogprobsPostProcessor:
             logits = logits.to(torch.float32)
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        # Extract logprobs for each token in the sequence
+        # Extract logprobs for each token in the sequence by gathering the logprob
+        # corresponding to the next token at each position
+        # Input shapes:
+        #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
+        #   token_ids: [batch_size, sequence_length] - actual tokens
+        # Output shape: [batch_size, sequence_length] - logprob of each token given previous
+        # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
         next_tokens = input_ids[:, 1:]
         log_probs = log_probs[:, :-1]
         token_logprobs = log_probs.gather(
@@ -716,7 +716,7 @@ class TopkLogitsPostProcessor:
 
     def __init__(
         self,
-        cfg: dict[str, Any],
+        cfg: PolicyConfig,
         device_mesh: Any,
         cp_mesh: Any,
         tp_mesh: Any,
@@ -818,6 +818,9 @@ class TopkLogitsPostProcessor:
 
         # Handle sequence packing unpacking
         if enable_seq_packing:
+            # Unpack top-k results from packed format back to original batch format
+            # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+            # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
             unpacked_vals = torch.zeros(
                 (original_batch_size, original_seq_len, self.k),
                 dtype=vals.dtype,
@@ -836,6 +839,8 @@ class TopkLogitsPostProcessor:
                 end = cu_seqlens[i + 1].item()
                 seq_len_actual = input_lengths[i].item()
 
+                # Extract the corresponding portion from packed results
+                # Note: vals and idx are [1, packed_seq_len, k] due to packing
                 unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                 unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
 
@@ -850,7 +855,7 @@ class ScorePostProcessor:
 
     def __init__(
         self,
-        cfg: dict[str, Any],
+        cfg: PolicyConfig,
     ):
         """Initialize ScorePostProcessor.
 
@@ -876,3 +881,45 @@ class ScorePostProcessor:
         rm_scores = rm_scores.squeeze(-1)
 
         return rm_scores
+
+
+def aggregate_training_statistics(
+    losses: list[float],
+    all_mb_metrics: list[dict[str, Any]],
+    grad_norm: Optional[torch.Tensor],
+    dp_group: Any,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Aggregate training statistics across microbatches and ranks.
+
+    Args:
+        losses: List of loss values from each microbatch
+        all_mb_metrics: List of metrics dictionaries from each microbatch
+        grad_norm: Gradient norm tensor (or None if eval mode)
+        dp_group: Data parallel process group for all-reduce
+        dtype: Model dtype for metrics
+
+    Returns:
+        Dictionary containing aggregated metrics including global_loss, grad_norm, etc.
+    """
+    # Compute global loss across all ranks
+    with torch.no_grad():
+        global_loss = torch.tensor(losses, device="cuda")
+        torch.distributed.all_reduce(global_loss, group=dp_group)
+
+    # Aggregate metrics across all microbatches
+    mb_metrics = defaultdict(list)
+    for m in all_mb_metrics:
+        for k, v in m.items():
+            mb_metrics[k].append(v)
+
+    metrics = {
+        "global_loss": global_loss.cpu(),
+        "grad_norm": grad_norm,
+        "rank": torch.distributed.get_rank(),
+        "gpu_name": torch.cuda.get_device_name(),
+        "model_dtype": dtype,
+        "all_mb_metrics": dict(mb_metrics),
+    }
+
+    return metrics
