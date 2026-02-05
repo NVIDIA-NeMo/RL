@@ -32,7 +32,7 @@ on:
         default: ""
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
-        required: true
+        required: false
         type: string
 
 jobs:
