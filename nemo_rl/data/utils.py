@@ -29,9 +29,6 @@ from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
-TrainDatasetType = Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]
-ValidationDatasetType = Optional[AllTaskProcessedDataset]
-
 
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
@@ -40,9 +37,12 @@ def setup_response_data(
     env_configs: Optional[dict[str, Any]] = None,
     is_vlm: bool = False,
 ) -> Union[
-    tuple[AllTaskProcessedDataset, Optional[AllTaskProcessedDataset]],
     tuple[
-        AllTaskProcessedDataset,
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[AllTaskProcessedDataset],
+    ],
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
         Optional[AllTaskProcessedDataset],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
