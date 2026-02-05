@@ -293,6 +293,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
+    def _remap_reference_state_dict(self):
+        for name, item in self.model.state_dict().items():
+            unwrapped_name = self.megatron_bridge._model_bridge._get_lora_unwrapped_name(name)
+            print(f"name: {name}, Unwrapped name: {unwrapped_name}")
+
+            if unwrapped_name in self.reference_state_dict:
+                self.reference_state_dict[unwrapped_name] = self.reference_state_dict[name]
+                del self.reference_state_dict[name]
+
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
         self.model.enable_forward_pre_hook()

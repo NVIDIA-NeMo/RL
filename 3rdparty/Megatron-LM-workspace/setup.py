@@ -44,6 +44,7 @@ megatron_core_cpp_extension_source_file = "megatron/core/datasets/helpers.cpp"
 CACHED_DEPENDENCIES = [
     # Default dependencies from pyproject.toml
     "torch",
+    "datasets",
     "numpy",
     "packaging>=24.2",
     # Dev dependencies from pyproject.toml
@@ -64,10 +65,9 @@ CACHED_DEPENDENCIES = [
     "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
-    # VCS dependency - must match pyproject.toml [tool.uv.sources]
     "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
-    "datasets",
     "fastapi~=0.50",
+    "flash-linear-attention~=0.3.2",
 ]
 
 
