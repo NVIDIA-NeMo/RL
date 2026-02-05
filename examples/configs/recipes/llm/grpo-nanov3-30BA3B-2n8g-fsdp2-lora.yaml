@@ -16,7 +16,7 @@ policy:
     lora_cfg:
       enabled: true
       dim: 128
-      alpha: 256
+      alpha: 512
       use_triton: false
   sequence_packing:
     enabled: false
