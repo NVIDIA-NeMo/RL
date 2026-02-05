@@ -23,10 +23,12 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_data_with_envs
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -45,6 +47,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 def main() -> None:
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:
