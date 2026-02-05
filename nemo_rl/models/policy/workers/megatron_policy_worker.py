@@ -1565,7 +1565,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # self.model.load_state_dict(self.reference_state_dict, strict=True)
                 # Swap reference model state_dict to self.model
                 for k, v in self.model.state_dict().items():
-                    print(f"k: {k}, v: {v}")
                     if isinstance(v, torch.Tensor):
                         v.copy_(self.reference_state_dict[k])
 
