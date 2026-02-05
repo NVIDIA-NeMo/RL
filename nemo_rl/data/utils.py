@@ -52,7 +52,10 @@ def setup_response_data(
     Args:
         tokenizer: Tokenizer or processor.
         data_config: Data config.
-        env_configs: Environment configs. If None, will not create environments.
+        env_configs: Environment configs.
+            If None, no environments will be created. This is used for:
+            - Algorithms like SFT which do not need environments.
+            - Environments like NeMo-Gym which need to handle the environment creation outside of this function.
         is_vlm: Whether to use VLM training or not.
 
     Returns:

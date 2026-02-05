@@ -175,11 +175,12 @@ Gym principle is that there is no hidden data pre or post processing from you. W
 The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
         )
 
-    print(
-        f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
-    )
-    config["grpo"]["max_val_samples"] = len(val_dataset)
-    config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
+    if val_dataset is not None:
+        print(
+            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+        )
+        config["grpo"]["max_val_samples"] = len(val_dataset)
+        config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
 
     # Print config
     print("Final config:")
