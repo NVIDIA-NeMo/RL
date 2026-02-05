@@ -30,7 +30,8 @@ def example_custom_dataloader(
     In this example, we simply sample data from each dataloader.
 
     Args:
-        dataloaders: A dictionary of dataloaders.
+        data_iterators: A dictionary of data iterators.
+        dataloaders: A dictionary of dataloaders. It is used to reset the data iterator when it is exhausted.
         **kwargs: Additional arguments to pass to the custom dataloader function.
 
     Returns:

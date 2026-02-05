@@ -293,7 +293,7 @@ data:
   num_workers: 1
 
   # use multiple dataloader for train
-  # see examples/configs/grpo_multiple_datasets.yaml for an example
+  # see https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details.
   use_multiple_dataloader: false
 
   # dataset

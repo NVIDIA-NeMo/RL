@@ -9,6 +9,7 @@ data:
   num_workers: 1
 
   # use multiple dataloader for train
+  # see https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details.
   use_multiple_dataloader: false
   num_prompts_per_dataloader: 16
   custom_dataloader: examples.custom_dataloader.custom_dataloader.example_custom_dataloader
