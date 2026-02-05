@@ -547,7 +547,6 @@ def _get_pack_sequence_parameters_for_megatron(
     cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
-    use_blockwise_fp8 = fp8_cfg.get("fp8_recipe", None) == "blockwise"
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
     pad_individual_seqs_to_multiple_of = 1
@@ -558,7 +557,11 @@ def _get_pack_sequence_parameters_for_megatron(
 
     # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
     if use_fp8:
-        divisor = 128 if use_blockwise_fp8 else 16
+        divisor = 16
+        if fp8_cfg.get("fp8_recipe", None) == "blockwise":
+            divisor = 128
+        elif fp8_cfg.get("fp8_recipe", None) == "mxfp8":
+            divisor = 32
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2
