@@ -22,6 +22,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_multiple_datasets.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    data.use_multiple_dataloader=true \
+    data.num_prompts_per_dataloader=1 \
+    data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader \
     grpo.val_at_start=true \
     grpo.max_val_samples=4 \
     grpo.val_batch_size=4 \
