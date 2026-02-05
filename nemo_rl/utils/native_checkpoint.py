@@ -241,12 +241,11 @@ def convert_dcp_to_hf(
     weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
     dcp_to_torch_save(dcp_ckpt_path, weights_path)
 
-    # Need to reload and save b/c the state dict is scoped inside the model key {"model": actual_state_dict}
+    # Reload and save because some DCP exports wrap weights under {"model": ...}
+    # while others save a flat state_dict already.
     state_dict = torch.load(weights_path)
-    assert set(state_dict.keys()) == {"model"}, (
-        f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
-    )
-    torch.save(state_dict["model"], weights_path)
+    if set(state_dict.keys()) == {"model"}:
+        torch.save(state_dict["model"], weights_path)
 
     config = AutoConfig.from_pretrained(
         model_name_or_path, trust_remote_code=True, **hf_overrides
