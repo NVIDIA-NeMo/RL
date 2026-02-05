@@ -241,8 +241,8 @@ def convert_dcp_to_hf(
     weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
     dcp_to_torch_save(dcp_ckpt_path, weights_path)
 
-    # Reload and save because some DCP exports wrap weights under {"model": ...}
-    # while others save a flat state_dict already.
+    # Reload and save because DCP exports wrap weights under {"model": ...} in dtensor v1
+    # while others save a flat state_dict already in dtensor v2.``
     state_dict = torch.load(weights_path)
     if set(state_dict.keys()) == {"model"}:
         torch.save(state_dict["model"], weights_path)
