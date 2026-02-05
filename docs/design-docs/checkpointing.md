@@ -16,7 +16,7 @@ Usually Hugging Face checkpoints keep the weights and tokenizer together (which 
 # Change to your appropriate checkpoint directory
 CKPT_DIR=results/sft/step_10
 
-uv run examples/converters/convert_dcp_to_hf.py --config=$CKPT_DIR/config.yaml --dcp-ckpt-path=$CKPT_DIR/policy/weights --hf-ckpt-path=${CKPT_DIR}-hf
+uv run examples/converters/convert_dcp_to_hf.py --config=$CKPT_DIR/config.yaml --dcp-ckpt-path=$CKPT_DIR/policy/weights/model --hf-ckpt-path=${CKPT_DIR}-hf
 rsync -ahP $CKPT_DIR/policy/tokenizer ${CKPT_DIR}-hf/
 ```
 
