@@ -124,24 +124,12 @@ def test_vllm_speculative_decoding_patch_still_needed():
     # The patch was fixed upstream: https://github.com/vllm-project/vllm/pull/30319
     # When this test fails, remove _patch_vllm_speculative_decoding_post_step()
     # from nemo_rl/models/generation/vllm/vllm_worker.py
-    import os
-    from importlib.util import find_spec
+    from importlib.metadata import version
 
-    spec = find_spec("vllm")
-    base_dir = next(iter(spec.submodule_search_locations))
-    file_path = os.path.join(base_dir, "v1", "engine", "core_client.py")
+    from packaging.version import Version
 
-    with open(file_path, "r") as f:
-        content = f.read()
-
-    old_snippet = (
-        "    def get_output(self) -> EngineCoreOutputs:\n"
-        "        outputs, _ = self.engine_core.step_fn()\n"
-        "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-    )
-
-    assert old_snippet in content, (
-        "vLLM has been updated to include the speculative decoding fix from "
+    assert Version(version("vllm")) < Version("0.14.0"), (
+        "vLLM >= 0.14.0 includes the speculative decoding fix from "
         "https://github.com/vllm-project/vllm/pull/30319. "
         "Please remove the _patch_vllm_speculative_decoding_post_step() function "
         "from nemo_rl/models/generation/vllm/vllm_worker.py"
