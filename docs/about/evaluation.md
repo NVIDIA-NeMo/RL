@@ -10,7 +10,7 @@ If you have trained a model and saved the checkpoint in the PyTorch DCP format, 
 # Example for a GRPO checkpoint at step 170
 uv run python examples/converters/convert_dcp_to_hf.py \
     --config results/grpo/step_170/config.yaml \
-    --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
+    --dcp-ckpt-path results/grpo/step_170/policy/weights/model \
     --hf-ckpt-path results/grpo/hf
 ```
 
