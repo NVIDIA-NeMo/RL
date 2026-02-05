@@ -74,6 +74,7 @@ from nemo_rl.models.policy.workers.patches import (
 )
 from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.fault_injection import Section, with_fault_injection
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -325,6 +326,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
+    @with_fault_injection(Section.TRAINING)
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,

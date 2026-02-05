@@ -100,6 +100,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.fault_injection import Section, with_fault_injection
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -300,6 +301,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         assert isinstance(self.model, DistributedDataParallel)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
 
+    @with_fault_injection(Section.TRAINING)
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -514,6 +516,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")

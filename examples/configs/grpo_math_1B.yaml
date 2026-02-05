@@ -340,3 +340,19 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+
+# Fault tolerance configuration for testing FT mechanisms
+fault_tolerance:
+  fault_injection:
+    enabled: false  # Set to true to enable fault injection
+    target_section: training  # "training" | "generation" | "environment" | null (any section)
+    target_rank: 0  # Which worker rank to fault (0-indexed)
+    # fault_type options (from nvidia_resiliency_ext.inprocess.tools.inject_fault.Fault):
+    #   GPU_ERROR, GPU_SLEEP, WORKLOAD_EXC, ASYNC_EXC, SIGNAL_EXC,
+    #   OS_ABORT, LOCK_GIL, SEGFAULT, SIGINT, SIGKILL, SIGTERM, SIGSTOP
+    fault_type: GPU_ERROR
+    delay_seconds: 100.0  # Fixed delay before fault triggers
+    # Alternatively, use exponential distribution:
+    # mtti_seconds: 100.0  # Mean time to injection
+    # offset_seconds: 5.0  # Minimum delay
+    # seed: 42  # For reproducibility
