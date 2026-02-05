@@ -208,7 +208,6 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    # Default nemo_gym env is used for trajectory collection
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())

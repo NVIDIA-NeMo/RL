@@ -668,7 +668,7 @@ def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
-    max_seq_length: int,
+    max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""

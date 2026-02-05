@@ -18,7 +18,12 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class NemoGymDataset(RawDataset):
-    """Simple wrapper around the Nemo Gym dataset."""
+    """Simple wrapper around the Nemo Gym dataset.
+
+    Args:
+        data_path: Path to the dataset JSONL file
+        repeat: Number of times to repeat the dataset, default is 1
+    """
 
     def __init__(self, data_path: str, repeat: int = 1, **kwargs) -> None:
         self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
