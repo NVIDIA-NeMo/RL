@@ -40,8 +40,8 @@ def setup_data_with_envs(
     env_configs: dict[str, Any],
     is_vlm: bool = False,
 ) -> tuple[
-    AllTaskProcessedDataset,
-    Optional[AllTaskProcessedDataset],
+    TrainDatasetType,
+    ValidationDatasetType,
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
