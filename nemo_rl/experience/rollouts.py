@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -993,7 +994,7 @@ def _calculate_single_metric(
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
         f"{key_name}/histogram": Histogram(values),
     }
 
