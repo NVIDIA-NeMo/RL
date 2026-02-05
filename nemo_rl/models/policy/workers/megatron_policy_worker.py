@@ -873,6 +873,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self.megatron_cfg.param_sync_func = self.megatron_cfg.param_sync_func[0]
 
         self.model = self.model[0]  # Get the first model from the list
+        self.use_peft = self.cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
@@ -900,20 +901,66 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
                 ref_mixed_precision_wrapper = CustomFloat16Module
 
+            ref_pre_wrap_hooks = []
+
+            if self.use_peft:
+                peft_cfg = self.cfg["megatron_cfg"].get("peft", {})
+                peft = LoRA(
+                    target_modules=peft_cfg["target_modules"],
+                    exclude_modules=peft_cfg["exclude_modules"],
+                    dim=peft_cfg["dim"],
+                    alpha=peft_cfg["alpha"],
+                    dropout=peft_cfg["dropout"],
+                    dropout_position=peft_cfg["dropout_position"],
+                    lora_A_init_method=peft_cfg["lora_A_init_method"],
+                    lora_B_init_method=peft_cfg["lora_B_init_method"],
+                    a2a_experimental=peft_cfg["a2a_experimental"],
+                    lora_dtype=peft_cfg["lora_dtype"],
+                )
+            else:
+                peft = None
+
+            ref_megatron_cfg.peft = peft
+
+            if ref_megatron_cfg is not None:
+                pre_peft_hook = _create_peft_pre_wrap_hook(ref_megatron_cfg, ref_state)
+                ref_megatron_cfg.model.register_pre_wrap_hook(pre_peft_hook)
+
+                def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+                    model = pre_peft_hook(model)
+                    return model
+
+                ref_pre_wrap_hooks.extend([composed_peft_hook])
+
             reference_model = get_model(
                 self.megatron_cfg.model,
                 self.megatron_cfg.ddp,
                 use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
+                data_parallel_random_init=self.megatron_cfg.rng.data_parallel_random_init,
+                pre_wrap_hook=ref_pre_wrap_hooks,
                 mixed_precision_wrapper=ref_mixed_precision_wrapper,
                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
-            print("Loading the Reference Model")
-            if (
-                ref_checkpoint_config.pretrained_checkpoint is not None
-                and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
-            ):
+            
+            if self.use_peft:
+                should_load_checkpoint = ref_megatron_cfg.checkpoint.load is not None and checkpoint_exists(
+                    ref_megatron_cfg.checkpoint.load
+                )
+                if should_load_checkpoint:
+                    # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
+                    # This is switched off here in order to load these states from the checkpoint
+                    ref_megatron_cfg.checkpoint.finetune = False
+            else:
+                should_load_checkpoint = (
+                    ref_megatron_cfg.checkpoint.load is not None and checkpoint_exists(ref_megatron_cfg.checkpoint.load)
+                ) or (
+                    ref_megatron_cfg.checkpoint.pretrained_checkpoint is not None
+                    and checkpoint_exists(ref_megatron_cfg.checkpoint.pretrained_checkpoint)
+                )
+
+            if should_load_checkpoint:
+                print("Loading the Reference Model")
                 load_checkpoint(
                     ref_state,  # Use the separate state object with ref checkpoint config
                     reference_model,
@@ -923,6 +970,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and self.megatron_cfg.dist.use_torch_fsdp2,
                 )
+            else:
+                print("Reference model not loaded")
+        
+            if should_load_checkpoint or self.use_peft:
                 reference_model = reference_model[0]
                 reference_model.eval()
                 self.reference_state_dict = {}
@@ -935,11 +986,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     else:
                         cpu_item = item
                     self.reference_state_dict[name] = cpu_item
-                print("Reference model loaded")
-            else:
-                print("Reference model not loaded")
 
-            self.model = self.move_model(self.model, "cuda")
+                self.model = self.move_model(self.model, "cuda")
 
         _update_model_config_funcs(
             [self.model],
@@ -994,6 +1042,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    def _remap_reference_state_dict(self):
+        for name, item in self.model.state_dict().items():
+            unwrapped_name = self.megatron_bridge._model_bridge._get_lora_unwrapped_name(name)
+            print(f"name: {name}, Unwrapped name: {unwrapped_name}")
+
+            if unwrapped_name in self.reference_state_dict:
+                self.reference_state_dict[unwrapped_name] = self.reference_state_dict[name]
+                del self.reference_state_dict[name]
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1505,7 +1562,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                     model_state_dict[name] = item
 
-                self.model.load_state_dict(self.reference_state_dict, strict=True)
+                # self.model.load_state_dict(self.reference_state_dict, strict=True)
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    print(f"k: {k}, v: {v}")
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(self.reference_state_dict[k])
+
                 # for name, item in self.reference_state_dict.items():
                 # if isinstance(item, torch.Tensor):
                 # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
@@ -1520,11 +1583,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
-                self.model.load_state_dict(model_state_dict, strict=True)
-                # for name, item in model_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
-                # self.model.state_dict()[name] = item
+                # self.model.load_state_dict(model_state_dict, strict=True)
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(model_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
