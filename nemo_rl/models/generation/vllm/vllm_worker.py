@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Measure module import time (import time first for measurement)
+import time
+
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
+
 import copy
 import gc
 import os
@@ -35,6 +40,10 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.timer import Timer
+
+# Calculate module import duration after all imports
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -142,6 +151,14 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
+        # Initialize timer for tracking initialization stages
+        self.init_timer = Timer()
+        self.init_timer.start("total_init")
+
+        # Record module import time
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
+
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
@@ -151,6 +168,7 @@ class BaseVllmGenerationWorker:
             self.tokenizer = None
             self.rank = 0
             self.world_size = 1
+            self.init_timer.stop("total_init")
             return
 
         # In Ray+vLLM setup, each worker process considers itself rank 0
@@ -420,11 +438,14 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        self._create_engine(llm_kwargs)
+        with self.init_timer.time("create_engine"):
+            self._create_engine(llm_kwargs)
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+
+        self.init_timer.stop("total_init")
 
     def llm(self):
         return self.llm
@@ -432,6 +453,10 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    def get_init_timer(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()

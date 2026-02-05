@@ -323,6 +323,7 @@ logger:
   mlflow_enabled: false  # Disable MLflow logging
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  collect_worker_init_timing: false  # If true, collects and saves worker initialization timing to JSON
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"

@@ -233,3 +233,81 @@ class TestTimeoutChecker:
         checker.mark_iteration()
         assert len(checker.iteration_times) == 1
         assert checker.iteration_times[0] > 0
+
+
+class TestTimerExtensions:
+    """Test suite for aggregate_max method."""
+
+    def test_aggregate_max_basic(self):
+        """Test basic aggregate_max functionality."""
+        # Create multiple timers with different measurements
+        timer1 = Timer()
+        timer1._timers["init"] = [1.0, 2.0]  # sum = 3.0
+        timer1._timers["load"] = [5.0]  # sum = 5.0
+
+        timer2 = Timer()
+        timer2._timers["init"] = [3.0, 4.0]  # sum = 7.0
+        timer2._timers["load"] = [2.0]  # sum = 2.0
+
+        timer3 = Timer()
+        timer3._timers["init"] = [1.5, 1.5]  # sum = 3.0
+        timer3._timers["process"] = [10.0]  # sum = 10.0
+
+        # Aggregate using max
+        result = Timer.aggregate_max([timer1, timer2, timer3], reduction_op="sum")
+
+        # Verify max values are selected for each label
+        assert result["init"] == 7.0  # max of [3.0, 7.0, 3.0]
+        assert result["load"] == 5.0  # max of [5.0, 2.0]
+        assert result["process"] == 10.0  # only in timer3
+
+    def test_aggregate_max_empty_list(self):
+        """Test aggregate_max with empty timer list."""
+        result = Timer.aggregate_max([])
+        assert result == {}
+
+    def test_aggregate_max_single_timer(self):
+        """Test aggregate_max with a single timer."""
+        timer = Timer()
+        timer._timers["operation"] = [1.0, 2.0, 3.0]
+
+        result = Timer.aggregate_max([timer], reduction_op="mean")
+        assert result["operation"] == 2.0  # mean of [1, 2, 3]
+
+    def test_aggregate_max_different_reduction_ops(self):
+        """Test aggregate_max with different reduction operations."""
+        timer1 = Timer()
+        timer1._timers["op"] = [1.0, 2.0, 3.0]  # mean=2.0, max=3.0, min=1.0
+
+        timer2 = Timer()
+        timer2._timers["op"] = [4.0, 5.0, 6.0]  # mean=5.0, max=6.0, min=4.0
+
+        # Test with mean reduction
+        result_mean = Timer.aggregate_max([timer1, timer2], reduction_op="mean")
+        assert result_mean["op"] == 5.0  # max of [2.0, 5.0]
+
+        # Test with max reduction
+        result_max = Timer.aggregate_max([timer1, timer2], reduction_op="max")
+        assert result_max["op"] == 6.0  # max of [3.0, 6.0]
+
+        # Test with min reduction
+        result_min = Timer.aggregate_max([timer1, timer2], reduction_op="min")
+        assert result_min["op"] == 4.0  # max of [1.0, 4.0]
+
+    def test_aggregate_max_disjoint_labels(self):
+        """Test aggregate_max when timers have completely different labels."""
+        timer1 = Timer()
+        timer1._timers["operation_a"] = [1.0]
+
+        timer2 = Timer()
+        timer2._timers["operation_b"] = [2.0]
+
+        timer3 = Timer()
+        timer3._timers["operation_c"] = [3.0]
+
+        result = Timer.aggregate_max([timer1, timer2, timer3], reduction_op="sum")
+
+        # All labels should be present with their respective values
+        assert result["operation_a"] == 1.0
+        assert result["operation_b"] == 2.0
+        assert result["operation_c"] == 3.0

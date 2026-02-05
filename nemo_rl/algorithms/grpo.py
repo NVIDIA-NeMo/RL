@@ -74,7 +74,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer, save_worker_init_timing
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # ===============================================================================
@@ -678,6 +678,16 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+
+    # Collect worker initialization timing if enabled
+    if master_config["logger"].get("collect_worker_init_timing", False):
+        worker_groups = {"policy": policy.worker_group}
+        if policy_generation is not None:
+            worker_groups["vllm"] = policy_generation.worker_group
+        save_worker_init_timing(
+            worker_groups,
+            Path(master_config["logger"]["log_dir"]) / "worker_init_timing.json",
+        )
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()

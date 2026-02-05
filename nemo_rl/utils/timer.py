@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import sys
 import time
 from contextlib import contextmanager
-from typing import Callable, Generator, Optional, Sequence, Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    from nemo_rl.distributed.worker_groups import RayWorkerGroup
 
 import numpy as np
 
@@ -232,6 +237,45 @@ class Timer:
 
         return results
 
+    @staticmethod
+    def aggregate_max(
+        timers: list["Timer"],
+        reduction_op: str = "sum",
+    ) -> dict[str, float]:
+        """Aggregate multiple timers by taking the maximum value for each label.
+
+        Args:
+            timers: List of Timer objects to aggregate
+            reduction_op: Reduction operation to apply to each timer's measurements before aggregation.
+                         Valid options are: "mean", "median", "min", "max", "std", "sum", "count"
+
+        Returns:
+            A dictionary mapping labels to the maximum value across all timers for that label
+
+        Raises:
+            ValueError: If an invalid reduction operation is provided
+        """
+        if not timers:
+            return {}
+
+        # Collect all unique labels across all timers
+        all_labels = set()
+        for timer in timers:
+            all_labels.update(timer._timers.keys())
+
+        # Aggregate by taking max for each label
+        aggregated: dict[str, float] = {}
+        for label in all_labels:
+            max_value = float("-inf")
+            for timer in timers:
+                if label in timer._timers:
+                    # Apply reduction to this timer's measurements for this label
+                    reduced_value = timer.reduce(label, reduction_op)
+                    max_value = max(max_value, reduced_value)
+            aggregated[label] = max_value
+
+        return aggregated
+
     def reset(self, label: Optional[str] = None) -> None:
         """Reset timings for the specified label or all labels.
 
@@ -246,6 +290,31 @@ class Timer:
         else:
             self._timers = {}
             self._start_times = {}
+
+
+def save_worker_init_timing(
+    worker_groups: dict[str, "RayWorkerGroup"],
+    output_path: Union[str, Path],
+) -> None:
+    """Collect and save initialization timing from multiple worker groups.
+
+    Args:
+        worker_groups: Dict mapping prefix to worker_group.
+        output_path: Path to save the JSON file.
+    """
+    timings: dict[str, float] = {}
+    metadata: dict[str, Any] = {"timestamp": time.time()}
+
+    for prefix, worker_group in worker_groups.items():
+        for k, v in worker_group.collect_init_timing().items():
+            timings[f"{prefix}/{k}"] = v
+        metadata[f"num_{prefix}_workers"] = len(worker_group.workers)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"timings": timings, "metadata": metadata}, f, indent=2)
+    print(f"✅ Saved worker init timing to {output_path}")
 
 
 def convert_to_seconds(time_string: str) -> int:

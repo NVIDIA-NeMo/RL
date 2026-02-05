@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Measure module import time (import time first for measurement)
+import time
+
+G_MODULE_IMPORT_START_TIME = time.perf_counter()
+
 import gc
 import os
 import re
-import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -102,6 +107,10 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
+
+# Calculate module import duration after all imports
+G_MODULE_IMPORT_DURATION = time.perf_counter() - G_MODULE_IMPORT_START_TIME
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -186,6 +195,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        self.init_timer = Timer()
+        self.init_timer.start("total_init")
+
+        # Record module import time
+        if "G_MODULE_IMPORT_DURATION" in globals():
+            self.init_timer._timers["module_import"] = [G_MODULE_IMPORT_DURATION]
+
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -195,16 +211,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
-        setup_distributed()
+        with self.init_timer.time("setup_distributed_nccl"):
+            setup_distributed()
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
             config
         )
         # Handle model import if needed
-        handle_model_import(
-            config, hf_model_name, pretrained_path, pt_checkpoint_exists
-        )
+        with self.init_timer.time("hf_model_import"):
+            handle_model_import(
+                config, hf_model_name, pretrained_path, pt_checkpoint_exists
+            )
 
         # Store tokenizer
         self.tokenizer = tokenizer
@@ -241,9 +259,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
-        model_and_optimizer_state = setup_model_and_optimizer(
-            config, self.megatron_cfg, init_optimizer
-        )
+        with self.init_timer.time("model_and_optimizer_setup"):
+            model_and_optimizer_state = setup_model_and_optimizer(
+                config, self.megatron_cfg, init_optimizer, init_timer=self.init_timer
+            )
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
@@ -258,26 +277,28 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # Step 5: Setup reference model if needed
         if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
-            self.reference_state_dict = setup_reference_model_state(
-                config, self.megatron_cfg, pretrained_path
-            )
-            self.model = self.move_model(self.model, "cuda")
+            with self.init_timer.time("reference_model_setup"):
+                self.model = self.move_model(self.model, "cpu")
+                self.reference_state_dict = setup_reference_model_state(
+                    config, self.megatron_cfg, pretrained_path
+                )
+                self.model = self.move_model(self.model, "cuda")
 
         # Step 6: Finalize setup
-        (
-            self.megatron_tokenizer,
-            self.megatron_bridge,
-            self.should_disable_forward_pre_hook,
-            self.dp_size,
-        ) = finalize_megatron_setup(
-            config,
-            self.megatron_cfg,
-            hf_model_name,
-            worker_sharding_annotations,
-            self.model,
-            self.optimizer,
-        )
+        with self.init_timer.time("finalize_setup"):
+            (
+                self.megatron_tokenizer,
+                self.megatron_bridge,
+                self.should_disable_forward_pre_hook,
+                self.dp_size,
+            ) = finalize_megatron_setup(
+                config,
+                self.megatron_cfg,
+                hf_model_name,
+                worker_sharding_annotations,
+                self.model,
+                self.optimizer,
+            )
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -291,6 +312,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+        # Stop total init timing
+        self.init_timer.stop("total_init")
+
+    def get_init_timer(self) -> Timer:
+        """Return init timing for controller aggregation."""
+        return self.init_timer
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
