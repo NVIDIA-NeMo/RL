@@ -171,6 +171,7 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 about/overview
 about/performance-summary
+about/model-support
 about/features
 about/backends
 about/quick-start
@@ -217,6 +218,8 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/dtensor-tp-accuracy.md
+guides/ft-launcher-guide.md
 ```
 
 ```{toctree}

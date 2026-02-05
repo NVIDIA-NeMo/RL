@@ -1,0 +1,11 @@
+defaults: ./sft-nanov3-30BA3B-2n8g-fsdp2.yaml
+logger:
+  wandb:
+    name: sft-nanov3-30BA3B-2n4g-fsdp2
+  tensorboard:
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n4g-fsdp2
+  mlflow:
+    run_name: sft-nanov3-30BA3B-2n4g-fsdp2
+cluster:
+  gpus_per_node: 4
+

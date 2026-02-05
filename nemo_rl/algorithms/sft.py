@@ -28,7 +28,6 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -71,6 +70,9 @@ class SFTConfig(TypedDict):
     val_global_batch_size: int
     val_micro_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     seed: int
 
 
@@ -238,7 +240,6 @@ def validate(
     loss_fn,
     step: int,
     master_config: MasterConfig,
-    sft_task_spec: TaskDataSpec,
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
@@ -358,7 +359,6 @@ def sft_train(
     loss_fn,
     master_config,
     logger,
-    sft_task_spec,
     checkpointer,
     sft_save_state: SFTSaveState,
 ) -> None:
@@ -388,6 +388,7 @@ def sft_train(
     # Validation configuration
     val_period = sft_config["val_period"]
     val_at_start = sft_config["val_at_start"]
+    val_at_end = sft_config["val_at_end"]
     max_num_epochs = sft_config["max_num_epochs"]
 
     # Run validation at the start if configured
@@ -400,7 +401,6 @@ def sft_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            sft_task_spec=sft_task_spec,
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
@@ -456,7 +456,11 @@ def sft_train(
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -465,8 +469,10 @@ def sft_train(
                     and current_step + 1 == len(train_dataloader)
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
@@ -474,7 +480,6 @@ def sft_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        sft_task_spec=sft_task_spec,
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],

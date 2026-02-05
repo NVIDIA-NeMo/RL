@@ -28,6 +28,8 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
+nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
+release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
 h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance_h100.txt")
 gb200_performance_test_suite_path = os.path.join(
     test_suites_dir, "performance_gb200.txt"
@@ -73,6 +75,28 @@ def release_test_suite():
 
 
 @pytest.fixture
+def nightly_gb200_test_suite():
+    nightly_gb200_suite = []
+    with open(nightly_gb200_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                nightly_gb200_suite.append(line)
+    return nightly_gb200_suite
+
+
+@pytest.fixture
+def release_gb200_test_suite():
+    release_gb200_suite = []
+    with open(release_gb200_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                release_gb200_suite.append(line)
+    return release_gb200_suite
+
+
+@pytest.fixture
 def performance_test_suite():
     performance_suite = []
     with open(h100_performance_test_suite_path, "r") as f:
@@ -92,9 +116,17 @@ def performance_test_suite():
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
+    nightly_gb200_test_suite,
+    release_gb200_test_suite,
     performance_test_suite,
 ):
-    return nightly_test_suite + release_test_suite + performance_test_suite
+    return (
+        nightly_test_suite
+        + release_test_suite
+        + nightly_gb200_test_suite
+        + release_gb200_test_suite
+        + performance_test_suite
+    )
 
 
 @pytest.fixture
@@ -112,12 +144,16 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
+        nightly_gb200_test_suite_path,
+        release_gb200_test_suite_path,
         h100_performance_test_suite_path,
         gb200_performance_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
+        "nightly_gb200_test_suite",
+        "release_gb200_test_suite",
         "h100_performance_test_suite",
         "gb200_performance_test_suite",
     ],
@@ -180,7 +216,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1180_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1210_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -212,8 +248,8 @@ def test_nightly_compute_stays_below_1180_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1180, (
-        f"Total GPU hours exceeded 1180: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1210, (
+        f"Total GPU hours exceeded 1210: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
