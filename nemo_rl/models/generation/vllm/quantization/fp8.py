@@ -31,6 +31,15 @@ FP8_BLOCK_QUANT_KWARGS = {
     "fmt": "e4m3",
     "quant_method": "fp8",
     "weight_block_size": [128, 128],
+    "is_mx": False,
+}
+
+
+MXFP8_BLOCK_QUANT_KWARGS = {
+    "activation_scheme": "dynamic",
+    "weight_scheme": "dynamic",
+    "quant_method": "fp8",
+    "is_mx": True,
 }
 
 
