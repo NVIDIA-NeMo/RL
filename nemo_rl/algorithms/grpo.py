@@ -1349,6 +1349,10 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                if dynamic_sampling_num_gen_batches == 1 and hasattr(
+                    policy_generation, "snapshot_step_metrics"
+                ):
+                    policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1491,6 +1495,10 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+                    gen_step_metrics = {}
+                    if hasattr(policy_generation, "get_step_metrics"):
+                        gen_step_metrics = policy_generation.get_step_metrics()
+                    advantages = (rewards - baseline).unsqueeze(-1)
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
@@ -1731,6 +1739,7 @@ def grpo_train(
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(gen_step_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
