@@ -36,7 +36,7 @@ DPO datasets in NeMo RL are encapsulated using classes. Each DPO data class is e
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
   2. `task_name`: A string identifier that uniquely identifies the dataset.
 
-If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. An example implementation can be found in [response_datasets/tulu3.py](../../nemo_rl/data/datasets/preference_datasets/tulu3.py).
+If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. An example implementation can be found in [preference_datasets/tulu3.py](../../nemo_rl/data/datasets/preference_datasets/tulu3.py).
 
 **Note:** The `task_name` field is required in each formatted example.
 
