@@ -427,9 +427,9 @@ class SGLangGenerationWorker:
             stop_string: Optional stop string for this sample
 
         Returns:
-            Tuple of (generated_tokens, logprobs):
+            Tuple of (generated_tokens, new_logprobs):
                 - generated_tokens: List of generated token IDs
-                - logprobs: List of log probabilities for generated tokens
+                - new_logprobs: List of log probabilities for generated tokens
         """
         # Prepare payload for SGLang API
         # Note: stop should be in sampling_params, not in payload top level
