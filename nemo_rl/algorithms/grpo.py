@@ -1519,17 +1519,22 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
-                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": train_data["input_ids"],
-                            "input_lengths": train_data["input_lengths"],
-                            **extra_multimodal_data,
-                        }
-                    )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    if not master_config["policy"].get("fuse_lp_and_train", False):
+                        # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
+                        logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": train_data["input_ids"],
+                                "input_lengths": train_data["input_lengths"],
+                                **extra_multimodal_data,
+                            }
+                        )
+                        train_data["prev_logprobs"] = policy.get_logprobs(
+                            logprob_data, timer=timer
+                        )["logprobs"]
+                    reference_logprobs = policy.get_reference_policy_logprobs(
+                        train_data
+                    )["reference_logprobs"]
+                    train_data["reference_policy_logprobs"] = reference_logprobs
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
