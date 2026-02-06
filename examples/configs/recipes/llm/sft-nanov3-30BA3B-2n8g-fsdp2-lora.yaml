@@ -12,7 +12,7 @@ policy:
       enabled: true
       dim: 256
       alpha: 512
-      exclude_modules: ['*out_proj*']
+      exclude_modules: ['*out_proj*'] # Exclude all out_proj modules. When NemotronHMamba2Mixer uses cuda_kernels_forward, out_proj LoRA has no gradient.
       match_all_linear: false
       use_triton: false
 logger:
