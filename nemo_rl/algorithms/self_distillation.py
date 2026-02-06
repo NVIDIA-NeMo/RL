@@ -99,7 +99,7 @@ class SelfDistillationSaveState(TypedDict):
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_distillation_save_state() -> DistillationSaveState:
+def _default_distillation_save_state() -> SelfDistillationSaveState:
     return {
         "current_epoch": 0,
         "current_step": 0,
@@ -118,7 +118,7 @@ class MasterConfig(TypedDict):
     loss_fn: DistillationLossConfig  # Loss function configuration
     env: dict[str, Any]  # Environment configuration
     data: DataConfig  # Data configuration
-    distillation: DistillationConfig  # Distillation configuration
+    distillation: SelfDistillationConfig  # Distillation configuration
     logger: LoggerConfig  # Logger configuration
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
@@ -155,6 +155,172 @@ def check_vocab_equality(
     )
 
 
+def _normalize_text_field(
+    value: Any, batch_size: int, default: str = ""
+) -> list[str]:
+    """Normalize a batch field into a list of strings with length batch_size."""
+    if value is None:
+        return [default for _ in range(batch_size)]
+    if isinstance(value, list):
+        return [default if v is None else str(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [default if v is None else str(v) for v in value.tolist()]
+    if torch.is_tensor(value):
+        # Best-effort string conversion for tensor-backed text fields.
+        try:
+            return [default if v is None else str(v) for v in value.tolist()]
+        except Exception:
+            return [default for _ in range(batch_size)]
+    # Scalar fallback: repeat for batch
+    return [default if value is None else str(value) for _ in range(batch_size)]
+
+
+def _build_cot_gt_texts(
+    batch: BatchedDataDict[Any], batch_size: int
+) -> list[str]:
+    """Build COT + ground-truth strings from batch fields."""
+    cot_texts = _normalize_text_field(batch.get("deepseek_reasoning"), batch_size)
+    gt_texts = _normalize_text_field(
+        batch.get("ground_truth_solution", batch.get("deepseek_solution")),
+        batch_size,
+    )
+
+    combined: list[str] = []
+    for cot, gt in zip(cot_texts, gt_texts):
+        cot = cot.strip() if cot else ""
+        gt = gt.strip() if gt else ""
+        if cot and gt:
+            combined.append(f"{cot}\n{gt}")
+        else:
+            combined.append(cot or gt)
+    return combined
+
+
+def _build_teacher_inputs_with_cot(
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    token_mask: torch.Tensor,
+    cot_texts: list[str],
+    tokenizer: TokenizerType,
+    max_seq_len: Optional[int],
+    make_sequence_length_divisible_by: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
+    """Insert COT+GT tokens before the first assistant token in each sequence."""
+    batch_size = input_ids.shape[0]
+    pad_token_id = tokenizer.pad_token_id or 0
+
+    teacher_ids_list: list[torch.Tensor] = []
+    insert_positions: list[int] = []
+    cot_lengths: list[int] = []
+
+    for i in range(batch_size):
+        seq_len = int(input_lengths[i].item())
+        seq_ids = input_ids[i, :seq_len]
+        seq_mask = token_mask[i, :seq_len]
+
+        assistant_positions = (seq_mask == 1).nonzero(as_tuple=False)
+        if assistant_positions.numel() > 0:
+            insert_pos = int(assistant_positions[0].item())
+        else:
+            insert_pos = seq_len
+
+        cot_text = cot_texts[i] if i < len(cot_texts) else ""
+        if cot_text:
+            cot_ids = tokenizer(
+                cot_text, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0].to(seq_ids.device, dtype=seq_ids.dtype)
+        else:
+            cot_ids = seq_ids.new_empty((0,))
+
+        if max_seq_len is not None and cot_ids.numel() > 0:
+            max_extra = max(0, max_seq_len - seq_len)
+            if cot_ids.numel() > max_extra:
+                cot_ids = cot_ids[:max_extra]
+
+        cot_len = int(cot_ids.numel())
+        insert_positions.append(insert_pos)
+        cot_lengths.append(cot_len)
+
+        if cot_len > 0:
+            teacher_ids = torch.cat(
+                [seq_ids[:insert_pos], cot_ids, seq_ids[insert_pos:]], dim=0
+            )
+        else:
+            teacher_ids = seq_ids.clone()
+        teacher_ids_list.append(teacher_ids)
+
+    teacher_padded = torch.nn.utils.rnn.pad_sequence(
+        teacher_ids_list, batch_first=True, padding_value=pad_token_id
+    )
+    teacher_input_lengths = torch.tensor(
+        [t.numel() for t in teacher_ids_list],
+        dtype=input_lengths.dtype,
+        device=input_lengths.device,
+    )
+
+    if make_sequence_length_divisible_by > 1:
+        max_len = teacher_padded.shape[1]
+        if max_len % make_sequence_length_divisible_by != 0:
+            padded_len = (
+                (max_len // make_sequence_length_divisible_by) + 1
+            ) * make_sequence_length_divisible_by
+            pad_len = padded_len - max_len
+            teacher_padded = torch.nn.functional.pad(
+                teacher_padded, (0, pad_len), value=pad_token_id
+            )
+
+    return teacher_padded, teacher_input_lengths, insert_positions, cot_lengths
+
+
+def _align_teacher_topk_to_student(
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    input_lengths: torch.Tensor,
+    insert_positions: list[int],
+    cot_lengths: list[int],
+    student_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align teacher top-k outputs with student input length after COT insertion."""
+    batch_size = teacher_topk_logits.shape[0]
+    k = teacher_topk_logits.shape[-1]
+
+    aligned_logits = torch.zeros(
+        (batch_size, student_seq_len, k),
+        dtype=teacher_topk_logits.dtype,
+        device=teacher_topk_logits.device,
+    )
+    aligned_indices = torch.zeros(
+        (batch_size, student_seq_len, k),
+        dtype=teacher_topk_indices.dtype,
+        device=teacher_topk_indices.device,
+    )
+
+    for i in range(batch_size):
+        seq_len = int(input_lengths[i].item())
+        insert_pos = insert_positions[i]
+        cot_len = cot_lengths[i]
+
+        if insert_pos > 0:
+            aligned_logits[i, :insert_pos, :] = teacher_topk_logits[
+                i, :insert_pos, :
+            ]
+            aligned_indices[i, :insert_pos, :] = teacher_topk_indices[
+                i, :insert_pos, :
+            ]
+
+        if seq_len > insert_pos:
+            src_start = insert_pos + cot_len
+            src_end = src_start + (seq_len - insert_pos)
+            aligned_logits[i, insert_pos:seq_len, :] = teacher_topk_logits[
+                i, src_start:src_end, :
+            ]
+            aligned_indices[i, insert_pos:seq_len, :] = teacher_topk_indices[
+                i, src_start:src_end, :
+            ]
+
+    return aligned_logits, aligned_indices
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -169,7 +335,7 @@ def setup(
     DistillationLossFn,
     Logger,
     CheckpointManager,
-    DistillationSaveState,
+    SelfDistillationSaveState,
     MasterConfig,
 ]:
     """Main entry point for distillation algorithm.
@@ -181,7 +347,7 @@ def setup(
     """
     # Extract configuration
     policy_config = master_config["policy"]
-    teacher_config = master_config["teacher"]
+    teacher_config = master_config.get("teacher", policy_config)
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
     distillation_config = master_config["distillation"]
@@ -194,7 +360,10 @@ def setup(
     )
 
     # Disallow SP + packing for dtensor path
-    for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
+    cfgs_to_check = [(policy_config, "student")]
+    if "teacher" in master_config:
+        cfgs_to_check.append((teacher_config, "teacher"))
+    for cfg, who in cfgs_to_check:
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
@@ -229,8 +398,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    distillation_save_state: Optional[DistillationSaveState] = cast(
-        Optional[DistillationSaveState],
+    distillation_save_state: Optional[SelfDistillationSaveState] = cast(
+        Optional[SelfDistillationSaveState],
         checkpointer.load_training_info(last_checkpoint_path),
     )
     if distillation_save_state is None:
@@ -484,6 +653,8 @@ def setup(
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n", flush=True)
 
+    teacher_policy = student_policy
+
     return (
         student_policy,
         teacher_policy,
@@ -515,7 +686,7 @@ def distillation_train(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
     checkpointer: CheckpointManager,
-    distillation_save_state: DistillationSaveState,
+    distillation_save_state: SelfDistillationSaveState,
     master_config: MasterConfig,
 ) -> None:
     """Run Distillation training algorithm."""
@@ -681,8 +852,6 @@ def distillation_train(
                         ],
                     )
 
-                    # TODO: append COT + ground truth answer to teacher train data 
-
                     # Create training data from flattened messages
                     train_data = BatchedDataDict[DistillationLossDataDict](
                         {
@@ -698,23 +867,68 @@ def distillation_train(
                     )
                     train_data.to("cpu")
 
-                print("▶ Preparing for teacher logprob inference...", flush=True)
+                # Build self-teacher inputs by inserting COT + GT before assistant tokens.
+                cot_texts = _build_cot_gt_texts(repeated_batch, repeated_batch.size)
+                max_seq_len = master_config["policy"].get(
+                    "max_total_sequence_length", None
+                )
+                make_seq_divisible_by = master_config["policy"].get(
+                    "make_sequence_length_divisible_by", 1
+                )
+                (
+                    teacher_input_ids,
+                    teacher_input_lengths,
+                    insert_positions,
+                    cot_lengths,
+                ) = _build_teacher_inputs_with_cot(
+                    train_data["input_ids"],
+                    train_data["input_lengths"],
+                    train_data["token_mask"],
+                    cot_texts,
+                    tokenizer,
+                    max_seq_len,
+                    make_seq_divisible_by,
+                )
+
+                teacher_data = BatchedDataDict(
+                    {
+                        "input_ids": teacher_input_ids,
+                        "input_lengths": teacher_input_lengths,
+                    }
+                )
+                teacher_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                teacher_data.to("cpu")
+
+                print("▶ Preparing for self-teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
+                        teacher_data,
                         k=master_config["distillation"]["topk_logits_k"],
                         timer=timer,
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    aligned_logits, aligned_indices = _align_teacher_topk_to_student(
+                        teacher_topk["topk_logits"],
+                        teacher_topk["topk_indices"],
+                        train_data["input_lengths"],
+                        insert_positions,
+                        cot_lengths,
+                        train_data["input_ids"].shape[1],
+                    )
+                    if aligned_logits.device.type != "cpu":
+                        aligned_logits = aligned_logits.cpu()
+                    if aligned_indices.device.type != "cpu":
+                        aligned_indices = aligned_indices.cpu()
+                    train_data["teacher_topk_logits"] = aligned_logits
+                    train_data["teacher_topk_indices"] = aligned_indices
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    if teacher_policy is not student_policy:
+                        teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
