@@ -146,6 +146,81 @@ def get_cluster_config(cluster_type: Optional[str] = None, partition: str = "bat
 
 
 # ============================================
+# HybridEP Auto-Configuration
+# ============================================
+
+# Model active parameters (in billions) for HybridEP SM calculation
+MODEL_ACTIVE_PARAMS = {
+    # Qwen MoE models
+    "Qwen/Qwen3-30B-A3B": 3,
+    "Qwen/Qwen3-235B-A22B": 22,
+    # DeepSeek MoE models  
+    "deepseek-ai/DeepSeek-V3": 37,
+    "deepseek-ai/DeepSeek-V2": 21,
+    "deepseek-ai/DeepSeek-V2.5": 21,
+    # Default for unknown models
+    "_default": 10,
+}
+
+
+def calculate_hybridep_num_sms(model_name: str, ep_degree: int, verbose: bool = True) -> int:
+    """
+    Calculate optimal moe_hybridep_num_sms based on model characteristics.
+    
+    The number of SMs dedicated to HybridEP communication should balance:
+    - Communication overhead (more SMs = faster dispatch/combine)
+    - Compute availability (fewer SMs left for actual computation)
+    
+    Heuristic:
+    - Base: sqrt(active_params_in_billions) * 4
+    - Scale up slightly for higher EP degrees (more cross-node communication)
+    - Clamp to range [4, 48] and round to nearest 4
+    
+    Examples:
+    - Qwen3-30B-A3B (3B active), EP=16: ~8 SMs
+    - Qwen3-235B-A22B (22B active), EP=16: ~20 SMs
+    - DeepSeek-V3 (37B active), EP=64: ~32 SMs
+    
+    Args:
+        model_name: HuggingFace model name
+        ep_degree: Expert parallelism degree
+        verbose: Print calculation details
+        
+    Returns:
+        Recommended moe_hybridep_num_sms value
+    """
+    import math
+    
+    # Get active parameters for the model
+    active_b = MODEL_ACTIVE_PARAMS.get(model_name, MODEL_ACTIVE_PARAMS["_default"])
+    
+    # Base calculation: sqrt(active_params) * 4
+    # This gives: 3B->7, 10B->12, 22B->18, 37B->24
+    base_sms = math.sqrt(active_b) * 4
+    
+    # EP scaling factor: higher EP means more cross-node communication
+    # +5% per EP degree above 4 (baseline)
+    ep_factor = 1.0 + max(0, (ep_degree - 4) * 0.05)
+    
+    # Calculate and round
+    num_sms = int(base_sms * ep_factor)
+    
+    # Clamp to reasonable range [4, 48]
+    num_sms = max(4, min(48, num_sms))
+    
+    # Round to nearest 4 for efficiency (SM scheduling)
+    num_sms = ((num_sms + 2) // 4) * 4
+    num_sms = max(4, num_sms)
+    
+    if verbose:
+        print(f"[INFO] Auto-calculated moe_hybridep_num_sms={num_sms}")
+        print(f"[INFO]   Model: {model_name} ({active_b}B active params)")
+        print(f"[INFO]   EP={ep_degree}, base={base_sms:.1f}, ep_factor={ep_factor:.2f}")
+    
+    return num_sms
+
+
+# ============================================
 # Model Configuration Loading
 # ============================================
 
@@ -348,7 +423,9 @@ def build_command(model_cfg: Dict[str, Any],
                   account: Optional[str] = None,
                   partition: Optional[str] = None,
                   enable_vllm_metrics: bool = False,
-                  vllm_metrics_interval: float = 0.5) -> str:
+                  vllm_metrics_interval: float = 0.5,
+                  enable_hybridep: bool = False,
+                  hybridep_num_sms: int = 32) -> str:
     """Build the sbatch command for a given configuration."""
     
     gpus_per_node = cluster_config["gpus_per_node"]
@@ -409,7 +486,9 @@ def build_command(model_cfg: Dict[str, Any],
     else:
         full_wandb_project = wandb_project
     model_short = model_cfg["model_name"].split("/")[-1].replace("-", "_").replace(".", "_")
-    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}"
+    # Add HybridEP suffix if enabled for easy comparison
+    hybridep_suffix = "_hybridep" if (enable_hybridep and t_ep > 1) else ""
+    wandb_name = f"{model_short}_N{num_nodes}xG{gpus_per_node}_Ttp{t_tp}cp{t_cp}ep{t_ep}pp{t_pp}dp{t_dp}_Gtp{g_tp}pp{g_pp}dp{g_dp}{hybridep_suffix}"
     
     # Job name (SLURM squeue display)
     # Format: Model_NxG_T.tp#.cp#.ep#.pp#.dp#_G.tp#.pp#.dp#
@@ -428,7 +507,9 @@ def build_command(model_cfg: Dict[str, Any],
         # Fallback: use first 10 chars, strip trailing underscores
         short_name = model_name_lower[:10].rstrip("_")
     
-    job_name = f"{short_name}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}"
+    # Add HybridEP marker to job name if enabled
+    hybridep_job_suffix = "_HEP" if (enable_hybridep and t_ep > 1) else ""
+    job_name = f"{short_name}_{num_nodes}x{gpus_per_node}_T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}.dp{t_dp}_G.tp{g_tp}.pp{g_pp}.dp{g_dp}{hybridep_job_suffix}"
     
     # Build command
     command = f"""NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo_math.py \\
@@ -463,6 +544,52 @@ policy.generation.vllm_cfg.async_engine=true \\
 policy.generation.vllm_cfg.enable_vllm_metrics_logger=true \\
 policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"""
     
+    # Add HybridEP for MoE models (EP > 1)
+    # HybridEP provides efficient expert parallelism communication
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    # Note: Use '++' prefix to append new keys not in the base Hydra schema
+    # IMPORTANT: moe_enable_deepep must be false when using hybridep backend
+    #            (moe_enable_deepep=true would automatically set backend to "deepep", causing a conflict)
+    if enable_hybridep and t_ep > 1:
+        # Calculate HybridEP parameters
+        # SEGMENT = GPUs per NVLink domain (same as gpus_per_node for single-segment nodes like GB200)
+        segment = gpus_per_node
+        # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN = min(4*SEGMENT, EP)
+        # This defines how many EP ranks are within one NVLink domain
+        num_hybridep_ranks = min(4 * segment, t_ep)
+        
+        # Prepend environment setup for DeepEP/HybridEP (for driver process)
+        # Key HybridEP environment variables:
+        # 1. CUDA_HOME and PATH for nvcc JIT compilation (DeepEP requires nvcc for runtime kernel compilation)
+        # 2. /bin/nvcc symlink (DeepEP hardcodes /bin/nvcc path - workaround until DeepEP is fixed)
+        # 3. NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN = min(4*SEGMENT, EP) - critical for HybridEP routing
+        # 4. USE_MNNVL=1 - Enable Multi-Node NVLink for cross-node EP communication
+        # 5. NCCL settings for optimal HybridEP performance
+        hybridep_env_setup = f"""export CUDA_HOME=\\${{CUDA_HOME:-/usr/local/cuda}} && \\
+export PATH=\\${{CUDA_HOME}}/bin:\\${{PATH}} && \\
+[ ! -f /bin/nvcc ] && [ -f \\${{CUDA_HOME}}/bin/nvcc ] && ln -sf \\${{CUDA_HOME}}/bin/nvcc /bin/nvcc 2>/dev/null || true && \\
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN={num_hybridep_ranks} && \\
+export USE_MNNVL=1 && \\
+export NCCL_SHM_DISABLE=1 && \\
+export NCCL_PROTO=simple && \\
+export NCCL_NVLS_ENABLE=0 && \\
+"""
+        command = hybridep_env_setup + command
+        
+        # Add HybridEP Megatron config overrides
+        # Environment variables are already set via 'export' above - they will be inherited by Ray workers
+        # moe_enable_deepep must be false when using hybridep backend (to avoid conflict)
+        command += f""" \\
+++policy.megatron_cfg.moe_enable_deepep=false \\
+++policy.megatron_cfg.moe_token_dispatcher_type=flex \\
+++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \\
+++policy.megatron_cfg.moe_hybridep_num_sms={hybridep_num_sms}"""
+        print(f"[INFO] HybridEP enabled for MoE model (EP={t_ep}, num_sms={hybridep_num_sms})")
+        print(f"[INFO]   SEGMENT={segment}, NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN={num_hybridep_ranks}")
+        print(f"[INFO]   USE_MNNVL=1, NCCL_SHM_DISABLE=1, NCCL_PROTO=simple, NCCL_NVLS_ENABLE=0")
+    elif enable_hybridep and t_ep <= 1:
+        print(f"[WARNING] HybridEP requested but EP={t_ep}. HybridEP is only effective with EP > 1. Skipping.")
+    
     # Build GRES option only for clusters that use it (H100 uses GRES, GB200 doesn't)
     gres_line = f"--gres=gpu:{gpus_per_node} \\\n    " if use_gres else ""
     
@@ -484,7 +611,9 @@ policy.generation.vllm_cfg.vllm_metrics_logger_interval={vllm_metrics_interval}"
     
     # Build log directory structure: exp_logs/{model}/{parallelism_config}/
     rollout_gbs = model_cfg['num_prompts'] * model_cfg['num_generations']
-    log_subdir = f"T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}_G.tp{g_tp}.pp{g_pp}_R{rollout_gbs}_T{model_cfg['train_gbs']}_S{model_cfg['max_seqlen']}"
+    # Add hybridep suffix to log directory if enabled
+    hybridep_log_suffix = "_hybridep" if (enable_hybridep and t_ep > 1) else ""
+    log_subdir = f"T.tp{t_tp}.cp{t_cp}.ep{t_ep}.pp{t_pp}_G.tp{g_tp}.pp{g_pp}_R{rollout_gbs}_T{model_cfg['train_gbs']}_S{model_cfg['max_seqlen']}{hybridep_log_suffix}"
     base_log_dir = str(Path.cwd() / "exp_logs" / short_name / log_subdir)
     
     sbatch_cmd = f"""COMMAND="{command}" \\
@@ -590,14 +719,31 @@ def list_presets(cluster_config: dict):
 
 
 def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None, 
-               dry_run: bool = False, **kwargs):
+               dry_run: bool = False, enable_hybridep: bool = False, 
+               hybridep_num_sms: str = "auto", **kwargs):
     """Launch a job with the given configuration."""
     cluster_type = cluster_config["cluster_type"]
     model_cfg = get_model_config(preset, cluster_type, variant)
     
     print_config_summary(model_cfg, cluster_config, preset)
     
-    cmd = build_command(model_cfg, cluster_config, **kwargs)
+    # Auto-calculate hybridep_num_sms if set to "auto"
+    if enable_hybridep:
+        if hybridep_num_sms == "auto":
+            # Get EP degree from training config
+            train_cfg = model_cfg.get("training", {})
+            ep_degree = train_cfg.get("ep", 1)
+            model_name = model_cfg.get("model_name", "")
+            hybridep_num_sms_int = calculate_hybridep_num_sms(model_name, ep_degree, verbose=True)
+        else:
+            hybridep_num_sms_int = int(hybridep_num_sms)
+    else:
+        hybridep_num_sms_int = 32  # default, won't be used
+    
+    cmd = build_command(model_cfg, cluster_config, 
+                        enable_hybridep=enable_hybridep,
+                        hybridep_num_sms=hybridep_num_sms_int,
+                        **kwargs)
     
     if dry_run:
         print("🔍 Dry run - Command that would be executed:\n")
@@ -608,9 +754,9 @@ def launch_job(preset: str, cluster_config: dict, variant: Optional[str] = None,
     # Check if requested node configuration is available (e.g. partition mismatch)
     # This prevents obscure sbatch errors like "Requested node configuration is not available"
     if cluster_type == "gb200" and "batch_long" in cmd:
-         # GB200 usually requires specific partition or constraint if batch_long is H100 only
-         # But here we just warn, assuming user knows their cluster
-         pass
+        # GB200 usually requires specific partition or constraint if batch_long is H100 only
+        # But here we just warn, assuming user knows their cluster
+        pass
 
     print("🚀 Launching job...")
     print("\n📝 Command to be executed:")
@@ -693,6 +839,12 @@ Examples:
     parser.add_argument("--vllm-metrics-interval", type=float, default=0.5,
                         help="vLLM metrics logging interval in seconds (default: 0.5)")
     
+    # HybridEP options for MoE models
+    parser.add_argument("--enable-hybridep", action="store_true",
+                        help="Enable HybridEP for MoE expert parallelism (requires EP > 1)")
+    parser.add_argument("--hybridep-num-sms", type=str, default="auto",
+                        help="Number of SMs for HybridEP operations. 'auto' calculates based on model size and EP degree (default: auto)")
+    
     args = parser.parse_args()
     
     # Infer cluster type from variant name if not explicitly specified
@@ -745,7 +897,9 @@ Examples:
                           account=args.account,
                           partition=args.job_partition,
                           enable_vllm_metrics=args.enable_vllm_metrics,
-                          vllm_metrics_interval=args.vllm_metrics_interval)
+                          vllm_metrics_interval=args.vllm_metrics_interval,
+                          enable_hybridep=args.enable_hybridep,
+                          hybridep_num_sms=args.hybridep_num_sms)
                 launched += 1
             except Exception as e:
                 print(f"❌ Error launching {preset}: {e}")
@@ -775,7 +929,9 @@ Examples:
                         account=args.account,
                         partition=args.job_partition,
                         enable_vllm_metrics=args.enable_vllm_metrics,
-                        vllm_metrics_interval=args.vllm_metrics_interval)
+                        vllm_metrics_interval=args.vllm_metrics_interval,
+                        enable_hybridep=args.enable_hybridep,
+                        hybridep_num_sms=args.hybridep_num_sms)
             except Exception as e:
                 print(f"❌ Error launching {p}: {e}")
         return
