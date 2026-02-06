@@ -220,7 +220,9 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.empty_like(vocab_parallel_logits)
+        grad_input: torch.Tensor = torch.empty_like(
+            vocab_parallel_logits, dtype=torch.float32
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
