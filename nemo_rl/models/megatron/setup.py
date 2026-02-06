@@ -215,9 +215,7 @@ def validate_and_set_config(
     }
     dtype = dtype_map[config["precision"]]
 
-    # Optimizer configuration
-    optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
-    offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
+
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
@@ -234,11 +232,14 @@ def validate_and_set_config(
         pretrained_path=pretrained_path,
         weights_path=weights_path,
     )
+    # Optimizer configuration
+    optimizer_cpu_offload = megatron_cfg.optimizer.optimizer_cpu_offload
+    offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
 
     final_padded_vocab_size = calculate_padded_vocab_size(
         megatron_cfg.model.vocab_size,
         megatron_cfg.model.make_vocab_size_divisible_by,
-        config["megatron_cfg"]["tensor_model_parallel_size"],
+        megatron_cfg.model.tensor_model_parallel_size,
     )
 
     return RuntimeConfig(
