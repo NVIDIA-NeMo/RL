@@ -21,8 +21,14 @@ The default YAML config shares the same base template as the SFT config but incl
 
 ## Datasets
 
-Each RM dataset class is expected to have the following attributes:
-1. `dataset`: The formatted dataset, which should be formatted like
+RM datasets in NeMo RL are encapsulated using classes. Each RM data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. An example implementation can be found in [response_datasets/tulu3.py](../../nemo_rl/data/datasets/preference_datasets/tulu3.py).
+
+**Note:** The `task_name` field is required in each formatted example.
+
 ```json
 {
   "context": [], // list of dicts - The prompt message (including previous turns, if any)
@@ -35,10 +41,10 @@ Each RM dataset class is expected to have the following attributes:
       "rank": 1, // int — The rank of the completion (lower rank is preferred)
       "completion": [] // list of dicts — The completion message(s)
     }
-  ]
+  ],
+  "task_name": "task_name" // identifier for the task
 }
 ```
-2. `task_name`: The unique task identifier for this dataset. This should specify the name you choose for this dataset.
 
 Currently, RM training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```json
@@ -76,7 +82,8 @@ Currently, RM training supports only two completions (where the lowest rank is p
                 }
             ]
         }
-    ]
+    ],
+    "task_name": "task_name"
 }
 ```
 

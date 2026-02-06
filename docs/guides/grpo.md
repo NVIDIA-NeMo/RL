@@ -38,6 +38,25 @@ To support this, we need to know:
 
 #### Dataset
 
+GRPO datasets in NeMo RL are encapsulated using classes. Each GRPO data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+GRPO datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/deepscaler.py](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) has an example:
+
+**Note:** The `task_name` field is required in each formatted example.
+
+```python
+def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "messages": [
+            {"role": "user", "content": data["problem"]},
+            {"role": "assistant", "content": data["answer"]},
+        ],
+        "task_name": self.task_name,
+    }
+```
+
 By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.). You can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
@@ -82,7 +101,7 @@ We support using multiple datasets for train and validation. You can refer to `e
 ```yaml
 data:
   _override_: true # override the data config instead of merging with it
-  # other data settings, see `examples/configs/sft.yaml` for more details
+  # other data settings, see `examples/configs/grpo_math_1B.yaml` for more details
   ...
   # dataset settings
   train:
