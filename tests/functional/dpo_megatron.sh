@@ -24,18 +24,19 @@ cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_dpo.py \
     --config $PROJECT_ROOT/examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
-    cluster.gpus_per_node=2 \
     dpo.max_num_steps=3 \
     dpo.val_batches=1 \
     dpo.val_period=3 \
+    policy.train_global_batch_size=8 \
+    policy.megatron_cfg.tensor_model_parallel_size=1 \
+    policy.megatron_cfg.sequence_parallel=false \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
     checkpointing.enabled=false \
-    policy.megatron_cfg.tensor_model_parallel_size=1 \
-    policy.megatron_cfg.sequence_parallel=false \
-    policy.train_global_batch_size=8 \
+    cluster.gpus_per_node=2 \
+    cluster.num_nodes=1 \
     $@ \
     2>&1 | tee $RUN_LOG
 
