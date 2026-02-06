@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,14 +57,12 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     # ------------------------------------------------------------------
     # 2. Identify the owning rank (the only rank with True flag)
     # ------------------------------------------------------------------
-    src_rank = None  # Rank *inside* the PP group
-    for rank, flag in enumerate(obj_flags):
-        if flag:
-            src_rank = rank
-            break
-
-    if src_rank is None:
+    true_ranks = [rank for rank, flag in enumerate(obj_flags) if flag]
+    if not true_ranks:
         raise ValueError("Object must exist on at least one PP rank")
+    if len(true_ranks) > 1:
+        raise ValueError(f"Object present on multiple PP ranks: {true_ranks}")
+    src_rank = true_ranks[0]
 
     # ------------------------------------------------------------------
     # 3. Broadcast the object from the source rank to all ranks
@@ -135,12 +133,11 @@ def broadcast_tensors_from_last_stage(
     if is_pipeline_last_stage(ignore_virtual=True):
         # Broadcast tensors from last stage
         for name, tensor in tensors.items():
-            if tensor is not None:
-                broadcasted_tensors[name] = broadcast_tensor(
-                    tensor, current_rank, pp_group
+            if tensor is None:
+                raise ValueError(
+                    f"Last PP stage must provide tensor '{name}' for broadcast."
                 )
-            else:
-                broadcasted_tensors[name] = None
+            broadcasted_tensors[name] = broadcast_tensor(tensor, current_rank, pp_group)
     else:
         # Receive tensors on other stages
         for name in tensors.keys():
