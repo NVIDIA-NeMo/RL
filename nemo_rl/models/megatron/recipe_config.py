@@ -20,11 +20,11 @@ allowing NeMo-RL to use pre-configured training recipes as a base and
 layer RL-specific settings on top.
 
 Recipes are specified via their fully qualified Python import path in the
-YAML config under ``policy.megatron_cfg.megatron_recipe``. For example:
+YAML config under ``policy.megatron_recipe``. For example:
 
     policy:
+      megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
       megatron_cfg:
-        megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
         ...
 
 The import path is resolved at runtime using ``load_recipe()``.

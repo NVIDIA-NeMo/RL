@@ -158,11 +158,6 @@ class MegatronConfigDisabled(TypedDict):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
-    # Fully qualified Python import path to a Megatron-Bridge recipe function.
-    # When set, the recipe is loaded at runtime to provide the base model configuration.
-    # When null/unset, configuration is loaded from the checkpoint's run_config.yaml.
-    # Example: "megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config"
-    megatron_recipe: NotRequired[str | None]
     env_vars: NotRequired[dict[str, str] | None]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
@@ -261,6 +256,11 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    # Fully qualified Python import path to a Megatron-Bridge recipe function.
+    # When set, the recipe is loaded at runtime to provide the base model configuration.
+    # When null/unset, configuration is loaded from the checkpoint's run_config.yaml.
+    # Example: "megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config"
+    megatron_recipe: NotRequired[str | None]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

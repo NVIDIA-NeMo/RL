@@ -279,7 +279,9 @@ def setup_model_config(
 ) -> tuple[ConfigContainer, Any]:
     """Setup model configuration."""
     model_cfg = None
-    megatron_recipe = config["megatron_cfg"].get("megatron_recipe")
+    megatron_recipe = config.get("megatron_recipe") or config.get(
+        "megatron_cfg", {}
+    ).get("megatron_recipe")
 
     if megatron_recipe:
         # Use Megatron-Bridge recipe specified in config
@@ -331,26 +333,32 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
-    # Validate optimizer configuration
-    _validate_optimizer_config(config)
 
     # Optional layernorm epsilon
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
-    # Validate chunking configuration
-    _validate_chunking_config(config)
-
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
-
-    # Validate training configuration
-    _validate_training_config(config, model_cfg)
 
     # Update megatron config with checkpoint, optimizer, scheduler, etc.
     _update_megatron_config(megatron_cfg, checkpoint_config, config, hf_model_name)
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
+
+    # Validate chunking configuration
+    _validate_chunking_config(config)
+
+    # Validate optimizer configuration
+    _validate_optimizer_config(megatron_cfg)
+
+    # Validate training configuration
+    _validate_training_config(megatron_cfg, model_cfg)
+
+    if "make_sequence_length_divisible_by" not in config:
+        config["make_sequence_length_divisible_by"] = (
+            model_cfg.tensor_model_parallel_size
+        )
 
     return megatron_cfg, model_cfg
 
@@ -481,12 +489,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             )
 
 
-def _validate_optimizer_config(config: PolicyConfig) -> None:
+def _validate_optimizer_config(megatron_cfg: ConfigContainer) -> None:
     """Validate optimizer configuration."""
-    optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
-    optimizer_offload_fraction = config["megatron_cfg"]["optimizer"][
-        "optimizer_offload_fraction"
-    ]
+    optimizer_cpu_offload = megatron_cfg.optimizer.optimizer_cpu_offload
+    optimizer_offload_fraction = megatron_cfg.optimizer.optimizer_offload_fraction
 
     if optimizer_cpu_offload:
         # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
@@ -524,9 +530,9 @@ def _create_checkpoint_config(
     )
 
 
-def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
+def _validate_training_config(megatron_cfg: ConfigContainer, model_cfg: Any) -> None:
     """Validate training configuration."""
-    assert "train_iters" in config["megatron_cfg"], (
+    assert megatron_cfg.train.train_iters is not None, (
         "train_iters must be set in megatron_cfg. For an example, see "
         "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
     )

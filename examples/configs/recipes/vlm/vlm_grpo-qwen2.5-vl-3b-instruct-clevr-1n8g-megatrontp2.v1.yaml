@@ -7,8 +7,8 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: false
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen2.qwen2_5_vl_3b_pretrain_config
 logger:
   wandb:
     name: vlm-grpo-3b-megatron

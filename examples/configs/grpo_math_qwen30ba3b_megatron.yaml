@@ -26,6 +26,8 @@ policy:
 
   scheduler: null # remove default FSDP scheduler
 
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_30b_pretrain_config
+  
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
