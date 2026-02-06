@@ -17,6 +17,61 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class LoRAConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class LoRAConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    match_all_linear: NotRequired[bool]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init: str
+    use_triton: NotRequired[bool]
+
+
+class AutomodelBackendConfig(TypedDict):
+    """Configuration for custom MoE implementation backend in Automodel.
+
+    Used when setting the backend in automodel_kwargs in your config.
+    Alternatively, pass `force_hf: true` in automodel_kwargs to fall back
+    to the HuggingFace implementation.
+    """
+
+    # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
+    _target_: str
+    # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
+    attn: NotRequired[str]
+    # Linear layer implementation: "te" (Transformer Engine), etc.
+    linear: NotRequired[str]
+    # RMSNorm implementation: "te" (Transformer Engine), etc.
+    rms_norm: NotRequired[str]
+    # Enable DeepEP (Deep Expert Parallelism) for MoE models
+    enable_deepep: NotRequired[bool]
+    # Use fake balanced gate for testing/debugging MoE
+    fake_balanced_gate: NotRequired[bool]
+    # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
+    # This should almost always be set to True when using a custom MoE implementation. Set to False only for specific use cases like debugging or performance testing.
+    enable_hf_state_dict_adapter: NotRequired[bool]
+    # Enable FSDP-specific optimizations
+    enable_fsdp_optimizations: NotRequired[bool]
+    # Precision for the MoE gate computation (e.g., "float64", "float32")
+    gate_precision: NotRequired[str]
+
+
+class AutomodelKwargs(TypedDict):
+    # Whether to use Liger kernel optimizations (default: false)
+    use_liger_kernel: NotRequired[bool]
+    # Backend configuration for MoE models
+    backend: NotRequired[AutomodelBackendConfig]
+    # Whether to force use of the HuggingFace implementation for MoE models
+    force_hf: NotRequired[bool]
+
+
 class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -32,6 +87,8 @@ class DTensorConfig(TypedDict):
     context_parallel_size: int
     custom_parallel_plan: str | None
     clear_cache_every_n_steps: NotRequired[int | None]
+    lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
+    automodel_kwargs: NotRequired[AutomodelKwargs]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -125,7 +182,17 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
-
+    moe_per_layer_logging: bool
+    # Set to true to enable DeepEP for expert parallel communication
+    # Must set moe_token_dispatcher_type to 'flex'
+    # Must set moe_shared_expert_overlap to False
+    moe_enable_deepep: bool
+    # The type of token dispatcher to use. The default is 'allgather'.
+    # Options are 'allgather','alltoall' and 'flex'
+    # Use 'flex' when using DeepEP
+    moe_token_dispatcher_type: str
+    # Can be used only with 'alltoall' token dispatcher
+    moe_shared_expert_overlap: bool
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig

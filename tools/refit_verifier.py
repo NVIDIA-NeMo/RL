@@ -216,6 +216,7 @@ def setup_configs(args, tokenizer):
             "pipeline_dtype": "bfloat16",
             "train_iters": 1,
             "bias_activation_fusion": False,
+            "moe_per_layer_logging": False,
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "optimizer": {

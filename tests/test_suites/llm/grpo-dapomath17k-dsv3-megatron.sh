@@ -20,7 +20,7 @@ fi
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     policy.model_name=$NRL_DEEPSEEK_V3_BF16_CKPT \
     grpo.max_num_steps=$MAX_STEPS \
@@ -43,4 +43,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/token_mult_prob_error"]) < 1.05' \
         'data["train/reward"]["10"] > 0.4'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi

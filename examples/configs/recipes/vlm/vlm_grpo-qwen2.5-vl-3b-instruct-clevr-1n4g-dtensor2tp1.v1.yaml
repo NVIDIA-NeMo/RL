@@ -1,0 +1,10 @@
+defaults: ./vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1.yaml
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-dtensor2tp1
+logger:
+  log_dir: logs/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-dtensor2tp1
+  wandb:
+    name: vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-dtensor2tp1
+cluster:
+  gpus_per_node: 4
+
