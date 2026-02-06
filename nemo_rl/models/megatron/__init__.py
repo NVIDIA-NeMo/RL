@@ -13,11 +13,9 @@
 # limitations under the License.
 
 from nemo_rl.models.megatron.recipe_config import (
-    get_available_recipes,
-    get_recipe_function,
+    load_recipe,
 )
 
 __all__ = [
-    "get_available_recipes",
-    "get_recipe_function",
+    "load_recipe",
 ]

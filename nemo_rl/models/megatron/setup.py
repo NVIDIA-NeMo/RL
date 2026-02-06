@@ -69,9 +69,7 @@ except ImportError:
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
-from nemo_rl.models.megatron.recipe_config import (
-    get_recipe_function,
-)
+from nemo_rl.models.megatron.recipe_config import load_recipe
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -235,7 +233,6 @@ def validate_and_set_config(
         hf_model_name=hf_model_name,
         pretrained_path=pretrained_path,
         weights_path=weights_path,
-        use_recipe=True,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -279,20 +276,15 @@ def setup_model_config(
     hf_model_name: str,
     pretrained_path: str,
     weights_path: Optional[str] = None,
-    use_recipe: bool = True,
 ) -> tuple[ConfigContainer, Any]:
     """Setup model configuration."""
     model_cfg = None
-    use_recipe_for_model = use_recipe and get_recipe_function(hf_model_name) is not None
+    megatron_recipe = config["megatron_cfg"].get("megatron_recipe")
 
-    if use_recipe_for_model:
-        # Use Megatron-Bridge golden recipes
-        print(f"[INFO] Using Megatron-Bridge recipe-based config for {hf_model_name}")
-        recipe_fn = get_recipe_function(hf_model_name)
-        if recipe_fn is None:
-            raise ValueError(f"No recipe found for {hf_model_name}")
-
-        megatron_cfg = recipe_fn()
+    if megatron_recipe:
+        # Use Megatron-Bridge recipe specified in config
+        print(f"[INFO] Using Megatron-Bridge recipe: {megatron_recipe}")
+        megatron_cfg = load_recipe(megatron_recipe)
         model_cfg = megatron_cfg.model
     else:
         # Load pretrained run config

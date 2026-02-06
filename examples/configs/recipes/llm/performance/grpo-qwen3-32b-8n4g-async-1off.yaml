@@ -9,10 +9,6 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-32b-8n4g-async-1off
 policy:
-  megatron_cfg:
-    tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
-    sequence_parallel: true
   generation:
     colocated:
       enabled: false

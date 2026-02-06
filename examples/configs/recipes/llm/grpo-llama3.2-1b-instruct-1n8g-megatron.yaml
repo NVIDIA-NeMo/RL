@@ -12,6 +12,7 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    megatron_recipe: megatron.bridge.recipes.llama.llama3.llama32_1b_pretrain_config
     scheduler:
       lr_warmup_iters: 50
   dtensor_cfg:

@@ -10,10 +10,6 @@ checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-64n8g-async-1off
 policy:
   logprob_batch_size: 2
-  megatron_cfg:
-    tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 16
-    expert_model_parallel_size: 16
   generation:
     colocated:
       enabled: false

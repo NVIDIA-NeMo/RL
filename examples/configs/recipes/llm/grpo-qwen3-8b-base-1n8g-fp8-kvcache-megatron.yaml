@@ -17,6 +17,7 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
+    megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_8b_pretrain_config
     converter_type: Qwen3ForCausalLM
     tensor_model_parallel_size: 4
     optimizer:

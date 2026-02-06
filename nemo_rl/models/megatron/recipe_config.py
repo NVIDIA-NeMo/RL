@@ -19,123 +19,63 @@ This module provides a clean integration with Megatron-Bridge recipes,
 allowing NeMo-RL to use pre-configured training recipes as a base and
 layer RL-specific settings on top.
 
-Example usage:
-    from nemo_rl.models.megatron.recipe_config import create_config_from_recipe
-    
-    megatron_cfg = create_config_from_recipe(
-        hf_model_name="meta-llama/Llama-3.1-8B-Instruct",
-        policy_config=config,
-        pretrained_path="/path/to/checkpoint",
-        weights_path=None,
-    )
+Recipes are specified via their fully qualified Python import path in the
+YAML config under ``policy.megatron_cfg.megatron_recipe``. For example:
 
-Internal flag for testing:
-    # To use pure recipe settings with minimal RL overrides (for testing):
-    megatron_cfg = create_config_from_recipe(
-        ...,
-        _apply_full_overrides=False,  # Internal flag - keeps recipe's optimizer/scheduler
-    )
+    policy:
+      megatron_cfg:
+        megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
+        ...
+
+The import path is resolved at runtime using ``load_recipe()``.
 """
 
-import warnings
-from typing import Any, Callable, Optional
+import importlib
 
-import torch
-from megatron.bridge import AutoBridge
-from megatron.bridge.training.config import (
-    CheckpointConfig,
-    ConfigContainer,
-    DistributedDataParallelConfig,
-    LoggerConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    TokenizerConfig,
-    TrainingConfig,
-)
-
-from nemo_rl.models.policy import PolicyConfig
+from megatron.bridge.training.config import ConfigContainer
 
 
-# =============================================================================
-# RECIPE DISCOVERY
-# =============================================================================
-
-def _import_llama_recipes():
-    """Import Llama recipes from Megatron-Bridge."""
-    try:
-        from megatron.bridge.recipes.llama.llama3 import (
-            llama31_8b_pretrain_config,
-            llama31_70b_pretrain_config,
-            llama31_405b_pretrain_config,
-            llama3_8b_pretrain_config,
-            llama3_70b_pretrain_config,
-            llama32_1b_pretrain_config,
-            llama32_3b_pretrain_config,
-        )
-        return {
-            "llama-3.2-1b": llama32_1b_pretrain_config,
-            "llama-3.2-3b": llama32_3b_pretrain_config,
-            "llama-3-8b": llama3_8b_pretrain_config,
-            "llama-3.1-8b": llama31_8b_pretrain_config,
-            "meta-llama-3-8b": llama3_8b_pretrain_config,
-            "meta-llama-3.1-8b": llama31_8b_pretrain_config,
-            "llama-3-70b": llama3_70b_pretrain_config,
-            "llama-3.1-70b": llama31_70b_pretrain_config,
-            "llama-3.1-405b": llama31_405b_pretrain_config,
-        }
-    except ImportError:
-        return {}
-
-
-def _import_qwen_recipes():
-    """Import Qwen recipes from Megatron-Bridge."""
-    try:
-        from megatron.bridge.recipes.qwen.qwen3 import (
-            qwen3_600m_pretrain_config,
-            qwen3_1p7b_pretrain_config,
-            qwen3_4b_pretrain_config,
-            qwen3_8b_pretrain_config,
-        )
-        return {
-            "qwen3-0.6b": qwen3_600m_pretrain_config,
-            "qwen3-1.7b": qwen3_1p7b_pretrain_config,
-            "qwen3-4b": qwen3_4b_pretrain_config,
-            "qwen3-8b": qwen3_8b_pretrain_config,
-        }
-    except ImportError:
-        return {}
-
-
-def get_recipe_function(hf_model_name: str) -> Optional[Callable[..., ConfigContainer]]:
+def load_recipe(recipe_path: str) -> ConfigContainer:
     """
-    Get the appropriate Megatron-Bridge recipe function for a model.
-    
+    Dynamically import and call a Megatron-Bridge recipe function.
+
     Args:
-        hf_model_name: HuggingFace model name or path
-        
+        recipe_path: Fully qualified Python import path to the recipe function.
+            For example: ``megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config``
+
     Returns:
-        Recipe function or None if no matching recipe found
+        A ConfigContainer produced by calling the recipe function.
+
+    Raises:
+        ValueError: If the recipe path is invalid or the function cannot be found.
+        TypeError: If the resolved object is not callable.
     """
-    model_lower = hf_model_name.lower().replace("/", "-").replace("_", "-")
-    
-    # Load recipes lazily
-    all_recipes = {}
-    all_recipes.update(_import_llama_recipes())
-    all_recipes.update(_import_qwen_recipes())
-    
-    # Try match
-    for pattern, recipe_fn in all_recipes.items():
-        if pattern in model_lower:
-            return recipe_fn
-    
-    return None
+    module_path, _, func_name = recipe_path.rpartition(".")
+    if not module_path or not func_name:
+        raise ValueError(
+            f"Invalid recipe path '{recipe_path}'. "
+            "Expected a fully qualified Python path like "
+            "'megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config'"
+        )
 
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(
+            f"Could not import module '{module_path}' from recipe path '{recipe_path}': {e}"
+        ) from e
 
-def get_available_recipes() -> list[str]:
-    """Return a list of available recipe patterns."""
-    all_recipes = {}
-    all_recipes.update(_import_llama_recipes())
-    all_recipes.update(_import_qwen_recipes())
-    return list(all_recipes.keys())
+    recipe_fn = getattr(module, func_name, None)
+    if recipe_fn is None:
+        raise ValueError(
+            f"Module '{module_path}' has no attribute '{func_name}'. "
+            f"Check that the recipe function name is correct in '{recipe_path}'."
+        )
 
+    if not callable(recipe_fn):
+        raise TypeError(
+            f"'{recipe_path}' resolved to a non-callable object of type {type(recipe_fn).__name__}. "
+            "Expected a recipe function."
+        )
 
+    return recipe_fn()

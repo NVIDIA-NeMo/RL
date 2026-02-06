@@ -78,6 +78,7 @@ policy:
 
   megatron_cfg:
     enabled: true
+    megatron_recipe: null  # Set to a fully qualified recipe path to use a Megatron-Bridge recipe, e.g. megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"

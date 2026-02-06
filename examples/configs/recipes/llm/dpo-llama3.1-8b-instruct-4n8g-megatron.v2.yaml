@@ -20,6 +20,7 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
     tensor_model_parallel_size: 4
 logger:
   wandb_enabled: true

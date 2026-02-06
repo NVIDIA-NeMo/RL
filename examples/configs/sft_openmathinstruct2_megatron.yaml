@@ -33,6 +33,7 @@ policy:
     enabled: false
 
   megatron_cfg:
+    megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
     activation_checkpointing: false
     context_parallel_size: 1
     distributed_data_parallel_config:

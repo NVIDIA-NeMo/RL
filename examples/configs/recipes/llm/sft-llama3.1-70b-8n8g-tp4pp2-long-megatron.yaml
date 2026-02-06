@@ -19,6 +19,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_70b_pretrain_config
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     freeze_moe_router: true

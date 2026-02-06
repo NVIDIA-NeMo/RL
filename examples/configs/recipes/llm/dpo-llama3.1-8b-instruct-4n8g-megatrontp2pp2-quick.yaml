@@ -22,6 +22,7 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
     pipeline_model_parallel_size: 2
 logger:
   wandb_enabled: true
