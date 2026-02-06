@@ -11,3 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo_rl.models.megatron.recipe_config import (
+    get_available_recipes,
+    get_recipe_function,
+)
+
+__all__ = [
+    "get_available_recipes",
+    "get_recipe_function",
+]
