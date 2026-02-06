@@ -342,7 +342,6 @@ def process_global_batch(
     }
 
 
-
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
     seq_lengths: torch.Tensor,

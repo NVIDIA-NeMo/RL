@@ -27,6 +27,7 @@ from megatron.core.parallel_state import (
 
 def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     """Broadcast an object across pipeline parallel ranks.
+
     This utility function handles broadcasting an object from the rank that owns it
     to all other pipeline parallel ranks. If only one rank has the object (non-None),
     it will be broadcast to all other ranks.
