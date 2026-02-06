@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import warnings
+from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -23,7 +24,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss import (
+from nemo_rl.algorithms.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
@@ -69,7 +70,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class DistillationConfig(TypedDict):
+class SelfDistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -87,7 +88,7 @@ class DistillationConfig(TypedDict):
     seed: int
 
 
-class DistillationSaveState(TypedDict):
+class SelfDistillationSaveState(TypedDict):
     total_steps: int  # Track total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
@@ -367,38 +368,38 @@ def setup(
             flush=True,
         )
 
-    # ==========================
-    #      Teacher Policy
-    # ==========================
-    print("\n▶ Setting up teacher policy...", flush=True)
-    # Checkpoint paths
-    weights_path = None
-    optimizer_path = None
+    # # ==========================
+    # #      Teacher Policy
+    # # ==========================
+    # print("\n▶ Setting up teacher policy...", flush=True)
+    # # Checkpoint paths
+    # weights_path = None
+    # optimizer_path = None
 
-    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
-        check_vocab_equality(
-            tokenizer, policy_config["model_name"], teacher_config["model_name"]
-        )
+    # if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+    #     check_vocab_equality(
+    #         tokenizer, policy_config["model_name"], teacher_config["model_name"]
+    #     )
 
-    if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
-        )
-        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
+    # if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
+    #     ## NOTE: this is equal to the total number of scheduler steps
+    #     total_train_iters = min(
+    #         distillation_config["max_num_steps"],
+    #         distillation_config["max_num_epochs"] * len(dataloader),
+    #     )
+    #     teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    teacher_policy = Policy(
-        name_prefix="teacher",
-        cluster=train_cluster,
-        config=teacher_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=False,
-        init_reference_model=False,
-    )
-    teacher_policy.offload_after_refit()
+    # teacher_policy = Policy(
+    #     name_prefix="teacher",
+    #     cluster=train_cluster,
+    #     config=teacher_config,
+    #     tokenizer=tokenizer,
+    #     weights_path=weights_path,
+    #     optimizer_path=optimizer_path,
+    #     init_optimizer=False,
+    #     init_reference_model=False,
+    # )
+    # teacher_policy.offload_after_refit()
 
     # ==========================
     #    Student Generation Interface
@@ -430,7 +431,12 @@ def setup(
     print("\n▶ Setting up student policy...", flush=True)
 
     # Checkpoint paths
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
@@ -846,9 +852,7 @@ def distillation_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            )
-                            if checkpointer.save_optimizer
-                            else None,
+                            ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
