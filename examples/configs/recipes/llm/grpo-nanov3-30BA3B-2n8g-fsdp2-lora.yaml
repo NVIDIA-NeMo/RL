@@ -17,6 +17,8 @@ policy:
       enabled: true
       dim: 128
       alpha: 512
+      exclude_modules: ['*out_proj*']
+      match_all_linear: false
       use_triton: false
   sequence_packing:
     enabled: false

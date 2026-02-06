@@ -12,6 +12,8 @@ policy:
       enabled: true
       dim: 256
       alpha: 512
+      exclude_modules: ['*out_proj*']
+      match_all_linear: false
       use_triton: false
 logger:
   wandb:
