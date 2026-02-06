@@ -688,6 +688,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ]
 
         model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
+        # HybridEP settings for MoE expert parallelism
+        # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+        if "moe_flex_dispatcher_backend" in self.cfg["megatron_cfg"]:
+            model_cfg.moe_flex_dispatcher_backend = self.cfg["megatron_cfg"][
+                "moe_flex_dispatcher_backend"
+            ]
+        if "moe_hybridep_num_sms" in self.cfg["megatron_cfg"]:
+            model_cfg.moe_hybridep_num_sms = self.cfg["megatron_cfg"]["moe_hybridep_num_sms"]
+
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
             model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
 
