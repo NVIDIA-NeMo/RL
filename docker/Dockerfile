@@ -96,6 +96,7 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
@@ -104,6 +105,9 @@ uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh
     source 3rdparty/vllm/nemo-rl.env
+fi
+if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
+    bash tools/build-custom-flashinfer.sh
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
