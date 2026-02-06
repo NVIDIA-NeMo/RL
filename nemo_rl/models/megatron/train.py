@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
@@ -25,6 +26,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -35,6 +37,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
+from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -47,24 +50,26 @@ PostProcessingFunction = Union[
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
-    cfg: Dict[str, Any],
+    cfg: PolicyConfig,
     input_ids_cp_sharded: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
-    defer_fp32_logits: Optional[bool] = None,
+    defer_fp32_logits: Optional[bool] = False,
+    straggler_timer: Optional[StragglerDetector] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
     Args:
         model: The model to run forward pass on
-        data_dict (BatchedDataDict): Dictionary containing batch data
-        cfg (dict): Configuration dictionary
+        data_dict: Dictionary containing batch data
+        cfg: Policy configuration dictionary
         input_ids_cp_sharded: Context-parallel sharded input token IDs
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
-        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
+        defer_fp32_logits: Whether to skip the conversion of logits to fp32
+        straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -81,31 +86,48 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    # with straggler_timer:
-    output_tensor = model(
-        input_ids=input_ids_cp_sharded,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        **additional_kwargs,
-        **multimodal_data,
-    )
 
-    # Apply temperature scaling to logits for training
-    # This matches the dtensor worker's _apply_temperature_scaling in the train method
-    if "generation" in cfg and cfg["generation"] is not None:
-        output_tensor.div_(cfg["generation"]["temperature"])
+    with straggler_timer() if straggler_timer is not None else nullcontext():
+        output_tensor = model(
+            input_ids=input_ids_cp_sharded,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **additional_kwargs,
+            **multimodal_data,
+        )
+
+    apply_temperature_scaling(output_tensor, cfg)
 
     return output_tensor
+
+
+def apply_temperature_scaling(
+    logits: torch.Tensor,
+    cfg: PolicyConfig,
+) -> torch.Tensor:
+    """Apply temperature scaling to logits.
+
+    Args:
+        logits: Logits tensor to scale
+        cfg: Policy configuration containing generation settings
+
+    Returns:
+        torch.Tensor: Temperature-scaled logits
+    """
+    if "generation" in cfg and cfg["generation"] is not None:
+        logits.div_(cfg["generation"]["temperature"])
+    return logits
 
 
 def forward_with_post_processing_fn(
     data_iterator: Iterator[ProcessedMicrobatch],
     model: GPTModel,
-    cfg: Dict[str, Any],
+    cfg: PolicyConfig,
     post_processing_fn: PostProcessingFunction,
-    defer_fp32_logits: Optional[bool] = True,
+    defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    straggler_timer: Optional[StragglerDetector] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -116,11 +138,12 @@ def forward_with_post_processing_fn(
     Args:
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         model: The model to run forward pass on
-        cfg (dict): Configuration dictionary
+        cfg: Policy configuration dictionary
         post_processing_fn: Post-processing function to post-process the logits
         defer_fp32_logits: Whether to defer FP32 conversion of logits
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -140,14 +163,15 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
     output_tensor = model_forward(
-        model,
-        data_dict,
-        cfg,
-        input_ids_cp_sharded,
-        position_ids,
-        attention_mask,
-        packed_seq_params,
-        defer_fp32_logits,
+        model=model,
+        data_dict=data_dict,
+        cfg=cfg,
+        input_ids_cp_sharded=input_ids_cp_sharded,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        packed_seq_params=packed_seq_params,
+        defer_fp32_logits=defer_fp32_logits,
+        straggler_timer=straggler_timer,
     )
 
     ## calling post_processing_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
@@ -180,17 +204,18 @@ def forward_with_post_processing_fn(
 
 def megatron_forward_backward(
     model: GPTModel,
-    cfg: Dict[str, Any],
+    cfg: PolicyConfig,
     data_iterator: Iterator[ProcessedMicrobatch],
     num_microbatches: int,
     seq_length: int,
     mbs: int,
     post_processing_fn: PostProcessingFunction,
     forward_only: bool = False,
-    defer_fp32_logits: Optional[bool] = None,
+    defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     do_not_average_loss: bool = False,
+    straggler_timer: Optional[StragglerDetector] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -200,19 +225,21 @@ def megatron_forward_backward(
 
     Args:
         model: The model to train
-        cfg (dict): Configuration dictionary
+        cfg: Policy configuration dictionary
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
-        num_microbatches (int): Number of microbatches to process
-        seq_length (int): Sequence length
-        mbs (int): Micro batch size
+        num_microbatches: Number of microbatches to process
+        seq_length: Sequence length
+        mbs: Micro batch size
         post_processing_fn: Post-processing function to post-process the logits
-        forward_only (bool): If True, skip backward pass
-        defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
+        forward_only: If True, skip backward pass
+        defer_fp32_logits: Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        do_not_average_loss: If True, do not average loss across microbatches
+        straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
-        BatchedDataDict: Results from the forward/backward execution
+        Results from the forward/backward execution
     """
     forward_step = partial(
         forward_with_post_processing_fn,
@@ -221,6 +248,7 @@ def megatron_forward_backward(
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        straggler_timer=straggler_timer,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -240,7 +268,7 @@ class LossPostProcessor:
     def __init__(
         self,
         loss_fn: LossFunction,
-        cfg: Dict[str, Any],
+        cfg: PolicyConfig,
         cp_normalize: bool = True,
     ):
         self.loss_fn = loss_fn
@@ -261,11 +289,10 @@ class LossPostProcessor:
         and context parallelism normalization.
 
         Args:
-            loss_fn: The base loss function to wrap
-            cfg (dict): Configuration dictionary
-            data_dict: Batched data dictionary
+            data_dict: Batched data dictionary for the current microbatch
             packed_seq_params: Parameters for packed sequences (optional)
-            cp_normalize (bool): Whether to normalize by context parallel size
+            global_valid_seqs: Global valid sequence count for loss normalization
+            global_valid_toks: Global valid token count for loss normalization
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -304,7 +331,7 @@ class LossPostProcessor:
 
 
 class LogprobsPostProcessor:
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: PolicyConfig):
         self.cfg = cfg
 
     def __call__(
@@ -369,7 +396,7 @@ class LogprobsPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: Dict[str, Any], k: int):
+    def __init__(self, cfg: PolicyConfig, k: int):
         self.cfg = cfg
         self.k = k
 

@@ -14,6 +14,7 @@
 """Test script to debug high gradients with sequence packing + context parallelism."""
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -41,13 +42,13 @@ class SequencePackingGradientTestActor:
 
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+        from nemo_rl.models.megatron.train import (
+            forward_with_post_processing_fn,
+            LossPostProcessor,
+        )
         from nemo_rl.models.megatron.data import (
             _pack_sequences_for_megatron,
             make_processed_microbatch_iterator,
-        )
-        from nemo_rl.models.megatron.train import (
-            LossPostProcessor,
-            forward_with_post_processing_fn,
         )
 
         # Initialize process group
@@ -295,6 +296,13 @@ class SequencePackingGradientTestActor:
         baseline_logits.grad.zero_()
         packed_logits = make_packed_logits(baseline_logits)
 
+        # mock straggler detector with dummy context manager
+        mock_straggler_timer = MagicMock()
+        mock_straggler_timer.return_value = MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        )
+
         # mock model forward
         class MockModel:
             def __init__(self):
@@ -325,43 +333,14 @@ class SequencePackingGradientTestActor:
             cp_normalize=True,
         )
 
-<<<<<<< HEAD
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, exc_type, exc_val, exc_tb):
-                        pass
-
-                self.straggler_timer = DummyStragglerTimer()
-
-        mock_mcore_state = MockMcoreState()
-
-        output_tensor, wrapped_loss_fn = forward_step_arbitrary_loss(
-            mock_mcore_state,
-            global_valid_seqs,
-            global_valid_toks,
-            data_iterator=make_processed_microbatch_iterator(
-                iter([packed_data_dict]),
-                cfg={
-                    "sequence_packing": {"enabled": True},
-                    "dynamic_batching": {"enabled": False},
-                    "megatron_cfg": {
-                        "tensor_model_parallel_size": 1,
-                        "sequence_parallel": False,
-                        "pipeline_model_parallel_size": 1,
-                        "context_parallel_size": cp_size,
-                    },
-                },
-=======
         output_tensor, wrapped_loss_fn = forward_with_post_processing_fn(
             data_iterator=make_processed_microbatch_iterator(
                 iter([packed_data_dict]),
                 cfg=cfg,
->>>>>>> a11ae1b2e (fix unit test)
                 seq_length_key="input_lengths",
                 pad_individual_seqs_to_multiple_of=pad_to_multiple,
                 pad_packed_seq_to_multiple_of=1,
-                straggler_timer=mock_mcore_state.straggler_timer,
+                straggler_timer=mock_straggler_timer,
                 pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
             ),
             model=MockModel(),
@@ -369,6 +348,7 @@ class SequencePackingGradientTestActor:
             post_processing_fn=post_processor,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            straggler_timer=mock_straggler_timer,
         )
         loss, metrics = wrapped_loss_fn(output_tensor)
 
