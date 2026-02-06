@@ -47,6 +47,7 @@ from nemo_rl.models.automodel.data import (
     process_global_batch,
 )
 from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
     get_microbatch_iterator,
     process_global_batch,
 )
