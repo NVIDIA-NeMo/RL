@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -96,8 +96,6 @@ def model_forward(
             **multimodal_data,
         )
 
-    apply_temperature_scaling(output_tensor, cfg)
-
     return output_tensor
 
 
@@ -174,7 +172,11 @@ def forward_with_post_processing_fn(
         straggler_timer=straggler_timer,
     )
 
-    ## calling post_processing_fn will return a function that takes the output tensor and returns a tuple of (loss, metrics)
+    # Apply temperature scaling only for sampling-oriented post-processors.
+    # Loss computation should use unscaled logits.
+    if isinstance(post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)):
+        apply_temperature_scaling(output_tensor, cfg)
+
     # Use type checking to dispatch to the correct post-processing method
     if isinstance(post_processing_fn, LossPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -425,10 +427,6 @@ class TopkLogitsPostProcessor:
         seq_lengths = data_dict["input_lengths"]
 
         def processor_fn_inner(output_tensor):
-            # Only the last PP stage produces final logits/top-k; earlier stages return empty
-            # if not is_pipeline_last_stage(ignore_virtual=True):
-            # return output_tensor.new_zeros(()), {}
-
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
             vocab_shard_size = output_tensor.shape[-1]
