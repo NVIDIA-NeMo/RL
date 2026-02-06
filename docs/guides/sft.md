@@ -84,6 +84,7 @@ data:
     # this dataset will override input_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     input_key: question
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
     split_validation_size: 0.05  # use 5% of the training data as validation data
     seed: 42  # seed for train/validation split when split_validation_size > 0
