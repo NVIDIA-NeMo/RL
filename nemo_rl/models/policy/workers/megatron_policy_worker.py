@@ -400,7 +400,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     gb_loss_metrics = None
 
                 # Broadcast loss metrics from last stage to all stages
-                ## TODO: check with PP > 1
                 gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
                     gb_loss_metrics
                 )
