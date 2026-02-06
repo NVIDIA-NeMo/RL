@@ -14,7 +14,6 @@
 import gc
 import os
 import re
-import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -97,229 +96,6 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-def setup_megatron_model(
-    policy_cfg: PolicyConfig,
-    cfg: ConfigContainer,
-    load_optimizer: bool = True,
-    get_embedding_ranks=None,  # TODO @sahilj: What is this?
-    get_position_embedding_ranks=None,
-):
-    state = GlobalState()
-    state.cfg = cfg
-    # TODO: Freeze state.cfg
-
-    cfg.dist.external_gpu_device_mapping = True
-    initialize_megatron(
-        cfg=cfg,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-    )
-
-    if cfg.ft and cfg.ft.enable_ft_package:
-        fault_tolerance.setup(cfg, state)
-        fault_tolerance.maybe_setup_simulated_fault(cfg.ft)
-
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options(cfg.model, cfg.train.micro_batch_size)
-
-    # Adjust the startup time so it reflects the largest value.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    start_time_tensor = torch.tensor(
-        [state.start_time], dtype=torch.double, device="cuda"
-    )
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    state.start_time = start_time_tensor.item()
-
-    print(
-        "time to initialize megatron (seconds): {:.3f}".format(
-            time.time() - state.start_time
-        )
-    )
-    torch.distributed.barrier()
-
-    # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = init_checkpointing_context(cfg.checkpoint)
-
-    # Tokenizer
-    build_tokenizer(
-        cfg.tokenizer,
-        make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
-        // cfg.model.tensor_model_parallel_size,
-        tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
-        trust_remote_code=True,
-    )
-    assert cfg.model.vocab_size, "vocab size must be specified in model config"
-
-    torch.distributed.barrier()
-
-    pre_wrap_hook = []
-    mixed_precision_wrapper = Float16Module
-    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-
-        def freeze_moe_router(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
-                # Handle both wrapped (Float16Module) and unwrapped models
-                if isinstance(model_module, Float16Module):
-                    model_module = model_module.module
-                # Handle VLM models
-                if hasattr(model_module, "language_model"):
-                    model_module = model_module.language_model
-                for layer in model_module.decoder.layers:
-                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
-                        layer.mlp.router.weight.requires_grad = False
-
-        mixed_precision_wrapper = CustomFloat16Module
-        pre_wrap_hook.extend([freeze_moe_router])
-
-    # Model, optimizer, and learning rate.
-    model = get_model(
-        cfg.model,
-        cfg.ddp,
-        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-    )
-    if load_optimizer:
-        optimizer, scheduler = setup_optimizer(
-            optimizer_config=cfg.optimizer,
-            scheduler_config=cfg.scheduler,
-            model=model,
-            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-        )
-    else:
-        optimizer = None
-        scheduler = None
-
-    print("Model, optimizer, and learning rate scheduler built")
-    torch.distributed.barrier()
-
-    # Load checkpoint if applicable
-    if (
-        cfg.checkpoint.load is not None
-        or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and (
-        checkpoint_exists(cfg.checkpoint.load)
-        or checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
-    ):
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
-        )
-        print("Checkpoint loaded")
-    torch.distributed.barrier()
-
-    return state, model, optimizer, scheduler, checkpointing_context
-
-
-def destroy_parallel_state():
-    """Safely destroy parallel state and reset async call tracking.
-
-    This function is called during initialization to clean up temporary distributed
-    state from model import operations. Resetting async call tracking ensures that
-    when the main Megatron distributed context is created, all ranks start with
-    consistent call_idx values for async checkpointing.
-    """
-    if torch.distributed.is_initialized():
-        try:
-            torch.distributed.barrier()
-            torch.distributed.destroy_process_group()
-        except:
-            pass  # Ignore errors if already destroyed
-    if hasattr(parallel_state, "destroy_model_parallel"):
-        try:
-            parallel_state.destroy_model_parallel()
-        except:
-            pass  # Ignore errors if already destroyed
-
-    # Reset async calls queue to prevent call_idx mismatches after distributed context recreation
-    try:
-        import nemo.tron.utils.async_utils as nemo_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(nemo_async_utils._async_calls_queue, "call_idx", None)
-        num_unfinalized = (
-            nemo_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            nemo_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the global async calls queue by creating a new instance
-        nemo_async_utils._async_calls_queue = AsyncCallsQueue()
-        print(f"[DEBUG] Reset NeMo async calls queue (old call_idx: {old_call_idx})")
-    except ImportError:
-        pass
-
-    # Also reset the Megatron async calls queue if it exists
-    try:
-        import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(
-            megatron_async_utils._async_calls_queue, "call_idx", None
-        )
-        num_unfinalized = (
-            megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            megatron_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
-        print(
-            f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
-        )
-    except ImportError:
-        pass
-
-    # Reset the third global async_calls instance in base strategy module
-    try:
-        import megatron.core.dist_checkpointing.strategies.base as base_strategy
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up and reset the global async_calls in base strategy
-        old_call_idx = getattr(base_strategy.async_calls, "call_idx", None)
-        num_unfinalized = base_strategy.async_calls.get_num_unfinalized_calls()
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting base strategy async_calls with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            base_strategy.async_calls.close()
-        except:
-            pass
-        base_strategy.async_calls = AsyncCallsQueue()
-        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
-    except ImportError:
-        pass
 
 
 @ray.remote(
@@ -473,7 +249,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        self.model.zero_grad_buffer()
+        # Note: zero_grad_buffer is called at the start of each global batch iteration
+        # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
 
@@ -506,15 +283,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model.train()
 
         with ctx:
-            # dim 1 is always assumed to be the sequence dim, sanity check this here
-            sequence_dim = 1
-            seq_dim_size = data["input_ids"].shape[sequence_dim]
-            for k, v in data.items():
-                if torch.is_tensor(v) and len(v.shape) > 1:
-                    assert v.shape[sequence_dim] == seq_dim_size, (
-                        f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                    )
-
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
@@ -545,7 +313,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
-                loss_fn_wrapped = LossPostProcessor(
+                loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                 )
@@ -564,12 +332,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
                         mbs=micro_batch_size,
-                        post_processing_fn=loss_fn_wrapped,
+                        post_processing_fn=loss_post_processor,
                         forward_only=eval_mode,
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         do_not_average_loss=True,
+                        straggler_timer=self.mcore_state.straggler_timer,
                     )
 
                 # Empty unused memory.
@@ -733,6 +502,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            straggler_timer=self.mcore_state.straggler_timer,
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
@@ -859,6 +629,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            straggler_timer=self.mcore_state.straggler_timer,
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
