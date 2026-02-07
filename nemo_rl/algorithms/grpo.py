@@ -1610,14 +1610,17 @@ def grpo_train(
                     del baseline
                     del std
 
-                    _log_mixed_rewards_and_advantages_information(
-                        logger=logger,
-                        total_steps=total_steps,
-                        metrics=metrics,
-                        baseline=baseline,
-                        advantages=advantages,
+                    # Extract prompt-only messages for advantage estimation
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
                     )
-
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
