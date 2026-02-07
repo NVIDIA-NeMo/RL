@@ -825,6 +825,50 @@ def get_logprobs_from_vocab_parallel_logits(
     )
 
 
+def get_logprobs_from_logits(
+    input_ids: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    seq_index: Optional[torch.Tensor] = None,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Computes log probabilities from logits."""
+    next_token_logits = next_token_logits.to(torch.float32)
+
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        logprobs = from_parallel_logits_to_logprobs(
+            next_token_logits,
+            input_ids,
+            vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+            tp_group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+        )
+        # slice off to the correct length to remove potential CP padding
+        logprobs = logprobs[:, : input_ids.shape[1] - 1]
+    elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        logprobs = get_logprobs_from_vocab_parallel_logits(
+            next_token_logits, input_ids, seq_index=seq_index
+        )
+    else:
+        # Remove last position's logits
+        next_token_logits_wo_last = next_token_logits[:, :-1]
+        next_token_logprobs = torch.nn.functional.log_softmax(
+            next_token_logits_wo_last, dim=-1
+        )
+        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
+        logprobs = next_token_logprobs.gather(
+            dim=-1, index=next_tokens.unsqueeze(-1)
+        ).squeeze(-1)
+
+    return logprobs
+
+
 @torch.no_grad()
 def distributed_vocab_topk(
     vocab_parallel_logits: torch.Tensor,
