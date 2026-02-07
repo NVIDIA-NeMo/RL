@@ -40,12 +40,14 @@ class PreferenceDataset(RawDataset):
 
     Args:
         data_path: Path to the dataset JSON file
+        subset: Optional subset name for the dataset, used for HuggingFace datasets
         split: Optional split name for the dataset, used for HuggingFace datasets
     """
 
     def __init__(
         self,
         data_path: str,
+        subset: Optional[str] = None,
         split: Optional[str] = None,
         **kwargs,
     ):
@@ -54,7 +56,7 @@ class PreferenceDataset(RawDataset):
             self.task_name = self.task_name[1:]
 
         # load from local or huggingface
-        self.dataset = load_dataset_from_path(data_path, split)
+        self.dataset = load_dataset_from_path(data_path, subset, split)
 
         # format the dataset
         self.dataset = self.dataset.add_column(
