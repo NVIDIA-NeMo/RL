@@ -365,6 +365,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
             "Sequence Packing must be enabled to use Context Parallelism with MCore"
         )
 
+        # Enable HCP process groups if HCP is configured
+        if config.get("hybrid_cp", {}).get("enabled", False):
+            model_cfg.hybrid_context_parallel = True
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
