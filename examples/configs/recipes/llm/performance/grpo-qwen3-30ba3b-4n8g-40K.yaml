@@ -1,12 +1,13 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 64
-  num_generations_per_prompt: 32
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   max_total_sequence_length: 40960
   dtensor_cfg:
@@ -34,6 +35,9 @@ policy:
     moe_enable_deepep: true
     moe_token_dispatcher_type: flex
     moe_shared_expert_overlap: false
+  hybrid_cp:
+    enabled: true
+    max_seqlen_per_dp_cp_rank: 5120
   generation:
     vllm_cfg:
       tensor_parallel_size: 2

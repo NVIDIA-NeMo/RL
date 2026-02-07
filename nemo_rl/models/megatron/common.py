@@ -30,6 +30,7 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
@@ -313,15 +314,77 @@ def _pack_sequences_for_megatron(
     )
 
 
+def _pad_sample_for_cp(
+    input_ids: torch.Tensor,
+    seq_length: int,
+    cp_size: int,
+    tp_size: int,
+    sequence_parallel: bool,
+    pad_token_id: int = 0,
+) -> torch.Tensor:
+    """Pad a single sample to be divisible by CP size requirements.
+
+    Args:
+        input_ids: Input tensor, shape [seqlen] or [1, seqlen]
+        seq_length: Actual sequence length (unpadded)
+        cp_size: Context parallel size for this sample
+        tp_size: Tensor parallel size
+        sequence_parallel: Whether sequence parallelism is enabled
+        pad_token_id: Token ID to use for padding
+
+    Returns:
+        Padded input_ids tensor
+    """
+    # Calculate padding factor
+    # With CP, sequences must be divisible by (cp_size * 2)
+    # With SP (sequence parallel), must also be divisible by tp_size
+    pad_factor = cp_size * 2
+    if sequence_parallel:
+        pad_factor *= tp_size
+
+    # Calculate padded length
+    padded_length = ((seq_length + pad_factor - 1) // pad_factor) * pad_factor
+
+    if padded_length == seq_length:
+        # No padding needed
+        return input_ids
+
+    # Apply padding
+    if input_ids.dim() == 1:
+        # Shape: [seqlen] -> [padded_length]
+        padding_size = padded_length - seq_length
+        padded_input_ids = torch.nn.functional.pad(
+            input_ids,
+            (0, padding_size),
+            mode='constant',
+            value=pad_token_id
+        )
+    else:
+        # Shape: [1, seqlen] -> [1, padded_length]
+        padding_size = padded_length - input_ids.shape[1]
+        padded_input_ids = torch.nn.functional.pad(
+            input_ids,
+            (0, padding_size),
+            mode='constant',
+            value=pad_token_id
+        )
+
+    return padded_input_ids
+
+
 def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
     max_seq_len_in_batch: int,
+    cp_size: Optional[int] = None,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
     Args:
         megatron_cfg: Megatron configuration
         max_seq_len_in_batch: Maximum sequence length in batch
+        cp_size: Optional CP size to use for padding calculations.
+            If None, uses global cp_size from config.
+            For HCP, pass local_cp_size for per-sample padding.
 
     Returns:
         Tuple of:
@@ -332,7 +395,9 @@ def _get_pack_sequence_parameters_for_megatron(
     tp_size = megatron_cfg["tensor_model_parallel_size"]
     sp = megatron_cfg["sequence_parallel"]
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
-    cp_size = megatron_cfg["context_parallel_size"]
+    # Use provided cp_size if given (for HCP), otherwise use global config
+    if cp_size is None:
+        cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
     use_blockwise_fp8 = fp8_cfg.get("fp8_recipe", None) == "blockwise"
@@ -492,6 +557,7 @@ def forward_step_arbitrary_loss(
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
+        cp_size_for_normalization = None  # Track CP size for loss normalization
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -505,22 +571,95 @@ def forward_step_arbitrary_loss(
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
 
-            # Pack sequences
-            (
-                input_ids,
-                input_ids_cp_sharded,
-                packed_seq_params,
-                cu_seqlens,
-                cu_seqlens_padded,
-            ) = _pack_sequences_for_megatron(
-                input_ids,
-                seq_lengths,
-                pad_individual_seqs_to_multiple_of,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
-            )
+            # Check if Hybrid Context Parallelism is enabled
+            # In HCP mode, Megatron's _get_new_data_iterator attaches local_cp_size to each sample
+            local_cp_size_tensor = data_dict.get("local_cp_size", None)
+
+            if local_cp_size_tensor is not None:
+                # HCP mode: Pad sample based on its local_cp_size, then use get_batch_on_this_hybrid_cp_rank
+                from megatron.core.utils import get_batch_on_this_hybrid_cp_rank
+                from megatron.core import parallel_state
+
+                local_cp_size = int(local_cp_size_tensor.item())
+
+                # Get actual sequence length for this sample
+                if seq_lengths.dim() == 0:
+                    # Scalar tensor
+                    actual_seq_len = int(seq_lengths.item())
+                elif seq_lengths.dim() == 1 and seq_lengths.shape[0] == 1:
+                    # Single element tensor
+                    actual_seq_len = int(seq_lengths[0].item())
+                else:
+                    # Assume first element if batch
+                    actual_seq_len = int(seq_lengths[0].item())
+
+                # Pad the sample based on local_cp_size
+                tp_size = get_tensor_model_parallel_world_size()
+                sequence_parallel = get_context_parallel_world_size() > 1
+
+                # Ensure input_ids is in correct format for padding
+                if input_ids.dim() == 2 and input_ids.shape[0] == 1:
+                    # [1, seqlen] format - squeeze to [seqlen]
+                    tokens = input_ids.squeeze(0)
+                else:
+                    tokens = input_ids
+
+                # Pad the tokens
+                padded_tokens = _pad_sample_for_cp(
+                    tokens,
+                    actual_seq_len,
+                    local_cp_size,
+                    tp_size,
+                    sequence_parallel,
+                    pad_token_id=0,
+                )
+
+                # Prepare batch dict for get_batch_on_this_hybrid_cp_rank
+                batch_dict = {"tokens": padded_tokens}
+
+                # Get the HCP process group for this CP size
+                cp_group = None
+                if local_cp_size > 1:
+                    cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
+                        group_size=local_cp_size
+                    )
+
+                # Call get_batch_on_this_hybrid_cp_rank - returns (batch, packed_seq_params)
+                batch_for_this_rank, packed_seq_params = get_batch_on_this_hybrid_cp_rank(
+                    batch=batch_dict,
+                    local_cp_size=local_cp_size,
+                    cp_group=cp_group,
+                )
+
+                # Extract the CP-sharded tokens
+                input_ids_cp_sharded = batch_for_this_rank["tokens"]
+
+                # Store local_cp_size for loss normalization
+                cp_size_for_normalization = local_cp_size
+
+                # Extract cu_seqlens_padded from packed_seq_params for logging
+                if packed_seq_params is not None:
+                    cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+            else:
+                # Use standard sequence packing without HCP
+                (
+                    input_ids,
+                    input_ids_cp_sharded,
+                    packed_seq_params,
+                    cu_seqlens,
+                    cu_seqlens_padded,
+                ) = _pack_sequences_for_megatron(
+                    input_ids,
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+
+                # Use global CP size for loss normalization
+                cp_size_for_normalization = get_context_parallel_world_size()
 
             # Log sequence packing information
             # if int(get_context_parallel_rank()) == 0 and int(get_tensor_model_parallel_rank()) == 0:
@@ -537,6 +676,7 @@ def forward_step_arbitrary_loss(
             position_ids = None
             attention_mask = None
         else:
+            # Non-packed sequences
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
@@ -547,6 +687,9 @@ def forward_step_arbitrary_loss(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
+            # Use global CP size for normalization in non-packed mode
+            if cp_size_for_normalization is None:
+                cp_size_for_normalization = get_context_parallel_world_size()
 
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
@@ -602,7 +745,13 @@ def forward_step_arbitrary_loss(
     )
 
     if cp_normalize:
-        cp_size = get_context_parallel_world_size()
+        # Use the appropriate CP size for normalization
+        # In HCP mode, use local_cp_size; otherwise use global CP size
+        if cp_size_for_normalization is not None:
+            cp_size = cp_size_for_normalization
+        else:
+            cp_size = get_context_parallel_world_size()
+
         orig_loss_fn_wrapped = loss_fn_wrapped
 
         def _div_by_cp_size(*args, **kwargs):

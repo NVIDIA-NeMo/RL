@@ -509,6 +509,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Shard and replicate the batch
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
+            cp_size = self.sharding_annotations.get_axis_size("context_parallel")
+
+            # Check if Hybrid Context Parallelism is enabled
+            hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
+
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
@@ -522,11 +527,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                     "sequence_packing"
                 ]["train_mb_tokens"]
-                sharded_data, _ = data.shard_by_batch_size(
-                    dp_size,
-                    batch_size=batch_size,
-                    sequence_packing_args=self.sequence_packing_args,
-                )
+
+                if hcp_enabled:
+                    # Use Hybrid Context Parallelism scheduler
+                    from nemo_rl.models.policy.hybrid_cp_scheduler import HeadNodeHCPScheduler
+                    from nemo_rl.models.policy.hybrid_cp_config import HybridCPConfig
+
+                    # Calculate max_seq_len from config or data
+                    # This is the maximum sequence length the model can handle
+                    max_seq_len = self.cfg.get("max_seq_length", None)
+                    if max_seq_len is None:
+                        # Fallback: use max length from current batch
+                        max_seq_len = int(data["input_lengths"].max().item())
+
+                    # Calculate max_seqlen_per_dp_cp_rank if not provided
+                    max_seqlen_per_dp_cp_rank = self.cfg["hybrid_cp"].get("max_seqlen_per_dp_cp_rank")
+                    if max_seqlen_per_dp_cp_rank is None:
+                        # Use floor division to calculate based on max_seq_len and cp_size
+                        max_seqlen_per_dp_cp_rank = max_seq_len // cp_size
+                        logger.info(
+                            f"HCP: Calculated max_seqlen_per_dp_cp_rank = {max_seqlen_per_dp_cp_rank} "
+                            f"(max_seq_len={max_seq_len} // cp_size={cp_size})"
+                        )
+
+                    hcp_config = HybridCPConfig(
+                        enabled=True,
+                        max_seqlen_per_dp_cp_rank=max_seqlen_per_dp_cp_rank,
+                        scheduling_strategy=self.cfg["hybrid_cp"].get("scheduling_strategy", "dp"),
+                        balance_slack=self.cfg["hybrid_cp"].get("balance_slack", 0.05),
+                        eps_bucket=self.cfg["hybrid_cp"].get("eps_bucket", 0.10),
+                    )
+
+                    hcp_scheduler = HeadNodeHCPScheduler(
+                        hcp_config=hcp_config,
+                        dp_size=dp_size,
+                        cp_size=cp_size,
+                        max_seq_len=max_seq_len,
+                    )
+
+                    sharded_data = hcp_scheduler.schedule_and_shard(
+                        data=data,
+                        seq_length_key="input_lengths",
+                    )
+                else:
+                    # Use standard sequence packing without HCP
+                    sharded_data, _ = data.shard_by_batch_size(
+                        dp_size,
+                        batch_size=batch_size,
+                        sequence_packing_args=self.sequence_packing_args,
+                    )
             else:
                 sharded_data = data.shard_by_batch_size(
                     dp_size,
