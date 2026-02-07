@@ -230,6 +230,10 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
+  # The complete trajectory is managed by gym, which will pass the entire thing to vllm.
+  # We just catch the vllm max seq len error and return an empty response with
+  # finish_reason=stop or incomplete_details=max_length that can be used to stop the trajectory,
+  # so max_input_seq_length is not used in this case.
   max_input_seq_length: null  # nemogym dataset doesn't use this parameter
   shuffle: true
   num_workers: 0
