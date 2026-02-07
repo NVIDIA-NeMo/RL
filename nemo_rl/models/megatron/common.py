@@ -115,6 +115,9 @@ def log_sequence_length_distribution(
         f"Sequence length distribution (total={total_seqs}): {dist_str}"
     )
 
+    print(f"[SeqPacking] {worker_info} | cu_seqlens_padded: {cu_seqlens_padded.cpu().tolist()} | "
+        f"Sequence length distribution (total={total_seqs}): {dist_str}")
+
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return (
@@ -520,12 +523,14 @@ def forward_step_arbitrary_loss(
             )
 
             # Log sequence packing information
-            max_seq_len = pad_full_seq_to if pad_full_seq_to is not None else original_seq_length
-            log_sequence_length_distribution(
-                cu_seqlens_padded,
-                max_seq_len=max_seq_len,
-                num_bins=5,
-            )
+            # if int(get_context_parallel_rank()) == 0 and int(get_tensor_model_parallel_rank()) == 0:
+            #     max_seq_len = pad_full_seq_to if pad_full_seq_to is not None else original_seq_length
+            #     print(f"Forward step: Trying to log")
+            #     log_sequence_length_distribution(
+            #         cu_seqlens_padded,
+            #         max_seq_len=max_seq_len,
+            #         num_bins=5,
+            #     )
 
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information

@@ -31,6 +31,9 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     activation_checkpointing: true
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
+    moe_shared_expert_overlap: false
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
