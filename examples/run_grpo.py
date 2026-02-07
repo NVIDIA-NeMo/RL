@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.utils import setup_data_with_envs
+from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -91,7 +91,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data_with_envs(tokenizer, config["data"], config["env"])
+    ) = setup_response_data(tokenizer, config["data"], config["env"])
 
     (
         policy,
