@@ -125,6 +125,9 @@ class GRPOConfig(TypedDict):
     val_period: int
     val_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
@@ -279,7 +282,11 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if grpo_config["val_period"] > 0 or grpo_config["val_at_start"]:
+    if (
+        grpo_config["val_period"] > 0
+        or grpo_config["val_at_start"]
+        or grpo_config["val_at_end"]
+    ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -294,6 +301,23 @@ def setup(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
             flush=True,
         )
+
+    # ==========================
+    #        Loss Function
+    # ==========================
+    loss_fn = ClippedPGLossFn(loss_config)
+
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
+        print("  ✓ force_on_policy_ratio enabled")
 
     # ==========================
     #          Cluster
@@ -659,19 +683,6 @@ def setup(
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
-
-    loss_fn = ClippedPGLossFn(loss_config)
-
-    # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
-        assert (
-            grpo_config["num_prompts_per_step"]
-            * grpo_config["num_generations_per_prompt"]
-            == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
-        )
-        print("  ✓ force_on_policy_ratio enabled")
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1157,6 +1168,7 @@ def grpo_train(
         "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
@@ -1277,6 +1289,10 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                if dynamic_sampling_num_gen_batches == 1 and hasattr(
+                    policy_generation, "snapshot_step_metrics"
+                ):
+                    policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1419,6 +1435,9 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+                    gen_step_metrics = {}
+                    if hasattr(policy_generation, "get_step_metrics"):
+                        gen_step_metrics = policy_generation.get_step_metrics()
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
@@ -1564,8 +1583,10 @@ def grpo_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1635,6 +1656,7 @@ def grpo_train(
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(gen_step_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
@@ -2135,6 +2157,7 @@ def async_grpo_train(
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     assert not colocated_inference, (
@@ -2574,7 +2597,10 @@ def async_grpo_train(
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
 
-                if val_period > 0 and (step + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 

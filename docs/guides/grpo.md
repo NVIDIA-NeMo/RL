@@ -68,6 +68,15 @@ data:
     env_name: "math"
 ```
 
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "input": "Hello",     // <input_key>: <input_content>
+  "output": "Hi there!" // <output_key>: <output_content>
+}
+```
+
 We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
 ```yaml
 data:
@@ -421,6 +430,16 @@ We use this to track if our models are experiencing entropy collapse too quickly
 
 
 
+
+## LoRA Configuration
+
+### DTensor Backend
+
+GRPO supports LoRA on the NeMoRL DTensor backend. The LoRA settings live under `policy.dtensor_cfg.lora_cfg`, and the fields follow the SFT LoRA configuration. For DTensor parameter details, see [SFT LoRA: DTensor Configuration Parameters](./sft.md#dtensor-configuration-parameters). To enable LoRA, set `policy.dtensor_cfg.lora_cfg.enabled=true`, then configure target modules, rank, alpha, and dropout as needed.
+
+Our DTensor LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+
+We already provide a DTensor-based Nano v3 GRPO LoRA recipe. See [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) for an end-to-end example.
 
 ## Evaluate the Trained Model
 
