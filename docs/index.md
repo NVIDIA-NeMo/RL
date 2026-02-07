@@ -209,6 +209,7 @@ adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
