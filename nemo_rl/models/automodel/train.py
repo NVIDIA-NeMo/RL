@@ -37,6 +37,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
+    get_logprobs_from_logits,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
@@ -508,6 +509,14 @@ class LossPostProcessor:
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
 
+        # Compute logprobs from logits
+        logprobs = get_logprobs_from_logits(
+            input_ids=mb["input_ids"],
+            next_token_logits=logits,
+            seq_index=mb.get("seq_index", None),
+        )
+        del logits
+
         # Wrap loss function for sequence packing if needed
         if processed_inputs.has_flash_attention:
             loss_fn_ = SequencePackingLossWrapper(
@@ -519,7 +528,7 @@ class LossPostProcessor:
             loss_fn_ = self.loss_fn
 
         loss, loss_metrics = loss_fn_(
-            logits,
+            logprobs,
             mb,
             global_valid_seqs,
             global_valid_toks,
