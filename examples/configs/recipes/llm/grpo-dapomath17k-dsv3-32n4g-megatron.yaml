@@ -1,12 +1,5 @@
 defaults: ./grpo-dapomath17k-dsv3-megatron.yaml
 policy:
-  megatron_cfg:
-    tensor_model_parallel_size: 4
-    expert_model_parallel_size: 16
-    pipeline_model_parallel_size: 4
-    context_parallel_size: 2
-    num_layers_in_first_pipeline_stage: 15
-    num_layers_in_last_pipeline_stage: 14
   make_sequence_length_divisible_by: 4
   generation:
     vllm_cfg:

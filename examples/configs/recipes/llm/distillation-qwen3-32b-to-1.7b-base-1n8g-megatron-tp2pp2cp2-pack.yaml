@@ -22,6 +22,7 @@ policy:
     ${.megatron_cfg.context_parallel_size}}, 2}
   megatron_cfg:
     enabled: true
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_32b_pretrain_config
 teacher:
   model_name: Qwen/Qwen3-32B
   dtensor_cfg:

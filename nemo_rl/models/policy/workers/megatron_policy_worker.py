@@ -278,6 +278,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model,
             self.optimizer,
         )
+        print("HELLO")
+        # Dump ConfigContainer to YAML for inspection (only on rank 0)
+        if self.rank == 0:
+            config_dump_path = "/lustre/fsw/portfolios/coreai/users/sfawzy/final_megatron_config_6.yaml"
+            try:
+                self.megatron_cfg.to_yaml(config_dump_path)
+                print(f"[DEBUG] Saved final ConfigContainer to: {config_dump_path}")
+            except Exception as e:
+                print(f"[WARNING] Failed to save ConfigContainer to YAML: {e}")
+            # Exit early after dumping config for inspection
+            import sys
+            print("[DEBUG] Exiting after ConfigContainer dump")
+            sys.exit(0)
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
