@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from typing import Any, Optional, Union
+import pdb 
 
 import torch
 from datasets import Dataset
@@ -98,6 +99,9 @@ class AllTaskProcessedDataset:
 
     def __getitem__(self, idx: int) -> DatumSpec:
         """Return a single prompt."""
+
+        #print(self.dataset)
+        #pdb.set_trace()
         entry = self.dataset[idx]
 
         # preprocessing

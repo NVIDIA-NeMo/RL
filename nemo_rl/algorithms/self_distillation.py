@@ -185,6 +185,11 @@ def _build_cot_gt_texts(
         batch_size,
     )
 
+    print("=====================")
+    print("CHAIN OF THOUGHT TEXTS")
+    print("=====================")
+    #print(cot_texts)
+
     combined: list[str] = []
     for cot, gt in zip(cot_texts, gt_texts):
         cot = cot.strip() if cot else ""
@@ -868,6 +873,8 @@ def distillation_train(
                     train_data.to("cpu")
 
                 # Build self-teacher inputs by inserting COT + GT before assistant tokens.
+
+                #print("Batch:", repeated_batch)
                 cot_texts = _build_cot_gt_texts(repeated_batch, repeated_batch.size)
                 max_seq_len = master_config["policy"].get(
                     "max_total_sequence_length", None
@@ -889,6 +896,27 @@ def distillation_train(
                     max_seq_len,
                     make_seq_divisible_by,
                 )
+
+                # DEBUG: verify COT tokens are inserted into teacher context
+                if (total_steps == 0) and (current_step == 0):
+                    i = 0  # check first sample
+                    seq_len = int(train_data["input_lengths"][i].item())
+                    insert_pos = insert_positions[i]
+                    cot_text = cot_texts[i]
+                    cot_ids = tokenizer(
+                        cot_text, return_tensors="pt", add_special_tokens=False
+                    )["input_ids"][0].tolist()
+
+                    # respect truncation
+                    max_seq_len = master_config["policy"].get("max_total_sequence_length", None)
+                    if max_seq_len is not None:
+                        max_extra = max(0, max_seq_len - seq_len)
+                        cot_ids = cot_ids[:max_extra]
+
+                    teacher_seq = teacher_input_ids[i, : int(teacher_input_lengths[i].item())].tolist()
+
+                    assert teacher_seq[insert_pos:insert_pos + len(cot_ids)] == cot_ids, \
+                        "COT tokens not found at expected insertion position"
 
                 teacher_data = BatchedDataDict(
                     {
