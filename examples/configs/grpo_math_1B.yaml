@@ -9,6 +9,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
@@ -21,6 +22,15 @@ grpo:
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -51,9 +61,12 @@ loss_fn:
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
+  truncated_importance_sampling_type: tis  # "tis" (clamp to max) or "icepop" (filter outside [min, max])
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
 
 checkpointing:
   enabled: true
