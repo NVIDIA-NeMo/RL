@@ -7,7 +7,7 @@ ProRLv2 (as used in this repo) is best thought of as **GRPO and a bundle of stab
 - **DAPO dynamic sampling**: skip prompt-groups with zero reward variance
 - **Decoupled (asymmetric) clipping**: `ratio_clip_max > ratio_clip_min`
 - **Token-level policy gradient loss**
-- **Importance sampling correction and TIS/CE-POP** (especially helpful for MoE/backend-mismatch scenarios)
+- **Importance sampling correction and TIS/ICE-POP** (especially helpful for MoE/backend-mismatch scenarios)
 - **Reinforce++: Decoupled local/global advantage normalization** (`reinforce_plus_plus`)
 - **“Stop properly” penalty** for truncated responses
 
@@ -151,8 +151,37 @@ loss_fn:
 - **`truncated_importance_sampling_type`**:
   - `"tis"`: clamp weights to `<= truncated_importance_sampling_ratio`
   - `"icepop"`: set weights outside \([min, max]\) to zero (filter outliers)
+  - `"seq-mask-tis"`: sequence-level geometric-mean mask + non-truncated token-level IS correction (see below)
 
 - **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss_functions.py`](../../nemo_rl/algorithms/loss_functions.py).
+
+### Seq-mask-tis: Sequence-level Geometric-Mean Mask
+
+`seq-mask-tis` is an alternative to ICE-POP that operates at the **sequence level** instead of per-token:
+
+1. For each sequence, compute the **geometric mean** of per-token IS ratios: \(\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\text{prev}}(a_t)}{\pi_{\text{gen}}(a_t)}\bigr)\)
+2. **Mask out** entire sequences whose geometric mean falls outside \([min, max]\).
+3. For retained sequences, apply the **non-truncated** (raw) token-level IS ratios to correct per-token gradients — no clamping, no per-token filtering.
+
+Key differences from ICE-POP:
+
+| | ICE-POP | seq-mask-tis |
+|---|---|---|
+| Filtering granularity | per token | per sequence |
+| IS correction weights | filtered (zeroed outside bounds) | raw / non-truncated |
+| Reference bounds | min=0.5, max=5 | min=0.002, max=0.003 |
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 0.003
+  truncated_importance_sampling_ratio_min: 0.002
+  truncated_importance_sampling_type: "seq-mask-tis"
+```
+
+Both ICE-POP and seq-mask-tis report a shared metric **`is_filter_drop_frac`** — the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) that were filtered out.
+
+- **Reference**: [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 
 ## Full Example Config (Annotated)
 
@@ -201,5 +230,6 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 - **GRPO**: [Group Relative Policy Optimization](https://arxiv.org/abs/2402.03300)
 - **REINFORCE++**: [REINFORCE++](https://arxiv.org/abs/2501.03262)
 - **DLER (stop properly penalty explanation)**: [DLER](https://arxiv.org/pdf/2510.15110)
+- **seq-mask-tis blog**: [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 - **[NeMo RL GRPO Guide](grpo.md)**
 - **[NeMo RL DAPO Guide](dapo.md)**
