@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 import torch.distributed
@@ -869,12 +869,20 @@ class SequencePackingLossWrapper:
     def __init__(
         self,
         loss_fn: LossFunction,
+        prepare_fn: Callable[Any, Any],
         cu_seqlens_q: Tensor,
         cu_seqlens_q_padded: Optional[Tensor] = None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = cu_seqlens_q_padded
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
 
     def __call__(
         self,
@@ -882,9 +890,6 @@ class SequencePackingLossWrapper:
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor | None,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -918,8 +923,8 @@ class SequencePackingLossWrapper:
             # get next_token_logits
             cp_size = (
                 1
-                if context_parallel_group is None
-                else torch.distributed.get_world_size(context_parallel_group)
+                if self.context_parallel_group is None
+                else torch.distributed.get_world_size(self.context_parallel_group)
             )
             logit_start = seq_start // cp_size
             logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
@@ -928,14 +933,14 @@ class SequencePackingLossWrapper:
                 1, logit_start, logit_length
             )
 
+            # prepare data for loss function
+            loss_fn_args = self.prepare_fn(next_token_logits_slice, unpadded_seq_data)
+
             loss, metrics = self.loss_fn(
-                next_token_logits_slice,
+                *loss_fn_args,
                 unpadded_seq_data,
                 global_valid_seqs,
                 global_valid_toks,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
             )
             loss_accum += loss
             for k, v in metrics.items():

@@ -505,6 +505,12 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
+        from nemo_rl.algorithms.loss_functions import (
+            ClippedPGLossFn,
+            DPOLossFn,
+            NLLLoss,
+        )
+
         # Handle CP redistribution
         if self.cp_size > 1:
             _, mb = prepare_data_for_cp(
@@ -514,30 +520,45 @@ class LossPostProcessor:
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
 
-        # Compute logprobs from logits
-        logprobs = get_logprobs_from_logits(
-            input_ids=mb["input_ids"],
-            next_token_logits=logits,
-            seq_index=mb.get("seq_index", None),
-        )
-        del logits
+        # Prepare data for loss function
+        def prepare_for_loss_fn(
+            logits: torch.Tensor, mb: BatchedDataDict[Any]
+        ) -> tuple[Any]:
+            if isinstance(self.loss_fn, (ClippedPGLossFn, NLLLoss, DPOLossFn)):
+                logprobs = get_logprobs_from_logits(
+                    input_ids=mb["input_ids"],
+                    next_token_logits=logits,
+                    seq_index=mb.get("seq_index", None),
+                )
+
+                loss_fn_args = (logprobs,)
+
+            # TODO: PreferenceLoss, DistillationLossFn
+
+            return loss_fn_args
 
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
             loss_fn_ = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
+                prepare_fn=prepare_for_loss_fn,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
+            loss, loss_metrics = loss_fn_(
+                logits,
+                mb,
+                global_valid_seqs,
+                global_valid_toks,
+            )
         else:
-            loss_fn_ = self.loss_fn
-
-        loss, loss_metrics = loss_fn_(
-            logprobs,
-            mb,
-            global_valid_seqs,
-            global_valid_toks,
-        )
+            loss_fn_args = prepare_for_loss_fn(logits, mb)
+            loss, loss_metrics = self.loss_fn(
+                *loss_fn_args,
+                mb,
+                global_valid_seqs,
+                global_valid_toks,
+            )
 
         return loss, loss_metrics
 
