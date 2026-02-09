@@ -1668,7 +1668,7 @@ class GetPackSequenceParametersTestActor:
         expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
         expected_packed = (
             32 * 4 * 2 * 2 * 4
-        )   # divisor * cp_size * 2 * tp_size * pp_size
+        )  # divisor * cp_size * 2 * tp_size * pp_size
 
         if (
             pad_individual != expected_individual
