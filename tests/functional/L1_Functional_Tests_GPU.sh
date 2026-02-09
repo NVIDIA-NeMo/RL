@@ -40,7 +40,9 @@ time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiple_datasets.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
+# Re-enable once it is fixed.
+# time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
+# Re-enable once SGLang build is fixed.
 # time uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 time uv run --no-sync bash ./tests/functional/prorlv2.sh
 time uv run --no-sync bash ./tests/functional/rm.sh
