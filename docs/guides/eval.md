@@ -15,7 +15,7 @@ Use the `examples/converters/convert_dcp_to_hf.py` script. You'll need the path 
 # Example for a GRPO checkpoint at step 170
 uv run python examples/converters/convert_dcp_to_hf.py \
     --config results/grpo/step_170/config.yaml \
-    --dcp-ckpt-path results/grpo/step_170/policy/weights/model \
+    --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
     --hf-ckpt-path results/grpo/hf
 ```
 > **Note:** Adjust the paths according to your training output directory structure.
