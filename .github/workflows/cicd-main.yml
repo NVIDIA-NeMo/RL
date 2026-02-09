@@ -222,6 +222,7 @@ jobs:
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ github.sha }}
+        SKIP_SGLANG_BUILD=1
 
   cicd-doc-tests:
     strategy:
