@@ -46,6 +46,7 @@ except ImportError:
 NEMO_GYM_ROLLOUT_MAX_RETRIES_TO_AVOID_LP_NAN = 3
 run_examples_called = 0
 
+
 @pytest.mark.skipif(
     not NEMO_GYM_INSTALLED,
     reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
