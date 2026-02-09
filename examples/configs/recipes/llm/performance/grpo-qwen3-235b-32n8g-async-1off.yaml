@@ -9,6 +9,13 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-32n8g-async-1off
 policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    context_parallel_size: 1
+    pipeline_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    defer_fp32_logits: false
   generation:
     colocated:
       enabled: false

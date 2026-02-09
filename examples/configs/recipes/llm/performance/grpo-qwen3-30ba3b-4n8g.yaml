@@ -7,6 +7,7 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  megatron_recipe: megatron_bridge.recipes.qwen.qwen3_moe.qwen3_30b_a3b_pretrain_config
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
   dtensor_cfg:

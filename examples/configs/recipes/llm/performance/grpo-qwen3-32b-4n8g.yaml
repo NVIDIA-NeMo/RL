@@ -14,6 +14,7 @@ policy:
   optimizer: null
   scheduler: null
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_recipe: megatron_bridge.recipes.qwen.qwen3.qwen3_32b_pretrain_config
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1

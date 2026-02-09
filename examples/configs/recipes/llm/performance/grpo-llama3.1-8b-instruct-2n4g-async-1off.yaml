@@ -9,6 +9,10 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-async-1off
 policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: false
   generation:
     colocated:
       enabled: false

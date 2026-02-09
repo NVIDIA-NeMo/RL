@@ -40,6 +40,7 @@ policy:
     enabled: false
   make_sequence_length_divisible_by: ${mul:${policy.dtensor_cfg.tensor_parallel_size},
     ${mul:2, ${policy.dtensor_cfg.context_parallel_size}}}
+  megatron_recipe: megatron_bridge.recipes.deepseek.deepseek_v3_pretrain_config
   megatron_cfg:
     empty_unused_memory_level: 2
     enabled: true

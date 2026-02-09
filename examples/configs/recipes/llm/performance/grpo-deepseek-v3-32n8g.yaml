@@ -19,6 +19,7 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron_bridge.recipes.deepseek.deepseek_v3_pretrain_config_32nodes
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
