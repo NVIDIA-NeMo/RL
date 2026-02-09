@@ -207,7 +207,7 @@ def setup_response_data(
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_preference_data(
     tokenizer: AutoTokenizer, data_config: DataConfig
-) -> tuple[AllTaskProcessedDataset, Optional[AllTaskProcessedDataset]]:
+) -> tuple[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]:
     """Setup preference data.
 
     This function is used to setup the preference data for the training and validation datasets.
