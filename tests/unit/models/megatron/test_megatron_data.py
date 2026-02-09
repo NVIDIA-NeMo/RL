@@ -1606,7 +1606,7 @@ class GetPackSequenceParametersTestActor:
                     "success": False,
                     "error": f"Expected pad_individual=1, pad_packed=1, pad_to={test_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
                 }
-        
+
         # Test 15: FP8 with MXFP8 recipe
         megatron_cfg = {
             "tensor_model_parallel_size": 1,
@@ -1642,12 +1642,16 @@ class GetPackSequenceParametersTestActor:
         expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
         expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
 
-        if pad_individual != expected_individual or pad_packed != expected_packed or pad_to is not None:
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to is not None
+        ):
             return {
                 "success": False,
                 "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
             }
-        
+
         # Test 17: FP8 with MXFP8 recipe, CP, TP+SP, and PP
         megatron_cfg = {
             "tensor_model_parallel_size": 2,
@@ -1656,15 +1660,21 @@ class GetPackSequenceParametersTestActor:
             "context_parallel_size": 4,
             "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
         }
-        
+
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
             megatron_cfg, max_seq_len
         )
-        
+
         expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = 32 * 4 * 2 * 2 * 4  # divisor * cp_size * 2 * tp_size * pp_size
-        
-        if pad_individual != expected_individual or pad_packed != expected_packed or pad_to != max_seq_len:
+        expected_packed = (
+            32 * 4 * 2 * 2 * 4
+        )   # divisor * cp_size * 2 * tp_size * pp_size
+
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to != max_seq_len
+        ):
             return {
                 "success": False,
                 "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to={max_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
