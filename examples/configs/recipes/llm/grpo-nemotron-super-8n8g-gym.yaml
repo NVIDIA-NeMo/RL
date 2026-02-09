@@ -296,7 +296,7 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:10000/v1
           api_key: dummy_key
-          model: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8"
+          model: dummy # TODO: update this to public HF name
           return_token_id_information: False
           uses_reasoning_parser: False
           spinup_server: True
