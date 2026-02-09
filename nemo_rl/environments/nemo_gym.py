@@ -115,7 +115,6 @@ Depending on your data shape, you may want to change these values."""
         timer.start("_run_rollouts_total")
         max_retries, trial = self.cfg["rollout_max_retries_to_avoid_lp_nan"], 0
         while trial < max_retries:
-
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
@@ -134,22 +133,26 @@ Depending on your data shape, you may want to change these values."""
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
-            
 
-            # determine if generation_logprobs contain NaN; if not, break; 
+            # determine if generation_logprobs contain NaN; if not, break;
             logprob_contains_nan = False
             for nemo_rl_result in nemo_rl_results:
                 for message in nemo_rl_result["message_log"]:
-                    if "generation_logprobs" in message and message["generation_logprobs"] is not None:
+                    if (
+                        "generation_logprobs" in message
+                        and message["generation_logprobs"] is not None
+                    ):
                         if torch.isnan(message["generation_logprobs"]).any():
                             logprob_contains_nan = True
                             break
             if logprob_contains_nan:
                 trial += 1
-                print(f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_retries})")
+                print(
+                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_retries})"
+                )
                 continue
             else:
-                break 
+                break
 
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
