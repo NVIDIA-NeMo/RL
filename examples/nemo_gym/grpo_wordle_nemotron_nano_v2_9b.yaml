@@ -1,0 +1,274 @@
+# GRPO Training Configuration for Wordle with Nemotron Nano V2 9B
+#
+# This configuration trains nvidia/NVIDIA-Nemotron-Nano-9B-v2 on the Wordle
+# word-guessing game using GRPO (Group Relative Policy Optimization).
+#
+# Backend: DTensor V2 / Automodel
+# Hardware: 4x A100 80GB GPUs
+#
+# Usage:
+#   uv run python examples/run_grpo_nemo_gym.py \
+#       --config examples/nemo_gym/grpo_wordle_nemotron_nano_v2_9b.yaml
+
+grpo:
+  max_num_epochs: 999999  # Effectively unlimited, controlled by max_num_steps
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1  # Wordle is 1 turn but allows up to 6 tool-calling steps
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 10
+  val_at_start: true
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 2.0  # Max win reward is 2.0
+    target_min: 0.0
+    target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false  # Need ref logprobs for KL penalty
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01  # Small KL penalty to prevent model collapse
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
+  use_importance_sampling_correction: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-wordle-nemo-gym"
+  # Validation metrics (accuracy = mean reward):
+  # - accuracy: Mean reward (Win=1.0-2.0, Loss=0.0)
+  # - wordle_simple_agent/won/mean: Win rate
+  # - wordle_simple_agent/turns_if_won/sum / won/sum = avg turns to win
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 32
+  max_total_sequence_length: 2048  # Wordle games need ~500-1000 tokens with /no_think
+  precision: "bfloat16"
+  logprob_chunk_size: null
+
+  # DTensor V2 / Automodel Configuration
+  dtensor_cfg:
+    _v2: true                          # Enable DTensor V2 / Automodel
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1            # No tensor parallelism for 4 GPUs
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+
+  # Disable Megatron (using DTensor V2 instead)
+  megatron_cfg:
+    enabled: false
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 1
+    empty_unused_memory_level: 0
+    activation_checkpointing: true
+    train_iters: 100000
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    apply_rope_fusion: true
+    defer_fp32_logits: false
+    moe_permute_fusion: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6
+      min_lr: 5.0e-7
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 100000
+      lr_warmup_iters: 13
+      lr_warmup_init: 5.0e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+  offload_optimizer_for_logprob: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      enable_expert_parallel: false
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7  # Lower to leave room for training
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      kv_cache_dtype: "auto"
+      expose_http_server: true
+      skip_tokenizer_init: false
+      tool_parser_plugin: nemo_rl/models/generation/vllm/nemotron_json_tool_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: nemotron_json
+    vllm_kwargs:
+      compilation_config:
+        use_inductor: false
+      # Required for Nemotron Nano v2
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/wordle/data/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/wordle/data/validation.jsonl
+  agent_name: wordle_simple_agent
+  shuffle: true
+  num_workers: 0
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/wordle/configs/wordle.yaml
+    wordle_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 18  # 6 guesses + room for check_word_validity/get_game_state calls
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body: {}
+
+logger:
+  log_dir: "logs/grpo-wordle-nemotron-nano-v2-9b"
+  num_val_samples_to_print: 5  # Print some validation samples to see game play
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "grpo-wordle"
+    name: "nemotron-nano-v2-9b-wordle"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-wordle"
+    run_name: "nemotron-nano-v2-9b-wordle"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 4  # 4 A100 80GB GPUs
+  num_nodes: 1
