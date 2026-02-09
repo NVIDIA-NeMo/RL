@@ -26,7 +26,7 @@ policy:
 
   scheduler: null # remove default FSDP scheduler
 
-  megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_30b_pretrain_config
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3_30b_a3b_finetune_config
   
   megatron_cfg:
     enabled: true
