@@ -1142,17 +1142,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
 
-        ret["topk_logits"] = (
+        # Use smaller dtypes to reduce serialization/transfer overhead:
+        # - bfloat16 for logits (half the size of float32, sufficient precision for KL)
+        # - int32 for indices (vocab size < 2^31, half the size of int64)
+        # Use ray.put() to return ObjectRef instead of actual data, allowing parallel
+        # serialization across workers and avoiding sequential serialization bottleneck
+        topk_logits_cpu = (
             torch.cat(all_topk_vals_padded, dim=0)
             if len(all_topk_vals_padded) > 1
             else all_topk_vals_padded[0]
-        ).cpu()
-        ret["topk_indices"] = (
+        ).to(torch.bfloat16).cpu()
+        topk_indices_cpu = (
             torch.cat(all_topk_idx_padded, dim=0)
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
-        ).cpu()
-        return ret
+        ).to(torch.int32).cpu()
+        return {
+            "topk_logits_ref": ray.put(topk_logits_cpu),
+            "topk_indices_ref": ray.put(topk_indices_cpu),
+        }
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

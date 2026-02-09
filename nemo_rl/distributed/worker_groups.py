@@ -868,7 +868,13 @@ class RayWorkerGroup:
 
         called_workers = []
         return_from_workers = []
-        # For each worker, determine what data it should receive
+
+        # Cache for ray.put() object references to avoid repeated serialization
+        # Key: tuple of shard indices (from in_sharded_axes), Value: dict of ObjectRefs
+        put_cache: dict[tuple, dict[str, Any]] = {}
+
+        # Pre-compute which workers should receive data and their shard keys
+        worker_info = []
         for worker_idx, worker in enumerate(self._workers):
             # Get the worker's coordinates in the sharding space
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
@@ -895,20 +901,50 @@ class RayWorkerGroup:
             if return_from_this_worker:
                 return_from_workers.append(worker_idx)
 
-            if should_receive_data:
-                # Find the appropriate data slice for this worker
-                worker_args = args
-                worker_kwargs = kwargs
-                for axis in in_sharded_axes:
-                    if axis in worker_coords:
-                        # Select the appropriate slice for this axis
-                        worker_args = [arg[worker_coords[axis]] for arg in worker_args]
-                        worker_kwargs = {
-                            key: value[worker_coords[axis]]
-                            for key, value in worker_kwargs.items()
-                        }
+            # Compute shard key based on in_sharded_axes coordinates
+            shard_key = tuple(
+                worker_coords.get(axis, 0)
+                for axis in in_sharded_axes
+                if axis in worker_coords
+            )
 
-                # Call the method on the worker with its data slice
+            worker_info.append(
+                (worker_idx, worker, worker_coords, should_receive_data, shard_key)
+            )
+
+        # For each worker, determine what data it should receive
+        for worker_idx, worker, worker_coords, should_receive_data, shard_key in (
+            worker_info
+        ):
+            if should_receive_data:
+                # Check if we already have ObjectRefs for this shard
+                if shard_key not in put_cache:
+                    # Find the appropriate data slice for this worker
+                    worker_args = args
+                    worker_kwargs = kwargs
+                    for axis in in_sharded_axes:
+                        if axis in worker_coords:
+                            # Select the appropriate slice for this axis
+                            worker_args = [
+                                arg[worker_coords[axis]] for arg in worker_args
+                            ]
+                            worker_kwargs = {
+                                key: value[worker_coords[axis]]
+                                for key, value in worker_kwargs.items()
+                            }
+
+                    # Use ray.put() to store data in object store once per unique shard
+                    # This avoids repeated serialization when the same data is sent to
+                    # multiple workers (e.g., replicated across tensor/context parallel)
+                    put_kwargs = {key: ray.put(value) for key, value in worker_kwargs.items()}
+                    put_cache[shard_key] = {"args": worker_args, "kwargs": put_kwargs}
+
+                # Retrieve cached ObjectRefs
+                cached = put_cache[shard_key]
+                worker_args = cached["args"]
+                worker_kwargs = cached["kwargs"]
+
+                # Call the method on the worker with its data slice (now using ObjectRefs)
                 future = getattr(worker, method_name).remote(
                     *worker_args, **worker_kwargs, **common_kwargs
                 )

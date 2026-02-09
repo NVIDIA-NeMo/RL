@@ -118,6 +118,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
             log_to_driver=True,
             include_dashboard=False,
             runtime_env=runtime_env,
+            object_store_memory=300000000000,
             _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         )
 
@@ -169,6 +170,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         log_to_driver=True,
         include_dashboard=True,
         runtime_env=local_runtime_env,
+        object_store_memory=300000000000,
         _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         resources={cvd_tag: 1},
     )

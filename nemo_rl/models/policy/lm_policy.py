@@ -481,13 +481,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
-        worker_batches = self.worker_group.get_all_worker_results(futures)
-        all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
-        all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
+        # Workers now return ObjectRefs instead of actual data for parallel serialization
+        with (
+            timer.time("get_topk_logits/get_worker_results")
+            if timer
+            else nullcontext()
+        ):
+            # This includes waiting for GPU forward + getting ObjectRefs
+            worker_batches = self.worker_group.get_all_worker_results(futures)
 
-        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
-        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
-        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        # Print worker timing breakdown (from first worker)
+        if worker_batches and "worker_timing" in worker_batches[0]:
+            wt = worker_batches[0]["worker_timing"]
+            print(
+                f"  [Worker timing] gpu_forward: {wt['gpu_forward_time']:.2f}s, "
+                f"post_process: {wt['post_process_time']:.2f}s, "
+                f"gpu_to_cpu: {wt['gpu_to_cpu_time']:.2f}s, "
+                f"ray_put: {wt['ray_put_time']:.2f}s",
+                flush=True,
+            )
+
+        with (
+            timer.time("get_topk_logits/fetch_from_object_store")
+            if timer
+            else nullcontext()
+        ):
+            # Collect all ObjectRefs and fetch them in parallel with ray.get()
+            all_logits_refs = [wb["topk_logits_ref"] for wb in worker_batches]
+            all_indices_refs = [wb["topk_indices_ref"] for wb in worker_batches]
+            # Parallel fetch from object store
+            all_topk_logits = ray.get(all_logits_refs)
+            all_topk_indices = ray.get(all_indices_refs)
+
+        with (
+            timer.time("get_topk_logits/concat_results") if timer else nullcontext()
+        ):
+            stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
+            stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
+            stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
 
         if self.use_dynamic_batches or self.use_sequence_packing:
             stacked.reorder_data(unsorted_data_indices)
