@@ -918,6 +918,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             return output_tensor, collection_fn
 
+        import time
+
+        t0 = time.perf_counter()
         forward_backward_func = get_forward_backward_func()
         list_of_outputs = forward_backward_func(
             forward_step_func=forward_step_fn,
@@ -929,6 +932,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             decoder_seq_length=padded_seq_length,
             forward_only=True,
         )
+        torch.cuda.synchronize()  # Ensure GPU work is done
+        t1 = time.perf_counter()
+        gpu_forward_time = t1 - t0
 
         if is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
@@ -956,11 +962,36 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             last_pp_rank = get_pipeline_model_parallel_last_rank()
             topk_logits = broadcast_tensor(None, last_pp_rank, pp_grp)
             topk_indices = broadcast_tensor(None, last_pp_rank, pp_grp)
+        t2 = time.perf_counter()
+        post_process_time = t2 - t1
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
-        )
+        # Use smaller dtypes to reduce serialization/transfer overhead:
+        # - bfloat16 for logits (half the size of float32, sufficient precision for KL)
+        # - int32 for indices (vocab size < 2^31, half the size of int64)
+        # Use ray.put() to return ObjectRef instead of actual data, allowing parallel
+        # serialization across workers and avoiding sequential serialization bottleneck
+        topk_logits_cpu = topk_logits.to(torch.bfloat16).cpu()
+        topk_indices_cpu = topk_indices.to(torch.int32).cpu()
+        t3 = time.perf_counter()
+        gpu_to_cpu_time = t3 - t2
+
+        logits_ref = ray.put(topk_logits_cpu)
+        indices_ref = ray.put(topk_indices_cpu)
+        t4 = time.perf_counter()
+        ray_put_time = t4 - t3
+
+        return {
+            "topk_logits_ref": logits_ref,
+            "topk_indices_ref": indices_ref,
+            # Timing info from worker (only rank 0 will be meaningful)
+            "worker_timing": {
+                "gpu_forward_time": gpu_forward_time,
+                "post_process_time": post_process_time,
+                "gpu_to_cpu_time": gpu_to_cpu_time,
+                "ray_put_time": ray_put_time,
+            },
+        }
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
