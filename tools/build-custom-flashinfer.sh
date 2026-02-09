@@ -72,9 +72,17 @@ desired.update({"path": "3rdparty/flashinfer", "editable": True})
 sources["flashinfer-python"] = desired
 
 # 2) Add flashinfer-python to [project.optional-dependencies].vllm
+project = doc.get("project")
+if project is None:
+    raise SystemExit("[ERROR] Missing [project] in pyproject.toml")
+
 opt = project.get("optional-dependencies")
 vllm_list = opt["vllm"]
-vllm_list.append("flashinfer-python")
+if not vllm_list:
+    vllm_list = []
+if "flashinfer-python" not in vllm_list:
+    vllm_list.append("flashinfer-python")
+opt["vllm"] = vllm_list
 
 pyproject_path.write_text(dumps(doc))
 print("[INFO] Updated pyproject.toml for local FlashInfer.")

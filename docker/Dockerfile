@@ -84,6 +84,11 @@ ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
+ARG BUILD_CUSTOM_VLLM_URL=
+ARG BUILD_CUSTOM_VLLM_REF=
+ARG BUILD_CUSTOM_FLASHINFER
+ARG BUILD_CUSTOM_FLASHINFER_URL=
+ARG BUILD_CUSTOM_FLASHINFER_REF=
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -103,11 +108,11 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh
+    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    bash tools/build-custom-flashinfer.sh
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
