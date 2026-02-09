@@ -236,8 +236,20 @@ def convert_dcp_to_hf(
         raise FileExistsError(
             f"HF checkpoint already exists at {hf_ckpt_path}. Delete it to run or set overwrite=True."
         )
-
     os.makedirs(hf_ckpt_path, exist_ok=True)
+
+    # The ckpt path of dtensor v2 is like <ckpt_dir>/model, while v1 is like <ckpt_dir>
+    # Choose the correct subdir based on the presence of the metadata file.
+    metadata_path = os.path.join(dcp_ckpt_path, ".metadata")
+    if not os.path.exists(metadata_path):
+        model_subdir = os.path.join(dcp_ckpt_path, "model")
+        model_metadata_path = os.path.join(model_subdir, ".metadata")
+        if os.path.exists(model_metadata_path):
+            dcp_ckpt_path = model_subdir
+            print(f"Using dcp_ckpt_path of Dtensor V2: {model_subdir}")
+    else:
+        print(f"Using dcp_ckpt_path of Dtensor V1: {dcp_ckpt_path}")
+
     weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
     dcp_to_torch_save(dcp_ckpt_path, weights_path)
 

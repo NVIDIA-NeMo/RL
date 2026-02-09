@@ -1867,9 +1867,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        weights_path, optimizer_path = self._normalize_checkpoint_paths(
-            weights_path, optimizer_path
-        )
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1884,9 +1881,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self, weights_path: str, optimizer_path: Optional[str] = None
     ) -> None:
         """Load a checkpoint into the model."""
-        weights_path, optimizer_path = self._normalize_checkpoint_paths(
-            weights_path, optimizer_path
-        )
         load_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1894,13 +1888,3 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
-
-    def _normalize_checkpoint_paths(
-        self, weights_path: str, optimizer_path: Optional[str]
-    ) -> tuple[str, Optional[str]]:
-        """Match DTensor v2 checkpoint layout for v1 saves/loads."""
-        if os.path.basename(weights_path) != "model":
-            weights_path = os.path.join(weights_path, "model")
-        if optimizer_path and os.path.basename(optimizer_path) != "optim":
-            optimizer_path = os.path.join(optimizer_path, "optim")
-        return weights_path, optimizer_path
