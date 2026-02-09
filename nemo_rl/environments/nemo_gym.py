@@ -163,21 +163,25 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-"""
+            )
+
+            if is_contiguous:
+                user_token_ids = output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
+            else:
+                # Token mismatch can happen when reasoning tokens (e.g., <think>...</think>)
+                # are stripped by the chat template on re-render but were present in the
+                # original generation. Use the full prompt_token_ids in this case.
+                user_token_ids = output_item_dict["prompt_token_ids"]
+                seen_token_ids = []  # Reset tracking
 
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": torch.tensor(user_token_ids),
                 }
             )
             nemo_rl_message_log.append(

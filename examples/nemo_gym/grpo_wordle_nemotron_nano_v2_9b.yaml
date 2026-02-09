@@ -14,7 +14,7 @@ grpo:
   max_num_epochs: 999999  # Effectively unlimited, controlled by max_num_steps
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
-  max_rollout_turns: 1  # Wordle is 1 turn but allows up to 6 tool-calling steps
+  max_rollout_turns: 6  # Wordle is 1 turn but allows up to 6 tool-calling steps
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -247,8 +247,11 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
+          # Disable reasoning!
           uses_reasoning_parser: false
-          extra_body: {}
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
 
 logger:
   log_dir: "logs/grpo-wordle-nemotron-nano-v2-9b"
