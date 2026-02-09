@@ -8,7 +8,7 @@ policy:
   model_name: openai/gpt-oss-20b
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
-  megatron_recipe: megatron.bridge.recipes.openai.gptoss.gptoss_20b_pretrain_config
+  megatron_recipe: megatron.bridge.recipes.openai.gpt_oss.gpt_oss_20b_pretrain_config
   megatron_cfg:
     enabled: true
     expert_model_parallel_size: 8

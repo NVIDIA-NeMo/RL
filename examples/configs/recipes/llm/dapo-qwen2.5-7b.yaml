@@ -34,6 +34,7 @@ policy:
   dtensor_cfg:
     _v2: false
     context_parallel_size: 4
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_7b_finetune_config
   megatron_cfg:
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2

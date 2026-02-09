@@ -7,8 +7,18 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
-  megatron_recipe: megatron.bridge.recipes.qwen.qwen2.qwen2_5_vl_3b_pretrain_config
+  megatron_cfg:
+    enabled: true
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_iters: 50
+      lr_warmup_init: 5.0e-08
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
 logger:
   wandb:
     name: vlm-grpo-3b-megatron

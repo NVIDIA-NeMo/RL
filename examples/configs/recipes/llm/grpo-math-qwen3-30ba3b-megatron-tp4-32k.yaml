@@ -20,7 +20,7 @@ policy:
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null
-  megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_30b_pretrain_config
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3_moe.qwen3_30b_a3b_finetune_config
   megatron_cfg:
     enabled: true
     converter_type: LlamaForCausalLM

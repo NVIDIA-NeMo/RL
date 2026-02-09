@@ -1,5 +1,7 @@
 defaults: ./grpo-qwen2.5-7b-instruct-4n8g-megatron.yaml
 policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 1
   make_sequence_length_divisible_by: 2
   generation:
     vllm_cfg:

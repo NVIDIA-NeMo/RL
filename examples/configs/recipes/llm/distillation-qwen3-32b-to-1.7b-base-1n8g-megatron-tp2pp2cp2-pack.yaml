@@ -31,6 +31,7 @@ teacher:
     enabled: false
   sequence_packing:
     enabled: true
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3.qwen3_32b_pretrain_config
   megatron_cfg:
     enabled: true
     tensor_model_parallel_size: 4

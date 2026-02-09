@@ -20,7 +20,7 @@ policy:
     algorithm: modified_ffd
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
-  megatron_recipe: megatron.bridge.recipes.nvidia.moonlight.moonlight_16b_a3b_pretrain_config
+  megatron_recipe: megatron.bridge.recipes.moonlight.moonlight_16b_pretrain_config
   megatron_cfg:
     enabled: true
     expert_model_parallel_size: 4
