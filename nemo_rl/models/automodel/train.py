@@ -306,7 +306,6 @@ def forward_with_post_processing_fn(
             input_lengths=data_dict["input_lengths"],
             original_batch_size=processed_mb.original_batch_size,
             original_seq_len=processed_mb.original_seq_len,
-            enable_seq_packing=post_processing_fn.enable_seq_packing,
             sequence_dim=sequence_dim,
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
@@ -457,6 +456,7 @@ class LossPostProcessor:
         tp_mesh: Any,
         cp_size: int,
         dp_size: int,
+        enable_seq_packing: bool = False,
     ):
         """Initialize LossPostProcessor.
 
@@ -468,6 +468,7 @@ class LossPostProcessor:
             tp_mesh: Tensor parallel mesh
             cp_size: Context parallel size
             dp_size: Data parallel size
+            enable_seq_packing: Whether sequence packing is enabled
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -476,6 +477,7 @@ class LossPostProcessor:
         self.tp_mesh = tp_mesh
         self.cp_size = cp_size
         self.dp_size = dp_size
+        self.enable_seq_packing = enable_seq_packing
 
     def __call__(
         self,
@@ -509,7 +511,7 @@ class LossPostProcessor:
             )
 
         # Wrap loss function for sequence packing if needed
-        if processed_inputs.has_flash_attention:
+        if self.enable_seq_packing:
             loss_fn_ = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
@@ -565,7 +567,6 @@ class LogprobsPostProcessor:
         input_lengths: torch.Tensor,
         original_batch_size: int,
         original_seq_len: int,
-        enable_seq_packing: bool,
         sequence_dim: int = 1,
     ) -> torch.Tensor:
         """Compute token log probabilities from logits.
@@ -576,7 +577,6 @@ class LogprobsPostProcessor:
             input_lengths: Sequence lengths
             original_batch_size: Original batch size before packing
             original_seq_len: Original sequence length before packing
-            enable_seq_packing: Whether sequence packing is enabled
             sequence_dim: Sequence dimension
 
         Returns:
@@ -631,7 +631,7 @@ class LogprobsPostProcessor:
         )
 
         # Handle sequence packing unpacking or mask application
-        if enable_seq_packing:
+        if self.enable_seq_packing:
             unpacked_logprobs = torch.zeros(
                 (original_batch_size, original_seq_len),
                 dtype=token_logprobs.dtype,
@@ -750,7 +750,6 @@ class TopkLogitsPostProcessor:
         input_lengths: torch.Tensor,
         original_batch_size: int,
         original_seq_len: int,
-        enable_seq_packing: bool,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute top-k logits and indices from model outputs.
@@ -761,7 +760,6 @@ class TopkLogitsPostProcessor:
             input_lengths: Sequence lengths
             original_batch_size: Original batch size before packing
             original_seq_len: Original sequence length before packing
-            enable_seq_packing: Whether sequence packing is enabled
             sequence_dim: Sequence dimension
 
         Returns:
@@ -817,7 +815,7 @@ class TopkLogitsPostProcessor:
                 vals, idx = torch.topk(full_logits, k=self.k, dim=-1)
 
         # Handle sequence packing unpacking
-        if enable_seq_packing:
+        if self.enable_seq_packing:
             # Unpack top-k results from packed format back to original batch format
             # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
             # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
