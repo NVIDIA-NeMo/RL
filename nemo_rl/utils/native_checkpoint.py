@@ -247,6 +247,10 @@ def convert_dcp_to_hf(
         if os.path.exists(model_metadata_path):
             dcp_ckpt_path = model_subdir
             print(f"Using dcp_ckpt_path of Dtensor V2: {model_subdir}")
+        else:
+            raise FileNotFoundError(
+                f"No metadata file found in {dcp_ckpt_path}(Dtensor V1 ckpt path) or {model_subdir}(Dtensor V2 ckpt path)."
+            )
     else:
         print(f"Using dcp_ckpt_path of Dtensor V1: {dcp_ckpt_path}")
 
