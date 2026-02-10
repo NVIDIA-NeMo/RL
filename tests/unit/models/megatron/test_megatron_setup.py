@@ -920,6 +920,7 @@ class TestHandleModelImport:
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.initialize_megatron")
     @patch("nemo_rl.models.megatron.setup.set_jit_fusion_options")
@@ -946,6 +947,7 @@ class TestSetupModelAndOptimizer:
         mock_set_jit,
         mock_init_megatron,
         mock_global_state,
+        mock_pg_collection,
     ):
         """Test setup_model_and_optimizer with MoE router freezing."""
         from nemo_rl.models.megatron.setup import setup_model_and_optimizer
