@@ -339,6 +339,7 @@ class TestLossPostProcessor:
             tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
+            enable_seq_packing=True,
         )
 
         batch_size = 1
@@ -461,7 +462,6 @@ class TestLogprobsPostProcessor:
             input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
-            enable_seq_packing=False,
         )
 
         assert result.shape == (batch_size, seq_len)
@@ -503,7 +503,6 @@ class TestLogprobsPostProcessor:
             input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
-            enable_seq_packing=False,
         )
 
         assert result.shape == (batch_size, seq_len)
@@ -549,7 +548,6 @@ class TestTopkLogitsPostProcessor:
             input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
-            enable_seq_packing=False,
         )
 
         assert vals.shape == (batch_size, seq_len, k)
@@ -1720,7 +1718,6 @@ class TestLogprobsPostProcessorSeqPacking:
             input_lengths=input_lengths,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
-            enable_seq_packing=True,
         )
 
         # Result should be unpacked to original shape
@@ -1736,7 +1733,6 @@ class TestLogprobsPostProcessorSeqPacking:
             cp_mesh=mock_cp_mesh,
             tp_mesh=mock_tp_mesh,
             cp_size=1,
-            enable_seq_packing=False,
         )
 
         batch_size = 4
@@ -1765,7 +1761,6 @@ class TestLogprobsPostProcessorSeqPacking:
             input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
-            enable_seq_packing=False,
         )
 
         # Verify result shape
@@ -1830,7 +1825,6 @@ class TestTopkLogitsPostProcessorSeqPacking:
             input_lengths=input_lengths,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
-            enable_seq_packing=True,
         )
 
         # Result should be unpacked to original shape
