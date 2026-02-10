@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -63,9 +62,10 @@ class TensorboardConfig(TypedDict):
 
 
 class MLflowConfig(TypedDict):
-    experiment_name: str
-    run_name: str
-    tracking_uri: NotRequired[str]
+    experiment_name: NotRequired[str | None]
+    run_id: NotRequired[str | None]
+    run_name: NotRequired[str | None]
+    tracking_uri: NotRequired[str | None]
     artifact_location: NotRequired[str | None]
 
 
@@ -772,26 +772,50 @@ class MLflowLogger(LoggerInterface):
             cfg: MLflow configuration
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        tracking_uri = cfg.get("tracking_uri")
-        if tracking_uri:
+        tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+        if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 
-        experiment_name = cfg["experiment_name"]
-        experiment = mlflow.get_experiment_by_name(experiment_name)
-        if experiment is None:
-            mlflow.create_experiment(
-                name=experiment_name,
-                **{"artifact_location": cfg.get("artifact_location", log_dir)}
-                if "artifact_location" in cfg or log_dir
-                else {},
-            )
-        else:
-            mlflow.set_experiment(experiment_name)
+        run_id = cfg.get("run_id") or os.getenv("MLFLOW_RUN_ID")
+        experiment_name = cfg.get("experiment_name") or os.getenv(
+            "MLFLOW_EXPERIMENT_NAME"
+        )
+        run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
 
-        # Start run
-        run_name = cfg["run_name"]
-        run_kwargs = {"run_name": run_name}
-        self.run = mlflow.start_run(**run_kwargs)
+        run = mlflow.active_run()
+
+        # If run_id is provided, try to use it directly
+        if run_id:
+            # If there is an active run but it's not the one we want, end it
+            if run and run.info.run_id != run_id:
+                mlflow.end_run()
+                run = None
+
+            # Start/resume the specified run
+            if run is None:
+                run = mlflow.start_run(run_id=run_id)
+
+        # If no run_id provided, fall back to experiment name logic
+        else:
+            # End any existing active run to start fresh or ensure correct context
+            if run:
+                mlflow.end_run()
+
+            if experiment_name is not None:
+                experiment = mlflow.get_experiment_by_name(experiment_name)
+                # if name is set but experiment is not found, create it
+                if experiment is None:
+                    mlflow.create_experiment(
+                        name=experiment_name,
+                        artifact_location=cfg.get("artifact_location") or log_dir,
+                    )
+                # set the experiment context manager
+                mlflow.set_experiment(experiment_name)
+            # Start a new run
+            run = mlflow.start_run(run_name=run_name)
+
+        self.run = run
+        self.run_id = run.info.run_id
         print(
             f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}"
         )
@@ -812,10 +836,14 @@ class MLflowLogger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional step metric name (ignored in MLflow)
         """
-        for name, value in metrics.items():
+        metrics_to_log = {}
+        flattened_metrics = flatten_dict(metrics)
+        for name, value in flattened_metrics.items():
             if prefix:
                 name = f"{prefix}/{name}"
-            mlflow.log_metric(name, value, step=step)
+            metrics_to_log[name] = value
+
+        mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to MLflow.
@@ -824,7 +852,7 @@ class MLflowLogger(LoggerInterface):
             params: Dictionary of hyperparameters to log
         """
         # MLflow does not support nested dicts
-        mlflow.log_params(flatten_dict(params))
+        mlflow.log_params(flatten_dict(params), run_id=self.run_id)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to MLflow.
@@ -834,9 +862,10 @@ class MLflowLogger(LoggerInterface):
             step: Global step value
             name: Name of the plot
         """
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_file:
-            figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
-            mlflow.log_artifact(tmp_file.name, f"plots/{name}")
+        # Use bbox_inches="tight" to remove extra whitespace/padding around the plot
+        mlflow.log_figure(
+            figure, f"plots/{name}.png", save_kwargs={"bbox_inches": "tight"}
+        )
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to MLflow."""

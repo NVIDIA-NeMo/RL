@@ -60,7 +60,7 @@ class AllTaskProcessedDataset:
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
-        # TODO: will be removed once preference dataset is refactored
+        # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.task_data_preprocessors = task_data_preprocessors

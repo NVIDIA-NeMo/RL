@@ -30,11 +30,12 @@ from nemo_rl.data.datasets import (
     update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
-OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
 
 
 def parse_args():
@@ -159,6 +160,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 def main(is_vlm: bool = False):
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:

@@ -27,11 +27,13 @@ class ResponseDataset(RawDataset):
         input_key: str,     # The input prompt/context
         output_key: str,    # The output response/answer
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
     Args:
         data_path: Path to the dataset JSON file
         input_key: Key for the input text, default is "input"
         output_key: Key for the output text, default is "output"
+        subset: Optional subset name for the dataset, used for HuggingFace datasets
         split: Optional split name for the dataset, used for HuggingFace datasets
         split_validation_size: Size of the validation data, default is 0
         seed: Seed for train/validation split when split_validation_size > 0, default is 42
@@ -42,6 +44,7 @@ class ResponseDataset(RawDataset):
         data_path: str,
         input_key: str = "input",
         output_key: str = "output",
+        subset: Optional[str] = None,
         split: Optional[str] = None,
         split_validation_size: float = 0,
         seed: int = 42,
@@ -49,10 +52,13 @@ class ResponseDataset(RawDataset):
     ):
         self.input_key = input_key
         self.output_key = output_key
-        self.task_name = data_path.split("/")[-1].split(".")[0]
+
+        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if self.task_name[0] == "-":
+            self.task_name = self.task_name[1:]
 
         # load from local or huggingface
-        self.dataset = load_dataset_from_path(data_path, split)
+        self.dataset = load_dataset_from_path(data_path, subset, split)
 
         # format the dataset
         if "messages" not in self.dataset.column_names:

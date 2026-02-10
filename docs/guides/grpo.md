@@ -38,6 +38,25 @@ To support this, we need to know:
 
 #### Dataset
 
+GRPO datasets in NeMo RL are encapsulated using classes. Each GRPO data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+GRPO datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/deepscaler.py](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) has an example:
+
+**Note:** The `task_name` field is required in each formatted example.
+
+```python
+def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "messages": [
+            {"role": "user", "content": data["problem"]},
+            {"role": "assistant", "content": data["answer"]},
+        ],
+        "task_name": self.task_name,
+    }
+```
+
 By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.). You can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
@@ -51,6 +70,7 @@ data:
     # this dataset will override input_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     input_key: question
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
     split_validation_size: 0.05  # use 5% of the training data as validation data
     seed: 42  # seed for train/validation split when split_validation_size > 0
@@ -68,11 +88,20 @@ data:
     env_name: "math"
 ```
 
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "input": "Hello",     // <input_key>: <input_content>
+  "output": "Hi there!" // <output_key>: <output_content>
+}
+```
+
 We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
 ```yaml
 data:
   _override_: true # override the data config instead of merging with it
-  # other data settings, see `examples/configs/sft.yaml` for more details
+  # other data settings, see `examples/configs/grpo_math_1B.yaml` for more details
   ...
   # dataset settings
   train:
@@ -421,6 +450,16 @@ We use this to track if our models are experiencing entropy collapse too quickly
 
 
 
+
+## LoRA Configuration
+
+### DTensor Backend
+
+GRPO supports LoRA on the NeMoRL DTensor backend. The LoRA settings live under `policy.dtensor_cfg.lora_cfg`, and the fields follow the SFT LoRA configuration. For DTensor parameter details, see [SFT LoRA: DTensor Configuration Parameters](./sft.md#dtensor-configuration-parameters). To enable LoRA, set `policy.dtensor_cfg.lora_cfg.enabled=true`, then configure target modules, rank, alpha, and dropout as needed.
+
+Our DTensor LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+
+We already provide a DTensor-based Nano v3 GRPO LoRA recipe. See [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) for an end-to-end example.
 
 ## Evaluate the Trained Model
 
