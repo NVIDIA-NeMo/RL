@@ -26,7 +26,6 @@ from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
-    from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -162,47 +161,57 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        cu_seqlens_padded: Optional[Tensor] = None,
-        unpacked_seqlen: Optional[int] = None,
-        input_ids: Optional[Tensor] = None,
-        fuse_lp_and_train: bool = False,
+        use_curr_logprobs_as_prev_logprobs: bool = False,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
-        if fuse_lp_and_train:
-            if cu_seqlens_padded is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-                    next_token_logits,
-                    input_ids,
-                    cu_seqlens_padded,
-                    unpacked_seqlen,
-                    vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                    vocab_end_index=(vocab_parallel_rank + 1)
-                    * next_token_logits.shape[-1],
-                    group=vocab_parallel_group,
-                    inference_only=True,
-                    cp_group=context_parallel_group,
-                )
-            else:
-                token_logprobs = from_parallel_logits_to_logprobs(
-                    next_token_logits,
-                    input_ids,
-                    vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                    vocab_end_index=(vocab_parallel_rank + 1)
-                    * next_token_logits.shape[-1],
-                    tp_group=vocab_parallel_group,
-                    inference_only=True,
-                )
-            prev_logprobs = token_logprobs
-
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        if not fuse_lp_and_train:
-            prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
+
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            curr_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+                next_token_logits, data["input_ids"], seq_index=seq_index
+            )
+        else:
+            next_token_logits_wo_last = next_token_logits[
+                :, :-1
+            ]  # Remove last position's logits
+            next_token_logprobs = torch.nn.functional.log_softmax(
+                next_token_logits_wo_last, dim=-1
+            )
+            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            curr_logprobs = next_token_logprobs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+
+        if use_curr_logprobs_as_prev_logprobs:
+            assert "prev_logprobs" not in data, (
+                "prev_logprobs should not be in data when use_curr_logprobs_as_prev_logprobs is True"
+            )
+            prev_logprobs = curr_logprobs.detach()
+        else:
+            prev_logprobs = data["prev_logprobs"][:, 1:]
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -269,39 +278,6 @@ class ClippedPGLossFn(LossFunction):
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
-
-        next_token_logits = next_token_logits.to(torch.float32)
-
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
-        else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -526,7 +502,6 @@ class NLLLoss(LossFunction):
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
-        **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
@@ -920,10 +895,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        cu_seqlens_padded: Optional[Tensor] = None,
-        unpacked_seqlen: Optional[int] = None,
-        input_ids: Optional[Tensor] = None,
-        fuse_lp_and_train: bool = False,
+        use_curr_logprobs_as_prev_logprobs: bool = False,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -975,10 +947,7 @@ class SequencePackingLossWrapper:
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
-                cu_seqlens_padded=cu_seqlens_padded,
-                unpacked_seqlen=unpacked_seqlen,
-                input_ids=input_ids,
-                fuse_lp_and_train=fuse_lp_and_train,
+                use_curr_logprobs_as_prev_logprobs=use_curr_logprobs_as_prev_logprobs,
             )
             loss_accum += loss
             for k, v in metrics.items():

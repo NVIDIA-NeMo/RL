@@ -1519,7 +1519,15 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    if not master_config["policy"].get("fuse_lp_and_train", False):
+                    rollout_global_batch_size = (
+                        master_config["grpo"]["num_generations_per_prompt"]
+                        * master_config["grpo"]["num_prompts_per_step"]
+                    )
+                    use_curr_logprobs_as_prev_logprobs = (
+                        master_config["policy"]["train_global_batch_size"]
+                        == rollout_global_batch_size
+                    )
+                    if not use_curr_logprobs_as_prev_logprobs:
                         # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
                         logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                             {
