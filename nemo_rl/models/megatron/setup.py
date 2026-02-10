@@ -372,13 +372,13 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
         "pipeline_model_parallel_size"
     ]
-    model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
-        "num_layers_in_first_pipeline_stage"
-    ]
-    model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"][
-        "num_layers_in_last_pipeline_stage"
-    ]
-    model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
+    model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"].get(
+        "num_layers_in_first_pipeline_stage", None
+    )
+    model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"].get(
+        "num_layers_in_last_pipeline_stage", None
+    )
+    model_cfg.sequence_parallel = config["megatron_cfg"].get("sequence_parallel", False)
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
@@ -389,41 +389,49 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
-    model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
-        "expert_tensor_parallel_size"
-    ]
-    model_cfg.expert_model_parallel_size = config["megatron_cfg"][
-        "expert_model_parallel_size"
-    ]
+    megatron_cfg = config["megatron_cfg"]
+    model_cfg.expert_tensor_parallel_size = megatron_cfg.get(
+        "expert_tensor_parallel_size", 1
+    )
+    model_cfg.expert_model_parallel_size = megatron_cfg.get(
+        "expert_model_parallel_size", 1
+    )
 
     # MoE stability settings
 
     # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
     # especially when using many experts.
-    model_cfg.moe_router_dtype = config["megatron_cfg"]["moe_router_dtype"]
+    if "moe_router_dtype" in megatron_cfg:
+        model_cfg.moe_router_dtype = megatron_cfg["moe_router_dtype"]
 
     # The below two configs (and "freeze_moe_router") are used to stabilize moe training
     # by preventing updates to the moe router. We found that this is helpful in reducing
     # logprob error during training.
 
     # Set this to "none" to disable load balancing loss.
-    model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
-        "moe_router_load_balancing_type"
-    ]
+    if "moe_router_load_balancing_type" in megatron_cfg:
+        model_cfg.moe_router_load_balancing_type = megatron_cfg[
+            "moe_router_load_balancing_type"
+        ]
     # Set this to 0.0 to disable updates to the moe router expert bias
-    model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
-        "moe_router_bias_update_rate"
-    ]
+    if "moe_router_bias_update_rate" in megatron_cfg:
+        model_cfg.moe_router_bias_update_rate = megatron_cfg[
+            "moe_router_bias_update_rate"
+        ]
 
-    model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
-    model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
-        "moe_token_dispatcher_type"
-    ]
-    model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
-        "moe_shared_expert_overlap"
-    ]
+    if "moe_enable_deepep" in megatron_cfg:
+        model_cfg.moe_enable_deepep = megatron_cfg["moe_enable_deepep"]
+    if "moe_token_dispatcher_type" in megatron_cfg:
+        model_cfg.moe_token_dispatcher_type = megatron_cfg[
+            "moe_token_dispatcher_type"
+        ]
+    if "moe_shared_expert_overlap" in megatron_cfg:
+        model_cfg.moe_shared_expert_overlap = megatron_cfg[
+            "moe_shared_expert_overlap"
+        ]
 
-    model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+    if "moe_permute_fusion" in megatron_cfg:
+        model_cfg.moe_permute_fusion = megatron_cfg["moe_permute_fusion"]
 
 
 def _apply_precision_config(
@@ -454,8 +462,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
+    megatron_cfg = config["megatron_cfg"]
+
     # Activation checkpointing
-    if config["megatron_cfg"]["activation_checkpointing"]:
+    if megatron_cfg.get("activation_checkpointing", False):
         model_cfg.recompute_granularity = "full"
         model_cfg.recompute_method = "uniform"
         model_cfg.recompute_num_layers = 1
@@ -470,8 +480,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
     # Fusion settings
-    model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
-    model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    if "apply_rope_fusion" in megatron_cfg:
+        model_cfg.apply_rope_fusion = megatron_cfg["apply_rope_fusion"]
+    if "bias_activation_fusion" in megatron_cfg:
+        model_cfg.bias_activation_fusion = megatron_cfg["bias_activation_fusion"]
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -741,7 +753,7 @@ def setup_model_and_optimizer(
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 
     mixed_precision_wrapper = Float16Module
-    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
+    if policy_cfg["megatron_cfg"].get("freeze_moe_router", False):
         if use_peft:
             raise ValueError(
                 "Freezing the MOE router is not currently supported when using PEFT"
@@ -1008,10 +1020,8 @@ def finalize_megatron_setup(
     )
 
     should_disable_forward_pre_hook = (
-        config["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
-        and config["megatron_cfg"]["distributed_data_parallel_config"][
-            "overlap_param_gather"
-        ]
+        megatron_cfg.optimizer.use_distributed_optimizer
+        and megatron_cfg.ddp.overlap_param_gather
     )
 
     return megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size
