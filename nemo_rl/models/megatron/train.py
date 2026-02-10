@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 from megatron.core.models.gpt import GPTModel
@@ -543,3 +544,42 @@ class TopkLogitsPostProcessor:
                 }
 
         return processor_fn_inner
+
+
+def aggregate_training_statistics(
+    all_mb_metrics: List[Dict[str, Any]],
+    losses: List[float],
+    data_parallel_group: torch.distributed.ProcessGroup,
+) -> Tuple[Dict[str, List[Any]], torch.Tensor]:
+    """Aggregate training statistics across microbatches and data-parallel ranks.
+
+    Computes a global loss by all-reducing per-gradient-buffer losses across the
+    data-parallel group, then collects per-microbatch metrics into lists keyed by
+    metric name.
+
+    Args:
+        all_mb_metrics: List of metric dicts from each microbatch.
+        losses: List of per-gradient-buffer scalar losses on this rank.
+        data_parallel_group: The data-parallel process group for all-reduce.
+
+    Returns:
+        Tuple of:
+            - mb_metrics: Dict mapping metric names to lists of values across microbatches.
+            - global_loss: Tensor of losses summed across all data-parallel ranks.
+    """
+    # Compute global loss across all data-parallel ranks
+    with torch.no_grad():
+        global_loss = torch.tensor(losses, device="cuda")
+        torch.distributed.all_reduce(
+            global_loss,
+            op=torch.distributed.ReduceOp.SUM,
+            group=data_parallel_group,
+        )
+
+    # Aggregate metrics across all microbatches
+    mb_metrics: Dict[str, List[Any]] = defaultdict(list)
+    for m in all_mb_metrics:
+        for k, v in m.items():
+            mb_metrics[k].append(v)
+
+    return dict(mb_metrics), global_loss

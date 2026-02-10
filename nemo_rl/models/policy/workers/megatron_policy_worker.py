@@ -82,6 +82,7 @@ from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
     TopkLogitsPostProcessor,
+    aggregate_training_statistics,
     megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -416,25 +417,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
-        mb_metrics = defaultdict(list)
-        for m in all_mb_metrics:
-            for k, v in m.items():
-                mb_metrics[k].append(v)
-
-        with torch.no_grad():
-            global_loss = torch.tensor(losses, device="cuda")
-            torch.distributed.all_reduce(
-                global_loss,
-                op=torch.distributed.ReduceOp.SUM,
-                group=parallel_state.get_data_parallel_group(),
-            )
+        mb_metrics, global_loss = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=losses,
+            data_parallel_group=parallel_state.get_data_parallel_group(),
+        )
 
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
-            "all_mb_metrics": dict(mb_metrics),
+            "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
         # Collect MoE aux metrics averaged across microbatches

@@ -1123,3 +1123,120 @@ class TestTopkLogitsPostProcessor:
         # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
         assert result["topk_logits"].shape == (2, unpacked_seqlen, k)
         assert result["topk_indices"].shape == (2, unpacked_seqlen, k)
+
+
+class TestAggregateTrainingStatistics:
+    """Tests for aggregate_training_statistics function."""
+
+    @patch("torch.distributed.all_reduce")
+    def test_aggregates_metrics_across_microbatches(self, mock_all_reduce):
+        """Test that per-microbatch metrics are collected into lists by key."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        all_mb_metrics = [
+            {"loss": 0.5, "lr": 1e-4},
+            {"loss": 0.3, "lr": 1e-4},
+            {"loss": 0.2, "lr": 1e-4},
+        ]
+
+        mock_dp_group = MagicMock()
+
+        mb_metrics, _ = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=[1.0],
+            data_parallel_group=mock_dp_group,
+        )
+
+        assert mb_metrics["loss"] == [0.5, 0.3, 0.2]
+        assert mb_metrics["lr"] == [1e-4, 1e-4, 1e-4]
+        assert len(mb_metrics) == 2
+
+    @patch("torch.distributed.all_reduce")
+    def test_returns_plain_dict(self, mock_all_reduce):
+        """Test that the returned mb_metrics is a plain dict, not defaultdict."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        mb_metrics, _ = aggregate_training_statistics(
+            all_mb_metrics=[{"loss": 0.5}],
+            losses=[1.0],
+            data_parallel_group=MagicMock(),
+        )
+
+        assert type(mb_metrics) is dict
+
+    @patch("torch.distributed.all_reduce")
+    def test_global_loss_tensor_from_losses(self, mock_all_reduce):
+        """Test that losses list is converted to a CUDA tensor for all-reduce."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        mock_dp_group = MagicMock()
+
+        _, global_loss = aggregate_training_statistics(
+            all_mb_metrics=[],
+            losses=[0.5, 0.3, 0.2],
+            data_parallel_group=mock_dp_group,
+        )
+
+        # Verify all_reduce was called with correct args
+        mock_all_reduce.assert_called_once()
+        call_args = mock_all_reduce.call_args
+        assert call_args[1]["op"] == torch.distributed.ReduceOp.SUM
+        assert call_args[1]["group"] is mock_dp_group
+
+        # Verify tensor shape matches losses list
+        reduced_tensor = call_args[0][0]
+        assert reduced_tensor.shape == (3,)
+
+    @patch("torch.distributed.all_reduce")
+    def test_empty_metrics(self, mock_all_reduce):
+        """Test with empty microbatch metrics list."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        mb_metrics, global_loss = aggregate_training_statistics(
+            all_mb_metrics=[],
+            losses=[1.0],
+            data_parallel_group=MagicMock(),
+        )
+
+        assert mb_metrics == {}
+        mock_all_reduce.assert_called_once()
+
+    @patch("torch.distributed.all_reduce")
+    def test_handles_heterogeneous_metric_keys(self, mock_all_reduce):
+        """Test that microbatches with different metric keys are handled correctly."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        all_mb_metrics = [
+            {"loss": 0.5, "lr": 1e-4},
+            {"loss": 0.3, "global_valid_seqs": 8},
+        ]
+
+        mb_metrics, _ = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=[0.8],
+            data_parallel_group=MagicMock(),
+        )
+
+        assert mb_metrics["loss"] == [0.5, 0.3]
+        assert mb_metrics["lr"] == [1e-4]
+        assert mb_metrics["global_valid_seqs"] == [8]
+
+    @patch("torch.distributed.all_reduce")
+    def test_no_grad_context(self, mock_all_reduce):
+        """Test that all-reduce runs under torch.no_grad context."""
+        from nemo_rl.models.megatron.train import aggregate_training_statistics
+
+        grad_enabled_during_all_reduce = []
+
+        def capture_grad_state(*args, **kwargs):
+            grad_enabled_during_all_reduce.append(torch.is_grad_enabled())
+
+        mock_all_reduce.side_effect = capture_grad_state
+
+        aggregate_training_statistics(
+            all_mb_metrics=[],
+            losses=[1.0],
+            data_parallel_group=MagicMock(),
+        )
+
+        assert grad_enabled_during_all_reduce == [False]
