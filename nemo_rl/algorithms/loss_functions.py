@@ -20,13 +20,6 @@ import torch.distributed
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
-    ChunkedDistributedGatherLogprob,
-    _get_tokens_on_this_cp_rank,
-    allgather_cp_sharded_tensor,
-    gather_logits_at_global_indices,
-)
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -932,165 +925,14 @@ class DistillationLossFn(LossFunction):
 
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
+        student_topk_logprobs: torch.Tensor,
+        teacher_topk_logprobs: torch.Tensor,
+        H_all: torch.Tensor | None,
         data: DistillationLossDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
-        # Basic shapes
-        input_ids = data["input_ids"]
-        batch_size = input_ids.shape[0]
-
-        # CP support: get CP group and size
-        cp_group = context_parallel_group
-        cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
-
-        # Ensure float32 for stability (match other losses)
-        next_token_logits = next_token_logits.to(torch.float32)
-        per_token_kl = None
-        # Preferred truncated-KL path: teacher provides top-k support per position
-        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
-        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
-
-        if teacher_topk_indices.shape[-1] <= 0:
-            raise ValueError(
-                f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
-                "topk=0 is not supported as it would result in empty tensor operations."
-            )
-
-        # Determine processing path and setup variables
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            V_local = int(next_token_logits.shape[-1])
-            vocab_start_index = vocab_parallel_rank * V_local
-            vocab_end_index = (vocab_parallel_rank + 1) * V_local
-            parallel_group = vocab_parallel_group
-            logits_tensor = next_token_logits
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            device_mesh = next_token_logits.device_mesh
-            tp_group = device_mesh.get_group("tp")
-            tp_rank = tp_group.rank()
-            local_student_logits = next_token_logits.to_local()
-            V_local = int(local_student_logits.shape[-1])
-            vocab_start_index = tp_rank * V_local
-            vocab_end_index = (tp_rank + 1) * V_local
-            parallel_group = tp_group
-            logits_tensor = local_student_logits
-            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
-            # For DTensor, derive CP group/size from the device mesh to ensure CP-aware alignment
-            if (
-                device_mesh.mesh_dim_names is not None
-                and "cp" in device_mesh.mesh_dim_names
-            ):
-                cp_group = device_mesh.get_group("cp")
-                cp_size = cp_group.size()
-            else:
-                cp_group = None
-                cp_size = 1
-        else:
-            parallel_group = None
-            logits_tensor = next_token_logits
-
-        # Process based on zero_outside_topk setting
-        if self.zero_outside_topk and parallel_group is not None:
-            # Distributed processing with chunking
-            indices_local = teacher_topk_indices
-            pad_len = 0
-            if cp_size > 1:
-                pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
-                if pad_len > 0:
-                    indices_local = torch.nn.functional.pad(
-                        indices_local, (0, 0, 0, pad_len), value=0
-                    )
-                cp_rank = torch.distributed.get_rank(cp_group)
-                indices_local = _get_tokens_on_this_cp_rank(
-                    indices_local, cp_rank, cp_size, seq_dim=1
-                )
-
-            S_local = int(logits_tensor.shape[1])
-            chunk_size = max(1, min(S_local, 1024))
-            student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
-                logits_tensor,
-                indices_local,
-                vocab_start_index,
-                vocab_end_index,
-                chunk_size,
-                parallel_group,
-                False,
-            )
-
-            if self.kl_type != "forward":
-                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
-                    logits_tensor,
-                    chunk_size,
-                    parallel_group,
-                    False,
-                )
-
-            if cp_size > 1:
-                student_topk_logprobs = allgather_cp_sharded_tensor(
-                    student_topk_logprobs, cp_group, seq_dim=1
-                )
-                if self.kl_type != "forward":
-                    H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
-                if pad_len > 0:
-                    student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
-                        H_all = H_all[:, :-pad_len]
-        elif self.zero_outside_topk:
-            # Non-distributed processing
-            student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
-            student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
-            )
-            if self.kl_type != "forward":
-                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
-        else:
-            # Gather logits at global indices
-            if (parallel_group is not None) or (cp_size > 1):
-                student_topk_logits = gather_logits_at_global_indices(
-                    logits_tensor,
-                    teacher_topk_indices,
-                    tp_group=parallel_group,
-                    cp_group=cp_group,
-                    vocab_start_index=(
-                        vocab_start_index if parallel_group is not None else 0
-                    ),
-                    vocab_end_index=(
-                        vocab_end_index
-                        if parallel_group is not None
-                        else int(logits_tensor.shape[-1])
-                    ),
-                )
-            else:
-                student_topk_logits = logits_tensor.gather(
-                    dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
-                )
-            student_topk_logprobs = torch.nn.functional.log_softmax(
-                student_topk_logits, dim=-1
-            )
-
-        # Move teacher tensors to the same device/dtype as student_topk_logits
-        teacher_topk_logits = teacher_topk_logits.to(
-            student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
-        )
-        teacher_topk_logprobs = torch.nn.functional.log_softmax(
-            teacher_topk_logits, dim=-1
-        )
-
-        # Single point of next-token alignment after TP/CP processing
-        teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
-        student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            # Align H_all with next-token prediction
-            H_all = H_all[:, :-1]
-
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -1143,7 +985,7 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": int(batch_size),
+            "num_valid_samples": data["input_ids"].shape[0],
         }
 
         return kl_loss, metrics
