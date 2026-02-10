@@ -106,11 +106,18 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Check that template grew after adding generation prompt.
-    # Can fail when chat templates strip reasoning tokens (e.g., <think>...</think>)
-    # from the last assistant message, causing it to be dropped entirely.
-    if len(template_token_ids) <= len(template_prefix_token_ids):
-        return template_token_ids
+    # Assert here to prepare for the logic below
+    assert len(template_token_ids) > len(
+        template_prefix_token_ids
+    ), f"""Found possibly non-monotonically increasing trajectory!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
+
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
+"""
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -119,9 +126,17 @@ def _replace_prefix_tokens(
             template_cut_start = pos
             break
 
-    # No EOS found — can happen with models that strip reasoning from prior turns.
-    if template_cut_start < 0:
-        return template_token_ids
+    # This should never be the case, but
+    assert (
+        template_cut_start >= 0
+    ), f"""No EOS token ID found in the chat-templated messages!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
+
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]

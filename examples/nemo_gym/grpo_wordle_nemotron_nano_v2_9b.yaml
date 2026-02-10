@@ -215,6 +215,7 @@ policy:
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: nemotron_json
+        chat_template: nemo_rl/models/generation/vllm/nemotron_chat_template.jinja
     vllm_kwargs:
       compilation_config:
         use_inductor: false
