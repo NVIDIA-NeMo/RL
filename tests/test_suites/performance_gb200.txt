@@ -11,6 +11,14 @@ tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g.sh
 tests/test_suites/llm/performance/grpo-deepseek-v3-32n4g.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-16n4g.sh
 
+## HybridEP (MoE optimization)
+tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-hybridep.sh
+tests/test_suites/llm/performance/grpo-qwen3-235b-16n4g-hybridep.sh
+
+## HybridEP + CUDA Graph
+tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-hybridep-cudagraph.sh
+tests/test_suites/llm/performance/grpo-qwen3-235b-16n4g-hybridep-cudagraph.sh
+
 ## ASYNC 1-off
 tests/test_suites/llm/performance/grpo-llama3.1-8b-instruct-2n4g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-32b-8n4g-async-1off.sh
