@@ -37,6 +37,7 @@ project-includes = [
   "examples/custom_parallel/custom_parallel.py",
   "examples/custom_parallel/llama_nemotron_super_49b_custom_plan.py",
   "nemo_rl/algorithms/__init__.py",
+  "nemo_rl/algorithms/advantage_estimator.py",
   "nemo_rl/algorithms/interfaces.py",
   "nemo_rl/algorithms/reward_functions.py",
   "nemo_rl/algorithms/utils.py",
