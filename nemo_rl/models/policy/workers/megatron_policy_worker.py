@@ -56,7 +56,6 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
