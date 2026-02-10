@@ -40,6 +40,7 @@ echo "Cloning repository..."
 GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" git clone --recursive "$GIT_URL" "$BUILD_DIR"
 cd "$BUILD_DIR"
 git checkout "$GIT_REF"
+git submodule update
 
 PYPROJECT_TOML="$REPO_ROOT/pyproject.toml"
 if [[ ! -f "$PYPROJECT_TOML" ]]; then
