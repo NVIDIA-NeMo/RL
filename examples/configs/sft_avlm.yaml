@@ -1,7 +1,17 @@
 defaults:
   - sft_vlm_3B.yaml
 
+sft:
+  val_batches: 2
+  val_global_batch_size: 8
+
 policy:
+  max_total_sequence_length: 32768
+  train_global_batch_size: 8
+  dtensor_cfg:
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: true
   tokenizer:
     video:
       num_frames: 16
