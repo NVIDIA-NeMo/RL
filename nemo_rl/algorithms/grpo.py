@@ -17,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -1563,7 +1564,10 @@ def grpo_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(
                         train_data,
-                        loss_fn,
+                        partial(
+                            loss_fn,
+                            use_curr_logprobs_as_prev_logprobs=use_curr_logprobs_as_prev_logprobs,
+                        ),
                         timer=timer,
                     )
 
@@ -2538,15 +2542,24 @@ def async_grpo_train(
 
                 print("▶ Computing logprobs...")
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["logprobs"]
+                    rollout_global_batch_size = (
+                        master_config["grpo"]["num_generations_per_prompt"]
+                        * master_config["grpo"]["num_prompts_per_step"]
+                    )
+                    use_curr_logprobs_as_prev_logprobs = (
+                        master_config["policy"]["train_global_batch_size"]
+                        == rollout_global_batch_size
+                    )
+                    if not use_curr_logprobs_as_prev_logprobs:
+                        fprop_logprobs = policy.get_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["logprobs"]
+                        train_data["prev_logprobs"] = fprop_logprobs
                     reference_logprobs = policy.get_reference_policy_logprobs(
                         train_data,
                         timer=timer,
                     )["reference_logprobs"]
-                    train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...")
@@ -2558,7 +2571,10 @@ def async_grpo_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(
                         train_data,
-                        loss_fn,
+                        partial(
+                            loss_fn,
+                            use_curr_logprobs_as_prev_logprobs=use_curr_logprobs_as_prev_logprobs,
+                        ),
                         timer=timer,
                     )
 
