@@ -340,19 +340,23 @@ def register_sequence_packing_loss_wrapper_baseline_actor():
 @pytest.fixture(scope="function")
 def cluster_fixture(request):
     """Create and teardown a virtual cluster for CP/TP tests."""
-    cp_size = int(request.node.callspec.params["cp_size"])
-    tp_size = int(request.node.callspec.params["tp_size"])
+    cp_size, tp_size = request.node.callspec.params["cp_tp"]
     world_size = cp_size * tp_size
-
-    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
-        pytest.skip(
-            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
-        )
 
     if not ray.is_initialized():
         from nemo_rl.distributed.virtual_cluster import init_ray
-
         init_ray()
+
+    # Check available GPUs via Ray cluster resources (works across multi-node),
+    # falling back to local torch.cuda.device_count() if Ray has no GPU info.
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus == 0:
+        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if available_gpus < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {available_gpus}"
+        )
 
     cluster_name = f"test-seq-pack-fusion-cp{cp_size}-tp{tp_size}"
     cluster = RayVirtualCluster(
@@ -362,10 +366,20 @@ def cluster_fixture(request):
     cluster.shutdown()
 
 
-@pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(
+    "cp_tp",
+    [
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+        (2, 4),
+        (4, 2),
+    ],
+    ids=lambda cp_tp: f"cp{cp_tp[0]}_tp{cp_tp[1]}",
+)
 def test_sequence_packing_loss_wrapper_baseline_cp_tp(
-    cluster_fixture, register_sequence_packing_loss_wrapper_baseline_actor, cp_size, tp_size
+    cluster_fixture, register_sequence_packing_loss_wrapper_baseline_actor, cp_tp
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
@@ -374,6 +388,7 @@ def test_sequence_packing_loss_wrapper_baseline_cp_tp(
       - backward gradients w.r.t. vocab-parallel logits
     for different CP and TP configurations.
     """
+    cp_size, tp_size = cp_tp
     cluster = cluster_fixture
     actor_fqn = register_sequence_packing_loss_wrapper_baseline_actor
     world_size = cp_size * tp_size
