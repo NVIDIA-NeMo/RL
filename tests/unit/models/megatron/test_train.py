@@ -60,30 +60,36 @@ class TestModelForward:
         assert torch.equal(result, mock_output)
         mock_model.assert_called_once()
 
-    def test_model_forward_with_temperature_scaling(self):
-        """Test model_forward applies temperature scaling."""
+    def test_model_forward_with_straggler_timer(self):
+        """Test model_forward uses straggler_timer context manager when provided."""
         from nemo_rl.models.megatron.train import model_forward
 
         mock_model = MagicMock()
-        mock_output = torch.ones(2, 10, 100) * 2.0
+        mock_output = torch.randn(1, 10, 100)
         mock_model.return_value = mock_output
 
         mock_data_dict = MagicMock()
         mock_data_dict.get_multimodal_dict.return_value = {}
 
-        cfg = {"generation": {"temperature": 2.0}}
+        mock_timer = MagicMock()
+        mock_ctx = MagicMock()
+        mock_timer.return_value = mock_ctx
 
         result = model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg=cfg,
+            cfg={},
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
             position_ids=torch.tensor([[0, 1, 2]]),
             attention_mask=torch.ones(1, 3),
+            straggler_timer=mock_timer,
         )
 
-        # Temperature scaling divides by 2.0, so 2.0 / 2.0 = 1.0
-        assert torch.allclose(result, torch.ones_like(result))
+        # Verify straggler_timer was called as a context manager
+        mock_timer.assert_called_once()
+        mock_ctx.__enter__.assert_called_once()
+        mock_ctx.__exit__.assert_called_once()
+        assert torch.equal(result, mock_output)
 
     def test_model_forward_with_packed_seq_params(self):
         """Test model_forward passes packed_seq_params to model."""
@@ -157,6 +163,58 @@ class TestModelForward:
 
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["position_ids"] is None
+
+
+class TestApplyTemperatureScaling:
+    """Tests for apply_temperature_scaling function."""
+
+    def test_temperature_scaling_with_generation_config(self):
+        """Test that logits are divided by the configured temperature."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.ones(2, 10, 100) * 4.0
+        cfg = {"generation": {"temperature": 2.0}}
+
+        result = apply_temperature_scaling(logits, cfg)
+
+        # 4.0 / 2.0 = 2.0
+        assert torch.allclose(result, torch.ones_like(result) * 2.0)
+        # Verify in-place: result is the same tensor
+        assert result.data_ptr() == logits.data_ptr()
+
+    def test_temperature_scaling_no_generation_key(self):
+        """Test that logits are unchanged when 'generation' key is absent."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.ones(2, 10, 100) * 3.0
+        cfg = {}
+
+        result = apply_temperature_scaling(logits, cfg)
+
+        assert torch.allclose(result, torch.ones_like(result) * 3.0)
+
+    def test_temperature_scaling_generation_is_none(self):
+        """Test that logits are unchanged when generation config is None."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.ones(2, 10, 100) * 3.0
+        cfg = {"generation": None}
+
+        result = apply_temperature_scaling(logits, cfg)
+
+        assert torch.allclose(result, torch.ones_like(result) * 3.0)
+
+    def test_temperature_scaling_with_temperature_one(self):
+        """Test that temperature=1.0 leaves logits unchanged."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.randn(2, 10, 100)
+        original = logits.clone()
+        cfg = {"generation": {"temperature": 1.0}}
+
+        result = apply_temperature_scaling(logits, cfg)
+
+        assert torch.allclose(result, original)
 
 
 class TestForwardWithPostProcessingFn:
@@ -290,6 +348,227 @@ class TestForwardWithPostProcessingFn:
             )
 
         mock_model_forward.assert_called_once()
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_applies_temperature_scaling_for_loss(
+        self,
+        mock_temp_scaling,
+        mock_model_forward,
+        mock_cp_size,
+        mock_cp_grp,
+        mock_tp_grp,
+        mock_tp_rank,
+    ):
+        """Test that forward_with_post_processing_fn applies temperature scaling for LossPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        output_tensor = torch.randn(2, 10, 100)
+        mock_model_forward.return_value = output_tensor
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "generation": {"temperature": 0.7},
+        }
+        post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
+
+        forward_with_post_processing_fn(
+            data_iterator=iter([processed_mb]),
+            model=MagicMock(),
+            cfg=cfg,
+            post_processing_fn=post_processor,
+        )
+
+        # Verify apply_temperature_scaling was called with the output tensor and cfg
+        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_applies_temperature_scaling_for_logprobs(
+        self, mock_temp_scaling, mock_model_forward
+    ):
+        """Test that forward_with_post_processing_fn applies temperature scaling for LogprobsPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        output_tensor = torch.randn(2, 10, 100)
+        mock_model_forward.return_value = output_tensor
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "generation": {"temperature": 0.5},
+        }
+        post_processor = LogprobsPostProcessor(cfg=cfg)
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                cfg=cfg,
+                post_processing_fn=post_processor,
+            )
+
+        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_applies_temperature_scaling_for_topk(
+        self, mock_temp_scaling, mock_model_forward
+    ):
+        """Test that forward_with_post_processing_fn applies temperature scaling for TopkLogitsPostProcessor."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            TopkLogitsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        output_tensor = torch.randn(2, 10, 100)
+        mock_model_forward.return_value = output_tensor
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"context_parallel_size": 1},
+            "generation": {"temperature": 1.5},
+        }
+        post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                cfg=cfg,
+                post_processing_fn=post_processor,
+            )
+
+        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_does_not_apply_temperature_scaling_for_unknown_type(
+        self, mock_temp_scaling, mock_model_forward
+    ):
+        """Test that temperature scaling is NOT applied for unknown post-processor types (before they raise)."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import forward_with_post_processing_fn
+
+        mock_model_forward.return_value = torch.randn(2, 10, 100)
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+
+        with pytest.raises(TypeError):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                cfg={"generation": {"temperature": 2.0}},
+                post_processing_fn="not_a_processor",
+            )
+
+        mock_temp_scaling.assert_not_called()
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_with_straggler_timer(
+        self, mock_model_forward, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """Test that straggler_timer is passed through to model_forward."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+        mock_model_forward.return_value = torch.randn(2, 10, 100)
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+
+        cfg = {"sequence_packing": {"enabled": False}}
+        post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
+        mock_timer = MagicMock()
+
+        forward_with_post_processing_fn(
+            data_iterator=iter([processed_mb]),
+            model=MagicMock(),
+            cfg=cfg,
+            post_processing_fn=post_processor,
+            straggler_timer=mock_timer,
+        )
+
+        # Verify straggler_timer was passed to model_forward
+        call_kwargs = mock_model_forward.call_args[1]
+        assert call_kwargs["straggler_timer"] is mock_timer
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_unknown_post_processor_raises(self, mock_model_forward):
@@ -714,3 +993,133 @@ class TestTopkLogitsPostProcessor:
             RuntimeError, match="Context Parallelism.*requires sequence packing"
         ):
             wrapped_fn(output_tensor)
+
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
+    def test_topk_cp_with_packing_single_sequence(
+        self, mock_topk, mock_tp_rank, mock_tp_grp, mock_cp_grp, mock_allgather
+    ):
+        """Test TopkLogitsPostProcessor with CP > 1 and packing for a single sequence."""
+        from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        cp_size = 2
+        k = 3
+        seq_len = 8  # Total packed length
+        local_seq_len = seq_len // cp_size  # Each CP rank sees half
+
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"context_parallel_size": cp_size},
+        }
+        processor = TopkLogitsPostProcessor(cfg=cfg, k=k)
+
+        mock_data_dict = MagicMock()
+        mock_data_dict.__getitem__ = MagicMock(
+            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+            if key == "input_ids"
+            else torch.tensor([8])
+        )
+
+        # distributed_vocab_topk returns local (CP-sharded) results
+        mock_topk_vals = torch.randn(1, local_seq_len, k)
+        mock_topk_idx = torch.randint(0, 100, (1, local_seq_len, k))
+        mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
+
+        # allgather returns the full gathered tensor
+        gathered_vals = torch.randn(1, seq_len, k)
+        gathered_idx = torch.randint(0, 100, (1, seq_len, k))
+        mock_allgather.side_effect = [gathered_vals, gathered_idx]
+
+        cu_seqlens_padded = torch.tensor([0, seq_len])
+
+        wrapped_fn = processor(
+            data_dict=mock_data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+
+        output_tensor = torch.randn(1, local_seq_len, 100)
+        loss, result = wrapped_fn(output_tensor)
+
+        # Verify allgather was called for both vals and indices
+        assert mock_allgather.call_count == 2
+        assert "topk_logits" in result
+        assert "topk_indices" in result
+        # Output should be unpacked: (batch_size=1, unpacked_seqlen=8, k=3)
+        assert result["topk_logits"].shape == (1, 8, k)
+        assert result["topk_indices"].shape == (1, 8, k)
+
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
+    def test_topk_cp_with_packing_multiple_sequences(
+        self, mock_topk, mock_tp_rank, mock_tp_grp, mock_cp_grp, mock_allgather
+    ):
+        """Test TopkLogitsPostProcessor with CP > 1, packing, and multiple sequences in batch."""
+        from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        cp_size = 2
+        k = 3
+        # Two sequences packed: seq1 has 4 tokens, seq2 has 6 tokens => total packed = 10
+        seq1_len = 4
+        seq2_len = 6
+        total_packed_len = seq1_len + seq2_len
+        local_packed_len = total_packed_len // cp_size
+        unpacked_seqlen = 6  # Max seq length in batch (for output shape)
+
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"context_parallel_size": cp_size},
+        }
+        processor = TopkLogitsPostProcessor(cfg=cfg, k=k)
+
+        mock_data_dict = MagicMock()
+        mock_data_dict.__getitem__ = MagicMock(
+            side_effect=lambda key: torch.zeros(2, unpacked_seqlen, dtype=torch.long)
+            if key == "input_ids"
+            else torch.tensor([seq1_len, seq2_len])
+        )
+
+        # distributed_vocab_topk returns local (CP-sharded) results
+        mock_topk_vals = torch.randn(1, local_packed_len, k)
+        mock_topk_idx = torch.randint(0, 100, (1, local_packed_len, k))
+        mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
+
+        # allgather is called once per sequence (2 sequences x 2 tensors = 4 calls)
+        def fake_allgather(local_tensor, group, seq_dim):
+            # Simulate gathering: double the seq_dim since cp_size=2
+            return local_tensor.repeat(1, cp_size, 1)
+
+        mock_allgather.side_effect = fake_allgather
+
+        cu_seqlens_padded = torch.tensor([0, seq1_len, total_packed_len])
+
+        wrapped_fn = processor(
+            data_dict=mock_data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+
+        output_tensor = torch.randn(1, local_packed_len, 100)
+        loss, result = wrapped_fn(output_tensor)
+
+        # allgather called 2x per sequence (vals + idx) x 2 sequences = 4 calls
+        assert mock_allgather.call_count == 4
+        assert "topk_logits" in result
+        assert "topk_indices" in result
+        # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
+        assert result["topk_logits"].shape == (2, unpacked_seqlen, k)
+        assert result["topk_indices"].shape == (2, unpacked_seqlen, k)
