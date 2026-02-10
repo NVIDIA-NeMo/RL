@@ -174,7 +174,10 @@ def forward_with_post_processing_fn(
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
-    if isinstance(post_processing_fn, (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor)):
+    if isinstance(
+        post_processing_fn,
+        (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
+    ):
         apply_temperature_scaling(output_tensor, cfg)
 
     # Use type checking to dispatch to the correct post-processing method
