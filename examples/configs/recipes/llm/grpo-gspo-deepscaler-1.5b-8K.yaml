@@ -30,7 +30,11 @@ policy:
     vllm_cfg:
       enforce_eager: true
 data:
-  dataset_name: DeepScaler
+  train:
+    dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
 env:
   math:
     num_workers: 16

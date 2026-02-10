@@ -52,6 +52,7 @@ def create_test_config() -> Dict[str, Any]:
             "val_global_batch_size": 4,
             "val_micro_batch_size": 2,
             "val_at_start": False,
+            "val_at_end": False,
             "seed": 42,
         },
         "checkpointing": {

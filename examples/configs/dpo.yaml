@@ -7,6 +7,7 @@ dpo:
   val_global_batch_size: 8
   val_micro_batch_size: 1
   val_at_start: true
+  val_at_end: false
   seed: 42
 
   reference_policy_kl_penalty: 0.05
@@ -49,7 +50,7 @@ policy:
 
   dtensor_cfg:
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
+      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -58,6 +59,18 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
+    # LoRA (Low-Rank Adaptation) Configuration
+    lora_cfg:
+      enabled: False  # Set to True to enable LoRA fine-tuning
+      target_modules: []  # List of module names to apply LoRA (empty list with match_all_linear=true applies to all linear layers)
+      exclude_modules: []  # List of module names to exclude from LoRA
+      match_all_linear: true  # If True, applies LoRA to all linear layers (overrides target_modules)
+      dim: 8  # LoRA rank (r): lower rank = fewer parameters but less capacity. Typical values: 4, 8, 16, 32, 64
+      alpha: 32  # LoRA scaling factor: effective learning rate multiplier = alpha/dim. Typical values: 16, 32, 64
+      dropout: 0.0  # Dropout probability applied to LoRA layers (0.0 = no dropout)
+      dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
+      lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
+      use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
 
   dynamic_batching:
     enabled: false
@@ -118,6 +131,10 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     
     optimizer:
       optimizer: "adam"
@@ -166,27 +183,49 @@ data:
   shuffle: true
   num_workers: 1
 
-  dataset_name: HelpSteer3
+  # dataset
+  train:
+    dataset_name: HelpSteer3
+    split: train
+  validation:
+    dataset_name: HelpSteer3
+    split: validation
   # You can use custom preference datasets for training and validation. For example:
   # 1. PreferenceDataset
-  #   data:
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
   #     dataset_name: PreferenceDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_paths:
-  #       <NameOfValidationDataset1>: <PathToValidationDataset1>
-  #       ...
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  #     prompt_file: null
+  #     system_prompt_file: null
+  #   # multiple validation sets is supported by using val_data_paths
+  #   # this will be removed after refactor
+  #   val_data_paths:
+  #     <NameOfValidationDataset1>: /path/to/local/val_dataset_1.jsonl
+  #     <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
   # 2. BinaryPreferenceDataset
-  #   data:
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     prompt_key: context
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
   #     dataset_name: BinaryPreferenceDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
-  #     prompt_key: <PromptKey>, default is "prompt"
-  #     chosen_key: <ChosenKey>, default is "chosen"
-  #     rejected_key: <RejectedKey>, default is "rejected"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  #     prompt_key: prompt
+  #     chosen_key: chosen
+  #     rejected_key: rejected
+  #     prompt_file: null
+  #     system_prompt_file: null
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets for more details.
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
@@ -204,6 +243,9 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb:
+    project: "dpo-dev"
+    name: "dpo"
+  swanlab:
     project: "dpo-dev"
     name: "dpo"
   tensorboard:

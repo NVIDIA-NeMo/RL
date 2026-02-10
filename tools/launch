@@ -32,8 +32,8 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/..)
 # Function to extract config from a script
 extract_config() {
     local script_path="$1"
-    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" | 
-                   grep -v "^#" | 
+    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" |
+                   grep -v "^#" |
                    grep "=" )
     if [[ -z "$config" ]]; then
         echo "[ERROR]: No config section found in script_path=$script_path"
@@ -41,6 +41,7 @@ extract_config() {
         echo
         echo "# ===== BEGIN CONFIG ====="
         echo "NUM_NODES=1        # How many nodes this job uses"
+        echo "GPUS_PER_NODE=8    # GPUs per node (8 for H100, 4 for GB200)"
         echo "STEPS_PER_RUN=60   # Approximately how many steps reached in one job"
         echo "MAX_STEPS=60       # Max training steps"
         echo 'NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up'
@@ -90,6 +91,7 @@ MOUNTS=${MOUNTS:-}
 # DRYRUN=2 additionally creates the snapshots (helpful to run a hermetic example manually or share a repro)
 DRYRUN=${DRYRUN:-}
 IS_RELEASE=${IS_RELEASE:-}  # Adds extra configuration for wandb to track this in the right project
+EXCLUDE_GRES=${EXCLUDE_GRES:-} # If set, will not include --gres=gpu:$GPUS_PER_NODE in the sbatch invocation
 NOW=$(date '+%y%m%d-%H%M%S')
 
 if [[ -n "$MOUNTS" ]]; then
@@ -109,6 +111,8 @@ done
 
 total_gpu_hours=0
 
+declare -a JOB_IDS=()
+
 for SCRIPT in $SCRIPTS; do
     # Extract and evaluate the config
     if ! config=$(extract_config $SCRIPT); then
@@ -117,8 +121,11 @@ for SCRIPT in $SCRIPTS; do
     fi
     eval "$config"
 
+    # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
+    export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
     # NUM_RUNS * NUM_NODES * NUM_GPUS * (NUM_MINUTES / 60)
-    gpu_hours=$((NUM_RUNS * NUM_NODES * 8 * NUM_MINUTES / 60))
+    gpu_hours=$((NUM_RUNS * NUM_NODES * GPUS_PER_NODE * NUM_MINUTES / 60))
     total_gpu_hours=$((total_gpu_hours + gpu_hours))
     echo "[INFO]: $gpu_hours GPUhrs to run $SCRIPT"
     if [[ "${DRYRUN}" -eq 1 ]]; then
@@ -127,7 +134,7 @@ for SCRIPT in $SCRIPTS; do
     fi
 
     rel_script=$(check_file_in_version_control_and_get_relpath_from_git_root $SCRIPT)
-    
+
     EXP_NAME=$(basename $SCRIPT .sh)
     SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
 
@@ -136,15 +143,27 @@ for SCRIPT in $SCRIPTS; do
         echo "Submitting $i/$NUM_RUNS job with ${NUM_NODES} nodes for $(basename $SCRIPT)"
         JOB_NAME=$(basename $SCRIPT .sh)
 
-        RELEASE_ARGS=()
+        EXTRA_SCRIPT_ARGS=(
+            logger.wandb.name=$(basename $SCRIPT .sh)
+            ++git_meta=$(git log -1 --format='%h-%f' HEAD)
+            # Record the container just for provenance
+            ++container=$CONTAINER
+            # Add any other args, helpful if you are bisecting and need to pass an argument to make something pass
+            ${EXTRA_SCRIPT_ARGS:-}
+        )
         if [[ -n "${IS_RELEASE}" ]]; then
-            RELEASE_ARGS=(
+            EXTRA_SCRIPT_ARGS+=(
                 logger.wandb.project=nemo-rl-release
-                logger.wandb.name=$(basename $SCRIPT .sh)-$(git rev-parse --short HEAD)
             )
         fi
-    
+
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
+
+        GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
+        if [[ -n "${EXCLUDE_GRES}" ]]; then
+            GRES_ARG=""
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -153,7 +172,7 @@ cd \$SCRIPT_DIR
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="apt install -y jq && uv run $rel_script ${RELEASE_ARGS[@]}" \\
+COMMAND="uv run $rel_script ${EXTRA_SCRIPT_ARGS[@]}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\
@@ -161,16 +180,118 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 \\
-    --gres=gpu:8 \\
+    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF
         if [[ "${DRYRUN}" -eq 2 ]]; then
             echo "[DRY_RUN]: Skipping submission of $SCRIPT. Find the snapshot at $SNAPSHOT_DIR and manually launch with 'bash continue.sh'"
         else
-            bash $SNAPSHOT_DIR/continue.sh
+            submission_output=$(bash $SNAPSHOT_DIR/continue.sh)
+            echo "$submission_output"
+            if [[ "$submission_output" =~ Submitted\ batch\ job\ ([0-9]+) ]]; then
+                JOB_IDS+=("${BASH_REMATCH[1]}")
+            else
+                echo "[ERROR]: Unable to parse job id after running 'bash $SNAPSHOT_DIR/continue.sh'"
+                exit 1
+            fi
         fi
     done
 done
 echo [INFO]: Total GPU hours: $total_gpu_hours
+
+if [[ -n "${WATCH:-}" && "${#JOB_IDS[@]}" -gt 0 ]]; then
+    WATCH_INTERVAL=${WATCH_INTERVAL:-300}
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Tracking ${#JOB_IDS[@]} jobs: ${JOB_IDS[*]}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Polling every ${WATCH_INTERVAL}s. Press Enter to refresh immediately."
+    active_ids=("${JOB_IDS[@]}")
+    while [[ ${#active_ids[@]} -gt 0 ]]; do
+        # This checks if we're in an interactive terminal then allow this interactive polling
+        if [[ -t 0 ]]; then
+            remaining=$WATCH_INTERVAL
+            while (( remaining > 0 )); do
+                if read -t 5 -n 1 _watch_input; then
+                    break
+                fi
+                remaining=$(( remaining - 5 ))
+            done
+        else
+            sleep "$WATCH_INTERVAL"
+        fi
+        mapfile -t current_ids < <(squeue --me -h -o "%A")
+        finished_ids=()
+        new_active_ids=()
+        for id in "${active_ids[@]}"; do
+            found=0
+            for cur in "${current_ids[@]}"; do
+                if [[ "$id" == "$cur" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 1 ]]; then
+                new_active_ids+=("$id")
+            else
+                finished_ids+=("$id")
+            fi
+        done
+        if [[ ${#finished_ids[@]} -gt 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Finished jobs: ${finished_ids[*]}"
+        fi
+        active_ids=("${new_active_ids[@]}")
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Remaining: ${#active_ids[@]}"
+    done
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: All tracked jobs have finished."
+
+    # All tests follow the pattern where the ray-driver.log contains the test metric check results.
+    # There may be multiple runs per test case and the latest one is not necessarily the run containing
+    # the metrics. For example, a test may launch 5 times, but it finishes early so the results are in the
+    # 4th run.
+    any_fail=0
+    BASE_SNAPSHOT_DIR=$(dirname "$SNAPSHOT_DIR")  # take the last one
+    # Build list of ray-driver logs by iterating JOB_IDS directly (one log per id)
+    all_logs=""
+    shopt -s nullglob
+    for _id in "${JOB_IDS[@]}"; do
+        matches=("$BASE_SNAPSHOT_DIR"/*/"$_id"-logs/ray-driver.log)
+        if [[ ${#matches[@]} -gt 0 ]]; then
+            all_logs+="${matches[0]} "
+        fi
+    done
+    shopt -u nullglob
+    # Create an associative array where $(basename $(dirname $(dirname $log))) is the experiment name and key
+    declare -A experiment_name_to_logs
+    for log in $all_logs; do
+        experiment_name=$(basename $(dirname $(dirname $log)))
+        experiment_name_to_logs[$experiment_name]+=" $log"
+    done
+    for experiment_name in "${!experiment_name_to_logs[@]}"; do
+        logs=${experiment_name_to_logs[$experiment_name]}
+        echo "[WATCH]: Checking $experiment_name"
+        # Check for 'Metric Checks' in the logs:
+        #   - If not found in any log, mark as general fail.
+        #   - If found but any 'FAIL' is present, mark as metric fail.
+        #   - If found and no 'FAIL', mark as metric pass.
+        if ! fgrep -A10000 'Metric Checks' $logs &>/dev/null; then
+            echo "[GENERAL FAIL]   $experiment_name"
+            # Print the logs to inspect
+            ls -lah $logs
+            any_fail=1
+        elif fgrep -A10000 'Metric Checks' $logs | fgrep FAIL &>/dev/null; then
+            echo "[METRIC FAIL]    $experiment_name"
+            # Print the metrics to inspect
+            fgrep -A10000 -H 'Metric Checks' $logs
+            any_fail=1
+        else
+            echo "[METRIC PASS]    $experiment_name"
+            # Print the metrics to inspect
+            fgrep -A10000 -H 'Metric Checks' $logs
+        fi
+    done
+    if [[ $any_fail -eq 1 ]]; then
+        echo "[INFO]: One or more tests failed. Exiting with status 1."
+    else
+        echo "[INFO]: All tests passed. Exiting with status 0."
+    fi
+    exit $any_fail
+fi

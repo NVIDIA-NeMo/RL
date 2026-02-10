@@ -1,0 +1,15 @@
+defaults: ./sft-qwen2.5-math7b-2n8g-megatron.yaml
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 1
+logger:
+  wandb:
+    name: sft-qwen2.5-math7b-2n4g-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-qwen2.5-math7b-2n4g-megatron
+  mlflow:
+    run_name: sft-qwen2.5-math7b-2n4g-megatron
+cluster:
+  gpus_per_node: 4
+
