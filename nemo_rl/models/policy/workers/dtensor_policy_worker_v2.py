@@ -366,6 +366,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
         )
 
         # Create train context factory
