@@ -203,6 +203,75 @@ def math_data_processor(
     return output
 
 
+def math_gdpo_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
+
+    user_message = datum_dict["messages"]
+    
+    # print(f"user_message {user_message}")
+
+    problem = user_message[1]["content"]
+
+    extra_env_info = {"ground_truth": user_message[2]["content"]}
+
+    message_log: LLMMessageLogType = []
+
+
+    system_message = {
+        "role": "system",
+        "content": user_message[0]["content"]
+
+    }
+
+    user_message = {
+        "role": "user",
+        "content": problem,
+    }
+
+
+    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
+        [system_message, user_message],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+
+    user_message["token_ids"] = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+    }
+    return output
+
+
 def math_hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -352,6 +421,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
+        "math_gdpo_data_processor": math_gdpo_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "math_data_processor": math_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,

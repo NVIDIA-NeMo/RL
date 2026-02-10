@@ -301,6 +301,8 @@ def calculate_rewards(
         # Store results with their original indices
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
+            # print(f"task_rewards {task_rewards.shape}")
+            # print(f"task_rewards[i] {len(task_rewards[i])}")
             all_rewards.append(task_rewards[i])
             all_env_observations.append(env_observations[i])
             all_terminateds.append(terminateds[i])
@@ -358,6 +360,10 @@ def run_multi_turn_rollout(
     batch_size = len(current_batch["message_log"])
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
+
+    ### Multi_rewards 
+    number_of_rewards = 3
+    multi_rewards = torch.zeros(batch_size, number_of_rewards, dtype=torch.float32)
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -436,8 +442,13 @@ def run_multi_turn_rollout(
 
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
+        
+        ## Multi_rewards
+        ## Only support single turn now so += and = is the same
+        multi_rewards[active_indices] += env_output.rewards
+        total_rewards[active_indices] += env_output.rewards.sum(dim=1)
 
-        total_rewards[active_indices] += env_output.rewards
+        
 
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags

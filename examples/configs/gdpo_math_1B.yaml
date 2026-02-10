@@ -57,7 +57,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo"
+  checkpoint_dir: "results/gdpo"
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
@@ -67,7 +67,7 @@ checkpointing:
   save_consolidated: false
 
 policy:
-  model_name: "Qwen/Qwen2.5-1.5B"
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
@@ -76,7 +76,7 @@ policy:
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 4
-  max_total_sequence_length: 512
+  max_total_sequence_length: 1024
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
@@ -121,7 +121,7 @@ policy:
       optimizer: "adam"
       lr: 5.0e-6
       min_lr: 5.0e-7
-      weight_decay: 0.01
+      weight_decay: 0.0
       bf16: true
       fp16: false
       params_dtype: "float32"
@@ -148,9 +148,9 @@ policy:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
-      lr_decay_style: "constant"
+      lr_decay_style: "cosine"
       lr_decay_iters: 1000
-      lr_warmup_iters: 13
+      lr_warmup_iters: 10 ## I don't know what is the total number of warmup iters
       lr_warmup_init: 5.0e-7
 
     distributed_data_parallel_config:
@@ -250,9 +250,9 @@ data:
   system_prompt_file: null
   shuffle: true
   num_workers: 1
-  processor: "math_hf_data_processor"
+  processor: "math_gdpo_data_processor"
   env_name: "math"
-  dataset_name: "OpenMathInstruct-2"
+  dataset_name: "gsm8k"
   # You can use custom response datasets for training and validation. For example:
   #   data:
   #     dataset_name: ResponseDataset
@@ -278,15 +278,15 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "grpo-dev"
-    name: "grpo-dev-logger"
+    project: "gdpo-dev"
+    name: "gdpo-dev-logger"
   swanlab:
-    project: "grpo-dev"
-    name: "grpo-dev-logger"
+    project: "gdpo-dev"
+    name: "gdpo-dev-logger"
   tensorboard: {}
   mlflow:
-    experiment_name: "grpo-dev"
-    run_name: "grpo-dev-logger"
+    experiment_name: "gdpo-dev"
+    run_name: "gdpo-dev-logger"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

@@ -1224,11 +1224,14 @@ def grpo_train(
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
+                # GDPO
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
                     print("▶ Computing advantages...", flush=True)
+
+                    
                     baseline, std = calculate_baseline_and_std_per_prompt(
                         input_ids,
                         rewards,
@@ -2196,7 +2199,7 @@ def async_grpo_train(
                     prompt_only_ids = prompt_batched_flat["token_ids"]
 
                     rewards = repeated_batch["total_reward"]
-
+                    ### 
                     print("▶ Computing advantages...")
 
                     baseline, std = calculate_baseline_and_std_per_prompt(
