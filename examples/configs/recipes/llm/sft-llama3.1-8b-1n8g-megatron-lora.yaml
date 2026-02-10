@@ -14,6 +14,7 @@ policy:
     chat_template: default
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
   megatron_cfg:
     enabled: true
     peft:

@@ -19,6 +19,7 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron_bridge.recipes.qwen.qwen3_moe.qwen3_235b_a22b_pretrain_config
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1

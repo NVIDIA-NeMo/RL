@@ -17,6 +17,7 @@ policy:
     enabled: false
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
+  megatron_recipe: megatron.bridge.recipes.deepseek.deepseek_v3.deepseek_v3_pretrain_config
   megatron_cfg:
     enabled: true
     activation_checkpointing: true

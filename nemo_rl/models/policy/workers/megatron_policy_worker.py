@@ -279,6 +279,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.optimizer,
         )
 
+        # Dump ConfigContainer to YAML for inspection (only on rank 0)
+        if self.rank == 0:
+            config_dump_path = "/lustre/fsw/portfolios/coreai/users/sfawzy/final_megatron_config.yaml"
+            try:
+                self.megatron_cfg.to_yaml(config_dump_path)
+                print(f"[DEBUG] Saved final ConfigContainer to: {config_dump_path}")
+            except Exception as e:
+                print(f"[WARNING] Failed to save ConfigContainer to YAML: {e}")
+
         # vars used for refit
         ## will be initialized in prepare_refit_info
         # refit_param_info_mcore combines the conversion tasks with the param memory
@@ -372,6 +381,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self.cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_cfg=self.megatron_cfg.model,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -556,6 +566,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_cfg=self.megatron_cfg.model,
         )
 
         def forward_step_fn(
@@ -763,6 +774,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_cfg=self.megatron_cfg.model,
         )
 
         def forward_step_fn(

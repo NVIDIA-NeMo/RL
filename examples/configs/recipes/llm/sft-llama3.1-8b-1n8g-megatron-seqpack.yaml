@@ -19,6 +19,7 @@ policy:
     enabled: true
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
+  megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_8b_pretrain_config
   megatron_cfg:
     enabled: true
     tensor_model_parallel_size: 2

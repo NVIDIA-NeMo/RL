@@ -8,6 +8,7 @@ policy:
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
   optimizer: null
+  megatron_recipe: megatron.bridge.recipes.nemotronh.nemotron_nano_12b_v2_pretrain_config
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false

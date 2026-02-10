@@ -15,6 +15,7 @@ policy:
     enabled: false
   optimizer: null
   scheduler: null
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3_8b_pretrain_config
   megatron_cfg:
     enabled: true
     converter_type: Qwen3ForCausalLM

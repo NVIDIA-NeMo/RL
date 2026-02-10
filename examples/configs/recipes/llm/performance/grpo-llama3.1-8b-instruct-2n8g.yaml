@@ -17,6 +17,7 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron_bridge.recipes.llama.llama3.llama31_8b_pretrain_config
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1

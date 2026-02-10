@@ -9,6 +9,7 @@ policy:
   max_total_sequence_length: 16384
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_7b_finetune_config
   megatron_cfg:
     enabled: true
     tensor_model_parallel_size: 4

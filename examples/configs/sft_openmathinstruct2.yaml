@@ -39,9 +39,6 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
-  megatron_cfg:
-    enabled: false
-
   dynamic_batching:
     enabled: false
 

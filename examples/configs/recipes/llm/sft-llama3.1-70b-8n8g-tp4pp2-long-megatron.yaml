@@ -17,6 +17,7 @@ policy:
   max_total_sequence_length: 4096
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron.bridge.recipes.llama.llama3.llama31_70b_pretrain_config
   megatron_cfg:
     enabled: true
     tensor_model_parallel_size: 4
