@@ -104,7 +104,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
 
 ## Container Pre-caching
 
-When a [release container](../docker.md#release-image) is built, it pre-caches:
+When a [release container](../docker.md#building-the-release-image) is built, it pre-caches:
 
 1. **Virtual environments**: All worker virtual environments are created and stored in the container
 2. **UV cache**: Python packages are pre-downloaded into the UV cache directory
