@@ -140,6 +140,11 @@ def forward_step_arbitrary_loss(
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
             )
+            # Cache packed input_ids so the fused wrapper can skip re-packing.
+            # Only for fused path — the unfused wrapper's data.slice() expects all
+            # tensors to have a matching batch dim, which [1, T_packed] does not.
+            if fuse_loss:
+                data_dict["packed_input_ids"] = input_ids
 
         loss_data = data_dict
 
