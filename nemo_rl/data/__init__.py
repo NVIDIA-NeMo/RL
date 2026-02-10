@@ -44,7 +44,7 @@ class PreferenceDatasetConfig(TypedDict):
 
 
 class DataConfig(TypedDict):
-    max_input_seq_length: int
+    max_input_seq_length: int | None
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
     add_generation_prompt: NotRequired[bool]
