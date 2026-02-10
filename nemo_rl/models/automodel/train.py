@@ -511,7 +511,6 @@ class LossPostProcessor:
             DistillationLossFn,
             DPOLossFn,
             NLLLossFn,
-            PreferenceLossFn,
         )
 
         # Handle CP redistribution
@@ -525,19 +524,16 @@ class LossPostProcessor:
 
         # Prepare data for loss function
         def prepare_for_loss_fn(
-            logits: torch.Tensor, mb: BatchedDataDict[Any]
+            logits: torch.Tensor, data_dict: BatchedDataDict[Any], **kwargs
         ) -> tuple[Any]:
             if isinstance(self.loss_fn, (ClippedPGLossFn, NLLLossFn, DPOLossFn)):
                 logprobs = get_logprobs_from_logits(
-                    input_ids=mb["input_ids"],
+                    input_ids=data_dict["input_ids"],
                     next_token_logits=logits,
-                    seq_index=mb.get("seq_index", None),
+                    seq_index=data_dict.get("seq_index", None),
                 )
 
                 loss_fn_args = (logprobs,)
-
-            elif isinstance(self.loss_fn, PreferenceLossFn):
-                loss_fn_args = (logits,)
 
             elif isinstance(self.loss_fn, DistillationLossFn):
                 calculate_entropy = (
@@ -546,8 +542,8 @@ class LossPostProcessor:
                 student_topk_logprobs, teacher_topk_logprobs, H_all = (
                     get_distilllation_topk_logprobs_from_logits(
                         student_logits=logits,
-                        teacher_topk_logits=mb["teacher_topk_logits"],
-                        teacher_topk_indices=mb["teacher_topk_indices"],
+                        teacher_topk_logits=data_dict["teacher_topk_logits"],
+                        teacher_topk_indices=data_dict["teacher_topk_indices"],
                         zero_outside_topk=self.loss_fn.zero_outside_topk,
                         calculate_entropy=calculate_entropy,
                     )
@@ -556,7 +552,8 @@ class LossPostProcessor:
                 loss_fn_args = (student_topk_logprobs, teacher_topk_logprobs, H_all)
 
             else:
-                raise ValueError(f"Unknown loss function type: {type(self.loss_fn)}")
+                # for PreferenceLossFn and SimpleLoss/SimpleNLLLoss in tests, just pass the logits
+                loss_fn_args = (logits,)
 
             return loss_fn_args
 

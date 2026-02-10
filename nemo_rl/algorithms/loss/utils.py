@@ -93,7 +93,13 @@ class SequencePackingLossWrapper:
             )
 
             # prepare data for loss function
-            loss_fn_args = self.prepare_fn(next_token_logits_slice, unpadded_seq_data)
+            loss_fn_args = self.prepare_fn(
+                logits=next_token_logits_slice,
+                data_dict=unpadded_seq_data,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
 
             loss, metrics = self.loss_fn(
                 *loss_fn_args,

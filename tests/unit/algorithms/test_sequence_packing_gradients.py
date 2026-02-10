@@ -21,6 +21,7 @@ import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossFn, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import get_logprobs_from_logits
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -151,8 +152,11 @@ class SequencePackingGradientTestActor:
         global_valid_seqs = torch.tensor(batch_size, dtype=torch.float, device="cuda")
 
         # Forward pass
-        baseline_loss, baseline_metrics = base_loss_fn(
-            baseline_logits,
+        curr_logprobs = get_logprobs_from_logits(
+            data_dict["input_ids"], baseline_logits
+        )
+        baseline_loss, _ = base_loss_fn(
+            curr_logprobs,
             data_dict,
             global_valid_seqs,
             global_valid_toks,
@@ -216,27 +220,45 @@ class SequencePackingGradientTestActor:
 
         packed_logits = make_packed_logits(baseline_logits)
 
+        def prepare_for_loss_fn(
+            logits,
+            data_dict,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        ):
+            logprobs = get_logprobs_from_logits(
+                input_ids=data_dict["input_ids"],
+                next_token_logits=logits,
+                seq_index=data_dict.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+
+            return logprobs
+
         # Create sequence packing wrapper
+        tp_group = torch.distributed.new_group(ranks=[rank])
         wrapper = SequencePackingLossWrapper(
             loss_fn=base_loss_fn,
+            prepare_fn=prepare_for_loss_fn,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_q_padded=cu_seqlens_padded,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group,
         )
 
         # Create data dict for packed sequences
         packed_data_dict = BatchedDataDict(original_data)
 
-        tp_group = torch.distributed.new_group(ranks=[rank])
-
         # Forward pass
-        packed_loss, packed_metrics = wrapper(
+        packed_loss, _ = wrapper(
             packed_logits,
             packed_data_dict,
             global_valid_seqs,
             global_valid_toks,
-            vocab_parallel_rank=0,
-            vocab_parallel_group=tp_group,
-            context_parallel_group=cp_group,
         )
 
         # Backward pass
