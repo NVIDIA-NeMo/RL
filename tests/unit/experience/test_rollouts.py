@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import gc
+import json
+import tempfile
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -22,8 +24,10 @@ import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -32,7 +36,6 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.environments.nemo_gym import nemo_gym_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
@@ -794,10 +797,21 @@ def test_run_async_nemo_gym_rollout(
     nemo_gym_sanity_test_data,  # noqa: F811
     nemo_gym_tokenizer,  # noqa: F811
 ):
+    # only keep the input part of the data for the test
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    # load the dataset and convert to compatible format for Nemo RL
+    nemo_gym_sanity_test_data = NemoGymDataset(data_path)
     nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_sanity_test_data["input"])
+        nemo_gym_data_processor(
+            nemo_gym_sanity_test_data.dataset[idx], None, None, None, idx
+        )
+        for idx in range(len(nemo_gym_sanity_test_data.dataset))
     ]
+
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
     actual_result = run_async_nemo_gym_rollout(
         policy_generation=nemo_gym_vllm_generation,
