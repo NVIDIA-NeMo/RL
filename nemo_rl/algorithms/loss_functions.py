@@ -30,6 +30,7 @@ from nemo_rl.distributed.model_utils import (
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -1148,6 +1149,7 @@ class SequencePackingFusionLossWrapper:
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
         )
 
+    @wrap_with_nvtx_name("SequencePackingFusionLossWrapper/_pack_input_ids")
     def _pack_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
 
@@ -1170,6 +1172,7 @@ class SequencePackingFusionLossWrapper:
             ]
         return packed
 
+    @wrap_with_nvtx_name("SequencePackingFusionLossWrapper/forward")
     def __call__(
         self,
         next_token_logits: torch.Tensor,
@@ -1189,15 +1192,11 @@ class SequencePackingFusionLossWrapper:
           3. Delegate to loss_fn._compute_loss_from_logprobs with the original
              (unpacked) data dict and the pre-computed logprobs.
         """
-        assert vocab_parallel_group is not None, (
-            "SequencePackingFusionLossWrapper requires vocab_parallel_group (Megatron TP)."
-        )
-        assert vocab_parallel_rank is not None, (
-            "vocab_parallel_rank must be provided with vocab_parallel_group."
-        )
-
-        # Step 1: Pack input_ids into the same layout as the packed logits.
-        packed_input_ids = self._pack_input_ids(data["input_ids"])
+        # Step 1: Use pre-packed input_ids from data if available, otherwise pack on the fly.
+        if "packed_input_ids" in data:
+            packed_input_ids = data["packed_input_ids"]
+        else:
+            packed_input_ids = self._pack_input_ids(data["input_ids"])
         unpacked_seqlen = data["input_ids"].shape[1]
 
         # Step 2: Compute logprobs from packed logits in a single shot.
