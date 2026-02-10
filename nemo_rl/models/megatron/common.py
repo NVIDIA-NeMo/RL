@@ -53,7 +53,6 @@ def forward_step_arbitrary_loss(
     defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
-    return_logprobs: bool = False,
 ):
     """Forward training step with support for packed sequences and context parallelism.
 
@@ -141,7 +140,6 @@ def forward_step_arbitrary_loss(
         vocab_parallel_rank=get_tensor_model_parallel_rank(),
         vocab_parallel_group=get_tensor_model_parallel_group(),
         context_parallel_group=get_context_parallel_group(),
-        return_logprobs=return_logprobs,
     )
 
     if cp_normalize:

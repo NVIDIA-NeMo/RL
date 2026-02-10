@@ -1531,10 +1531,6 @@ def grpo_train(
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
                         )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
-                    )["reference_logprobs"]
-                    train_data["reference_policy_logprobs"] = reference_logprobs
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"

@@ -344,10 +344,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with ctx:
             forward_step = partial(
-                forward_step_arbitrary_loss,
-                loss_fn=loss_fn,
-                policy_cfg=self.cfg,
-                fuse_lp_and_train=self.cfg.get("fuse_lp_and_train", False),
+                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
             )
             all_mb_metrics = []
             losses = []
