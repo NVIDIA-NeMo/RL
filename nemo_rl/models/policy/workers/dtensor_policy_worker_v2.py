@@ -1081,7 +1081,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             optimizer=self.optimizer,
             optimizer_path=optimizer_path,
             scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path is None else None,
+            tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
             lora_enabled=self.lora_enabled,
