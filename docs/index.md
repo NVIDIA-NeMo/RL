@@ -170,6 +170,8 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 :hidden:
 
 about/overview
+about/performance-summary
+about/model-support
 about/features
 about/backends
 about/quick-start
@@ -179,6 +181,8 @@ about/evaluation
 about/clusters
 about/tips-and-tricks
 ```
+
+
 
 ```{toctree}
 :caption: Environment Start
@@ -200,10 +204,12 @@ guides/sft-openmathinstruct2.md
 :caption: Guides
 :hidden:
 
+guides/nemotron-3-nano.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -213,6 +219,8 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/dtensor-tp-accuracy.md
+guides/ft-launcher-guide.md
 ```
 
 ```{toctree}
@@ -242,6 +250,7 @@ design-docs/design-and-philosophy.md
 design-docs/padding.md
 design-docs/logger.md
 design-docs/uv.md
+design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md

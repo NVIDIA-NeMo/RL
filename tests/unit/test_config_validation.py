@@ -35,6 +35,9 @@ pytestmark = pytest.mark.run_first
 if not OmegaConf.has_resolver("mul"):
     OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
+if not OmegaConf.has_resolver("max"):
+    OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
+
 
 def validate_config_section(
     section_config: Dict[str, Any],
@@ -132,3 +135,43 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_all_config_no_tp_size_accuracy_issues(config_file):
+    """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
+
+    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    """
+
+    print(f"\nValidating config file: {config_file}")
+
+    # Load the config file with inheritance
+    config = load_config_with_inheritance(config_file)
+    config_dict = OmegaConf.to_container(config, resolve=True)
+
+    # Skip if config does not have policy or logprob_batch_size
+    if "policy" not in config_dict or "logprob_batch_size" not in config_dict["policy"]:
+        return
+
+    # Skip if config set force_on_policy_ratio to True
+    if "loss_fn" in config_dict and config_dict["loss_fn"].get(
+        "force_on_policy_ratio", False
+    ):
+        return
+
+    # Check if TP size >= 4 and train_micro_batch_size != logprob_batch_size
+    if config_dict["policy"]["megatron_cfg"]["enabled"]:
+        tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
+    else:
+        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+
+    train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
+    logprob_bs = config_dict["policy"]["logprob_batch_size"]
+
+    if tp_size >= 4 and train_micro_bs != logprob_bs:
+        raise AssertionError(
+            f"Config file {config_file} has TP size >= 4 accuracy issues. "
+            "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )

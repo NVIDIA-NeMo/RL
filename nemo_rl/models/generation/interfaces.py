@@ -172,6 +172,7 @@ class GenerationOutputSpec(TypedDict):
     - generation_lengths: Tensor containing the actual length of each generated sequence
     - unpadded_sequence_lengths: Tensor containing the actual length of each input + generated sequence (without padding)
     - logprobs: Tensor of log probabilities for each generated token (right padded with zeros)
+    - truncated: Boolean tensor indicating if each sequence was truncated (hit max_tokens limit)
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 2 sequences:
@@ -197,6 +198,9 @@ class GenerationOutputSpec(TypedDict):
       [0.0, 0.0, 0.0, -1.2, -0.8, -2.1, -1.5, 0.0],  # First 3 are 0 (input tokens), next 4 are actual logprobs
       [0.0, 0.0, 0.0, 0.0, 0.0, -0.9, -1.7, 0.0],     # First 5 are 0 (input tokens), next 2 are actual logprobs
     ]
+
+    truncated:
+    [False, True]  # Example 2 was truncated (hit max_tokens limit without EOS)
     ```
 
     All functions receiving or returning GenerationOutputSpec should ensure
@@ -209,6 +213,9 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    truncated: NotRequired[
+        torch.Tensor
+    ]  # Whether each sequence was truncated and hit max_tokens without stop token
     __extra__: Any
 
 
@@ -236,6 +243,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether the generation backend requires KV cache scales synchronization."""
+        return False
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         raise NotImplementedError
@@ -252,3 +264,22 @@ class GenerationInterface(ABC):
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
         return False
+
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting.
+
+        This is an optional method that backends can implement to clear
+        telemetry metrics. Default implementation does nothing.
+        """
+        pass
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics for performance reporting.
+
+        This is an optional method that backends can implement to collect
+        telemetry metrics. Default implementation returns empty dict.
+
+        Returns:
+            Dictionary of metrics. Format may vary by backend.
+        """
+        return {}

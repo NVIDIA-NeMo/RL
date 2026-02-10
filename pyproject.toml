@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=42", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -17,12 +17,13 @@ requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
+  "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                                            # for flash-attn parallel build
-  "torch==2.8.0",
+  "torch==2.9.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.49.2",
-  "transformers>=4.55.4",
+  "transformers==4.57.1",
   "wandb",
   "numpy",
   "datasets>=4.0.0",
@@ -48,19 +49,25 @@ dependencies = [
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "nvidia-resiliency-ext",
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
 ]
 
 [project.optional-dependencies]
-# Currently unused, but after https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved, we should use this for the "BASE" PYEXECUTABLE
+fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
 automodel = [
   "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "vllm==0.11.0",      # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
   "flash-attn==2.8.1",
   "mamba-ssm",
   "causal-conv1d",
+  "nv-grouped-gemm",
+  "transformer-engine[pytorch]==2.10.0",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
 vllm = [
   "cuda-python",
@@ -68,15 +75,28 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
-  "vllm==0.11.0",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "vllm==0.11.2",
   "num2words>=0.5.14",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "flash-attn==2.8.1",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "mamba-ssm",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "causal-conv1d",
+]
+sglang = [
+  "sglang==0.5.7",
+  "orjson",
+  "uvloop",
+  "requests",
+  "openai",
+  "partial-json-parser",
+  "sentencepiece",
+  "sgl-kernel",
+  "compressed-tensors",
+  "msgspec",
+  "python-multipart",
+  "torchao",
+  "xgrammar",
+  "interegular",
+  "openai-harmony",
+  "torch-memory-saver",
+  "einops",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -91,21 +111,20 @@ mcore = [
   "transformer-engine[pytorch]==2.10.0",
   "megatron-core",
   "megatron-bridge",
-  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-  "vllm==0.11.0",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
-penguin = ["penguin"]
+nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
 
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.8.0",
+  "torch==2.9.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -149,7 +168,7 @@ test = [
 megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
-penguin = { workspace = true }
+nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -164,15 +183,23 @@ triton = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
+nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
+sgl-kernel = { git = "https://github.com/sgl-project/sglang", tag = "v0.5.7", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
 members = [
   "3rdparty/Megatron-LM-workspace",
   "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
-  "3rdparty/Penguin-workspace",
+  "3rdparty/Gym-workspace/Gym",
+  # Research projects are also added here in order for them to share the global root level uv.lock.
+  # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
+  # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
+  # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
+  # globally we must choose 1.X otherwise we run into pickle issues from ray.
+  "research/template_project",
 ]
 
 [[tool.uv.index]]
@@ -187,6 +214,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
+extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -195,6 +223,8 @@ no-build-isolation-package = [
   "causal-conv1d",
   "deep_gemm",
   "deep_ep",
+  "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  "sgl-kernel",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -207,10 +237,52 @@ default-groups = ["dev", "build"]
 link-mode = "copy"
 # The TE override is needed because automodel/mbridge we are on is still on 2.5.0
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
+# The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
+# The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
   "transformer-engine[pytorch]==2.10.0",
   "opencv-python-headless>=4.11.0",
+  "timm<=1.0.22",
+  "nvidia-modelopt[torch]>=0.39.0",
+  # sglang requires torch 2.9.1, but we need 2.9.0
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
+  # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
+  "llguidance>=1.3.0,<1.4.0",
+  # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
+  "setuptools>=80.10.2",
 ]
+# CVE fixes
+constraint-dependencies = [
+  "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
+  "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
+  "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
+  "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
+  "pyasn1>=0.6.2",            # Address CVE GHSA-63vm-454h-vhhq
+  "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
+  "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
+  "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
+]
+
+conflicts = [
+  [
+    { extra = "fsdp" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "mcore" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "vllm" },
+    { extra = "sglang" },
+  ],
+]
+
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
@@ -222,6 +294,8 @@ transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
+sgl-kernel = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -231,19 +305,19 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
-version = "1.5.0.post8"
+version = "1.5.4"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "2.2.4"
+version = "2.2.6.post3"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.1.0+e3908bf"
+version = "v1.2.1+bfded34"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -251,6 +325,18 @@ name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v2.0.0+7b6b556"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "nv-grouped-gemm"
+# This version has to match the version in the commit/rev/tag used
+version = "v1.1.4.post7"
+requires-dist = ["setuptools", "wheel", "torch", "numpy"]
+
+[[tool.uv.dependency-metadata]]
+name = "sgl-kernel"
+# This version has to match the version in the commit/rev/tag used
+version = "0.3.20"
+requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [tool.black]
 line-length = 120
@@ -273,6 +359,7 @@ markers = [
   "hf_gated: marks tests that require HuggingFace token access for gated models",
   "automodel: marks tests that require the automodel extra",
   "vllm: marks tests that require the vllm extra",
+  "sglang: marks tests that require the sglang extra",
 ]
 
 [tool.pyrefly]

@@ -14,7 +14,7 @@
 
 import shutil
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -127,6 +127,101 @@ class TestTensorboardLogger:
             "batch_size": 32,
             "model.hidden_size": 128,
         }
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_python_primitives(self, mock_summary_writer, temp_dir):
+        """Test that Python primitives pass through unchanged."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        assert logger._coerce_to_scalar(42) == 42
+        assert logger._coerce_to_scalar(3.14) == 3.14
+        assert logger._coerce_to_scalar(True) is True
+        assert logger._coerce_to_scalar("hello") == "hello"
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_numpy_types(self, mock_summary_writer, temp_dir):
+        """Test that numpy scalar types are coerced to Python primitives."""
+        import numpy as np
+
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        # numpy scalar types
+        assert logger._coerce_to_scalar(np.float32(1.5)) == 1.5
+        assert logger._coerce_to_scalar(np.float64(2.5)) == 2.5
+        assert logger._coerce_to_scalar(np.int32(10)) == 10
+        assert logger._coerce_to_scalar(np.int64(20)) == 20
+        assert logger._coerce_to_scalar(np.bool_(True)) is True
+
+        # 0-d numpy arrays
+        assert logger._coerce_to_scalar(np.array(3.14)) == 3.14
+        # 1-element numpy arrays
+        assert logger._coerce_to_scalar(np.array([42])) == 42
+
+        # Multi-element arrays should return None
+        assert logger._coerce_to_scalar(np.array([1, 2, 3])) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_torch_tensors(self, mock_summary_writer, temp_dir):
+        """Test that torch scalar tensors are coerced to Python primitives."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        # 0-d tensors
+        assert logger._coerce_to_scalar(torch.tensor(3.14)) == pytest.approx(3.14)
+        assert logger._coerce_to_scalar(torch.tensor(42)) == 42
+
+        # 1-element tensors
+        assert logger._coerce_to_scalar(torch.tensor([99])) == 99
+
+        # Multi-element tensors should return None
+        assert logger._coerce_to_scalar(torch.tensor([1, 2, 3])) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_incompatible_types(self, mock_summary_writer, temp_dir):
+        """Test that incompatible types return None."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        assert logger._coerce_to_scalar({"key": "value"}) is None
+        assert logger._coerce_to_scalar([1, 2, 3]) is None
+        assert logger._coerce_to_scalar(None) is None
+        assert logger._coerce_to_scalar(object()) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_log_metrics_coerces_numpy_and_torch(self, mock_summary_writer, temp_dir):
+        """Test that log_metrics correctly logs numpy/torch scalars."""
+        import numpy as np
+
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        metrics = {
+            "python_float": 1.0,
+            "numpy_float32": np.float32(2.0),
+            "numpy_float64": np.float64(3.0),
+            "torch_scalar": torch.tensor(4.0),
+            "numpy_0d": np.array(5.0),
+            "torch_1elem": torch.tensor([6.0]),
+            "skip_list": [1, 2, 3],
+            "skip_dict": {"a": 1},
+            "skip_multi_tensor": torch.tensor([1.0, 2.0]),
+        }
+        logger.log_metrics(metrics, step=1)
+
+        mock_writer = mock_summary_writer.return_value
+        # Should log 6 scalars, skip 3 incompatible
+        assert mock_writer.add_scalar.call_count == 6
+
+        # Verify each scalar was logged with correct value
+        calls = {c[0][0]: c[0][1] for c in mock_writer.add_scalar.call_args_list}
+        assert calls["python_float"] == 1.0
+        assert calls["numpy_float32"] == pytest.approx(2.0)
+        assert calls["numpy_float64"] == pytest.approx(3.0)
+        assert calls["torch_scalar"] == pytest.approx(4.0)
+        assert calls["numpy_0d"] == pytest.approx(5.0)
+        assert calls["torch_1elem"] == pytest.approx(6.0)
 
 
 class TestWandbLogger:
@@ -341,10 +436,9 @@ class TestSwanlabLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # Check that log was called with metrics and commit=False
-        # When using step_metric, step should be ignored and commit=False should be used
+        # Check that log was called with metrics
         mock_run = mock_swanlab.init.return_value
-        mock_run.log.assert_called_once_with(metrics, commit=False)
+        mock_run.log.assert_called_once_with(metrics, step=step)
 
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_swanlab):
@@ -362,30 +456,14 @@ class TestSwanlabLogger:
 
         logger.log_metrics(metrics, step, prefix=prefix, step_metric=step_metric)
 
-        # Check that log was called with prefixed metrics and commit=False
-        # The step_metric key gets prefixed based on the current implementation
+        # Check that log was called with prefixed metrics
         mock_run = mock_swanlab.init.return_value
         expected_metrics = {
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
         }
-        mock_run.log.assert_called_once_with(expected_metrics, commit=False)
-
-    @patch("nemo_rl.utils.logger.swanlab")
-    def test_define_metric(self, mock_swanlab):
-        """Test defining a metric with a custom step metric."""
-        cfg = {}
-        logger = SwanlabLogger(cfg)
-
-        # Define metric pattern and step metric
-        logger.define_metric("ray/*", step_metric="ray/ray_step")
-
-        # Check that define_metric was called
-        mock_run = mock_swanlab.init.return_value
-        mock_run.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_run.log.assert_called_once_with(expected_metrics, step=step)
 
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_hyperparams(self, mock_swanlab):
@@ -1415,8 +1493,12 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on both loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_wandb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
+        mock_tb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1525,10 +1607,10 @@ class TestLogger:
 
         # Check that log_metrics was called on both loggers with correct parameters
         mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
         mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1690,13 +1772,17 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on all loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        mock_swanlab_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+        mock_wandb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
         )
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_swanlab_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
+        mock_tb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
         mock_mlflow_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+            metrics, step, "", None, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1740,6 +1826,97 @@ class TestLogger:
         mock_tb_instance.log_hyperparams.assert_called_once_with(params)
         mock_mlflow_instance.log_hyperparams.assert_called_once_with(params)
         mock_swanlab_instance.log_hyperparams.assert_called_once_with(params)
+
+    def test_log_plot_per_worker_timeline_metrics_logs_expected_series(self):
+        """Ensure per-worker and average plots are produced and logged."""
+        logger = Logger.__new__(Logger)
+        backend_logger = MagicMock()
+        logger.loggers = [backend_logger]
+
+        metrics = {
+            0: [1, 2, 3],
+            1: [2, 3, 4],
+        }
+
+        mock_fig_worker, mock_ax_worker = MagicMock(), MagicMock()
+        mock_fig_avg, mock_ax_avg = MagicMock(), MagicMock()
+
+        with (
+            patch(
+                "nemo_rl.utils.logger.plt.subplots",
+                side_effect=[
+                    (mock_fig_worker, mock_ax_worker),
+                    (mock_fig_avg, mock_ax_avg),
+                ],
+            ) as mock_subplots,
+            patch("nemo_rl.utils.logger.plt.close") as mock_close,
+        ):
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics,
+                step=1,
+                prefix="vllm",
+                name="kv_cache",
+                timeline_interval=0.5,
+            )
+
+        assert mock_subplots.call_count == 2
+        expected_x = [0.0, 0.5, 1.0]
+        mock_ax_worker.plot.assert_has_calls(
+            [
+                call(expected_x, [1.0, 2.0, 3.0], label="worker_0"),
+                call(expected_x, [2.0, 3.0, 4.0], label="worker_1"),
+            ],
+            any_order=False,
+        )
+
+        avg_call = mock_ax_avg.plot.call_args_list[0]
+        assert avg_call.args[0] == expected_x
+        assert avg_call.args[1].tolist() == [1.5, 2.5, 3.5]
+        assert avg_call.kwargs["label"] == "average"
+
+        backend_logger.log_plot.assert_has_calls(
+            [
+                call(mock_fig_worker, 1, "vllm/per_worker_kv_cache"),
+                call(mock_fig_avg, 1, "vllm/average_kv_cache"),
+            ],
+            any_order=False,
+        )
+        assert mock_close.call_args_list == [
+            call(mock_fig_worker),
+            call(mock_fig_avg),
+        ]
+
+    def test_log_plot_per_worker_timeline_metrics_requires_positive_interval(self):
+        """timeline_interval must be positive."""
+        logger = Logger.__new__(Logger)
+        logger.loggers = [MagicMock()]
+
+        with pytest.raises(ValueError):
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics={0: [1, 2]},
+                step=1,
+                prefix="train",
+                name="pending",
+                timeline_interval=0.0,
+            )
+
+    def test_log_plot_per_worker_timeline_metrics_skips_when_no_data(self):
+        """No plots should be produced when metrics are empty."""
+        logger = Logger.__new__(Logger)
+        backend_logger = MagicMock()
+        logger.loggers = [backend_logger]
+
+        with patch("nemo_rl.utils.logger.plt.subplots") as mock_subplots:
+            logger.log_plot_per_worker_timeline_metrics(
+                metrics={},
+                step=1,
+                prefix="train",
+                name="pending",
+                timeline_interval=1.0,
+            )
+
+        mock_subplots.assert_not_called()
+        backend_logger.log_plot.assert_not_called()
 
 
 def test_print_message_log_samples(capsys):

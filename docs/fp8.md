@@ -11,6 +11,10 @@ This module provides a suite of tools to enable FP8 quantization for large langu
 - Uses **TransformerEngine** for linear layer implementation.
 - Supports both **Deepseek-style sub-channel scaling** and **per-tensor scaling**.
 
+### Recommended recipe
+- For Hopper GPUs we recommend to use FP8 (Deepseek-style) precision for both generation and training for best convergence and speedup
+- For Blackwell GPUs, FP8 (deepseek-style) with FP32 scaling factor is not supported in training. Currently we recommend to use FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
+
 ## Integration with NeMo RL
 
 NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  
@@ -53,7 +57,7 @@ FP8 generations are recommended to be configured with the following settings:
                 use_activation_pow2_scale: False
 ```
 
-"To train with FP8, you need to set the Megatron path and configure it using the following settings:
+To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```
     policy:
@@ -66,23 +70,18 @@ FP8 generations are recommended to be configured with the following settings:
 
 ## Compatibility Note for Deepseek-Style FP8 Training
 
-When using FP8 training with Deepseek-style FP8 (sub-channel scaling), be aware of the following compatibility issue:
+The TransformerEngine implementation for this recipe requires **cuda version ≥ 12.9**. The latest nemo-rl depends on torch 2.8.0 + cuda 12.9 (since this [commit](https://github.com/NVIDIA-NeMo/RL/commit/3f36d14b53e906b27c01c06e36dbbd2b8eb300cd)). Users should check-out code to latest and build container from `docker/Dockerfile` ([instructions](docker.md)). 
 
-The TransformerEngine implementation for this recipe requires **cuBLAS version ≥ 12.9**. However, `nemo-rl` currently depends on **Torch 2.7.1**, which in turn requires **CUDA 12.8**. As a result, attempting to use the default setup will trigger the following error:
+If you are using nemo-rl before this [commit](https://github.com/NVIDIA-NeMo/RL/commit/3f36d14b53e906b27c01c06e36dbbd2b8eb300cd), you will see the following error when trying to use fp8 training:
 
 ```
-File "/opt/ray_venvs/nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 646, in fp8_autocast
+File "/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 646, in fp8_autocast
 FP8GlobalStateManager.fp8_autocast_enter(
-File "/opt/ray_venvs/nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 465, in fp8_autocast_enter
+File "/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 465, in fp8_autocast_enter
 assert fp8_block_available, reason_for_no_fp8_block
            ^^^^^^^^^^^^^^^^^^^
 AssertionError: FP8 block scaled GEMM requires Hopper and CUDA >= 12.9.
 ```
-This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0** (Please follow [#1122](https://github.com/NVIDIA-NeMo/RL/issues/1122) for more progress on the upgrade). In the meantime, you can enable Deepseek-style FP8 training using the following workaround:
-
-- **Build the NGC PyTorch container** from `docker/Dockerfile.ngc_pytorch`.  
-  This setup uses the system Python environment, which includes **CUDA version 12.9 or higher**, meeting the requirements for TransformerEngine’s FP8 implementation.
-
 
 
 ## Accuracy
@@ -93,5 +92,5 @@ The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run t
 * For BF16: `examples/configs/grpo_math_8B_megatron.yaml`
 * For FP8: `examples/configs/grpo_math_8B_megatron_fp8.yaml`
 
-In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 step.
+In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 steps.
 Efforts are ongoing to performs longer runs and further optimize performance.
