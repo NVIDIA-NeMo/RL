@@ -1,0 +1,10 @@
+defaults: ./sft-llama3.1-8b-1n8g-fsdp2tp1-long.yaml
+checkpointing:
+  checkpoint_dir: results/sft-llama3.1-8b-1n4g-fsdp2tp1-long
+logger:
+  log_dir: logs/sft-llama3.1-8b-1n4g-fsdp2tp1-long
+  wandb:
+    name: sft-llama3.1-8b-1n4g-fsdp2tp1-long
+cluster:
+  gpus_per_node: 4
+

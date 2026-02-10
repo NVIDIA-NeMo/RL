@@ -29,12 +29,12 @@ uv venv
 
 ```sh
 # DTensor
-uv run python examples/run_grpo_math.py
+uv run python examples/run_grpo.py
 ```
 
 ```sh
 # Megatron
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 

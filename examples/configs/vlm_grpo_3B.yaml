@@ -10,6 +10,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
@@ -21,6 +22,13 @@ grpo:
     overlong_buffer_length: 512
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -46,6 +54,7 @@ loss_fn:
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
   token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
 
 checkpointing:
   enabled: true
@@ -102,6 +111,10 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
 
     optimizer:
       optimizer: "adam"
@@ -206,6 +219,7 @@ policy:
     vllm_cfg:
       async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
       precision: ${policy.precision}
+      kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -225,12 +239,22 @@ policy:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/clevr_cogent_cot.txt"
-  system_prompt_file: null
-  dataset_name: "clevr-cogent"
-  split: "trainA"
   shuffle: true
   num_workers: 1
+
+  # dataset
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "clevr-cogent"
 
 env:
   clevr-cogent:
@@ -266,6 +290,9 @@ logger:
   mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
   tensorboard: {}

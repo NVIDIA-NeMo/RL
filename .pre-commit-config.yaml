@@ -57,15 +57,18 @@ repos:
   # intend to merge. Without it, you might run experiments with one config, but when merging upstream,
   # the config could silently fall back to the base defaults—resulting in different hyperparameters.
   #
-  # For example, we’ve seen cases where an SFT recipe runs without a custom chat_template. When merged,
-  # it unexpectedly picks up the default recommended chat_template from upstream, which doesn’t match
+  # For example, we've seen cases where an SFT recipe runs without a custom chat_template. When merged,
+  # it unexpectedly picks up the default recommended chat_template from upstream, which doesn't match
   # the original experiment setup.
   #
   # If this check is disruptive, you can disable the pre-commit hook locally. However, before a recipe
   # is accepted upstream, we expect the config to be minimized.
+  #
+  # The minimize-check command infers the base config from each recipe's `defaults` key, so it
+  # correctly handles inheritance chains (e.g., child → parent → grandparent).
   - repo: local
     hooks:
-      - id: configs-minimize-check-llm
+      - id: configs-minimize-check
         name: minimize-check llm recipes
         language: system
         pass_filenames: false
@@ -74,17 +77,4 @@ repos:
           - -lc
           - |
             set -euo pipefail
-            base="examples/configs/dpo.yaml"; for f in examples/configs/recipes/llm/dpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
-            base="examples/configs/grpo_math_1B.yaml"; for f in examples/configs/recipes/llm/grpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
-            base="examples/configs/sft.yaml"; for f in examples/configs/recipes/llm/sft-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
-            base="examples/configs/distillation_math.yaml"; for f in examples/configs/recipes/llm/distillation-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
-      - id: configs-minimize-check-vlm
-        name: minimize-check vlm recipes
-        language: system
-        pass_filenames: false
-        entry: bash
-        args:
-          - -lc
-          - |
-            set -euo pipefail
-            base="examples/configs/vlm_grpo_3B.yaml"; for f in examples/configs/recipes/vlm/vlm_grpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
+            for f in examples/configs/recipes/{llm,vlm}/*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$f"; done

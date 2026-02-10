@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_distillation_math.py \
+    $PROJECT_ROOT/examples/run_distillation.py \
     --config $PROJECT_ROOT/examples/configs/distillation_math_megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B-Base \
     teacher.model_name=Qwen/Qwen3-0.6B \
@@ -40,7 +40,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     distillation.max_val_samples=16 \
     distillation.val_batch_size=8 \
     distillation.val_period=3 \
-    data.dataset_name=OpenMathInstruct-2 \
+    data.train.dataset_name=OpenMathInstruct-2 \
+    ++data.train.split_validation_size=0.05 \
+    data.validation=null \
     loss_fn.zero_outside_topk=false \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \

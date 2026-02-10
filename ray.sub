@@ -5,6 +5,7 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
+#SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -69,18 +70,16 @@ COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If le
 # CUDNN_HOME_DIR=cudnn-linux-x86_64-9.17.0.29_cuda12-archive \
 # sbatch ray.sub
 #
-# ===== cuDNN 9.18.0 (NVIDIA internal artifactory, .tar.gz) =====
+# ===== cuDNN 9.18.1 (public NVIDIA download, .tar.xz) =====
 # CUDNN_INSTALL=1 sbatch ray.sub   # Uses defaults below
 #
 CUDNN_INSTALL=${CUDNN_INSTALL:-0}
-CUDNN_VERSION=${CUDNN_VERSION:-9.18.0}
-CUDNN_BUILD=${CUDNN_BUILD:-65}
-# cuDNN tarball URL (NVIDIA internal artifactory - 9.18.0.65 for CUDA 12.9)
-CUDNN_TARBALL_URL=${CUDNN_TARBALL_URL:-https://urm.nvidia.com/artifactory/hw-cudnn-generic/CUDNN/v9.18/v9.18.0.65/12.9/cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}.tar.gz}
-# CUDNN_HOME - extraction directory name (differs between versions)
-# 9.17: cudnn-linux-x86_64-9.17.0.29_cuda12-archive
-# 9.18: cudnn-linux-x86_64-9.18.0.65
-CUDNN_HOME_DIR=${CUDNN_HOME_DIR:-cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}}
+CUDNN_VERSION=${CUDNN_VERSION:-9.18.1}
+CUDNN_BUILD=${CUDNN_BUILD:-3}
+# cuDNN tarball URL (public NVIDIA download - 9.18.1.3 for CUDA 12)
+CUDNN_TARBALL_URL=${CUDNN_TARBALL_URL:-https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}_cuda12-archive.tar.xz}
+# CUDNN_HOME_DIR - extraction directory name (matches tarball name without extension)
+CUDNN_HOME_DIR=${CUDNN_HOME_DIR:-cudnn-linux-x86_64-${CUDNN_VERSION}.${CUDNN_BUILD}_cuda12-archive}
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -327,14 +326,6 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     if [[ -f "\$CUDNN_TARBALL" && ! -d "\$CUDNN_HOME" ]]; then
       echo "[INFO] Extracting cuDNN tarball..."
       tar -xf "\$CUDNN_TARBALL"
-      
-      # Handle different tarball directory naming conventions
-      # 9.17 (.tar.xz): extracts to cudnn-linux-x86_64-9.17.0.29_cuda12-archive (matches CUDNN_HOME, no rename needed)
-      # 9.18 (.tar.gz): extracts to just "cudnn" (needs rename to CUDNN_HOME)
-      if [[ -d "cudnn" && ! -d "\$CUDNN_HOME" ]]; then
-        echo "[INFO] Renaming 'cudnn' to \$CUDNN_HOME..."
-        mv cudnn "\$CUDNN_HOME"
-      fi
     fi
     
     if [[ -d "\$CUDNN_HOME" ]]; then
@@ -384,6 +375,8 @@ ray start --head \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
+    --dashboard-host="$head_node_ip" \
+    --include-dashboard=True \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
     --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \
@@ -504,14 +497,6 @@ if [[ "$CUDNN_INSTALL" == "1" ]]; then
     if [[ -f "\$CUDNN_TARBALL" && ! -d "\$CUDNN_HOME" ]]; then
       echo "[INFO] Extracting cuDNN tarball..."
       tar -xf "\$CUDNN_TARBALL"
-      
-      # Handle different tarball directory naming conventions
-      # 9.17 (.tar.xz): extracts to cudnn-linux-x86_64-9.17.0.29_cuda12-archive (matches CUDNN_HOME, no rename needed)
-      # 9.18 (.tar.gz): extracts to just "cudnn" (needs rename to CUDNN_HOME)
-      if [[ -d "cudnn" && ! -d "\$CUDNN_HOME" ]]; then
-        echo "[INFO] Renaming 'cudnn' to \$CUDNN_HOME..."
-        mv cudnn "\$CUDNN_HOME"
-      fi
     fi
     
     if [[ -d "\$CUDNN_HOME" ]]; then
@@ -549,7 +534,6 @@ fi
 
 # Note: TE will be built by uv when NRL_FORCE_REBUILD_VENVS=true
 # CUDNN_HOME is already exported above for uv to use during TE compilation
-
 
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
@@ -594,13 +578,8 @@ done
 # At this stage the Ray cluster bringup has started on the physical nodes in the allocation
 # Before we launch a job on this cluster we need to make sure that the bringup is complete
 # We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
-#
-# NOTE: We use the container's ray binary explicitly (/opt/nemo_rl_venv/bin/ray) to avoid
-# picking up the host's conda/miniconda ray which may be a different version.
-CONTAINER_RAY_BIN=${CONTAINER_RAY_BIN:-/opt/nemo_rl_venv/bin/ray}
-
 extract_worker_units() {
-  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" $CONTAINER_RAY_BIN status 2>/dev/null || true)
+  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" ray status)
   if echo "$status_output" | grep -q "worker_units"; then
     worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
     echo $worker_units
@@ -651,7 +630,6 @@ if [[ -z "\$WORKER_NUM" ]]; then
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\${CUDNN_SETUP}\$COMMAND"
   else
     # Set up cuDNN environment and start interactive shell
-    # Using env to pass environment variables to the new bash process
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
   fi
 else
