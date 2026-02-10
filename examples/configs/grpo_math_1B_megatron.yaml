@@ -90,7 +90,7 @@ policy:
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-    freeze_moe_router: true
+    freeze_moe_router: false
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
@@ -100,6 +100,19 @@ policy:
     moe_shared_expert_overlap: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+
+    peft:
+      enabled: true
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
     
     optimizer:
       optimizer: "adam"
