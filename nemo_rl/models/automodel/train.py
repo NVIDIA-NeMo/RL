@@ -37,6 +37,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
+    get_distilllation_topk_logprobs_from_logits,
     get_logprobs_from_logits,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -507,8 +508,10 @@ class LossPostProcessor:
         """
         from nemo_rl.algorithms.loss_functions import (
             ClippedPGLossFn,
+            DistillationLossFn,
             DPOLossFn,
             NLLLoss,
+            PreferenceLoss,
         )
 
         # Handle CP redistribution
@@ -533,7 +536,27 @@ class LossPostProcessor:
 
                 loss_fn_args = (logprobs,)
 
-            # TODO: PreferenceLoss, DistillationLossFn
+            elif isinstance(self.loss_fn, PreferenceLoss):
+                loss_fn_args = (logits,)
+
+            elif isinstance(self.loss_fn, DistillationLossFn):
+                calculate_entropy = (
+                    self.loss_fn.zero_outside_topk and self.loss_fn.kl_type != "forward"
+                )
+                student_topk_logprobs, teacher_topk_logprobs, H_all = (
+                    get_distilllation_topk_logprobs_from_logits(
+                        student_logits=logits,
+                        teacher_topk_logits=mb["teacher_topk_logits"],
+                        teacher_topk_indices=mb["teacher_topk_indices"],
+                        zero_outside_topk=self.loss_fn.zero_outside_topk,
+                        calculate_entropy=calculate_entropy,
+                    )
+                )
+
+                loss_fn_args = (student_topk_logprobs, teacher_topk_logprobs, H_all)
+
+            else:
+                raise ValueError(f"Unknown loss function type: {type(self.loss_fn)}")
 
             return loss_fn_args
 
