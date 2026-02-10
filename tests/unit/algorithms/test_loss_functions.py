@@ -26,7 +26,10 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import get_logprobs_from_logits
+from nemo_rl.distributed.model_utils import (
+    get_distilllation_topk_logprobs_from_logits,
+    get_logprobs_from_logits,
+)
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
@@ -1753,8 +1756,17 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
         }
     )
 
+    calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=student_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, metrics = loss_fn(
-        student_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1797,8 +1809,17 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
         }
     )
 
-    loss, metrics = loss_fn(
-        student_logits,
+    calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=student_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
+    loss, _ = loss_fn(
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1836,13 +1857,13 @@ def test_distillation_loss_invalid_k_zero():
 
     # This should raise a ValueError for k=0
     with pytest.raises(ValueError, match="topk must be positive"):
-        loss_fn(
-            student_logits,
-            data,
-            global_valid_seqs=torch.sum(data["sample_mask"]),
-            global_valid_toks=torch.sum(
-                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
-            ),
+        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        _ = get_distilllation_topk_logprobs_from_logits(
+            student_logits=student_logits,
+            teacher_topk_logits=data["teacher_topk_logits"],
+            teacher_topk_indices=data["teacher_topk_indices"],
+            zero_outside_topk=loss_fn.zero_outside_topk,
+            calculate_entropy=calculate_entropy,
         )
 
 
@@ -1861,8 +1882,17 @@ def test_distillation_loss_gradient_flow():
         }
     )
 
+    calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=student_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, _ = loss_fn(
-        student_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1894,8 +1924,17 @@ def test_distillation_loss_edge_cases():
 
     # Test with all-zero logits
     zero_logits = torch.zeros_like(student_logits)
+    calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=zero_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, _ = loss_fn(
-        zero_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1907,8 +1946,16 @@ def test_distillation_loss_edge_cases():
 
     # Test with very large logits
     large_logits = torch.ones_like(student_logits) * 100.0
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=large_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, _ = loss_fn(
-        large_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1920,8 +1967,16 @@ def test_distillation_loss_edge_cases():
 
     # Test with very small logits
     small_logits = torch.ones_like(student_logits) * -100.0
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=small_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, _ = loss_fn(
-        small_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
@@ -1969,8 +2024,17 @@ def test_distillation_loss_fn_call():
         }
     )
 
+    calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+        student_logits=student_logits,
+        teacher_topk_logits=data["teacher_topk_logits"],
+        teacher_topk_indices=data["teacher_topk_indices"],
+        zero_outside_topk=loss_fn.zero_outside_topk,
+        calculate_entropy=calculate_entropy,
+    )
+
     loss, metrics = loss_fn(
-        student_logits,
+        *loss_fn_args,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(
