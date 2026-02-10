@@ -1,6 +1,6 @@
 # Generation Interface
 
-This document explains the token generation interface and various backends for the NeMo RL framework. The generation system is designed with a unified interface that allows different backends (like VLLM, Hugging Face, SGLang, and TRT-LLM) to provide token generation capabilities while adhering to the same API.
+This document explains the token generation interface and various backends for the NeMo RL framework. The generation system is designed with a unified interface that allows different backends (like VLLM, Megatron, Hugging Face, SGLang, and TRT-LLM) to provide token generation capabilities while adhering to the same API.
 
 ## Generation Interface
 
@@ -12,7 +12,7 @@ The core of the generation system is defined in `interfaces.py`, which establish
    ```python
    class GenerationConfig(TypedDict):
        """Configuration for generation."""
-       backend: str              # The backend to use (e.g., "vllm", "hf")
+       backend: str              # The backend to use (e.g., "vllm", "megatron", "hf")
        max_new_tokens: int       # Maximum number of tokens to generate
        temperature: float        # Sampling temperature
        top_p: float              # Top-p sampling parameter
@@ -60,6 +60,10 @@ The core of the generation system is defined in `interfaces.py`, which establish
 
 A key design principle for generation backends is that they process tokens directly, without involving the tokenizer. By ensuring that only tokens are exchanged, we eliminate the risk of inconsistencies arising from different tokenizer versions or specifications between the training and generation frameworks.
 
+## Generation Backends
+
+NeMo RL supports multiple generation backends that implement the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation for different use cases.
+
 ## VLLM Backend
 
 The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
@@ -90,9 +94,63 @@ The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backe
 2. Updating weights from IPC handles for efficient weight sharing.
 3. Checking if weights have been updated correctly.
 
-## Usage Example
+## Megatron Backend
 
-To use a generation backend:
+The Megatron backend provides native Megatron-Core inference capabilities, eliminating the need for weight conversion between training and generation. This backend is particularly beneficial when using Megatron for training, as it enables seamless integration and optimal performance.
+
+### Key Features
+
+1. **No Weight Conversion**: Uses the same Megatron model format for both training and generation, eliminating conversion overhead and potential inconsistencies.
+2. **CUDA Graph Support**: Leverages CUDA graphs for optimized inference performance.
+3. **Dynamic Inference Engine**: Utilizes Megatron Core's `DynamicInferenceEngine` for efficient batched generation.
+4. **Integrated with Training**: The generation capability is built directly into the `MegatronPolicyWorker`, enabling efficient co-located training and generation.
+
+### MegatronPolicyWorker Generation
+
+The Megatron generation backend is implemented within the {py:class}`MegatronPolicyWorker <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker>` class. The `generate <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker.generate>` method performs the following:
+
+1. Wraps the Megatron model with `GPTInferenceWrapper` for inference optimization.
+2. Creates a `DynamicInferenceContext` to manage inference state and memory.
+3. Initializes a `DynamicInferenceEngine` with CUDA graph support enabled.
+4. Processes batched requests with proper sampling parameters (temperature, top_k, top_p).
+5. Returns outputs conforming to {py:class}`GenerationOutputSpec <nemo_rl.models.generation.interfaces.GenerationOutputSpec>`.
+
+### Configuration
+
+To use the Megatron generation backend, configure your YAML file as follows:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    mcore_generation_config:
+      buffer_size_gb: 20              # Memory buffer size for inference context
+      buffer_guaranteed_fraction: 0.1  # Fraction of buffer guaranteed to be available for active requests
+      num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
+      max_tokens: 16384                # Maximum number of tokens for inference
+```
+
+### Configuration Parameters
+
+The `mcore_generation_config` section controls Megatron Core inference engine behavior:
+
+- **buffer_size_gb**: Total memory buffer size (in GB) allocated for the dynamic inference context. This determines how much GPU memory is reserved for KV caches and intermediate states. Keeping this higher will pull in more requests at once. 
+- **buffer_guaranteed_fraction**: Fraction of the buffer that is guaranteed to be available (between 0.0 and 1.0). This helps to make sure that there is always some memory for active requests to complete. 
+- **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
+- **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
+
+
+## Usage Examples
+
+### Using VLLM Backend
+
+To use the VLLM generation backend:
 
 ```python
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -132,6 +190,32 @@ generator.prepare_for_generation()
 output = generator.generate(input_data, greedy=False)
 generator.finish_generation()
 ```
+
+### Using Megatron Backend
+
+To use the Megatron generation backend, configure your YAML file:
+
+```yaml
+policy:
+  model_name: meta-llama/Llama-3.2-1B-Instruct
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    mcore_generation_config:
+      buffer_size_gb: 20
+      buffer_guaranteed_fraction: 0.1
+      num_cuda_graphs: 16
+      max_tokens: 16384
+```
+
+For a complete example, see:
+- **Configuration**: `examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`
+- **Test Script**: `tests/functional/grpo_megatron_generation.sh`
 
 ## Extend with New Backends
 

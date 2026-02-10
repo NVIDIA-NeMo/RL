@@ -1,0 +1,19 @@
+defaults: ./grpo-qwen3-30ba3b-8n8g-megatron.yaml
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 2
+  make_sequence_length_divisible_by: 2
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-8n4g-megatron
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-8n4g-megatron
+  wandb:
+    name: grpo-qwen3-30ba3b-8n4g-megatron
+cluster:
+  gpus_per_node: 4
+

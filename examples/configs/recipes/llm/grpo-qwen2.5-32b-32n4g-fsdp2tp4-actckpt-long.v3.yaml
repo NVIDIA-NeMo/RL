@@ -1,0 +1,17 @@
+defaults: ./grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long.v3.yaml
+policy:
+  dtensor_cfg:
+    tensor_parallel_size: 4
+  make_sequence_length_divisible_by: 4
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-32b-32n4g-fsdp2tp4-actckpt-long
+logger:
+  log_dir: logs/grpo-qwen2.5-32b-32n4g-fsdp2tp4-actckpt-long
+  wandb:
+    name: grpo-qwen2.5-32b-32n4g-fsdp2tp4-actckpt-long
+cluster:
+  gpus_per_node: 4
+

@@ -47,19 +47,16 @@ class VllmInternalWorkerExtension:
         train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank()
         # Place vLLM ranks after all training ranks so all training workers can join
         rank = train_world_size + rank_prefix + local_rank
 
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size
+        self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+            master_address=ip, port=port, rank=rank, world_size=world_size
         )
-        self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-            pg, device=self.device
-        )
+        self.model_update_group.init_nccl_communicator(device=self.device)
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -96,6 +93,35 @@ class VllmInternalWorkerExtension:
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+    def _maybe_process_fp8_kv_cache(self) -> None:
+        """Process weights after loading for FP8 KV cache (static scales)."""
+        use_fp8_kv_cache = False
+        if hasattr(self.model_runner.vllm_config, "cache_config"):
+            kv_cache_dtype = getattr(
+                self.model_runner.vllm_config.cache_config, "cache_dtype", None
+            )
+            use_fp8_kv_cache = (
+                kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+            )
+
+        if not use_fp8_kv_cache:
+            return
+
+        # FP8 KV cache: process KV scales after weight loading
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        # Get target device for processing
+        target_device = next(self.model_runner.model.parameters()).device
+
+        # Call process_weights_after_loading to handle KV scales
+        process_weights_after_loading(
+            self.model_runner.model,
+            self.model_runner.model_config,
+            target_device,
+        )
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -114,6 +140,13 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.model_executor.model_loader.utils import (
+                        process_weights_after_loading,
+                    )
+
+                    process_weights_after_loading(
+                        self.model_runner.model, self.model_config, self.device
+                    )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
@@ -141,7 +174,7 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
                 # Load weights into the model
-                from nemo_rl.models.generation import fp8
+                from nemo_rl.models.generation.vllm.quantization import fp8
 
                 if fp8.is_fp8_model(self.model_runner.vllm_config):
                     # the fp8 load_weights additionally casts bf16 weights into fp8
@@ -160,6 +193,9 @@ class VllmInternalWorkerExtension:
                 weights = None
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+            # Process weights after loading for FP8 KV cache
+            self._maybe_process_fp8_kv_cache()
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -191,7 +227,7 @@ class VllmInternalWorkerExtension:
             Returns:
                 None
             """
-            from nemo_rl.models.generation import fp8
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
             if fp8.is_fp8_model(model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
@@ -208,6 +244,10 @@ class VllmInternalWorkerExtension:
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+
+            # Process weights after loading for FP8 KV cache
+            self._maybe_process_fp8_kv_cache()
+
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

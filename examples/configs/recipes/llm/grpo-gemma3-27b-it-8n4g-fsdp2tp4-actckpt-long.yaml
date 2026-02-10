@@ -1,0 +1,17 @@
+defaults: ./grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml
+policy:
+  dtensor_cfg:
+    tensor_parallel_size: 4
+  make_sequence_length_divisible_by: 4
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+checkpointing:
+  checkpoint_dir: results/grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long
+logger:
+  log_dir: logs/grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long
+  wandb:
+    name: grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long
+cluster:
+  gpus_per_node: 4
+

@@ -19,7 +19,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo_rm.py \
+    $PROJECT_ROOT/examples/run_grpo.py \
     --config examples/configs/grpo_rm_1B.yaml \
     policy.model_name=Qwen/Qwen2.5-1.5B \
     grpo.num_prompts_per_step=2 \

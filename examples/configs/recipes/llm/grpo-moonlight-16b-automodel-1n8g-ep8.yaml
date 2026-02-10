@@ -1,0 +1,60 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: -1
+loss_fn:
+  reference_policy_kl_penalty: 0.04
+checkpointing:
+  checkpoint_dir: results/grpo-moonlight-16b-a3b-instruct-automodel-1n8g-ep8
+  enabled: false
+  save_period: 10000
+policy:
+  model_name: moonshotai/Moonlight-16B-A3B-Instruct
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
+  activation_checkpointing_enabled: false
+  dtensor_cfg:
+    expert_parallel_size: 8
+    clear_cache_every_n_steps: 50
+    automodel_kwargs:
+      use_liger_kernel: false
+      backend:
+        _target_: nemo_automodel.components.moe.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: false
+        gate_precision: float64
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 4
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1
+      total_iters: 13
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1
+      total_iters: 10000000000
+  - milestones:
+    - 13
+data:
+  max_input_seq_length: 4096
+cluster:
+  gpus_per_node: 8
+logger:
+  log_dir: logs/grpo-moonlight-16b-a3b-instruct-automodel-1n8g-ep8
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-moonlight-16b-a3b-instruct-automodel-1n8g-ep8
