@@ -21,11 +21,11 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
-GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
+GIT_REF=${2:-4a5299c93ff97c26def537b92562df5ada530fea}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
-VLLM_WHEEL_COMMIT=${3:-862f2ef893d9751db0a92bd2d4ae0e3d9677872f}  # use full commit hash from the main branch
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+VLLM_WHEEL_COMMIT=${3:-4a5299c93ff97c26def537b92562df5ada530fea}  # merge commit of vllm PR #24322 (spec decode with draft models)
+export VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-0.14.0rc2.dev156%2Bg4a5299c93-cp38-abi3-manylinux_2_31_x86_64.whl}"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then

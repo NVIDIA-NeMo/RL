@@ -76,7 +76,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.11.2",
+  "vllm>=0.12",
   "num2words>=0.5.14",
 ]
 sglang = [

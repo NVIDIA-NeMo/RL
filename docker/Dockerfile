@@ -114,7 +114,8 @@ fi
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
-uv sync --link-mode symlink --locked --extra sglang --no-install-project
+# Skipped: sgl-kernel build broken (DeepGEMM ref 54f99a8 missing upstream)
+# uv sync --link-mode symlink --locked --extra sglang --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
