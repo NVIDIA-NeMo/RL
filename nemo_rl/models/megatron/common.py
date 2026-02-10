@@ -30,7 +30,8 @@ from megatron.core.transformer.moe.moe_utils import (
     reduce_aux_losses_tracker_across_ranks,
 )
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 

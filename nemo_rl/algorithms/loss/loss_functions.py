@@ -11,62 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
-from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, TypeVar
 
 import torch
-import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss.config import (
+    ClippedPGLossConfig,
+    ClippedPGLossDataDict,
+    DistillationLossConfig,
+    DistillationLossDataDict,
+    DPOLossConfig,
+    DPOLossDataDict,
+    PreferenceLossDataDict,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
-
-
-class ClippedPGLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    reference_policy_kl_type: str
-    kl_input_clamp_value: float | None
-    kl_output_clamp_value: float | None
-    ratio_clip_min: float
-    ratio_clip_max: float
-    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
-    ratio_clip_c: float | None
-    use_on_policy_kl_approximation: bool
-    use_importance_sampling_correction: bool
-    truncated_importance_sampling_ratio: float | None
-    # Type of truncated importance sampling: "tis" (clamp max) or "icepop" (filter [min, max])
-    truncated_importance_sampling_type: NotRequired[str | None]
-    # Lower bound for ICE-POP filtering (default 0.5)
-    truncated_importance_sampling_ratio_min: NotRequired[float | None]
-    token_level_loss: bool
-    # If True, apply the off-policy importance-sampling correction at the
-    # sequence level (one weight per generated sample), as in GSPO.
-    # If False (default), correction is applied at the token level as in the
-    # original GRPO paper.
-    sequence_level_importance_ratios: NotRequired[bool]
-    disable_ppo_ratio: NotRequired[bool]
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
-    # NOTE: This should only be used when doing exactly one update per rollout
-    # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
-    force_on_policy_ratio: NotRequired[bool]
-    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
-    use_kl_in_reward: NotRequired[bool]
-
-
-class ClippedPGLossDataDict(TypedDict):
-    """Required keys for the Clipped Policy Gradient loss function."""
-
-    input_ids: torch.Tensor
-    advantages: torch.Tensor
-    prev_logprobs: torch.Tensor
-    generation_logprobs: torch.Tensor
-    reference_policy_logprobs: torch.Tensor
-    token_mask: torch.Tensor
-    sample_mask: torch.Tensor
-    __extra__: Any
 
 
 class ClippedPGLossFn(LossFunction):
@@ -486,7 +448,7 @@ class ClippedPGLossFn(LossFunction):
         )
 
 
-class NLLLoss(LossFunction):
+class NLLLossFn(LossFunction):
     """Negative Log Likelihood Loss function."""
 
     loss_type = LossType.TOKEN_LEVEL
@@ -529,15 +491,7 @@ class NLLLoss(LossFunction):
         }
 
 
-class PreferenceLossDataDict(TypedDict):
-    """Required keys for the preference loss function."""
-
-    input_ids: torch.Tensor
-    token_mask: torch.Tensor
-    sample_mask: torch.Tensor
-
-
-class PreferenceLoss(LossFunction):
+class PreferenceLossFn(LossFunction):
     """Preference Loss function.
 
     Optimizes the model to prefer chosen responses over rejected ones
@@ -633,24 +587,7 @@ class PreferenceLoss(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
-
-
-class DPOLossDataDict(TypedDict):
-    """Required keys for the DPO loss function."""
-
-    input_ids: torch.Tensor
-    reference_policy_logprobs: torch.Tensor
-    token_mask: torch.Tensor
-    sample_mask: torch.Tensor
-
-
-class DPOLossFn(PreferenceLoss):
+class DPOLossFn(PreferenceLossFn):
     """Direct Preference Optimization (DPO) loss function.
 
     This loss function implements the DPO algorithm as described in:
@@ -712,7 +649,7 @@ class DPOLossFn(PreferenceLoss):
         self.sft_loss_weight = cfg["sft_loss_weight"]
         self.preference_average_log_probs = cfg["preference_average_log_probs"]
         self.sft_average_log_probs = cfg["sft_average_log_probs"]
-        self.sft_loss = NLLLoss()
+        self.sft_loss = NLLLossFn()
 
         self.loss_type = LossType.SEQUENCE_LEVEL
 
@@ -789,123 +726,6 @@ class DPOLossFn(PreferenceLoss):
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
         }
-
-
-class SequencePackingLossWrapper:
-    def __init__(
-        self,
-        loss_fn: LossFunction,
-        prepare_fn: Callable[Any, Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    ):
-        self.loss_fn = loss_fn
-        self.prepare_fn = prepare_fn
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = cu_seqlens_q_padded
-        self.vocab_parallel_rank = vocab_parallel_rank
-        self.vocab_parallel_group = vocab_parallel_group
-        self.context_parallel_group = context_parallel_group
-
-    def __call__(
-        self,
-        next_token_logits: Tensor,
-        data: BatchedDataDict[Any],
-        global_valid_seqs: Tensor | None,
-        global_valid_toks: Tensor | None,
-    ) -> tuple[Tensor, dict[str, Any]]:
-        """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
-        unpadded_cu_seqlens = self.cu_seqlens_q
-        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if self.cu_seqlens_q_padded is not None:
-            padded_cu_seqlens = self.cu_seqlens_q_padded
-            padded_seq_lengths = (
-                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
-            )
-        else:
-            padded_cu_seqlens = unpadded_cu_seqlens
-            padded_seq_lengths = unpadded_seq_lengths
-        seq_starts = padded_cu_seqlens[:-1]
-        seq_ends = padded_cu_seqlens[1:]
-
-        loss_accum = 0
-        metrics_accum = {}
-        for seq_idx in range(len(seq_starts)):
-            seq_start = seq_starts[seq_idx].item()
-            seq_end = seq_ends[seq_idx].item()
-
-            # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
-            seq_data = data.slice(seq_idx, seq_idx + 1)
-            unpadded_seq_data = {}
-            for k, v in seq_data.items():
-                if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:
-                    unpadded_seq_data[k] = v[:, : unpadded_seq_lengths[seq_idx]]
-                else:
-                    unpadded_seq_data[k] = v
-
-            # get next_token_logits
-            cp_size = (
-                1
-                if self.context_parallel_group is None
-                else torch.distributed.get_world_size(self.context_parallel_group)
-            )
-            logit_start = seq_start // cp_size
-            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
-            logit_length = logit_end - logit_start
-            next_token_logits_slice = next_token_logits.narrow(
-                1, logit_start, logit_length
-            )
-
-            # prepare data for loss function
-            loss_fn_args = self.prepare_fn(next_token_logits_slice, unpadded_seq_data)
-
-            loss, metrics = self.loss_fn(
-                *loss_fn_args,
-                unpadded_seq_data,
-                global_valid_seqs,
-                global_valid_toks,
-            )
-            loss_accum += loss
-            for k, v in metrics.items():
-                if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
-                        metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
-                        metrics_accum[k] = float("-inf")
-                    else:
-                        metrics_accum[k] = 0
-
-                val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
-
-                # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
-                    if not math.isinf(val):
-                        metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
-                    if not math.isinf(val):
-                        metrics_accum[k] = max(metrics_accum[k], val)
-                else:
-                    metrics_accum[k] += val
-
-        return loss_accum, metrics_accum
-
-
-class DistillationLossConfig(TypedDict):
-    kl_type: str
-    mixed_kl_weight: float
-    zero_outside_topk: bool
-
-
-class DistillationLossDataDict(TypedDict):
-    input_ids: torch.Tensor
-    input_lengths: torch.Tensor
-    token_mask: torch.Tensor
-    sample_mask: torch.Tensor
-    teacher_topk_logits: torch.Tensor
-    teacher_topk_indices: torch.Tensor
 
 
 class DistillationLossFn(LossFunction):

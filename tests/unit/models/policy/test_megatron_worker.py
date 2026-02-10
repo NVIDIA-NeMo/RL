@@ -22,11 +22,11 @@ import ray
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DPOLossFn,
-    NLLLoss,
+    NLLLossFn,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -825,7 +825,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     )
 
     # Test loss functions
-    nll_loss_fn = NLLLoss()
+    nll_loss_fn = NLLLossFn()
     pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     policy1.prepare_for_training()
@@ -903,7 +903,7 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
     )
 
     tokenizer = get_tokenizer({"name": tiny_llama_model_path})
-    nll_loss_fn = NLLLoss()
+    nll_loss_fn = NLLLossFn()
 
     cluster1 = RayVirtualCluster(
         name="test-gradnorm-mbs1",
@@ -1843,7 +1843,7 @@ def test_megatron_sft_training(tiny_llama_model_path):
     )
 
     # Create NLL loss function for SFT
-    sft_loss_fn = NLLLoss()
+    sft_loss_fn = NLLLossFn()
 
     try:
         # Prepare for training
@@ -2360,7 +2360,7 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
         )
 
         # Use SimpleLoss for consistent comparison
-        loss_fn = NLLLoss()
+        loss_fn = NLLLossFn()
 
         try:
             # Prepare for training

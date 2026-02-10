@@ -19,10 +19,7 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.loss_functions import (
-    ClippedPGLossFn,
-    SequencePackingLossWrapper,
-)
+from nemo_rl.algorithms.loss import ClippedPGLossFn, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (

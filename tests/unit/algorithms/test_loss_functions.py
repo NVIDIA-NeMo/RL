@@ -17,12 +17,12 @@ from copy import deepcopy
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DistillationLossFn,
     DPOLossFn,
-    NLLLoss,
+    NLLLossFn,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -69,7 +69,7 @@ def test_nll_loss():
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn()
 
     vocab_size = 8
     data = {
@@ -131,7 +131,7 @@ def test_nll_loss():
         ),
     )
     ## loss per token is 999, and we have two unmasked tokens
-    ## NLLLoss averages the loss over unmasked tokens
+    ## NLLLossFn averages the loss over unmasked tokens
     torch.testing.assert_close(loss.cpu(), torch.tensor(999.0))
     assert metrics_dict["num_unmasked_tokens"] == 2
 
@@ -329,7 +329,7 @@ def test_dpo_sft_matches_nll_loss():
     next_token_logits = torch.randn((batch_size * 2, 5, vocab_size)).to("cuda")
 
     # Compute NLL loss
-    nll_loss_fn = NLLLoss()
+    nll_loss_fn = NLLLossFn()
     token_logprobs = get_logprobs_from_logits(
         sft_data["input_ids"], next_token_logits[::2]
     )

@@ -32,7 +32,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -506,12 +506,12 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
-        from nemo_rl.algorithms.loss_functions import (
+        from nemo_rl.algorithms.loss import (
             ClippedPGLossFn,
             DistillationLossFn,
             DPOLossFn,
-            NLLLoss,
-            PreferenceLoss,
+            NLLLossFn,
+            PreferenceLossFn,
         )
 
         # Handle CP redistribution
@@ -527,7 +527,7 @@ class LossPostProcessor:
         def prepare_for_loss_fn(
             logits: torch.Tensor, mb: BatchedDataDict[Any]
         ) -> tuple[Any]:
-            if isinstance(self.loss_fn, (ClippedPGLossFn, NLLLoss, DPOLossFn)):
+            if isinstance(self.loss_fn, (ClippedPGLossFn, NLLLossFn, DPOLossFn)):
                 logprobs = get_logprobs_from_logits(
                     input_ids=mb["input_ids"],
                     next_token_logits=logits,
@@ -536,7 +536,7 @@ class LossPostProcessor:
 
                 loss_fn_args = (logprobs,)
 
-            elif isinstance(self.loss_fn, PreferenceLoss):
+            elif isinstance(self.loss_fn, PreferenceLossFn):
                 loss_fn_args = (logits,)
 
             elif isinstance(self.loss_fn, DistillationLossFn):

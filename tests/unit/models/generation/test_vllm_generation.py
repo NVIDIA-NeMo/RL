@@ -23,7 +23,7 @@ import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -719,7 +719,7 @@ async def run_hf_train_process(
     1. Use vLLM for generation
     2. Use HF policy for training and logprob computation
     """
-    from tests.unit.test_utils import SimpleNLLLoss
+    from tests.unit.test_utils import SimpleNLLLossFn
 
     try:
         prompts = [
@@ -858,7 +858,7 @@ async def run_hf_train_process(
         lm_policy.prepare_for_training()
 
         # Just do one training step to verify it works
-        results = lm_policy.train(train_data, SimpleNLLLoss())
+        results = lm_policy.train(train_data, SimpleNLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         lm_policy.finish_training()
@@ -2164,7 +2164,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy.prepare_for_training()
 
         # Do one training step to verify it works
-        results = megatron_policy.train(train_data, NLLLoss())
+        results = megatron_policy.train(train_data, NLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
@@ -2331,7 +2331,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy.prepare_for_training()
 
         # Do one training step to verify it works
-        results = megatron_policy.train(train_data, NLLLoss())
+        results = megatron_policy.train(train_data, NLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
