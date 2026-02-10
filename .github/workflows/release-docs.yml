@@ -20,9 +20,14 @@ on:
         required: true
         type: boolean
         default: true
+      docs-version-override:
+        description: Docs version override. If not provided, defaults to the version of the commit's tag.
+        required: false
+        type: string
+        default: ""
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
-        required: true
+        required: false
         type: string
 
 jobs:
@@ -36,7 +41,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.67.2
+          ref: v0.71.0
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
@@ -51,6 +56,7 @@ jobs:
           artifacts-path: _build/html
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
           overwrite-latest-on-tag: false
+          docs-version-override: ${{ inputs.docs-version-override }}
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: rl-publish-docs-${{ github.run_id }}
           aws-region: ${{ vars.DOCS_AWS_REGION }}
