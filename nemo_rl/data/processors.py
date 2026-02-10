@@ -14,6 +14,7 @@
 
 """Contains data processors for evaluation."""
 
+import json
 import logging
 from typing import Any, Dict, cast
 
@@ -663,6 +664,27 @@ def multichoice_qa_processor(
     return output
 
 
+def nemo_gym_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym."""
+    output: DatumSpec = {
+        # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
+        "extra_env_info": json.loads(datum_dict["extra_env_info"]),
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        # fake keys for compatibility with the current GRPO implementation
+        "message_log": [{"role": "user", "content": "", "token_ids": torch.tensor([])}],
+        "length": 0,
+    }
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -679,6 +701,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
+        "nemo_gym_data_processor": nemo_gym_data_processor,
     },
 )
 
