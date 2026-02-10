@@ -1329,7 +1329,7 @@ class GetPackSequenceParametersTestActor:
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
         }
-        max_seq_len = 1024
+        max_seq_len = 1023
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
             megatron_cfg, max_seq_len
@@ -1515,10 +1515,14 @@ class GetPackSequenceParametersTestActor:
 
         expected_individual = 2 * 2 * 2  # cp_size * 2 * tp_size
         expected_packed = 16 * 2 * 2 * 2  # divisor * cp_size * 2 * tp_size
+
+        def _round_up_to_multiple_of(x, y):
+            return (x + y - 1) // y * y
+
         if (
             pad_individual != expected_individual
             or pad_packed != expected_packed
-            or pad_to != max_seq_len
+            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
         ):
             return {
                 "success": False,
@@ -1666,14 +1670,12 @@ class GetPackSequenceParametersTestActor:
         )
 
         expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = (
-            32 * 4 * 2 * 2 * 4
-        )  # divisor * cp_size * 2 * tp_size * pp_size
+        expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size * pp_size
 
         if (
             pad_individual != expected_individual
             or pad_packed != expected_packed
-            or pad_to != max_seq_len
+            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
         ):
             return {
                 "success": False,
