@@ -48,9 +48,11 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -739,6 +741,7 @@ def setup_model_and_optimizer(
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -865,21 +868,67 @@ def setup_reference_model_state(
     if config["megatron_cfg"].get("freeze_moe_router", False):
         ref_mixed_precision_wrapper = MoEFloat16Module
 
+    ref_pre_wrap_hooks = []
+    use_peft = config["megatron_cfg"].get("peft", {}).get("enabled", False)
+    
+    if use_peft:
+        peft_cfg = config["megatron_cfg"].get("peft", {})
+        peft = LoRA(
+            target_modules=peft_cfg["target_modules"],
+            exclude_modules=peft_cfg["exclude_modules"],
+            dim=peft_cfg["dim"],
+            alpha=peft_cfg["alpha"],
+            dropout=peft_cfg["dropout"],
+            dropout_position=peft_cfg["dropout_position"],
+            lora_A_init_method=peft_cfg["lora_A_init_method"],
+            lora_B_init_method=peft_cfg["lora_B_init_method"],
+            a2a_experimental=peft_cfg["a2a_experimental"],
+            lora_dtype=peft_cfg["lora_dtype"],
+        )
+    else:
+        peft = None
+
+    ref_megatron_cfg.peft = peft
+
+    if ref_megatron_cfg is not None:
+        pre_peft_hook = _create_peft_pre_wrap_hook(ref_megatron_cfg, ref_state)
+        ref_megatron_cfg.model.register_pre_wrap_hook(pre_peft_hook)
+
+        def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+            model = pre_peft_hook(model)
+            return model
+
+        ref_pre_wrap_hooks.extend([composed_peft_hook])
+
     reference_model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        pre_wrap_hook=megatron_cfg.rng.data_parallel_random_init,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        pre_wrap_hook=ref_pre_wrap_hooks,
         mixed_precision_wrapper=ref_mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups()
     )
+
+    if use_peft:
+        should_load_checkpoint = ref_checkpoint_config.load is not None and checkpoint_exists(
+            ref_checkpoint_config.load
+        )
+        if should_load_checkpoint:
+            # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
+            # This is switched off here in order to load these states from the checkpoint
+            ref_megatron_cfg.checkpoint.finetune = False
+    else:
+        should_load_checkpoint = (
+            ref_checkpoint_config.pretrained_checkpoint is not None
+            and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
+        )
 
     print("Loading the Reference Model")
     reference_state_dict = {}
 
-    if ref_checkpoint_config.pretrained_checkpoint is not None and checkpoint_exists(
-        ref_checkpoint_config.pretrained_checkpoint
-    ):
+    if should_load_checkpoint:
         load_checkpoint(
             ref_state,
             reference_model,
@@ -890,7 +939,10 @@ def setup_reference_model_state(
         )
         reference_model = reference_model[0]
         reference_model.eval()
+    else:
+        print("Reference model not loaded")
 
+    if should_load_checkpoint or use_peft:
         # Store reference state dict on CPU
         for name, item in reference_model.state_dict().items():
             if isinstance(item, torch.Tensor):
@@ -900,8 +952,6 @@ def setup_reference_model_state(
                 cpu_item = item
             reference_state_dict[name] = cpu_item
         print("Reference model loaded")
-    else:
-        print("Reference model not loaded")
 
     return reference_state_dict
 

@@ -10,7 +10,6 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
-  val_at_end: false
   max_val_samples: 256
   val_batch_size: 256
   async_grpo:
@@ -44,7 +43,7 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 64 # Only used when generating using megatron backend
-  logprob_batch_size: ${policy.train_micro_batch_size}
+  logprob_batch_size: 8
   max_total_sequence_length: 512
   precision: "bfloat16"
 
@@ -90,7 +89,7 @@ policy:
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-    freeze_moe_router: true
+    freeze_moe_router: false
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
