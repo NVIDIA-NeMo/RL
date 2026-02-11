@@ -188,6 +188,8 @@ class GeneralConversationsJsonlDataset:
         self,
         data_path: str,
         media_data_dir: Optional[str] = None,
+        split_validation_size: float = 0,
+        seed: int = 42,
         **kwargs
     ):
         self.media_data_dir = media_data_dir
@@ -197,6 +199,10 @@ class GeneralConversationsJsonlDataset:
         )
 
         self.preprocessor = partial(self._datum_preprocessor, media_directory=media_data_dir)
+
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
 
     @classmethod
     def process_message_fragment(cls, tag: str, fragment: Any, media_directory: Optional[str] = None) -> dict[str, Any]:

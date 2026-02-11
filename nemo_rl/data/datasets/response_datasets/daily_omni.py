@@ -32,7 +32,7 @@ class DailyOmniDataset(RawDataset):
 
     task_name = "daily-omni"
 
-    def __init__(self, split: str = "train", **kwargs):
+    def __init__(self, split: str = "train", split_validation_size: float = 0, seed: int = 42, **kwargs):
         # train, valA, and valB are supported splits.
         SPLIT_TO_HF_NAME = {
             "train": "liarliar/Daily-Omni",
@@ -83,6 +83,10 @@ class DailyOmniDataset(RawDataset):
         )
 
         self.preprocessor = self.format_data
+
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
 
     @classmethod
     def get_prompt(cls, data: dict[str, Any]) -> str:
