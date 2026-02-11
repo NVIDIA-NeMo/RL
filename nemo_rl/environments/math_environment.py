@@ -323,9 +323,9 @@ class HFMultiRewardVerifyWorker:
                         f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify'"
                     )
 
-                results[0].extend(float(cor_reward))
-                results[1].extend(float(int_reward))
-                results[2].extend(float(format_reward))
+                results[0].extend(cor_reward)
+                results[1].extend(int_reward)
+                results[2].extend(format_reward)
 
                 if return_extracted_answer:
                     # Make sure the extracted answer is not None and is a list of two elements
@@ -354,7 +354,8 @@ class HFMultiRewardVerifyWorker:
             # print(f"return_extracted_answer results {len(results)}")
             return results, extracted_answers
         else:
-            # print(f"results {len(results)}")
+            print(f"results {len(results)}")
+            print(f"results {results}")
             return results
             # return results --> [[0,1,0], [0,2,0], .........]
 
@@ -644,7 +645,9 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).T.cpu() ## Shape Batch_size, Number_rewards
         print(f"rewards ??? {rewards.shape}")
-        done = torch.ones_like(rewards[0]).cpu()
+        ## hard fixed this done to
+        # done = torch.ones_like(rewards[0]).cpu()
+        done = torch.ones(rewards.shape[0]).cpu()
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(
