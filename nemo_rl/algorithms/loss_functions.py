@@ -209,9 +209,17 @@ class ClippedPGLossFn(LossFunction):
             assert "prev_logprobs" not in data, (
                 "prev_logprobs should not be in data when use_curr_logprobs_as_prev_logprobs is True"
             )
+            print(
+                f"use_curr_logprobs_as_prev_logprobs is True, curr_logprobs: {curr_logprobs.shape}",
+                flush=True,
+            )
             prev_logprobs = curr_logprobs.detach()
         else:
             prev_logprobs = data["prev_logprobs"][:, 1:]
+            print(
+                f"use_curr_logprobs_as_prev_logprobs is False, prev_logprobs: {prev_logprobs.shape}",
+                flush=True,
+            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 

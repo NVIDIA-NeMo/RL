@@ -1528,15 +1528,15 @@ def grpo_train(
                         master_config["policy"]["train_global_batch_size"]
                         == rollout_global_batch_size
                     )
+                    # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
+                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": train_data["input_ids"],
+                            "input_lengths": train_data["input_lengths"],
+                            **extra_multimodal_data,
+                        }
+                    )
                     if not use_curr_logprobs_as_prev_logprobs:
-                        # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
-                        logprob_data = BatchedDataDict[ClippedPGLossDataDict](
-                            {
-                                "input_ids": train_data["input_ids"],
-                                "input_lengths": train_data["input_lengths"],
-                                **extra_multimodal_data,
-                            }
-                        )
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
                         )["logprobs"]
