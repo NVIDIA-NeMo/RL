@@ -1329,7 +1329,7 @@ class GetPackSequenceParametersTestActor:
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
         }
-        max_seq_len = 1024
+        max_seq_len = 1023
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
             megatron_cfg, max_seq_len
@@ -1443,7 +1443,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": True},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1462,7 +1467,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1481,7 +1491,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 4,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1506,7 +1521,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 4,
             "context_parallel_size": 2,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "other"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1515,10 +1535,14 @@ class GetPackSequenceParametersTestActor:
 
         expected_individual = 2 * 2 * 2  # cp_size * 2 * tp_size
         expected_packed = 16 * 2 * 2 * 2  # divisor * cp_size * 2 * tp_size
+
+        def _round_up_to_multiple_of(x, y):
+            return (x + y - 1) // y * y
+
         if (
             pad_individual != expected_individual
             or pad_packed != expected_packed
-            or pad_to != max_seq_len
+            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
         ):
             return {
                 "success": False,
@@ -1531,7 +1555,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": False},
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1569,7 +1598,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 8,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1606,6 +1640,92 @@ class GetPackSequenceParametersTestActor:
                     "success": False,
                     "error": f"Expected pad_individual=1, pad_packed=1, pad_to={test_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
                 }
+
+        # Test 15: FP8 with MXFP8 recipe
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 32 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Expected pad_individual=1, pad_packed=32, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 16: FP8 with MXFP8 recipe, CP, and TP+SP
+        megatron_cfg = {
+            "tensor_model_parallel_size": 2,
+            "sequence_parallel": True,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 4,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, max_seq_len
+        )
+
+        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
+        expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
+
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to is not None
+        ):
+            return {
+                "success": False,
+                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 17: FP8 with MXFP8 recipe, CP, TP+SP, and PP
+        megatron_cfg = {
+            "tensor_model_parallel_size": 2,
+            "sequence_parallel": True,
+            "pipeline_model_parallel_size": 4,
+            "context_parallel_size": 4,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, max_seq_len
+        )
+
+        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
+        expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size * pp_size
+
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
+        ):
+            return {
+                "success": False,
+                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to={max_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
 
         return {"success": True, "error": None}
 
