@@ -6,7 +6,7 @@ sft:
   val_global_batch_size: 8
 
 policy:
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 16384
   train_global_batch_size: 8
   dtensor_cfg:
     tensor_parallel_size: 1
@@ -14,7 +14,7 @@ policy:
     enabled: true
   tokenizer:
     video:
-      num_frames: 16
+      num_frames: 4
 
 data:
   # dataset
