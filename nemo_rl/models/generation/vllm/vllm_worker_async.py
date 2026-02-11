@@ -330,6 +330,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             openai_serving_models_kwargs["model_config"] = model_config
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
+        enforce_monotonicity = self.cfg["vllm_cfg"].get("enforce_monotonicity", True)
+
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
@@ -383,6 +385,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     tool_parser,
                     add_special_tokens,
                 )
+
+                if not enforce_monotonicity:
+                    return res
 
                 if request.required_prefix_token_ids is None:
                     return res
