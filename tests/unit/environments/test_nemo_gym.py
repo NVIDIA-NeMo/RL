@@ -43,9 +43,6 @@ except ImportError:
     nemo_gym = None
     NEMO_GYM_INSTALLED = False
 
-NEMO_GYM_ROLLOUT_MAX_RETRIES_TO_AVOID_LP_NAN = 3
-run_examples_called = 0
-
 
 @pytest.mark.skipif(
     not NEMO_GYM_INSTALLED,
