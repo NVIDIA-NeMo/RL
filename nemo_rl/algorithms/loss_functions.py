@@ -1143,6 +1143,12 @@ class SequencePackingFusionLossWrapper:
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     ):
+        assert hasattr(loss_fn, "_compute_loss_from_logprobs"), (
+            f"{type(loss_fn).__name__} does not implement _compute_loss_from_logprobs. "
+            "SequencePackingFusionLossWrapper requires a loss function with this method "
+            "(e.g., ClippedPGLossFn)."
+        )
+
         self.loss_fn = loss_fn
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
@@ -1198,6 +1204,11 @@ class SequencePackingFusionLossWrapper:
         unpacked_seqlen = data["input_ids"].shape[1]
 
         # Step 2: Compute logprobs from packed logits in a single shot.
+        assert vocab_parallel_rank is not None and vocab_parallel_group is not None, (
+            "SequencePackingFusionLossWrapper requires vocab_parallel_rank and vocab_parallel_group when converting "
+            "parallel logits to logprobs for packed sequences; ensure the caller provides "
+            "vocab_parallel_rank (and vocab_parallel_group)."
+        )
         curr_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             next_token_logits.to(torch.float32),
             packed_input_ids,
