@@ -34,10 +34,12 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args():
@@ -192,6 +194,7 @@ def setup_puzzle_data(
 def main():
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:

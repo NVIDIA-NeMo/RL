@@ -10,10 +10,16 @@
 </div>
 
 ## 📣 News
+* [02/04/2026] LoRA Support
+    * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
+    * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).
+    * Nano v3 LoRA recipes:
+        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * NeMo-Gym + NeMo-RL support
-    * 📊 [Coming soon] release run
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1Xgg8D7mNkWnz6t2uL8BbPfPb7UTkN1H0?usp=sharing) to get a head start on your experimentation.
 * [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [10/10/2025] **DAPO Algorithm Support**  
   NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm that extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.

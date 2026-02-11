@@ -136,6 +136,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
 
+        if (
+            not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
+            and "logprob_batch_size" in config
+            and tp_size >= 4
+        ):
+            sep_line = "\n" + ("-" * 80)
+            assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
+                f"{sep_line}\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "\n"
+                "Please choose either of the following solutions to avoid this issue:\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
+                "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
+                "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
+                "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
+                f"{sep_line}\n"
+            )
+
         if actual_world_size < model_parallel_size:
             raise ValueError(
                 f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
