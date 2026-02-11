@@ -1008,6 +1008,7 @@ class TestSetupModelAndOptimizer:
 class TestSetupReferenceModelState:
     """Tests for setup_reference_model_state function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.get_model")
@@ -1021,6 +1022,7 @@ class TestSetupReferenceModelState:
         mock_get_model,
         mock_global_state,
         mock_init_ckpt_context,
+        mock_pg_collection,
         capsys,
     ):
         """Test setup_reference_model_state when checkpoint exists."""
@@ -1077,6 +1079,7 @@ class TestSetupReferenceModelState:
 class TestFinalizeMegatronSetup:
     """Tests for finalize_megatron_setup function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup._update_model_config_funcs")
     @patch("nemo_rl.models.megatron.setup.build_tokenizer")
     @patch("nemo_rl.models.megatron.setup.AutoBridge")
@@ -1085,6 +1088,7 @@ class TestFinalizeMegatronSetup:
         mock_auto_bridge,
         mock_build_tokenizer,
         mock_update_model_config,
+        mock_pg_collection,
     ):
         """Test basic finalize_megatron_setup."""
         from nemo_rl.models.megatron.setup import finalize_megatron_setup
