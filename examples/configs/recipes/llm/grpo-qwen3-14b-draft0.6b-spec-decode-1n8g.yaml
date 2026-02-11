@@ -1,0 +1,40 @@
+defaults: /opt/nemo-rl/examples/configs/grpo_math_1B.yaml
+grpo:
+  max_num_steps: 200
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-14b-draft0.6b-spec-decode-1n8g
+policy:
+  model_name: Qwen/Qwen3-14B
+  tokenizer:
+    name: Qwen/Qwen3-14B
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.80
+      max_model_len: 2048
+    vllm_kwargs:
+      speculative_config:
+        method: draft_model
+        model: Qwen/Qwen3-0.6B
+        num_speculative_tokens: 5
+        draft_tensor_parallel_size: 2
+data:
+  max_input_seq_length: 1024
+logger:
+  log_dir: logs/grpo-qwen3-14b-draft0.6b-spec-decode-1n8g
+  wandb_enabled: false
+  tensorboard_enabled: true
+cluster:
+  gpus_per_node: 8
