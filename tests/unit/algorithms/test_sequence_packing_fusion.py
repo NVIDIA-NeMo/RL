@@ -32,8 +32,8 @@ import torch
 
 from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossFn, 
-    SequencePackingLossWrapper, 
     SequencePackingFusionLossWrapper,
+    SequencePackingLossWrapper, 
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -58,7 +58,7 @@ class SequencePackingLossWrapperBaselineActor:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         assert world_size == self.cp_size * self.tp_size, (
-            f"Expected WORLD_SIZE={self.cp_size*self.tp_size}, got {world_size}."
+            f"Expected WORLD_SIZE={self.cp_size * self.tp_size}, got {world_size}."
         )
 
         # ---------------------------------------------------------------------
@@ -73,12 +73,16 @@ class SequencePackingLossWrapperBaselineActor:
 
         # CP groups: one per tp_rank, varying cp coordinate
         for tp_rank in range(self.tp_size):
-            ranks = [cp_rank * self.tp_size + tp_rank for cp_rank in range(self.cp_size)]
+            ranks = [
+                cp_rank * self.tp_size + tp_rank for cp_rank in range(self.cp_size)
+            ]
             cp_groups.append(torch.distributed.new_group(ranks=ranks))
 
         # TP groups: one per cp_rank, varying tp coordinate
         for cp_rank in range(self.cp_size):
-            ranks = [cp_rank * self.tp_size + tp_rank for tp_rank in range(self.tp_size)]
+            ranks = [
+                cp_rank * self.tp_size + tp_rank for tp_rank in range(self.tp_size)
+            ]
             tp_groups.append(torch.distributed.new_group(ranks=ranks))
 
         my_tp_rank = rank % self.tp_size
@@ -109,14 +113,23 @@ class SequencePackingLossWrapperBaselineActor:
 
         # Variable lengths, but <= max_seq_len
         seq_lengths = torch.tensor(
-            [max_seq_len // 4, max_seq_len // 2, max_seq_len // 3, max_seq_len * 3 // 4],
+            [
+                max_seq_len // 4,
+                max_seq_len // 2,
+                max_seq_len // 3,
+                max_seq_len * 3 // 4,
+            ],
             dtype=torch.int32,
             device=device,
         )
 
         # Input ids + masks
-        input_ids = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-        token_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32, device=device)
+        input_ids = torch.zeros(
+            batch_size, max_seq_len, dtype=torch.long, device=device,
+        )
+        token_mask = torch.zeros(
+            batch_size, max_seq_len, dtype=torch.float32, device=device,
+        )
         for i in range(batch_size):
             L = int(seq_lengths[i].item())
             input_ids[i, :L] = torch.randint(0, vocab_size_total, (L,), device=device)
@@ -166,7 +179,11 @@ class SequencePackingLossWrapperBaselineActor:
         # ---------------------------------------------------------------------
         # Global logits (same across ranks), then slice by TP rank
         full_logits = torch.randn(
-            batch_size, max_seq_len, vocab_size_total, device=device, dtype=torch.float32
+            batch_size, 
+            max_seq_len, 
+            vocab_size_total, 
+            device=device, 
+            dtype=torch.float32,
         )
 
         def make_logits_and_packed_logits():
@@ -196,7 +213,8 @@ class SequencePackingLossWrapperBaselineActor:
                 tmp[:, :seq_len, :] = logits_local[i : i + 1, :seq_len, :]
                 packed_logits[
                     :,
-                    run_seq // self.cp_size : (run_seq + padded_seq_len) // self.cp_size,
+                    run_seq // self.cp_size : (run_seq + padded_seq_len)
+                    // self.cp_size,
                     :,
                 ] = _get_tokens_on_this_cp_rank(
                     tmp, torch.distributed.get_rank(cp_group), self.cp_size
@@ -242,7 +260,9 @@ class SequencePackingLossWrapperBaselineActor:
             "make_logits_and_packed_logits": make_logits_and_packed_logits,
         }
 
-    def run_compare_sequence_packing_wrappers(self, use_cached_packed_input_ids: bool = False):
+    def run_compare_sequence_packing_wrappers(
+        self, use_cached_packed_input_ids: bool = False,
+    ):
         """
         Compare helper (for when your candidate/fused wrapper exists):
         - Builds inputs ONCE
@@ -294,7 +314,9 @@ class SequencePackingLossWrapperBaselineActor:
             candidate_data_dict = BatchedDataDict(dict(data_dict))
             candidate_data_dict["packed_input_ids"] = tc["packed_input_ids"]
 
-        candidate_logits, candidate_packed_logits = tc["make_logits_and_packed_logits"]()
+        candidate_logits, candidate_packed_logits = tc[
+            "make_logits_and_packed_logits"
+        ]()
         candidate_loss, candidate_metrics = candidate_wrapper(
             candidate_packed_logits,
             candidate_data_dict,
@@ -324,9 +346,7 @@ class SequencePackingLossWrapperBaselineActor:
         }
 
 
-SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN = (
-    f"{SequencePackingLossWrapperBaselineActor.__module__}.SequencePackingLossWrapperBaselineActor"
-)
+SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN = f"{SequencePackingLossWrapperBaselineActor.__module__}.SequencePackingLossWrapperBaselineActor"
 
 @pytest.fixture
 def register_sequence_packing_loss_wrapper_baseline_actor():
@@ -341,12 +361,13 @@ def register_sequence_packing_loss_wrapper_baseline_actor():
 
     if SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
         if original_registry_value is None:
-            del ACTOR_ENVIRONMENT_REGISTRY[SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN]
+            del ACTOR_ENVIRONMENT_REGISTRY[
+                SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN
+            ]
         else:
-            ACTOR_ENVIRONMENT_REGISTRY[SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN] = (
-                original_registry_value
-            )
-
+            ACTOR_ENVIRONMENT_REGISTRY[
+                SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN
+            ] = original_registry_value
 
 @pytest.fixture(scope="function")
 def cluster_fixture(request):
@@ -395,8 +416,10 @@ def cluster_fixture(request):
     ids=["pack_on_the_fly", "cached_packed_input_ids"],
 )
 def test_sequence_packing_loss_wrapper_baseline_cp_tp(
-    cluster_fixture, register_sequence_packing_loss_wrapper_baseline_actor,
-    cp_tp, use_cached_packed_input_ids,
+    cluster_fixture, 
+    register_sequence_packing_loss_wrapper_baseline_actor,
+    cp_tp, 
+    use_cached_packed_input_ids,
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
