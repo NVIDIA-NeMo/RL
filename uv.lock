@@ -289,6 +289,12 @@ wheels = [
 ]
 
 [[package]]
+name = "accumulation-tree"
+version = "0.6.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/dc/4ffda8a22b6af3f41bcec07ddfebe723218976eaa016cefbc904634a4e85/accumulation_tree-0.6.4.tar.gz", hash = "sha256:5f907667e4106b5ba140b6b871e1902eb2a93d429b92f8a9f7ddb2bee7704334", size = 12635, upload-time = "2024-09-26T21:50:40.627Z" }
+
+[[package]]
 name = "aiobotocore"
 version = "2.24.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4559,11 +4565,11 @@ dependencies = [
     { name = "mlflow" },
     { name = "omegaconf" },
     { name = "openai" },
-    { name = "orjson" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-core" },
     { name = "ray", extra = ["default"] },
+    { name = "tdigest" },
     { name = "tqdm" },
     { name = "uvicorn" },
     { name = "uvloop" },
@@ -4610,7 +4616,6 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "omegaconf" },
     { name = "openai", specifier = "<=2.6.1" },
-    { name = "orjson" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "psutil" },
     { name = "pydantic" },
@@ -4622,6 +4627,7 @@ requires-dist = [
     { name = "ray", extras = ["default"] },
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "tdigest", specifier = ">=0.5.2.2" },
     { name = "tqdm" },
     { name = "uvicorn" },
     { name = "uvloop" },
@@ -4838,7 +4844,7 @@ requires-dist = [
     { name = "rich" },
     { name = "sentencepiece", marker = "extra == 'sglang'" },
     { name = "setuptools" },
-    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7" },
+    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508" },
     { name = "sglang", marker = "extra == 'sglang'", specifier = "==0.5.7" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
@@ -6864,6 +6870,12 @@ wheels = [
 ]
 
 [[package]]
+name = "pyudorandom"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/14/6fc20ea903eda547d6a255e995f8d4a09fdc3cf8bfacb6f85e6d669bc259/pyudorandom-1.0.0.tar.gz", hash = "sha256:f30a093a0170c15f9c7f87eb29f71f0f5fde995528b7c6dc4606d389e8c37755", size = 1599, upload-time = "2016-07-18T16:18:56.037Z" }
+
+[[package]]
 name = "pywin32"
 version = "311"
 source = { registry = "https://pypi.org/simple" }
@@ -7620,7 +7632,7 @@ wheels = [
 [[package]]
 name = "sgl-kernel"
 version = "0.3.20"
-source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7#232982a0dee4f0f9545189a7d9b6b9bb802e4910" }
+source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508#3167bcc01c3074d5739e8086757cd8c66077d508" }
 dependencies = [
     { name = "scikit-build-core" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -8187,6 +8199,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ec/fe/802052aecb21e3797b8f7902564ab6ea0d60ff8ca23952079064155d1ae1/tabulate-0.9.0.tar.gz", hash = "sha256:0095b12bf5966de529c0feb1fa08671671b3368eec77d7ef7ab114be2c068b3c", size = 81090, upload-time = "2022-10-06T17:21:48.54Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/40/44/4a5f08c96eb108af5cb50b41f76142f0afa346dfa99d5296fe7202a11854/tabulate-0.9.0-py3-none-any.whl", hash = "sha256:024ca478df22e9340661486f85298cff5f6dcdba14f3813e8830015b9ed1948f", size = 35252, upload-time = "2022-10-06T17:21:44.262Z" },
+]
+
+[[package]]
+name = "tdigest"
+version = "0.5.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accumulation-tree" },
+    { name = "pyudorandom" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/34/7e2f78d1ed0af7d0039ab2cff45b6bf8512234b9f178bb21713084a1f2f0/tdigest-0.5.2.2.tar.gz", hash = "sha256:8deffc8bac024761786f43d9444e3b6c91008cd690323e051f068820a7364d0e", size = 6549, upload-time = "2019-05-07T18:57:40.771Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/72/f420480118cbdd18eb761b9936f0a927957130659a638449575b4a4f0aa7/tdigest-0.5.2.2-py2.py3-none-any.whl", hash = "sha256:e32ff6ab62e4defdb93b816c831080d94dfa1efb68a9fa1e7976c237fa9375cb", size = 9445, upload-time = "2019-05-07T18:57:37.493Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/94/fd3853b98f39d10206b08f2737d2ec2dc6f46a42dc7b7e05f4f0162d13ee/tdigest-0.5.2.2-py3-none-any.whl", hash = "sha256:dd25f8d6e6be002192bba9e4b8c16491d36c10b389f50637818603d1f67c6fb2", size = 9440, upload-time = "2019-05-07T18:57:38.942Z" },
 ]
 
 [[package]]
