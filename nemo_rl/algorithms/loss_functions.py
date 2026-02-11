@@ -1163,9 +1163,7 @@ class SequencePackingFusionLossWrapper:
             1, total_packed_len, dtype=input_ids.dtype, device=input_ids.device
         )
         for i in range(batch_size):
-            actual_len = int(
-                (self.cu_seqlens_q[i + 1] - self.cu_seqlens_q[i]).item()
-            )
+            actual_len = int((self.cu_seqlens_q[i + 1] - self.cu_seqlens_q[i]).item())
             packed_start = int(self.cu_seqlens_q_padded[i].item())
             packed[0, packed_start : packed_start + actual_len] = input_ids[
                 i, :actual_len
