@@ -1,0 +1,30 @@
+defaults:
+  - sft_vlm_3B.yaml
+
+sft:
+  val_batches: 2
+  val_global_batch_size: 8
+
+policy:
+  max_total_sequence_length: 32768
+  train_global_batch_size: 8
+  dtensor_cfg:
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: true
+  tokenizer:
+    video:
+      num_frames: 16
+
+data:
+  # dataset
+  train:
+    dataset_name: daily-omni
+    split: train
+    split_validation_size: 0.05  # use 5% of the training data as validation data
+    seed: 42  # seed for train/validation split when split_validation_size > 0
+  validation:
+    dataset_name: null
+  # default settings for all datasets
+  default:
+    prompt_file: null

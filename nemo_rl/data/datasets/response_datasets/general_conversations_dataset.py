@@ -214,6 +214,10 @@ class GeneralConversationsJsonlDataset:
         
         self.task_spec = TaskDataSpec(task_name="GeneralConversationsJsonlDataset")
 
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
+
     @classmethod
     def process_message_fragment(cls, tag: str, fragment: Any, media_directory: Optional[str] = None) -> dict[str, Any]:
         if media_directory is not None and \
