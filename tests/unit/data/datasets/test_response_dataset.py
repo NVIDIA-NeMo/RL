@@ -342,6 +342,7 @@ def test_dailyomni_dataset():
 
     # check the first example
     first_example = dataset.dataset[0]
+    assert hasattr(dataset, "preprocessor") and dataset.preprocessor is not None
     first_example = dataset.preprocessor(first_example)
 
     # only contains messages and task_name
