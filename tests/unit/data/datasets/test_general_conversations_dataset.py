@@ -63,6 +63,8 @@ def test_general_conversation_jsonl_multimodal_interleaved_multiturn():
         }
         dataset = load_response_dataset(data_config)
 
+        assert len(dataset.dataset) == 1
+
         # Raw first example from the jsonl
         first_raw = dataset.dataset[0]
         # Run the preprocessor (same as used in the pipeline)
@@ -73,22 +75,24 @@ def test_general_conversation_jsonl_multimodal_interleaved_multiturn():
         assert "task_name" in formatted
         assert formatted["task_name"] == "general-conversation-jsonl"
 
-        assert len(formatted["messages"]) == 2
+        assert len(formatted["messages"]) == 4
 
         # User message: content is list of audio/video/image block + text block
         user_msg0 = formatted["messages"][0]
         assert user_msg0["role"] == "user"
         user_content0 = user_msg0["content"]
         assert isinstance(user_content0, list)
+        assert len(user_content0) == 1
         # the "sound" tag will be converted to the "audio" tag
         assert user_content0[0] == {"type": "audio", "audio": "sample_000001.2345ew.flac"}
 
         # Assistant message: content is list of text block(s).
         # Multimodal tokens are also supported in a similar fashion as for the user message.
         assistant_msg0 = formatted["messages"][1]
-        assert assistant_msg0["role"] == "user"
+        assert assistant_msg0["role"] == "assistant"
         assistant_content0 = assistant_msg0["content"]
         assert isinstance(assistant_content0, list)
+        assert len(assistant_content0) == 1
         assert assistant_content0[0] == {
             "type": "text", 
             "text": "Automatic speech recognition is a technology that allows computers to recognize and transcribe spoken language. In the NeMo Framework, ASR is used for tasks such as speech-to-text and voice recognition."
@@ -98,6 +102,7 @@ def test_general_conversation_jsonl_multimodal_interleaved_multiturn():
         assert user_msg1["role"] == "user"
         user_content1 = user_msg1["content"]
         assert isinstance(user_content1, list)
+        assert len(user_content1) == 9
         assert user_content1[0] == {"type": "text", "text": "Describe what is NeMo based on the tutorial video: "}
         # video-audio tag will be splitted into one video tag followed by one audio tag
         # TODO: more advanced video-audio interleaving technique? Should be handled on the model level.
@@ -105,16 +110,16 @@ def test_general_conversation_jsonl_multimodal_interleaved_multiturn():
         assert user_content1[2] == {"type": "audio", "audio": "sample_000001.35tags.mp4"}
         assert user_content1[3] == {"type": "text", "text": " and the information in the two images: "}
         assert user_content1[4] == {"type": "image", "image": "sample_000001.as23ds.jpg"}
-        assert user_content1[5] == {"type": "text", "text": " "}
-        assert user_content1[6] == {"type": "image", "image": "sample_000001.gds233.jpg"}
-        assert user_content1[7] == {"type": "text", "text": ". Combine that information with sound "}
-        assert user_content1[8] == {"type": "audio", "audio": "sample_000001.gd1dtg.wav"}
-        assert user_content1[9] == {"type": "text", "text": ". Answer: "}
+        assert user_content1[5] == {"type": "image", "image": "sample_000001.gds233.jpg"}
+        assert user_content1[6] == {"type": "text", "text": ". Combine that information with sound "}
+        assert user_content1[7] == {"type": "audio", "audio": "sample_000001.gd1dtg.wav"}
+        assert user_content1[8] == {"type": "text", "text": ". Answer: "}
 
-        assistant_msg1 = formatted["messages"][1]
-        assert assistant_msg1["role"] == "user"
+        assistant_msg1 = formatted["messages"][3]
+        assert assistant_msg1["role"] == "assistant"
         assistant_content1 = assistant_msg1["content"]
         assert isinstance(assistant_content1, list)
+        assert len(assistant_content1) == 1
         assert assistant_content1[0] == {
             "type": "text", 
             "text": "The NeMo Framework provides a range of tools and features for training and deploying ASR models, including model parallelism, data parallelism, and distributed checkpointing. This allows for faster training and inference times, as well as improved model accuracy and reliability."
@@ -181,6 +186,8 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         }
         dataset = load_response_dataset(data_config)
 
+        assert len(dataset.dataset) == 3
+
         # Raw first example from the jsonl
         first_raw = dataset.dataset[0]
         # Run the preprocessor (same as used in the pipeline)
@@ -198,6 +205,7 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         assert user_msg0["role"] == "user"
         user_content0 = user_msg0["content"]
         assert isinstance(user_content0, list)
+        assert len(user_content0) == 2
         # the "sound" tag will be converted to the "audio" tag
         assert user_content0[0] == {"type": "image", "image": "sample_000001.as23ds.jpg"}
         assert user_content0[1] == {"type": "text", "text": "\nPlease describe this image."}
@@ -205,13 +213,14 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         # Assistant message: content is list of text block(s).
         # Multimodal tokens are also supported in a similar fashion as for the user message.
         assistant_msg0 = formatted["messages"][1]
-        assert assistant_msg0["role"] == "user"
+        assert assistant_msg0["role"] == "assistant"
         assistant_content0 = assistant_msg0["content"]
         assert isinstance(assistant_content0, list)
+        assert len(assistant_content0) == 1
         assert assistant_content0[0] == {"type": "text", "text": "Two kids are playing ping pong in this image."}
 
         # Raw Second example from the jsonl
-        second_raw = dataset.dataset[0]
+        second_raw = dataset.dataset[1]
         # Run the preprocessor (same as used in the pipeline)
         formatted = dataset.preprocessor(second_raw)
 
@@ -227,23 +236,24 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         assert user_msg0["role"] == "user"
         user_content0 = user_msg0["content"]
         assert isinstance(user_content0, list)
+        assert len(user_content0) == 1
         # the "sound" tag will be converted to the "audio" tag
         assert user_content0[0] == {"type": "audio", "audio": "sample_000001.2345ew.flac"}
-        assert user_content0[1] == {"type": "text", "text": "\nPlease describe this image."}
 
         # Assistant message: content is list of text block(s).
         # Multimodal tokens are also supported in a similar fashion as for the user message.
         assistant_msg0 = formatted["messages"][1]
-        assert assistant_msg0["role"] == "user"
+        assert assistant_msg0["role"] == "assistant"
         assistant_content0 = assistant_msg0["content"]
         assert isinstance(assistant_content0, list)
+        assert len(assistant_content0) == 1
         assert assistant_content0[0] == {
             "type": "text", 
             "text": "Automatic speech recognition is a technology that allows computers to recognize and transcribe spoken language. In the NeMo Framework, ASR is used for tasks such as speech-to-text and voice recognition."
         }
 
         # Raw Third example from the jsonl
-        third_raw = dataset.dataset[0]
+        third_raw = dataset.dataset[2]
         # Run the preprocessor (same as used in the pipeline)
         formatted = dataset.preprocessor(third_raw)
 
@@ -259,6 +269,7 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         assert user_msg0["role"] == "user"
         user_content0 = user_msg0["content"]
         assert isinstance(user_content0, list)
+        assert len(user_content0) == 3
         # the "sound" tag will be converted to the "audio" tag
         assert user_content0[0] == {"type": "video", "video": "sample_000001.35tags.mp4"}
         assert user_content0[1] == {"type": "audio", "audio": "sample_000001.35tags.mp4"}
@@ -267,9 +278,10 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         # Assistant message: content is list of text block(s).
         # Multimodal tokens are also supported in a similar fashion as for the user message.
         assistant_msg0 = formatted["messages"][1]
-        assert assistant_msg0["role"] == "user"
+        assert assistant_msg0["role"] == "assistant"
         assistant_content0 = assistant_msg0["content"]
         assert isinstance(assistant_content0, list)
+        assert len(assistant_content0) == 1
         assert assistant_content0[0] == {
             "type": "text", 
             "text": "The NeMo Framework provides a range of tools and features for training and deploying ASR models, including model parallelism, data parallelism, and distributed checkpointing. This allows for faster training and inference times, as well as improved model accuracy and reliability."
