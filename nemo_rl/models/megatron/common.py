@@ -129,11 +129,14 @@ def forward_step_arbitrary_loss(
         if pack_sequences and packed_seq_params is not None:
             # Choose between fused (single forward pass) and iterative (per-sequence) wrapper
             fuse_loss = (
-                policy_cfg is not None
-                and policy_cfg.get("sequence_packing", {}).get("fuse_loss", False)
+                policy_cfg is not None and policy_cfg.get(
+                    "sequence_packing", {}
+                ).get("fuse_loss", False)
             )
             wrapper_cls = (
-                SequencePackingFusionLossWrapper if fuse_loss else SequencePackingLossWrapper
+                SequencePackingFusionLossWrapper 
+                if fuse_loss 
+                else SequencePackingLossWrapper
             )
             loss_fn = wrapper_cls(
                 loss_fn=loss_fn,
