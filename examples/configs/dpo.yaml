@@ -177,7 +177,13 @@ policy:
       overlap_param_gather: true
       data_parallel_sharding_strategy: "optim_grads_params"
       use_custom_fsdp: false
-    
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true

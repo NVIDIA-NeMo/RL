@@ -155,6 +155,12 @@ policy: &POLICY_BASE
             use_custom_fsdp: false
             data_parallel_sharding_strategy: "optim_grads_params"
 
+        fp8_cfg:
+            enabled: false
+            fp8: "e4m3"
+            fp8_recipe: "blockwise"
+            fp8_param: false
+
     scheduler:
         - name: "torch.optim.lr_scheduler.LinearLR"
           kwargs:
