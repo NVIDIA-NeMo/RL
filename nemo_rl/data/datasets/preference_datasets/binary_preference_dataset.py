@@ -36,6 +36,7 @@ class BinaryPreferenceDataset(RawDataset):
         prompt_key: Key for the input prompt/context, default is "prompt"
         chosen_key: Key for the preferred/winning response, default is "chosen"
         rejected_key: Key for the non-preferred/losing response, default is "rejected"
+        subset: Optional subset name for the dataset, used for HuggingFace datasets
         split: Optional split name for the dataset, used for HuggingFace datasets
     """
 
@@ -45,6 +46,7 @@ class BinaryPreferenceDataset(RawDataset):
         prompt_key: str = "prompt",
         chosen_key: str = "chosen",
         rejected_key: str = "rejected",
+        subset: Optional[str] = None,
         split: Optional[str] = None,
         **kwargs,
     ):
@@ -57,7 +59,7 @@ class BinaryPreferenceDataset(RawDataset):
             self.task_name = self.task_name[1:]
 
         # load from local or huggingface
-        self.dataset = load_dataset_from_path(data_path, split)
+        self.dataset = load_dataset_from_path(data_path, subset, split)
 
         # format the dataset
         self.dataset = self.dataset.map(

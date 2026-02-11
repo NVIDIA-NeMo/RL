@@ -27,16 +27,15 @@ from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
-from nemo_rl.utils.config import load_config_with_inheritance
+from nemo_rl.utils.config import (
+    load_config_with_inheritance,
+    register_omegaconf_resolvers,
+)
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
 
-if not OmegaConf.has_resolver("mul"):
-    OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
-
-if not OmegaConf.has_resolver("max"):
-    OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
+register_omegaconf_resolvers()
 
 
 def validate_config_section(
