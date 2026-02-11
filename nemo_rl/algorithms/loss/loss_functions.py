@@ -19,20 +19,6 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-<<<<<<< HEAD:nemo_rl/algorithms/loss/loss_functions.py
-=======
-from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
-    ChunkedDistributedGatherLogprob,
-    _get_tokens_on_this_cp_rank,
-    allgather_cp_sharded_tensor,
-    from_parallel_logits_to_logprobs,
-    from_parallel_logits_to_logprobs_packed_sequences,
-    gather_logits_at_global_indices,
-    get_logprobs_from_vocab_parallel_logits,
-)
-from nemo_rl.utils.nsys import wrap_with_nvtx_name
->>>>>>> d3f2b224 (Cache packed input ids):nemo_rl/algorithms/loss_functions.py
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 

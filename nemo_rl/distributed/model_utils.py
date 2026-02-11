@@ -25,6 +25,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
+
 @torch.no_grad()
 def _compute_distributed_log_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
@@ -929,6 +930,7 @@ def from_parallel_logits_to_logprobs(
         logprobs = logprobs[:, :-pad_len]
 
     return logprobs[:, :-1]
+
 
 @wrap_with_nvtx_name("from_parallel_logits_to_logprobs_packed_sequences")
 def from_parallel_logits_to_logprobs_packed_sequences(

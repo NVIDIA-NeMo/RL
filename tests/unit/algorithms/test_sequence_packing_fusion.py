@@ -31,9 +31,9 @@ import ray
 import torch
 
 from nemo_rl.algorithms.loss_functions import (
-    ClippedPGLossFn, 
+    ClippedPGLossFn,
     SequencePackingFusionLossWrapper,
-    SequencePackingLossWrapper, 
+    SequencePackingLossWrapper,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -125,10 +125,16 @@ class SequencePackingLossWrapperBaselineActor:
 
         # Input ids + masks
         input_ids = torch.zeros(
-            batch_size, max_seq_len, dtype=torch.long, device=device,
+            batch_size,
+            max_seq_len,
+            dtype=torch.long,
+            device=device,
         )
         token_mask = torch.zeros(
-            batch_size, max_seq_len, dtype=torch.float32, device=device,
+            batch_size,
+            max_seq_len,
+            dtype=torch.float32,
+            device=device,
         )
         for i in range(batch_size):
             L = int(seq_lengths[i].item())
@@ -179,10 +185,10 @@ class SequencePackingLossWrapperBaselineActor:
         # ---------------------------------------------------------------------
         # Global logits (same across ranks), then slice by TP rank
         full_logits = torch.randn(
-            batch_size, 
-            max_seq_len, 
-            vocab_size_total, 
-            device=device, 
+            batch_size,
+            max_seq_len,
+            vocab_size_total,
+            device=device,
             dtype=torch.float32,
         )
 
@@ -261,7 +267,8 @@ class SequencePackingLossWrapperBaselineActor:
         }
 
     def run_compare_sequence_packing_wrappers(
-        self, use_cached_packed_input_ids: bool = False,
+        self,
+        use_cached_packed_input_ids: bool = False,
     ):
         """
         Compare helper (for when your candidate/fused wrapper exists):
@@ -286,7 +293,7 @@ class SequencePackingLossWrapperBaselineActor:
             cu_seqlens_q=tc["cu_seqlens"],
             cu_seqlens_q_padded=tc["cu_seqlens_padded"],
         )
-        
+
         candidate_wrapper = SequencePackingFusionLossWrapper(
             loss_fn=base_loss_fn,
             cu_seqlens_q=tc["cu_seqlens"],
@@ -348,6 +355,7 @@ class SequencePackingLossWrapperBaselineActor:
 
 SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN = f"{SequencePackingLossWrapperBaselineActor.__module__}.SequencePackingLossWrapperBaselineActor"
 
+
 @pytest.fixture
 def register_sequence_packing_loss_wrapper_baseline_actor():
     """Register the actor in ACTOR_ENVIRONMENT_REGISTRY for RayWorkerGroup."""
@@ -369,6 +377,7 @@ def register_sequence_packing_loss_wrapper_baseline_actor():
                 SEQUENCE_PACKING_LOSS_WRAPPER_BASELINE_ACTOR_FQN
             ] = original_registry_value
 
+
 @pytest.fixture(scope="function")
 def cluster_fixture(request):
     """Create and teardown a virtual cluster for CP/TP tests."""
@@ -377,6 +386,7 @@ def cluster_fixture(request):
 
     if not ray.is_initialized():
         from nemo_rl.distributed.virtual_cluster import init_ray
+
         init_ray()
 
     # Check available GPUs via Ray cluster resources (works across multi-node),
@@ -416,9 +426,9 @@ def cluster_fixture(request):
     ids=["pack_on_the_fly", "cached_packed_input_ids"],
 )
 def test_sequence_packing_loss_wrapper_baseline_cp_tp(
-    cluster_fixture, 
+    cluster_fixture,
     register_sequence_packing_loss_wrapper_baseline_actor,
-    cp_tp, 
+    cp_tp,
     use_cached_packed_input_ids,
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
@@ -477,4 +487,3 @@ def test_sequence_packing_loss_wrapper_baseline_cp_tp(
         )
 
     worker_group.shutdown(force=True)
-
