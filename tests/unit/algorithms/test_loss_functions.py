@@ -1004,6 +1004,7 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["use_importance_sampling_correction"] = True
     cfg["truncated_importance_sampling_ratio"] = 0.8
+    cfg["truncated_importance_sampling_type"] = "tis"
     if sequence_level_importance_ratios:
         cfg["sequence_level_importance_ratios"] = True
         cfg["token_level_loss"] = False

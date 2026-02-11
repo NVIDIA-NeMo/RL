@@ -45,6 +45,10 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
+    # Type of truncated importance sampling: "tis" (clamp max) or "icepop" (filter [min, max])
+    truncated_importance_sampling_type: NotRequired[str | None]
+    # Lower bound for ICE-POP filtering (default 0.5)
+    truncated_importance_sampling_ratio_min: NotRequired[float | None]
     token_level_loss: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
@@ -57,6 +61,8 @@ class ClippedPGLossConfig(TypedDict):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: NotRequired[bool]
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -132,6 +138,14 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio = cfg[
             "truncated_importance_sampling_ratio"
         ]
+        # Type of truncated importance sampling: "tis" (clamp max) or "icepop" (filter [min, max])
+        self.truncated_importance_sampling_type = cfg.get(
+            "truncated_importance_sampling_type"
+        )
+        # Lower bound for ICE-POP filtering (default 0.5)
+        self.truncated_importance_sampling_ratio_min = cfg.get(
+            "truncated_importance_sampling_ratio_min"
+        )
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(
             "sequence_level_importance_ratios",
@@ -151,6 +165,23 @@ class ClippedPGLossFn(LossFunction):
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
             )
+            assert self.truncated_importance_sampling_type in ("tis", "icepop"), (
+                f"truncated_importance_sampling_type must be 'tis' or 'icepop', got {self.truncated_importance_sampling_type}"
+            )
+        else:
+            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
+            ignored_params = []
+            if cfg.get("truncated_importance_sampling_type") is not None:
+                ignored_params.append("truncated_importance_sampling_type")
+            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
+                ignored_params.append("truncated_importance_sampling_ratio_min")
+            if ignored_params:
+                print(
+                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
+                    f"parameters are ignored: {', '.join(ignored_params)}. "
+                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
+                    flush=True,
+                )
 
     def __call__(
         self,
@@ -378,12 +409,35 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
-        # TIS see https://fengyao.notion.site/off-policy-rl
+        # Truncated Importance Sampling (TIS / ICE-POP)
+        # TIS: Simple clamp to max value
+        # ICE-POP: Filter out samples with importance weights outside [min, max]
         if self.truncated_importance_sampling_ratio is not None:
-            actor_importance_weights_expanded = torch.clamp(
-                actor_importance_weights_expanded,
-                max=self.truncated_importance_sampling_ratio,
-            )
+            if self.truncated_importance_sampling_type == "tis":
+                # TIS: Simple clamp to max value
+                actor_importance_weights_expanded = torch.clamp(
+                    actor_importance_weights_expanded,
+                    max=self.truncated_importance_sampling_ratio,
+                )
+            elif self.truncated_importance_sampling_type == "icepop":  # icepop
+                # ICE-POP: Filter out samples with importance weights outside [min, max]
+                actor_importance_weights_expanded = torch.where(
+                    (
+                        actor_importance_weights_expanded
+                        >= self.truncated_importance_sampling_ratio_min
+                    )
+                    & (
+                        actor_importance_weights_expanded
+                        <= self.truncated_importance_sampling_ratio
+                    ),
+                    actor_importance_weights_expanded,
+                    torch.zeros_like(actor_importance_weights_expanded),
+                )
+            else:
+                raise ValueError(
+                    f"Invalid truncated importance sampling type: {self.truncated_importance_sampling_type}"
+                )
+
         actor_importance_weights = actor_importance_weights_expanded
         del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
