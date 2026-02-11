@@ -188,6 +188,8 @@ class GeneralConversationsJsonlDataset:
         self,
         data_path: str,
         media_data_dir: Optional[str] = None,
+        split_validation_size: float = 0,
+        seed: int = 42,
         **kwargs
     ):
         self.media_data_dir = media_data_dir
