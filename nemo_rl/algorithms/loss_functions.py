@@ -161,12 +161,15 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        use_curr_logprobs_as_prev_logprobs: bool = False,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
+        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
@@ -205,21 +208,10 @@ class ClippedPGLossFn(LossFunction):
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
 
-        if use_curr_logprobs_as_prev_logprobs:
-            assert "prev_logprobs" not in data, (
-                "prev_logprobs should not be in data when use_curr_logprobs_as_prev_logprobs is True"
-            )
-            print(
-                f"use_curr_logprobs_as_prev_logprobs is True, curr_logprobs: {curr_logprobs.shape}",
-                flush=True,
-            )
+        # For truly on-policy training, use curr_logprobs as prev_logprobs
+        # This avoids computing prev_logprobs upstream
+        if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
-        else:
-            prev_logprobs = data["prev_logprobs"][:, 1:]
-            print(
-                f"use_curr_logprobs_as_prev_logprobs is False, prev_logprobs: {prev_logprobs.shape}",
-                flush=True,
-            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -903,7 +895,6 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        use_curr_logprobs_as_prev_logprobs: bool = False,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -955,7 +946,6 @@ class SequencePackingLossWrapper:
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
-                use_curr_logprobs_as_prev_logprobs=use_curr_logprobs_as_prev_logprobs,
             )
             loss_accum += loss
             for k, v in metrics.items():
