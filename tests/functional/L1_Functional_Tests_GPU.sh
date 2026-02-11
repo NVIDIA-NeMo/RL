@@ -43,6 +43,9 @@ time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 # Re-enable once it is fixed.
 # time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
 time uv run --no-sync bash ./tests/functional/grpo_sglang.sh
+time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
+# Re-enable once SGLang build is fixed.
+# time uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 time uv run --no-sync bash ./tests/functional/prorlv2.sh
 time uv run --no-sync bash ./tests/functional/rm.sh
 time uv run --no-sync bash ./tests/functional/sft.sh
