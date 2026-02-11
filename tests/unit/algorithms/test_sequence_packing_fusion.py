@@ -442,7 +442,6 @@ def test_sequence_packing_loss_wrapper_baseline_cp_tp(
     cp_size, tp_size = cp_tp
     cluster = cluster_fixture
     actor_fqn = register_sequence_packing_loss_wrapper_baseline_actor
-    world_size = cp_size * tp_size
 
     sharding_layout = [
         [cp_rank * tp_size + tp_rank for tp_rank in range(tp_size)]
