@@ -558,9 +558,9 @@ def _get_pack_sequence_parameters_for_megatron(
     # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
     if use_fp8:
         divisor = 16
-        if fp8_cfg.get("fp8_recipe", None) == "blockwise":
+        if fp8_cfg["fp8_recipe"] == "blockwise":
             divisor = 128
-        elif fp8_cfg.get("fp8_recipe", None) == "mxfp8":
+        elif fp8_cfg["fp8_recipe"] == "mxfp8":
             divisor = 32
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:

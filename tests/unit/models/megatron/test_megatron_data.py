@@ -1443,7 +1443,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": True},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1462,7 +1467,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1481,7 +1491,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 4,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1506,7 +1521,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 4,
             "context_parallel_size": 2,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "other"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1535,7 +1555,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": False},
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1573,7 +1598,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 8,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1617,7 +1647,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": False,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1636,7 +1671,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 4,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
@@ -1662,7 +1702,12 @@ class GetPackSequenceParametersTestActor:
             "sequence_parallel": True,
             "pipeline_model_parallel_size": 4,
             "context_parallel_size": 4,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
         }
 
         pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
