@@ -107,6 +107,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        do_on_policy_fixes: bool = True,
     ) -> list[dict]:
         timer = Timer()
 
@@ -124,7 +125,7 @@ Depending on your data shape, you may want to change these values."""
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                    nemo_gym_result, tokenizer, do_on_policy_fixes
                 )
 
             nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
@@ -145,7 +146,10 @@ Depending on your data shape, you may want to change these values."""
         return nemo_rl_results, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
-        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+        self,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
+        do_on_policy_fixes: bool,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
@@ -163,7 +167,8 @@ Depending on your data shape, you may want to change these values."""
                 continue
 
             assert (
-                seen_token_ids
+                not do_on_policy_fixes
+                or seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
