@@ -565,7 +565,7 @@ def generation_setup(request, tiny_llama_model_path):
     indirect=True,
     ids=["2gpu_dp2_megatron", "2gpu_tp2_megatron"],
 )
-def xtest_megatron_policy_generation(generation_setup):
+def test_megatron_policy_generation(generation_setup):
     """Test Megatron policy generation with different backends."""
     policy, cluster, data, prompts = generation_setup
 
