@@ -163,6 +163,7 @@ class GRPOConfig(TypedDict):
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
+    # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
