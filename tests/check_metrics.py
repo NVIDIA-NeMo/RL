@@ -1,3 +1,9 @@
+#!/usr/bin/env -S uv run --script -q
+# /// script
+# dependencies = [
+#   "rich"
+# ]
+# ///
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -172,6 +178,12 @@ def main():
     parser.add_argument(
         "checks", nargs="+", help="Conditions to check, will be eval()'d"
     )
+    parser.add_argument(
+        "--table-width",
+        type=int,
+        default=None,
+        help="Set the overall table width (columns will auto-size within this width)",
+    )
 
     # Add helpful usage examples
     parser.epilog = """
@@ -200,7 +212,7 @@ def main():
     console = Console()
 
     # Create a table
-    table = Table(title="Metric Checks")
+    table = Table(title="Metric Checks", min_width=150, width=args.table_width)
     table.add_column("Status", style="bold")
     table.add_column("Check", style="dim")
     table.add_column("Value", style="cyan")
