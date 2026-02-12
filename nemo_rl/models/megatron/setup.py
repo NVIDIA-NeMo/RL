@@ -664,12 +664,15 @@ def setup_model_and_optimizer(
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
     # Tokenizer
+    if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
+        megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
     build_tokenizer(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // megatron_cfg.model.tensor_model_parallel_size,
         tensor_model_parallel_size=megatron_cfg.model.tensor_model_parallel_size,
-        trust_remote_code=True,
     )
     assert megatron_cfg.model.vocab_size, "vocab size must be specified in model config"
 
@@ -936,6 +939,10 @@ def finalize_megatron_setup(
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
         tokenizer_model=hf_model_name,
+        hf_tokenizer_kwargs={
+            "trust_remote_code": True,
+            "use_fast": True,
+        },
     )
 
     megatron_tokenizer = build_tokenizer(
@@ -943,7 +950,6 @@ def finalize_megatron_setup(
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // config["megatron_cfg"]["tensor_model_parallel_size"],
         tensor_model_parallel_size=config["megatron_cfg"]["tensor_model_parallel_size"],
-        trust_remote_code=True,
     )
 
     dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
