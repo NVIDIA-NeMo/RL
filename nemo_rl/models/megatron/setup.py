@@ -681,10 +681,6 @@ def setup_model_and_optimizer(
 
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-        if use_peft:
-            raise ValueError(
-                "Freezing the MOE router is not currently supported when using PEFT"
-            )
 
         def freeze_moe_router(megatron_model):
             if not isinstance(megatron_model, list):
