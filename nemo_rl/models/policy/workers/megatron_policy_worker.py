@@ -939,7 +939,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
-                pad_len = padded_seq_length - tk.shape[1]
+                pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
@@ -1487,15 +1487,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             # Ordinary offload case
             if move_params:
-                for name, param in model.state_dict().items():
-                    new_state_dict = {}
-                    for name, item in model.state_dict().items():
-                        if isinstance(item, torch.Tensor):
-                            item = item.detach().to(
-                                device=device, non_blocking=True, copy=True
-                            )
-                        new_state_dict[name] = item
-                    model.load_state_dict(new_state_dict)
+                new_state_dict = {}
+                for name, item in model.state_dict().items():
+                    if isinstance(item, torch.Tensor):
+                        item = item.detach().to(
+                            device=device, non_blocking=True, copy=True
+                        )
+                    new_state_dict[name] = item
+                model.load_state_dict(new_state_dict)
         return model
 
     def move_optimizer(self, device: str):

@@ -128,6 +128,11 @@ policy:
       overlap_param_gather: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -146,6 +151,7 @@ data:
   #   train:
   #     # this dataset will override prompt_key and use the default values for other vars
   #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     subset: null  # used for HuggingFace datasets
   #     split: train  # used for HuggingFace datasets
   #   validation:
   #     # this dataset will use the default values for other vars except data_path
@@ -165,6 +171,7 @@ data:
   #     # this dataset will override prompt_key and use the default values for other vars
   #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
   #     prompt_key: context
+  #     subset: null  # used for HuggingFace datasets
   #     split: train  # used for HuggingFace datasets
   #   validation:
   #     # this dataset will use the default values for other vars except data_path

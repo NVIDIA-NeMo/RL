@@ -14,6 +14,13 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   async_grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
@@ -129,7 +136,11 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    fp8_cfg: null
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 
     env_vars: null
 

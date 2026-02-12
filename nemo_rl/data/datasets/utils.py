@@ -62,11 +62,16 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:image/png;base64,{img_str}"
 
 
-def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
+def load_dataset_from_path(
+    data_path: str,
+    data_subset: Optional[str] = None,
+    data_split: Optional[str] = "train",
+):
     """Load a dataset from a local file, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
     Args:
         data_path: The path to the dataset.
+        data_subset: The subset to load from the dataset. Only supported for huggingface datasets.
         data_split: The split to load from the dataset.
     """
     FILEEXT2TYPE = {
@@ -78,12 +83,21 @@ def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
         ".txt": "text",
     }
     suffix = os.path.splitext(data_path)[-1]
+    # load from local file (not save_to_disk format)
     if dataset_type := FILEEXT2TYPE.get(suffix):
+        assert data_subset is None, (
+            "data_subset is only supported for huggingface datasets"
+        )
         raw_dataset = load_dataset(dataset_type, data_files=data_path)
     else:
         try:
-            raw_dataset = load_dataset(data_path)
+            # load from huggingface
+            if data_subset:
+                raw_dataset = load_dataset(data_path, data_subset)
+            else:
+                raw_dataset = load_dataset(data_path)
         except ValueError as e:
+            # load from local file (save_to_disk format)
             if "load_from_disk" in str(e):
                 raw_dataset = load_from_disk(data_path)
             else:

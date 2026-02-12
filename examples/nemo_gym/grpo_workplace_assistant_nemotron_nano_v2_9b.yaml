@@ -21,6 +21,13 @@ grpo:
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -45,6 +52,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
+  checkpoint_dir: "results/grpo"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
@@ -229,12 +237,26 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
-  # Train: 1129 samples, Validation: 126 samples
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+  # The complete trajectory is managed by gym, which will pass the entire thing to vllm.
+  # We just catch the vllm max seq len error and return an empty response with
+  # finish_reason=stop or incomplete_details=max_length that can be used to stop the trajectory,
+  # so max_input_seq_length is not used in this case.
+  max_input_seq_length: null  # nemogym dataset doesn't use this parameter
   shuffle: true
   num_workers: 0
+
+  # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
+  # Train: 1129 samples, Validation: 126 samples
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null  # nemogym dataset doesn't use this parameter
+    system_prompt_file: null  # nemogym dataset doesn't use this parameter
+    processor: "nemo_gym_data_processor"
 
 env:
   should_use_nemo_gym: true
