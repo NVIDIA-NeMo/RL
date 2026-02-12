@@ -463,7 +463,7 @@ class ClippedPGLossFn(LossFunction):
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
-                    "is_filter_drop_frac": 1.0
+                    "is_oob_ratio": 1.0
                     - masked_mean(
                         seq_kept_mask,
                         sample_mask,
