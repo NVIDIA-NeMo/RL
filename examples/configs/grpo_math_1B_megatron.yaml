@@ -32,7 +32,7 @@ checkpointing:
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
-  save_period: 30
+  save_period: 10
   checkpoint_must_save_by: null
 
 policy:
@@ -143,7 +143,7 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
 
   generation:
-    backend: "megatron"
+    backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     top_p: 1.0
