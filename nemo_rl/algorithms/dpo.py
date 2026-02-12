@@ -385,6 +385,7 @@ def validate_one_dataset(
 
         val_metrics = defaultdict(list)
         num_valid_batches = 0
+        policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
