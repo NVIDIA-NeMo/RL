@@ -2,18 +2,18 @@
 defaults: "grpo_math_1B_megatron.yaml"
 
 grpo:
-  num_prompts_per_step: 16
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
 
 policy:
   model_name: "Qwen/Qwen3-30B-A3B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: 64
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 4
-  max_total_sequence_length: 1024
+  max_total_sequence_length: 4096
   precision: "bfloat16"
 
   dtensor_cfg:
@@ -68,7 +68,7 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      tensor_parallel_size: 16
+      tensor_parallel_size: 4
       gpu_memory_utilization: 0.7
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
