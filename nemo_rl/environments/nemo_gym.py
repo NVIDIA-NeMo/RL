@@ -28,7 +28,6 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
-    rollout_max_retries_to_avoid_lp_nan: int = 1
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -84,6 +83,14 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            "rollout_max_attempts_to_avoid_lp_nan", 1
+        )
+
+        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
+        )
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -113,7 +120,7 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
 
         timer.start("_run_rollouts_total")
-        max_attempts, trial = self.cfg["rollout_max_attempts_to_avoid_lp_nan"], 0
+        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
@@ -148,7 +155,7 @@ Depending on your data shape, you may want to change these values."""
             if logprob_contains_nan:
                 trial += 1
                 print(
-                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_retries})"
+                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
                 )
                 continue
             else:
