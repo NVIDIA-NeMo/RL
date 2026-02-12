@@ -149,8 +149,6 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 class MegatronGenerationConfig(TypedDict):
     # Total GPU memory (in GB) allocated for KV cache buffers
     buffer_size_gb: int
-    # Fraction of buffer reserved for guaranteed active requests
-    buffer_guaranteed_fraction: float
     # Number of CUDA graphs to pre-compile for different batch sizes
     num_cuda_graphs: int
     # Size of each KV cache block in tokens (affects memory granularity)
@@ -1902,9 +1900,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ]
         enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
         unified_memory_level = mcore_generation_config["unified_memory_level"]
-        buffer_guaranteed_fraction = mcore_generation_config[
-            "buffer_guaranteed_fraction"
-        ]
         max_tokens = mcore_generation_config["max_tokens"]
 
         model_config = self.model.config
@@ -1916,7 +1911,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
@@ -1927,7 +1921,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=False,
             unified_memory_level=unified_memory_level,
-            max_tokens_override=max_tokens,
+            max_tokens=max_tokens,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
@@ -2000,23 +1994,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         result = []
         while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern(verbose=False)
-            finished_requests = result_step.get("finished_requests", [])
-            for finished_request in finished_requests:
-                result.append(finished_request)
+            result_step = dynamic_engine.step_modern()
+            result.extend(result_step["finished_request_records"])
 
         # Sort results by request_id to maintain original batch order
         result.sort(key=lambda x: x.request_id)
 
         out = {
-            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+            "tokens": [x.requests[0].prompt_tokens.tolist() + x.requests[0].generated_tokens for x in result],
+            "logprobs": [x.requests[0].prompt_log_probs + x.requests[0].generated_log_probs for x in result],
         }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        max_gen_seq_len = max([len(x.requests[0].generated_tokens) for x in result])
         padded_input_length = input_ids.size(1)
 
         max_seq_len = padded_input_length + max_gen_seq_len
