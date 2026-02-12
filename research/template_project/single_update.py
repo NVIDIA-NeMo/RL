@@ -41,9 +41,11 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def main(config: MasterConfig) -> None:
@@ -178,6 +180,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 if __name__ == "__main__":
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:
