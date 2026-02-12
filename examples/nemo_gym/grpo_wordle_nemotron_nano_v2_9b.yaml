@@ -76,7 +76,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32
-  max_total_sequence_length: 2048  # Wordle games need ~500-1000 tokens with /no_think
+  max_total_sequence_length: 2048
   precision: "bfloat16"
   logprob_chunk_size: null
 
@@ -87,7 +87,7 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1            # No tensor parallelism for 4 GPUs
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
@@ -215,7 +215,7 @@ policy:
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: nemotron_json
-        chat_template: nemo_rl/models/generation/vllm/nemotron_chat_template.jinja
+        chat_template: null  # Use model's default template; custom template not needed with source code workarounds
     vllm_kwargs:
       compilation_config:
         use_inductor: false
