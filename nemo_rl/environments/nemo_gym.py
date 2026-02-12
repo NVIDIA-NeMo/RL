@@ -113,8 +113,8 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
 
         timer.start("_run_rollouts_total")
-        max_retries, trial = self.cfg["rollout_max_retries_to_avoid_lp_nan"], 0
-        while trial < max_retries:
+        max_attempts, trial = self.cfg["rollout_max_attempts_to_avoid_lp_nan"], 0
+        while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
