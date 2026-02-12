@@ -364,7 +364,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 (
                     data_iterator,
                     num_microbatches,
-                    micro_batch_size,
+                    mbs,
                     seq_length,
                     padded_seq_length,
                 ) = get_microbatch_iterator(
