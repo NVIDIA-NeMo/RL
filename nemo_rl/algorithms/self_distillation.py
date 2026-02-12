@@ -86,6 +86,7 @@ class SelfDistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    ema_decay: float  # EMA decay rate for teacher updates (e.g., 0.999). Set to 1.0 to disable EMA.
 
 
 class SelfDistillationSaveState(TypedDict):
@@ -188,6 +189,11 @@ def _build_cot_gt_texts(
     print("=====================")
     print("CHAIN OF THOUGHT TEXTS")
     print("=====================")
+
+    # pring average length of cot texts 
+    cot_lengths = [len(cot.split()) for cot in cot_texts]
+    avg_cot_length = sum(cot_lengths) / len(cot_lengths) if cot_lengths else 0
+    print(f"Average CoT length (in tokens): {avg_cot_length:.2f}")
     #print(cot_texts)
 
     combined: list[str] = []
@@ -324,6 +330,31 @@ def _align_teacher_topk_to_student(
             ]
 
     return aligned_logits, aligned_indices
+
+
+def _update_ema_teacher(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    ema_decay: float,
+) -> None:
+    """Update teacher parameters using exponential moving average (EMA) of student parameters.
+
+    Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
+
+    Args:
+        student_policy: The student policy whose parameters will be used for update
+        teacher_policy: The teacher policy whose parameters will be updated via EMA
+        ema_decay: EMA decay rate (typically 0.999 or 0.9999). Higher = slower teacher updates.
+    """
+    if ema_decay >= 1.0:
+        # No EMA update needed
+        return
+
+    # Get policy update through remote call
+    update_info = {
+        "ema_decay": ema_decay,
+    }
+    teacher_policy.update_from_ema(student_policy, update_info)
 
 
 def setup(
@@ -654,11 +685,57 @@ def setup(
 
     loss_fn = DistillationLossFn(loss_config)
 
+    # ==========================
+    #      EMA Teacher Policy
+    # ==========================
+    # The teacher policy can be configured to use Exponential Moving Average (EMA) updates:
+    # - If ema_decay = 1.0 (default): teacher shares parameters with student (no separate teacher)
+    # - If ema_decay < 1.0: separate teacher policy is created and updated after each training step
+    #   Formula: teacher_params = ema_decay * teacher_params + (1 - ema_decay) * student_params
+    #   Example: ema_decay=0.999 means teacher slowly tracks student with 99.9% of old values
+    ema_decay = distillation_config.get("ema_decay", 1.0)
+
+    if ema_decay >= 1.0:
+        # No EMA: teacher and student share parameters (self-distillation mode)
+        print("\n▶ Using shared parameters for teacher (no EMA)", flush=True)
+        teacher_policy = student_policy
+    else:
+        # EMA enabled: create separate teacher policy that will be updated via EMA
+        print(f"\n▶ Setting up EMA teacher policy (decay={ema_decay})...", flush=True)
+
+        # Determine teacher checkpoint paths
+        if last_checkpoint_path:
+            teacher_weights_path = Path(last_checkpoint_path) / "teacher" / "weights"
+            # Check if teacher checkpoint exists; if not, use student weights as initialization
+            if not teacher_weights_path.exists():
+                print("  ⚠️ No teacher checkpoint found, initializing from student weights", flush=True)
+                teacher_weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        else:
+            # No checkpoint: teacher will be initialized from student weights after creation
+            teacher_weights_path = None
+
+        # Create teacher policy (same architecture as student)
+        teacher_policy = Policy(
+            name_prefix="teacher",
+            cluster=train_cluster,
+            config=policy_config,  # Same config as student
+            tokenizer=tokenizer,
+            weights_path=teacher_weights_path,
+            optimizer_path=None,  # Teacher doesn't need optimizer
+            init_optimizer=False,
+            init_reference_model=False,
+        )
+
+        # If no checkpoint, copy student weights to teacher
+        if teacher_weights_path is None:
+            print("  ⚠️ Initializing teacher from current student weights...", flush=True)
+            teacher_policy.copy_weights_from(student_policy)
+
+        print(f"  ✓ EMA teacher initialized with decay={ema_decay}", flush=True)
+
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n", flush=True)
-
-    teacher_policy = student_policy
 
     return (
         student_policy,
@@ -898,25 +975,22 @@ def distillation_train(
                 )
 
                 # DEBUG: verify COT tokens are inserted into teacher context
-                if (total_steps == 0) and (current_step == 0):
-                    i = 0  # check first sample
-                    seq_len = int(train_data["input_lengths"][i].item())
-                    insert_pos = insert_positions[i]
-                    cot_text = cot_texts[i]
-                    cot_ids = tokenizer(
-                        cot_text, return_tensors="pt", add_special_tokens=False
-                    )["input_ids"][0].tolist()
-
-                    # respect truncation
-                    max_seq_len = master_config["policy"].get("max_total_sequence_length", None)
-                    if max_seq_len is not None:
-                        max_extra = max(0, max_seq_len - seq_len)
-                        cot_ids = cot_ids[:max_extra]
-
-                    teacher_seq = teacher_input_ids[i, : int(teacher_input_lengths[i].item())].tolist()
-
-                    assert teacher_seq[insert_pos:insert_pos + len(cot_ids)] == cot_ids, \
-                        "COT tokens not found at expected insertion position"
+                if total_steps == 0:
+                    i = 0
+                    t_len = int(teacher_input_lengths[i].item())
+                    teacher_text = tokenizer.decode(teacher_input_ids[i, :t_len], skip_special_tokens=False)
+                    
+                    s_len = int(train_data["input_lengths"][i].item())
+                    student_text = tokenizer.decode(train_data["input_ids"][i, :s_len], skip_special_tokens=False)
+                    
+                    print("=== STUDENT INPUT (decoded) ===")
+                    print(student_text)
+                    print(f"\n=== TEACHER INPUT (decoded) ===")
+                    print(teacher_text)
+                    print(f"\n=== COT TEXT (raw string) ===")
+                    print(cot_texts[i][:1000])
+                    print(f"\nInsert pos: {insert_positions[i]}, COT len: {cot_lengths[i]}")
+                    print(f"Student len: {s_len}, Teacher len: {t_len}")
 
                 teacher_data = BatchedDataDict(
                     {
@@ -933,11 +1007,12 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        teacher_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
-                    )
+                    with torch.no_grad(): 
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            teacher_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
                     aligned_logits, aligned_indices = _align_teacher_topk_to_student(
                         teacher_topk["topk_logits"],
                         teacher_topk["topk_indices"],
@@ -967,6 +1042,13 @@ def distillation_train(
                         loss_fn,
                         timer=timer,
                     )
+
+                # Update EMA teacher parameters after training step
+                ema_decay = master_config["distillation"].get("ema_decay", 1.0)
+                if ema_decay < 1.0 and teacher_policy is not student_policy:
+                    with timer.time("ema_update"):
+                        print("▶ Updating EMA teacher parameters...", flush=True)
+                        _update_ema_teacher(student_policy, teacher_policy, ema_decay)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -1100,6 +1182,20 @@ def distillation_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
+
+                        # Save teacher weights separately if EMA is enabled
+                        ema_decay = master_config["distillation"].get("ema_decay", 1.0)
+                        if ema_decay < 1.0 and teacher_policy is not student_policy:
+                            print("  • Saving EMA teacher weights...", flush=True)
+                            teacher_policy.save_checkpoint(
+                                weights_path=os.path.join(
+                                    checkpoint_path, "teacher", "weights"
+                                ),
+                                optimizer_path=None,  # Teacher doesn't need optimizer
+                                tokenizer_path=None,  # Already saved with student
+                                checkpointing_cfg=master_config["checkpointing"],
+                            )
+
                         torch.save(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),

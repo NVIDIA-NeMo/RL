@@ -6,12 +6,18 @@ distillation:
   max_num_steps: 1000
   max_num_epochs: 10
   val_batch_size: 64
-  val_period: 20
+  val_period: 10
   val_at_start: false
   val_at_end: false
   max_val_samples: 512
-  topk_logits_k: 64
+  topk_logits_k: 1024
   seed: 42
+  # EMA Teacher Configuration:
+  # - ema_decay: 1.0 (default) = teacher shares parameters with student (standard self-distillation)
+  # - ema_decay: 0.999 = separate EMA teacher that slowly tracks student (teacher = 0.999*teacher + 0.001*student)
+  # - ema_decay: 0.9999 = slower EMA update (more stable but less responsive to student changes)
+  # Set ema_decay < 1.0 to enable a separate teacher policy with EMA updates
+  ema_decay: 0.9999999
 
 loss_fn:
   kl_type: "mixed"
@@ -19,7 +25,7 @@ loss_fn:
   zero_outside_topk: false
 
 checkpointing:
-  enabled: true
+  enabled: false
   checkpoint_dir: "checkpoints/self-distillation-${policy.model_name}"
   metric_name: "val:accuracy"
   higher_is_better: true
@@ -30,7 +36,7 @@ checkpointing:
   save_consolidated: false
 
 policy: &POLICY_BASE
-  model_name: "Qwen/Qwen3-1.7B-Base"
+  model_name: "Qwen/Qwen3-1.7B"
   tokenizer:
     name: ${..model_name}
     chat_template_kwargs: null
@@ -38,7 +44,7 @@ policy: &POLICY_BASE
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 16384
   precision: "bfloat16"
   logprob_chunk_size: null
 
@@ -172,7 +178,7 @@ policy: &POLICY_BASE
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.4
       max_model_len: ${...max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
