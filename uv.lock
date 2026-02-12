@@ -5215,7 +5215,7 @@ requires-dist = [
     { name = "rich" },
     { name = "sentencepiece", marker = "extra == 'sglang'" },
     { name = "setuptools" },
-    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7" },
+    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508" },
     { name = "sglang", marker = "extra == 'sglang'", specifier = "==0.5.7" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
@@ -8039,7 +8039,7 @@ wheels = [
 [[package]]
 name = "sgl-kernel"
 version = "0.3.20"
-source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7#232982a0dee4f0f9545189a7d9b6b9bb802e4910" }
+source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508#3167bcc01c3074d5739e8086757cd8c66077d508" }
 dependencies = [
     { name = "scikit-build-core" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },

@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import argparse
-import json
 import os
 import pprint
-from itertools import chain, repeat
-from typing import Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -42,24 +39,21 @@ from nemo_rl.algorithms.grpo import (
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
+from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGym,
     NemoGymConfig,
-    nemo_gym_example_to_nemo_rl_datum_spec,
     setup_nemo_gym_config,
 )
+from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -73,40 +67,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
-
-
-def setup_single_nemo_gym_dataset(
-    jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None
-):
-    with open(jsonl_fpath) as f:
-        nemo_gym_examples = list(map(json.loads, f))
-
-    print(f"Loaded data at {jsonl_fpath}. Found {len(nemo_gym_examples)} examples")
-
-    if num_repeats:
-        previous_length = len(nemo_gym_examples)
-        nemo_gym_examples = list(
-            chain.from_iterable(
-                repeat(nemo_gym_example, num_repeats)
-                for nemo_gym_example in nemo_gym_examples
-            )
-        )
-        print(
-            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(nemo_gym_examples)}!"
-        )
-
-    nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
-    ]
-
-    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
-    return AllTaskProcessedDataset(
-        nemo_rl_compatible_examples,
-        tokenizer,
-        None,
-        passthrough_task_processor,
-    )
 
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
@@ -160,12 +120,13 @@ def collect_trajectories(
 def main() -> None:
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:
         args.config = os.path.join(
             os.path.dirname(__file__),
-            "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml",
+            "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml",
         )
 
     config = load_config(args.config)
@@ -201,14 +162,10 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_nemo_gym(config)
 
+    # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
-    train_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["train_jsonl_fpath"],
-        tokenizer=tokenizer,
-    )
-    val_dataset = setup_single_nemo_gym_dataset(
-        jsonl_fpath=config["data"]["validation_jsonl_fpath"],
-        tokenizer=tokenizer,
+    train_dataset, val_dataset = setup_response_data(
+        tokenizer, config["data"], env_configs=None
     )
 
     # Validation dataset config setup.
@@ -221,11 +178,12 @@ Gym principle is that there is no hidden data pre or post processing from you. W
 The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
         )
 
-    print(
-        f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
-    )
-    config["grpo"]["max_val_samples"] = len(val_dataset)
-    config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
+    if val_dataset is not None:
+        print(
+            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+        )
+        config["grpo"]["max_val_samples"] = len(val_dataset)
+        config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
 
     # Print config
     print("Final config:")
@@ -254,15 +212,12 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    nemo_gym = NemoGym.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.nemo_gym.NemoGym"
-            ),
-        }
-    ).remote(nemo_gym_config)
+    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
+
+    # Bind task_to_env and val_task_to_env for nemo_gym env
+    # Hardcode here to match `run_async_nemo_gym_rollout`
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
