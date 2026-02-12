@@ -106,13 +106,13 @@ openai_model:
       model: ${policy_model_name}
       return_token_id_information: true
       uses_reasoning_parser: true
+rollout_max_attempts_to_avoid_lp_nan: 1
 """
 
     config = NemoGymConfig(
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
-        rollout_max_retries_to_avoid_lp_nan=1,
     )
     env = NemoGym.options(
         runtime_env={
