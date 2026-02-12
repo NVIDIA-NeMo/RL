@@ -27,6 +27,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossConfig,
@@ -51,6 +55,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import extract_necessary_env_names
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -114,6 +119,17 @@ class AsyncGRPOConfig(TypedDict):
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
+class AdvEstimatorConfig(TypedDict):
+    """Configuration for advantage estimator (GRPO or Reinforce++)."""
+
+    name: str  # "grpo" or "reinforce_plus_plus"
+    # GRPO specific
+    normalize_rewards: NotRequired[bool]
+    use_leave_one_out_baseline: NotRequired[bool]
+    # Reinforce++ specific
+    minus_baseline: NotRequired[bool]
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -125,6 +141,9 @@ class GRPOConfig(TypedDict):
     val_period: int
     val_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
@@ -143,6 +162,8 @@ class GRPOConfig(TypedDict):
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
+    # Advantage estimator configuration (grpo or reinforce_plus_plus)
+    adv_estimator: NotRequired[AdvEstimatorConfig]
 
 
 class GRPOSaveState(TypedDict):
@@ -279,7 +300,11 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if grpo_config["val_period"] > 0 or grpo_config["val_at_start"]:
+    if (
+        grpo_config["val_period"] > 0
+        or grpo_config["val_at_start"]
+        or grpo_config["val_at_end"]
+    ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -296,16 +321,33 @@ def setup(
         )
 
     # ==========================
+    #        Loss Function
+    # ==========================
+    loss_fn = ClippedPGLossFn(loss_config)
+
+    # Validate force_on_policy_ratio
+    if loss_config.get("force_on_policy_ratio", False):
+        assert (
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
+            == policy_config["train_global_batch_size"]
+        ), (
+            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
+        print("  ✓ force_on_policy_ratio enabled")
+
+    # ==========================
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    reward_model_enabled = (
-        "env_name" in data_config and data_config["env_name"] == "reward_model"
-    )
+
+    env_name_list = extract_necessary_env_names(data_config)
+    rm_env_enabled = "reward_model" in env_name_list
 
     total_nodes = cluster_config["num_nodes"]
-    if reward_model_enabled:
+    if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
         rm_gpus_per_node = rm_resource["gpus_per_node"]
@@ -382,7 +424,7 @@ def setup(
             inference_nodes = 1
             # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
             reward_gpus_to_subtract = (
-                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
+                rm_gpus_per_node if total_nodes == 1 and rm_env_enabled else 0
             )
             train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
             assert train_gpus_per_node > 0, (
@@ -390,7 +432,7 @@ def setup(
                 f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
                 + (
                     f" - rm_gpus_per_node:{rm_gpus_per_node}"
-                    if total_nodes == 1 and reward_model_enabled
+                    if total_nodes == 1 and rm_env_enabled
                     else ""
                 )
             )
@@ -660,19 +702,6 @@ def setup(
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
 
-    loss_fn = ClippedPGLossFn(loss_config)
-
-    # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
-        assert (
-            grpo_config["num_prompts_per_step"]
-            * grpo_config["num_generations_per_prompt"]
-            == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
-        )
-        print("  ✓ force_on_policy_ratio enabled")
-
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -723,33 +752,6 @@ def setup(
 # ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
-
-
-def normalize_advantages_with_epsilon(
-    advantages: torch.Tensor,
-    std: torch.Tensor,
-    epsilon: float = 1e-6,
-) -> torch.Tensor:
-    """Normalize advantages by standard deviation, skipping samples with zero std.
-
-    When std is exactly zero (from leave-one-out baseline with identical rewards),
-    normalization is skipped for those samples to prevent numerical instability.
-    This makes normalize_rewards compatible with use_leave_one_out_baseline.
-
-    Args:
-        advantages: Tensor of shape (batch_size, 1) containing advantage values
-        std: Tensor of shape (batch_size,) containing standard deviation values
-        epsilon: Small value to avoid division by very small std, defaults to 1e-6
-
-    Returns:
-        Normalized advantages tensor of same shape as input advantages
-    """
-    # Only normalize where std > 0 to avoid division by near-zero
-    non_zero_std_mask = std > 0
-    advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
-        std.unsqueeze(-1)[non_zero_std_mask] + epsilon
-    )
-    return advantages
 
 
 def dynamic_sampling(
@@ -971,6 +973,73 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _create_advantage_estimator(master_config: MasterConfig):
+    """Create and return an advantage estimator based on configuration.
+
+    Args:
+        master_config: The master configuration dictionary.
+
+    Returns:
+        An advantage estimator instance (GRPOAdvantageEstimator or ReinforcePlusPlusAdvantageEstimator).
+
+    Raises:
+        ValueError: If the advantage estimator name is not recognized.
+    """
+    grpo_config = master_config["grpo"]
+    loss_config = master_config["loss_fn"]
+
+    # Provide backward-compatible defaults when adv_estimator is not in config.
+    # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
+    # which older configs still use.
+    adv_estimator_config = grpo_config.get(
+        "adv_estimator",
+        {
+            "name": "grpo",
+            "normalize_rewards": grpo_config.get("normalize_rewards", True),
+            "use_leave_one_out_baseline": grpo_config.get(
+                "use_leave_one_out_baseline", False
+            ),
+            "minus_baseline": True,
+        },
+    )
+
+    adv_estimator_name = adv_estimator_config["name"]
+    if adv_estimator_name == "grpo":
+        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_plus_plus":
+        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print("  ✓ Using Reinforce++ advantage estimator")
+    else:
+        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+
+    return adv_estimator
+
+
+def _extract_prompt_only_messages(message_logs: list) -> list:
+    """Extract only prompt messages (user/system) from message logs.
+
+    This is used to get prompt IDs for advantage estimation, excluding
+    any assistant responses.
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+
+    Returns:
+        List of message logs containing only user and system messages.
+    """
+    prompt_only_message_logs = []
+    for message_log in message_logs:
+        prompt_only_log = []
+        for message in message_log:
+            if message["role"] == "user" or message["role"] == "system":
+                prompt_only_log.append(message)
+        prompt_only_message_logs.append(prompt_only_log)
+    return prompt_only_message_logs
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1157,8 +1226,12 @@ def grpo_train(
         "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+
+    # Initialize advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -1277,6 +1350,10 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                if dynamic_sampling_num_gen_batches == 1 and hasattr(
+                    policy_generation, "snapshot_step_metrics"
+                ):
+                    policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1419,22 +1496,25 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+                    gen_step_metrics = {}
+                    if hasattr(policy_generation, "get_step_metrics"):
+                        gen_step_metrics = policy_generation.get_step_metrics()
                     advantages = (rewards - baseline).unsqueeze(-1)
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
-                        )
+                    # Save baseline for logging (before deletion)
+                    baseline_for_log = baseline.clone()
 
-                    _log_mixed_rewards_and_advantages_information(
-                        logger=logger,
-                        total_steps=total_steps,
-                        metrics=metrics,
-                        baseline=baseline,
-                        advantages=advantages,
+                    # Extract prompt-only messages for advantage estimation
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
                     )
-
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
@@ -1450,7 +1530,7 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
-                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
@@ -1465,10 +1545,6 @@ def grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            message["advantages"] = advantages[i].expand(
-                                message["token_ids"].shape
-                            )
-                    del advantages
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1480,11 +1556,11 @@ def grpo_train(
                     )
 
                     # Create training data from flattened messages
+                    # Note: advantages will be computed and added after logprobs are available
                     train_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": flat_messages["token_ids"],
                             "input_lengths": input_lengths,
-                            "advantages": flat_messages["advantages"],
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
@@ -1532,6 +1608,33 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
+                # Compute advantages with adv_estimator using correct mask and logprobs
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...", flush=True)
+                    # Get token-level mask: token_mask * sample_mask
+                    token_mask = train_data["token_mask"]
+                    sample_mask = train_data["sample_mask"]
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
+                    del prompt_ids_for_adv
+
+                    # Log rewards and advantages information
+                    _log_mixed_rewards_and_advantages_information(
+                        logger=logger,
+                        total_steps=total_steps,
+                        metrics=metrics,
+                        baseline=baseline_for_log,
+                        advantages=train_data["advantages"],
+                    )
+                    del baseline_for_log
+
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -1564,8 +1667,10 @@ def grpo_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1597,7 +1702,7 @@ def grpo_train(
                     )
 
                 # Get flat advantages and token mask for masked metrics computation
-                flat_advantages = flat_messages["advantages"]
+                flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
 
@@ -1635,6 +1740,7 @@ def grpo_train(
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(gen_step_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
@@ -1787,6 +1893,7 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
+            del train_data
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
@@ -1881,7 +1988,7 @@ def grpo_train(
             # processing rewards
             del repeated_batch
             del rewards
-            del train_data
+            # train_data already deleted after logging above
             # logging
             del metrics
             if "val_metrics" in dir():
@@ -2135,7 +2242,11 @@ def async_grpo_train(
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
+    val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+
+    # Initialize advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
 
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
@@ -2414,59 +2525,27 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    prompt_only_message_logs = []
-                    for message_log in repeated_batch["message_log"]:
-                        prompt_only_log = []
-                        for message in message_log:
-                            if message["role"] == "user" or message["role"] == "system":
-                                prompt_only_log.append(message)
-                        prompt_only_message_logs.append(prompt_only_log)
-
-                    prompt_batched_flat, prompt_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            prompt_only_message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
+                    # Extract prompt-only messages for advantage estimation
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
                     )
-                    prompt_only_ids = prompt_batched_flat["token_ids"]
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
-
-                    print("▶ Computing advantages...")
-
-                    baseline, std = calculate_baseline_and_std_per_prompt(
-                        prompt_only_ids,
-                        rewards,
-                        torch.ones_like(rewards),
-                        leave_one_out_baseline=master_config["grpo"][
-                            "use_leave_one_out_baseline"
-                        ],
-                    )
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
-                    print(
-                        f"  📊 Baseline stats: min={baseline.min():.4f}, max={baseline.max():.4f}, mean={baseline.mean():.4f}"
-                    )
-                    print(
-                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                    )
-
-                    if master_config["grpo"]["normalize_rewards"]:
-                        advantages = normalize_advantages_with_epsilon(
-                            advantages=advantages,
-                            std=std,
-                        )
-
-                        print(
-                            f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
-                        )
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message
+                    # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
@@ -2481,9 +2560,6 @@ def async_grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            message["advantages"] = advantages[i].expand(
-                                message["token_ids"].shape
-                            )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2495,11 +2571,11 @@ def async_grpo_train(
                     )
 
                     # Create training data
+                    # Note: advantages will be computed and added after logprobs are available
                     train_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": flat_messages["token_ids"],
                             "input_lengths": input_lengths,
-                            "advantages": flat_messages["advantages"],
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
@@ -2524,6 +2600,33 @@ def async_grpo_train(
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
+
+                # Compute advantages with adv_estimator using correct mask and logprobs
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...", flush=True)
+                    # Get token-level mask: token_mask * sample_mask
+                    token_mask = train_data["token_mask"]
+                    sample_mask = train_data["sample_mask"]
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
+                    del prompt_ids_for_adv
+
+                    # Log advantages stats
+                    # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
+                    # already normalized advantages (equivalent to "Normalized advantages stats"
+                    # in older versions). For ReinforcePlusPlusAdvantageEstimator, advantages
+                    # are globally normalized across valid tokens.
+                    advantages = train_data["advantages"]
+                    print(
+                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
@@ -2574,7 +2677,10 @@ def async_grpo_train(
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
 
-                if val_period > 0 and (step + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
@@ -2609,8 +2715,11 @@ def async_grpo_train(
                     # Resume trajectory collection after validation
                     trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
-                flat_advantages = flat_messages["advantages"]
+                flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
+                # Save content for logging before deleting flat_messages
+                flat_messages_content = flat_messages.get("content", [])
+                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -2748,7 +2857,7 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
-            log_data = {"content": flat_messages["content"]}
+            log_data = {"content": flat_messages_content}
             log_data["rewards"] = rewards.tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
@@ -2756,6 +2865,8 @@ def async_grpo_train(
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
+            del train_data
+            del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
