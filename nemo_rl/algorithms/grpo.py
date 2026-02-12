@@ -39,6 +39,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    compute_spec_decode_token_acceptance_metrics,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
@@ -1842,6 +1843,19 @@ def grpo_train(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
             )
+            step_token_acceptance_metrics = (
+                compute_spec_decode_token_acceptance_metrics(
+                    metrics.get("generation_logger_metrics", {})
+                )
+            )
+            if "token_acceptance_rate" in step_token_acceptance_metrics:
+                print(
+                    "  • Token Acceptance Rate: "
+                    f"{step_token_acceptance_metrics['token_acceptance_rate']:.4f} "
+                    f"({step_token_acceptance_metrics['accepted_draft_tokens']:.0f}/"
+                    f"{step_token_acceptance_metrics['proposed_draft_tokens']:.0f})",
+                    flush=True,
+                )
 
             print("\n⏱️  Timing:", flush=True)
             # Display total time first, separately
@@ -2816,6 +2830,18 @@ def async_grpo_train(
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
+            step_token_acceptance_metrics = (
+                compute_spec_decode_token_acceptance_metrics(
+                    metrics.get("generation_logger_metrics", {})
+                )
+            )
+            if "token_acceptance_rate" in step_token_acceptance_metrics:
+                print(
+                    "  • Token Acceptance Rate: "
+                    f"{step_token_acceptance_metrics['token_acceptance_rate']:.4f} "
+                    f"({step_token_acceptance_metrics['accepted_draft_tokens']:.0f}/"
+                    f"{step_token_acceptance_metrics['proposed_draft_tokens']:.0f})"
+                )
 
             print("\n⏱️  Timing:")
             total_time = timing_metrics.get("total_step_time", 0)

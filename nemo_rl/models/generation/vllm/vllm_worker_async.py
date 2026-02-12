@@ -212,6 +212,35 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self.spec_decode_accepted_tokens: list[int] = []
+        self.spec_decode_proposed_tokens: list[int] = []
+        self._spec_decode_accepted_counter_name: Optional[str] = None
+        self._spec_decode_proposed_counter_name: Optional[str] = None
+
+        def _normalize_metric_name(name: str) -> str:
+            return name.lower().replace("-", "_")
+
+        def _is_spec_decode_token_counter(name: str) -> bool:
+            normalized_name = _normalize_metric_name(name)
+            return (
+                "token" in normalized_name
+                and ("spec" in normalized_name or "draft" in normalized_name)
+            )
+
+        def _is_accepted_token_counter(name: str) -> bool:
+            normalized_name = _normalize_metric_name(name)
+            return _is_spec_decode_token_counter(normalized_name) and (
+                "accept" in normalized_name or "accepted" in normalized_name
+            )
+
+        def _is_proposed_token_counter(name: str) -> bool:
+            normalized_name = _normalize_metric_name(name)
+            return _is_spec_decode_token_counter(normalized_name) and (
+                ("proposed" in normalized_name)
+                or ("proposal" in normalized_name)
+                or ("speculative" in normalized_name)
+                or ("draft" in normalized_name)
+            )
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -233,6 +262,22 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
+                                elif (
+                                    self._spec_decode_accepted_counter_name is None
+                                    and _is_accepted_token_counter(m.name)
+                                ):
+                                    self._spec_decode_accepted_counter_name = m.name
+                                elif (
+                                    self._spec_decode_proposed_counter_name is None
+                                    and _is_proposed_token_counter(m.name)
+                                    and not _is_accepted_token_counter(m.name)
+                                ):
+                                    self._spec_decode_proposed_counter_name = m.name
+
+                                if m.name == self._spec_decode_accepted_counter_name:
+                                    self.spec_decode_accepted_tokens.append(int(m.value))
+                                if m.name == self._spec_decode_proposed_counter_name:
+                                    self.spec_decode_proposed_tokens.append(int(m.value))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -261,6 +306,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "spec_decode_accepted_tokens": copy.deepcopy(
+                    self.spec_decode_accepted_tokens
+                ),
+                "spec_decode_proposed_tokens": copy.deepcopy(
+                    self.spec_decode_proposed_tokens
+                ),
             }
         return metric
 
@@ -273,6 +324,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.spec_decode_accepted_tokens = []
+            self.spec_decode_proposed_tokens = []
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()

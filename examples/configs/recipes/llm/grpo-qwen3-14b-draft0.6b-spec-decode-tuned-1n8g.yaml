@@ -25,6 +25,9 @@ policy:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.85
       max_model_len: 2048
+      async_engine: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
     vllm_kwargs:
       speculative_config:
         method: draft_model

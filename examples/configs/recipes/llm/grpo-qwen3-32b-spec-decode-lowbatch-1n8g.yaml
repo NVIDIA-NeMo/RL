@@ -1,29 +1,31 @@
-defaults: ../../grpo_math_1B.yaml
+defaults: /opt/nemo-rl/examples/configs/grpo_math_1B.yaml
 grpo:
-  max_num_steps: 200
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
+  max_num_steps: 10
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-7b-spec-decode-1n8g
+  checkpoint_dir: results/grpo-qwen3-32b-spec-decode-lowbatch
+  enabled: false
 policy:
-  model_name: Qwen/Qwen3-4B
+  model_name: Qwen/Qwen3-32B
   tokenizer:
-    name: Qwen/Qwen3-4B
-  train_global_batch_size: 512
+    name: Qwen/Qwen3-32B
+  train_global_batch_size: 8
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 2048
+  max_total_sequence_length: 5120
   dynamic_batching:
     enabled: true
   sequence_packing:
     enabled: false
   make_sequence_length_divisible_by: 1
   generation:
-    max_new_tokens: 1024
+    max_new_tokens: 4096
+    temperature: 0.6
     vllm_cfg:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.85
-      max_model_len: 2048
+      max_model_len: 5120
       async_engine: true
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
@@ -31,16 +33,13 @@ policy:
       speculative_config:
         method: draft_model
         model: Qwen/Qwen3-0.6B
-        num_speculative_tokens: 5
+        num_speculative_tokens: 3
         draft_tensor_parallel_size: 1
 data:
   max_input_seq_length: 1024
 logger:
-  log_dir: logs/grpo-qwen2.5-7b-spec-decode-1n8g
+  log_dir: logs/grpo-qwen3-32b-spec-decode-lowbatch
   wandb_enabled: false
   tensorboard_enabled: true
-  wandb:
-    project: nemo-rl
-    name: grpo-qwen2.5-7b-spec-decode-1n8g
 cluster:
   gpus_per_node: 8

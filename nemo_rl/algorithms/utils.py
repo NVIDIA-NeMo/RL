@@ -383,6 +383,61 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     return batch
 
 
+def _counter_delta_over_step(counter_series: list[Any]) -> float:
+    """Estimate step-local increments from a cumulative counter timeline."""
+    parsed_values = []
+    for value in counter_series:
+        try:
+            parsed_values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    if len(parsed_values) < 2:
+        return 0.0
+
+    delta = parsed_values[-1] - parsed_values[0]
+    # If the counter resets during the step, fallback to the latest counter value.
+    if delta < 0:
+        return max(0.0, parsed_values[-1])
+    return delta
+
+
+def compute_spec_decode_token_acceptance_metrics(
+    generation_logger_metrics: dict[str, Any],
+) -> dict[str, float]:
+    """Compute speculative decoding token acceptance metrics from logger timelines."""
+    accepted_per_worker = generation_logger_metrics.get("spec_decode_accepted_tokens")
+    proposed_per_worker = generation_logger_metrics.get("spec_decode_proposed_tokens")
+    if not isinstance(accepted_per_worker, dict) or not isinstance(
+        proposed_per_worker, dict
+    ):
+        return {}
+
+    accepted_draft_tokens = sum(
+        _counter_delta_over_step(worker_series)
+        for worker_series in accepted_per_worker.values()
+        if isinstance(worker_series, list)
+    )
+    proposed_draft_tokens = sum(
+        _counter_delta_over_step(worker_series)
+        for worker_series in proposed_per_worker.values()
+        if isinstance(worker_series, list)
+    )
+
+    if accepted_draft_tokens <= 0 and proposed_draft_tokens <= 0:
+        return {}
+
+    token_acceptance_metrics: dict[str, float] = {
+        "accepted_draft_tokens": accepted_draft_tokens,
+        "proposed_draft_tokens": proposed_draft_tokens,
+    }
+    if proposed_draft_tokens > 0:
+        token_acceptance_metrics["token_acceptance_rate"] = (
+            accepted_draft_tokens / proposed_draft_tokens
+        )
+    return token_acceptance_metrics
+
+
 def print_performance_metrics(
     train_results: dict[str, float],
     metrics: dict[str, Any],
@@ -562,6 +617,19 @@ def print_performance_metrics(
                     "Num Pending Samples",
                     None,
                 )
+        token_acceptance_metrics = compute_spec_decode_token_acceptance_metrics(
+            vllm_logger_metrics
+        )
+        if "token_acceptance_rate" in token_acceptance_metrics:
+            accepted_draft_tokens = token_acceptance_metrics["accepted_draft_tokens"]
+            proposed_draft_tokens = token_acceptance_metrics["proposed_draft_tokens"]
+            token_acceptance_rate = token_acceptance_metrics["token_acceptance_rate"]
+            print(
+                "  • Spec Decode Token Acceptance Rate: "
+                f"{token_acceptance_rate:.4f} "
+                f"({accepted_draft_tokens:.0f}/{proposed_draft_tokens:.0f})"
+            )
+        performance_metrics.update(token_acceptance_metrics)
 
     # =====================================================
     # Throughputs
