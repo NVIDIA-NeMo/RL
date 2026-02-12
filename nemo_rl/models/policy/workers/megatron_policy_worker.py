@@ -97,7 +97,10 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
+    get_runtime_env_for_policy_worker,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -227,6 +230,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
+
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            generation_cfg = self.cfg["generation"]
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg.get("top_k", None),
+                top_p=generation_cfg.get("top_p", 1.0),
+                temperature=generation_cfg.get("temperature", 1.0),
+            )
+        else:
+            self.sampling_params = None
+
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
@@ -344,7 +358,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with ctx:
             forward_step = partial(
-                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+                forward_step_arbitrary_loss,
+                loss_fn=loss_fn,
+                sampling_params=self.sampling_params,
             )
             all_mb_metrics = []
             losses = []
@@ -596,8 +612,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             # Apply temperature scaling to logits for training
             # This matches the dtensor worker's _apply_temperature_scaling in the train method
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
+            if (
+                self.sampling_params is not None
+                and self.sampling_params.temperature != 1.0
+            ):
+                output_tensor.div_(self.sampling_params.temperature)
 
             def collection_fn(output_tensor):
                 stc = time.time()
@@ -616,6 +635,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         inference_only=True,
                         cp_group=get_context_parallel_group(),
                         chunk_size=logprob_chunk_size,
+                        sampling_params=self.sampling_params,
                     )
                 else:
                     token_logprobs = from_parallel_logits_to_logprobs(
@@ -626,6 +646,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         tp_group=tp_grp,
                         inference_only=True,
                         chunk_size=logprob_chunk_size,
+                        sampling_params=self.sampling_params,
                     )
 
                 # Prepend 0 logprob for first token to maintain same sequence length as input
@@ -698,6 +719,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # if isinstance(item, torch.Tensor):
                 # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
 
+                saved_sampling_params = self.sampling_params
+                if saved_sampling_params is not None:
+                    self.sampling_params = TrainingSamplingParams(
+                        top_k=None,
+                        top_p=1.0,
+                        temperature=saved_sampling_params.temperature,
+                    )
+                else:
+                    self.sampling_params = None
+
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -708,6 +739,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
+                self.sampling_params = saved_sampling_params
                 self.model.load_state_dict(model_state_dict, strict=True)
                 # for name, item in model_state_dict.items():
                 # if isinstance(item, torch.Tensor):
@@ -797,8 +829,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 **multimodal_data,
             )
 
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
+            if (
+                self.sampling_params is not None
+                and self.sampling_params.temperature != 1.0
+            ):
+                output_tensor.div_(self.sampling_params.temperature)
 
             def collection_fn(_):
                 # Only the last PP stage produces final logits/top-k; earlier stages return empty

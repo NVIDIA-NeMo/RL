@@ -71,8 +71,12 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
+    need_top_k_filtering,
+    need_top_p_filtering,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -171,6 +175,16 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            generation_cfg = self.cfg["generation"]
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg.get("top_k", None),
+                top_p=generation_cfg.get("top_p", 1.0),
+                temperature=generation_cfg.get("temperature", 1.0),
+            )
+        else:
+            self.sampling_params = None
 
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -477,8 +491,21 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            logits.div_(self.cfg["generation"]["temperature"])
+        if self.sampling_params is not None and self.sampling_params.temperature != 1.0:
+            logits.div_(self.sampling_params.temperature)
+        return logits
+
+    def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
+        if self.sampling_params is not None and (
+            need_top_k_filtering(self.sampling_params.top_k)
+            or need_top_p_filtering(self.sampling_params.top_p)
+        ):
+            logits, _ = apply_top_k_top_p(
+                logits,
+                top_k=self.sampling_params.top_k,
+                top_p=self.sampling_params.top_p,
+            )
         return logits
 
     @staticmethod
@@ -789,6 +816,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            sampling_params=self.sampling_params,
                         )
                         del logits
 
@@ -1079,6 +1107,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids_dtensor,
                             seq_index_tensor,
                             chunk_size=logprob_chunk_size,
+                            sampling_params=self.sampling_params,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
@@ -1088,6 +1117,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 logits,
                                 input_ids,
                                 chunk_size=logprob_chunk_size,
+                                sampling_params=self.sampling_params,
                             )
                         else:
                             if logprob_chunk_size is not None:
@@ -1105,6 +1135,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     chunk_logits = logits[
                                         :, chunk_start:chunk_end, :
                                     ].to(torch.float32)
+                                    # Apply top-k and top-p filtering
+                                    chunk_logits = self._apply_top_k_top_p_filtering(
+                                        chunk_logits
+                                    )
                                     log_probs = torch.nn.functional.log_softmax(
                                         chunk_logits, dim=-1
                                     )
@@ -1112,7 +1146,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 log_probs = torch.cat(chunked_log_probs, dim=1)
                                 del chunked_log_probs
                             else:
+                                # Apply top-k and top-p filtering
                                 logits = logits.to(torch.float32)
+                                logits = self._apply_top_k_top_p_filtering(logits)
                                 log_probs = torch.nn.functional.log_softmax(
                                     logits, dim=-1
                                 )
@@ -1607,8 +1643,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
             try:
@@ -1622,11 +1660,29 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     val = to_local_if_dtensor(v)
                     val.copy_(self.reference_model_state_dict[k])
 
+                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+                # The reference policy has different weights, so its top-k/top-p set is
+                # inherently different from the current policy. Using filtered logprobs
+                # would cause -inf mismatches that cannot be resolved by masking.
+                # Note: We keep temperature scaling since it was applied to prev_logprobs.
+                saved_sampling_params = self.sampling_params
+                if saved_sampling_params is not None:
+                    self.sampling_params = TrainingSamplingParams(
+                        top_k=None,  # Disable top-k
+                        top_p=1.0,  # Disable top-p
+                        temperature=saved_sampling_params.temperature,  # Keep temperature
+                    )
+                else:
+                    self.sampling_params = None
+
                 # - self.model is the original reference_model, now on CUDA
                 # - curr_state_dict is the train model, now on CPU
                 yield
 
             finally:
+                # Restore sampling_params
+                self.sampling_params = saved_sampling_params
+
                 # Restore train model state_dict
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
