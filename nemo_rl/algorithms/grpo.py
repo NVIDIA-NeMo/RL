@@ -55,6 +55,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import extract_necessary_env_names
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -341,12 +342,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    reward_model_enabled = (
-        "env_name" in data_config and data_config["env_name"] == "reward_model"
-    )
+
+    env_name_list = extract_necessary_env_names(data_config)
+    rm_env_enabled = "reward_model" in env_name_list
 
     total_nodes = cluster_config["num_nodes"]
-    if reward_model_enabled:
+    if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
         rm_gpus_per_node = rm_resource["gpus_per_node"]
@@ -423,7 +424,7 @@ def setup(
             inference_nodes = 1
             # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
             reward_gpus_to_subtract = (
-                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
+                rm_gpus_per_node if total_nodes == 1 and rm_env_enabled else 0
             )
             train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
             assert train_gpus_per_node > 0, (
@@ -431,7 +432,7 @@ def setup(
                 f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
                 + (
                     f" - rm_gpus_per_node:{rm_gpus_per_node}"
-                    if total_nodes == 1 and reward_model_enabled
+                    if total_nodes == 1 and rm_env_enabled
                     else ""
                 )
             )
