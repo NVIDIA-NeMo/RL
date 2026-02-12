@@ -68,7 +68,10 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
     get_runtime_env_for_policy_worker,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
@@ -239,6 +242,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            generation_cfg = self.cfg["generation"]
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg.get("top_k", None),
+                top_p=generation_cfg.get("top_p", 1.0),
+                temperature=generation_cfg.get("temperature", 1.0),
+            )
+        else:
+            self.sampling_params = None
+
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
             config=config,
@@ -322,6 +335,24 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.is_generation_colocated,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+    def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.sampling_params is not None and self.sampling_params.temperature != 1.0:
+            logits.div_(self.sampling_params.temperature)
+        return logits
+
+    def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
+        sampling_params = self.sampling_params
+        if sampling_params is not None and need_top_k_or_top_p_filtering(
+            sampling_params.top_k, sampling_params.top_p
+        ):
+            logits, _ = apply_top_k_top_p(
+                logits,
+                top_k=sampling_params.top_k,
+                top_p=sampling_params.top_p,
+            )
+        return logits
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -796,9 +827,24 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 # - self.model is the original reference_model, now on CUDA
                 # - curr_state_dict is the train model, now on CPU
+
+                # Save and adjust sampling_params for reference model
+                saved_sampling_params = self.sampling_params
+                if saved_sampling_params is not None:
+                    self.sampling_params = TrainingSamplingParams(
+                        top_k=None,
+                        top_p=1.0,
+                        temperature=saved_sampling_params.temperature,
+                    )
+                else:
+                    self.sampling_params = None
+
                 yield
 
             finally:
+                # Restore sampling_params
+                self.sampling_params = saved_sampling_params
+
                 # Restore train model state_dict
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
