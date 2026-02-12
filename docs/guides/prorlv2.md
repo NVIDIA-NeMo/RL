@@ -169,17 +169,17 @@ Key differences from ICE-POP:
 |---|---|---|
 | Filtering granularity | per token | per sequence |
 | IS correction weights | filtered (zeroed outside bounds) | raw / non-truncated |
-| Reference bounds | min=0.5, max=5 | min=0.002, max=0.003 |
+| Reference bounds | min=0.5, max=5 | min=0.999, max=1.002 |
 
 ```yaml
 loss_fn:
   use_importance_sampling_correction: true
-  truncated_importance_sampling_ratio: 0.003
-  truncated_importance_sampling_ratio_min: 0.002
+  truncated_importance_sampling_ratio: 1.002
+  truncated_importance_sampling_ratio_min: 0.999
   truncated_importance_sampling_type: "seq-mask-tis"
 ```
 
-Both ICE-POP and seq-mask-tis report a shared metric **`is_filter_drop_frac`** — the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) that were filtered out.
+Both ICE-POP and seq-mask-tis report a shared metric **`is_oob_ratio`** — the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) that were filtered out.
 
 - **Reference**: [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 

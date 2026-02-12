@@ -420,7 +420,7 @@ class ClippedPGLossFn(LossFunction):
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
         # "seq-mask-tis" – zero out entire sequences whose geometric-mean
         #                  IS ratio ∉ [min, max]; retained sequences keep
-        #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.002–0.003)
+        #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
@@ -437,7 +437,7 @@ class ClippedPGLossFn(LossFunction):
                     <= self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
-                    "is_filter_drop_frac": 1.0
+                    "is_oob_ratio": 1.0
                     - masked_mean(
                         token_kept_mask.float(),
                         mask,
@@ -451,8 +451,14 @@ class ClippedPGLossFn(LossFunction):
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
                 # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
+                log_is_ratio = torch.nan_to_num(
+                    prev_logprobs - generation_logprobs,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
                 seq_log_is_ratio_mean = masked_mean(
-                    prev_logprobs - generation_logprobs, token_mask, dim=-1
+                    log_is_ratio, token_mask, dim=-1
                 )  # [B]
                 seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
                 seq_kept_mask = (
