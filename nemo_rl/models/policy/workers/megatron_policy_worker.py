@@ -393,6 +393,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             global_valid_toks,
                             pack_sequences=self.cfg["sequence_packing"]["enabled"],
                             defer_fp32_logits=self.defer_fp32_logits,
+                            num_microbatches=num_microbatches,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,
@@ -401,7 +402,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         micro_batch_size=mbs,
                         decoder_seq_length=padded_seq_length,
                         forward_only=eval_mode,
-                        do_not_average_loss=True,
                     )
 
                 # Empty unused memory.
