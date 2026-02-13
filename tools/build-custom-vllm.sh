@@ -112,18 +112,21 @@ deps = project.get("dependencies")
 if not any(x.startswith("setuptools_scm") for x in deps):
     deps.append("setuptools_scm")
 
-# 2) Update [project.optional-dependencies].vllm: unpin vllm==... -> vllm
+# 2) Update [project.optional-dependencies].vllm: unpin any vllm constraint -> vllm
 opt = project.get("optional-dependencies")
 vllm_list = opt["vllm"]
-# Remove any pinned vllm==...
+# Remove any constrained vllm entry (for example vllm==..., vllm>=...).
 keep_items = []
 has_unpinned_vllm = False
 for item in vllm_list:
     s = str(item).strip()
-    if s.startswith("vllm=="):
-        continue
+    # Keep exactly one unconstrained `vllm` entry.
     if s == "vllm":
         has_unpinned_vllm = True
+        continue
+    # Drop any constrained vllm specifier and rely on local source below.
+    if s.startswith("vllm"):
+        continue
     keep_items.append(item)
 if not has_unpinned_vllm:
     keep_items.append("vllm")

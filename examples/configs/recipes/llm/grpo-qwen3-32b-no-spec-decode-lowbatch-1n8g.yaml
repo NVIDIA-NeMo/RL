@@ -1,0 +1,36 @@
+defaults: /opt/nemo-rl/examples/configs/grpo_math_1B.yaml
+grpo:
+  max_num_steps: 10
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-no-spec-decode-lowbatch
+  enabled: false
+policy:
+  model_name: Qwen/Qwen3-32B
+  tokenizer:
+    name: Qwen/Qwen3-32B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 5120
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 4096
+    temperature: 0.6
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: 5120
+data:
+  max_input_seq_length: 1024
+logger:
+  log_dir: logs/grpo-qwen3-32b-no-spec-decode-lowbatch
+  wandb_enabled: false
+  tensorboard_enabled: true
+cluster:
+  gpus_per_node: 8

@@ -838,13 +838,16 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+        vllm_logger_metrics: dict[str, Any] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
             "generation_tokens": {},  # dp_idx -> list[int]
             "spec_decode_accepted_tokens": {},  # dp_idx -> list[int]
             "spec_decode_proposed_tokens": {},  # dp_idx -> list[int]
+            "spec_decode_accepted_counter_name": {},  # dp_idx -> str
+            "spec_decode_proposed_counter_name": {},  # dp_idx -> str
+            "spec_decode_counter_candidates_seen": {},  # dp_idx -> list[str]
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -873,6 +876,27 @@ class VllmGeneration(GenerationInterface):
             if spec_decode_proposed_tokens:
                 vllm_logger_metrics["spec_decode_proposed_tokens"][dp_idx] = (
                     spec_decode_proposed_tokens
+                )
+            spec_decode_accepted_counter_name = stats.get(
+                "spec_decode_accepted_counter_name"
+            )
+            if isinstance(spec_decode_accepted_counter_name, str):
+                vllm_logger_metrics["spec_decode_accepted_counter_name"][dp_idx] = (
+                    spec_decode_accepted_counter_name
+                )
+            spec_decode_proposed_counter_name = stats.get(
+                "spec_decode_proposed_counter_name"
+            )
+            if isinstance(spec_decode_proposed_counter_name, str):
+                vllm_logger_metrics["spec_decode_proposed_counter_name"][dp_idx] = (
+                    spec_decode_proposed_counter_name
+                )
+            spec_decode_counter_candidates_seen = stats.get(
+                "spec_decode_counter_candidates_seen"
+            )
+            if isinstance(spec_decode_counter_candidates_seen, list):
+                vllm_logger_metrics["spec_decode_counter_candidates_seen"][dp_idx] = (
+                    spec_decode_counter_candidates_seen
                 )
 
         return vllm_logger_metrics

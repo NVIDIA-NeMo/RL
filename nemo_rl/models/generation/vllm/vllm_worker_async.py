@@ -148,6 +148,8 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        import inspect
+
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -155,9 +157,52 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
-            llm_kwargs["compilation_config"] = CompilationConfig(
-                **llm_kwargs["compilation_config"]
-            )
+            compilation_config = llm_kwargs["compilation_config"]
+            if isinstance(compilation_config, dict):
+                valid_field_names = None
+
+                pydantic_fields = getattr(CompilationConfig, "__pydantic_fields__", None)
+                if isinstance(pydantic_fields, dict) and pydantic_fields:
+                    valid_field_names = set(pydantic_fields.keys())
+                else:
+                    try:
+                        signature_params = inspect.signature(
+                            CompilationConfig
+                        ).parameters
+                        inferred_fields = {
+                            name
+                            for name, param in signature_params.items()
+                            if param.kind
+                            in (
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                inspect.Parameter.KEYWORD_ONLY,
+                            )
+                        }
+                        if inferred_fields and not inferred_fields.issubset(
+                            {"args", "kwargs"}
+                        ):
+                            valid_field_names = inferred_fields
+                    except (TypeError, ValueError):
+                        pass
+
+                if valid_field_names is not None:
+                    dropped_fields = sorted(
+                        set(compilation_config.keys()) - valid_field_names
+                    )
+                    if dropped_fields:
+                        print(
+                            "⚠️[vLLM Init] Ignoring unsupported compilation_config "
+                            f"fields: {dropped_fields}",
+                        )
+                    compilation_config = {
+                        k: v
+                        for k, v in compilation_config.items()
+                        if k in valid_field_names
+                    }
+
+                llm_kwargs["compilation_config"] = CompilationConfig(
+                    **compilation_config
+                )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
@@ -216,30 +261,79 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.spec_decode_proposed_tokens: list[int] = []
         self._spec_decode_accepted_counter_name: Optional[str] = None
         self._spec_decode_proposed_counter_name: Optional[str] = None
+        self._spec_decode_counter_candidates_seen: set[str] = set()
+        self._spec_decode_counter_warning_emitted = False
+        self._spec_decode_counter_selection_logged = False
 
         def _normalize_metric_name(name: str) -> str:
             return name.lower().replace("-", "_")
 
-        def _is_spec_decode_token_counter(name: str) -> bool:
-            normalized_name = _normalize_metric_name(name)
+        def _is_spec_decode_related_counter(normalized_name: str) -> bool:
             return (
-                "token" in normalized_name
-                and ("spec" in normalized_name or "draft" in normalized_name)
+                "spec_decode" in normalized_name
+                or "speculative" in normalized_name
+                or "draft" in normalized_name
+                or "lookahead" in normalized_name
             )
+
+        def _is_per_position_counter(normalized_name: str) -> bool:
+            return "per_pos" in normalized_name or "per_position" in normalized_name
+
+        preferred_accepted_counter_names = {
+            "vllm:spec_decode_num_accepted_tokens",
+            "vllm:spec_decode_num_accepted_tokens_total",
+            "vllm:spec_decode_accepted_tokens",
+            "vllm:spec_decode_accepted_tokens_total",
+        }
+        preferred_proposed_counter_names = {
+            "vllm:spec_decode_num_draft_tokens",
+            "vllm:spec_decode_num_draft_tokens_total",
+            "vllm:spec_decode_proposed_tokens",
+            "vllm:spec_decode_proposed_tokens_total",
+            "vllm:spec_decode_num_proposed_tokens",
+            "vllm:spec_decode_num_proposed_tokens_total",
+        }
+        normalized_preferred_accepted_counter_names = {
+            _normalize_metric_name(name) for name in preferred_accepted_counter_names
+        }
+        normalized_preferred_proposed_counter_names = {
+            _normalize_metric_name(name) for name in preferred_proposed_counter_names
+        }
 
         def _is_accepted_token_counter(name: str) -> bool:
             normalized_name = _normalize_metric_name(name)
-            return _is_spec_decode_token_counter(normalized_name) and (
-                "accept" in normalized_name or "accepted" in normalized_name
+            if normalized_name in normalized_preferred_accepted_counter_names:
+                return True
+            if _is_per_position_counter(normalized_name):
+                return False
+            return (
+                "accept" in normalized_name
+                and "token" in normalized_name
+                and _is_spec_decode_related_counter(normalized_name)
             )
 
         def _is_proposed_token_counter(name: str) -> bool:
             normalized_name = _normalize_metric_name(name)
-            return _is_spec_decode_token_counter(normalized_name) and (
-                ("proposed" in normalized_name)
-                or ("proposal" in normalized_name)
-                or ("speculative" in normalized_name)
-                or ("draft" in normalized_name)
+            if normalized_name in normalized_preferred_proposed_counter_names:
+                return True
+            return (
+                "token" in normalized_name
+                and _is_spec_decode_related_counter(normalized_name)
+                and (
+                    ("propos" in normalized_name)
+                    or ("proposal" in normalized_name)
+                    or ("speculative" in normalized_name)
+                    or ("draft" in normalized_name)
+                )
+                and "accept" not in normalized_name
+            )
+
+        def _is_fallback_accepted_token_counter(name: str) -> bool:
+            normalized_name = _normalize_metric_name(name)
+            return (
+                "accept" in normalized_name
+                and "token" in normalized_name
+                and normalized_name != "vllm:generation_tokens"
             )
 
         def _logger_loop():
@@ -260,24 +354,67 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                                 elif m.name == "vllm:kv_cache_usage_perc":
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
+                                normalized_counter_name = _normalize_metric_name(m.name)
+                                if _is_spec_decode_related_counter(
+                                    normalized_counter_name
+                                ) or "accept" in normalized_counter_name:
+                                    self._spec_decode_counter_candidates_seen.add(m.name)
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
-                                elif (
+
+                                if (
                                     self._spec_decode_accepted_counter_name is None
                                     and _is_accepted_token_counter(m.name)
                                 ):
                                     self._spec_decode_accepted_counter_name = m.name
-                                elif (
+
+                                if (
                                     self._spec_decode_proposed_counter_name is None
                                     and _is_proposed_token_counter(m.name)
-                                    and not _is_accepted_token_counter(m.name)
                                 ):
                                     self._spec_decode_proposed_counter_name = m.name
+
+                                # Fallback when vLLM emits an accepted-token counter without
+                                # explicit spec/decode keywords in the metric name.
+                                if (
+                                    self._spec_decode_accepted_counter_name is None
+                                    and self._spec_decode_proposed_counter_name is not None
+                                    and _is_fallback_accepted_token_counter(m.name)
+                                    and not _is_per_position_counter(normalized_counter_name)
+                                    and m.name != self._spec_decode_proposed_counter_name
+                                ):
+                                    self._spec_decode_accepted_counter_name = m.name
 
                                 if m.name == self._spec_decode_accepted_counter_name:
                                     self.spec_decode_accepted_tokens.append(int(m.value))
                                 if m.name == self._spec_decode_proposed_counter_name:
                                     self.spec_decode_proposed_tokens.append(int(m.value))
+
+                    with self._vllm_metrics_lock:
+                        if (
+                            not self._spec_decode_counter_selection_logged
+                            and self._spec_decode_proposed_counter_name is not None
+                        ):
+                            print(
+                                "📋[vLLM Metric Logger] Selected spec-decode counters: "
+                                f"accepted={self._spec_decode_accepted_counter_name}, "
+                                f"proposed={self._spec_decode_proposed_counter_name}",
+                                flush=True,
+                            )
+                            self._spec_decode_counter_selection_logged = True
+                        if (
+                            self._spec_decode_proposed_counter_name is not None
+                            and self._spec_decode_accepted_counter_name is None
+                            and not self._spec_decode_counter_warning_emitted
+                        ):
+                            print(
+                                "⚠️[vLLM Metric Logger] Found speculative decoding "
+                                f"proposed-token counter '{self._spec_decode_proposed_counter_name}' "
+                                "but no accepted-token counter. Token acceptance rate "
+                                f"will be reported as N/A. Candidate counters seen: {sorted(self._spec_decode_counter_candidates_seen)}",
+                                flush=True,
+                            )
+                            self._spec_decode_counter_warning_emitted = True
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -311,6 +448,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 ),
                 "spec_decode_proposed_tokens": copy.deepcopy(
                     self.spec_decode_proposed_tokens
+                ),
+                "spec_decode_accepted_counter_name": self._spec_decode_accepted_counter_name,
+                "spec_decode_proposed_counter_name": self._spec_decode_proposed_counter_name,
+                "spec_decode_counter_candidates_seen": sorted(
+                    self._spec_decode_counter_candidates_seen
                 ),
             }
         return metric

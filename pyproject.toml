@@ -76,7 +76,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm>=0.12",
+  "vllm>=0.15.1,<0.16",
   "num2words>=0.5.14",
 ]
 sglang = [
@@ -214,6 +214,8 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
+# Lock only Python versions currently supported by vLLM wheels used in this project.
+environments = ["python_full_version < '3.13'"]
 extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a" } }
 no-build-isolation-package = [
   "transformer-engine-torch",

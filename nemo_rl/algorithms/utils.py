@@ -405,13 +405,29 @@ def _counter_delta_over_step(counter_series: list[Any]) -> float:
 def compute_spec_decode_token_acceptance_metrics(
     generation_logger_metrics: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute speculative decoding token acceptance metrics from logger timelines."""
+    """Compute speculative decoding token acceptance metrics from logger timelines.
+
+    Returns:
+        A dictionary with accepted/proposed draft token deltas and, when available,
+        acceptance rate. If proposed tokens are present but the accepted-token
+        counter is unavailable, acceptance rate is intentionally omitted so callers
+        can report `N/A` instead of a misleading `0.0`.
+    """
     accepted_per_worker = generation_logger_metrics.get("spec_decode_accepted_tokens")
     proposed_per_worker = generation_logger_metrics.get("spec_decode_proposed_tokens")
     if not isinstance(accepted_per_worker, dict) or not isinstance(
         proposed_per_worker, dict
     ):
         return {}
+
+    accepted_counter_found = any(
+        isinstance(worker_series, list) and len(worker_series) > 0
+        for worker_series in accepted_per_worker.values()
+    )
+    proposed_counter_found = any(
+        isinstance(worker_series, list) and len(worker_series) > 0
+        for worker_series in proposed_per_worker.values()
+    )
 
     accepted_draft_tokens = sum(
         _counter_delta_over_step(worker_series)
@@ -430,8 +446,10 @@ def compute_spec_decode_token_acceptance_metrics(
     token_acceptance_metrics: dict[str, float] = {
         "accepted_draft_tokens": accepted_draft_tokens,
         "proposed_draft_tokens": proposed_draft_tokens,
+        "spec_decode_accepted_counter_found": float(accepted_counter_found),
+        "spec_decode_proposed_counter_found": float(proposed_counter_found),
     }
-    if proposed_draft_tokens > 0:
+    if proposed_draft_tokens > 0 and accepted_counter_found:
         token_acceptance_metrics["token_acceptance_rate"] = (
             accepted_draft_tokens / proposed_draft_tokens
         )
@@ -617,17 +635,54 @@ def print_performance_metrics(
                     "Num Pending Samples",
                     None,
                 )
+        accepted_counter_name_by_worker = vllm_logger_metrics.get(
+            "spec_decode_accepted_counter_name", {}
+        )
+        proposed_counter_name_by_worker = vllm_logger_metrics.get(
+            "spec_decode_proposed_counter_name", {}
+        )
+        if isinstance(proposed_counter_name_by_worker, dict):
+            proposed_counter_names = sorted(
+                {
+                    value
+                    for value in proposed_counter_name_by_worker.values()
+                    if isinstance(value, str) and value
+                }
+            )
+            accepted_counter_names = []
+            if isinstance(accepted_counter_name_by_worker, dict):
+                accepted_counter_names = sorted(
+                    {
+                        value
+                        for value in accepted_counter_name_by_worker.values()
+                        if isinstance(value, str) and value
+                    }
+                )
+            if proposed_counter_names:
+                accepted_display = accepted_counter_names or ["<missing>"]
+                print(
+                    "  • Spec Decode Counter Selection: "
+                    f"accepted={accepted_display}, proposed={proposed_counter_names}"
+                )
         token_acceptance_metrics = compute_spec_decode_token_acceptance_metrics(
             vllm_logger_metrics
         )
+        accepted_counter_found = (
+            token_acceptance_metrics.get("spec_decode_accepted_counter_found", 1.0) > 0.5
+        )
+        proposed_draft_tokens = token_acceptance_metrics.get("proposed_draft_tokens", 0.0)
         if "token_acceptance_rate" in token_acceptance_metrics:
             accepted_draft_tokens = token_acceptance_metrics["accepted_draft_tokens"]
-            proposed_draft_tokens = token_acceptance_metrics["proposed_draft_tokens"]
             token_acceptance_rate = token_acceptance_metrics["token_acceptance_rate"]
             print(
                 "  • Spec Decode Token Acceptance Rate: "
                 f"{token_acceptance_rate:.4f} "
                 f"({accepted_draft_tokens:.0f}/{proposed_draft_tokens:.0f})"
+            )
+        elif proposed_draft_tokens > 0 and not accepted_counter_found:
+            print(
+                "  • Spec Decode Token Acceptance Rate: "
+                f"N/A (accepted counter unavailable, proposed={proposed_draft_tokens:.0f})"
             )
         performance_metrics.update(token_acceptance_metrics)
 

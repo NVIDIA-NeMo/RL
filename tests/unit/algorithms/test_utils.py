@@ -20,6 +20,7 @@ import torch
 
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    compute_spec_decode_token_acceptance_metrics,
     get_tokenizer,
     maybe_pad_last_batch,
     print_performance_metrics,
@@ -593,3 +594,33 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
+
+
+def test_compute_spec_decode_token_acceptance_metrics_normal_case():
+    generation_logger_metrics = {
+        "spec_decode_accepted_tokens": {0: [10, 28], 1: [3, 11]},
+        "spec_decode_proposed_tokens": {0: [20, 50], 1: [8, 24]},
+    }
+
+    metrics = compute_spec_decode_token_acceptance_metrics(generation_logger_metrics)
+
+    assert metrics["accepted_draft_tokens"] == 26.0
+    assert metrics["proposed_draft_tokens"] == 46.0
+    assert metrics["token_acceptance_rate"] == 26.0 / 46.0
+    assert metrics["spec_decode_accepted_counter_found"] == 1.0
+    assert metrics["spec_decode_proposed_counter_found"] == 1.0
+
+
+def test_compute_spec_decode_token_acceptance_metrics_missing_accepted_counter():
+    generation_logger_metrics = {
+        "spec_decode_accepted_tokens": {},
+        "spec_decode_proposed_tokens": {0: [120, 170]},
+    }
+
+    metrics = compute_spec_decode_token_acceptance_metrics(generation_logger_metrics)
+
+    assert metrics["accepted_draft_tokens"] == 0.0
+    assert metrics["proposed_draft_tokens"] == 50.0
+    assert "token_acceptance_rate" not in metrics
+    assert metrics["spec_decode_accepted_counter_found"] == 0.0
+    assert metrics["spec_decode_proposed_counter_found"] == 1.0

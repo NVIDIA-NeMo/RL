@@ -1848,12 +1848,27 @@ def grpo_train(
                     metrics.get("generation_logger_metrics", {})
                 )
             )
+            accepted_counter_found = (
+                step_token_acceptance_metrics.get(
+                    "spec_decode_accepted_counter_found", 1.0
+                )
+                > 0.5
+            )
+            proposed_draft_tokens = step_token_acceptance_metrics.get(
+                "proposed_draft_tokens", 0.0
+            )
             if "token_acceptance_rate" in step_token_acceptance_metrics:
                 print(
                     "  • Token Acceptance Rate: "
                     f"{step_token_acceptance_metrics['token_acceptance_rate']:.4f} "
                     f"({step_token_acceptance_metrics['accepted_draft_tokens']:.0f}/"
                     f"{step_token_acceptance_metrics['proposed_draft_tokens']:.0f})",
+                    flush=True,
+                )
+            elif proposed_draft_tokens > 0 and not accepted_counter_found:
+                print(
+                    "  • Token Acceptance Rate: "
+                    f"N/A (accepted counter unavailable, proposed={proposed_draft_tokens:.0f})",
                     flush=True,
                 )
 
@@ -2835,12 +2850,26 @@ def async_grpo_train(
                     metrics.get("generation_logger_metrics", {})
                 )
             )
+            accepted_counter_found = (
+                step_token_acceptance_metrics.get(
+                    "spec_decode_accepted_counter_found", 1.0
+                )
+                > 0.5
+            )
+            proposed_draft_tokens = step_token_acceptance_metrics.get(
+                "proposed_draft_tokens", 0.0
+            )
             if "token_acceptance_rate" in step_token_acceptance_metrics:
                 print(
                     "  • Token Acceptance Rate: "
                     f"{step_token_acceptance_metrics['token_acceptance_rate']:.4f} "
                     f"({step_token_acceptance_metrics['accepted_draft_tokens']:.0f}/"
                     f"{step_token_acceptance_metrics['proposed_draft_tokens']:.0f})"
+                )
+            elif proposed_draft_tokens > 0 and not accepted_counter_found:
+                print(
+                    "  • Token Acceptance Rate: "
+                    f"N/A (accepted counter unavailable, proposed={proposed_draft_tokens:.0f})"
                 )
 
             print("\n⏱️  Timing:")
