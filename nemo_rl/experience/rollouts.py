@@ -530,11 +530,10 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
-    # Expose individual reward signals when env returns multi-reward (e.g. HFMultiRewardVerifyWorker)
-    if multi_rewards.shape[1] >= 3:
-        current_batch["reward1"] = multi_rewards[:, 0].clone()
-        current_batch["reward2"] = multi_rewards[:, 1].clone()
-        current_batch["reward3"] = multi_rewards[:, 2].clone()
+    # Expose per-component rewards when env returns multi-reward (reward1, reward2, ... rewardN)
+    num_reward_components = multi_rewards.shape[1]
+    for i in range(num_reward_components):
+        current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -665,9 +664,7 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
-    reward1_acc = 0.0
-    reward2_acc = 0.0
-    reward3_acc = 0.0
+    reward_acc_list: list[float] = []  # per-component rewards, length set on first multi-reward
     multi_reward_seen = False
     turn_count = 0
     token_count = 0
@@ -736,16 +733,15 @@ async def run_sample_multi_turn_rollout(
 
         # Get environment feedback
         env_output = calculate_rewards(sample_batch, task_to_env)
-        # Update total reward and optional per-reward signals
-        if (
-            env_output.rewards.ndim == 2
-            and env_output.rewards.shape[1] >= 3
-        ):
+        # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
+        if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
             multi_reward_seen = True
+            n = env_output.rewards.shape[1]
+            if len(reward_acc_list) == 0:
+                reward_acc_list = [0.0] * n
             total_reward += float(env_output.rewards[0].sum().item())
-            reward1_acc += float(env_output.rewards[0, 0].item())
-            reward2_acc += float(env_output.rewards[0, 1].item())
-            reward3_acc += float(env_output.rewards[0, 2].item())
+            for j in range(n):
+                reward_acc_list[j] += float(env_output.rewards[0, j].item())
         else:
             total_reward += float(env_output.rewards[0].item())
         # Check termination
@@ -798,9 +794,8 @@ async def run_sample_multi_turn_rollout(
         "idx": sample_idx,
     }
     if multi_reward_seen:
-        final_sample_state["reward1"] = torch.tensor(reward1_acc)
-        final_sample_state["reward2"] = torch.tensor(reward2_acc)
-        final_sample_state["reward3"] = torch.tensor(reward3_acc)
+        for j in range(len(reward_acc_list)):
+            final_sample_state[f"reward{j + 1}"] = torch.tensor(reward_acc_list[j])
 
     # Sample metrics
     sample_metrics = {
@@ -921,15 +916,16 @@ def run_async_multi_turn_rollout(
                 dtype=torch.bool,
             ),
         }
-        if "reward1" in final_sample_states[0]:
-            final_batch_dict["reward1"] = torch.stack(
-                [state["reward1"] for state in final_sample_states]
-            )
-            final_batch_dict["reward2"] = torch.stack(
-                [state["reward2"] for state in final_sample_states]
-            )
-            final_batch_dict["reward3"] = torch.stack(
-                [state["reward3"] for state in final_sample_states]
+        print("testing new code")
+        # Add any reward component keys (reward1, reward2, ...) from the first state
+        reward_keys = [
+            k for k in final_sample_states[0]
+            if k.startswith("reward") and k[6:].isdigit()
+        ]
+        reward_keys = sorted(reward_keys, key=lambda k: int(k[6:]))
+        for key in reward_keys:
+            final_batch_dict[key] = torch.stack(
+                [state[key] for state in final_sample_states]
             )
         final_batch = BatchedDataDict[DatumSpec](final_batch_dict)
 
@@ -1202,16 +1198,20 @@ def run_async_nemo_gym_rollout(
         # Extra information not in the DatumSpec used by the GRPO algorithm
         "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
     }
-    if results and "reward1" in results[0].get("full_result", {}):
-        final_batch_dict["reward1"] = torch.tensor(
-            [r["full_result"]["reward1"] for r in results]
+    # Add any reward component keys (reward1, reward2, ...) from full_result
+    if results:
+        full_result = results[0].get("full_result", {})
+        reward_keys = sorted(
+            [
+                k for k in full_result
+                if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit()
+            ],
+            key=lambda k: int(k[6:]),
         )
-        final_batch_dict["reward2"] = torch.tensor(
-            [r["full_result"]["reward2"] for r in results]
-        )
-        final_batch_dict["reward3"] = torch.tensor(
-            [r["full_result"]["reward3"] for r in results]
-        )
+        for key in reward_keys:
+            final_batch_dict[key] = torch.tensor(
+                [r["full_result"][key] for r in results]
+            )
     final_batch = BatchedDataDict[DatumSpec](final_batch_dict)
 
     return AsyncNemoGymRolloutResult(

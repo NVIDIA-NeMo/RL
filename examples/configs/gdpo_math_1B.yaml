@@ -16,6 +16,7 @@ grpo:
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  use_gdpo: true  # GDPO: multi-reward advantage (per-component baselines, sum then normalize)
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128

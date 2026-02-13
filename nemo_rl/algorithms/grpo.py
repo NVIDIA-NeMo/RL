@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -136,6 +137,10 @@ class GRPOConfig(TypedDict):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
+    # Use GDPO multi-reward advantage (per-component baselines, sum advantages, then normalize).
+    # When True, reward components are discovered from the batch (keys reward1, reward2, ...).
+    # Requires the environment to expose per-reward keys; see nemo_rl/environments/math_environment.py.
+    use_gdpo: NotRequired[bool]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
 
@@ -820,6 +825,15 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
+def _get_reward_component_keys(batch: BatchedDataDict[Any]) -> list[str]:
+    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order.
+
+    Enables environments to expose any number of rewards without code changes elsewhere.
+    """
+    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
+    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+
+
 def scale_rewards(
     repeated_batch: BatchedDataDict[DatumSpec], reward_scaling_cfg: RewardScalingConfig
 ) -> BatchedDataDict[DatumSpec]:
@@ -863,9 +877,8 @@ def scale_rewards(
             source_max - source_min
         ) * (target_max - target_min)
         repeated_batch["total_reward"] = scaled_rewards
-        for key in ("reward1", "reward2", "reward3"):
-            if key in repeated_batch:
-                repeated_batch[key] = _scale(repeated_batch[key])
+        for key in _get_reward_component_keys(repeated_batch):
+            repeated_batch[key] = _scale(repeated_batch[key])
 
     return repeated_batch
 
@@ -1235,21 +1248,18 @@ def grpo_train(
                 print("▶ Processing rewards...,", flush=True)
                 # GDPO
                 with timer.time("reward_calculation"):
-                    # Extract rewards from final_batch. When using a multi-reward env
-                    # (e.g. HFMultiRewardVerifyWorker), individual signals are also available.
+                    # Extract rewards from final_batch. When use_gdpo is True and the batch has
+                    # multiple reward components (reward1, reward2, ...), use GDPO advantage.
                     rewards = repeated_batch["total_reward"]
-                    reward1 = repeated_batch.get("reward1")
-                    reward2 = repeated_batch.get("reward2")
-                    reward3 = repeated_batch.get("reward3")
+                    use_gdpo = master_config["grpo"].get("use_gdpo", False)
+                    reward_component_keys = _get_reward_component_keys(repeated_batch)
                     use_multi_reward_advantages = (
-                        reward1 is not None
-                        and reward2 is not None
-                        and reward3 is not None
+                        use_gdpo and len(reward_component_keys) >= 2
                     )
 
                     # Store input_ids in batch so that after dynamic_sampling it stays aligned with
                     # the (possibly filtered) batch: select_indices / from_batches / slice all
-                    # apply to this key, so per-reward baselines use the same prompts as reward1/2/3.
+                    # apply to this key, so per-reward baselines use the same prompts as reward components.
                     repeated_batch["_input_ids_for_baseline"] = input_ids
 
                     print("▶ Computing advantages...", flush=True)
@@ -1293,51 +1303,36 @@ def grpo_train(
                         continue
 
                     if use_multi_reward_advantages:
-                        # Per-reward baselines and advantages, then sum and normalize.
-                        # Use input_ids from the current (possibly dynamic-sampling-filtered) batch
-                        # so baselines are computed over the same prompts as r1, r2, r3.
+                        # GDPO: per-reward baselines and advantages, then sum and normalize.
+                        # Use input_ids from the current (possibly dynamic-sampling-filtered) batch.
                         current_input_ids = repeated_batch["_input_ids_for_baseline"]
-                        r1 = repeated_batch["reward1"]
-                        r2 = repeated_batch["reward2"]
-                        r3 = repeated_batch["reward3"]
-                        assert current_input_ids.shape[0] == r1.shape[0], (
-                            "_input_ids_for_baseline must match reward batch size after dynamic_sampling; "
-                            f"got {current_input_ids.shape[0]} vs {r1.shape[0]}"
+                        valid = torch.ones_like(
+                            repeated_batch[reward_component_keys[0]]
                         )
-                        valid = torch.ones_like(r1)
                         leave_one_out = master_config["grpo"][
                             "use_leave_one_out_baseline"
                         ]
-                        baseline1, std1 = calculate_baseline_and_std_per_prompt(
-                            current_input_ids, r1, valid, leave_one_out_baseline=leave_one_out
+                        assert current_input_ids.shape[0] == valid.shape[0], (
+                            "_input_ids_for_baseline must match reward batch size after dynamic_sampling; "
+                            f"got {current_input_ids.shape[0]} vs {valid.shape[0]}"
                         )
-                        baseline2, std2 = calculate_baseline_and_std_per_prompt(
-                            current_input_ids, r2, valid, leave_one_out_baseline=leave_one_out
-                        )
-                        baseline3, std3 = calculate_baseline_and_std_per_prompt(
-                            current_input_ids, r3, valid, leave_one_out_baseline=leave_one_out
-                        )
-                        advantages_reward1 = (r1 - baseline1).unsqueeze(-1)
-                        advantages_reward2 = (r2 - baseline2).unsqueeze(-1)
-                        advantages_reward3 = (r3 - baseline3).unsqueeze(-1)
-                        if master_config["grpo"]["normalize_rewards"]:
-                            advantages_reward1 = normalize_advantages_with_epsilon(
-                                advantages=advantages_reward1,
-                                std=std1,
+                        advantage_parts = []
+                        for key in reward_component_keys:
+                            r = repeated_batch[key]
+                            base, std_k = calculate_baseline_and_std_per_prompt(
+                                current_input_ids,
+                                r,
+                                valid,
+                                leave_one_out_baseline=leave_one_out,
                             )
-                            advantages_reward2 = normalize_advantages_with_epsilon(
-                                advantages=advantages_reward2,
-                                std=std2,
-                            )
-                            advantages_reward3 = normalize_advantages_with_epsilon(
-                                advantages=advantages_reward3,
-                                std=std3,
-                            )
-                        advantages = (
-                            advantages_reward1
-                            + advantages_reward2
-                            + advantages_reward3
-                        )
+                            adv_k = (r - base).unsqueeze(-1)
+                            if master_config["grpo"]["normalize_rewards"]:
+                                adv_k = normalize_advantages_with_epsilon(
+                                    advantages=adv_k,
+                                    std=std_k,
+                                )
+                            advantage_parts.append(adv_k)
+                        advantages = sum(advantage_parts)
                         # Normalize combined advantage to zero mean and unit std
                         adv_std = advantages.std()
                         if adv_std > 0:

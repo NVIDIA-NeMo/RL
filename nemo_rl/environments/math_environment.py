@@ -607,8 +607,8 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         ]
 
         worker_results = ray.get(futures)
-        print(f"worker_results {len(worker_results)}")
-        print(f"worker_results[0] {len(worker_results[0])}")
+        # print(f"worker_results {len(worker_results)}")
+        # print(f"worker_results[0] {len(worker_results[0])}")
         
         # Flatten the results and extract both scores and answers
         number_of_rewards = 3
@@ -630,8 +630,8 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
                 for i in range(number_of_rewards):
                     results[i].extend(worker_result[i])
 
-        print(f"results len len {len(results)}")
-        print(f"results[0] len len {len(results[0])}")
+        # print(f"results len len {len(results)}")
+        # print(f"results[0] len len {len(results[0])}")
         observations = [
             {
                 "role": "environment",
@@ -644,7 +644,7 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
 
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).T.cpu() ## Shape Batch_size, Number_rewards
-        print(f"rewards ??? {rewards.shape}")
+        # print(f"rewards ??? {rewards.shape}")
         ## hard fixed this done to
         # done = torch.ones_like(rewards[0]).cpu()
         done = torch.ones(rewards.shape[0]).cpu()
