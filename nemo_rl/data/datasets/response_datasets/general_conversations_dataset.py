@@ -78,12 +78,14 @@ def conversation_process_message(
     tried_default_extensions: Optional[set] = None,
     process_message_fragment: Callable = lambda tag, fragment: [{tag: fragment}],
 ) -> list[Dict[str, Any]]:
-    """
+    """Convert one conversation message from a string to a list of dictionaries representing media or text.
+
     Args:
         raw: dictionary with all webdataset compliant keys of a sample. 
-            Emtpy for jsonl dataset, non-empty otherwise
+            Emtpy for jsonl dataset, non-empty otherwise.
         metadata: 
     """
+
     if raw is None:
         raw = {}
     if tried_default_extensions is None:
@@ -139,6 +141,7 @@ def conversation_process_message(
 
 class GeneralConversationsJsonlDataset:
     """Loads general conversation datasets that have the json (manifest) files and media files in separate files (jsonl datasets).
+
     Each sample can be single/multi-turn converstaions with multiple modalities.
     Each modality can have one or more number of media objects.
     There is no requiement of where the media tag (e.g. '<sound>') should appear in the conversations.
@@ -223,9 +226,7 @@ class GeneralConversationsJsonlDataset:
         cls, example: dict[str, Any],
         media_directory: Optional[str] = None
     ) -> dict[str, list[dict[str, Any]]]:
-        """
-        Convert the json structure into an OpenAI-API-like message log.
-        """
+        """Convert the json structure into an OpenAI-API-like message log."""
         processed_example = {
             "messages": [],
             "task_name": cls.task_name,
