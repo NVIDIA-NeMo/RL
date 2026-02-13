@@ -104,6 +104,10 @@ unset CONDA_EXE
 unset _CE_CONDA
 unset _CE_M
 
+# Ensure nvcc is findable for HybridEP/deep_ep JIT on all nodes (head + workers)
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:${PATH}
+
 if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   mkdir -p "$UV_CACHE_DIR_OVERRIDE"
   if [[ -n $MOUNTS ]]; then
@@ -488,30 +492,32 @@ if [[ -n "$COMMAND" ]]; then
   srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
+  # Shell setup for attach: unset conda (avoids x86_64/ARM64 conflict on GB200) and prepend nvcc to PATH.
+  # Use '\'' to escape single quotes so ${CUDA_HOME} and $PATH expand *inside* the container (preserving uv etc)
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
+# Note: CONDA is unset and CUDA_HOME/PATH set for each attach shell (GB200/HybridEP)
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c 'unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE _CE_CONDA _CE_M; export CUDA_HOME=\${CUDA_HOME:-/usr/local/cuda}; export PATH=\${CUDA_HOME}/bin:\$PATH; '"\$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash -c 'unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE _CE_CONDA _CE_M; export CUDA_HOME=\${CUDA_HOME:-/usr/local/cuda}; export PATH=\${CUDA_HOME}/bin:\$PATH; exec bash -l'
   fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
-  # and use nodes_array[1] through nodes_array[N-1]
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
   fi
   nodes_array=($nodes)
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c 'unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE _CE_CONDA _CE_M; export CUDA_HOME=\${CUDA_HOME:-/usr/local/cuda}; export PATH=\${CUDA_HOME}/bin:\$PATH; '"\$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash -c 'unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE _CE_CONDA _CE_M; export CUDA_HOME=\${CUDA_HOME:-/usr/local/cuda}; export PATH=\${CUDA_HOME}/bin:\$PATH; exec bash -l'
   fi
 fi
 EOF

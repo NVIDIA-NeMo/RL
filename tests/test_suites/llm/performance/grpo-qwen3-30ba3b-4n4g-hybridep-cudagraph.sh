@@ -4,9 +4,18 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
-# HybridEP environment variables
+# Unset conda environment variables to prevent x86_64 conda on ARM64 (GB200) nodes
+# which causes "Exec format error" when uv tries to inspect the Python interpreter
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE _CE_CONDA _CE_M
+
+# HybridEP environment variables for DeepEP JIT compilation
+# USE_MNNVL=1 enables multi-node NVLink support for HybridEP
 export USE_MNNVL=1
 unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+
+# CUDA environment for JIT compilation (container should have these, but set explicitly for safety)
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:${PATH}
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
@@ -20,8 +29,9 @@ NUM_MINUTES=120
 exit_if_max_steps_reached
 
 # Run the experiment
+# NRL_FORCE_REBUILD_VENVS=true ensures deep_ep (HybridEP) is installed
 cd $PROJECT_ROOT
-uv run examples/run_grpo_math.py \
+NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo_math.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
