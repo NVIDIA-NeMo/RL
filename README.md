@@ -10,10 +10,16 @@
 </div>
 
 ## 📣 News
+* [02/04/2026] LoRA Support
+    * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
+    * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).
+    * Nano v3 LoRA recipes:
+        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * NeMo-Gym + NeMo-RL support
-    * 📊 [Coming soon] release run
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1Xgg8D7mNkWnz6t2uL8BbPfPb7UTkN1H0?usp=sharing) to get a head start on your experimentation.
 * [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [10/10/2025] **DAPO Algorithm Support**  
   NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm that extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
@@ -157,11 +163,11 @@ uv venv</code></pre>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (DTensor)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo_math.py</code></pre>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py</code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (Megatron)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo_math.py &#92;
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo.py &#92;
 --config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
       </td>
     </tr>
@@ -222,7 +228,7 @@ uv venv
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 > [!NOTE]
 > - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
->   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo_math.py`
+>   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`
 > - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 > - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
@@ -240,21 +246,21 @@ To run GRPO on a single GPU for `Qwen/Qwen2.5-1.5B`:
 
 ```sh
 # Run the GRPO math example using a 1B parameter model
-uv run python examples/run_grpo_math.py
+uv run python examples/run_grpo.py
 ```
 
 By default, this uses the configuration in `examples/configs/grpo_math_1B.yaml`. You can customize parameters with command-line overrides. For example, to run on 8 GPUs,
 
 ```sh
 # Run the GRPO math example using a 1B parameter model using 8 GPUs
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   cluster.gpus_per_node=8
 ```
 
 You can override any of the parameters listed in the YAML configuration file. For example,
 
 ```sh
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   policy.model_name="meta-llama/Llama-3.2-1B-Instruct" \
   checkpointing.checkpoint_dir="results/llama1b_math" \
   logger.wandb_enabled=True \
@@ -268,7 +274,7 @@ To train using this config on a single GPU:
 
 ```sh
 # Run a GRPO math example on 1 GPU using the Megatron backend
-uv run python examples/run_grpo_math.py \
+uv run python examples/run_grpo.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
@@ -281,7 +287,7 @@ For additional details on supported backends and how to configure the training b
 NUM_ACTOR_NODES=2
 
 # grpo_math_8b uses Llama-3.1-8B-Instruct model
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml cluster.num_nodes=2 checkpointing.checkpoint_dir='results/llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='grpo-llama8b_math'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml cluster.num_nodes=2 checkpointing.checkpoint_dir='results/llama8b_2nodes' logger.wandb_enabled=True logger.wandb.name='grpo-llama8b_math'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -311,7 +317,7 @@ HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -344,13 +350,13 @@ We provide an example on-policy distillation experiment using the [DeepScaler da
 To run on-policy distillation on a single GPU using `Qwen/Qwen3-1.7B-Base` as the student and `Qwen/Qwen3-4B` as the teacher:
 
 ```sh
-uv run python examples/run_distillation_math.py
+uv run python examples/run_distillation.py
 ```
 
 Customize parameters with command-line overrides. For example:
 
 ```sh
-uv run python examples/run_distillation_math.py \
+uv run python examples/run_distillation.py \
   policy.model_name="Qwen/Qwen3-1.7B-Base" \
   teacher.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
@@ -362,7 +368,7 @@ uv run python examples/run_distillation_math.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_distillation_math.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
+COMMAND="uv run ./examples/run_distillation.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \

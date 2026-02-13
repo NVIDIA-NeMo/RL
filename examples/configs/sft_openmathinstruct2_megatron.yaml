@@ -9,6 +9,7 @@ sft:
   val_global_batch_size: 128
   val_micro_batch_size: 1
   val_at_start: true
+  val_at_end: false
   seed: 42
 
 checkpointing:
@@ -99,14 +100,11 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
 
-    ## fp8 training currently not supported
-    #fp8_cfg:
-    #  enabled: true
-    #  fp8: hybrid
-    #  fp8_recipe: delayed
-    #  fp8_param: true # false gives the following error: "RuntimeError: /TransformerEngine/transformer_engine/common/gemm/cublaslt_gemm.cu:116 in function CanonicalizeGemmInput: Assertion failed: !is_fp8_dtype(ret.Atype). Input A is missing column-wise usage"
-    #  fp8_dot_product_attention: false #true
-    #  fp8_multi_head_attention: false #true
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 
   dynamic_batching:
     enabled: false

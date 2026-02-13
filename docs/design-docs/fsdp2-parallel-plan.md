@@ -25,6 +25,6 @@ A custom parallel plan should be defined in a separate file, such as the example
 To implement the custom parallel plan, either update the value of `custom_parallel_plan` in the `yaml` file directly, or pass the override via the command line. For example:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     policy.dtensor_cfg.custom_parallel_plan=examples.custom_parallel.custom_parallel.custom_parallel_plan
 ```

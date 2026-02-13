@@ -18,7 +18,6 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
@@ -83,6 +82,14 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            "rollout_max_attempts_to_avoid_lp_nan", 1
+        )
+
+        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
+        )
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -111,25 +118,47 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
-        nemo_gym_num_rows = len(nemo_gym_examples)
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
-
         timer.start("_run_rollouts_total")
-        nemo_rl_rowidxs = []
-        nemo_rl_results = []
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                nemo_gym_row, nemo_gym_result = await task
+        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
+        while trial < max_attempts:
+            nemo_gym_num_rows = len(nemo_gym_examples)
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples, head_server_config=self.head_server_config
+            )
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+            nemo_rl_rowidxs = []
+            nemo_rl_results = []
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    nemo_gym_row, nemo_gym_result = await task
+
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_result, tokenizer
+                    )
+
+                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
+                nemo_rl_results.append(nemo_rl_result)
+
+            # determine if generation_logprobs contain NaN; if not, break;
+            logprob_contains_nan = False
+            for nemo_rl_result in nemo_rl_results:
+                for message in nemo_rl_result["message_log"]:
+                    if (
+                        "generation_logprobs" in message
+                        and message["generation_logprobs"] is not None
+                    ):
+                        if torch.isnan(message["generation_logprobs"]).any():
+                            logprob_contains_nan = True
+                            break
+            if logprob_contains_nan:
+                trial += 1
+                print(
+                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
                 )
-
-            nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-            nemo_rl_results.append(nemo_rl_result)
+                continue
+            else:
+                break
 
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
@@ -236,27 +265,3 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
-
-
-########################################
-# Data utils
-########################################
-
-
-# We do some light preprocessing here to make our data format compatible with nemo rl format
-def nemo_gym_example_to_nemo_rl_datum_spec(
-    nemo_gym_example: dict, idx: int
-) -> DatumSpec:
-    return DatumSpec(
-        message_log=[
-            {"role": "user", "content": "", "token_ids": torch.tensor([])}
-        ],  # Fake message
-        length=0,
-        extra_env_info=nemo_gym_example,
-        loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples
-        idx=idx,
-        task_name="nemo_gym",
-        stop_strings=None,
-        # Extra vars
-        token_ids=[],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
-    )
