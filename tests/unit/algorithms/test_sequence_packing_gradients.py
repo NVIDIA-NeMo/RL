@@ -351,7 +351,7 @@ class SequencePackingGradientTestActor:
             model=MockModel(),
             loss_fn=base_loss_fn,
             pack_sequences=True,
-            cp_normalize=True,
+            num_microbatches=1,
         )
         loss, metrics = wrapped_loss_fn(output_tensor)
 
