@@ -27,6 +27,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -415,18 +416,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
+                pg_collection = get_pg_collection(self.model)
+
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
                 update_successful = logical_and_across_model_parallel_group(
-                    update_successful
+                    update_successful, mp_group=pg_collection.mp
                 )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
-                    grad_norm
+                    grad_norm, mp_group=pg_collection.mp
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
-                    num_zeros_in_grad
+                    num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
                 if update_successful:
@@ -1036,9 +1039,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ]
         enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
         unified_memory_level = mcore_generation_config["unified_memory_level"]
-        buffer_guaranteed_fraction = mcore_generation_config[
-            "buffer_guaranteed_fraction"
-        ]
         max_tokens = mcore_generation_config["max_tokens"]
 
         model_config = self.model.config
@@ -1050,7 +1050,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
@@ -1061,7 +1060,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=False,
             unified_memory_level=unified_memory_level,
-            max_tokens_override=max_tokens,
+            max_tokens=max_tokens,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
@@ -1134,23 +1133,27 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         result = []
         while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern(verbose=False)
-            finished_requests = result_step.get("finished_requests", [])
-            for finished_request in finished_requests:
-                result.append(finished_request)
+            result_step = dynamic_engine.step_modern()
+            result.extend(result_step["finished_request_records"])
 
         # Sort results by request_id to maintain original batch order
         result.sort(key=lambda x: x.request_id)
 
         out = {
-            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+            "tokens": [
+                x.requests[0].prompt_tokens.tolist() + x.requests[0].generated_tokens
+                for x in result
+            ],
+            "logprobs": [
+                x.requests[0].prompt_log_probs + x.requests[0].generated_log_probs
+                for x in result
+            ],
         }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        max_gen_seq_len = max([len(x.requests[0].generated_tokens) for x in result])
         padded_input_length = input_ids.size(1)
 
         max_seq_len = padded_input_length + max_gen_seq_len

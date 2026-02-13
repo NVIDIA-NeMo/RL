@@ -87,14 +87,13 @@ def create_megatron_test_config(
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
-                "buffer_size_gb": 20,
-                "buffer_guaranteed_fraction": 0.1,
+                "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,
-                "block_size_tokens": 256,
+                "block_size_tokens": 1024,
                 "use_cuda_graphs_for_non_decode_steps": True,
                 "enable_chunked_prefill": True,
                 "unified_memory_level": 0,
-                "max_tokens": 16384,
+                "max_tokens": 65536,
             },
             "colocated": {
                 "enabled": True,
