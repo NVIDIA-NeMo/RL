@@ -26,8 +26,9 @@ bridge_src_dir = "Megatron-Bridge/src/megatron/bridge"
 bridge_package_name = "megatron.bridge"
 
 CACHED_DEPENDENCIES = [
-    "transformers>=4.57.1",
+    "transformers<5.0.0",
     "datasets",
+    "accelerate",
     "omegaconf>=2.3.0",
     "tensorboard>=2.19.0",
     "typing-extensions",
@@ -40,7 +41,7 @@ CACHED_DEPENDENCIES = [
     "hydra-core>1.3,<=1.3.2",
     "megatron-core[dev,mlm]>=0.15.0a0,<0.17.0",
     "qwen-vl-utils",
-    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    "transformer-engine[pytorch]>=2.10.0a0,<2.12.0",
     "mamba-ssm",
     "nvidia-resiliency-ext",
     "causal-conv1d",
