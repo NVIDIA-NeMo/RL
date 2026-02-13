@@ -95,6 +95,13 @@ ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
+ARG BUILD_CUSTOM_VLLM_URL
+ARG BUILD_CUSTOM_VLLM_REF
+ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
+# Only use for custom flashinfer installs.
+ARG BUILD_CUSTOM_FLASHINFER
+ARG BUILD_CUSTOM_FLASHINFER_URL
+ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
@@ -110,14 +117,18 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh
+    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
+fi
+if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
