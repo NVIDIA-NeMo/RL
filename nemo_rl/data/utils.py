@@ -84,6 +84,7 @@ def setup_response_data(
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     task_to_env = {}
     data_list = []
 
@@ -99,6 +100,8 @@ def setup_response_data(
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
         task_data_processors[task_name] = (data.task_spec, data.processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[task_name] = data.preprocessor
         if has_envs:
             task_to_env[task_name] = envs[cfg["env_name"]]
 
@@ -108,12 +111,14 @@ def setup_response_data(
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
+    val_task_data_preprocessors = {}
     val_task_to_env = {}
     val_data_list = []
 
@@ -124,6 +129,8 @@ def setup_response_data(
             # bind task_name to task_data_processors and task_to_env
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[task_name]
             if has_envs:
                 val_task_to_env[task_name] = task_to_env[task_name]
 
@@ -144,6 +151,8 @@ def setup_response_data(
                 val_data.task_spec,
                 val_data.processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[task_name] = val_data.preprocessor
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
@@ -155,6 +164,7 @@ def setup_response_data(
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
