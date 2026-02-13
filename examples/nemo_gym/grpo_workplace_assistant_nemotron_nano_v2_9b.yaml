@@ -262,6 +262,7 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
+    rollout_max_attempts_to_avoid_lp_nan: 1
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
