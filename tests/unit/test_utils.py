@@ -17,6 +17,7 @@ import torch
 
 from nemo_rl.algorithms.interfaces import LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.utils import TrainingSamplingParams
 
 
 class SimpleLoss:
@@ -31,6 +32,7 @@ class SimpleLoss:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: Optional[TrainingSamplingParams] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # Just return mean of logprobs as the loss for testing
         loss = next_token_logits.mean()
@@ -55,6 +57,7 @@ class SimpleNLLLoss:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sampling_params: Optional[TrainingSamplingParams] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position

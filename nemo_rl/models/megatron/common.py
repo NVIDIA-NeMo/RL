@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.moe_utils import (
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.utils import TrainingSamplingParams
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -52,7 +53,7 @@ def forward_step_arbitrary_loss(
     pack_sequences: bool = False,
     defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
-    policy_cfg: Optional[dict] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
 ):
     """Forward training step with support for packed sequences and context parallelism.
 
@@ -66,7 +67,7 @@ def forward_step_arbitrary_loss(
         pack_sequences (bool): Whether to pack sequences for efficiency
         defer_fp32_logits (Optional[bool]): Whether to skip the conversion of logits to fp32
         cp_normalize (bool): Whether to normalize the loss by the cp_size
-        policy_cfg (Optional[dict]): Policy configuration containing generation parameters
+        sampling_params (Optional[TrainingSamplingParams]): Sampling parameters for temperature scaling and top-k/top-p filtering
 
     Notes on packed sequences with context parallelism (CP):
         - When CP > 1, each sequence is padded to a multiple of (cp_size * 2)
@@ -114,12 +115,8 @@ def forward_step_arbitrary_loss(
 
         # Apply temperature scaling to logits for training
         # This matches the dtensor worker's _apply_temperature_scaling in the train method
-        if (
-            policy_cfg is not None
-            and "generation" in policy_cfg
-            and policy_cfg["generation"] is not None
-        ):
-            output_tensor.div_(policy_cfg["generation"]["temperature"])
+        if sampling_params is not None and sampling_params.temperature != 1.0:
+            output_tensor.div_(sampling_params.temperature)
 
         # Unpack the output tensor if we did packed sequences
         if pack_sequences and packed_seq_params is not None:
@@ -140,6 +137,7 @@ def forward_step_arbitrary_loss(
         vocab_parallel_rank=get_tensor_model_parallel_rank(),
         vocab_parallel_group=get_tensor_model_parallel_group(),
         context_parallel_group=get_context_parallel_group(),
+        sampling_params=sampling_params,
     )
 
     if cp_normalize:
