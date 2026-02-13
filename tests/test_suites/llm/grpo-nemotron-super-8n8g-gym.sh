@@ -19,7 +19,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo.py \
+uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \
     policy.model_name=$MODEL_NAME \
     data.train_jsonl_fpath=$TRAIN_PATH \
