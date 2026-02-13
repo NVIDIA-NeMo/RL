@@ -546,7 +546,7 @@ class BaseVllmGenerationWorker:
                 from vllm.v1.metrics.reader import get_metrics_snapshot
 
                 vllm_prom_metrics = get_metrics_snapshot()
-            for metric in metrics:
+            for metric in vllm_prom_metrics:
                 if hasattr(metric, "values"):
                     metrics[metric.name] = metric.values
                 elif hasattr(metric, "value"):
