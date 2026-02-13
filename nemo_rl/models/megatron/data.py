@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
 
@@ -211,7 +212,7 @@ def process_microbatch(
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     pack_sequences: bool = False,
-    straggler_timer: StragglerDetector = None,
+    straggler_timer: Optional[StragglerDetector] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -221,7 +222,8 @@ def process_microbatch(
     Optional[torch.Tensor],
 ]:
     """Process a microbatch for Megatron model forward pass."""
-    with straggler_timer(bdata=True):
+    ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
+    with ctx:
         input_ids = data_dict["input_ids"]
         attention_mask = None
         position_ids = None
@@ -294,15 +296,15 @@ def process_global_batch(
     *,
     batch_idx: int,
     batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> dict[str, Any]:
     """Process a global batch and compute normalization factors.
 
     Args:
-        data: Full dataset
+        data: Full dataset to extract a batch from
+        loss_fn: Loss function (used to check loss type for token-level validation)
+        dp_group: Data parallel process group for all-reduce
         batch_idx: Index of batch to extract
         batch_size: Size of batch to extract
-        loss_fn: Loss function (used to check loss type)
-        dp_mesh: Data parallel mesh
 
     Returns:
         Dictionary containing:
