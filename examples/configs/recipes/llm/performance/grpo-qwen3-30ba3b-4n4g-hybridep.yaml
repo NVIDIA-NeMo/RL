@@ -7,9 +7,9 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-hybridep
 
 policy:
+  # Disabled for HybridEP compatibility. With further updates, sequence_packing.enabled: true may become viable.
   sequence_packing:
-    enabled: true
-    algorithm: modified_first_fit_decreasing
+    enabled: false
 
   megatron_cfg:
     activation_checkpointing: true
