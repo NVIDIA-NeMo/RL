@@ -182,6 +182,9 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
+    # Attention backend available values:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
+    attention_backend: NotRequired[str]
     moe_per_layer_logging: bool
     # Set to true to enable DeepEP for expert parallel communication
     # Must set moe_token_dispatcher_type to 'flex'
