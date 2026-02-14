@@ -7,8 +7,8 @@ This guide explains how to use your own version of vLLM while leveraging a pre-c
 Clone your vLLM fork and build it using the provided script. For example:
 
 ```sh
-# Usage: bash tools/build-custom-vllm.sh <GIT_URL> <GIT_REF> <VLLM_WHEEL_COMMIT>
-bash tools/build-custom-vllm.sh https://github.com/terrykong/vllm.git terryk/demo-custom-vllm d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70
+# Usage: bash tools/build-custom-vllm.sh <GIT_URL> <GIT_REF> <VLLM_PRECOMPILED_WHEEL_LOCATION>
+bash tools/build-custom-vllm.sh https://github.com/terrykong/vllm.git terryk/demo-custom-vllm https://wheels.vllm.ai/862f2ef893d9751db0a92bd2d4ae0e3d9677872f/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
 
 # [INFO] pyproject.toml updated. NeMo RL is now configured to use the local vLLM at 3rdparty/vllm.
 # [INFO] Verify this new vllm version by running:
@@ -47,7 +47,7 @@ To ensure the custom vLLM install is setup properly in NeMo RL applications, alw
 
 ```sh
 # Ensures vLLM uses the precompiled wheel and avoids recompiling C++ sources
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/862f2ef893d9751db0a92bd2d4ae0e3d9677872f/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
 # Ensures worker venvs are rebuilt to use the custom vLLM. Otherwise it may use the cached version in cached venvs
 export NRL_FORCE_REBUILD_VENVS=true
 # This isn't necessary if you only do `uv run foobar.py`, but may be needed if you switching between optional extras `uv run --extra vllm foobar.py`. If you are unsure if you need this, it's safer to include it.

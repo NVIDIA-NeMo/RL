@@ -31,10 +31,12 @@ uv run examples/run_sft.py \
 ## Datasets
 
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
-  1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
-  2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
 
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
+
+**Note:** The `task_name` field is required in each formatted example.
 
 ```python
 def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -52,7 +54,8 @@ def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
                 "role": "assistant",
                 "content": data["answers"]["text"][0],
             },
-        ]
+        ],
+        "task_name": self.task_name,
     }
 ```
 
@@ -84,6 +87,7 @@ data:
     # this dataset will override input_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     input_key: question
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
     split_validation_size: 0.05  # use 5% of the training data as validation data
     seed: 42  # seed for train/validation split when split_validation_size > 0
@@ -214,9 +218,6 @@ Without `use_preserving_dataset: true`, the loader would incorrectly add:
 
 This corrupts your training data and can lead to models generating invalid tool calls. The `PreservingDataset` mode maintains the exact structure of each tool call.
 
-
-Adding a new dataset is a straightforward process.
-As long as your custom dataset has the `formatted_ds` and `task_spec` attributes described above, it can serve as a drop-in replacement for Squad and OpenAssistant.
 
 ## Evaluate the Trained Model
 
