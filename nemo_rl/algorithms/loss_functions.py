@@ -424,6 +424,18 @@ class ClippedPGLossFn(LossFunction):
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
+                token_in_bounds = (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_ratio
+                )
+                _is_filter_metrics = {
+                    "is_oob_ratio": 1.0
+                    - masked_mean(
+                        token_in_bounds.float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
                     max=self.truncated_importance_sampling_ratio,
