@@ -15,7 +15,7 @@
 from datasets import Dataset
 
 from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
-from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
+from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataPreProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
@@ -27,6 +27,7 @@ class RawDataset:
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
     task_spec: TaskDataSpec
+    preprocessor: TaskDataPreProcessFnCallable | None = None
 
     def split_train_validation(self, test_size: float, seed: int):
         if test_size > 0:

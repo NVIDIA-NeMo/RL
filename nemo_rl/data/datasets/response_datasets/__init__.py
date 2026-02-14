@@ -32,6 +32,8 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 )
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
+from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
+from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import GeneralConversationsJsonlDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
@@ -39,6 +41,8 @@ DATASET_REGISTRY = {
     # built-in datasets
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
+    "daily-omni": DailyOmniDataset,
+    "general-conversation-jsonl": GeneralConversationsJsonlDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
@@ -84,6 +88,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 __all__ = [
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",
+    "DailyOmniDataset",
+    "GeneralConversationsJsonlDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
     "DeepScalerDataset",
