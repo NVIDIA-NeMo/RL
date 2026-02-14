@@ -21,6 +21,7 @@ grpo:
     enabled: true
     overlong_buffer_length: 512
     max_response_length: 1024
+  skip_reference_policy_logprobs_calculation: true
 loss_fn:
   reference_policy_kl_penalty: 0.0  # Corresponds to actor_rollout_ref.actor.kl_loss_coef
   ratio_clip_max: 0.28  # clip_ratio_high
