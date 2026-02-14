@@ -73,8 +73,8 @@ policy:
     chat_template_kwargs: null
   hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
+  train_micro_batch_size: 2
+  logprob_batch_size: 4
   generation_batch_size: 32
   max_total_sequence_length: 2048
   precision: "bfloat16"
@@ -87,7 +87,7 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
@@ -244,7 +244,7 @@ env:
     wordle_simple_agent:
       responses_api_agents:
         simple_agent:
-          max_steps: 18  # 6 guesses + room for check_word_validity/get_game_state calls
+          max_steps: 12  # 6 turns × 2 tool calls max per turn
     policy_model:
       responses_api_models:
         vllm_model:
@@ -274,5 +274,5 @@ logger:
     flush_interval: 10
 
 cluster:
-  gpus_per_node: 4  # 4 A100 80GB GPUs
+  gpus_per_node: 8  # 4 A100 80GB GPUs
   num_nodes: 1
