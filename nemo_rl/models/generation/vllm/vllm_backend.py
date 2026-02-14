@@ -194,7 +194,15 @@ class VllmInternalWorkerExtension:
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
+            torch.cuda.synchronize()
             # Process weights after loading for FP8 KV cache
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
             self._maybe_process_fp8_kv_cache()
 
             gc.collect()
