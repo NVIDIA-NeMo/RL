@@ -25,8 +25,6 @@ from megatron.core.transformer import MegatronModule
 class MegatronGenerationConfig(TypedDict):
     # Total GPU memory (in GB) allocated for KV cache buffers
     buffer_size_gb: int
-    # Fraction of buffer reserved for guaranteed active requests
-    buffer_guaranteed_fraction: float
     # Number of CUDA graphs to pre-compile for different batch sizes
     num_cuda_graphs: int
     # Size of each KV cache block in tokens (affects memory granularity)
