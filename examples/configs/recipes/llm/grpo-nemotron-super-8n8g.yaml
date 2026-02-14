@@ -1,0 +1,77 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  val_period: 10
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  truncated_importance_sampling_ratio: 5.0
+
+policy:
+  model_name: dummy # TODO: update this to public HF name
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    sequence_parallel: true
+    context_parallel_size: 2
+    tensor_model_parallel_size: 4
+    expert_tensor_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+      overlap_grad_reduce: false
+    bias_activation_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    moe_permute_fusion: true
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 8
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      skip_tokenizer_init: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+    precision: bf16
+    use_deep_gemm: false
+    fp8_cfg:
+      is_mx: true
+      dynamic_weight_quant: false
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron-super-8n8g
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron-super-8n8g
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

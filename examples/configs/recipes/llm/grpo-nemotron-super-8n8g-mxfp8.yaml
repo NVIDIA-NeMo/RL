@@ -1,0 +1,17 @@
+defaults: ./grpo-nemotron-super-8n8g.yaml
+
+policy:
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+
+  generation:
+    vllm_cfg:
+      precision: fp8
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron-super-8n8g-mxfp8
+
+logger:
+  wandb:
+    name: grpo-nemotron-super-8n8g-mxfp8
