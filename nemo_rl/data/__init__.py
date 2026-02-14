@@ -20,6 +20,7 @@ class ResponseDatasetConfig(TypedDict):
     data_path: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]
+    subset: NotRequired[str | None]
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
@@ -38,13 +39,14 @@ class PreferenceDatasetConfig(TypedDict):
     prompt_key: NotRequired[str]
     chosen_key: NotRequired[str]
     rejected_key: NotRequired[str]
+    subset: NotRequired[str | None]
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
 
 class DataConfig(TypedDict):
-    max_input_seq_length: int
+    max_input_seq_length: int | None
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
     add_generation_prompt: NotRequired[bool]
