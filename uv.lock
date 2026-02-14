@@ -3589,6 +3589,7 @@ wheels = [
 name = "megatron-bridge"
 source = { editable = "3rdparty/Megatron-Bridge-workspace" }
 dependencies = [
+    { name = "accelerate" },
     { name = "causal-conv1d" },
     { name = "datasets" },
     { name = "flash-linear-attention" },
@@ -3614,6 +3615,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate" },
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
     { name = "datasets" },
     { name = "flash-linear-attention" },
@@ -3631,8 +3633,8 @@ requires-dist = [
     { name = "tensorboard", specifier = ">=2.19.0" },
     { name = "timm" },
     { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.9.0a0,<2.10.0" },
-    { name = "transformers", specifier = ">=4.57.1" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.10.0a0,<2.12.0" },
+    { name = "transformers", specifier = "<5.0.0" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.19.10" },
 ]
@@ -3643,8 +3645,10 @@ source = { editable = "3rdparty/Megatron-LM-workspace" }
 dependencies = [
     { name = "av" },
     { name = "causal-conv1d" },
+    { name = "datasets" },
     { name = "einops" },
     { name = "emerging-optimizers" },
+    { name = "fastapi" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-python", version = "0.5.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang')" },
     { name = "flashinfer-python", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
@@ -3659,7 +3663,6 @@ dependencies = [
     { name = "onnxscript" },
     { name = "opentelemetry-api" },
     { name = "packaging" },
-    { name = "setuptools" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tensorstore", version = "0.1.76", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3671,29 +3674,30 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = "<16.0.0" },
+    { name = "av" },
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
+    { name = "datasets" },
     { name = "einops", specifier = "~=0.8" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
+    { name = "fastapi", specifier = "~=0.50" },
     { name = "flash-linear-attention", specifier = "~=0.3.2" },
-    { name = "flashinfer-python" },
+    { name = "flashinfer-python", specifier = "~=0.5.0" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
-    { name = "numpy", specifier = "<2.0.0" },
+    { name = "numpy" },
     { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", specifier = ">=0.33.0a0,<0.34.0" },
-    { name = "nvidia-resiliency-ext", specifier = ">=0.4.0a0,<0.5.0" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-resiliency-ext" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
     { name = "opentelemetry-api", specifier = "~=1.33.1" },
     { name = "packaging", specifier = ">=24.2" },
-    { name = "setuptools", specifier = "<80.0.0" },
     { name = "tensorstore", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "torch", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
     { name = "tqdm" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.9.0a0,<2.10.0" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], specifier = ">=2.9.0a0,<2.12.0" },
     { name = "wget" },
 ]
 
@@ -4838,7 +4842,7 @@ requires-dist = [
     { name = "rich" },
     { name = "sentencepiece", marker = "extra == 'sglang'" },
     { name = "setuptools" },
-    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7" },
+    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508" },
     { name = "sglang", marker = "extra == 'sglang'", specifier = "==0.5.7" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
@@ -7620,7 +7624,7 @@ wheels = [
 [[package]]
 name = "sgl-kernel"
 version = "0.3.20"
-source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7#232982a0dee4f0f9545189a7d9b6b9bb802e4910" }
+source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508#3167bcc01c3074d5739e8086757cd8c66077d508" }
 dependencies = [
     { name = "scikit-build-core" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
