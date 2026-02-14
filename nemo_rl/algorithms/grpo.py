@@ -162,6 +162,9 @@ class GRPOConfig(TypedDict):
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
+    # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
+    # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
+    seq_logprob_error_threshold: float | None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1161,6 +1164,89 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
+def compute_and_apply_seq_logprob_error_masking(
+    train_data: BatchedDataDict,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: Optional[float],
+) -> tuple[float, int, float]:
+    """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
+
+    This function computes the multiplicative probability error per sequence
+    (same calculation as token_mult_prob_error but aggregated per-sequence) and
+    optionally masks sequences that exceed the configured threshold.
+
+    Args:
+        train_data: Training data dict containing token_mask, sample_mask,
+                   prev_logprobs, and generation_logprobs. If masking is applied,
+                   sample_mask will be updated in-place.
+        rewards: Reward tensor for computing statistics on masked sequences.
+        seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
+                                    exceeding this threshold. If None, only compute metrics.
+
+    Returns:
+        Tuple of (max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct)
+    """
+    # Compute sequence-level logprob error metrics (always)
+    token_mask = train_data["token_mask"][:, 1:]
+    sample_mask = train_data["sample_mask"]
+    prev_logprobs = train_data["prev_logprobs"][:, 1:]
+    generation_logprobs = train_data["generation_logprobs"][:, 1:]
+    lp_error = torch.abs(generation_logprobs - prev_logprobs)
+
+    # Use combined mask exactly as in loss function
+    mask = token_mask * sample_mask.unsqueeze(-1)
+
+    # Calculate sequence-level multiplicative prob error
+    # EXACT same calculation as token_mult_prob_error but per-sequence
+    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(dim=-1) / mask.sum(
+        dim=-1
+    ).clamp(min=1)
+    max_seq_mult_prob_error = (
+        seq_mult_prob_error.max().item() if seq_mult_prob_error.numel() > 0 else 0.0
+    )
+
+    # Apply sequence-level masking if configured
+    num_masked_seqs = 0
+    masked_correct_pct = 0.0
+
+    if seq_logprob_error_threshold is not None:
+        print(
+            f"▶ Applying sequence-level logprob error masking (threshold={seq_logprob_error_threshold})...",
+            flush=True,
+        )
+
+        original_sample_mask = sample_mask.clone()
+
+        # Create mask for sequences below threshold
+        seq_error_mask = (
+            seq_mult_prob_error <= seq_logprob_error_threshold
+        ).float() * original_sample_mask
+
+        diff_mask = original_sample_mask - seq_error_mask
+        num_masked_seqs = int(diff_mask.sum().item())
+
+        if num_masked_seqs > 0:
+            diff_mask_bool = diff_mask.bool()
+            masked_correct_count = (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            masked_correct_pct = masked_correct_count / num_masked_seqs
+
+        # Update sample_mask in train_data
+        train_data["sample_mask"] = seq_error_mask
+
+        print(
+            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+            flush=True,
+        )
+        if num_masked_seqs > 0:
+            print(
+                f"  • {masked_correct_count}/{num_masked_seqs} masked sequences were correct (reward=1)"
+                f" → {masked_correct_pct:.2%}",
+                flush=True,
+            )
+
+    return max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1608,6 +1694,17 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
+                    (
+                        max_seq_mult_prob_error,
+                        num_masked_seqs,
+                        masked_correct_pct,
+                    ) = compute_and_apply_seq_logprob_error_masking(
+                        train_data=train_data,
+                        rewards=rewards,
+                        seq_logprob_error_threshold=master_config["grpo"][
+                            "seq_logprob_error_threshold"
+                        ],
+                    )
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -1770,6 +1867,11 @@ def grpo_train(
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -2601,6 +2703,17 @@ def async_grpo_train(
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 
+                    (
+                        max_seq_mult_prob_error,
+                        num_masked_seqs,
+                        masked_correct_pct,
+                    ) = compute_and_apply_seq_logprob_error_masking(
+                        train_data=train_data,
+                        rewards=rewards,
+                        seq_logprob_error_threshold=master_config["grpo"][
+                            "seq_logprob_error_threshold"
+                        ],
+                    )
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -2774,6 +2887,11 @@ def async_grpo_train(
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
