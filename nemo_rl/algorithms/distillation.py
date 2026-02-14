@@ -79,6 +79,9 @@ class DistillationConfig(TypedDict):
     val_batch_size: int
     val_period: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     max_val_samples: int
     topk_logits_k: int
     seed: int
@@ -256,7 +259,11 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if distillation_config["val_period"] > 0 or distillation_config["val_at_start"]:
+    if (
+        distillation_config["val_period"] > 0
+        or distillation_config["val_at_start"]
+        or distillation_config["val_at_end"]
+    ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -533,6 +540,7 @@ def distillation_train(
     total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
+    val_at_end = master_config["distillation"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
     max_epochs = master_config["distillation"][
         "max_num_epochs"
@@ -689,7 +697,9 @@ def distillation_train(
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data, k=master_config["distillation"]["topk_logits_k"]
+                        train_data,
+                        k=master_config["distillation"]["topk_logits_k"],
+                        timer=timer,
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
@@ -702,15 +712,21 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(train_data, loss_fn)
+                    train_results = student_policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference

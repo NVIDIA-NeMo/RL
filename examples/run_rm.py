@@ -13,21 +13,14 @@
 # limitations under the License.
 
 import argparse
-import logging
 import os
 import pprint
-from typing import Any
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.rm import MasterConfig, rm_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
-from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
-from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
-from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.utils import setup_preference_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -44,141 +37,6 @@ def parse_args():
     args, overrides = parser.parse_known_args()
 
     return args, overrides
-
-
-# =======================================================
-# Data Processing
-# =======================================================
-def rm_preprocessor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    """Process a datum dictionary for RM training."""
-    assert len(datum_dict["completions"]) == 2, (
-        "RM training supports only two completions"
-    )
-    # Lower rank is preferred
-    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
-        chosen_completion = datum_dict["completions"][0]
-        rejected_completion = datum_dict["completions"][1]
-    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
-        chosen_completion = datum_dict["completions"][1]
-        rejected_completion = datum_dict["completions"][0]
-    else:
-        raise NotImplementedError(
-            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
-        )
-
-    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
-    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
-
-    message_log_chosen = get_formatted_message_log(
-        messages_chosen, tokenizer, task_data_spec
-    )
-    message_log_rejected = get_formatted_message_log(
-        messages_rejected, tokenizer, task_data_spec
-    )
-
-    length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
-    length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
-
-    loss_multiplier = 1.0
-    if max(length_chosen, length_rejected) > max_seq_length:
-        # make smaller and mask out
-        logging.warning(
-            f"Truncating chosen and rejected messages to {max_seq_length} tokens"
-        )
-        for message in message_log_chosen:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log_chosen))
-            ]
-        for message in message_log_rejected:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log_rejected))
-            ]
-        loss_multiplier = 0.0
-
-        length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
-        length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
-
-        # safeguard against edge case where there are too many turns to fit within the max length
-        assert max(length_chosen, length_rejected) <= max_seq_length
-
-    output = {
-        "message_log_chosen": message_log_chosen,
-        "length_chosen": length_chosen,
-        "message_log_rejected": message_log_rejected,
-        "length_rejected": length_rejected,
-        "extra_env_info": None,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
-    return output
-
-
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
-    print("\n▶ Setting up data...")
-
-    # load dataset
-    data = load_preference_dataset(data_config)
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
-
-    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
-    if val_dataset:
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
-
-    rm_task_spec = data.task_spec
-
-    train_dataset = AllTaskProcessedDataset(
-        train_dataset,
-        tokenizer,
-        rm_task_spec,
-        rm_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-
-    # TODO @yukih: unify the code when support multiple datasets for other algorithms
-    if "val_data_paths" in data_config and data_config["val_data_paths"]:
-        val_dataset = {}
-
-        assert isinstance(data_config["val_data_paths"], dict), (
-            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
-        )
-        val_data_paths = data_config["val_data_paths"]
-
-        for val_dataset_name, val_dataset_path in val_data_paths.items():
-            assert val_dataset_name not in val_dataset
-            val_data = PreferenceDataset(val_dataset_path)
-            print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
-            )
-            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
-                val_data.formatted_ds["train"],
-                tokenizer,
-                val_data.task_spec,
-                rm_preprocessor,
-                max_seq_length=data_config["max_input_seq_length"],
-            )
-    else:
-        val_dataset = (
-            {
-                "default": AllTaskProcessedDataset(
-                    val_dataset,
-                    tokenizer,
-                    rm_task_spec,
-                    rm_preprocessor,
-                    max_seq_length=data_config["max_input_seq_length"],
-                )
-            }
-            if val_dataset
-            else {}
-        )
-
-    return train_dataset, val_dataset, rm_task_spec
 
 
 def main():
@@ -218,11 +76,7 @@ def main():
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
     # setup data
-    (
-        dataset,
-        val_dataset,
-        rm_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    dataset, val_dataset = setup_preference_data(tokenizer, config["data"])
 
     (
         policy,
@@ -244,7 +98,6 @@ def main():
         loss_fn,
         master_config,
         logger,
-        rm_task_spec,
         checkpointer,
         rm_save_state,
     )

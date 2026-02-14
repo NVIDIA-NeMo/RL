@@ -10,6 +10,7 @@ sft:
   val_global_batch_size: 32
   val_micro_batch_size: 1
   val_at_start: true
+  val_at_end: false
   seed: 42
 
 checkpointing:
@@ -174,6 +175,12 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
       use_custom_fsdp: false
 
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true
@@ -194,6 +201,10 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+
+  # You can also use multiple datasets by using a list of datasets.
+  # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
+
   # You can use custom response datasets for training and validation. For example:
   # train:
   #   # this dataset will override input_key and use the default values for other vars
@@ -212,8 +223,7 @@ data:
   #   processor: "sft_processor"
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
-
-  ## OpenAI format specific configs
+  # OpenAI format specific configs
   # train_data_path: "/path/to/train.jsonl"  # Path to training data
   # val_data_path: "/path/to/val.jsonl"      # Path to validation data
   # chat_key: "messages"                     # Key for messages in the data

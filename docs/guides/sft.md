@@ -31,10 +31,12 @@ uv run examples/run_sft.py \
 ## Datasets
 
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
-  1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
-  2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
 
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
+
+**Note:** The `task_name` field is required in each formatted example.
 
 ```python
 def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -52,7 +54,8 @@ def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
                 "role": "assistant",
                 "content": data["answers"]["text"][0],
             },
-        ]
+        ],
+        "task_name": self.task_name,
     }
 ```
 
@@ -84,6 +87,7 @@ data:
     # this dataset will override input_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     input_key: question
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
     split_validation_size: 0.05  # use 5% of the training data as validation data
     seed: 42  # seed for train/validation split when split_validation_size > 0
@@ -98,6 +102,40 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+```
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "input": "Hello",     // <input_key>: <input_content>
+  "output": "Hi there!" // <output_key>: <output_content>
+}
+```
+
+We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
+```yaml
+data:
+  _override_: true # override the data config instead of merging with it
+  # other data settings, see `examples/configs/sft.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # train dataset 1
+    - dataset_name: OpenMathInstruct-2
+      split_validation_size: 0.05 # use 5% of the training data as validation data
+      seed: 42  # seed for train/validation split when split_validation_size > 0
+    # train dataset 2
+    - dataset_name: DeepScaler
+  validation:
+    # validation dataset 1
+    - dataset_name: AIME2024
+      repeat: 16
+    # validation dataset 2
+    - dataset_name: DAPOMathAIME2024
+  # default settings for all datasets
+  default:
+    ...
 ```
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
@@ -181,9 +219,6 @@ Without `use_preserving_dataset: true`, the loader would incorrectly add:
 This corrupts your training data and can lead to models generating invalid tool calls. The `PreservingDataset` mode maintains the exact structure of each tool call.
 
 
-Adding a new dataset is a straightforward process.
-As long as your custom dataset has the `formatted_ds` and `task_spec` attributes described above, it can serve as a drop-in replacement for Squad and OpenAssistant.
-
 ## Evaluate the Trained Model
 
 Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
@@ -191,7 +226,7 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, including Nano‑v3 models. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
 
 Notes:
 - LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
@@ -234,6 +269,7 @@ policy:
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
+For the Nano‑v3 SFT LoRA recipe, see:[sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
 ### Megatron Configuration Parameters
 

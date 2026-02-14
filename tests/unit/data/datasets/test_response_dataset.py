@@ -24,7 +24,7 @@ from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_da
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
 
 
-def create_sample_data(input_key, output_key, is_save_to_disk=False):
+def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".json"):
     data = [
         {input_key: "Hello", output_key: "Hi there!"},
         {input_key: "How are you?", output_key: "I'm good, thanks!"},
@@ -36,9 +36,22 @@ def create_sample_data(input_key, output_key, is_save_to_disk=False):
         dataset = Dataset.from_list(data)
         dataset.save_to_disk(data_path)
     else:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(data, f)
+        # If file_ext is provided, use it. If not provided but is_save_to_disk is False, default to .json
+        if file_ext is None:
+            file_ext = ".json"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=file_ext, delete=False) as f:
             data_path = f.name
+
+        if file_ext == ".json":
+            with open(data_path, "w") as f:
+                json.dump(data, f)
+        elif file_ext == ".parquet":
+            dataset = Dataset.from_list(data)
+            dataset.to_parquet(data_path)
+        elif file_ext == ".csv":
+            dataset = Dataset.from_list(data)
+            dataset.to_csv(data_path)
 
     return data_path
 
@@ -53,10 +66,18 @@ def tokenizer():
 @pytest.mark.parametrize(
     "input_key,output_key", [("input", "output"), ("question", "answer")]
 )
-@pytest.mark.parametrize("is_save_to_disk", [True, False])
-def test_response_dataset(input_key, output_key, is_save_to_disk, tokenizer):
+@pytest.mark.parametrize(
+    "is_save_to_disk,file_ext",
+    [
+        (True, None),
+        (False, ".json"),
+        (False, ".parquet"),
+        (False, ".csv"),
+    ],
+)
+def test_response_dataset(input_key, output_key, is_save_to_disk, file_ext, tokenizer):
     # load the dataset
-    data_path = create_sample_data(input_key, output_key, is_save_to_disk)
+    data_path = create_sample_data(input_key, output_key, is_save_to_disk, file_ext)
     data_config = {
         "dataset_name": "ResponseDataset",
         "data_path": data_path,
@@ -87,6 +108,37 @@ def test_response_dataset(input_key, output_key, is_save_to_disk, tokenizer):
         add_special_tokens=False,
     )
     assert combined_message == " Question: Hello Answer: Hi there!"
+
+
+def test_response_dataset_gsm8k_with_subset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "ResponseDataset",
+        "data_path": "openai/gsm8k",
+        "input_key": "question",
+        "output_key": "answer",
+        "subset": "main",
+        "split": "train",
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the input and output keys
+    assert dataset.input_key == "question"
+    assert dataset.output_key == "answer"
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][:20] == "Natalia sold clips t"
+    assert first_example["messages"][1]["role"] == "assistant"
+    assert first_example["messages"][1]["content"][:20] == "Natalia sold 48/2 = "
 
 
 def test_helpsteer3_dataset():

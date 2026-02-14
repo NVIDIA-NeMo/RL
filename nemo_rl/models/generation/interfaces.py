@@ -172,6 +172,7 @@ class GenerationOutputSpec(TypedDict):
     - generation_lengths: Tensor containing the actual length of each generated sequence
     - unpadded_sequence_lengths: Tensor containing the actual length of each input + generated sequence (without padding)
     - logprobs: Tensor of log probabilities for each generated token (right padded with zeros)
+    - truncated: Boolean tensor indicating if each sequence was truncated (hit max_tokens limit)
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 2 sequences:
@@ -197,6 +198,9 @@ class GenerationOutputSpec(TypedDict):
       [0.0, 0.0, 0.0, -1.2, -0.8, -2.1, -1.5, 0.0],  # First 3 are 0 (input tokens), next 4 are actual logprobs
       [0.0, 0.0, 0.0, 0.0, 0.0, -0.9, -1.7, 0.0],     # First 5 are 0 (input tokens), next 2 are actual logprobs
     ]
+
+    truncated:
+    [False, True]  # Example 2 was truncated (hit max_tokens limit without EOS)
     ```
 
     All functions receiving or returning GenerationOutputSpec should ensure
@@ -209,6 +213,9 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    truncated: NotRequired[
+        torch.Tensor
+    ]  # Whether each sequence was truncated and hit max_tokens without stop token
     __extra__: Any
 
 

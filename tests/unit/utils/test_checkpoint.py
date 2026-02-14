@@ -377,3 +377,123 @@ def test_get_resume_paths_missing_optimizer(checkpoint_manager, checkpoint_dir):
     # Verify weights path is returned but optimizer path is None
     assert weights_path is not None
     assert optimizer_path is None
+
+
+def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):
+    """Test that get_best_checkpoint_path returns None when no checkpoints exist."""
+    result = checkpoint_manager.get_best_checkpoint_path()
+    assert result is None
+
+
+def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
+    """Test that get_best_checkpoint_path filters out checkpoints missing the metric and warns."""
+    # Use keep_top_k=None to keep all checkpoints for this test
+    config = {
+        "enabled": True,
+        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
+        "metric_name": "loss",
+        "higher_is_better": False,
+        "keep_top_k": None,  # Keep all checkpoints
+    }
+    manager = CheckpointManager(config)
+
+    # Create checkpoints where some have the metric and others don't
+    steps = [1, 2, 3, 4]
+    training_infos = [
+        {"loss": 0.5},  # step 1 - has loss
+        {"other_metric": 0.8},  # step 2 - missing loss
+        {"loss": 0.3},  # step 3 - has loss (best)
+        {},  # step 4 - missing loss
+    ]
+
+    for step, training_info in zip(steps, training_infos):
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    # Should warn about missing metrics but still return the best checkpoint
+    import warnings
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        best_path = manager.get_best_checkpoint_path()
+
+        # Should have warned about 2 checkpoints missing the metric
+        assert len(w) == 1
+        assert "Ignoring 2 checkpoint(s)" in str(w[0].message)
+        assert "val_at_end" in str(w[0].message)
+
+    # Should return the checkpoint with the best (lowest) loss
+    with open(Path(best_path) / "training_info.json", "r") as f:
+        metadata = json.load(f)
+        assert metadata["loss"] == 0.3  # step 3 has the best loss
+
+
+def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
+    """Test that get_best_checkpoint_path returns latest checkpoint when all are missing the metric."""
+    # Use keep_top_k=None to keep all checkpoints for this test
+    config = {
+        "enabled": True,
+        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
+        "metric_name": "loss",
+        "higher_is_better": False,
+        "keep_top_k": None,  # Keep all checkpoints
+    }
+    manager = CheckpointManager(config)
+
+    # Create checkpoints where none have the required metric
+    steps = [1, 2, 3]
+    training_infos = [
+        {"other_metric": 0.5},  # step 1 - missing loss
+        {},  # step 2 - missing loss
+        {"different_metric": 0.3},  # step 3 - missing loss
+    ]
+
+    for step, training_info in zip(steps, training_infos):
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    # Should warn and return latest checkpoint when no checkpoints have the metric
+    import warnings
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        best_path = manager.get_best_checkpoint_path()
+
+        # Should have warned twice: once about ignoring all checkpoints, once about returning latest
+        assert len(w) == 2
+        assert "Ignoring 3 checkpoint(s)" in str(w[0].message)
+        assert "No checkpoints contain metric 'loss'" in str(w[1].message)
+        assert "Returning latest checkpoint" in str(w[1].message)
+        assert "val_at_end" in str(w[1].message)
+
+    # Should return the latest checkpoint (step 3)
+    assert Path(best_path).name == "step_3"
+
+
+def test_get_best_checkpoint_path_higher_is_better(tmp_path):
+    """Test get_best_checkpoint_path with higher_is_better=True."""
+    config = {
+        "enabled": True,
+        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
+        "metric_name": "accuracy",
+        "higher_is_better": True,
+        "keep_top_k": None,  # Keep all
+    }
+    manager = CheckpointManager(config)
+
+    # Create checkpoints with different accuracy values
+    steps = [1, 2, 3]
+    accuracies = [0.7, 0.9, 0.8]  # step 2 has the best accuracy
+
+    for step, acc in zip(steps, accuracies):
+        training_info = {"accuracy": acc}
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    # Get best checkpoint path
+    best_path = manager.get_best_checkpoint_path()
+
+    # Verify it's the checkpoint with highest accuracy
+    with open(Path(best_path) / "training_info.json", "r") as f:
+        metadata = json.load(f)
+        assert metadata["accuracy"] == 0.9  # step 2

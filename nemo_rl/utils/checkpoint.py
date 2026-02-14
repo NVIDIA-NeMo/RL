@@ -257,25 +257,41 @@ class CheckpointManager:
         """Get the path to the best checkpoint based on the metric.
 
         Returns the path to the checkpoint with the best metric value. If no checkpoints
-        exist, returns None. If the metric isn't found, we warn and return the latest checkpoint.
+        exist, returns None. If some checkpoints are missing the metric, they are filtered
+        out with a warning. If no checkpoints have the metric, returns the latest checkpoint.
 
         Returns:
-            Optional[str]: Path to the best checkpoint, or None if no valid checkpoints exist.
+            Optional[str]: Path to the best checkpoint, or None if no checkpoints exist.
         """
         checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
         if len(checkpoint_history) == 0:
             return None
-        # sort by metric value
-        if self.metric_name not in checkpoint_history[0][2]:
+
+        # Filter checkpoints that have the metric
+        valid_checkpoints = [c for c in checkpoint_history if self.metric_name in c[2]]
+        ignored_count = len(checkpoint_history) - len(valid_checkpoints)
+
+        if ignored_count > 0:
+            ignored_steps = [
+                c[0] for c in checkpoint_history if self.metric_name not in c[2]
+            ]
             warnings.warn(
-                f"Metric {self.metric_name} not found in checkpoint history. Returning last"
+                f"Ignoring {ignored_count} checkpoint(s) at step(s) {ignored_steps} that do not have "
+                f"metric '{self.metric_name}'. Consider enabling val_at_end or adjusting val_period "
+                f"to align with max_steps."
+            )
+
+        if len(valid_checkpoints) == 0:
+            warnings.warn(
+                f"No checkpoints contain metric '{self.metric_name}'. Returning latest checkpoint. "
+                f"Consider enabling val_at_end or adjusting val_period to align with max_steps."
             )
             return self.get_latest_checkpoint_path()
 
-        checkpoint_history.sort(
+        valid_checkpoints.sort(
             key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
         )
-        return str(checkpoint_history[0][1])
+        return str(valid_checkpoints[0][1])
 
     def get_latest_checkpoint_path(self) -> Optional[str]:
         """Get the path to the latest checkpoint.
