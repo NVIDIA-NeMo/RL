@@ -1,0 +1,21 @@
+# Qwen3-235B-A22B with HybridEP + CUDA Graph Performance Recipe
+# GB200 cluster: 16 nodes x 4 GPUs = 64 GPUs
+# HybridEP + CUDA Graph (attn, moe_router) enabled
+defaults: ./grpo-qwen3-235b-16n4g-hybridep.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-16n4g-hybridep-cudagraph
+
+policy:
+  megatron_cfg:
+    # CUDA Graph settings
+    cuda_graph_impl: transformer_engine
+    cuda_graph_scope:
+      - attn
+      - moe_router
+    cuda_graph_warmup_steps: 3
+
+logger:
+  log_dir: logs/grpo-qwen3-235b-16n4g-hybridep-cudagraph
+  wandb:
+    name: grpo-qwen3-235b-16n4g-hybridep-cudagraph

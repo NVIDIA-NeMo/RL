@@ -1,0 +1,32 @@
+# Qwen3-235B-A22B with HybridEP Performance Recipe
+# GB200 cluster: 16 nodes x 4 GPUs = 64 GPUs
+# HybridEP enabled with flex dispatcher backend
+defaults: ./grpo-qwen3-235b-16n4g.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-16n4g-hybridep
+
+policy:
+  sequence_packing:
+    enabled: false  # Disabled for stability with HybridEP
+
+  megatron_cfg:
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_num_layers: null
+    recompute_modules:
+      - moe_act
+
+    # HybridEP settings
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_permute_fusion: true
+    moe_shared_expert_overlap: false
+
+logger:
+  log_dir: logs/grpo-qwen3-235b-16n4g-hybridep
+  wandb:
+    project: nemo-rl-performance
+    name: grpo-qwen3-235b-16n4g-hybridep
