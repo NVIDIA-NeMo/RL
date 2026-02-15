@@ -145,7 +145,7 @@ if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra sglang --no-install-project
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
+uv sync --link-mode symlink --locked --extra automodel --no-group transformers-v4 --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8

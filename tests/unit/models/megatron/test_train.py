@@ -29,6 +29,8 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
+pytestmark = pytest.mark.mcore
+
 
 class TestModelForward:
     """Tests for model_forward function."""

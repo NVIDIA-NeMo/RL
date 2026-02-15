@@ -898,9 +898,9 @@ async def run_hf_train_process(
         (False, True, "bfloat16", False),
         (True, False, "fp8", False),
         (False, True, "fp8", False),
-        # LoRA tests
-        (False, False, "bfloat16", True),
-        (True, False, "bfloat16", True),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -964,9 +964,9 @@ async def test_vllm_generation_with_hf_training_colocated(
         (False, True, "bfloat16", False),
         (True, False, "fp8", False),
         (False, True, "fp8", False),
-        # LoRA tests
-        (False, False, "bfloat16", True),
-        (True, False, "bfloat16", True),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
@@ -1728,7 +1728,10 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 
 
 # megatron still holds little memory after refit, so we only test dtensor now
-@pytest.mark.parametrize("train_backend", ["dtensor_v1", "dtensor_v2"])
+@pytest.mark.parametrize(
+    "train_backend",
+    ["dtensor_v1", pytest.param("dtensor_v2", marks=pytest.mark.automodel)],
+)
 def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -1905,7 +1908,9 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
+@pytest.mark.parametrize(
+    "policy_type", ["dtensor", pytest.param("megatron", marks=pytest.mark.mcore)]
+)
 async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
     tokenizer,
@@ -2014,6 +2019,7 @@ async def test_vllm_refit_non_colocated_update_weights(
         print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
@@ -2190,6 +2196,7 @@ def test_vllm_generation_with_megatron_training(
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training_moe_model(
@@ -2357,6 +2364,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(180)
 def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     """Test that vLLM streaming weight update with Megatron can save memory."""
@@ -2445,6 +2453,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(120)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
@@ -2536,6 +2545,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
     megatron_policy = None
     vllm_generation = None

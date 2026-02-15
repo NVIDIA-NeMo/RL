@@ -31,7 +31,7 @@ from nemo_automodel.components._peft.lora import (
     apply_lora_to_linear_modules,
 )
 
-from nemo_rl.utils.automodel_checkpoint import (
+from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
     _infer_checkpoint_root,
     detect_checkpoint_format,
@@ -372,7 +372,7 @@ class TestAutomodelCheckpointManager:
     @patch("torch.distributed.get_rank")
     def test_manager_initialization(self, mock_get_rank, mock_meshes):
         """Test AutomodelCheckpointManager initialization."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -380,39 +380,19 @@ class TestAutomodelCheckpointManager:
         manager = AutomodelCheckpointManager(
             dp_mesh=mock_dp_mesh,
             tp_mesh=mock_tp_mesh,
-            model_state_dict_keys=["layer1.weight", "layer2.weight"],
         )
 
         assert manager.checkpointer is None
         assert manager.checkpoint_config is None
-        assert manager.model_state_dict_keys == ["layer1.weight", "layer2.weight"]
         assert manager.dp_mesh is mock_dp_mesh
         assert manager.tp_mesh is mock_tp_mesh
-
-    @patch("torch.distributed.get_rank")
-    def test_set_model_state_dict_keys(self, mock_get_rank, mock_meshes):
-        """Test setting model state dict keys."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        new_keys = ["new_layer.weight", "new_layer.bias"]
-        manager.set_model_state_dict_keys(new_keys)
-
-        assert manager.model_state_dict_keys == new_keys
 
     @patch("torch.distributed.get_rank")
     def test_save_checkpoint_without_checkpointer_raises(
         self, mock_get_rank, mock_meshes
     ):
         """Test that save_checkpoint raises error without initialized checkpointer."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -434,7 +414,7 @@ class TestAutomodelCheckpointManager:
     @patch("torch.distributed.get_rank")
     def test_save_checkpoint_without_config_raises(self, mock_get_rank, mock_meshes):
         """Test that save_checkpoint raises error without checkpointing config."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -461,7 +441,7 @@ class TestAutomodelCheckpointManager:
         self, mock_get_rank, mock_meshes
     ):
         """Test that load_checkpoint raises error without initialized checkpointer."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -480,32 +460,9 @@ class TestAutomodelCheckpointManager:
             )
 
     @patch("torch.distributed.get_rank")
-    def test_load_base_model_without_checkpointer_raises(
-        self, mock_get_rank, mock_meshes
-    ):
-        """Test that load_base_model raises error without initialized checkpointer."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        mock_model = MagicMock()
-
-        with pytest.raises(AssertionError, match="Checkpointer must be initialized"):
-            manager.load_base_model(
-                model=mock_model,
-                model_name="test-model",
-            )
-
-    @patch("torch.distributed.get_rank")
     def test_init_checkpointer_creates_checkpointer(self, mock_get_rank, mock_meshes):
         """Test that init_checkpointer creates a new checkpointer."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -519,7 +476,7 @@ class TestAutomodelCheckpointManager:
 
         # Mock the Checkpointer class
         with patch(
-            "nemo_rl.utils.automodel_checkpoint.Checkpointer"
+            "nemo_rl.models.automodel.checkpoint.Checkpointer"
         ) as mock_checkpointer_cls:
             mock_checkpointer = MagicMock()
             mock_checkpointer_cls.return_value = mock_checkpointer
@@ -535,7 +492,7 @@ class TestAutomodelCheckpointManager:
     @patch("torch.distributed.get_rank")
     def test_init_checkpointer_does_nothing_if_exists(self, mock_get_rank, mock_meshes):
         """Test that init_checkpointer does nothing if checkpointer already exists."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -551,7 +508,7 @@ class TestAutomodelCheckpointManager:
 
         # Try to init again
         with patch(
-            "nemo_rl.utils.automodel_checkpoint.Checkpointer"
+            "nemo_rl.models.automodel.checkpoint.Checkpointer"
         ) as mock_checkpointer_cls:
             manager.init_checkpointer(
                 config_updates={"model_repo_id": "test-model"},
@@ -566,7 +523,7 @@ class TestAutomodelCheckpointManager:
         self, mock_get_rank, mock_meshes
     ):
         """Test that update_checkpointer_config updates the config."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -597,7 +554,7 @@ class TestAutomodelCheckpointManager:
         self, mock_get_rank, mock_meshes
     ):
         """Test that update_checkpointer_config does nothing without checkpointer."""
-        from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
@@ -632,7 +589,7 @@ class TestSaveCheckpointFunctional:
         return mock_dp_mesh, mock_tp_mesh
 
     @patch("torch.distributed.get_rank")
-    @patch("nemo_rl.utils.automodel_checkpoint.Checkpointer")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
     def test_save_model_only(
         self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
     ):
@@ -670,7 +627,7 @@ class TestSaveCheckpointFunctional:
             mock_checkpointer.save_optimizer.assert_not_called()
 
     @patch("torch.distributed.get_rank")
-    @patch("nemo_rl.utils.automodel_checkpoint.Checkpointer")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
     def test_save_with_optimizer(
         self,
         mock_checkpointer_cls,
@@ -714,7 +671,7 @@ class TestSaveCheckpointFunctional:
             mock_checkpointer.save_optimizer.assert_called_once()
 
     @patch("torch.distributed.get_rank")
-    @patch("nemo_rl.utils.automodel_checkpoint.Checkpointer")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
     def test_save_with_tokenizer(
         self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
     ):
