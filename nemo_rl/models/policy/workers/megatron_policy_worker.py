@@ -2259,6 +2259,41 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
 
+    def _clear_fp8_caches(self):
+        """Clear FP8 workspace caches and release fragmented GPU memory.
+
+        The main memory issue in the train→offload→refit→generate cycle is CUDA
+        allocator fragmentation, not leaked FP8 tensors. This method:
+        1. Clears TE workspace buffers (which hold references to scratch memory)
+        2. Runs gc.collect() + empty_cache() to return freed blocks to CUDA
+
+        For anti-fragmentation, configure PYTORCH_CUDA_ALLOC_CONF in the recipe YAML:
+        - "max_split_size_mb:512" — fast, prevents large-block splitting
+        - "expandable_segments:True" — most effective but ~5x slower weight transfer
+        """
+        # 1. Clear Transformer Engine workspaces
+        workspace_count = 0
+        for module in self.model.modules():
+            if hasattr(module, "_fp8_workspaces"):
+                module._fp8_workspaces.clear()
+                workspace_count += 1
+
+        # 2. Clear global TE workspace
+        try:
+            import transformer_engine.pytorch as te
+
+            if hasattr(te, "module") and hasattr(te.module.base, "clear_workspace"):
+                te.module.base.clear_workspace()
+        except ImportError:
+            pass
+
+        print(
+            f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
@@ -2272,6 +2307,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
+
+        # Clear FP8 caches (uint8/int16 tensors) to CPU
+        if self.fp8_cfg.get("force_clear_fp8_caches", False):
+            self._clear_fp8_caches()
+
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
@@ -2300,6 +2340,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB

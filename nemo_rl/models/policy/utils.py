@@ -271,8 +271,11 @@ def configure_dynamo_cache() -> None:
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
-    Note: expandable_segments configuration is handled directly in the worker init methods
-    to ensure proper GPU detection after CUDA initialization.
+    Note: For FP8 training on Hopper+ GPUs, users should set env_vars in their
+    recipe YAML to enable expandable_segments:
+        megatron_cfg:
+          env_vars:
+            PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     """
     runtime_env = {
         **get_nsight_config_if_pattern_matches(policy_worker_name),

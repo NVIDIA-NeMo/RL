@@ -5,6 +5,7 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
+  enabled: false
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
@@ -29,12 +30,26 @@ policy:
     scheduler:
       lr_warmup_iters: 2
       lr_warmup_init: 5.0e-08
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    # IMPORTANT for FP8: Enable expandable_segments on Hopper+ (H100) to reduce memory fragmentation
+    # This MUST be set before CUDA initialization to be effective
+    # Crashes on Ampere GPUs - only use on compute capability 9.0+ (Hopper/H100)
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   generation:
     max_new_tokens: 4096
     vllm_cfg:
       precision: fp8
       max_model_len: 4096
       use_deep_gemm: true
+      enforce_eager: true  # Disable CUDA graphs to prevent FP8 memory leak
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.7
 data:
   max_input_seq_length: 4096
 logger:
