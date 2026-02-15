@@ -23,7 +23,7 @@ grpo:
   overlong_filtering: false
   max_val_samples: null
   val_batch_size: null
-  seed: 42
+  seed: 88
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
@@ -62,8 +62,8 @@ checkpointing:
   # - wordle_simple_agent/turns_if_won/sum / won/sum = avg turns to win
   metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 3
-  save_period: 10
+  keep_top_k: 1
+  save_period: 5
   checkpoint_must_save_by: null
 
 policy:
@@ -243,7 +243,7 @@ env:
     - resources_servers/wordle/configs/wordle.yaml
     wordle_simple_agent:
       responses_api_agents:
-        simple_agent:
+        wordle:
           max_steps: 12  # 6 turns × 2 tool calls max per turn
     policy_model:
       responses_api_models:
@@ -274,5 +274,5 @@ logger:
     flush_interval: 10
 
 cluster:
-  gpus_per_node: 8  # 4 A100 80GB GPUs
+  gpus_per_node: 4  # 4 A100 80GB GPUs
   num_nodes: 1
