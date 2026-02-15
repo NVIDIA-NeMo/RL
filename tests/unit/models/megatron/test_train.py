@@ -29,6 +29,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
+
 pytestmark = pytest.mark.mcore
 
 
