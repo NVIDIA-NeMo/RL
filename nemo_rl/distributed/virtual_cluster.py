@@ -53,7 +53,7 @@ class PY_EXECUTABLES:
     FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
+    AUTOMODEL = f"uv run --locked --no-cache --extra automodel --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"

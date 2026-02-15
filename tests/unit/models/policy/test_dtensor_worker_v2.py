@@ -52,7 +52,6 @@ def create_test_config(
     dtensor_v2: bool = False,
     precision: str = "float32",
     expert_parallel_size: int = 1,
-    use_hf_tp_plan: bool = False,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
     checkpointing: dict | None = None,
@@ -93,7 +92,6 @@ def create_test_config(
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
             "expert_parallel_size": expert_parallel_size,
-            "use_hf_tp_plan": use_hf_tp_plan,
         },
         "dynamic_batching": {
             "enabled": True,

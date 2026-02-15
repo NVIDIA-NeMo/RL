@@ -34,7 +34,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -48,14 +47,12 @@ class AutomodelCheckpointManager:
     Attributes:
         checkpointer: The underlying nemo_automodel Checkpointer instance.
         checkpoint_config: The current checkpoint configuration.
-        model_state_dict_keys: List of model state dict keys for checkpoint validation.
     """
 
     def __init__(
         self,
         dp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
-        model_state_dict_keys: Optional[list[str]] = None,
         moe_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize the AutomodelCheckpointManager.
@@ -63,12 +60,10 @@ class AutomodelCheckpointManager:
         Args:
             dp_mesh: The data parallel device mesh.
             tp_mesh: The tensor parallel device mesh.
-            model_state_dict_keys: Optional list of model state dict keys.
             moe_mesh: Optional MoE device mesh.
         """
         self.checkpointer: Optional[Checkpointer] = None
         self.checkpoint_config: Optional[AutomodelCheckpointingConfig] = None
-        self.model_state_dict_keys = model_state_dict_keys
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
@@ -114,7 +109,6 @@ class AutomodelCheckpointManager:
             model_repo_id=config_updates.get("model_repo_id", ""),
             save_consolidated=config_updates.get("save_consolidated", False),
             is_peft=config_updates.get("is_peft", False),
-            model_state_dict_keys=self.model_state_dict_keys,
             is_async=config_updates.get("is_async", False),
             dequantize_base_checkpoint=config_updates.get(
                 "dequantize_base_checkpoint", False
@@ -160,9 +154,6 @@ class AutomodelCheckpointManager:
                 # Ensure enum type
                 v = SerializationFormat[v.upper()] if isinstance(v, str) else v
             setattr(cfg, k, v)
-        # Ensure model_state_dict_keys is current
-        if self.model_state_dict_keys is not None:
-            cfg.model_state_dict_keys = self.model_state_dict_keys
 
         # Rebuild _addons list based on updated config
         # This is necessary because _addons is populated during __init__ based on config
@@ -188,60 +179,6 @@ class AutomodelCheckpointManager:
             self.checkpointer._addons.append(ConsolidatedHFAddon())
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
-
-    def set_model_state_dict_keys(self, keys: list[str]) -> None:
-        """Set the model state dict keys for checkpoint validation.
-
-        Args:
-            keys: List of model state dict keys.
-        """
-        self.model_state_dict_keys = keys
-        if self.checkpointer is not None:
-            self.checkpointer.config.model_state_dict_keys = keys
-
-    def load_base_model(
-        self,
-        model: nn.Module,
-        model_name: str,
-        hf_cache_dir: Optional[str] = None,
-        dequantize_base_checkpoint: bool = False,
-        peft_init_method: Optional[str] = None,
-    ) -> None:
-        """Load base model weights using the Automodel Checkpointer.
-
-        This method loads the initial HuggingFace model weights into the parallelized model.
-
-        Args:
-            model: The model to load weights into.
-            model_name: Name or path of the model.
-            hf_cache_dir: Optional HuggingFace cache directory.
-            dequantize_base_checkpoint: Whether to dequantize the base checkpoint.
-
-        Raises:
-            AssertionError: If checkpointer has not been initialized.
-        """
-        assert self.checkpointer is not None, (
-            "Checkpointer must be initialized before loading base model. "
-            "Call init_checkpointer() first."
-        )
-
-        self.update_checkpointer_config(
-            config_updates={
-                "model_repo_id": model_name,
-                "dequantize_base_checkpoint": dequantize_base_checkpoint,
-            },
-            checkpoint_root=None,
-        )
-        self.checkpointer.config.model_state_dict_keys = self.model_state_dict_keys
-
-        self.checkpointer.load_base_model(
-            model,
-            device=torch.cuda.current_device(),
-            root_dir=hf_cache_dir or TRANSFORMERS_CACHE,
-            model_name=model_name,
-            peft_init_method=peft_init_method,
-            load_base_model=True,
-        )
 
     def save_checkpoint(
         self,
