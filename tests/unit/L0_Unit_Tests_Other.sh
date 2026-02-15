@@ -42,11 +42,11 @@ else
 fi
 
 # Check and run automodel tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra automodel pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
+exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra automodel --no-group transformers-v4 pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
 if [[ $exit_code -eq 5 ]]; then
     echo "No automodel tests to run"
 else
-    uv run --extra automodel bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
+    uv run --extra automodel --no-group transformers-v4 bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
 fi
 
 # Check and run vllm tests
