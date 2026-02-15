@@ -20,6 +20,22 @@ import torch
 from nemo_automodel.components._peft.lora import PeftConfig
 
 
+class DistributedContext(NamedTuple):
+    """Distributed context returned by setup_distributed().
+
+    Contains the device meshes and distributed configuration needed for
+    model parallelization and training.
+    """
+
+    device_mesh: Any  # DeviceMesh
+    moe_mesh: Any  # Optional[DeviceMesh]
+    fsdp2_config: Any  # FSDP2Config
+    moe_config: Any  # Optional[MoEParallelizerConfig]
+    dp_size: int
+    tp_size: int
+    cp_size: int
+
+
 class RuntimeConfig(NamedTuple):
     """Runtime configuration for model training and inference.
 
@@ -60,7 +76,6 @@ class ModelAndOptimizerState(NamedTuple):
     """
 
     model: torch.nn.Module
-    model_state_dict_keys: list[str]
     optimizer: Optional[torch.optim.Optimizer]
     scheduler: Optional[Any]
     is_hf_model: bool
