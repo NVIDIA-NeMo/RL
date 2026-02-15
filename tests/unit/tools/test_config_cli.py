@@ -137,7 +137,7 @@ def test_minimize_in_place_and_check_with_explicit_base(
     )
 
     # Before minimizing with explicit base, check should fail
-    ns = type("NS", (), {"base": str(base), "config": str(child)})
+    ns = type("NS", (), {"base": str(base), "configs": [str(child)]})
     ret = cli.minimize_check(ns)
     assert ret == 1
     err = capsys.readouterr().err
@@ -478,7 +478,7 @@ def test_minimize_check_inferred_base(cli: Any, tmp_path: Path) -> None:
         ).strip()
     )
 
-    ns = type("NS", (), {"config": str(child), "base": None})
+    ns = type("NS", (), {"configs": [str(child)], "base": None})
     ret = cli.minimize_check(ns)
     assert ret == 0  # Already minimized
 

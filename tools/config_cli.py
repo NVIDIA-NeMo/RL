@@ -25,8 +25,9 @@ Subcommands:
     its `defaults` chain. By default, the base is inferred from the config's
     `defaults` key (which must be a string, not a list). Optionally, pass
     --base to override and rebase the config to a different parent.
-  - minimize-check: Same args as `minimize` but only checks if minimization
-    would change the file; exits non-zero if changes are needed.
+  - minimize-check: Same as `minimize` but only checks if minimization
+    would change the file(s); exits non-zero if changes are needed.
+    Accepts multiple config paths to avoid repeated startup overhead.
 
 The `expand` and `minimize` commands support printing to stdout or in-place editing of the config file.
 
@@ -469,16 +470,18 @@ def compare(args: argparse.Namespace) -> int:
     return 0
 
 
-def minimize_check(args: argparse.Namespace) -> int:
-    """Check if minimizing would change the file. Exit non-zero if so.
+def _minimize_check_one(
+    child_path: Path,
+    base_override: Optional[str],
+    base_config_cache: dict[Path, dict],
+) -> int:
+    """Check if minimizing would change a single file. Exit non-zero if so.
 
-    Args (same as `minimize`):
-      config: Child config path
-      base: Optional base config path (inferred from defaults if not provided)
+    Args:
+        child_path: Resolved path to the child config
+        base_override: Optional explicit base config path (--base)
+        base_config_cache: Cache of resolved path -> expanded base config container
     """
-    child_path = Path(args.config).resolve()
-
-    # Compute minimized text (same as minimize())
     child_cfg_raw = OmegaConf.load(child_path)
     if not isinstance(child_cfg_raw, DictConfig):
         print(
@@ -488,17 +491,19 @@ def minimize_check(args: argparse.Namespace) -> int:
         return 2
 
     # Determine base: from --base arg or infer from defaults
-    if args.base:
-        base_path = Path(args.base).resolve()
+    if base_override:
+        base_path = Path(base_override).resolve()
         base_inferred = False
-        base_cfg_raw = OmegaConf.load(base_path)
-        if not isinstance(base_cfg_raw, DictConfig):
-            print(
-                f"[minimize-check] Base config must be a mapping: {base_path}",
-                file=sys.stderr,
-            )
-            return 2
-        base_resolved = OmegaConf.to_container(base_cfg_raw)
+        if base_path not in base_config_cache:
+            base_cfg_raw = OmegaConf.load(base_path)
+            if not isinstance(base_cfg_raw, DictConfig):
+                print(
+                    f"[minimize-check] Base config must be a mapping: {base_path}",
+                    file=sys.stderr,
+                )
+                return 2
+            base_config_cache[base_path] = OmegaConf.to_container(base_cfg_raw)
+        base_resolved = base_config_cache[base_path]
     else:
         try:
             base_path = _infer_base_from_defaults(child_path, child_cfg_raw)
@@ -506,8 +511,11 @@ def minimize_check(args: argparse.Namespace) -> int:
             print(f"[minimize-check] {e}", file=sys.stderr)
             return 2
         base_inferred = True
-        # Load EXPANDED base (full inheritance chain) for proper comparison
-        base_resolved = OmegaConf.to_container(load_config(str(base_path)))
+        if base_path not in base_config_cache:
+            base_config_cache[base_path] = OmegaConf.to_container(
+                load_config(str(base_path))
+            )
+        base_resolved = base_config_cache[base_path]
 
     child_resolved = OmegaConf.to_container(child_cfg_raw)
     if not isinstance(child_resolved, dict) or not isinstance(base_resolved, dict):
@@ -544,7 +552,7 @@ def minimize_check(args: argparse.Namespace) -> int:
 
     if current_norm_text != minimized_text:
         suggested_cmd = f"tools/config_cli.py minimize {child_path} --in-place"
-        if args.base:
+        if base_override:
             suggested_cmd = f"tools/config_cli.py minimize {child_path} --base {base_path} --in-place"
         print(
             f"[minimize-check] {child_path} is not minimized.\n"
@@ -554,6 +562,22 @@ def minimize_check(args: argparse.Namespace) -> int:
         return 1
 
     return 0
+
+
+def minimize_check(args: argparse.Namespace) -> int:
+    """Check if minimizing would change the file(s). Exit non-zero if so.
+
+    Accepts one or more config paths. When multiple files are given, all are
+    checked in a single process invocation (avoiding repeated startup overhead)
+    and expanded base configs are cached across files.
+    """
+    base_config_cache: dict[Path, dict] = {}
+    worst = 0
+    for config in args.configs:
+        child_path = Path(config).resolve()
+        ret = _minimize_check_one(child_path, args.base, base_config_cache)
+        worst = max(worst, ret)
+    return worst
 
 
 if __name__ == "__main__":
@@ -596,9 +620,9 @@ if __name__ == "__main__":
 
     p_minchk = sub.add_parser(
         "minimize-check",
-        help="Exit non-zero if minimizing would change the file",
+        help="Exit non-zero if minimizing would change the file(s)",
     )
-    p_minchk.add_argument("config", help="Config file to check")
+    p_minchk.add_argument("configs", nargs="+", help="Config file(s) to check")
     p_minchk.add_argument(
         "--base",
         help="Base config path (if not provided, inferred from config's defaults key)",
