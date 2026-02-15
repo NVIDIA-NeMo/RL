@@ -18,7 +18,7 @@ policy:
     automodel_kwargs:
       use_liger_kernel: false
       backend:
-        _target_: nemo_automodel.components.moe.utils.BackendConfig
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
         attn: te
         linear: te
         rms_norm: te
