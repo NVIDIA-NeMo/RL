@@ -15,7 +15,6 @@ policy:
     bias_activation_fusion: false
     tensor_model_parallel_size: 2
     context_parallel_size: 2
-    expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     sequence_parallel: true
     moe_router_dtype: fp32
@@ -34,9 +33,6 @@ policy:
       fp8_cfg:
         is_mx: true
         dynamic_weight_quant: false
-        activation_scheme: dynamic
-  sequence_packing:
-    enabled: true
 data:
   max_input_seq_length: 512
 logger:

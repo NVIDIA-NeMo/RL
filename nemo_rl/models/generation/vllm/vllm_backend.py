@@ -13,7 +13,7 @@
 # limitations under the License.
 import gc
 import traceback
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import torch
 import zmq
@@ -123,11 +123,11 @@ class VllmInternalWorkerExtension:
         )
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(self) -> Tuple[bool, Optional[Exception]]:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
-            bool: True if weights were successfully updated.
+            Tuple[bool, Exception]: (True, None) if weights were successfully updated, otherwise False and the exception.
         """
         buffer = None
         weights = None
@@ -207,18 +207,18 @@ class VllmInternalWorkerExtension:
 
             gc.collect()
             torch.cuda.empty_cache()
-            return True
+            return True, None
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
-            return False
+            return False, e
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self) -> Tuple[bool, Optional[Exception]]:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -260,9 +260,11 @@ class VllmInternalWorkerExtension:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
             )
-            return False
+            return False, e
 
-        return True
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True, None
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

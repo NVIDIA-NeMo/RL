@@ -1012,9 +1012,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             worker_result = worker_results[0]
 
-            if not worker_result:
+            if not worker_result[0]:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {worker_result[1]}"
                 )
                 return False
             return True
@@ -1048,9 +1048,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             worker_result = worker_results[0]
 
-            if not worker_result:
+            if not worker_result[0]:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {worker_result[1]}"
                 )
                 return False
             return True
