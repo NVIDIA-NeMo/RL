@@ -51,6 +51,7 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -669,12 +670,15 @@ def setup_model_and_optimizer(
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
     # Tokenizer
+    if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
+        megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
     build_tokenizer(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // megatron_cfg.model.tensor_model_parallel_size,
         tensor_model_parallel_size=megatron_cfg.model.tensor_model_parallel_size,
-        trust_remote_code=True,
     )
     assert megatron_cfg.model.vocab_size, "vocab size must be specified in model config"
 
@@ -737,6 +741,8 @@ def setup_model_and_optimizer(
         pre_wrap_hook.extend([composed_peft_hook])
 
     # Model, optimizer, and learning rate.
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    setattr(megatron_cfg.model, "_pg_collection", pg_collection)
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
@@ -745,6 +751,7 @@ def setup_model_and_optimizer(
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -878,6 +885,7 @@ def setup_reference_model_state(
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
         pre_wrap_hook=megatron_cfg.rng.data_parallel_random_init,
         mixed_precision_wrapper=ref_mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     print("Loading the Reference Model")
@@ -931,11 +939,16 @@ def finalize_megatron_setup(
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
         tokenizer_model=hf_model_name,
+        hf_tokenizer_kwargs={
+            "trust_remote_code": True,
+            "use_fast": True,
+        },
     )
 
     megatron_tokenizer = build_tokenizer(
@@ -943,7 +956,6 @@ def finalize_megatron_setup(
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // config["megatron_cfg"]["tensor_model_parallel_size"],
         tensor_model_parallel_size=config["megatron_cfg"]["tensor_model_parallel_size"],
-        trust_remote_code=True,
     )
 
     dp_size = worker_sharding_annotations.get_axis_size("data_parallel")

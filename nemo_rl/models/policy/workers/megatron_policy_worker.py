@@ -14,11 +14,9 @@
 import gc
 import os
 import re
-import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from functools import partial
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
@@ -27,6 +25,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -43,29 +42,16 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
-    get_context_parallel_group,
     get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_last_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
-    distributed_vocab_topk,
-    from_parallel_logits_to_logprobs,
-    from_parallel_logits_to_logprobs_packed_sequences,
-)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -73,15 +59,16 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.common import (
-    broadcast_tensor,
-    forward_step_arbitrary_loss,
-    get_moe_metrics,
-)
+from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
+)
+from nemo_rl.models.megatron.pipeline_parallel import (
+    broadcast_loss_metrics_from_last_stage,
+    broadcast_obj_from_pp_rank,
+    broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
@@ -91,6 +78,13 @@ from nemo_rl.models.megatron.setup import (
     setup_reference_model_state,
     validate_and_set_config,
     validate_model_paths,
+)
+from nemo_rl.models.megatron.train import (
+    LogprobsPostProcessor,
+    LossPostProcessor,
+    TopkLogitsPostProcessor,
+    aggregate_training_statistics,
+    megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -104,59 +98,6 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-def broadcast_object_across_pp_ranks(obj):
-    """Broadcast an object across pipeline parallel ranks.
-
-    This utility function handles broadcasting an object from the rank that owns it
-    to all other pipeline parallel ranks. If only one rank has the object (non-None),
-    it will be broadcast to all other ranks.
-
-    Args:
-        obj: The object to broadcast. Can be None on ranks that don't own it.
-
-    Returns:
-        The object on all ranks (either the original or the broadcast copy).
-
-    Raises:
-        ValueError: If the object doesn't exist on any pipeline parallel rank.
-    """
-    pp_size = get_pipeline_model_parallel_world_size()
-    pp_group = get_pipeline_model_parallel_group()
-
-    if pp_size == 1:
-        return obj
-
-    # ------------------------------------------------------------------
-    # 1. Gather presence flags from all PP ranks to find the source rank
-    # ------------------------------------------------------------------
-    has_obj = obj is not None
-    obj_flags = [None] * pp_size
-    torch.distributed.all_gather_object(obj_flags, has_obj, group=pp_group)
-
-    # ------------------------------------------------------------------
-    # 2. Identify the owning rank (the only rank with True flag)
-    # ------------------------------------------------------------------
-    src_rank = None  # Rank *inside* the PP group
-    for rank, flag in enumerate(obj_flags):
-        if flag:
-            src_rank = rank
-            break
-
-    if src_rank is None:
-        raise ValueError("Object must exist on at least one PP rank")
-
-    # ------------------------------------------------------------------
-    # 3. Broadcast the object from the source rank to all ranks
-    # ------------------------------------------------------------------
-    # Use broadcast_object_list which is more robust than all_gather_object
-    obj_list = [obj]
-    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
-    global_src = pp_ranks[src_rank]
-    torch.distributed.broadcast_object_list(obj_list, src=global_src, group=pp_group)
-
-    return obj_list[0]
 
 
 @ray.remote(
@@ -310,7 +251,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        self.model.zero_grad_buffer()
+        # Note: zero_grad_buffer is called at the start of each global batch iteration
+        # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
 
@@ -343,9 +285,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model.train()
 
         with ctx:
-            forward_step = partial(
-                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
-            )
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
@@ -376,6 +315,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
+                loss_post_processor = LossPostProcessor(
+                    loss_fn=loss_fn,
+                    cfg=self.cfg,
+                )
+
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
@@ -397,24 +341,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     )
 
                     # Forward pass.
-                    forward_backward_func = get_forward_backward_func()
-                    losses_reduced = forward_backward_func(
-                        forward_step_func=partial(
-                            forward_step,
-                            self.mcore_state,
-                            global_valid_seqs,
-                            global_valid_toks,
-                            pack_sequences=self.cfg["sequence_packing"]["enabled"],
-                            defer_fp32_logits=self.defer_fp32_logits,
-                        ),
-                        data_iterator=data_iterator,
+                    losses_reduced = megatron_forward_backward(
                         model=self.model,
+                        cfg=self.cfg,
+                        data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
-                        micro_batch_size=mbs,
-                        decoder_seq_length=padded_seq_length,
+                        mbs=micro_batch_size,
+                        post_processing_fn=loss_post_processor,
                         forward_only=eval_mode,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
                         do_not_average_loss=True,
+                        straggler_timer=self.mcore_state.straggler_timer,
                     )
 
                 # Empty unused memory.
@@ -429,18 +369,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
+                pg_collection = get_pg_collection(self.model)
+
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
                 update_successful = logical_and_across_model_parallel_group(
-                    update_successful
+                    update_successful, mp_group=pg_collection.mp
                 )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
-                    grad_norm
+                    grad_norm, mp_group=pg_collection.mp
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
-                    num_zeros_in_grad
+                    num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
                 if update_successful:
@@ -472,19 +414,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
 
-                    torch.distributed.broadcast_object_list(
-                        [gb_loss_metrics],
-                        src=get_pipeline_model_parallel_last_rank(),
-                        group=get_pipeline_model_parallel_group(),
-                    )
                 else:
-                    loss_metrics = [None]  # type: ignore
-                    torch.distributed.broadcast_object_list(
-                        loss_metrics,
-                        src=get_pipeline_model_parallel_last_rank(),
-                        group=get_pipeline_model_parallel_group(),
-                    )
-                    gb_loss_metrics = loss_metrics[0]
+                    gb_loss_metrics = None
+
+                # Broadcast loss metrics from last stage to all stages
+                gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
+                    gb_loss_metrics
+                )
+                if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
@@ -497,25 +434,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
-        mb_metrics = defaultdict(list)
-        for m in all_mb_metrics:
-            for k, v in m.items():
-                mb_metrics[k].append(v)
-
-        with torch.no_grad():
-            global_loss = torch.tensor(losses, device="cuda")
-            torch.distributed.all_reduce(
-                global_loss,
-                op=torch.distributed.ReduceOp.SUM,
-                group=parallel_state.get_data_parallel_group(),
-            )
+        mb_metrics, global_loss = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=losses,
+            data_parallel_group=parallel_state.get_data_parallel_group(),
+        )
 
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
-            "all_mb_metrics": dict(mb_metrics),
+            "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
         # Collect MoE aux metrics averaged across microbatches
@@ -574,97 +504,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        def forward_step_fn(
-            data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
-        ):
-            processed_mb = next(data_iterator)
-            # Extract the processed components
-            data_dict = processed_mb.data_dict
-            input_ids = processed_mb.input_ids
-            input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
-            attention_mask = processed_mb.attention_mask
-            position_ids = processed_mb.position_ids
-            packed_seq_params = processed_mb.packed_seq_params
-            cu_seqlens_padded = processed_mb.cu_seqlens_padded
-            unpacked_input_ids = data_dict["input_ids"]
-
-            multimodal_data = data_dict.get_multimodal_dict(
-                as_tensors=True, device=input_ids.device
-            )
-            if len(multimodal_data) > 0:
-                position_ids = None
-
-            additional_kwargs = {}
-            # Mamba models currently do not support packed_seq_params
-            if packed_seq_params is not None:
-                additional_kwargs["packed_seq_params"] = packed_seq_params
-
-            if self.defer_fp32_logits:
-                additional_kwargs["fp32_output"] = False
-
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                **multimodal_data,
-                **additional_kwargs,
-            )
-
-            # Apply temperature scaling to logits for training
-            # This matches the dtensor worker's _apply_temperature_scaling in the train method
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
-
-            def collection_fn(output_tensor):
-                stc = time.time()
-                tp_grp = get_tensor_model_parallel_group()
-                tp_rank = get_tensor_model_parallel_rank()
-                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-                if self.cfg["sequence_packing"]["enabled"]:
-                    token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-                        output_tensor,
-                        target=input_ids,
-                        cu_seqlens_padded=cu_seqlens_padded,
-                        unpacked_seqlen=seq_length,
-                        vocab_start_index=tp_rank * output_tensor.shape[-1],
-                        vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                        group=tp_grp,
-                        inference_only=True,
-                        cp_group=get_context_parallel_group(),
-                        chunk_size=logprob_chunk_size,
-                    )
-                else:
-                    token_logprobs = from_parallel_logits_to_logprobs(
-                        output_tensor,
-                        target=unpacked_input_ids,
-                        vocab_start_index=tp_rank * output_tensor.shape[-1],
-                        vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                        tp_group=tp_grp,
-                        inference_only=True,
-                        chunk_size=logprob_chunk_size,
-                    )
-
-                # Prepend 0 logprob for first token to maintain same sequence length as input
-                token_logprobs = torch.cat(
-                    [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-                )
-                return torch.tensor(0.0, device=token_logprobs.device), {
-                    "logprobs": token_logprobs
-                }
-
-            return output_tensor, collection_fn
-
-        forward_backward_func = get_forward_backward_func()
-        list_of_logprobs = forward_backward_func(
-            forward_step_func=forward_step_fn,
-            data_iterator=mb_iterator,
+        list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            num_microbatches=num_microbatches,
+            cfg=self.cfg,
+            data_iterator=mb_iterator,
             seq_length=padded_seq_length,
-            micro_batch_size=micro_batch_size,
-            decoder_seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
+            post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
             forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            straggler_timer=self.mcore_state.straggler_timer,
         )
+
         if is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
@@ -677,12 +529,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 all_log_probs_padded.append(lp)
 
             logprobs = torch.cat(all_log_probs_padded, dim=0)
-            # broadcast logprobs to first pp rank
-            broadcast_tensor(logprobs, torch.distributed.get_rank(), pp_grp)
+            tensors = {"logprobs": logprobs}
         else:
-            logprobs = broadcast_tensor(
-                None, get_pipeline_model_parallel_last_rank(), pp_grp
-            )
+            tensors = {"logprobs": None}
+        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
@@ -781,172 +631,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        def forward_step_fn(
-            data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
-        ):
-            processed_mb = next(data_iterator)
-            # Extract the processed components
-            data_dict = processed_mb.data_dict
-            input_ids = processed_mb.input_ids
-            input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
-            attention_mask = processed_mb.attention_mask
-            position_ids = processed_mb.position_ids
-            packed_seq_params = processed_mb.packed_seq_params
-            cu_seqlens_padded = processed_mb.cu_seqlens_padded
-            unpacked_input_ids = data_dict["input_ids"]
-
-            multimodal_data = data_dict.get_multimodal_dict(
-                as_tensors=True, device=input_ids_cp_sharded.device
-            )
-            if len(multimodal_data) > 0:
-                position_ids = None
-
-            additional_kwargs = {}
-            if packed_seq_params is not None:
-                additional_kwargs["packed_seq_params"] = packed_seq_params
-
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                **additional_kwargs,
-                **multimodal_data,
-            )
-
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
-
-            def collection_fn(_):
-                # Only the last PP stage produces final logits/top-k; earlier stages return empty
-                # if not is_pipeline_last_stage(ignore_virtual=True):
-                # return output_tensor.new_zeros(()), {}
-
-                tp_grp = get_tensor_model_parallel_group()
-                tp_rank = get_tensor_model_parallel_rank()
-                vocab_shard_size = output_tensor.shape[-1]
-                vocab_start_index = tp_rank * vocab_shard_size
-
-                chunk_size = None
-                if "logprob_chunk_size" in self.cfg:
-                    chunk_size = self.cfg["logprob_chunk_size"]
-
-                topk_vals_local, topk_idx_local = distributed_vocab_topk(
-                    output_tensor,
-                    k,
-                    tp_grp,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_start_index + vocab_shard_size,
-                    chunk_size=chunk_size,
-                )
-
-                if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
-                    cp_grp = get_context_parallel_group()
-                    if self.cfg["sequence_packing"]["enabled"]:
-                        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                        # Per-sequence CP allgather following packed-sequence logic
-                        batch_size = data_dict["input_ids"].shape[0]
-                        total_packed_len = int(cu_seqlens_padded[-1].item())
-
-                        topk_vals_full = torch.zeros(
-                            (1, total_packed_len, k),
-                            dtype=topk_vals_local.dtype,
-                            device=topk_vals_local.device,
-                        )
-                        topk_idx_full = torch.zeros(
-                            (1, total_packed_len, k),
-                            dtype=topk_idx_local.dtype,
-                            device=topk_idx_local.device,
-                        )
-
-                        for i in range(batch_size):
-                            start_idx = int(cu_seqlens_padded[i].item())
-                            end_idx = int(cu_seqlens_padded[i + 1].item())
-                            if end_idx > start_idx:
-                                local_vals_slice = topk_vals_local[
-                                    :, start_idx // cp_size : end_idx // cp_size, :
-                                ]
-                                local_idx_slice = topk_idx_local[
-                                    :, start_idx // cp_size : end_idx // cp_size, :
-                                ]
-                                gathered_vals = allgather_cp_sharded_tensor(
-                                    local_vals_slice, cp_grp, seq_dim=1
-                                )
-                                gathered_idx = allgather_cp_sharded_tensor(
-                                    local_idx_slice, cp_grp, seq_dim=1
-                                )
-                                # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
-                                # Flatten leading dims and reshape to [1, expected_len, k] to match target.
-                                expected_len = end_idx - start_idx
-                                if (
-                                    gathered_vals.dim() == 3
-                                    and gathered_vals.shape[1] != expected_len
-                                ):
-                                    gathered_vals = gathered_vals.reshape(
-                                        1, expected_len, gathered_vals.shape[-1]
-                                    )
-                                if (
-                                    gathered_idx.dim() == 3
-                                    and gathered_idx.shape[1] != expected_len
-                                ):
-                                    gathered_idx = gathered_idx.reshape(
-                                        1, expected_len, gathered_idx.shape[-1]
-                                    )
-                                topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                                topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
-                    else:
-                        # Sequence packing must be enabled when CP > 1
-                        raise RuntimeError(
-                            "Context Parallelism (CP>1) requires sequence packing to be enabled."
-                        )
-                else:
-                    topk_vals_full = topk_vals_local
-                    topk_idx_full = topk_idx_local
-
-                if self.cfg["sequence_packing"]["enabled"]:
-                    batch_size = data_dict["input_ids"].shape[0]
-                    seq_lengths = data_dict["input_lengths"]
-                    out_vals = torch.zeros(
-                        (batch_size, seq_length, k),
-                        dtype=topk_vals_full.dtype,
-                        device=topk_vals_full.device,
-                    )
-                    out_idx = torch.zeros(
-                        (batch_size, seq_length, k),
-                        dtype=topk_idx_full.dtype,
-                        device=topk_idx_full.device,
-                    )
-                    for i in range(batch_size):
-                        seq_len = int(seq_lengths[i].item())
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        if seq_len > 0:
-                            out_vals[i, :seq_len, :] = topk_vals_full[
-                                0, start_idx : start_idx + seq_len, :
-                            ]
-                            out_idx[i, :seq_len, :] = topk_idx_full[
-                                0, start_idx : start_idx + seq_len, :
-                            ]
-                    return output_tensor.new_zeros(()), {
-                        "topk_logits": out_vals,
-                        "topk_indices": out_idx,
-                    }
-                else:
-                    return output_tensor.new_zeros(()), {
-                        "topk_logits": topk_vals_full,
-                        "topk_indices": topk_idx_full,
-                    }
-
-            return output_tensor, collection_fn
-
-        forward_backward_func = get_forward_backward_func()
-        list_of_outputs = forward_backward_func(
-            forward_step_func=forward_step_fn,
-            data_iterator=mb_iterator,
+        list_of_outputs = megatron_forward_backward(
             model=self.model,
-            num_microbatches=num_microbatches,
+            cfg=self.cfg,
+            data_iterator=mb_iterator,
             seq_length=padded_seq_length,
-            micro_batch_size=micro_batch_size,
-            decoder_seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
+            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            straggler_timer=self.mcore_state.straggler_timer,
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
@@ -955,7 +650,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
-                pad_len = padded_seq_length - tk.shape[1]
+                pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
@@ -965,16 +660,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             topk_logits = torch.cat(logits_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
 
-            topk_logits = broadcast_tensor(
-                topk_logits, torch.distributed.get_rank(), pp_grp
-            )
-            topk_indices = broadcast_tensor(
-                topk_indices, torch.distributed.get_rank(), pp_grp
-            )
+            tensors_to_broadcast = {
+                "topk_logits": topk_logits,
+                "topk_indices": topk_indices,
+            }
         else:
-            last_pp_rank = get_pipeline_model_parallel_last_rank()
-            topk_logits = broadcast_tensor(None, last_pp_rank, pp_grp)
-            topk_indices = broadcast_tensor(None, last_pp_rank, pp_grp)
+            tensors_to_broadcast = {
+                "topk_logits": None,
+                "topk_indices": None,
+            }
+
+        # Broadcast tensors from last stage to all stages
+        broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
+        topk_logits = broadcasted["topk_logits"]
+        topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict.from_batches(
@@ -1052,9 +751,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ]
         enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
         unified_memory_level = mcore_generation_config["unified_memory_level"]
-        buffer_guaranteed_fraction = mcore_generation_config[
-            "buffer_guaranteed_fraction"
-        ]
         max_tokens = mcore_generation_config["max_tokens"]
 
         model_config = self.model.config
@@ -1066,7 +762,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
             buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
@@ -1077,7 +772,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=False,
             unified_memory_level=unified_memory_level,
-            max_tokens_override=max_tokens,
+            max_tokens=max_tokens,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
@@ -1150,23 +845,27 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         result = []
         while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern(verbose=False)
-            finished_requests = result_step.get("finished_requests", [])
-            for finished_request in finished_requests:
-                result.append(finished_request)
+            result_step = dynamic_engine.step_modern()
+            result.extend(result_step["finished_request_records"])
 
         # Sort results by request_id to maintain original batch order
         result.sort(key=lambda x: x.request_id)
 
         out = {
-            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+            "tokens": [
+                x.requests[0].prompt_tokens.tolist() + x.requests[0].generated_tokens
+                for x in result
+            ],
+            "logprobs": [
+                x.requests[0].prompt_log_probs + x.requests[0].generated_log_probs
+                for x in result
+            ],
         }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
         batch_size = data["input_ids"].size(0)
-        max_gen_seq_len = max([len(x.generated_tokens) for x in result])
+        max_gen_seq_len = max([len(x.requests[0].generated_tokens) for x in result])
         padded_input_length = input_ids.size(1)
 
         max_seq_len = padded_input_length + max_gen_seq_len
@@ -1267,7 +966,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 )
 
             # Broadcast size_in_bytes across pipeline parallel ranks
-            return broadcast_object_across_pp_ranks(size_in_bytes)
+            return broadcast_obj_from_pp_rank(size_in_bytes)
 
         for task in self.refit_conversion_tasks:
             param_info.append(
