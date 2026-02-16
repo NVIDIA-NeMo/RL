@@ -608,6 +608,12 @@ def _create_megatron_config(
             data_parallel_sharding_strategy=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["data_parallel_sharding_strategy"],
+            fp8_param_gather=config["megatron_cfg"]["optimizer"].get(
+                "reuse_grad_buf_for_mxfp8_param_ag", False
+            ),
+            reuse_grad_buf_for_mxfp8_param_ag=config["megatron_cfg"]["optimizer"].get(
+                "reuse_grad_buf_for_mxfp8_param_ag", False
+            ),
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
