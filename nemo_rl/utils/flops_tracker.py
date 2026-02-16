@@ -24,7 +24,23 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
+# GPT-OSS may not be available in all transformers versions
+try:
+    from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+
+    _HAS_GPT_OSS = True
+except ImportError:
+    _HAS_GPT_OSS = False
+    GptOssConfig = None
+
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    deepseekv3,
+    gpt_oss,
+    llama,
+    qwen2,
+    qwen3,
+)
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -75,6 +91,41 @@ def convert_config_to_flops_config(
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
         ), llama
+    elif _HAS_GPT_OSS and isinstance(config, GptOssConfig):
+        # GPT-OSS: MoE model with sliding window attention
+        # Extract MoE FFN hidden size (may be different from intermediate_size)
+        moe_ffn_hidden_size = getattr(
+            config, "moe_ffn_hidden_size", config.intermediate_size
+        )
+
+        # Extract sliding window attention parameters
+        # window_size is typically a tuple (left, right), we use left as the window size
+        window_size = getattr(config, "window_size", None)
+        swa_window_size = window_size[0] if window_size else 128
+
+        # window_attn_skip_freq: if N, every Nth layer uses full attention
+        window_attn_skip_freq = getattr(config, "window_attn_skip_freq", 2)
+
+        # kv_channels may be explicitly set or derived from hidden_size / num_heads
+        kv_channels = getattr(
+            config, "kv_channels", config.hidden_size // config.num_attention_heads
+        )
+
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            moe_ffn_hidden_size=moe_ffn_hidden_size,
+            moe_router_topk=config.num_experts_per_tok,
+            swa_window_size=swa_window_size,
+            window_attn_skip_freq=window_attn_skip_freq,
+            kv_channels=kv_channels,
+            gated_linear_unit=True,  # GPT-OSS uses SwiGLU
+        ), gpt_oss
     elif config.__class__.model_type == "deepseek_v3":
         return FLOPSConfig(
             gbs=0,

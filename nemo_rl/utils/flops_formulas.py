@@ -58,6 +58,20 @@ class FLOPSConfig:
     mamba_num_groups: Optional[int] = None
     mamba_num_heads: Optional[int] = None
 
+    # GPT-OSS / Sliding Window Attention specific fields
+    swa_window_size: Optional[int] = None
+    """Sliding window attention window size."""
+
+    window_attn_skip_freq: Optional[int] = None
+    """Frequency of full attention layers. If N, every Nth layer uses full attention,
+    others use sliding window attention. None means all layers use SWA if window_size is set."""
+
+    kv_channels: Optional[int] = None
+    """Key/Value channels per attention head. Defaults to hidden_size / num_attention_heads."""
+
+    gated_linear_unit: bool = True
+    """Whether MLP uses gated linear unit (e.g., SwiGLU). Default True for modern architectures."""
+
 
 def gpt3(config: FLOPSConfig):
     """Model FLOPs for GPT3 family."""
@@ -542,3 +556,220 @@ def _hybrid_model_flops(config: FLOPSConfig):
 def nemotronh(config: FLOPSConfig):
     """Model FLOPs for NemotronH."""
     return _hybrid_model_flops(config)
+
+
+# =============================================================================
+# GPT-OSS FLOPS Calculation Utilities
+# =============================================================================
+
+
+def _compute_kv_channels(config: FLOPSConfig) -> int:
+    """Compute key/value channels per head, with fallback to hidden_size / num_heads."""
+    if config.kv_channels is not None:
+        return config.kv_channels
+    return config.hs // config.attention_heads
+
+
+def _is_layer_window_attention(
+    window_attn_skip_freq: Optional[int],
+    layer_idx: int,
+) -> bool:
+    """Determine if a layer uses sliding window attention.
+
+    Args:
+        window_attn_skip_freq: If N, every Nth layer (1-indexed) uses full attention.
+            None means all layers use sliding window attention.
+        layer_idx: 0-indexed layer number.
+
+    Returns:
+        True if the layer uses sliding window attention, False for full attention.
+    """
+    if window_attn_skip_freq is None:
+        return True
+    # Convert to 1-indexed for skip frequency check
+    layer_number = layer_idx + 1
+    # layer_number % freq == 0 means full attention
+    return layer_number % window_attn_skip_freq != 0
+
+
+def _attention_flops(
+    seq_len: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    num_query_groups: int,
+    kv_channels: int,
+    is_swa: bool = False,
+    swa_window_size: int = 128,
+) -> int:
+    """Calculate FLOPS for a single attention layer.
+
+    This follows the standard transformer attention computation:
+    - QKV linear projections
+    - Attention score computation (Q @ K^T)
+    - Attention output (scores @ V)
+    - Output projection
+
+    Args:
+        seq_len: Sequence length.
+        hidden_size: Model hidden size.
+        num_attention_heads: Number of attention heads for queries.
+        num_query_groups: Number of key-value groups (for GQA/MQA).
+        kv_channels: Dimension per attention head.
+        is_swa: Whether to use sliding window attention.
+        swa_window_size: Window size for sliding window attention.
+
+    Returns:
+        Total FLOPS for the attention layer (forward + backward = 6x multiplier).
+    """
+    # QKV linear projection: hidden -> (q_heads + 2 * kv_groups) * kv_channels
+    linear_qkv = seq_len * hidden_size * (
+        kv_channels * (num_attention_heads + num_query_groups * 2)
+    )
+
+    # Output projection: q_heads * kv_channels -> hidden
+    linear_proj = seq_len * hidden_size * (kv_channels * num_attention_heads)
+
+    # Attention computation
+    if is_swa:
+        # Sliding window attention: reduced attention span
+        # For causal SWA, non-zero elements = triangle + rectangle
+        attention_mask_nz_elem = (
+            swa_window_size * (swa_window_size + 1) / 2
+            + (seq_len - swa_window_size) * swa_window_size
+        )
+        attention = num_attention_heads * (attention_mask_nz_elem * kv_channels) * 2
+    else:
+        # Full causal attention
+        bmm_k = kv_channels
+        bmm_b = num_attention_heads
+        attention_mask_nz_elem = seq_len * (seq_len + 1) / 2
+        attention = bmm_b * attention_mask_nz_elem * bmm_k * 2
+
+    # 6x multiplier: 3x for forward/backward (fwd + wgrad + dgrad), 2x for GEMM operations
+    return int((linear_qkv + linear_proj + attention) * 6)
+
+
+def _moe_mlp_flops(
+    seq_len: int,
+    hidden_size: int,
+    moe_ffn_hidden_size: int,
+    moe_router_topk: int,
+    gated_linear_unit: bool = True,
+) -> int:
+    """Calculate FLOPS for a single MoE MLP layer.
+
+    Args:
+        seq_len: Sequence length.
+        hidden_size: Model hidden size.
+        moe_ffn_hidden_size: Hidden size of each expert's FFN.
+        moe_router_topk: Number of experts activated per token.
+        gated_linear_unit: Whether using gated activation (e.g., SwiGLU).
+
+    Returns:
+        Total FLOPS for the MoE MLP layer (forward + backward = 6x multiplier).
+    """
+    # Total tokens processed = seq_len * topk (each token goes to topk experts)
+    total_num_tokens = seq_len * moe_router_topk
+
+    # FC1: hidden -> ffn_hidden (2x if gated for gate + value)
+    glu_multiplier = 2 if gated_linear_unit else 1
+    linear_fc1 = total_num_tokens * hidden_size * moe_ffn_hidden_size * glu_multiplier
+
+    # FC2: ffn_hidden -> hidden
+    linear_fc2 = total_num_tokens * moe_ffn_hidden_size * hidden_size
+
+    return int((linear_fc1 + linear_fc2) * 6)
+
+
+def _vocab_flops(
+    seq_len: int,
+    hidden_size: int,
+    vocab_size: int,
+) -> int:
+    """Calculate FLOPS for the vocabulary/output projection layer.
+
+    Args:
+        seq_len: Sequence length.
+        hidden_size: Model hidden size.
+        vocab_size: Vocabulary size.
+
+    Returns:
+        Total FLOPS for the vocab layer (forward + backward = 6x multiplier).
+    """
+    return int(seq_len * hidden_size * vocab_size * 6)
+
+
+def gpt_oss(config: FLOPSConfig) -> int:
+    """Model FLOPS for GPT-OSS family.
+
+    GPT-OSS is a Mixture-of-Experts model with sliding window attention:
+    - Uses MoE (Mixture of Experts) for FFN layers
+    - Some layers use full attention, others use sliding window attention
+    - The pattern is controlled by window_attn_skip_freq
+
+    Args:
+        config: FLOPSConfig with the following required fields:
+            - gbs: Global batch size
+            - enc_seq_len: Sequence length
+            - hs: Hidden size
+            - layers: Number of transformer layers
+            - attention_heads: Number of attention heads
+            - query_groups: Number of KV groups (for GQA)
+            - moe_ffn_hidden_size: Expert FFN hidden size
+            - moe_router_topk: Number of experts per token
+            - vocab_size: Vocabulary size
+            And optional fields:
+            - swa_window_size: Sliding window size (default: 128)
+            - window_attn_skip_freq: Full attention frequency (default: 2)
+            - kv_channels: KV dimension per head (default: hs / attention_heads)
+            - gated_linear_unit: Whether using gated MLP (default: True)
+
+    Returns:
+        Total FLOPS for the model.
+    """
+    seq_len = config.enc_seq_len
+    hidden_size = config.hs
+    num_layers = config.layers
+
+    # Get optional parameters with defaults
+    swa_window_size = config.swa_window_size if config.swa_window_size is not None else 128
+    window_attn_skip_freq = (
+        config.window_attn_skip_freq if config.window_attn_skip_freq is not None else 2
+    )
+    kv_channels = _compute_kv_channels(config)
+    gated_linear_unit = config.gated_linear_unit
+
+    total_flops = 0
+
+    # Per-layer FLOPS
+    for layer_idx in range(num_layers):
+        # Determine attention type for this layer
+        is_swa = _is_layer_window_attention(window_attn_skip_freq, layer_idx)
+
+        # Attention FLOPS
+        attn_flops = _attention_flops(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_attention_heads=config.attention_heads,
+            num_query_groups=config.query_groups,
+            kv_channels=kv_channels,
+            is_swa=is_swa,
+            swa_window_size=swa_window_size,
+        )
+
+        # MoE MLP FLOPS
+        mlp_flops = _moe_mlp_flops(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            moe_ffn_hidden_size=config.moe_ffn_hidden_size,
+            moe_router_topk=config.moe_router_topk,
+            gated_linear_unit=gated_linear_unit,
+        )
+
+        total_flops += attn_flops + mlp_flops
+
+    # Vocabulary/output projection FLOPS
+    total_flops += _vocab_flops(seq_len, hidden_size, config.vocab_size)
+
+    # Multiply by global batch size
+    return total_flops * config.gbs
