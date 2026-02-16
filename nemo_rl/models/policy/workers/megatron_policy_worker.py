@@ -2663,6 +2663,71 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_iter_func=lambda x: x[1],
         )
 
+    @torch.no_grad()
+    def update_weights_from_collective(self) -> bool:
+        """Receive updated weights from collective communication (inference side).
+
+        This method is the consumer counterpart of broadcast_weights_for_collective.
+        It receives weights broadcast by the training workers and updates the local
+        model parameters.
+
+        TODO: Implement the actual weight update logic using packed_broadcast_consumer.
+        The implementation should:
+        1. Iterate over the stored state_dict_info
+        2. Use packed_broadcast_consumer to receive weights from the training side
+        3. Update the local Megatron model parameters with the received weights
+
+        Returns:
+            bool: True if weights were successfully updated.
+        """
+        raise NotImplementedError(
+            "update_weights_from_collective for MegatronPolicyWorker is not yet implemented. "
+            "This placeholder will be replaced with actual NCCL collective weight reception logic."
+        )
+
+    def init_collective_as_inference(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
+        """Initialize collective communication for inference-side workers.
+
+        Unlike the base init_collective (used by training workers which use
+        self.rank directly), this method offsets the rank by train_world_size
+        so inference workers get globally unique ranks that don't collide
+        with training workers.
+
+        Args:
+            ip: IP address for the process group rendezvous.
+            port: Port for the process group rendezvous.
+            world_size: Total world size (train + inference workers).
+            train_world_size: Number of training workers (used to offset ranks).
+        """
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        # Offset rank by train_world_size so inference workers get unique global ranks
+        rank = train_world_size + self.rank
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
+
+    def store_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Store state dict metadata for weight refitting on the inference side.
+
+        This is the inference-side counterpart of prepare_refit_info(). Instead of
+        calculating the metadata from the model, it accepts pre-computed metadata
+        from the training side.
+
+        TODO: Implement proper storage and use of state_dict_info for
+        update_weights_from_collective.
+
+        Args:
+            state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples,
+                as returned by the training-side prepare_refit_info().
+        """
+        self.state_dict_info = state_dict_info
+
     def prepare_for_lp_inference(self):
 
         self.model = self.move_model(self.model, "cuda", move_grads=False)
