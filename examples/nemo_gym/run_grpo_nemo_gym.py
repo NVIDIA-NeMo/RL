@@ -253,6 +253,7 @@ The validation set you pass in will directly be used for validation with no addi
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
+        enforce_monotonicity=policy_generation.cfg.get("vllm_cfg", {}).get("enforce_monotonicity", True),
     )
     nemo_gym = NemoGym.options(
         runtime_env={
