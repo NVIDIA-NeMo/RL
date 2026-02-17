@@ -57,6 +57,7 @@ class FLOPSConfig:
     mamba_head_dim: Optional[int] = None
     mamba_num_groups: Optional[int] = None
     mamba_num_heads: Optional[int] = None
+    gated_linear_unit: Optional[int] = None
 
 
 def gpt3(config: FLOPSConfig):
