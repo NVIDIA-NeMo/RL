@@ -9,14 +9,18 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=45
+NUM_MINUTES=60
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo.py \
+
+export NRL_VLLM_USE_V1=1
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+
+uv run examples/run_grpo_math.py \
     --config $CONFIG_PATH \
     policy.model_name=$MODEL_NAME \
     grpo.max_num_steps=$MAX_STEPS \

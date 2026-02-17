@@ -4,10 +4,16 @@ policy:
   megatron_cfg:
     fp8_cfg:
       enabled: true
+    moe_router_dtype: "fp32"
 
   generation:
     vllm_cfg:
       precision: fp8
+      fp8_cfg:
+        dynamic_weight_quant: false
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: 0
 
 checkpointing:
   checkpoint_dir: results/grpo-nemotron-super-8n8g-mxfp8

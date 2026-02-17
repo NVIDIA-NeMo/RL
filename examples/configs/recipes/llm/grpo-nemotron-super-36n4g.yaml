@@ -1,4 +1,4 @@
-defaults: ./grpo-nemotron-super-8n8g-gym.yaml
+defaults: ./grpo-nemotron-super-20n8g-gym.yaml
 
 policy:
   generation:

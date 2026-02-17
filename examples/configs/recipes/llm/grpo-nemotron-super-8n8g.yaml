@@ -12,6 +12,7 @@ grpo:
 
 loss_fn:
   truncated_importance_sampling_ratio: 5.0
+  use_importance_sampling_correction: true
 
 policy:
   model_name: dummy # TODO: update this to public HF name
@@ -23,7 +24,10 @@ policy:
   max_total_sequence_length: 8192
   sequence_packing:
     enabled: true
+  dtensor_cfg:
+    enabled: false
   megatron_cfg:
+    enabled: true
     sequence_parallel: true
     context_parallel_size: 2
     tensor_model_parallel_size: 4
