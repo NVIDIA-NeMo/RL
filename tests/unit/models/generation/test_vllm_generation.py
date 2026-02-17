@@ -898,9 +898,9 @@ async def run_hf_train_process(
         (False, True, "bfloat16", False),
         (True, False, "fp8", False),
         (False, True, "fp8", False),
-        # LoRA tests
-        (False, False, "bfloat16", True),
-        (True, False, "bfloat16", True),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -964,9 +964,9 @@ async def test_vllm_generation_with_hf_training_colocated(
         (False, True, "bfloat16", False),
         (True, False, "fp8", False),
         (False, True, "fp8", False),
-        # LoRA tests
-        (False, False, "bfloat16", True),
-        (True, False, "bfloat16", True),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
@@ -1728,7 +1728,10 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 
 
 # megatron still holds little memory after refit, so we only test dtensor now
-@pytest.mark.parametrize("train_backend", ["dtensor_v1", "dtensor_v2"])
+@pytest.mark.parametrize(
+    "train_backend",
+    ["dtensor_v1", pytest.param("dtensor_v2", marks=pytest.mark.automodel)],
+)
 def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy

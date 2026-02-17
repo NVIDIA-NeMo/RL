@@ -373,7 +373,9 @@ class TestSingleGPUCluster:
         cluster.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_single_gpu_training(
         self, use_v2, single_gpu_cluster, tiny_llama_model_path
     ):
@@ -450,7 +452,9 @@ class TestSingleGPUCluster:
             policy.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_single_gpu_logprob(
         self, use_v2, single_gpu_cluster, tiny_llama_model_path
     ):
@@ -772,8 +776,12 @@ class TestTwoGPUCluster:
     @pytest.mark.parametrize(
         "policy_setup",
         [
-            {"dtensor_v2": True, "enable_loras": False},
-            {"dtensor_v2": True, "enable_loras": True},
+            pytest.param(
+                {"dtensor_v2": True, "enable_loras": False}, marks=pytest.mark.automodel
+            ),
+            pytest.param(
+                {"dtensor_v2": True, "enable_loras": True}, marks=pytest.mark.automodel
+            ),
             {"dtensor_v2": False, "enable_loras": False},
         ],
         indirect=True,
@@ -860,18 +868,23 @@ class TestTwoGPUCluster:
             )
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_worker_training(self, use_v2, training_setup):
         policy, data, loss_fn = training_setup
         _test_dtensor_worker_training(policy, data, loss_fn)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     def test_dtensor_worker_training_with_lora(self, training_with_lora_setup):
         policy, data, loss_fn = training_with_lora_setup
         _test_dtensor_worker_training(policy, data, loss_fn)
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(
         self, use_v2, logprob_setup
     ):
@@ -879,11 +892,14 @@ class TestTwoGPUCluster:
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     def test_dtensor_worker_logprob_with_lora(self, logprob_with_lora_setup):
         policy, data, logprobs = logprob_with_lora_setup
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         self, use_v2, two_gpu_cluster, tiny_llama_tied_model_path
     ):
@@ -1037,7 +1053,9 @@ class TestTwoGPUCluster:
         policy_mbs2.worker_group.shutdown()
 
     @pytest.mark.timeout(300)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_v1_policy_flops_range_check(
         self, tiny_llama_model_path, two_gpu_cluster, use_v2
     ):

@@ -214,6 +214,7 @@ def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.parametrize(
     "model_fixture_name,tp,cp,sp,cpu_offload,activation_checkpointing",
     [
@@ -309,6 +310,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.timeout(360)
 def test_dtensor_v2_checkpoint_save_and_load(
     two_gpu_virtual_cluster,
@@ -394,6 +396,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("precision", ["bfloat16", "float16"])
 def test_dtensor_v2_mixed_precision_training_and_logprobs(
