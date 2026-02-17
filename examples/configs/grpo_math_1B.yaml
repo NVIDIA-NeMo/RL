@@ -243,6 +243,11 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port range for HTTP server allocation (vLLM, SGLang servers).
+    # Must not overlap with Ray's --min-worker-port/--max-worker-port range
+    # or the OS ephemeral range (default 32768-60999).
+    port_range_low: 10001
+    port_range_high: 20000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
