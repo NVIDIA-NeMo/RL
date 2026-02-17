@@ -479,6 +479,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         self.model.zero_grad_buffer()
 
+        from megatron.bridge.training.train import (
+            _handle_mxfp8_param_buffer_copy,
+        )
+
+        _handle_mxfp8_param_buffer_copy(
+            optimizer=self.optimizer,
+            reuse_grad_buf_for_mxfp8_param_ag=self.cfg["megatron_cfg"][
+                "optimizer"
+            ]["reuse_grad_buf_for_mxfp8_param_ag"],
+            overlap_param_gather=self.cfg["megatron_cfg"][
+                "distributed_data_parallel_config"
+            ]["overlap_param_gather"],
+        )
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
