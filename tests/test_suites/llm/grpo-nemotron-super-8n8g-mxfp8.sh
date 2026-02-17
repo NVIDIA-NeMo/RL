@@ -22,7 +22,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_USE_FLASHINFER_MOE_FP8=1
 export VLLM_FLASHINFER_MOE_BACKEND=latency
 
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     policy.model_name=$MODEL_NAME \
     grpo.max_num_steps=$MAX_STEPS \
