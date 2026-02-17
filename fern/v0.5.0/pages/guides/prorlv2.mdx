@@ -162,7 +162,7 @@ loss_fn:
 
 `seq-mask-tis` is an alternative to ICE-POP that operates at the **sequence level** instead of per-token:
 
-1. For each sequence, compute the **geometric mean** of per-token IS ratios: $\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\mathrm{train}}(a_t)}{\pi_{\mathrm{gen}}(a_t)}\bigr)$
+1. For each sequence, compute the **geometric mean** of per-token IS ratios: $\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\text{train}}(a_t)}{\pi_{\text{gen}}(a_t)}\bigr)$
 2. **Mask out** entire sequences whose geometric mean falls outside $[min, max]$.
 3. For retained sequences, apply the **non-truncated** (raw) token-level IS ratios to correct per-token gradients — no clamping, no per-token filtering.
 

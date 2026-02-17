@@ -65,15 +65,15 @@ A key design principle for generation backends is that they process tokens direc
 
 ## Generation Backends
 
-NeMo RL supports multiple generation backends that implement the `GenerationInterface ` to provide efficient text generation for different use cases.
+NeMo RL supports multiple generation backends that implement the `GenerationInterface` to provide efficient text generation for different use cases.
 
 ## VLLM Backend
 
-The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the `GenerationInterface ` to provide efficient text generation using the VLLM library, which is optimized for large language models.
+The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the `GenerationInterface` to provide efficient text generation using the VLLM library, which is optimized for large language models.
 
 ### VllmGeneration Class
 
-The `VllmGeneration ` class is the main implementation of the `GenerationInterface ` for VLLM. It performs the following functions:
+The `VllmGeneration` class is the main implementation of the `GenerationInterface` for VLLM. It performs the following functions:
 
 1. Sets up VLLM workers in a distributed environment using Ray.
 2. Manages the lifecycle of these workers (initialization, generation, shutdown).
@@ -82,7 +82,7 @@ The `VllmGeneration ` class is the main implementation of the `GenerationInterfa
 
 ### VllmGenerationWorker
 
-The `VllmGenerationWorker ` is a Ray actor that:
+The `VllmGenerationWorker` is a Ray actor that:
 
 1. Initializes and manages a VLLM model instance.
 2. Performs the actual generation on a GPU.
@@ -91,7 +91,7 @@ The `VllmGenerationWorker ` is a Ray actor that:
 
 ### Custom VLLM Extensions
 
-The `UpdatableVllmInternalWorker ` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:
+The `UpdatableVllmInternalWorker` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:
 
 1. Reporting device IDs to allow mapping of workers to specific GPUs.
 2. Updating weights from IPC handles for efficient weight sharing.
@@ -110,13 +110,13 @@ The Megatron backend provides native Megatron-Core inference capabilities, elimi
 
 ### MegatronPolicyWorker Generation
 
-The Megatron generation backend is implemented within the `MegatronPolicyWorker ` class. The `generate <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker.generate>` method performs the following:
+The Megatron generation backend is implemented within the `MegatronPolicyWorker` class. The `generate <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker.generate>` method performs the following:
 
 1. Wraps the Megatron model with `GPTInferenceWrapper` for inference optimization.
 2. Creates a `DynamicInferenceContext` to manage inference state and memory.
 3. Initializes a `DynamicInferenceEngine` with CUDA graph support enabled.
 4. Processes batched requests with proper sampling parameters (temperature, top_k, top_p).
-5. Returns outputs conforming to `GenerationOutputSpec `.
+5. Returns outputs conforming to `GenerationOutputSpec`.
 
 ### Configuration
 
@@ -223,9 +223,9 @@ For a complete example, see:
 
 To add a new generation backend:
 
-1. Create a new class that implements `GenerationInterface `.
-2. Implement the required methods: `generate `, `prepare_for_generation `, and `finish_generation `.
-3. Ensure your implementation works with the standard `GenerationConfig ` and `GenerationDatumSpec ` structures.
+1. Create a new class that implements `GenerationInterface`.
+2. Implement the required methods: `generate`, `prepare_for_generation`, and `finish_generation`.
+3. Ensure your implementation works with the standard `GenerationConfig` and `GenerationDatumSpec` structures.
 4. Register your backend with the system (if needed) to make it accessible.
 
 This modular design allows for easy extension with new backends while maintaining a consistent interface for the rest of the system.

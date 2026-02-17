@@ -79,7 +79,7 @@ if not is_right_padded:
 :hide:
 ```
 
-The `verify_right_padding() ` function checks that:
+The `verify_right_padding()` function checks that:
 1. All padding (zeros or padding token provided by the user) appears after valid tokens.
 2. The padding starts at the position specified by the length tensor.
 
@@ -93,6 +93,6 @@ The function automatically detects whether you're passing input or output data:
 
 2. **Track Length Tensors**: Include appropriate length tensors with your data.
 
-3. **Verify Padding**: Use `verify_right_padding() ` when in doubt.
+3. **Verify Padding**: Use `verify_right_padding()` when in doubt.
 
 4. **Mask Padding in Operations**: Use lengths to exclude padding tokens from loss calculations.

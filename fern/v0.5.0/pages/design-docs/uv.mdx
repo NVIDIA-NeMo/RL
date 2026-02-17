@@ -47,7 +47,7 @@ In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWor
 
 ### Supported Python Executables
 
-We provide several predefined Python executable configurations in `PY_EXECUTABLES `:
+We provide several predefined Python executable configurations in `PY_EXECUTABLES`:
 
 ```python
 class PY_EXECUTABLES:
@@ -64,15 +64,15 @@ To ensure consistent dependencies between actors, we run with `--locked` to make
 
 ### Customization
 
-If you need a different Python executable configuration, you can override the default one by passing your own in `RayWorkerBuilder.__call__ `. This provides flexibility for special use cases without modifying the core configurations.
+If you need a different Python executable configuration, you can override the default one by passing your own in `RayWorkerBuilder.__call__`. This provides flexibility for special use cases without modifying the core configurations.
 
 ## How It Works
 
 When a NeMo RL job is started:
 
-1. The driver script creates several `RayWorkerGroup `s.
-2. Each worker group will create their workers which are wrapped in a `RayWorkerBuilder ` where the fully qualified name (FQN) of the worker class is passed as a string.
-3. `RayWorkerBuilder ` launches the worker under `RayWorkerBuilder ` which allows us to initialize the class without importing packages not available in the base environment.
+1. The driver script creates several `RayWorkerGroup`s.
+2. Each worker group will create their workers which are wrapped in a `RayWorkerBuilder` where the fully qualified name (FQN) of the worker class is passed as a string.
+3. `RayWorkerBuilder` launches the worker under `RayWorkerBuilder` which allows us to initialize the class without importing packages not available in the base environment.
 4. Before the worker class is instantiated by the `RayWorkerBuilder`, the FQN is used to lookup -- in a [global registry](/../../nemo_rl/distributed/ray_actor_environment_registry.py))) -- to determine which member of `PY_EXECUTABLES` should be used to launch that set of workers. If the chosen `PY_EXECUTABLES.*` starts with `uv`; a `venv` is created with all the dependencies it needs and the `runtime_env["py_executable"]` is replaced with the `venv`'s python interpreter.
 
 This approach allows a fast start-up and maintains dependency isolation. It also has the added benefit of having all the virtual environments local under `./venvs`.

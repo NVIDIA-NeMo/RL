@@ -23,15 +23,15 @@ def escape_mdx_curly_braces(content: str) -> str:
 
 def convert_py_roles(content: str) -> str:
     """Convert {py:class}`text` and {py:meth}`text` to inline code `text`."""
-    # {py:class}`text` or {py:class}`text <module.path>`
+    # {py:class}`text` or {py:class}`text <module.path>` - strip trailing space from capture
     content = re.sub(
-        r"\{py:class\}`([^`<]+)(?:\s*<[^>]+>)?`",
-        r"`\1`",
+        r"\{py:class\}`([^`<]+?)(?:\s*<[^>]+>)?`",
+        lambda m: f"`{m.group(1).strip()}`",
         content,
     )
     content = re.sub(
-        r"\{py:meth\}`([^`<]+)(?:\s*<[^>]+>)?`",
-        r"`\1`",
+        r"\{py:meth\}`([^`<]+?)(?:\s*<[^>]+>)?`",
+        lambda m: f"`{m.group(1).strip()}`",
         content,
     )
     return content

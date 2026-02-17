@@ -19,7 +19,7 @@ The logger is designed to track key training metrics (including distributed metr
 
 Since there is a single controller, the single process running the main training loop will gather the metrics and do the logging.
 
-To handle multiple logger backends, we will have a `LoggerInterface ` interface that the `TensorboardLogger `, `WandbLogger `, `MLflowLogger ` and `SwanlabLogger ` will implement:
+To handle multiple logger backends, we will have a `LoggerInterface` interface that the `TensorboardLogger`, `WandbLogger`, `MLflowLogger` and `SwanlabLogger` will implement:
 
 ```python
 class LoggerInterface(ABC):
@@ -36,7 +36,7 @@ class LoggerInterface(ABC):
         pass
 ```
 
-A `Logger ` wrapper class will also implement `LoggerInterface ` and maintain a list of loggers to which it delegates writing logs. This will be the main class the user uses in the training loop. Usage example:
+A `Logger` wrapper class will also implement `LoggerInterface` and maintain a list of loggers to which it delegates writing logs. This will be the main class the user uses in the training loop. Usage example:
 
 ```python
 # Initialize logger with wandb, tensorboard, mlflow and swanlab enabled

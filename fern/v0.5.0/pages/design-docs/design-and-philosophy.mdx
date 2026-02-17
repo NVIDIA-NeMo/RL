@@ -23,8 +23,8 @@ Fundamentally, managing these RL Actors requires four key capabilities:
 ## Design
 
 We create composable and hackable abstractions for each layer of the tasks above
-- Resourcing: `RayVirtualCluster `
-- Isolation: `RayWorkerGroup `
+- Resourcing: `RayVirtualCluster`
+- Isolation: `RayWorkerGroup`
 - Coordination: A Single-Process Controller using Ray
 - Communication: Data flows through one of the following:
   - the single controller 
@@ -36,7 +36,7 @@ By creating a common interface for these four tasks, the RL algorithm code can s
 
 ![actor-wg-worker-vc](/assets/actor-wg-worker-vc.png)
 
-### `RayVirtualCluster `
+### `RayVirtualCluster`
 VirtualCluster provides a basic abstraction on top of Ray Placement Groups that allow you to section off a part of your compute resources for WorkerGroups to run on as though they had their own cluster. They support running just one WorkerGroup on each VirtualCluster, or *colocation*, where multiple WorkerGroups share resources (i.e running policy training(hf) and generation(vllm) on the same GPUs in-turn).
 
 ```python
@@ -71,7 +71,7 @@ class RayVirtualCluster:
         """
 ```
 
-### `RayWorkerGroup `
+### `RayWorkerGroup`
 All work is done by "Worker Processes" (Ray Actors) that run on a small unit of resources (usually 1 CPU or 1 CPU+GPU). These workers are managed by the *RayWorkerGroup*.
 ```python
 class RayWorkerGroup:
