@@ -588,7 +588,11 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
+        optimizer=OptimizerConfig(
+            fp8_recipe=config["megatron_cfg"]["fp8_cfg"]["fp8_recipe"],
+            overlap_param_gather=config["megatron_cfg"]["distributed_data_parallel_config"]["overlap_param_gather"],
+            **config["megatron_cfg"]["optimizer"]
+        ),
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][
