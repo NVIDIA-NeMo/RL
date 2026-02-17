@@ -56,7 +56,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
+fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d", "transformers<5.0.0"]
 automodel = [
   "nemo-automodel[moe]",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -74,6 +74,7 @@ vllm = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   "vllm==0.11.2",
   "num2words>=0.5.14",
+  "transformers<5.0.0",
 ]
 sglang = [
   "sglang==0.5.7",
@@ -93,6 +94,7 @@ sglang = [
   "openai-harmony",
   "torch-memory-saver",
   "einops",
+  "transformers<5.0.0",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -112,6 +114,7 @@ mcore = [
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "transformers<5.0.0",
 ]
 nemo_gym = ["nemo_gym"]
 
