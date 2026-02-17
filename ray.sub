@@ -84,12 +84,8 @@ elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
-# Worker port range must be ABOVE the OS ephemeral range (32768-60999) to prevent
-# TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern (CheckPortFree)
-# that leaves a 100-500ms window where the port is unguarded.  If the range overlaps
-# with the ephemeral range, the kernel can assign the same port as an ephemeral
-# source port for outgoing TCP traffic during that window, causing EADDRINUSE when
-# the worker tries to bind.
+# Worker port range must be outsid the OS ephemeral range (32768-60999) to prevent
+# possible TOCTOU collisions during Ray's port assignment.
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-61001}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-61513}
 ########################################################
