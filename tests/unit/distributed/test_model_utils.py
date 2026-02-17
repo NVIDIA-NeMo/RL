@@ -18,6 +18,7 @@ import ray
 import torch
 
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     DistributedLogprob,
@@ -705,14 +706,25 @@ class DistributedLogprobTestActor:
         full_logits.grad = None
 
         # Compute distributed gradients
-        distributed_log_probs = DistributedLogprob.apply(
-            vocab_parallel_logits,
-            target,
-            vocab_start_index,
-            vocab_end_index,
-            self.tp_group,
-            False,  # inference_only=False to enable backward
-        )
+        if chunk_size is not None:
+            distributed_log_probs = ChunkedDistributedLogprob.apply(
+                vocab_parallel_logits,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                self.tp_group,
+                False,  # inference_only=False to enable backward
+            )
+        else:
+            distributed_log_probs = DistributedLogprob.apply(
+                vocab_parallel_logits,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                self.tp_group,
+                False,  # inference_only=False to enable backward
+            )
 
         distributed_loss = torch.sum(distributed_log_probs)
         distributed_loss.backward()
@@ -951,6 +963,168 @@ def test_distributed_logprob_all_tests(
             futures = worker_group.run_all_workers_single_data("test_edge_cases")
             results = ray.get(futures)
             print("Edge cases test completed successfully")
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class ChunkedDistributedEntropyTestActor:
+    def __init__(self, tp_size, chunk_size, inference_only):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.inference_only = inference_only
+        self.env_vars = dict(os.environ)
+
+    def test_chunked_distributed_entropy(self):
+        torch.distributed.init_process_group(backend="nccl")
+
+        rank = int(os.environ["RANK"])
+        tp_group = torch.distributed.new_group(ranks=list(range(self.tp_size)))
+
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        torch.manual_seed(1337)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+
+        # === Baseline: single-GPU entropy ===
+        baseline_logits = (
+            full_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+        baseline_log_probs = torch.nn.functional.log_softmax(baseline_logits, dim=-1)
+        baseline_probs = baseline_log_probs.exp()
+        # H = sum_v p_v * log(p_v)  (negative entropy; matches ChunkedDistributedEntropy)
+        baseline_entropy = (baseline_probs * baseline_log_probs).sum(dim=-1)  # [B, S]
+
+        if not self.inference_only:
+            baseline_entropy.sum().backward()
+            baseline_grad = baseline_logits.grad[
+                :, :, vocab_start_index:vocab_end_index
+            ].clone()
+
+        # === Distributed: ChunkedDistributedEntropy ===
+        local_logits = full_logits[:, :, vocab_start_index:vocab_end_index]
+        local_logits = (
+            local_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+
+        distributed_entropy = ChunkedDistributedEntropy.apply(
+            local_logits,
+            self.chunk_size,
+            tp_group,
+            self.inference_only,
+        )
+
+        # Forward check
+        torch.testing.assert_close(
+            distributed_entropy, baseline_entropy, rtol=1e-4, atol=1e-4
+        )
+        forward_diff = torch.max(
+            torch.abs(distributed_entropy - baseline_entropy)
+        ).item()
+
+        # Backward check
+        if not self.inference_only:
+            distributed_entropy.sum().backward()
+            grad_local = local_logits.grad
+            torch.testing.assert_close(grad_local, baseline_grad, rtol=1e-4, atol=1e-4)
+            grad_diff = torch.max(torch.abs(grad_local - baseline_grad)).item()
+        else:
+            grad_diff = None
+
+        return {
+            "forward_max_diff": forward_diff,
+            "grad_max_diff": grad_diff,
+        }
+
+
+CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN = f"{ChunkedDistributedEntropyTestActor.__module__}.ChunkedDistributedEntropyTestActor"
+
+
+@pytest.fixture
+def register_chunked_distributed_entropy_test_actor():
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN
+
+    if CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_DISTRIBUTED_ENTROPY_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, chunk_size, inference_only",
+    [
+        (1, 5, False),
+        (2, 4, False),
+        (1, 3, True),
+    ],
+)
+def test_chunked_distributed_entropy(
+    register_chunked_distributed_entropy_test_actor,
+    tp_size,
+    chunk_size,
+    inference_only,
+):
+    world_size = tp_size
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, "
+            f"got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_chunked_distributed_entropy_test_actor
+
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size), names=["tp"]
+        )
+        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size, inference_only)
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        futures = worker_group.run_all_workers_single_data(
+            "test_chunked_distributed_entropy"
+        )
+        results = ray.get(futures)
+
+        for i, result in enumerate(results):
+            print(f"Worker {i} forward max diff: {result['forward_max_diff']:.2e}")
+            assert result["forward_max_diff"] < 1e-4, (
+                f"Worker {i} forward diff too large: {result['forward_max_diff']}"
+            )
+            if not inference_only:
+                print(f"Worker {i} grad max diff: {result['grad_max_diff']:.2e}")
+                assert (
+                    result["grad_max_diff"] is not None
+                    and result["grad_max_diff"] < 1e-4
+                ), f"Worker {i} grad diff too large: {result['grad_max_diff']}"
+            else:
+                assert result["grad_max_diff"] is None
 
         worker_group.shutdown(force=True)
 
