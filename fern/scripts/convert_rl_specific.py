@@ -16,6 +16,11 @@ def strip_octicon(content: str) -> str:
     return re.sub(r"\{octicon\}`[^`]+`\s*", "", content)
 
 
+def escape_mdx_curly_braces(content: str) -> str:
+    """Escape {variable} in code blocks so MDX doesn't parse as JSX (e.g. {overrides})."""
+    return content.replace("{overrides}", "\\{overrides\\}")
+
+
 def convert_py_roles(content: str) -> str:
     """Convert {py:class}`text` and {py:meth}`text` to inline code `text`."""
     # {py:class}`text` or {py:class}`text <module.path>`
@@ -38,6 +43,7 @@ def convert_file(filepath: Path) -> bool:
     original = content
 
     content = strip_octicon(content)
+    content = escape_mdx_curly_braces(content)
     content = convert_py_roles(content)
 
     if content != original:

@@ -37,7 +37,7 @@ fern/
 
 To migrate or update docs from `docs/` to Fern:
 
-**Note:** Copy `docs/assets/` to `fern/assets/` if your docs reference images. The copy script does this automatically when `docs/assets` exists.
+**Assets:** The docs reference images (e.g. `../assets/*.png`). These must exist in `docs/assets/` and will be copied to `fern/assets/` by the copy script. If `docs/assets/` is missing or images are not committed, create the directory and add the image files, or the Fern build will report missing path errors. Image paths in MDX are normalized to `/assets/` (relative to the Fern site root).
 
 ```bash
 # 1. Copy docs to fern (run from repo root)

@@ -21,7 +21,7 @@ This document focuses on ProRLv2-specific knobs and gotchas. For foundational co
 Use the example configuration [`examples/configs/prorlv2.yaml`](/../../examples/configs/prorlv2.yaml):
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2.yaml {overrides}
+uv run examples/run_grpo_math.py --config examples/configs/prorlv2.yaml \{overrides\}
 ```
 
 `prorlv2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](/../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
@@ -55,7 +55,7 @@ Defaults in examples/configs/prorlv2.yaml:
 
 Steps:
   1) Per prompt-group, compute mean reward, then subtract it:
-       a_i = r_i - mean_{j in same prompt} r_j
+       a_i = r_i - mean_{\{j in same prompt\}} r_j
 
   2) Global normalize across *all valid response tokens* in the batch:
        A <- (A - mean(A)) / sqrt(max(var(A), 1e-8))
@@ -80,7 +80,7 @@ When a generation hits the max length without emitting EOS, many pipelines mark 
 
 - `stop_properly_penalty_coef = 0.0`: truncated samples get **zero reward**
 - `stop_properly_penalty_coef = 1.0`: **no penalty** (keep original rewards)
-- Any value in \([0, 1]\) interpolates between the two.
+- Any value in $[0, 1]$ interpolates between the two.
 
 In the example config:
 
@@ -134,7 +134,7 @@ NeMo RL supports **importance sampling correction**, and ProRLv2’s example con
 Quick intuition:
 
 - This is mainly useful for **MoE/backend mismatch** cases, where the generation backend and the training policy can disagree on logprobs.
-- We compute an importance weight from `prev_logprobs` (training policy) vs `generation_logprobs` (generator). **ICE-POP** drops outliers by zeroing weights outside \([min, max]\).
+- We compute an importance weight from `prev_logprobs` (training policy) vs `generation_logprobs` (generator). **ICE-POP** drops outliers by zeroing weights outside $[min, max]$.
 - In the common setup of **one policy update per rollout batch** (i.e., minibatch equals the per-step rollout batch; no PPO multi-epoch reuse), the PPO/GRPO likelihood ratio term is effectively **1.0** at update time, so the main stability issue is the MoE/backend-mismatch importance weights.
 - “Online ICE-POP” here just means applying that ICE-POP filtering **during loss computation** on the current training batch.
 
@@ -153,7 +153,7 @@ loss_fn:
 - **`truncated_importance_sampling_ratio_min`**: lower bound used by ICE-POP filtering
 - **`truncated_importance_sampling_type`**:
   - `"tis"`: clamp weights to `<= truncated_importance_sampling_ratio`
-  - `"icepop"`: set weights outside \([min, max]\) to zero (filter outliers)
+  - `"icepop"`: set weights outside $[min, max]$ to zero (filter outliers)
   - `"seq-mask-tis"`: sequence-level geometric-mean mask + non-truncated token-level IS correction (see below)
 
 - **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss_functions.py`](/../../nemo_rl/algorithms/loss_functions.py).
@@ -162,8 +162,8 @@ loss_fn:
 
 `seq-mask-tis` is an alternative to ICE-POP that operates at the **sequence level** instead of per-token:
 
-1. For each sequence, compute the **geometric mean** of per-token IS ratios: \(\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\text{train}}(a_t)}{\pi_{\text{gen}}(a_t)}\bigr)\)
-2. **Mask out** entire sequences whose geometric mean falls outside \([min, max]\).
+1. For each sequence, compute the **geometric mean** of per-token IS ratios: $\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\mathrm{train}}(a_t)}{\pi_{\mathrm{gen}}(a_t)}\bigr)$
+2. **Mask out** entire sequences whose geometric mean falls outside $[min, max]$.
 3. For retained sequences, apply the **non-truncated** (raw) token-level IS ratios to correct per-token gradients — no clamping, no per-token filtering.
 
 Key differences from ICE-POP:
