@@ -1,0 +1,137 @@
+navigation:
+  - section: Home
+    contents:
+      - page: Welcome
+        path: ../v0.5.0/pages/index.mdx
+  - section: About
+    contents:
+      - page: Overview
+        path: ../v0.5.0/pages/about/overview.mdx
+      - page: Performance Summary
+        path: ../v0.5.0/pages/about/performance-summary.mdx
+      - page: Model Support
+        path: ../v0.5.0/pages/about/model-support.mdx
+      - page: Features
+        path: ../v0.5.0/pages/about/features.mdx
+      - page: Backends
+        path: ../v0.5.0/pages/about/backends.mdx
+      - page: Quick Start
+        path: ../v0.5.0/pages/about/quick-start.mdx
+      - page: Installation
+        path: ../v0.5.0/pages/about/installation.mdx
+      - section: Algorithms
+        contents:
+          - page: Index
+            path: ../v0.5.0/pages/about/algorithms/index.mdx
+          - page: SFT
+            path: ../v0.5.0/pages/about/algorithms/sft.mdx
+          - page: DPO
+            path: ../v0.5.0/pages/about/algorithms/dpo.mdx
+          - page: RM
+            path: ../v0.5.0/pages/about/algorithms/rm.mdx
+          - page: GRPO
+            path: ../v0.5.0/pages/about/algorithms/grpo.mdx
+          - page: DAPO
+            path: ../v0.5.0/pages/about/algorithms/dapo.mdx
+          - page: On-Policy Distillation
+            path: ../v0.5.0/pages/about/algorithms/on-policy-distillation.mdx
+      - page: Evaluation
+        path: ../v0.5.0/pages/about/evaluation.mdx
+      - page: Clusters
+        path: ../v0.5.0/pages/about/clusters.mdx
+      - page: Tips and Tricks
+        path: ../v0.5.0/pages/about/tips-and-tricks.mdx
+  - section: Environment Start
+    contents:
+      - page: Local Workstation
+        path: ../v0.5.0/pages/local-workstation.mdx
+      - page: Cluster
+        path: ../v0.5.0/pages/cluster.mdx
+  - section: E2E Examples
+    contents:
+      - page: SFT on OpenMathInstruct2
+        path: ../v0.5.0/pages/guides/sft-openmathinstruct2.mdx
+  - section: Guides
+    contents:
+      - page: Nemotron 3 Nano
+        path: ../v0.5.0/pages/guides/nemotron-3-nano.mdx
+      - page: Adding New Models
+        path: ../v0.5.0/pages/adding-new-models.mdx
+      - page: SFT
+        path: ../v0.5.0/pages/guides/sft.mdx
+      - page: DPO
+        path: ../v0.5.0/pages/guides/dpo.mdx
+      - page: DAPO
+        path: ../v0.5.0/pages/guides/dapo.mdx
+      - page: ProRLv2
+        path: ../v0.5.0/pages/guides/prorlv2.mdx
+      - page: GRPO
+        path: ../v0.5.0/pages/guides/grpo.mdx
+      - page: GRPO DeepscaleR
+        path: ../v0.5.0/pages/guides/grpo-deepscaler.mdx
+      - page: GRPO Sliding Puzzle
+        path: ../v0.5.0/pages/guides/grpo-sliding-puzzle.mdx
+      - page: RM
+        path: ../v0.5.0/pages/guides/rm.mdx
+      - page: Environments
+        path: ../v0.5.0/pages/guides/environments.mdx
+      - page: Eval
+        path: ../v0.5.0/pages/guides/eval.mdx
+      - page: Deepseek
+        path: ../v0.5.0/pages/guides/deepseek.mdx
+      - page: Model Quirks
+        path: ../v0.5.0/pages/model-quirks.mdx
+      - page: Async GRPO
+        path: ../v0.5.0/pages/guides/async-grpo.mdx
+      - page: DTensor TP Accuracy
+        path: ../v0.5.0/pages/guides/dtensor-tp-accuracy.mdx
+      - page: FT Launcher Guide
+        path: ../v0.5.0/pages/guides/ft-launcher-guide.mdx
+  - section: Containers
+    contents:
+      - page: Docker
+        path: ../v0.5.0/pages/docker.mdx
+  - section: Development
+    contents:
+      - page: Testing
+        path: ../v0.5.0/pages/testing.mdx
+      - page: Documentation
+        path: ../v0.5.0/pages/documentation.mdx
+      - page: Debugging
+        path: ../v0.5.0/pages/debugging.mdx
+      - page: NSys Profiling
+        path: ../v0.5.0/pages/nsys-profiling.mdx
+      - page: FP8
+        path: ../v0.5.0/pages/fp8.mdx
+      - page: Use Custom vLLM
+        path: ../v0.5.0/pages/guides/use-custom-vllm.mdx
+  - section: Design Docs
+    contents:
+      - page: Design and Philosophy
+        path: ../v0.5.0/pages/design-docs/design-and-philosophy.mdx
+      - page: Padding
+        path: ../v0.5.0/pages/design-docs/padding.mdx
+      - page: Logger
+        path: ../v0.5.0/pages/design-docs/logger.mdx
+      - page: UV
+        path: ../v0.5.0/pages/design-docs/uv.mdx
+      - page: Dependency Management
+        path: ../v0.5.0/pages/design-docs/dependency-management.mdx
+      - page: Chat Datasets
+        path: ../v0.5.0/pages/design-docs/chat-datasets.mdx
+      - page: Generation
+        path: ../v0.5.0/pages/design-docs/generation.mdx
+      - page: Checkpointing
+        path: ../v0.5.0/pages/design-docs/checkpointing.mdx
+      - page: Loss Functions
+        path: ../v0.5.0/pages/design-docs/loss-functions.mdx
+      - page: FSDP2 Parallel Plan
+        path: ../v0.5.0/pages/design-docs/fsdp2-parallel-plan.mdx
+      - page: Training Backends
+        path: ../v0.5.0/pages/design-docs/training-backends.mdx
+      - page: Sequence Packing and Dynamic Batching
+        path: ../v0.5.0/pages/design-docs/sequence-packing-and-dynamic-batching.mdx
+      - page: Env Vars
+        path: ../v0.5.0/pages/design-docs/env-vars.mdx
+      - page: NeMo Gym Integration
+        path: ../v0.5.0/pages/design-docs/nemo-gym-integration.mdx
