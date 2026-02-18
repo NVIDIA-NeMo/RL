@@ -24,7 +24,7 @@ dependencies = [
   "colored==2.2.3",
   "ray[default]==2.49.2",
   "transformers==4.57.1",
-  "wandb",
+  "wandb>=0.25.0",
   "numpy",
   "datasets>=4.0.0",
   "rich",
