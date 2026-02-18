@@ -221,6 +221,7 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    use_processor: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):

@@ -15,11 +15,13 @@
 """Setup utilities for automodel-based training in NeMo RL."""
 
 import os
-from typing import Any, Optional
+from functools import partial
+from typing import Any, Optional, Union
 
 import torch
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.config.loader import _resolve_target
@@ -28,14 +30,20 @@ from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
 STRING_TO_DTYPE = {
@@ -43,6 +51,86 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def get_tokenizer(
+    tokenizer_config: TokenizerConfig, get_processor: bool = False
+) -> Union[PreTrainedTokenizerBase, AutoProcessor]:
+    """Get tokenizer using NeMoAutoTokenizer for automodel workers.
+
+    Uses NeMoAutoTokenizer which provides custom tokenizer dispatch per model type
+    and falls back to NeMoAutoTokenizerWithBosEosEnforced for default handling.
+
+    Args:
+        tokenizer_config: A dictionary containing tokenizer configuration.
+            Required keys:
+                - name: The name or path of the pretrained tokenizer
+            Optional keys:
+                - chat_template: The chat template to use. Can be:
+                    - None: Uses a passthrough template that just returns message content
+                    - "default": Uses the tokenizer's default template
+                    - A file path ending in ".jinja": Loads template from file
+                    - A custom jinja2 template string
+                    If not specified, the tokenizer's default template will be used.
+                - chat_template_kwargs: Arguments passed to tokenizer.apply_chat_template()
+        get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
+
+    Returns:
+        The configured tokenizer or processor instance.
+    """
+    processor = None
+
+    if get_processor:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = NeMoAutoTokenizer.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if "chat_template" in tokenizer_config:
+        if tokenizer_config["chat_template"] is None:
+            print("Using passthrough chat template")
+            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+        elif tokenizer_config["chat_template"].lower() == "default":
+            print("Using tokenizer's default chat template")
+        elif tokenizer_config["chat_template"].endswith(".jinja"):
+            template_path = tokenizer_config["chat_template"]
+            print(f"Loading chat template from file: {template_path}")
+            with open(template_path, "r") as f:
+                tokenizer.chat_template = f.read()
+        else:
+            print("Using custom chat template")
+            tokenizer.chat_template = tokenizer_config["chat_template"]
+    else:
+        print("No chat template provided, using tokenizer's default")
+
+    if (
+        "chat_template_kwargs" in tokenizer_config
+        and tokenizer_config["chat_template_kwargs"] is not None
+    ):
+        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+        tokenizer.apply_chat_template = partial(
+            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+        )
+
+    if processor is not None:
+        processor.pad_token = tokenizer.pad_token
+        processor.eos_token = tokenizer.eos_token
+        processor.bos_token = tokenizer.bos_token
+        processor.pad_token_id = tokenizer.pad_token_id
+        processor.eos_token_id = tokenizer.eos_token_id
+        processor.bos_token_id = tokenizer.bos_token_id
+        processor.name_or_path = tokenizer.name_or_path
+
+    return tokenizer if processor is None else processor
 
 
 def validate_and_prepare_config(

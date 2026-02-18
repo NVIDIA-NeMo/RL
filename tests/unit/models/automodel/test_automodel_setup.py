@@ -31,6 +31,7 @@ from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
+    get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
@@ -1780,3 +1781,235 @@ class TestSetupModelAndOptimizer:
         mock_buffer.data.to.assert_called_with("cpu")
         # Verify model was moved to CPU
         mock_model.to.assert_called_with("cpu")
+
+
+@pytest.mark.automodel
+class TestGetTokenizer:
+    """Test suite for get_tokenizer function."""
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_basic_tokenizer_loading(self, mock_nemo_auto_tokenizer):
+        """Test basic tokenizer loading uses NeMoAutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        result = get_tokenizer({"name": "gpt2"})
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "gpt2", trust_remote_code=True
+        )
+        assert result is mock_tokenizer
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_sets_pad_token_from_eos(self, mock_nemo_auto_tokenizer):
+        """Test that pad_token is set to eos_token when None."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = None
+        mock_tokenizer.eos_token = "<eos>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        assert mock_tokenizer.pad_token == "<eos>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):
+        """Test that existing pad_token is not overridden."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_tokenizer.eos_token = "<eos>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        assert mock_tokenizer.pad_token == "<pad>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_passthrough_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that chat_template=None sets passthrough template."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "chat_template": None})
+
+        captured = capsys.readouterr()
+        assert "Using passthrough chat template" in captured.out
+        assert (
+            mock_tokenizer.chat_template
+            == "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_default_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that chat_template='default' keeps tokenizer's default."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_tokenizer.chat_template = "original_template"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "chat_template": "default"})
+
+        captured = capsys.readouterr()
+        assert "Using tokenizer's default chat template" in captured.out
+        assert mock_tokenizer.chat_template == "original_template"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_custom_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that a custom chat template string is set."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        custom_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+        get_tokenizer({"name": "gpt2", "chat_template": custom_template})
+
+        captured = capsys.readouterr()
+        assert "Using custom chat template" in captured.out
+        assert mock_tokenizer.chat_template == custom_template
+
+    @patch("builtins.open", create=True)
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_jinja_file_chat_template(
+        self, mock_nemo_auto_tokenizer, mock_open, capsys
+    ):
+        """Test that .jinja file template is loaded from file."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        mock_open.return_value.__enter__ = lambda s: s
+        mock_open.return_value.__exit__ = MagicMock(return_value=False)
+        mock_open.return_value.read.return_value = "template_from_file"
+
+        get_tokenizer({"name": "gpt2", "chat_template": "/path/to/template.jinja"})
+
+        captured = capsys.readouterr()
+        assert "Loading chat template from file" in captured.out
+        mock_open.assert_called_once_with("/path/to/template.jinja", "r")
+        assert mock_tokenizer.chat_template == "template_from_file"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_no_chat_template_key(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that missing chat_template key uses tokenizer's default."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        captured = capsys.readouterr()
+        assert "No chat template provided, using tokenizer's default" in captured.out
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs(self, mock_nemo_auto_tokenizer):
+        """Test that chat_template_kwargs are applied via functools.partial."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        original_apply = mock_tokenizer.apply_chat_template
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer(
+            {
+                "name": "gpt2",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        # apply_chat_template should be wrapped with partial
+        assert mock_tokenizer.apply_chat_template is not original_apply
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs_none_is_ignored(self, mock_nemo_auto_tokenizer):
+        """Test that chat_template_kwargs=None does not wrap apply_chat_template."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        original_apply = mock_tokenizer.apply_chat_template
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer(
+            {
+                "name": "gpt2",
+                "chat_template_kwargs": None,
+            }
+        )
+
+        assert mock_tokenizer.apply_chat_template is original_apply
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs_invalid_type_raises(self, mock_nemo_auto_tokenizer):
+        """Test that non-dict chat_template_kwargs raises assertion."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        with pytest.raises(AssertionError, match="chat_template_kwargs should be"):
+            get_tokenizer(
+                {
+                    "name": "gpt2",
+                    "chat_template_kwargs": "not_a_dict",
+                }
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor(self, mock_auto_processor):
+        """Test that get_processor=True returns an AutoProcessor."""
+        mock_processor = MagicMock()
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.pad_token = "<pad>"
+        mock_inner_tokenizer.eos_token = "<eos>"
+        mock_inner_tokenizer.bos_token = "<bos>"
+        mock_inner_tokenizer.pad_token_id = 0
+        mock_inner_tokenizer.eos_token_id = 1
+        mock_inner_tokenizer.bos_token_id = 2
+        mock_inner_tokenizer.name_or_path = "test-model"
+        mock_processor.tokenizer = mock_inner_tokenizer
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+
+        result = get_tokenizer({"name": "test-vlm"}, get_processor=True)
+
+        mock_auto_processor.from_pretrained.assert_called_once_with(
+            "test-vlm", trust_remote_code=True, use_fast=True
+        )
+        assert result is mock_processor
+        assert mock_processor.pad_token == "<pad>"
+        assert mock_processor.eos_token == "<eos>"
+        assert mock_processor.bos_token == "<bos>"
+        assert mock_processor.pad_token_id == 0
+        assert mock_processor.eos_token_id == 1
+        assert mock_processor.bos_token_id == 2
+        assert mock_processor.name_or_path == "test-model"
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):
+        """Test that processor path also sets pad_token from eos when None."""
+        mock_processor = MagicMock()
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.pad_token = None
+        mock_inner_tokenizer.eos_token = "<eos>"
+        mock_inner_tokenizer.bos_token = "<bos>"
+        mock_inner_tokenizer.pad_token_id = None
+        mock_inner_tokenizer.eos_token_id = 1
+        mock_inner_tokenizer.bos_token_id = 2
+        mock_inner_tokenizer.name_or_path = "test-vlm"
+        mock_processor.tokenizer = mock_inner_tokenizer
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+
+        result = get_tokenizer({"name": "test-vlm"}, get_processor=True)
+
+        assert mock_inner_tokenizer.pad_token == "<eos>"
+        assert result is mock_processor
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_does_not_use_hf_auto_tokenizer(self, mock_nemo_auto_tokenizer):
+        """Test that NeMoAutoTokenizer is used, not HF AutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        with patch("nemo_rl.models.automodel.setup.AutoTokenizer") as mock_hf:
+            get_tokenizer({"name": "gpt2"})
+            mock_hf.from_pretrained.assert_not_called()
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once()

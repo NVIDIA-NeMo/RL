@@ -34,10 +34,6 @@ from nemo_automodel.components.distributed.tensor_utils import (
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from torch.distributed.tensor import DTensor
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-)
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -211,8 +207,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: AutoTokenizer,
-        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -225,11 +219,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
         apply_torch_aten_alias_tensor_patch()
 
-        # Store configuration and tokenizer/processor
+        # Store configuration
         self.cfg = config
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.is_vlm = processor is not None
+
+        # Reconstruct tokenizer/processor locally to avoid pickling across
+        # incompatible transformers versions (v4 head node → v5 worker).
+        from nemo_rl.models.automodel.setup import get_tokenizer
+
+        use_processor = config["tokenizer"].get("use_processor", False)
+        result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+        if use_processor:
+            self.processor = result
+            self.tokenizer = result.tokenizer
+        else:
+            self.tokenizer = result
+            self.processor = None
+        self.is_vlm = self.processor is not None
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
@@ -278,7 +283,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Set up model and optimizer
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
-            tokenizer=tokenizer,
+            tokenizer=self.tokenizer,
             runtime_config=runtime_config,
             distributed_context=distributed_context,
             checkpoint_manager=self.checkpoint_manager,
