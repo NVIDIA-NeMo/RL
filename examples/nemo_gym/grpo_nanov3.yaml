@@ -10,6 +10,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 5
   val_at_start: False
+  val_at_end: False
   overlong_filtering: true
   max_val_samples: null
   val_batch_size: 256
@@ -122,6 +123,7 @@ policy:
     defer_fp32_logits: True
     track_moe_metrics: True
     moe_per_layer_logging: True
+    moe_shared_expert_overlap: false
 
     optimizer:
       optimizer: "adam"
@@ -220,6 +222,7 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder

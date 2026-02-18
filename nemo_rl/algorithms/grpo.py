@@ -1801,7 +1801,6 @@ def grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -1982,6 +1981,7 @@ def grpo_train(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
                 del log_data
+            del flat_messages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
