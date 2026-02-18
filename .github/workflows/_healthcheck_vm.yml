@@ -45,7 +45,6 @@ on:
 
 jobs:
   check-status-and-maybe-shutdown:
-    environment: main
     runs-on: ${{ inputs.vm }}
     outputs:
       status: ${{ steps.status.outputs.main }}

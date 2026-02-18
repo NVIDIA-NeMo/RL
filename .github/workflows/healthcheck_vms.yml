@@ -14,7 +14,7 @@
 name: VM Health Check and Reboot
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       list-of-vms: ${{ steps.main.outputs.main }}
-    environment: main
     steps:
       - name: Get list of VMs
         id: main
