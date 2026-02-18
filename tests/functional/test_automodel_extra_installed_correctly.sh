@@ -6,7 +6,7 @@ cd $SCRIPT_DIR
 
 uv sync
 # Just the first call with --extra automodel is invoked with --reinstall in case submodules were recently updated/downloaded
-uv run --reinstall --extra automodel --no-build-isolation python <<"EOF"
+uv run --reinstall --extra automodel --no-group transformers-v4 --no-build-isolation python <<"EOF"
 import torch
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -42,7 +42,7 @@ print("[Automodel extra dependencies test successful]")
 EOF
 
 # Test that automodel components can be accessed
-uv run --extra automodel --no-build-isolation python <<"EOF"
+uv run --extra automodel --no-group transformers-v4 --no-build-isolation python <<"EOF"
 # This must be the first import to get all of the automodel packages added to the path
 import nemo_rl
 
@@ -67,6 +67,6 @@ EOF
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
+uv sync --link-mode symlink --locked --extra automodel --no-group transformers-v4 --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 echo Success

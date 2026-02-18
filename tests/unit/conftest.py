@@ -126,7 +126,7 @@ def pytest_collection_modifyitems(config, items):
         except ImportError:
             raise ImportError(
                 "Cannot run automodel tests: nemo_automodel is not available.\n"
-                "Please run tests with: uv run --extra automodel --group test pytest ..."
+                "Please run tests with: uv run --extra automodel --no-group transformers-v4 --group test pytest ..."
             )
         # Include only automodel tests
         new_items = [item for item in new_items if item.get_closest_marker("automodel")]

@@ -27,9 +27,11 @@ except ImportError:
 
 import torch
 
+from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
+    get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
@@ -48,12 +50,10 @@ def mock_config():
         "sequence_packing": {"enabled": False},
         "dtensor_cfg": {
             "cpu_offload": False,
-            "context_parallel_size": 1,
             "tensor_parallel_size": 1,
+            "context_parallel_size": 1,
             "expert_parallel_size": 1,
-            "data_parallel_size": None,
             "sequence_parallel": False,
-            "use_hf_tp_plan": False,
             "activation_checkpointing": False,
         },
         "generation": None,
@@ -608,30 +608,75 @@ class TestSetupDistributed:
             is_reward_model=False,
         )
 
-    @patch("nemo_rl.models.automodel.setup.FSDP2Manager")
+    @pytest.fixture
+    def mock_device_mesh(self):
+        """Create a mock device mesh with subscriptable dimension sizes."""
+        mock_mesh = MagicMock()
+        # Configure dimension subscript access
+        dp_dim = MagicMock()
+        dp_dim.size.return_value = 4
+        tp_dim = MagicMock()
+        tp_dim.size.return_value = 1
+        cp_dim = MagicMock()
+        cp_dim.size.return_value = 1
+
+        mock_mesh.__getitem__ = lambda self, key: {
+            "dp": dp_dim,
+            "tp": tp_dim,
+            "cp": cp_dim,
+        }[key]
+        return mock_mesh
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_basic(
-        self, mock_torch_dist, mock_fsdp2_manager, mock_config, mock_runtime_config
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
     ):
         """Test basic distributed setup without CPU offload."""
         mock_torch_dist.get_world_size.return_value = 8
-        mock_manager_instance = MagicMock()
-        mock_fsdp2_manager.return_value = mock_manager_instance
+        mock_fsdp2_config_instance = MagicMock()
+        mock_fsdp2_config.return_value = mock_fsdp2_config_instance
+        mock_moe_config_instance = MagicMock()
+        mock_moe_config.return_value = mock_moe_config_instance
+        mock_moe_mesh = MagicMock()
+        mock_create_mesh.return_value = (mock_device_mesh, mock_moe_mesh)
 
         result = setup_distributed(mock_config, mock_runtime_config)
 
         mock_torch_dist.init_process_group.assert_called_once_with(backend="nccl")
-        assert result == mock_manager_instance
+        assert isinstance(result, DistributedContext)
+        assert result.device_mesh == mock_device_mesh
+        assert result.moe_mesh == mock_moe_mesh
+        assert result.fsdp2_config == mock_fsdp2_config_instance
+        assert result.moe_config == mock_moe_config_instance
 
-    @patch("nemo_rl.models.automodel.setup.FSDP2Manager")
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_with_cpu_offload(
-        self, mock_torch_dist, mock_fsdp2_manager, mock_config
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_device_mesh,
     ):
         """Test distributed setup with CPU offload."""
         mock_torch_dist.get_world_size.return_value = 4
-        mock_manager_instance = MagicMock()
-        mock_fsdp2_manager.return_value = mock_manager_instance
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_create_mesh.return_value = (mock_device_mesh, None)
 
         runtime_config = RuntimeConfig(
             model_class=Mock,
@@ -653,44 +698,80 @@ class TestSetupDistributed:
         mock_torch_dist.init_process_group.assert_called_once_with(
             backend="cuda:nccl,cpu:gloo"
         )
-        assert result == mock_manager_instance
+        assert isinstance(result, DistributedContext)
 
-    @patch("nemo_rl.models.automodel.setup.FSDP2Manager")
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
-    def test_setup_distributed_world_size_one_calls_setup(
-        self, mock_torch_dist, mock_fsdp2_manager, mock_config, mock_runtime_config
+    def test_setup_distributed_world_size_one_cpu_offload_raises(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
     ):
-        """Test that world_size=1 calls _setup_distributed on manager."""
+        """Test that world_size=1 with cpu_offload raises NotImplementedError."""
         mock_torch_dist.get_world_size.return_value = 1
-        mock_manager_instance = MagicMock()
-        mock_fsdp2_manager.return_value = mock_manager_instance
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
 
-        result = setup_distributed(mock_config, mock_runtime_config)
+        runtime_config = RuntimeConfig(
+            model_class=Mock,
+            model_config=MagicMock(),
+            hf_config_overrides={},
+            allow_flash_attn_args=True,
+            attn_impl=None,
+            dtype=torch.bfloat16,
+            enable_seq_packing=False,
+            max_grad_norm=1.0,
+            cpu_offload=True,
+            offload_optimizer_for_logprob=False,
+            is_generation_colocated=None,
+            is_reward_model=False,
+        )
 
-        mock_manager_instance._setup_distributed.assert_called_once()
-        assert result == mock_manager_instance
+        with pytest.raises(
+            NotImplementedError, match="CPUOffload doesn't work on single GPU"
+        ):
+            setup_distributed(mock_config, runtime_config)
 
-    @patch("nemo_rl.models.automodel.setup.FSDP2Manager")
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_passes_correct_params(
-        self, mock_torch_dist, mock_fsdp2_manager, mock_config, mock_runtime_config
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
     ):
-        """Test that FSDP2Manager is initialized with correct parameters."""
+        """Test that FSDP2Config and create_device_mesh are called with correct parameters."""
         mock_torch_dist.get_world_size.return_value = 4
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_create_mesh.return_value = (mock_device_mesh, None)
 
         setup_distributed(mock_config, mock_runtime_config)
 
-        call_kwargs = mock_fsdp2_manager.call_args[1]
-        assert call_kwargs["dp_size"] is None
-        assert call_kwargs["dp_replicate_size"] == 1
-        assert call_kwargs["tp_size"] == 1
-        assert call_kwargs["cp_size"] == 1
-        assert call_kwargs["ep_size"] == 1
-        assert call_kwargs["pp_size"] == 1
-        assert call_kwargs["sequence_parallel"] is False
-        assert call_kwargs["backend"] == "nccl"
-        assert call_kwargs["world_size"] == 4
-        assert call_kwargs["activation_checkpointing"] is False
+        # Verify FSDP2Config was constructed with correct kwargs
+        fsdp2_call_kwargs = mock_fsdp2_config.call_args[1]
+        assert fsdp2_call_kwargs["sequence_parallel"] is False
+        assert fsdp2_call_kwargs["activation_checkpointing"] is False
+        assert fsdp2_call_kwargs["backend"] == "nccl"
+
+        # Verify create_device_mesh was called with correct size params
+        mesh_call_kwargs = mock_create_mesh.call_args[1]
+        assert mesh_call_kwargs["tp_size"] == 1
+        assert mesh_call_kwargs["pp_size"] == 1
+        assert mesh_call_kwargs["cp_size"] == 1
+        assert mesh_call_kwargs["ep_size"] == 1
+        assert mesh_call_kwargs["world_size"] == 4
 
 
 @pytest.mark.automodel
@@ -716,16 +797,19 @@ class TestSetupModelAndOptimizer:
         )
 
     @pytest.fixture
-    def mock_distributed_manager(self):
-        """Create a mock FSDP2Manager for testing."""
-        manager = MagicMock()
-        manager.device_mesh = MagicMock()
-        manager.device_mesh.mesh_dim_names = ["dp_shard_cp"]
-        manager.moe_mesh = MagicMock()
-        manager.tp_size = 1
-        manager.cp_size = 1
-        manager.sequence_parallel = False
-        return manager
+    def mock_distributed_context(self):
+        """Create a mock DistributedContext for testing."""
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = False
+        return DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=1,
+            cp_size=1,
+        )
 
     @pytest.fixture
     def mock_checkpoint_manager(self):
@@ -741,17 +825,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_and_optimizer_basic(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -766,7 +848,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = None
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         # Setup mock optimizer
         mock_optimizer = MagicMock()
@@ -776,27 +857,250 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
             is_vlm=False,
             init_optimizer=True,
         )
 
         assert isinstance(result, ModelAndOptimizerState)
-        mock_checkpoint_manager.set_model_state_dict_keys.assert_called_once()
-        mock_checkpoint_manager.load_base_model.assert_called_once()
+        # Verify from_pretrained was called with distributed kwargs
+        mock_runtime_config.model_class.from_pretrained.assert_called_once()
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["device_mesh"] == mock_distributed_context.device_mesh
+        assert (
+            call_kwargs["distributed_config"] == mock_distributed_context.fsdp2_config
+        )
+        # Verify config= is NOT passed (avoids duplicate arg for custom models)
+        assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_passes_hf_config_overrides_as_flat_kwargs(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that hf_config_overrides are passed as flat kwargs to from_pretrained."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+
+        # Set hf_config_overrides on runtime_config
+        overrides = {
+            "rope_scaling": {"type": "linear", "factor": 2.0},
+            "max_position_embeddings": 4096,
+        }
+        runtime_config = RuntimeConfig(
+            model_class=MagicMock(),
+            model_config=mock_runtime_config.model_config,
+            hf_config_overrides=overrides,
+            allow_flash_attn_args=True,
+            attn_impl=None,
+            dtype=torch.bfloat16,
+            enable_seq_packing=False,
+            max_grad_norm=1.0,
+            cpu_offload=False,
+            offload_optimizer_for_logprob=False,
+            is_generation_colocated=None,
+            is_reward_model=False,
+        )
+        runtime_config.model_class.from_pretrained.return_value = mock_model
+        runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+
+        mock_optimizer = MagicMock()
+        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        call_kwargs = runtime_config.model_class.from_pretrained.call_args[1]
+        # hf_config_overrides should be passed as flat kwargs
+        assert call_kwargs["rope_scaling"] == {"type": "linear", "factor": 2.0}
+        assert call_kwargs["max_position_embeddings"] == 4096
+        # config= should NOT be passed
+        assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_reward_model_passes_num_labels(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_config,
+        mock_autoconfig,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that reward model passes num_labels=1 to from_pretrained."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+
+        # Configure as reward model with num_labels already set to 1
+        # (validate_and_prepare_config sets this)
+        mock_autoconfig.num_labels = 1
+        runtime_config = RuntimeConfig(
+            model_class=MagicMock(),
+            model_config=mock_autoconfig,
+            hf_config_overrides={},
+            allow_flash_attn_args=True,
+            attn_impl=None,
+            dtype=torch.bfloat16,
+            enable_seq_packing=False,
+            max_grad_norm=1.0,
+            cpu_offload=False,
+            offload_optimizer_for_logprob=False,
+            is_generation_colocated=None,
+            is_reward_model=True,
+        )
+        runtime_config.model_class.from_pretrained.return_value = mock_model
+        runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+
+        mock_optimizer = MagicMock()
+        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        call_kwargs = runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["num_labels"] == 1
+
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_non_reward_model_does_not_pass_num_labels(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that non-reward model does not pass num_labels to from_pretrained."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+
+        mock_optimizer = MagicMock()
+        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert "num_labels" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_reward_model_with_hf_config_overrides(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_config,
+        mock_autoconfig,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that reward model correctly combines hf_config_overrides with num_labels."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+
+        mock_autoconfig.num_labels = 1
+        overrides = {"max_position_embeddings": 4096}
+        runtime_config = RuntimeConfig(
+            model_class=MagicMock(),
+            model_config=mock_autoconfig,
+            hf_config_overrides=overrides,
+            allow_flash_attn_args=True,
+            attn_impl=None,
+            dtype=torch.bfloat16,
+            enable_seq_packing=False,
+            max_grad_norm=1.0,
+            cpu_offload=False,
+            offload_optimizer_for_logprob=False,
+            is_generation_colocated=None,
+            is_reward_model=True,
+        )
+        runtime_config.model_class.from_pretrained.return_value = mock_model
+        runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+
+        mock_optimizer = MagicMock()
+        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        call_kwargs = runtime_config.model_class.from_pretrained.call_args[1]
+        # Both overrides and num_labels should be present
+        assert call_kwargs["num_labels"] == 1
+        assert call_kwargs["max_position_embeddings"] == 4096
+        assert "config" not in call_kwargs
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_and_optimizer_no_optimizer(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -809,13 +1113,12 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
             init_optimizer=False,
         )
@@ -825,17 +1128,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_weights_path(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -849,7 +1150,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -858,7 +1158,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
             weights_path="/path/to/weights",
             optimizer_path="/path/to/optimizer",
@@ -871,17 +1171,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_no_weights_path_prints_message(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
         capsys,
@@ -896,7 +1194,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -905,7 +1202,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
             weights_path=None,
         )
@@ -914,16 +1211,14 @@ class TestSetupModelAndOptimizer:
         assert "No weights path provided" in captured.out
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_dict_scheduler(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -936,7 +1231,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_scheduler = MagicMock()
@@ -957,7 +1251,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -965,17 +1259,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.SequentialLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_list_scheduler(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_sequential_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -989,7 +1281,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_scheduler = MagicMock()
@@ -1014,7 +1305,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -1023,17 +1314,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_sets_pad_token_id(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1047,7 +1336,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = None  # Initially None
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
         mock_tokenizer.pad_token_id = 42
 
         mock_optimizer = MagicMock()
@@ -1057,7 +1345,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -1065,17 +1353,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_moe_model(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1093,7 +1379,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1102,29 +1387,36 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
         assert result.is_moe_model is True
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_cp_raises_for_vlm(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
         """Test that context parallel with VLM raises AssertionError."""
         mock_get_rank.return_value = 0
-        mock_distributed_manager.cp_size = 2  # CP enabled
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = False
+        distributed_context = DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=1,
+            cp_size=2,  # CP enabled
+        )
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -1140,30 +1432,35 @@ class TestSetupModelAndOptimizer:
                 config=mock_config,
                 tokenizer=mock_tokenizer,
                 runtime_config=mock_runtime_config,
-                distributed_manager=mock_distributed_manager,
+                distributed_context=distributed_context,
                 checkpoint_manager=mock_checkpoint_manager,
                 is_vlm=True,
             )
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_cp_and_sp_raises_error(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
         """Test that CP with sequence parallel raises AssertionError."""
         mock_get_rank.return_value = 0
-        mock_distributed_manager.cp_size = 2  # CP enabled
-        mock_distributed_manager.tp_size = 2  # TP enabled
-        mock_distributed_manager.sequence_parallel = True  # SP enabled
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = True  # SP enabled
+        distributed_context = DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=2,  # TP enabled
+            cp_size=2,  # CP enabled
+        )
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -1180,38 +1477,37 @@ class TestSetupModelAndOptimizer:
                 config=mock_config,
                 tokenizer=mock_tokenizer,
                 runtime_config=mock_runtime_config,
-                distributed_manager=mock_distributed_manager,
+                distributed_context=distributed_context,
                 checkpoint_manager=mock_checkpoint_manager,
             )
 
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_cp_raises_for_gemma3(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
         """Test that context parallel with Gemma3 raises AssertionError."""
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
-
         mock_get_rank.return_value = 0
-        mock_distributed_manager.cp_size = 2  # CP enabled
-        mock_distributed_manager.tp_size = 1
-        mock_distributed_manager.sequence_parallel = False
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = False
+        distributed_context = DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=1,
+            cp_size=2,  # CP enabled
+        )
 
-        # Create a mock model that will pass the isinstance check for Gemma3ForCausalLM
-        mock_model = MagicMock(spec=Gemma3ForCausalLM)
-        mock_model.state_dict.return_value = {}
-        mock_model.config = MagicMock()
-        mock_model.config.pad_token_id = 0
-        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        # Set model_type to gemma3 to trigger validation
+        mock_runtime_config.model_config.model_type = "gemma3"
         mock_runtime_config.model_config.architectures = ["Gemma3ForCausalLM"]
 
         with pytest.raises(
@@ -1222,25 +1518,23 @@ class TestSetupModelAndOptimizer:
                 config=mock_config,
                 tokenizer=mock_tokenizer,
                 runtime_config=mock_runtime_config,
-                distributed_manager=mock_distributed_manager,
+                distributed_context=distributed_context,
                 checkpoint_manager=mock_checkpoint_manager,
             )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     @patch("nemo_rl.models.automodel.setup._resolve_target")
     def test_setup_model_with_backend_automodel_kwargs(
         self,
         mock_resolve_target,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1257,7 +1551,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1273,7 +1566,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -1282,21 +1575,17 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     @patch("nemo_rl.models.automodel.setup.PeftConfig")
-    @patch("nemo_rl.models.automodel.setup.apply_lora_to_linear_modules")
     def test_setup_model_with_lora(
         self,
-        mock_apply_lora,
         mock_peft_config,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1314,7 +1603,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1329,29 +1617,29 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
         mock_peft_config.from_dict.assert_called_once()
-        mock_apply_lora.assert_called_once()
+        # Verify peft_config was passed to from_pretrained
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["peft_config"] == mock_peft_config_instance
         assert result.peft_config == mock_peft_config_instance
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     @patch("nemo_rl.models.automodel.setup.cuda", create=True)
     def test_setup_model_with_activation_checkpointing(
         self,
         mock_cuda,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1365,7 +1653,6 @@ class TestSetupModelAndOptimizer:
         mock_model.config.pad_token_id = 0
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1379,7 +1666,7 @@ class TestSetupModelAndOptimizer:
                 config=mock_config,
                 tokenizer=mock_tokenizer,
                 runtime_config=mock_runtime_config,
-                distributed_manager=mock_distributed_manager,
+                distributed_context=mock_distributed_context,
                 checkpoint_manager=mock_checkpoint_manager,
             )
 
@@ -1387,17 +1674,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_tied_word_embeddings(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_runtime_config,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1421,7 +1706,6 @@ class TestSetupModelAndOptimizer:
 
         mock_runtime_config.model_class.from_pretrained.return_value = mock_model
         mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1430,7 +1714,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=mock_runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -1439,17 +1723,15 @@ class TestSetupModelAndOptimizer:
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.init_empty_weights")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_cpu_offload(
         self,
         mock_get_class,
-        mock_init_empty_weights,
         mock_get_rank,
         mock_lambda_lr,
         mock_config,
         mock_autoconfig,
-        mock_distributed_manager,
+        mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
     ):
@@ -1483,7 +1765,6 @@ class TestSetupModelAndOptimizer:
         mock_model.buffers.return_value = [mock_buffer]
         runtime_config.model_class.from_pretrained.return_value = mock_model
         runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-        mock_distributed_manager.parallelize.return_value = mock_model
 
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
@@ -1492,7 +1773,7 @@ class TestSetupModelAndOptimizer:
             config=mock_config,
             tokenizer=mock_tokenizer,
             runtime_config=runtime_config,
-            distributed_manager=mock_distributed_manager,
+            distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
         )
 
@@ -1500,3 +1781,235 @@ class TestSetupModelAndOptimizer:
         mock_buffer.data.to.assert_called_with("cpu")
         # Verify model was moved to CPU
         mock_model.to.assert_called_with("cpu")
+
+
+@pytest.mark.automodel
+class TestGetTokenizer:
+    """Test suite for get_tokenizer function."""
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_basic_tokenizer_loading(self, mock_nemo_auto_tokenizer):
+        """Test basic tokenizer loading uses NeMoAutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        result = get_tokenizer({"name": "gpt2"})
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "gpt2", trust_remote_code=True
+        )
+        assert result is mock_tokenizer
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_sets_pad_token_from_eos(self, mock_nemo_auto_tokenizer):
+        """Test that pad_token is set to eos_token when None."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = None
+        mock_tokenizer.eos_token = "<eos>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        assert mock_tokenizer.pad_token == "<eos>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):
+        """Test that existing pad_token is not overridden."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_tokenizer.eos_token = "<eos>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        assert mock_tokenizer.pad_token == "<pad>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_passthrough_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that chat_template=None sets passthrough template."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "chat_template": None})
+
+        captured = capsys.readouterr()
+        assert "Using passthrough chat template" in captured.out
+        assert (
+            mock_tokenizer.chat_template
+            == "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_default_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that chat_template='default' keeps tokenizer's default."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_tokenizer.chat_template = "original_template"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "chat_template": "default"})
+
+        captured = capsys.readouterr()
+        assert "Using tokenizer's default chat template" in captured.out
+        assert mock_tokenizer.chat_template == "original_template"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_custom_chat_template(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that a custom chat template string is set."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        custom_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+        get_tokenizer({"name": "gpt2", "chat_template": custom_template})
+
+        captured = capsys.readouterr()
+        assert "Using custom chat template" in captured.out
+        assert mock_tokenizer.chat_template == custom_template
+
+    @patch("builtins.open", create=True)
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_jinja_file_chat_template(
+        self, mock_nemo_auto_tokenizer, mock_open, capsys
+    ):
+        """Test that .jinja file template is loaded from file."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        mock_open.return_value.__enter__ = lambda s: s
+        mock_open.return_value.__exit__ = MagicMock(return_value=False)
+        mock_open.return_value.read.return_value = "template_from_file"
+
+        get_tokenizer({"name": "gpt2", "chat_template": "/path/to/template.jinja"})
+
+        captured = capsys.readouterr()
+        assert "Loading chat template from file" in captured.out
+        mock_open.assert_called_once_with("/path/to/template.jinja", "r")
+        assert mock_tokenizer.chat_template == "template_from_file"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_no_chat_template_key(self, mock_nemo_auto_tokenizer, capsys):
+        """Test that missing chat_template key uses tokenizer's default."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2"})
+
+        captured = capsys.readouterr()
+        assert "No chat template provided, using tokenizer's default" in captured.out
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs(self, mock_nemo_auto_tokenizer):
+        """Test that chat_template_kwargs are applied via functools.partial."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        original_apply = mock_tokenizer.apply_chat_template
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer(
+            {
+                "name": "gpt2",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        # apply_chat_template should be wrapped with partial
+        assert mock_tokenizer.apply_chat_template is not original_apply
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs_none_is_ignored(self, mock_nemo_auto_tokenizer):
+        """Test that chat_template_kwargs=None does not wrap apply_chat_template."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        original_apply = mock_tokenizer.apply_chat_template
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer(
+            {
+                "name": "gpt2",
+                "chat_template_kwargs": None,
+            }
+        )
+
+        assert mock_tokenizer.apply_chat_template is original_apply
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_chat_template_kwargs_invalid_type_raises(self, mock_nemo_auto_tokenizer):
+        """Test that non-dict chat_template_kwargs raises assertion."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        with pytest.raises(AssertionError, match="chat_template_kwargs should be"):
+            get_tokenizer(
+                {
+                    "name": "gpt2",
+                    "chat_template_kwargs": "not_a_dict",
+                }
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor(self, mock_auto_processor):
+        """Test that get_processor=True returns an AutoProcessor."""
+        mock_processor = MagicMock()
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.pad_token = "<pad>"
+        mock_inner_tokenizer.eos_token = "<eos>"
+        mock_inner_tokenizer.bos_token = "<bos>"
+        mock_inner_tokenizer.pad_token_id = 0
+        mock_inner_tokenizer.eos_token_id = 1
+        mock_inner_tokenizer.bos_token_id = 2
+        mock_inner_tokenizer.name_or_path = "test-model"
+        mock_processor.tokenizer = mock_inner_tokenizer
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+
+        result = get_tokenizer({"name": "test-vlm"}, get_processor=True)
+
+        mock_auto_processor.from_pretrained.assert_called_once_with(
+            "test-vlm", trust_remote_code=True, use_fast=True
+        )
+        assert result is mock_processor
+        assert mock_processor.pad_token == "<pad>"
+        assert mock_processor.eos_token == "<eos>"
+        assert mock_processor.bos_token == "<bos>"
+        assert mock_processor.pad_token_id == 0
+        assert mock_processor.eos_token_id == 1
+        assert mock_processor.bos_token_id == 2
+        assert mock_processor.name_or_path == "test-model"
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):
+        """Test that processor path also sets pad_token from eos when None."""
+        mock_processor = MagicMock()
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.pad_token = None
+        mock_inner_tokenizer.eos_token = "<eos>"
+        mock_inner_tokenizer.bos_token = "<bos>"
+        mock_inner_tokenizer.pad_token_id = None
+        mock_inner_tokenizer.eos_token_id = 1
+        mock_inner_tokenizer.bos_token_id = 2
+        mock_inner_tokenizer.name_or_path = "test-vlm"
+        mock_processor.tokenizer = mock_inner_tokenizer
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+
+        result = get_tokenizer({"name": "test-vlm"}, get_processor=True)
+
+        assert mock_inner_tokenizer.pad_token == "<eos>"
+        assert result is mock_processor
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_does_not_use_hf_auto_tokenizer(self, mock_nemo_auto_tokenizer):
+        """Test that NeMoAutoTokenizer is used, not HF AutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        with patch("nemo_rl.models.automodel.setup.AutoTokenizer") as mock_hf:
+            get_tokenizer({"name": "gpt2"})
+            mock_hf.from_pretrained.assert_not_called()
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once()

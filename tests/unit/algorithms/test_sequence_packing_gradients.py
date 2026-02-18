@@ -444,6 +444,7 @@ def cluster_fixture(request):
     cluster.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("cp_size", [1, 2])
 def test_sequence_packing_gradients_with_cp(
     cluster_fixture, register_sequence_packing_gradient_test_actor, cp_size

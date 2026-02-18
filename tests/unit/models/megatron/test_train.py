@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+pytestmark = pytest.mark.mcore
+
 
 class TestModelForward:
     """Tests for model_forward function."""

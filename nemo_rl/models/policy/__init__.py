@@ -42,7 +42,7 @@ class AutomodelBackendConfig(TypedDict):
     to the HuggingFace implementation.
     """
 
-    # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
+    # Hydra target class path (e.g., "nemo_automodel.components.models.common.utils.BackendConfig")
     _target_: str
     # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
     attn: NotRequired[str]
@@ -76,19 +76,37 @@ class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class MoEParallelizerOptions(TypedDict):
+    """MoE parallelizer config options (mirrors Automodel's MoEParallelizerConfig)."""
+
+    ignore_router_for_ac: NotRequired[bool]
+    reshard_after_forward: NotRequired[bool]
+    lm_head_precision: NotRequired[str | None]
+    wrap_outer_model: NotRequired[bool]
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
+    # Distributed parallelism sizes
+    # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
-    custom_parallel_plan: str | None
-    clear_cache_every_n_steps: NotRequired[int | None]
+    expert_parallel_size: NotRequired[int]
+    # Distributed config options (mirrors Automodel's FSDP2Config)
+    sequence_parallel: bool
+    activation_checkpointing: bool
+    cpu_offload: bool
+    custom_parallel_plan: NotRequired[str | None]
+    defer_fsdp_grad_sync: NotRequired[bool]
+    # MoE parallelizer config
+    moe_parallelizer: NotRequired[MoEParallelizerOptions]
+    # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Runtime
+    clear_cache_every_n_steps: NotRequired[int | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -203,6 +221,7 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    use_processor: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):
