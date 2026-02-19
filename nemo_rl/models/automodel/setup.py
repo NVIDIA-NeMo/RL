@@ -150,7 +150,7 @@ def validate_and_prepare_config(
             )
 
         rm_type = config["reward_model_cfg"]["reward_model_type"]
-        if rm_type == "bradley_terry":
+        if rm_type == "bradley_terry" or rm_type == "regression":
             model_class = NeMoAutoModelForSequenceClassification
             if model_config.num_labels != 1:
                 print(
