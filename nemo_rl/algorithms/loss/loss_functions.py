@@ -118,7 +118,11 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg["ratio_clip_min"]
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
+        self.reference_policy_kl_penalty = (
+            cfg["reference_policy_kl_penalty"]
+            if not cfg.get("use_kl_in_reward", False)
+            else 0
+        )
         self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
         self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
         self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
@@ -978,3 +982,51 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+class MseValueLossFn(LossFunction):
+    """Mean Squared Error value loss function."""
+
+    def __init__(self, loss_cfg):
+        self.ratio_clip_min = loss_cfg["ratio_clip_min"]
+        self.ratio_clip_max = loss_cfg["ratio_clip_max"]
+
+    def __call__(
+        self,
+        values: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute Mean Squared Error value loss."""
+
+        if values.shape[-1] != 1:
+            values = values[..., 0]
+
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        old_values = data["values"]
+
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        values_clamped = values.clamp(
+            old_values - self.ratio_clip_min,
+            old_values + self.ratio_clip_max,
+        )
+
+        loss = torch.max(
+            torch.square(values - returns),
+            torch.square(values_clamped - returns),
+        )
+
+        loss = 0.5 * masked_mean(
+            loss, mask, global_normalization_factor=global_valid_toks
+        )
+
+        metrics = {
+            "loss": float(loss.item()),
+            "num_valid_samples": int(values.shape[0]),
+        }
+
+        return loss, metrics

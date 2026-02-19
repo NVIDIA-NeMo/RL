@@ -17,15 +17,12 @@ import random
 import re
 import warnings
 from functools import partial, wraps
+from locale import normalize
 from typing import Any, Optional
 
 import numpy as np
 import torch
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    PreTrainedTokenizerBase,
-)
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
@@ -220,6 +217,24 @@ def mask_out_neg_inf_logprobs(
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
     return logprobs
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        correction = (normalization_factor) / (normalization_factor - 1)
+        variance = variance * correction
+    return variance
 
 
 def set_seed(seed: int) -> None:
