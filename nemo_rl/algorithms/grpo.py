@@ -396,11 +396,6 @@ def setup(
         )
 
     else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
-
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = policy_nodes

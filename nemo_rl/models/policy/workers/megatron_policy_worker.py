@@ -230,6 +230,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+        
+        self.dynamic_inference_engine = None
+        self.inference_client = None
+        self.inference_context = None
+        self.inference_wrapped_model = None
+        self._inference_engine_initialized = False
+        self._inference_engine_alseep = True  # Start paused since we begin with training
+        self._inference_loop = None  # Event loop for inference operations
+        self._inference_thread = None  # Thread running the event loop
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -237,7 +246,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def disable_forward_pre_hook(self, param_sync=True):
         assert isinstance(self.model, DistributedDataParallel)
-        self.model.disable_forward_pre_hook(param_sync=param_sync)
+        for module, handle in list(self.model.remove_forward_pre_hook_handles.items()):
+            handle.remove()
+        self.model.remove_forward_pre_hook_handles.clear()
+        if param_sync:
+            self.model.start_param_sync(force_sync=True)
+            
+        # TODO : Check why this doesnt work. 
+        #self.model.disable_forward_pre_hook(param_sync=param_sync)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -1447,16 +1463,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
         """
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Offset rank by train_world_size so inference workers get unique global ranks
         rank = train_world_size + self.rank
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size
+        self.model_update_group = StatelessProcessGroup(
+            master_address=ip, port=port, rank=rank, world_size=world_size
         )
         device = torch.cuda.current_device()
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
+        self.model_update_group.init_nccl_communicator(device=device)
 
     def store_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Store state dict metadata for weight refitting on the inference side.
