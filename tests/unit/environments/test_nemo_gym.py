@@ -106,6 +106,7 @@ openai_model:
       model: ${policy_model_name}
       return_token_id_information: true
       uses_reasoning_parser: true
+rollout_max_attempts_to_avoid_lp_nan: 1
 """
 
     config = NemoGymConfig(
