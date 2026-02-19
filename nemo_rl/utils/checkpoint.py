@@ -65,6 +65,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
