@@ -146,7 +146,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         return adv
 
 
-class GAEAdvantageEstimator:
+class GeneralizedAdvantageEstimator:
     """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
 
     GAE computes advantages using temporal difference (TD) and exponentially-weighted averages:
@@ -172,6 +172,7 @@ class GAEAdvantageEstimator:
         prompt_ids,
         rewards,
         mask,
+        lengths,
         values,
         **kwargs,
     ):
@@ -179,107 +180,31 @@ class GAEAdvantageEstimator:
 
         Args:
             prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
-                       For GAE, this is used to identify episode boundaries across samples.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
                     In PPO, this is typically the final reward at the end of the trajectory.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            lengths: Input lengths of shape [batch_size].
             values: Value predictions of shape [batch_size, seq_len]. Required for GAE.
             **kwargs: Additional arguments (unused).
 
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        batch_size, seq_len = mask.shape
-        device = values.device
-
-        # Compute temporal differences: δ_t = r_t + γ * V(s_{t+1}) * (1 - done) - V(s_t)
-        deltas = rewards + self.gae_gamma * next_values * (1 - dones) - values
-
-        # Compute GAE recursively backwards: A_t = δ_t + γλ * (1 - done) * A_{t+1}
+        rewards_expanded = torch.zeros_like(values)
         advantages = torch.zeros_like(values)
-        gae = torch.zeros(batch_size, device=device)
+        values_next = torch.zeros_like(values)
+        values_next[:, :-1] = values[:, 1:]
 
-        # Iterate backwards through time
-        for t in reversed(range(seq_len)):
-            # Only compute GAE for valid tokens
-            valid_mask_t = mask[:, t]
+        for i, l in enumerate(lengths):
+            rewards_expanded[i, l] = rewards[i]
 
-            # GAE recursive formula
-            gae = (
-                deltas[:, t]
-                + self.gae_gamma * self.gae_lambda * (1 - dones[:, t]) * gae
+        deltas = rewards_expanded + self.gae_gamma * values_next - values
+
+        last_advantage = 0
+        for t in reversed(range(values.shape[1])):
+            advantages[:, t] = (
+                deltas[:, t] + self.gae_gamma * self.gae_lambda * last_advantage
             )
-
-            # Store advantages only for valid positions
-            advantages[:, t] = gae * valid_mask_t
-
-            # Reset GAE to 0 for sequences that ended (done=1) or are invalid (mask=0)
-            gae = gae * (1 - dones[:, t]) * valid_mask_t
-
-        # Normalize advantages globally across batch if requested
-        if self.normalize_advantages:
-            valid_advantages = advantages[mask.bool()]
-            if valid_advantages.numel() > 0:
-                adv_mean = valid_advantages.mean()
-                adv_std = valid_advantages.std()
-                advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-                # Ensure padding tokens remain zero
-                advantages = advantages * mask
+            last_advantage = advantages[:, t]
 
         return advantages
-
-    def compute_value_targets(
-        self,
-        rewards,
-        values,
-        next_values,
-        mask,
-        dones=None,
-    ):
-        """Compute value function targets for training the critic.
-
-        Value targets are computed as the discounted sum of rewards with bootstrapping:
-            V_target(s_t) = r_t + γ * V(s_{t+1}) * (1 - done_t)
-
-        Alternatively, they can be computed from advantages:
-            V_target(s_t) = A_t + V(s_t)
-
-        Args:
-            rewards: Tensor of shape [batch_size] or [batch_size, seq_len] containing rewards.
-            values: Value predictions of shape [batch_size, seq_len].
-            next_values: Next state value predictions of shape [batch_size, seq_len].
-            mask: Response token mask of shape [batch_size, seq_len].
-            dones: Episode termination flags of shape [batch_size, seq_len].
-
-        Returns:
-            Value targets tensor of shape [batch_size, seq_len].
-        """
-        batch_size, seq_len = mask.shape
-        device = values.device
-
-        # Expand rewards to token-level if needed
-        if rewards.dim() == 1:
-            rewards_expanded = torch.zeros_like(values)
-            for i in range(batch_size):
-                valid_positions = torch.nonzero(mask[i], as_tuple=True)[0]
-                if len(valid_positions) > 0:
-                    last_valid_pos = valid_positions[-1]
-                    rewards_expanded[i, last_valid_pos] = rewards[i]
-            rewards = rewards_expanded
-
-        # Create done masks if not provided
-        if dones is None:
-            dones = torch.zeros_like(mask, dtype=torch.float32, device=device)
-            for i in range(batch_size):
-                valid_positions = torch.nonzero(mask[i], as_tuple=True)[0]
-                if len(valid_positions) > 0:
-                    last_valid_pos = valid_positions[-1]
-                    dones[i, last_valid_pos] = 1.0
-
-        # Compute value targets with bootstrapping
-        value_targets = rewards + self.gae_gamma * next_values * (1 - dones)
-
-        # Apply mask to ensure padding positions have zero targets
-        value_targets = value_targets * mask
-
-        return value_targets

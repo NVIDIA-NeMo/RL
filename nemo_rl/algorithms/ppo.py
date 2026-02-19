@@ -28,7 +28,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
-    GAEAdvantageEstimator,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
@@ -1007,7 +1007,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         )
         print("  ✓ Using Reinforce++ advantage estimator")
     elif adv_estimator_name == "gae":
-        adv_estimator = GAEAdvantageEstimator(adv_estimator_config, loss_config)
+        adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.get("gae_lambda", 0.95)
         gae_gamma = adv_estimator_config.get("gae_gamma", 0.99)
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
@@ -1381,6 +1381,19 @@ def ppo_train(
                 with timer.time("value_training"):
                     print("▶ Training value...", flush=True)
                     pass
+
+            if current_epoch % val_period == 0 and current_step != 0:
+                with timer.time("validation"):
+                    print("▶ Validating...", flush=True)
+                    val_metrics, validation_timings = validate(
+                        policy,
+                        val_dataloader,
+                        tokenizer,
+                        loss_fn,
+                        step=total_steps + 1,
+                        master_config=master_config,
+                        logger=logger,
+                    )
 
 
 def validate(
