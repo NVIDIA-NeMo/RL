@@ -620,7 +620,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using the policy."""
+        """Generate a batch of data using the policy.
+        
+        For coordinator-based inference (Megatron backend), all data is sent to DP rank 0
+        only, which submits requests to the coordinator. The coordinator then distributes
+        work across all DP engines. Other DP ranks participate in the engine loop but
+        don't receive input data directly.
+        """
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -629,14 +635,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        if self.cfg["generation"]['backend'] == "vllm":
+            dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+            data = data.shard_by_batch_size(dp_size, batch_size=None)
+            in_sharded_axes = ["data_parallel"]
+            output_is_replicated = [
+                "tensor_parallel",
+                "pipeline_parallel",
+            ]
+        elif self.cfg["generation"]['backend'] == "megatron":
+        # For coordinator-based inference: send ALL data to DP rank 0 only.
+        # Other DP ranks are called with data=None but still participate in the
+        # inference engine loop. The coordinator handles load balancing across DP ranks.
+        # 
+        # With in_sharded_axes=[] and data_parallel not in replicate_on_axes,
+        # data_parallel becomes a "free axis". Only workers at DP coord 0 receive data,
+        # while workers at other DP coords get None (via make_dummy_calls_to_free_axes).
+            in_sharded_axes = []
+            output_is_replicated = [
+                "data_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ]
+        else:
+            raise ValueError(f"Invalid generation backend: {self.cfg['generation']['backend']}, expected 'vllm' or 'megatron'")
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
+            data=data,  # Full data goes to DP=0 only (free axis behavior)
+            in_sharded_axes=in_sharded_axes,
             replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=output_is_replicated,
+            make_dummy_calls_to_free_axes=True,  # Call all DP ranks, but only DP=0 gets data
             common_kwargs={"greedy": greedy},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
