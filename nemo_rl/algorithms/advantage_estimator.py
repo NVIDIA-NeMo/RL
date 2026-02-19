@@ -18,10 +18,14 @@ This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
 - GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, sum then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
+- GAEAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
+- GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 """
+
+from string import whitespace
 
 import torch
 
@@ -29,6 +33,8 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
     get_gdpo_reward_component_keys,
+    masked_mean,
+    masked_var,
 )
 
 
@@ -220,3 +226,131 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv = (adv - adv_mean) * adv_rstd
 
         return adv
+
+
+class GeneralizedAdvantageEstimator:
+    """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
+
+    GAE computes advantages using temporal difference (TD) and exponentially-weighted averages:
+        δ_t = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
+        A_t = Σ_{l=0}^{∞} (γλ)^l * δ_{t+l}
+
+    This is computed recursively backwards:
+        A_t = δ_t + γλ * (1 - done_t) * A_{t+1}
+
+    Args:
+        gae_lambda: GAE λ parameter (decay factor for advantage estimation, typically 0.95-0.98)
+        gae_gamma: Discount factor γ (typically 0.99)
+        normalize_advantages: If True, normalize advantages globally across batch
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.gae_lambda = estimator_config.get("gae_lambda", 0.95)
+        self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
+        self.normalize_advantages = estimator_config.get("normalize_advantages", True)
+
+        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.1)
+        self.kl_enabled = loss_config.get("use_kl_in_reward", False)
+        self.kl_type = loss_config.get("reference_policy_kl_type", "k3")
+
+    def _reward_whiten(
+        self,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        shift_mean: bool = True,
+    ) -> torch.Tensor:
+        mean = masked_mean(rewards, mask)
+        var = masked_var(rewards, mask, mean)
+
+        whitened_rewards = (rewards - mean) * torch.rsqrt(var + 1e-8)
+
+        if not shift_mean:
+            whitened_rewards = whitened_rewards + mean
+        return whitened_rewards
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        lengths,
+        values,
+        reference_logprobs,
+        logprobs,
+        **kwargs,
+    ):
+        """Compute GAE advantages with temporal bootstrapping.
+
+        Args:
+            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+                    In PPO, this is typically the final reward at the end of the trajectory.
+            mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            lengths: Input lengths of shape [batch_size].
+            values: Value predictions of shape [batch_size, seq_len]. Required for GAE.
+            reference_logprobs: Reference policy log probabilities of shape [batch_size, seq_len]. Required for GAE.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Advantages tensor of shape [batch_size, seq_len].
+        """
+        if self.kl_enabled:
+            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type) * self.kl_coef
+        else:
+            kl = None
+        advantages, returns = self.compute_advantage_reference(
+            rewards, lengths, values, kl, mask=mask
+        )
+
+        advantages = torch.masked_fill(
+            self._reward_whiten(advantages, mask),
+            # advantages,
+            ~(mask.bool()),
+            0,
+        )
+        return advantages, returns
+
+    def compute_advantage_reference(
+        self,
+        rewards,
+        lengths,
+        values,
+        kl,
+        **kwargs,
+    ):
+        """Reference GAE implementation for correctness validation.
+
+        Fixes two issues in compute_advantage:
+        1. Terminal state: uses V=0 at t=L (not a padding token's value).
+        2. No cross-sequence contamination: accumulation resets per sequence.
+
+        Args:
+            rewards: Tensor of shape [batch_size].
+            lengths: Total sequence lengths of shape [batch_size].
+            values: Value predictions of shape [batch_size, seq_len].
+
+        Returns:
+            advantages: Tensor of shape [batch_size, seq_len].
+            returns: advantages + values, shape [batch_size, seq_len].
+        """
+        advantages = torch.zeros_like(values)
+        if kl is None:
+            kl = torch.zeros_like(values)
+
+        for i in range(values.shape[0]):
+            L = int(lengths[i])
+
+            last_adv = 0.0
+            v_next = 0.0
+            r = rewards[i].item()
+
+            for t in reversed(range(L)):
+                delta = r - kl[i, t] + self.gae_gamma * v_next - values[i, t]
+                last_adv = delta + self.gae_gamma * self.gae_lambda * last_adv
+                advantages[i, t] = last_adv
+
+                v_next = values[i, t]
+                r = 0.0
+
+        returns = advantages + values
+        return advantages, returns

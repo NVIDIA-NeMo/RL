@@ -785,6 +785,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
         pass
