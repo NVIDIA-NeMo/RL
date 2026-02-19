@@ -1,0 +1,21 @@
+# Qwen3-30B-A3B with HybridEP + CUDA Graph Performance Recipe
+# GB200 cluster: 4 nodes x 4 GPUs = 16 GPUs
+# HybridEP + CUDA Graph (attn, moe_router) enabled
+defaults: ./grpo-qwen3-30ba3b-4n4g-hybridep.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-hybridep-cudagraph
+
+policy:
+  megatron_cfg:
+    # CUDA Graph settings
+    cuda_graph_impl: transformer_engine
+    cuda_graph_scope:
+      - attn
+      - moe_router
+    cuda_graph_warmup_steps: 3
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-hybridep-cudagraph
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-hybridep-cudagraph
