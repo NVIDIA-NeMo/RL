@@ -87,6 +87,7 @@ class PreparedState(IntEnum):
     LOGPROB = 1
     TRAIN = 2
 
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
