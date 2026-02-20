@@ -3589,6 +3589,7 @@ wheels = [
 name = "megatron-bridge"
 source = { editable = "3rdparty/Megatron-Bridge-workspace" }
 dependencies = [
+    { name = "accelerate" },
     { name = "causal-conv1d" },
     { name = "datasets" },
     { name = "flash-linear-attention" },
@@ -3614,6 +3615,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate" },
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
     { name = "datasets" },
     { name = "flash-linear-attention" },
@@ -3631,8 +3633,8 @@ requires-dist = [
     { name = "tensorboard", specifier = ">=2.19.0" },
     { name = "timm" },
     { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.9.0a0,<2.10.0" },
-    { name = "transformers", specifier = ">=4.57.1" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.10.0a0,<2.12.0" },
+    { name = "transformers", specifier = "<5.0.0" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.19.10" },
 ]
@@ -3643,8 +3645,10 @@ source = { editable = "3rdparty/Megatron-LM-workspace" }
 dependencies = [
     { name = "av" },
     { name = "causal-conv1d" },
+    { name = "datasets" },
     { name = "einops" },
     { name = "emerging-optimizers" },
+    { name = "fastapi" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-python", version = "0.5.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang')" },
     { name = "flashinfer-python", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
@@ -3659,7 +3663,6 @@ dependencies = [
     { name = "onnxscript" },
     { name = "opentelemetry-api" },
     { name = "packaging" },
-    { name = "setuptools" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tensorstore", version = "0.1.76", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3671,29 +3674,30 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = "<16.0.0" },
+    { name = "av" },
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
+    { name = "datasets" },
     { name = "einops", specifier = "~=0.8" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
+    { name = "fastapi", specifier = "~=0.50" },
     { name = "flash-linear-attention", specifier = "~=0.3.2" },
-    { name = "flashinfer-python" },
+    { name = "flashinfer-python", specifier = "~=0.5.0" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
-    { name = "numpy", specifier = "<2.0.0" },
+    { name = "numpy" },
     { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", specifier = ">=0.33.0a0,<0.34.0" },
-    { name = "nvidia-resiliency-ext", specifier = ">=0.4.0a0,<0.5.0" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-resiliency-ext" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
     { name = "opentelemetry-api", specifier = "~=1.33.1" },
     { name = "packaging", specifier = ">=24.2" },
-    { name = "setuptools", specifier = "<80.0.0" },
     { name = "tensorstore", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "torch", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
     { name = "tqdm" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.9.0a0,<2.10.0" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], specifier = ">=2.9.0a0,<2.12.0" },
     { name = "wget" },
 ]
 
@@ -4840,7 +4844,7 @@ requires-dist = [
     { name = "rich" },
     { name = "sentencepiece", marker = "extra == 'sglang'" },
     { name = "setuptools" },
-    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7" },
+    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508" },
     { name = "sglang", marker = "extra == 'sglang'", specifier = "==0.5.7" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
@@ -4859,7 +4863,7 @@ requires-dist = [
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "uvloop", marker = "extra == 'sglang'" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.2" },
-    { name = "wandb" },
+    { name = "wandb", specifier = ">=0.25.0" },
     { name = "xgrammar", marker = "extra == 'sglang'" },
 ]
 provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "nemo-gym"]
@@ -7622,7 +7626,7 @@ wheels = [
 [[package]]
 name = "sgl-kernel"
 version = "0.3.20"
-source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&tag=v0.5.7#232982a0dee4f0f9545189a7d9b6b9bb802e4910" }
+source = { git = "https://github.com/sgl-project/sglang?subdirectory=sgl-kernel&rev=3167bcc01c3074d5739e8086757cd8c66077d508#3167bcc01c3074d5739e8086757cd8c66077d508" }
 dependencies = [
     { name = "scikit-build-core" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -9611,7 +9615,7 @@ wheels = [
 
 [[package]]
 name = "wandb"
-version = "0.21.1"
+version = "0.25.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -9625,17 +9629,17 @@ dependencies = [
     { name = "sentry-sdk" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/26/69/217598886af89350e36bc05c092a67c9c469cff1fd6446edd4c879027e36/wandb-0.21.1.tar.gz", hash = "sha256:753bbdaa3a7703344056e019425b39c17a3d31d8ca0c4d13c4efc046935b08b9", size = 40131395, upload-time = "2025-08-07T18:52:48.85Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/60/d94952549920469524b689479c864c692ca47eca4b8c2fe3389b64a58778/wandb-0.25.0.tar.gz", hash = "sha256:45840495a288e34245d69d07b5a0b449220fbc5b032e6b51c4f92ec9026d2ad1", size = 43951335, upload-time = "2026-02-13T00:17:45.515Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/d0/589f970741f3ead9ad28d4cbb668d1e6a39848df767f004ac9c7bed8f4b5/wandb-0.21.1-py3-none-macosx_10_14_x86_64.whl", hash = "sha256:96f9eedeae428de0d88f9751fb81f1b730ae7902f35c2f5a7a904d7733f124f3", size = 21701698, upload-time = "2025-08-07T18:52:22.399Z" },
-    { url = "https://files.pythonhosted.org/packages/41/6c/a6140a0f395a99902aafdfe63088b7aff509e4f14cd7dd084d47eab36f27/wandb-0.21.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:41a1ec1b98d9d7e1bcafc483bce82e184b6cbae7531328a0fe8dd0f56d96a92e", size = 21221046, upload-time = "2025-08-07T18:52:26.134Z" },
-    { url = "https://files.pythonhosted.org/packages/e9/d8/dacbb30ed35141d48a387d84f2e792d4b61b5bcdbf5ffdbd3f0b57beb346/wandb-0.21.1-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:f74d4691c38318ed8611e00ca3246b4152a03ff390fdce41816bea5705452a73", size = 21885803, upload-time = "2025-08-07T18:52:28.489Z" },
-    { url = "https://files.pythonhosted.org/packages/b0/48/3a7290a33b1f64e29ac8779dab4d4cdef31a9ed3c3d9ea656a4507d64332/wandb-0.21.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8c8fbd60b9abf4b9bec201f311602f61394d41a3503c801750b03975a5e36d1b", size = 20825318, upload-time = "2025-08-07T18:52:31.282Z" },
-    { url = "https://files.pythonhosted.org/packages/a9/54/c0a087114ff1bb6c32e64aaa58aea4342cebc0ad58b1378c0a5a831d2508/wandb-0.21.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5ded9313672630c0630f5b13c598ce9aa0e932e811ebc18823fcc4d73acfb6bb", size = 22362500, upload-time = "2025-08-07T18:52:33.889Z" },
-    { url = "https://files.pythonhosted.org/packages/65/68/3aae277ea9fb5d91eec066cf256755bed3a740d92b539888a7ce36cf3f6c/wandb-0.21.1-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:44f3194d697b409f91708c50c5f9d56e282434a0d60ac380b64f0fb6991cd630", size = 20830372, upload-time = "2025-08-07T18:52:36.76Z" },
-    { url = "https://files.pythonhosted.org/packages/d2/bb/58d206e79be1f279ef06cb934ae1e208bcacd2cd73b7a7652236575010d6/wandb-0.21.1-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:e0b68bb6dbe94f1910c665c755f438292df40c272feb1a8b42208c1df52cce26", size = 22438521, upload-time = "2025-08-07T18:52:39.672Z" },
-    { url = "https://files.pythonhosted.org/packages/e7/b8/dfe01f8e4c40d5dda820fd839c39431608a3453670f79404fa28915972d2/wandb-0.21.1-py3-none-win32.whl", hash = "sha256:98306c3fb369dfafb7194270b938b000ea2bb08dbddff10c19b5a805fd5cab80", size = 21569814, upload-time = "2025-08-07T18:52:42.58Z" },
-    { url = "https://files.pythonhosted.org/packages/51/ba/81c77d5d831fcddb89661c85175fcbb91d2ffecf6b0591972829da3eb42f/wandb-0.21.1-py3-none-win_amd64.whl", hash = "sha256:8be92a7e92b5cb5ce00ec0961f9dbaad7757ffdbc5b5a8f2cc7188e23f653f0a", size = 21569817, upload-time = "2025-08-07T18:52:45.559Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/7d/0c131db3ec9deaabbd32263d90863cbfbe07659527e11c35a5c738cecdc5/wandb-0.25.0-py3-none-macosx_12_0_arm64.whl", hash = "sha256:5eecb3c7b5e60d1acfa4b056bfbaa0b79a482566a9db58c9f99724b3862bc8e5", size = 23287536, upload-time = "2026-02-13T00:17:20.265Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/95/31bb7f76a966ec87495e5a72ac7570685be162494c41757ac871768dbc4f/wandb-0.25.0-py3-none-macosx_12_0_x86_64.whl", hash = "sha256:daeedaadb183dc466e634fba90ab2bab1d4e93000912be0dee95065a0624a3fd", size = 25196062, upload-time = "2026-02-13T00:17:23.356Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/a1/258cdedbf30cebc692198a774cf0ef945b7ed98ee64bdaf62621281c95d8/wandb-0.25.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:5e0127dbcef13eea48f4b84268da7004d34d3120ebc7b2fa9cefb72b49dbb825", size = 22799744, upload-time = "2026-02-13T00:17:26.437Z" },
+    { url = "https://files.pythonhosted.org/packages/de/91/ec9465d014cfd199c5b2083d271d31b3c2aedeae66f3d8a0712f7f54bdf3/wandb-0.25.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6c4c38077836f9b7569a35b0e1dcf1f0c43616fcd936d182f475edbfea063665", size = 25262839, upload-time = "2026-02-13T00:17:28.8Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/95/cb2d1c7143f534544147fb53fe87944508b8cb9a058bc5b6f8a94adbee15/wandb-0.25.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:6edd8948d305cb73745bf564b807bd73da2ccbd47c548196b8a362f7df40aed8", size = 22853714, upload-time = "2026-02-13T00:17:31.68Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/94/68163f70c1669edcf130822aaaea782d8198b5df74443eca0085ec596774/wandb-0.25.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:ada6f08629bb014ad6e0a19d5dec478cdaa116431baa3f0a4bf4ab8d9893611f", size = 25358037, upload-time = "2026-02-13T00:17:34.676Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/fb/9578eed2c01b2fc6c8b693da110aa9c73a33d7bb556480f5cfc42e48c94e/wandb-0.25.0-py3-none-win32.whl", hash = "sha256:020b42ca4d76e347709d65f59b30d4623a115edc28f462af1c92681cb17eae7c", size = 24604118, upload-time = "2026-02-13T00:17:37.641Z" },
+    { url = "https://files.pythonhosted.org/packages/25/97/460f6cb738aaa39b4eb2e6b4c630b2ae4321cdd70a79d5955ea75a878981/wandb-0.25.0-py3-none-win_amd64.whl", hash = "sha256:78307ac0b328f2dc334c8607bec772851215584b62c439eb320c4af4fb077a00", size = 24604122, upload-time = "2026-02-13T00:17:39.991Z" },
+    { url = "https://files.pythonhosted.org/packages/27/6c/5847b4dda1dfd52630dac08711d4348c69ed657f0698fc2d949c7f7a6622/wandb-0.25.0-py3-none-win_arm64.whl", hash = "sha256:c6174401fd6fb726295e98d57b4231c100eca96bd17de51bfc64038a57230aaf", size = 21785298, upload-time = "2026-02-13T00:17:42.475Z" },
 ]
 
 [[package]]

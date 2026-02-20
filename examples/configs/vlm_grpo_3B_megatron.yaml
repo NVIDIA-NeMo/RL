@@ -36,6 +36,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+  seq_logprob_error_threshold: null
 loss_fn:
   reference_policy_kl_penalty: 0.01
   # Can be set to k1, k2, k3
@@ -189,6 +190,11 @@ policy:
       overlap_param_gather: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
