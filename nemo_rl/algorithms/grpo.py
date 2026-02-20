@@ -292,11 +292,25 @@ def setup(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
+    # Track epoch for async GRPO (will be None for sync GRPO or old checkpoints)
+    restored_epoch: Optional[int] = None
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
             os.path.join(last_checkpoint_path, "train_dataloader.pt")
         )
-        dataloader.load_state_dict(dataloader_state_dict)
+        # Handle direct state_dict and dict with epoch
+        if (
+            isinstance(dataloader_state_dict, dict)
+            and "current_epoch" in dataloader_state_dict
+        ):
+            # Extract epoch and dataloader state
+            restored_epoch = dataloader_state_dict["current_epoch"]
+            if "dataloader_state" in dataloader_state_dict:
+                dataloader.load_state_dict(dataloader_state_dict["dataloader_state"])
+            print(f"  ✓ Restored from epoch {restored_epoch}")
+        else:
+            # Direct dataloader state_dict
+            dataloader.load_state_dict(dataloader_state_dict)
 
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
@@ -2281,6 +2295,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    restored_epoch: Optional[int] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2434,6 +2449,12 @@ def async_grpo_train(
 
     # Start trajectory collection in background
     collection_task = trajectory_collector.start_collection.remote(dataloader)
+
+    # Restore epoch if resuming from checkpoint
+    if restored_epoch is not None:
+        trajectory_collector.set_dataloader_state.remote(
+            {"current_epoch": restored_epoch}
+        )
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
