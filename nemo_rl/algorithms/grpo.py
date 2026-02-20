@@ -117,6 +117,12 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # Maximum number of in-flight prompts in generation.
+    # Required to enable pipeline-rl style async-grpo training.
+    # Allowed values are 1 <= max_num_in_flight_batches_in_generation <= max_trajectory_age_steps
+    # Maximum number of in-flight prompts will be max_num_in_flight_batches_in_generation * num_prompts_per_step
+    # By having lower max_num_in_flight_batches_in_generation, we could reduce the avg trajectory age, but might also reduce the inference throughput.
+    max_num_in_flight_batches_in_generation: NotRequired[int]
 
 
 class AdvEstimatorConfig(TypedDict):
