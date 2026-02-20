@@ -1974,7 +1974,9 @@ def grpo_train(
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
                 log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
 
                 logger.log_batched_dict_as_jsonl(
