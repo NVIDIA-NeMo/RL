@@ -89,7 +89,6 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[data.task_name] = data.preprocessor
 
-
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
         merged_data,
