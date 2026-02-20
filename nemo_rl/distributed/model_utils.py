@@ -17,8 +17,6 @@ from typing import Any, Optional
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
 
 @torch.no_grad()
 def _compute_distributed_log_softmax(
