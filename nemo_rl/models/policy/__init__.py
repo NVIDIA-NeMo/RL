@@ -204,8 +204,8 @@ class TokenizerConfig(TypedDict):
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
-    audio: NotRequired[dict[str, Any] | None]
-    video: NotRequired[dict[str, Any] | None]
+    audio: NotRequired[dict[str, Any]]
+    video: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):
