@@ -32,6 +32,7 @@ time uv run --no-sync bash ./tests/functional/eval.sh
 time uv run --no-sync bash ./tests/functional/eval_async.sh
 time uv run --no-sync bash ./tests/functional/grpo.sh
 time uv run --no-sync bash ./tests/functional/grpo_async.sh
+time uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
 time uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
 time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
