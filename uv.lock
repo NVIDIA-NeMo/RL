@@ -4746,6 +4746,7 @@ mcore = [
     { name = "flash-attn" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
+    { name = "torch-memory-saver" },
     { name = "transformer-engine", extra = ["pytorch"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 nemo-gym = [
@@ -4883,6 +4884,7 @@ requires-dist = [
     { name = "tiktoken" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.9.0", index = "https://pypi.org/simple" },
+    { name = "torch-memory-saver", marker = "extra == 'mcore'" },
     { name = "torch-memory-saver", marker = "extra == 'sglang'" },
     { name = "torchao", marker = "extra == 'sglang'" },
     { name = "torchdata" },

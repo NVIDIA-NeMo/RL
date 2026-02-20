@@ -130,6 +130,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}
 
     scheduler:
+      override_opt_param_scheduler: true
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
@@ -156,7 +157,7 @@ policy:
       num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      unified_memory_level: 1  # Unified memory usage level (0=disabled, 1+=enables unified memory )
+      unified_memory_level: 0  # Unified memory usage level (0=disabled, 1+=enables unified memory )
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       enable_chunked_prefill: false
       kv_cache_management_mode: "persist" # Can be "persist", "offload", or "recompute"
