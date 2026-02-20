@@ -125,6 +125,7 @@ class ClippedPGLossFn(LossFunction):
     """
 
     def __init__(self, cfg: ClippedPGLossConfig):
+        self.chunk_size: Optional[int] = None
         self.ratio_clip_min = cfg["ratio_clip_min"]
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
@@ -244,6 +245,7 @@ class ClippedPGLossFn(LossFunction):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                chunk_size=self.chunk_size,
             )
             # slice off to the correct length to remove potential CP padding
             curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
@@ -1156,24 +1158,31 @@ class SequencePackingFusionLossWrapper:
         )
 
     @wrap_with_nvtx_name("SequencePackingFusionLossWrapper/_pack_input_ids")
-    def _pack_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _pack_input_ids(
+        self, input_ids: torch.Tensor, cp_size: int = 1
+    ) -> torch.Tensor:
         """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
 
-        Each sequence i is placed at cu_seqlens_q_padded[i] in the packed tensor,
-        with actual_len = cu_seqlens_q[i+1] - cu_seqlens_q[i] tokens copied.
-        Padding regions are filled with zeros.
+        When cp_size > 1, input_ids is [B, S // cp_size] (already CP-sharded) and
+        offsets are divided by cp_size to produce [1, T_packed // cp_size].
         """
         batch_size = input_ids.shape[0]
-        total_packed_len = int(self.cu_seqlens_q_padded[-1].item())
+        total_packed_len = self.cu_seqlens_q_padded[-1].item() // cp_size
+
+        # [T_packed]
         packed = torch.zeros(
-            1, total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+            total_packed_len, dtype=input_ids.dtype, device=input_ids.device
         )
+
         for i in range(batch_size):
-            actual_len = int((self.cu_seqlens_q[i + 1] - self.cu_seqlens_q[i]).item())
-            packed_start = int(self.cu_seqlens_q_padded[i].item())
-            packed[0, packed_start : packed_start + actual_len] = input_ids[
-                i, :actual_len
-            ]
+            actual_len = (
+                self.cu_seqlens_q[i + 1] - self.cu_seqlens_q[i]
+            ).item() // cp_size
+            packed_start = self.cu_seqlens_q_padded[i].item() // cp_size
+            packed[packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
+
+        # [T_packed] -> [1, T_packed]
+        packed = packed.unsqueeze(0)
         return packed
 
     @wrap_with_nvtx_name("SequencePackingFusionLossWrapper/forward")
@@ -1190,28 +1199,43 @@ class SequencePackingFusionLossWrapper:
         """Compute loss for all packed sequences in one forward pass.
 
         Steps:
-          1. Pack input_ids from [B, S] to [1, T_packed] to match packed logit layout.
+          1. Roll input_ids on [B, S], CP-shard, then pack to [1, T_packed // CP].
           2. Compute curr_logprobs from packed logits via
              from_parallel_logits_to_logprobs_packed_sequences → [B, S-1].
           3. Delegate to loss_fn._compute_loss_from_logprobs with the original
              (unpacked) data dict and the pre-computed logprobs.
         """
-        # Step 1: Use pre-packed input_ids from data if available, otherwise pack on the fly.
-        if "packed_input_ids" in data:
-            packed_input_ids = data["packed_input_ids"]
-        else:
-            packed_input_ids = self._pack_input_ids(data["input_ids"])
-        unpacked_seqlen = data["input_ids"].shape[1]
-
-        # Step 2: Compute logprobs from packed logits in a single shot.
         assert vocab_parallel_rank is not None and vocab_parallel_group is not None, (
             "SequencePackingFusionLossWrapper requires vocab_parallel_rank and vocab_parallel_group when converting "
             "parallel logits to logprobs for packed sequences; ensure the caller provides "
             "vocab_parallel_rank (and vocab_parallel_group)."
         )
+
+        input_ids = data["input_ids"]
+        unpacked_seqlen = input_ids.shape[1]
+        cp_size = (
+            1
+            if context_parallel_group is None
+            else torch.distributed.get_world_size(context_parallel_group)
+        )
+        cp_rank = (
+            0
+            if context_parallel_group is None
+            else torch.distributed.get_rank(context_parallel_group)
+        )
+
+        # Roll targets on [B, S] (each row shifts independently), then CP-shard and pack.
+        rolled_ids = input_ids.roll(-1, dims=1)
+        rolled_ids = _get_tokens_on_this_cp_rank(
+            rolled_ids, cp_rank, cp_size, seq_dim=1
+        )
+
+        # Pack the rolled input_ids from [B, S // CP] to [1, T_packed // CP]
+        packed_rolled_targets = self._pack_input_ids(rolled_ids, cp_size)
+
         curr_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             next_token_logits.to(torch.float32),
-            packed_input_ids,
+            packed_rolled_targets,
             self.cu_seqlens_q_padded,
             unpacked_seqlen,
             vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
@@ -1219,9 +1243,10 @@ class SequencePackingFusionLossWrapper:
             group=vocab_parallel_group,
             inference_only=False,
             cp_group=context_parallel_group,
+            chunk_size=getattr(self.loss_fn, "chunk_size", None),
+            target_is_pre_rolled=True,
         )
 
-        # Step 3: Compute loss from pre-computed logprobs using the original data dict.
         return self.loss_fn._compute_loss_from_logprobs(
             curr_logprobs, data, global_valid_seqs, global_valid_toks
         )

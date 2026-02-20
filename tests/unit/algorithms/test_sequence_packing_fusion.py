@@ -259,27 +259,17 @@ class SequencePackingLossWrapperBaselineActor:
             "loss_cfg": loss_cfg,
             "cu_seqlens": cu_seqlens,
             "cu_seqlens_padded": cu_seqlens_padded,
-            "packed_input_ids": _packed_input_ids,  # [1, T_packed] from _pack_sequences_for_megatron
             "data_dict": data_dict,
             "global_valid_seqs": global_valid_seqs,
             "global_valid_toks": global_valid_toks,
             "make_logits_and_packed_logits": make_logits_and_packed_logits,
         }
 
-    def run_compare_sequence_packing_wrappers(
-        self,
-        use_cached_packed_input_ids: bool = False,
-    ):
-        """
-        Compare helper (for when your candidate/fused wrapper exists):
-        - Builds inputs ONCE
-        - Runs baseline wrapper and candidate wrapper on identical inputs
-        - Returns loss/metrics + max grad for each
+    def run_compare_sequence_packing_wrappers(self):
+        """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
-        Args:
-            use_cached_packed_input_ids: If True, store pre-packed input_ids in data dict
-                so the fused wrapper skips _pack_input_ids. If False, the fused wrapper
-                packs on the fly (fallback path).
+        Builds inputs once, runs both wrappers on identical inputs,
+        and returns loss/metrics + max grad for each.
         """
         rank, _my_cp_rank, my_tp_rank, cp_group, tp_group = self._setup_process_groups()
         tc = self._build_test_case(cp_group=cp_group, my_tp_rank=my_tp_rank)
@@ -315,18 +305,12 @@ class SequencePackingLossWrapperBaselineActor:
         baseline_grad = baseline_logits.grad.clone()
 
         # Candidate run (fresh logits, identical values)
-        # Optionally add pre-packed input_ids to data dict for the fused wrapper only
-        candidate_data_dict = data_dict
-        if use_cached_packed_input_ids:
-            candidate_data_dict = BatchedDataDict(dict(data_dict))
-            candidate_data_dict["packed_input_ids"] = tc["packed_input_ids"]
-
         candidate_logits, candidate_packed_logits = tc[
             "make_logits_and_packed_logits"
         ]()
         candidate_loss, candidate_metrics = candidate_wrapper(
             candidate_packed_logits,
-            candidate_data_dict,
+            data_dict,
             tc["global_valid_seqs"],
             tc["global_valid_toks"],
             vocab_parallel_rank=my_tp_rank,
@@ -420,24 +404,17 @@ def cluster_fixture(request):
     ],
     ids=lambda cp_tp: f"cp{cp_tp[0]}_tp{cp_tp[1]}",
 )
-@pytest.mark.parametrize(
-    "use_cached_packed_input_ids",
-    [False, True],
-    ids=["pack_on_the_fly", "cached_packed_input_ids"],
-)
 def test_sequence_packing_loss_wrapper_baseline_cp_tp(
     cluster_fixture,
     register_sequence_packing_loss_wrapper_baseline_actor,
     cp_tp,
-    use_cached_packed_input_ids,
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical:
       - loss values
       - backward gradients w.r.t. vocab-parallel logits
-    for different CP and TP configurations, and both with and without
-    pre-packed input_ids cached in the data dict.
+    for different CP and TP configurations.
     """
     cp_size, tp_size = cp_tp
     cluster = cluster_fixture
@@ -459,7 +436,6 @@ def test_sequence_packing_loss_wrapper_baseline_cp_tp(
 
     futures = worker_group.run_all_workers_single_data(
         "run_compare_sequence_packing_wrappers",
-        use_cached_packed_input_ids=use_cached_packed_input_ids,
     )
     results = ray.get(futures)
 
