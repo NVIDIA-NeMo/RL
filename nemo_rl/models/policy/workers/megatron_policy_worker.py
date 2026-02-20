@@ -945,16 +945,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             # 1. pause the inference engine
             if self._inference_engine_initialized and not self._inference_engine_alseep:
                 self._sleep()
-            
+
             # 2. Toggle CUDA graphs OFF 
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
             
-            # 4. Clear rotary embedding cache again (Megatron RL does this on exit too)
+            # 3. Clear rotary embedding cache again (Megatron RL does this on exit too)
             if has_lru_cache:
                 rotary_module.forward.cache_clear()
             
-            # 5. Restore training state
+            # 4. Restore training state
             if was_training:
                 lang_module.train()
             
@@ -990,8 +990,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
         from megatron.core.inference.sampling_params import SamplingParams
 
         self.model.config.flash_decode = False
@@ -1125,8 +1123,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "generation_lengths": generation_lengths,
             "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
-
-        no_grad.__exit__(None, None, None)
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
