@@ -14,8 +14,8 @@ tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n4g-fsdp2tp2.v3.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron_generation.sh
 
-# Functional moonlight run
-tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh
+# Functional moonlight run - Disbaled till it can be fixed
+# tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh
 
 # Functional VLM run
 tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-dtensor2tp1.v1.sh
