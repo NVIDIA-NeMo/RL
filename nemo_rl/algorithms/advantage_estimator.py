@@ -196,7 +196,7 @@ class GeneralizedAdvantageEstimator:
         values_next[:, :-1] = values[:, 1:]
 
         for i, l in enumerate(lengths):
-            rewards_expanded[i, l] = rewards[i]
+            rewards_expanded[i, l - 1] = rewards[i]
 
         deltas = rewards_expanded + self.gae_gamma * values_next - values
 
