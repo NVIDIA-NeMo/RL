@@ -719,13 +719,15 @@ class TestLossPostProcessor:
     def test_loss_post_processor_with_cp_normalize(
         self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
-        """Test LossPostProcessor with CP normalization."""
+        """Test LossPostProcessor with CP normalization and microbatch pre-scaling."""
         from nemo_rl.models.megatron.train import LossPostProcessor
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
         cfg = {"sequence_packing": {"enabled": False}}
 
-        processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=True)
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn, cfg=cfg, num_microbatches=4, cp_normalize=True
+        )
 
         # Set up mock return values for process groups
         mock_tp_grp.return_value = MagicMock()
@@ -736,8 +738,8 @@ class TestLossPostProcessor:
         output_tensor = torch.randn(2, 10, 100)
         loss, _ = wrapped_fn(output_tensor)
 
-        # Loss should be divided by CP size (2)
-        assert torch.isclose(loss, torch.tensor(0.5))
+        # Loss should be scaled by num_microbatches / (cp_size * cp_size) = 4 / (2 * 2) = 1.0
+        assert torch.isclose(loss, torch.tensor(1.0))
 
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
