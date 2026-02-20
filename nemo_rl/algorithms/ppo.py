@@ -1303,6 +1303,7 @@ def ppo_train(
                     max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
                     greedy=False,
                 )
+
                 policy_generation.finish_generation()
                 # Collect generation logger metrics for performance reporting after each generation step
                 # inflight batch sizes and num pending samples are collected from each worker
@@ -1319,6 +1320,22 @@ def ppo_train(
 
             with timer.time("reward_calculation"):
                 print("▶ Calculating rewards and values...", flush=True)
+
+                for message_log in repeated_batch["message_log"]:
+                    for _, message in enumerate(message_log):
+                        if message["role"] == "assistant":
+                            message["token_loss_mask"] = torch.ones_like(
+                                message["token_ids"]
+                            )
+                        else:
+                            message["token_loss_mask"] = torch.zeros_like(
+                                message["token_ids"]
+                            )
+                        if "generation_logprobs" not in message:
+                            message["generation_logprobs"] = torch.zeros_like(
+                                message["token_ids"], dtype=torch.float32
+                            )
+
                 messages, input_lengths = batched_message_log_to_flat_message(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -1330,7 +1347,7 @@ def ppo_train(
                 values = (
                     torch.arange(messages["token_ids"].shape[0])
                     / messages["token_ids"].shape[0]
-                )
+                )[:, None].repeat(1, messages["token_ids"].shape[1])
 
                 train_data = BatchedDataDict(
                     {
@@ -1339,10 +1356,10 @@ def ppo_train(
                         "generation_logprobs": messages["generation_logprobs"],
                         "values": values,
                         "rewards": repeated_batch["total_reward"],
+                        "sample_mask": repeated_batch["loss_multiplier"],
+                        "token_mask": messages["token_loss_mask"],
                     }
                 )
-
-                print(messages["token_ids"].shape, input_lengths.shape, values.shape)
 
             with timer.time("compute_advantages"):
                 print("▶ Computing advantages...", flush=True)
@@ -1351,9 +1368,18 @@ def ppo_train(
                     rewards=train_data["rewards"],
                     mask=torch.ones_like(messages["token_ids"]),
                     values=train_data["values"],
+                    lengths=input_lengths,
                 )
 
-                print(train_data["advantages"])
+            with timer.time("logprob_inference_prep"):
+                print("▶ Preparing for logprob inference...", flush=True)
+                policy.prepare_for_lp_inference()
+
+            with timer.time("policy_and_reference_logprobs"):
+                print("▶ Computing policy and reference logprobs...", flush=True)
+                train_data["prev_logprobs"] = policy.get_logprobs(
+                    train_data, timer=timer
+                )["logprobs"]
 
             for step in range(steps_per_epoch):
                 print(f"▶ Step {step + 1}/{steps_per_epoch}...", flush=True)
@@ -1367,8 +1393,15 @@ def ppo_train(
                         ],
                         "values": train_data["values"][permutation],
                         "rewards": train_data["rewards"][permutation],
+                        "sample_mask": train_data["sample_mask"][permutation],
+                        "token_mask": train_data["token_mask"][permutation],
+                        "advantages": train_data["advantages"][permutation],
+                        "prev_logprobs": train_data["prev_logprobs"][permutation],
                     }
                 )
+
+                with timer.time("policy_training_prep"):
+                    policy.prepare_for_training()
 
                 with timer.time("policy_training"):
                     print("▶ Training policy...", flush=True)
