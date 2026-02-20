@@ -318,6 +318,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
+                    num_microbatches=num_microbatches,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -339,7 +340,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
-                        do_not_average_loss=True,
                         straggler_timer=self.mcore_state.straggler_timer,
                     )
 
