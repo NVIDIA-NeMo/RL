@@ -27,7 +27,11 @@ import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import NemoGymConfig
+from nemo_rl.environments.nemo_gym import (
+    NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.environments.utils import create_env
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -56,10 +60,12 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
 
             nemo_gym_dict = dict(config["env"]["nemo_gym"])
             nemo_gym_dict["dry_run"] = True
-            # TODO: this should depend in the container (DONT MERGE UNTIL FIXED)
-            nemo_gym_dict["uv_cache_dir"] = "/root/.cache/uv"
-            # TODO: this should depend in the container (DONT MERGE UNTIL FIXED)
-            nemo_gym_dict["uv_venv_dir"] = "/opt/gym_venvs"
+            uv_cache_dir = get_nemo_gym_uv_cache_dir()
+            if uv_cache_dir is not None:
+                nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+            uv_venv_dir = get_nemo_gym_venv_dir()
+            if uv_venv_dir is not None:
+                nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
 
             nemo_gym_config = NemoGymConfig(
                 model_name="dummy-model",

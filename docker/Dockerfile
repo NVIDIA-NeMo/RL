@@ -83,6 +83,10 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
+# Config paths (relative to repo root) whose NeMo Gym venvs should be prefetched.
+# Override to prefetch venvs for different configs, or set to empty to skip.
+ARG NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml examples/nemo_gym/grpo_nanov3.yaml"
 
 
 FROM base AS hermetic
@@ -147,6 +151,15 @@ fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
+
+# Prefetch NeMo Gym internal venvs (for gym servers like code_gen, math, etc.)
+if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+fi
+
+# Remove /tmp/ray because the previous script starts up a local ray cluster which creates a session
+# that we can just clean up.
+rm -rf /tmp/ray
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
