@@ -21,7 +21,6 @@ import wandb.util
 
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
-import ray
 from omegaconf import OmegaConf
 from wandb import Table
 
@@ -42,10 +41,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGymConfig,
     setup_nemo_gym_config,
 )
-from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -191,9 +188,14 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
+    is_trajectory_collection = (
+        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
+    )
+
     (
         policy,
         policy_generation,
+        nemo_gym_env,
         cluster,
         dataloader,
         val_dataloader,
@@ -204,21 +206,7 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    is_trajectory_collection = (
-        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
-    nemo_gym_config = NemoGymConfig(
-        model_name=policy_generation.cfg["model_name"],
-        base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["nemo_gym"],
-    )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
-    # Blocking wait for NeMo-Gym to spin up
-    ray.get(nemo_gym.health_check.remote())
-
-    # Bind task_to_env and val_task_to_env for nemo_gym env
-    # Hardcode here to match `run_async_nemo_gym_rollout`
-    task_to_env = {"nemo_gym": nemo_gym}
+    task_to_env = {"nemo_gym": nemo_gym_env}
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:

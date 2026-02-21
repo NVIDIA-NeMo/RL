@@ -252,6 +252,7 @@ def main():
     (
         policy,
         policy_generation,
+        _nemo_gym_actor,
         cluster,
         dataloader,
         val_dataloader,
