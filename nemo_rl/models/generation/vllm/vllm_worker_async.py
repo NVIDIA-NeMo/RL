@@ -482,6 +482,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return_tokens_as_token_ids=True,
             )
         )
+
+        # Load custom reasoning parser plugin if specified
+        reasoning_parser_plugin = serving_chat_kwargs.pop("reasoning_parser_plugin", None)
+        if reasoning_parser_plugin:
+            from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+            ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
