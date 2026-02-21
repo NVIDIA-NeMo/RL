@@ -444,6 +444,11 @@ def test_sequence_packing_loss_wrapper_baseline_cp_tp(
 
     for r in results:
         rank = r["rank"]
+        # Sanity: gradients must be non-None and non-zero (autograd is connected)
+        for label in ("baseline", "candidate"):
+            grad = r[label]["logits_local_grad"]
+            assert grad is not None, f"{label} grad is None on rank {rank}"
+            assert grad.abs().sum() > 0, f"{label} grad is all zeros on rank {rank}"
         # Forward: loss values must match
         torch.testing.assert_close(
             r["baseline"]["loss"],
