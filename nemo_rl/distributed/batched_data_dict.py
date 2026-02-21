@@ -537,7 +537,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         aggregated_shards = [SlicedDataDict() for _ in range(shards)]
 
-        # Group data by shard position across all chunks.
+        # Group data by shard position across all chunks
         for shard_idx in range(shards):
             shard_ranges: list[tuple[int, int]] = []
             for chunk_idx in range(num_chunks):
@@ -556,7 +556,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             for k, v in data.items():
                 if torch.is_tensor(v):
-                    # Pre-allocate and copy each chunk exactly once.
+                    # Pre-allocate and copy each chunk once
                     rows = sum(end - start for start, end in shard_ranges)
                     shard_tensor = torch.empty(
                         (rows, *v.shape[1:]),
@@ -568,23 +568,20 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         span = end - start
                         shard_tensor[offset : offset + span].copy_(v[start:end])
                         offset += span
+
                     aggregated_shards[shard_idx][k] = shard_tensor
                 elif isinstance(v, PackedTensor):
-                    # PackedTensor is collected per chunk then concatenated once.
+                    # PackedTensor is collected per chunk then concatenated once
                     packed_slices = [
                         v.slice(list(range(start, end))) for start, end in shard_ranges
                     ]
-                    if packed_slices:
-                        aggregated_shards[shard_idx][k] = (
-                            PackedTensor.concat(packed_slices)
-                            if len(packed_slices) > 1
-                            else packed_slices[0]
-                        )
+
+                    aggregated_shards[shard_idx][k] = PackedTensor.concat(packed_slices) if packed_slices else PackedTensor.empty_like(v)
                 else:
                     shard_values = []
                     for start, end in shard_ranges:
                         shard_values.extend([v[i] for i in range(start, end)])
-                        
+
                     aggregated_shards[shard_idx][k] = shard_values
 
         # map inputs to microbatches such that the total number tokens in
