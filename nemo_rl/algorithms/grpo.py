@@ -1848,9 +1848,11 @@ def grpo_train(
 
                     with timer.time("add_loss_mask"):
                         # Add loss mask to each message in LLMMessageLogType
+                        # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                        # not assistant messages that were part of the prompt history
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             for j, message in enumerate(message_log):
-                                if message["role"] == "assistant":
+                                if message["role"] == "assistant" and "generation_logprobs" in message:
                                     message["token_loss_mask"] = torch.ones_like(
                                         message["token_ids"]
                                     )
@@ -3004,9 +3006,11 @@ def async_grpo_train(
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Add loss mask to each message
+                    # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                    # not assistant messages that were part of the prompt history
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
+                            if message["role"] == "assistant" and "generation_logprobs" in message:
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
