@@ -2669,6 +2669,35 @@ def async_grpo_train(
         max_size=optimal_buffer_size
     )
 
+    # Restore replay buffer state from checkpoint if available
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if last_checkpoint_path is not None:
+        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
+        if os.path.exists(replay_buffer_path):
+            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+            try:
+                replay_buffer_state = torch.load(
+                    replay_buffer_path, weights_only=False
+                )
+                ray.get(
+                    replay_buffer.load_state_dict.remote(
+                        replay_buffer_state,
+                        num_prompts_per_step=num_prompts_per_step,
+                        current_training_step=step,
+                    )
+                )
+                print(
+                    f"✅ Replay buffer restored from checkpoint"
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to restore replay buffer state: {e}")
+                raise e
+        else:
+            print(
+                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+                "Starting with empty buffer (this is expected for older checkpoints)."
+            )
+
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
     )
@@ -2773,24 +2802,42 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill
+    # Wait for initial buffer fill and current step to have complete batch
     print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
+        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
 
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+        # Check if current training step has enough trajectories
+        current_step_ready = ray.get(
+            replay_buffer.has_complete_batch.remote(step, num_prompts_per_step)
         )
 
-        if buffer_size_current >= min_trajectories_needed:
+        print(
+            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+            f"step {step} ready={current_step_ready}"
+        )
+
+        if current_step_ready:
             break
 
+        # Also break if we have minimum trajectories and it's a fresh start (no gap-filling needed)
+        if buffer_size_current >= min_trajectories_needed and wait_iterations == 0:
+            # Check how many trajectories needed for current step
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(step, num_prompts_per_step)
+            )
+            if trajectories_needed > 0:
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more trajectories for step {step}"
+                )
+
+        wait_iterations += 1
         time.sleep(1.0)
 
-    print("✅ Buffer ready! Starting training loop...")
+    print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
     try:
@@ -3261,6 +3308,18 @@ def async_grpo_train(
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        # Save replay buffer state for resumption
+                        print("📦 Saving replay buffer state...")
+                        replay_buffer_state = ray.get(
+                            replay_buffer.state_dict.remote()
+                        )
+                        torch.save(
+                            replay_buffer_state,
+                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        )
+                        print(
+                            f"✅ Saved replay buffer with {len(replay_buffer_state['trajectories'])} trajectories"
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()

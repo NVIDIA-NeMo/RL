@@ -239,7 +239,7 @@ class TestReplayBuffer:
         ray.kill(buffer)
 
     def test_replay_buffer_age_filtering(self):
-        """Test that old trajectories are filtered out."""
+        """Test that old trajectories are silently evicted during sampling."""
         buffer = ReplayBuffer.remote(max_size=10)
 
         # Push trajectories with different ages
@@ -260,18 +260,27 @@ class TestReplayBuffer:
             )
         )
 
+        # Verify initial state: 2 trajectories in buffer
+        assert ray.get(buffer.size.remote()) == 2
+
         # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
+        # min_valid_version = 3 - 1 = 2, so trajectory with weight_version=0 is too old
+        # The sample() method should silently evict the old trajectory
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
             )
+        )
+
+        # Should get the recent trajectory (target_weight_version=3 matches current_weight_version=3)
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+
+        # Buffer should now be empty (old evicted, recent sampled)
+        assert ray.get(buffer.size.remote()) == 0
 
         ray.kill(buffer)
 
@@ -698,6 +707,253 @@ class TestAsyncUtilsIntegration:
         assert sample_result is None
 
         ray.kill(buffer)
+
+    def test_replay_buffer_state_dict(self):
+        """Test state_dict serialization for checkpointing."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        # Push some trajectories
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer.push_with_wait_signal.remote(
+                trajectory1, weight_version=5, target_weight_version=6
+            )
+        )
+        ray.get(
+            buffer.push_with_wait_signal.remote(
+                trajectory2, weight_version=6, target_weight_version=7
+            )
+        )
+
+        # Get state dict
+        state = ray.get(buffer.state_dict.remote())
+
+        # Verify state contains expected keys
+        assert "trajectories" in state
+        assert "trajectory_versions" in state
+        assert "target_weight_versions" in state
+        assert "last_target_weight_already_generated" in state
+        assert "max_size" in state
+
+        # Verify state values
+        assert len(state["trajectories"]) == 2
+        assert state["trajectory_versions"] == [5, 6]
+        assert state["target_weight_versions"] == [6, 7]
+        assert state["last_target_weight_already_generated"] == 7
+        assert state["max_size"] == 10
+
+        # Verify trajectories are correctly serialized
+        assert state["trajectories"][0]["batch"]["data"] == "test1"
+        assert state["trajectories"][1]["batch"]["data"] == "test2"
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict(self):
+        """Test load_state_dict restoration from checkpoint."""
+        # Create and populate first buffer
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer1.push_with_wait_signal.remote(
+                trajectory1, weight_version=5, target_weight_version=6
+            )
+        )
+        ray.get(
+            buffer1.push_with_wait_signal.remote(
+                trajectory2, weight_version=6, target_weight_version=7
+            )
+        )
+
+        # Get state from first buffer
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        # Create a new empty buffer and restore state
+        buffer2 = ReplayBuffer.remote(max_size=10)
+
+        # Verify new buffer is initially empty
+        assert ray.get(buffer2.size.remote()) == 0
+
+        # Load state
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        # Verify state was restored correctly
+        assert ray.get(buffer2.size.remote()) == 2
+
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5, 6]
+        assert debug_info["target_weight_versions"] == [6, 7]
+
+        # Verify last_target_weight_already_generated was restored
+        last_target = ray.get(buffer2.get_last_target_weight_already_generated.remote())
+        assert last_target == 7
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_state_dict_round_trip(self):
+        """Test complete save/restore cycle preserves functionality."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        # Populate buffer
+        for i in range(3):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.push_with_wait_signal.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        # Save state
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        # Restore to new buffer
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        # Test that sampling works correctly after restore
+        sample_result = ray.get(
+            buffer2.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        # trajectory with target_weight_version=2 is from weight_version=1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "test1"
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_state_dict_max_size_change(self):
+        """Test load_state_dict handles max_size config changes gracefully."""
+        # Create buffer with large max_size and fill it
+        buffer1 = ReplayBuffer.remote(max_size=5)
+
+        for i in range(4):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.push_with_wait_signal.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        # Save state
+        state = ray.get(buffer1.state_dict.remote())
+        assert len(state["trajectories"]) == 4
+        ray.kill(buffer1)
+
+        # Restore to buffer with smaller max_size (should truncate)
+        buffer2 = ReplayBuffer.remote(max_size=2)
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        # Buffer should be truncated to max_size
+        assert ray.get(buffer2.size.remote()) == 2
+
+        # First 2 trajectories should be preserved (FIFO truncation)
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [0, 1]
+        assert debug_info["target_weight_versions"] == [1, 2]
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_state_dict_missing_keys(self):
+        """Test load_state_dict raises error for missing required keys."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        # Create incomplete state (missing required keys)
+        incomplete_state = {
+            "trajectories": [],
+            "trajectory_versions": [],
+            # Missing: target_weight_versions, last_target_weight_already_generated
+        }
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            ray.get(buffer.load_state_dict.remote(incomplete_state))
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_state_dict_empty_buffer(self):
+        """Test state_dict/load_state_dict with empty buffer."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        # Get state of empty buffer
+        state = ray.get(buffer1.state_dict.remote())
+
+        assert state["trajectories"] == []
+        assert state["trajectory_versions"] == []
+        assert state["target_weight_versions"] == []
+        assert state["last_target_weight_already_generated"] == -1
+
+        ray.kill(buffer1)
+
+        # Restore empty state to new buffer
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        assert ray.get(buffer2.size.remote()) == 0
+        last_target = ray.get(buffer2.get_last_target_weight_already_generated.remote())
+        assert last_target == -1
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_checkpoint_with_torch_save(self):
+        """Test that state_dict can be saved/loaded using torch.save/load."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        # Push trajectories with tensor data (similar to real use case)
+        trajectory = {
+            "batch": {
+                "token_ids": torch.tensor([1, 2, 3]),
+                "rewards": torch.tensor([0.5]),
+            },
+            "rollout_metrics": {"reward": 1.0, "length": 10},
+            "timestamp": 12345.0,
+        }
+        ray.get(
+            buffer1.push_with_wait_signal.remote(
+                trajectory, weight_version=5, target_weight_version=6
+            )
+        )
+
+        # Save state using torch.save (simulating checkpoint)
+        state = ray.get(buffer1.state_dict.remote())
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            torch.save(state, f.name)
+            checkpoint_path = f.name
+
+        ray.kill(buffer1)
+
+        # Load state using torch.load (simulating resume)
+        # Use weights_only=False because replay buffer contains custom objects
+        loaded_state = torch.load(checkpoint_path, weights_only=False)
+
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer2.load_state_dict.remote(loaded_state))
+
+        # Verify restoration
+        assert ray.get(buffer2.size.remote()) == 1
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5]
+        assert debug_info["target_weight_versions"] == [6]
+
+        # Clean up
+        os.unlink(checkpoint_path)
+        ray.kill(buffer2)
 
 
 class TestPromptExtraction:
