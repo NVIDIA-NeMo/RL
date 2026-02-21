@@ -1253,7 +1253,7 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
-) -> tuple[float, int, float]:
+) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
     This function computes the multiplicative probability error per sequence
@@ -1269,7 +1269,9 @@ def compute_and_apply_seq_logprob_error_masking(
                                     exceeding this threshold. If None, only compute metrics.
 
     Returns:
-        Tuple of (max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct)
+        Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
+        min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
+        num_masked_seqs, masked_correct_pct
     """
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
@@ -1286,13 +1288,24 @@ def compute_and_apply_seq_logprob_error_masking(
     seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(dim=-1) / mask.sum(
         dim=-1
     ).clamp(min=1)
-    max_seq_mult_prob_error = (
-        seq_mult_prob_error.max().item() if seq_mult_prob_error.numel() > 0 else 0.0
-    )
+
+    if seq_mult_prob_error.numel() > 0:
+        max_seq_mult_prob_error = seq_mult_prob_error.max().item()
+        mean_seq_mult_prob_error = seq_mult_prob_error.mean().item()
+        min_seq_mult_prob_error = seq_mult_prob_error.min().item()
+    else:
+        max_seq_mult_prob_error = 0.0
+        mean_seq_mult_prob_error = 0.0
+        min_seq_mult_prob_error = 0.0
 
     # Apply sequence-level masking if configured
     num_masked_seqs = 0
     masked_correct_pct = 0.0
+
+    # After-mask metrics (same as before if no threshold)
+    max_seq_mult_prob_error_after_mask = max_seq_mult_prob_error
+    mean_seq_mult_prob_error_after_mask = mean_seq_mult_prob_error
+    min_seq_mult_prob_error_after_mask = min_seq_mult_prob_error
 
     if seq_logprob_error_threshold is not None:
         print(
@@ -1312,8 +1325,23 @@ def compute_and_apply_seq_logprob_error_masking(
 
         if num_masked_seqs > 0:
             diff_mask_bool = diff_mask.bool()
-            masked_correct_count = (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            masked_correct_count = int(
+                (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            )
             masked_correct_pct = masked_correct_count / num_masked_seqs
+
+        # Compute after-mask metrics (only for sequences that passed the threshold)
+        kept_mask = seq_error_mask.bool()
+        if kept_mask.sum() > 0:
+            kept_errors = seq_mult_prob_error[kept_mask]
+            max_seq_mult_prob_error_after_mask = kept_errors.max().item()
+            mean_seq_mult_prob_error_after_mask = kept_errors.mean().item()
+            min_seq_mult_prob_error_after_mask = kept_errors.min().item()
+        else:
+            # All sequences were masked
+            max_seq_mult_prob_error_after_mask = 0.0
+            mean_seq_mult_prob_error_after_mask = 0.0
+            min_seq_mult_prob_error_after_mask = 0.0
 
         # Update sample_mask in train_data
         train_data["sample_mask"] = seq_error_mask
@@ -1329,7 +1357,16 @@ def compute_and_apply_seq_logprob_error_masking(
                 flush=True,
             )
 
-    return max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct
+    return {
+        "max_seq_mult_prob_error": max_seq_mult_prob_error,
+        "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
+        "min_seq_mult_prob_error": min_seq_mult_prob_error,
+        "max_seq_mult_prob_error_after_mask": max_seq_mult_prob_error_after_mask,
+        "mean_seq_mult_prob_error_after_mask": mean_seq_mult_prob_error_after_mask,
+        "min_seq_mult_prob_error_after_mask": min_seq_mult_prob_error_after_mask,
+        "num_masked_seqs": num_masked_seqs,
+        "masked_correct_pct": masked_correct_pct,
+    }
 
 
 # ===============================================================================
@@ -1776,7 +1813,21 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
+                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
+                skip_prev_logprobs = (
+                    force_on_policy_ratio and seq_logprob_error_threshold is None
+                )
+                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
+                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
+                    warnings.warn(
+                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+                        "Computing prev_logprobs anyway for seq-level error masking."
+                    )
+
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -1826,28 +1877,48 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    assert seq_logprob_error_threshold is None, (
-                        "seq_logprob_error_threshold requires prev_logprobs computation; "
-                        "cannot use with force_on_policy_ratio=True"
-                    )
-                    max_seq_mult_prob_error = 0.0
-                    num_masked_seqs = 0
-                    masked_correct_pct = 0.0
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": 0.0,
+                        "mean_seq_mult_prob_error": 0.0,
+                        "min_seq_mult_prob_error": 0.0,
+                        "max_seq_mult_prob_error_after_mask": 0.0,
+                        "mean_seq_mult_prob_error_after_mask": 0.0,
+                        "min_seq_mult_prob_error_after_mask": 0.0,
+                        "num_masked_seqs_by_logprob_error": 0,
+                        "masked_correct_pct": 0.0,
+                    }
                 else:
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": seq_error_result[
+                            "max_seq_mult_prob_error"
+                        ],
+                        "mean_seq_mult_prob_error": seq_error_result[
+                            "mean_seq_mult_prob_error"
+                        ],
+                        "min_seq_mult_prob_error": seq_error_result[
+                            "min_seq_mult_prob_error"
+                        ],
+                        "max_seq_mult_prob_error_after_mask": seq_error_result[
+                            "max_seq_mult_prob_error_after_mask"
+                        ],
+                        "mean_seq_mult_prob_error_after_mask": seq_error_result[
+                            "mean_seq_mult_prob_error_after_mask"
+                        ],
+                        "min_seq_mult_prob_error_after_mask": seq_error_result[
+                            "min_seq_mult_prob_error_after_mask"
+                        ],
+                        "num_masked_seqs_by_logprob_error": seq_error_result[
+                            "num_masked_seqs"
+                        ],
+                        "masked_correct_pct": seq_error_result["masked_correct_pct"],
+                    }
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -2015,9 +2086,7 @@ def grpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 ## Checkpointing
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
@@ -2896,7 +2965,22 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
+                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
+                skip_prev_logprobs = (
+                    force_on_policy_ratio and seq_logprob_error_threshold is None
+                )
+
+                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
+                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
+                    warnings.warn(
+                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+                        "Computing prev_logprobs anyway for seq-level error masking."
+                    )
+
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -2931,27 +3015,48 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
                 if skip_prev_logprobs:
-                    assert seq_logprob_error_threshold is None, (
-                        "seq_logprob_error_threshold requires prev_logprobs computation; "
-                        "cannot use with force_on_policy_ratio=True"
-                    )
-                    max_seq_mult_prob_error = 0.0
-                    num_masked_seqs = 0
-                    masked_correct_pct = 0.0
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": 0.0,
+                        "mean_seq_mult_prob_error": 0.0,
+                        "min_seq_mult_prob_error": 0.0,
+                        "max_seq_mult_prob_error_after_mask": 0.0,
+                        "mean_seq_mult_prob_error_after_mask": 0.0,
+                        "min_seq_mult_prob_error_after_mask": 0.0,
+                        "num_masked_seqs_by_logprob_error": 0,
+                        "masked_correct_pct": 0.0,
+                    }
                 else:
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": seq_error_result[
+                            "max_seq_mult_prob_error"
+                        ],
+                        "mean_seq_mult_prob_error": seq_error_result[
+                            "mean_seq_mult_prob_error"
+                        ],
+                        "min_seq_mult_prob_error": seq_error_result[
+                            "min_seq_mult_prob_error"
+                        ],
+                        "max_seq_mult_prob_error_after_mask": seq_error_result[
+                            "max_seq_mult_prob_error_after_mask"
+                        ],
+                        "mean_seq_mult_prob_error_after_mask": seq_error_result[
+                            "mean_seq_mult_prob_error_after_mask"
+                        ],
+                        "min_seq_mult_prob_error_after_mask": seq_error_result[
+                            "min_seq_mult_prob_error_after_mask"
+                        ],
+                        "num_masked_seqs_by_logprob_error": seq_error_result[
+                            "num_masked_seqs"
+                        ],
+                        "masked_correct_pct": seq_error_result["masked_correct_pct"],
+                    }
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3129,9 +3234,7 @@ def async_grpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
