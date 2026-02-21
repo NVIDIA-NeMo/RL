@@ -50,10 +50,6 @@ class SequencePackingGradientTestActor:
             LossPostProcessor,
             forward_with_post_processing_fn,
         )
-        from nemo_rl.models.megatron.data import (
-            _pack_sequences_for_megatron,
-            make_processed_microbatch_iterator,
-        )
 
         # Initialize process group
         torch.distributed.init_process_group(backend="nccl")

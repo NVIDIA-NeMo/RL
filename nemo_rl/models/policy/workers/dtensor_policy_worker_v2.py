@@ -46,11 +46,6 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
-from nemo_rl.models.automodel.data import (
-    check_sequence_dim,
-    get_microbatch_iterator,
-    process_global_batch,
-)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
@@ -95,118 +90,6 @@ def dtensor_params_generator(
         model: The model whose parameters to generate.
         target_dtype: The dtype to convert tensors to.
         peft_config: Optional LoRA config for filtering which layers to merge.
-
-    Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
-    """
-    module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
-        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
-            continue
-        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
-
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
-        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
-            yield (
-                adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
-            )
-            del adapted_tensor
-        del adapted_fqn_tensors
-        del merged_tensor
-        del full_tensor
-
-
-@torch.no_grad()
-def _maybe_merge_lora_weight(
-    module_map: dict[str, nn.Module],
-    fqn: str,
-    tensor: torch.Tensor,
-) -> torch.Tensor:
-    if not fqn.endswith(".weight"):
-        return tensor
-    module_name = fqn[: -len(".weight")]
-    module = module_map.get(module_name)
-    if not isinstance(module, LinearLoRA):
-        return tensor
-    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
-        return tensor
-
-    lora_a = (
-        module.lora_A.weight.full_tensor()
-        if isinstance(module.lora_A.weight, DTensor)
-        else module.lora_A.weight
-    )
-    lora_b = (
-        module.lora_B.weight.full_tensor()
-        if isinstance(module.lora_B.weight, DTensor)
-        else module.lora_B.weight
-    )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
-    scale = getattr(module, "scale", None)
-
-    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
-        scale = module.alpha / module.dim
-    if scale is None:
-        scale = 1.0
-
-    return tensor + torch.matmul(lora_b, lora_a) * scale
-
-
-def _maybe_adapt_tensor_to_hf(
-    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
-) -> list[tuple[str, torch.Tensor]]:
-    adapter = getattr(model_part, "state_dict_adapter", None)
-    if adapter:
-        return adapter.convert_single_tensor_to_hf(
-            fqn,
-            tensor,
-            exclude_key_regex=r".*_extra_state.*",
-            quantization=quantization,
-        )
-    return [(fqn, tensor)]
-
-
-@contextlib.contextmanager
-def get_train_context(
-    cp_size: int,
-    cp_mesh: Any,
-    cp_buffers: list,
-    sequence_dim: int,
-    dtype: torch.dtype,
-    autocast_enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Create combined context manager for training with context parallel and autocast."""
-    with contextlib.ExitStack() as stack:
-        context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=cp_mesh,
-                cp_buffers=cp_buffers,
-                cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                cp_no_restore_buffers=set(cp_buffers),
-            )
-
-        stack.enter_context(
-            get_train_context_automodel(False, False, context_parallel_ctx)()
-        )
-        if autocast_enabled:
-            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
-        yield
-
-
-def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
-
-    Args:
-        model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.

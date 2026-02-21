@@ -21,7 +21,7 @@ from collections import defaultdict
 
 from nemo_rl.data import multimodal_utils
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 _DEBUG=True
@@ -139,7 +139,7 @@ def conversation_process_message(
     return fragments
 
 
-class GeneralConversationsJsonlDataset:
+class GeneralConversationsJsonlDataset(RawDataset):
     """Loads general conversation datasets that have the json (manifest) files and media files in separate files (jsonl datasets).
 
     Each sample can be single/multi-turn converstaions with multiple modalities.

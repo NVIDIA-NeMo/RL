@@ -37,9 +37,6 @@ pytestmark = pytest.mark.run_first
 
 register_omegaconf_resolvers()
 
-if not OmegaConf.has_resolver("max"):
-    OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
-
 
 def validate_config_section(
     section_config: Dict[str, Any],

@@ -14,8 +14,8 @@
 
 import re
 import base64
-import inspect
 import decord
+import inspect
 from PIL import Image
 from io import BytesIO
 from collections import defaultdict
@@ -29,43 +29,6 @@ from transformers import PreTrainedTokenizerBase
 
 load_audio_kwargs = [param for param in inspect.signature(load_audio).parameters]
 load_video_kwargs = [param for param in inspect.signature(load_video).parameters]
-
-
-# List of allowed placeholder strings for different media types in the dataset string
-# e.g. "This is an example of <image>"
-media_tags = {
-    'image': '<image>',
-    'video': '<video>',
-    'audio': '<audio>',
-    'video-audio': '<video-audio>',
-}
-media_tags_reversed = {v: k for k, v in media_tags.items()}
-
-default_media_extensions = {
-    'image': ['png','jpeg','jpg', 'img'],
-    'video': ['mp4'],
-    'video-audio': ['mp4'],
-    'audio': ['wav', 'flac', "mp3"],
-}
-
-
-# different media namings maybe used in the raw dataset,
-# in which case, they need to be mapped to the allowed ones
-# WARNING: values cannot be used as the keys in the same dict to avoid cyclic graph
-media_tags_to_allowed = {
-    'speech': 'audio',
-    'speeches': 'audio',
-    'sound': 'audio',
-    'audios': 'audio',
-    'images': 'image',
-    'videos': 'video',
-}
-
-
-# Build a pattern like: <image>|<video>|<audio>|<video-audio>
-media_tag_pattern = re.compile(
-    r"(" + "|".join(re.escape(tag) for tag in media_tags.values()) + ")"
-)
 
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -347,7 +310,7 @@ def load_media_from_message(
         multimodal_load_kwargs = get_multimodal_default_settings_from_processor(processor)
 
     if "image" in media_in_message:
-        loaded_media["image"] += [Image.open(img) if isinstance(img, str) else img for img in media_in_message["image"]]
+        loaded_media["image"] += [resolve_to_image(img) for img in media_in_message["image"]]
     if "audio" in media_in_message:
         for aud in media_in_message["audio"]:
             if isinstance(aud, str):

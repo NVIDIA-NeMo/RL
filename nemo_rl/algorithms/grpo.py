@@ -1513,11 +1513,6 @@ def grpo_train(
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
-                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
-                        rollout_metrics["mean_gen_tokens_per_sample"]
-                    )
-                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
-
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
                 )
@@ -1594,21 +1589,6 @@ def grpo_train(
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
-
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
-                    del prompt_batched_flat
-                    del input_ids
-                    del baseline
-                    del std
 
                     # Extract prompt-only messages for advantage estimation
                     prompt_only_message_logs = _extract_prompt_only_messages(
@@ -1821,7 +1801,6 @@ def grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -1982,21 +1961,29 @@ def grpo_train(
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {"content": metrics_logging_data["content"]}
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
-
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
+
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
                 del log_data
+            del flat_messages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"

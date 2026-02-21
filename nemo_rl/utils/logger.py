@@ -463,10 +463,6 @@ class SwanlabLogger(LoggerInterface):
         """Log histogram metrics to swanlab."""
         return
 
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to swanlab."""
-        return
-
 
 class GpuMetricSnapshot(TypedDict):
     step: int
@@ -870,10 +866,6 @@ class MLflowLogger(LoggerInterface):
         mlflow.log_figure(
             figure, f"plots/{name}.png", save_kwargs={"bbox_inches": "tight"}
         )
-
-    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to MLflow."""
-        return
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to MLflow."""
