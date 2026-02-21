@@ -536,6 +536,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             data = self.data
 
         aggregated_shards = [SlicedDataDict() for _ in range(shards)]
+        shard_tensor_chunks: list[dict[str, list[torch.Tensor]]] = [
+            {} for _ in range(shards)
+        ]
+        shard_packed_chunks: list[dict[str, list[PackedTensor]]] = [
+            {} for _ in range(shards)
+        ]
 
         # Group data by shard position across all chunks
         for shard_idx in range(shards):
@@ -552,38 +558,30 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 indices = torch.arange(shard_start, shard_end)
 
                 for k in data:
-                    if k not in aggregated_shards[shard_idx]:
-                        # First time seeing this key for this shard, initialize it
-                        if torch.is_tensor(data[k]):
-                            aggregated_shards[shard_idx][k] = data[k][indices].clone()
-                        elif isinstance(data[k], PackedTensor):
-                            aggregated_shards[shard_idx][k] = data[k].slice(
-                                indices.tolist()
-                            )
-                        else:
-                            aggregated_shards[shard_idx][k] = [
-                                data[k][i] for i in indices
-                            ]
+                    if torch.is_tensor(data[k]):
+                        shard_tensor_chunks[shard_idx].setdefault(k, []).append(
+                            data[k][indices].clone()
+                        )
+                    elif isinstance(data[k], PackedTensor):
+                        shard_packed_chunks[shard_idx].setdefault(k, []).append(
+                            data[k].slice(indices.tolist())
+                        )
+                    elif k not in aggregated_shards[shard_idx]:
+                        aggregated_shards[shard_idx][k] = [data[k][i] for i in indices]
                     else:
-                        # Append to existing data - concatenate tensors or extend lists
-                        if torch.is_tensor(data[k]):
-                            aggregated_shards[shard_idx][k] = torch.cat(
-                                [
-                                    aggregated_shards[shard_idx][k],
-                                    data[k][indices].clone(),
-                                ]
-                            )
-                        elif isinstance(data[k], PackedTensor):
-                            aggregated_shards[shard_idx][k] = PackedTensor.concat(
-                                [
-                                    aggregated_shards[shard_idx][k],
-                                    data[k].slice(indices.tolist()),
-                                ]
-                            )
-                        else:
-                            aggregated_shards[shard_idx][k].extend(
-                                [data[k][i] for i in indices]
-                            )
+                        aggregated_shards[shard_idx][k].extend(
+                            [data[k][i] for i in indices]
+                        )
+
+        for shard_idx in range(shards):
+            for k, chunks in shard_tensor_chunks[shard_idx].items():
+                aggregated_shards[shard_idx][k] = (
+                    torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                )
+            for k, chunks in shard_packed_chunks[shard_idx].items():
+                aggregated_shards[shard_idx][k] = (
+                    PackedTensor.concat(chunks) if len(chunks) > 1 else chunks[0]
+                )
 
         # map inputs to microbatches such that the total number tokens in
         # a microbatch is as close to (including padding tokens) 'max_tokens_per_microbatch'
