@@ -1299,12 +1299,14 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
+            policy.offload_before_refit()
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
+            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -1495,6 +1497,8 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
+
+    to_compute_kl = master_config["loss_fn"]["reference_policy_kl_penalty"] > 0
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -1551,18 +1555,20 @@ def grpo_train(
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
-                    # Repeat batch items
-                    repeated_batch: BatchedDataDict[DatumSpec] = (
-                        batch.repeat_interleave(
-                            master_config["grpo"]["num_generations_per_prompt"]
+                    with timer.time("repeat_interleaving"):
+                        # Repeat batch items
+                        repeated_batch: BatchedDataDict[DatumSpec] = (
+                            batch.repeat_interleave(
+                                master_config["grpo"]["num_generations_per_prompt"]
+                            )
                         )
-                    )
-                    # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    input_ids = batched_flat["token_ids"]
+                    with timer.time("batch_message"):
+                        # Convert LLMMessageLogType to FlatMessagesType for generation
+                        batched_flat, input_lengths = batched_message_log_to_flat_message(
+                            repeated_batch["message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        input_ids = batched_flat["token_ids"]
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
@@ -1800,59 +1806,65 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
-                    if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
+                    with timer.time("overlong_filter"):
+                        use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                        if use_overlong_filtering:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            truncated = repeated_batch["truncated"]
 
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
 
-                        loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
-                    # Add loss mask to each message in LLMMessageLogType
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                            loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    # Convert updated LLMMessageLogType to FlatMessagesType for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
+                    with timer.time("add_loss_mask"):
+                        # Add loss mask to each message in LLMMessageLogType
+                        for i, message_log in enumerate(repeated_batch["message_log"]):
+                            for j, message in enumerate(message_log):
+                                if message["role"] == "assistant":
+                                    message["token_loss_mask"] = torch.ones_like(
+                                        message["token_ids"]
+                                    )
+                                else:
+                                    message["token_loss_mask"] = torch.zeros_like(
+                                        message["token_ids"]
+                                    )
+                                if "generation_logprobs" not in message:
+                                    message["generation_logprobs"] = torch.zeros_like(
+                                        message["token_ids"], dtype=torch.float32
+                                    )
 
-                    # Create training data from flattened messages
-                    # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
-                    )
+                    with timer.time("message_to_flat"):
+                        # Convert updated LLMMessageLogType to FlatMessagesType for training
+                        flat_messages, input_lengths = batched_message_log_to_flat_message(
+                            repeated_batch["message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=master_config["policy"][
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+
+                    with timer.time("flatten"):
+                        # Create training data from flattened messages
+                        # Note: advantages will be computed and added after logprobs are available
+                        train_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": flat_messages["token_ids"],
+                                "input_lengths": input_lengths,
+                                "generation_logprobs": flat_messages["generation_logprobs"],
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                            }
+                        )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
-                    extra_multimodal_data = flat_messages.get_multimodal_dict(
-                        as_tensors=False
-                    )
-                    train_data.update(extra_multimodal_data)
-                    train_data.to("cpu")
+                    with timer.time("multimodal_dict"):
+                        extra_multimodal_data = flat_messages.get_multimodal_dict(
+                            as_tensors=False
+                        )
+                        train_data.update(extra_multimodal_data)
+                        train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
@@ -1875,7 +1887,7 @@ def grpo_train(
                         logprob_data, timer=timer
                     )["logprobs"]
 
-                    if not master_config["grpo"].get(
+                    if to_compute_kl and not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         train_data["reference_policy_logprobs"] = (
@@ -2587,6 +2599,7 @@ def async_grpo_train(
     num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
     samples_per_prompt_group = master_config["grpo"]["num_generations_per_prompt"]
     train_gbs = master_config["policy"]["train_global_batch_size"]
+    to_compute_kl = master_config["loss_fn"]["reference_policy_kl_penalty"] > 0
 
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
@@ -2939,10 +2952,13 @@ def async_grpo_train(
                         train_data,
                         timer=timer,
                     )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["reference_logprobs"]
+                    if to_compute_kl:
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["reference_logprobs"]
+                    else:
+                        reference_logprobs = torch.zeros_like(fprop_logprobs)
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 

@@ -433,11 +433,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     tool_parser=tool_parser,
                     add_special_tokens=add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0][
+                actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[2][
+                engine_prompt = res[1][
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
