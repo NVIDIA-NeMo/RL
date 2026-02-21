@@ -536,42 +536,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             data = self.data
 
         aggregated_shards = [SlicedDataDict() for _ in range(shards)]
-        tensor_keys = [k for k, v in data.items() if torch.is_tensor(v)]
-        packed_keys = [k for k, v in data.items() if isinstance(v, PackedTensor)]
-        other_keys = [k for k in data if k not in tensor_keys and k not in packed_keys]
 
         # Group data by shard position across all chunks.
-        # Tensor fields are pre-allocated and filled exactly once per chunk.
         for shard_idx in range(shards):
-            shard_tensor_offsets: dict[str, int] = {}
-            for k in tensor_keys:
-                if allow_uneven_shards:
-                    rows = 0
-                    for chunk_idx in range(num_chunks):
-                        chunk_start = chunk_idx * batch_size
-                        shard_start = min(
-                            chunk_start + shard_idx * shard_size, total_batch_size
-                        )
-                        shard_end = min(
-                            chunk_start + (shard_idx + 1) * shard_size, total_batch_size
-                        )
-                        rows += max(0, shard_end - shard_start)
-                else:
-                    rows = num_chunks * shard_size
-
-                aggregated_shards[shard_idx][k] = torch.empty(
-                    (rows, *data[k].shape[1:]),
-                    dtype=data[k].dtype,
-                    device=data[k].device,
-                )
-                shard_tensor_offsets[k] = 0
-
-            shard_packed_chunks: dict[str, list[PackedTensor]] = {
-                k: [] for k in packed_keys
-            }
-            for k in other_keys:
-                aggregated_shards[shard_idx][k] = []
-
+            shard_ranges: list[tuple[int, int]] = []
             for chunk_idx in range(num_chunks):
                 chunk_start = chunk_idx * batch_size
                 shard_start = chunk_start + shard_idx * shard_size
@@ -579,32 +547,42 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 if allow_uneven_shards:
                     shard_start = min(shard_start, total_batch_size)
                     shard_end = min(shard_end, total_batch_size)
-                if shard_start >= shard_end:
-                    continue
+                if shard_start < shard_end:
+                    shard_ranges.append((shard_start, shard_end))
 
-                slice_len = shard_end - shard_start
-                for k in tensor_keys:
-                    shard_tensor = aggregated_shards[shard_idx][k]
-                    offset = shard_tensor_offsets[k]
-                    shard_tensor[offset : offset + slice_len].copy_(
-                        data[k][shard_start:shard_end]
+            # Process each key by data type.
+            for k, v in data.items():
+                if torch.is_tensor(v):
+                    # Pre-allocate and copy each chunk exactly once.
+                    rows = sum(end - start for start, end in shard_ranges)
+                    shard_tensor = torch.empty(
+                        (rows, *v.shape[1:]),
+                        dtype=v.dtype,
+                        device=v.device,
                     )
-                    shard_tensor_offsets[k] = offset + slice_len
-
-                packed_slice_indices = list(range(shard_start, shard_end))
-                for k in packed_keys:
-                    shard_packed_chunks[k].append(data[k].slice(packed_slice_indices))
-
-                for k in other_keys:
-                    aggregated_shards[shard_idx][k].extend(
-                        [data[k][i] for i in packed_slice_indices]
-                    )
-
-            for k, chunks in shard_packed_chunks.items():
-                if chunks:
-                    aggregated_shards[shard_idx][k] = (
-                        PackedTensor.concat(chunks) if len(chunks) > 1 else chunks[0]
-                    )
+                    offset = 0
+                    for start, end in shard_ranges:
+                        span = end - start
+                        shard_tensor[offset : offset + span].copy_(v[start:end])
+                        offset += span
+                    aggregated_shards[shard_idx][k] = shard_tensor
+                elif isinstance(v, PackedTensor):
+                    # PackedTensor is collected per chunk then concatenated once.
+                    packed_slices = [
+                        v.slice(list(range(start, end))) for start, end in shard_ranges
+                    ]
+                    if packed_slices:
+                        aggregated_shards[shard_idx][k] = (
+                            PackedTensor.concat(packed_slices)
+                            if len(packed_slices) > 1
+                            else packed_slices[0]
+                        )
+                else:
+                    # Append list-like data in shard order across chunks.
+                    shard_values = []
+                    for start, end in shard_ranges:
+                        shard_values.extend([v[i] for i in range(start, end)])
+                    aggregated_shards[shard_idx][k] = shard_values
 
         # map inputs to microbatches such that the total number tokens in
         # a microbatch is as close to (including padding tokens) 'max_tokens_per_microbatch'
