@@ -541,16 +541,19 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for shard_idx in range(shards):
             shard_ranges: list[tuple[int, int]] = []
             for chunk_idx in range(num_chunks):
+                # Calculate indices for this particular sub-shard within the chunk
                 chunk_start = chunk_idx * batch_size
                 shard_start = chunk_start + shard_idx * shard_size
                 shard_end = chunk_start + (shard_idx + 1) * shard_size
                 if allow_uneven_shards:
+                    # Cap the end index at the total batch size for the last shard
+                    # or if shard_end calculation goes beyond total_batch_size
                     shard_start = min(shard_start, total_batch_size)
                     shard_end = min(shard_end, total_batch_size)
+                
                 if shard_start < shard_end:
                     shard_ranges.append((shard_start, shard_end))
 
-            # Process each key by data type.
             for k, v in data.items():
                 if torch.is_tensor(v):
                     # Pre-allocate and copy each chunk exactly once.
@@ -578,10 +581,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                             else packed_slices[0]
                         )
                 else:
-                    # Append list-like data in shard order across chunks.
                     shard_values = []
                     for start, end in shard_ranges:
                         shard_values.extend([v[i] for i in range(start, end)])
+                        
                     aggregated_shards[shard_idx][k] = shard_values
 
         # map inputs to microbatches such that the total number tokens in
