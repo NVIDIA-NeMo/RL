@@ -32,6 +32,15 @@ class NemoGymConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
 
 
+class GenRMCompareConfig(TypedDict, total=False):
+    """Configuration for GenRM batch comparison."""
+
+    enabled: bool
+    agent_names: List[str]
+    server_name: str
+    num_generations_per_prompt: int
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -132,15 +141,39 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        genrm_config: Optional[GenRMCompareConfig] = None,
     ) -> list[dict]:
         timer = Timer()
+
+        # Build comparison strategy if GenRM is enabled
+        comparison_strategy = None
+        if genrm_config and genrm_config.get("enabled", False):
+            from nemo_gym.comparison_strategies import (
+                GenRMStrategy,
+                GenRMStrategyConfig,
+            )
+
+            comparison_strategy = GenRMStrategy(
+                GenRMStrategyConfig(
+                    agent_names=genrm_config.get("agent_names", ["genrm_simple_agent"]),
+                    genrm_compare_server_name=genrm_config.get(
+                        "server_name", "genrm_compare"
+                    ),
+                    policy_model_server_name="policy_model",
+                    num_generations_per_prompt=genrm_config.get(
+                        "num_generations_per_prompt", 16
+                    ),
+                )
+            )
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+                comparison_strategy=comparison_strategy,
             )
 
             nemo_rl_rowidxs = []

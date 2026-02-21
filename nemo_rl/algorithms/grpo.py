@@ -1637,6 +1637,19 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
+                            # GenRM compare config
+                            use_genrm_compare=master_config["env"].get(
+                                "use_genrm_compare", False
+                            ),
+                            num_generations_per_prompt=master_config["grpo"][
+                                "num_generations_per_prompt"
+                            ],
+                            genrm_compare_server_name=master_config["env"].get(
+                                "genrm_compare_server_name", "genrm_compare"
+                            ),
+                            genrm_agent_names=master_config["env"].get(
+                                "genrm_agent_names", ["genrm_simple_agent"]
+                            ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2324,6 +2337,16 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
+        # Validate GenRM compare configuration
+        use_genrm_compare = master_config["env"].get("use_genrm_compare", False)
+        num_val_gens = master_config["grpo"].get("num_val_generations_per_prompt", 1)
+        if use_genrm_compare and num_val_gens <= 1:
+            raise ValueError(
+                f"GenRM compare requires num_val_generations_per_prompt > 1 for pairwise comparison, "
+                f"but got num_val_generations_per_prompt={num_val_gens}. "
+                f"Set grpo.num_val_generations_per_prompt to at least 2."
+            )
+
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
@@ -2337,6 +2360,14 @@ def validate(
                 break
 
             additional_metrics_to_report = dict()
+
+            # Duplicate prompts for multiple generations per prompt during validation
+            # Similar to training, this allows evaluating model consistency and diversity
+            if num_val_gens > 1:
+                val_batch_for_rollout = val_batch.repeat_interleave(num_val_gens)
+            else:
+                val_batch_for_rollout = val_batch
+
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -2344,13 +2375,22 @@ def validate(
                 generation_config = master_config["policy"]["generation"]
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
-                    input_batch=val_batch,
+                    input_batch=val_batch_for_rollout,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    # GenRM compare config
+                    use_genrm_compare=use_genrm_compare,
+                    num_generations_per_prompt=num_val_gens,
+                    genrm_compare_server_name=master_config["env"].get(
+                        "genrm_compare_server_name", "genrm_compare"
+                    ),
+                    genrm_agent_names=master_config["env"].get(
+                        "genrm_agent_names", ["genrm_simple_agent"]
+                    ),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -2358,7 +2398,7 @@ def validate(
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
-                    val_batch,
+                    val_batch_for_rollout,
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
@@ -2368,7 +2408,7 @@ def validate(
             else:
                 val_batch, gen_metrics = run_multi_turn_rollout(
                     policy_generation,
-                    val_batch,
+                    val_batch_for_rollout,
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],

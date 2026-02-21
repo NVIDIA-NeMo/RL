@@ -1016,6 +1016,11 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    # GenRM compare config
+    use_genrm_compare: bool = False,
+    num_generations_per_prompt: Optional[int] = None,
+    genrm_compare_server_name: str = "genrm_compare",
+    genrm_agent_names: Optional[list[str]] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
@@ -1058,11 +1063,24 @@ def run_async_nemo_gym_rollout(
 
         row["_rowidx"] = rowidx
 
+    # Build GenRM config if enabled
+    genrm_config = None
+    if use_genrm_compare:
+        assert num_generations_per_prompt is not None, (
+            "num_generations_per_prompt must be provided when use_genrm_compare is True"
+        )
+        genrm_config = {
+            "enabled": True,
+            "agent_names": genrm_agent_names or ["genrm_simple_agent"],
+            "server_name": genrm_compare_server_name,
+            "num_generations_per_prompt": num_generations_per_prompt,
+        }
+
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
         results, rollout_loop_timing_metrics = ray.get(
             nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
+                nemo_gym_rows, tokenizer, timer_prefix, genrm_config
             )
         )
 
