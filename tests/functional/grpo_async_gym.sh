@@ -21,6 +21,19 @@ mkdir -p $EXP_DIR $LOG_DIR $CHECKPOINT_DIR $DATA_DIR
 
 cd $PROJECT_ROOT
 
+# Follow nemo-gym instructions here to get this data:
+# https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup
+cd 3rdparty/Gym-workspace/Gym
+config_paths="responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,\
+resources_servers/workplace_assistant/configs/workplace_assistant.yaml"
+
+uv run ng_prepare_data "+config_paths=[${config_paths}]" \
+    +output_dirpath=data/workplace_assistant \
+    +mode=train_preparation \
+    +should_download=true \
+    +data_source=huggingface
+cd -
+
 # This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
 # which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
 # smoke test, we trim all but the first tool
