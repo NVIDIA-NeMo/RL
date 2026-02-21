@@ -53,6 +53,7 @@ dependencies = [
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
+  "setuptools_scm",
 ]
 
 [project.optional-dependencies]
@@ -69,16 +70,7 @@ automodel = [
   "transformer-engine[pytorch]==2.8.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
-vllm = [
-  "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
-  # deep_ep also needs libibverbs-dev
-  # sudo apt-get update
-  # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.11.2",
-  "num2words>=0.5.14",
-]
+vllm = ["cuda-python", "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c", "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480", "num2words>=0.5.14", "vllm"]
 sglang = [
   "sglang==0.5.7",
   "orjson",
@@ -187,6 +179,7 @@ causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
+vllm = {path = "3rdparty/vllm", editable = true}
 
 [tool.uv.workspace]
 members = [
@@ -225,6 +218,7 @@ no-build-isolation-package = [
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sgl-kernel",
+  "vllm",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd

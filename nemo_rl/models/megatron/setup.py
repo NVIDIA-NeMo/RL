@@ -312,6 +312,9 @@ def setup_model_config(
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
+
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
 
@@ -404,6 +407,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply Multi Token Prediction configuration."""
+    model_cfg.mtp_loss_scaling_factor = config["megatron_cfg"][
+        "mtp_loss_scaling_factor"
+    ]
+    model_cfg.mtp_use_repeated_layer = config["megatron_cfg"][
+        "mtp_use_repeated_layer"
+    ]
+    # In mcore, mtp_num_layers is used for both number of MTP layers when mtp_use_repeated_layer is False and number of times to repeat the MTP layer when mtp_use_repeated_layer is True
+    model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
+    model_cfg.mtp_detach_heads = config["megatron_cfg"]["mtp_detach_heads"]
 
 
 def _apply_precision_config(

@@ -146,6 +146,13 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    # In mcore, mtp_num_layers is used for both number of MTP layers when mtp_use_repeated_layer is False and number of times to repeat the MTP layer when mtp_use_repeated_layer is True
+    mtp_num_layers: 0
+    # If true, detach MTP heads from main model - MTP loss won't affect main model gradients
+    mtp_detach_heads: false
+
 
     optimizer:
       optimizer: "adam"
