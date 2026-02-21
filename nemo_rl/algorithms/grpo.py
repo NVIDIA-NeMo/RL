@@ -646,6 +646,7 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
+    init_reference_model = master_config["loss_fn"]["reference_policy_kl_penalty"] > 0
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
@@ -657,6 +658,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
 
