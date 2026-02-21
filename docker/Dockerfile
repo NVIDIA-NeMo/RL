@@ -116,17 +116,16 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
-# First copy only the dependency files
-COPY --from=nemo-rl pyproject.toml uv.lock ./
-# Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
-COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
-COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
-COPY --from=nemo-rl --link research/ ./research/
-COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
+# Copy in source from build context (defaults to cloned repo, can be overridden)
+COPY --from=nemo-rl . /opt/nemo-rl
+# Unshallow the repo to get the full history (in the case it was from the scratch layer).
+# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
+# so do a quick check before trying to unshallow.
+RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
+# The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
@@ -189,13 +188,6 @@ LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
-# Copy in source from build context (defaults to cloned repo, can be overridden)
-# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
-# Unshallow the repo to get the full history (in the case it was from the scratch layer).
-# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
-# so do a quick check before trying to unshallow.
-RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
