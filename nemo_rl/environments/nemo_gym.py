@@ -282,6 +282,20 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             )
             output_item_dict.pop("generation_log_probs")
 
+        if not nemo_rl_message_log:
+            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            prompt_token_ids = tokenizer.apply_chat_template(
+                input_messages, tokenize=True
+            )
+            raise ValueError(
+                f"NeMo Gym returned a result with no generation data. "
+                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated.\n"
+                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
+                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"to a value larger than {len(prompt_token_ids)}."
+            )
+
         return {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
