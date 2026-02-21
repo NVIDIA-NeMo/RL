@@ -2821,16 +2821,31 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
-                    # Aggregate rollout metrics across groups (simple mean where applicable)
+                    # Aggregate rollout metrics across groups with proper aggregation per metric type
                     rollout_metrics = {}
                     for t in trajectories:
                         for k, v in t["rollout_metrics"].items():
                             rollout_metrics.setdefault(k, []).append(v)
-                    # TODO: this simple averaging might cause misleading information for such data as max_gen_tokens, etc.
-                    rollout_metrics = {
-                        k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
-                        for k, v in rollout_metrics.items()
-                    }
+                    # Aggregate metrics properly based on their semantics
+                    aggregated_rollout_metrics = {}
+                    for k, v in rollout_metrics.items():
+                        if not isinstance(v[0], (int, float)):
+                            aggregated_rollout_metrics[k] = v
+                        elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
+                            # For min metrics, take the actual minimum
+                            # Handles both "key/min" format and "min_key" format (but not "min_*_rate" which are averages)
+                            aggregated_rollout_metrics[k] = min(v)
+                        elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
+                            # For max metrics, take the actual maximum
+                            # Handles both "key/max" format and "max_key" format (but not "max_*_rate" which are averages)
+                            aggregated_rollout_metrics[k] = max(v)
+                        elif k == "total_turns":
+                            # For total counts, sum them
+                            aggregated_rollout_metrics[k] = sum(v)
+                        else:
+                            # For mean/rate metrics, take the average
+                            aggregated_rollout_metrics[k] = sum(v) / len(v)
+                    rollout_metrics = aggregated_rollout_metrics
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
