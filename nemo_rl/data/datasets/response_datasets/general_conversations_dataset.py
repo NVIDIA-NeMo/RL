@@ -146,43 +146,43 @@ class GeneralConversationsJsonlDataset(RawDataset):
     Each modality can have one or more number of media objects.
     There is no requiement of where the media tag (e.g. '<sound>') should appear in the conversations.
 
-    The structure of the jsonl files could be like this:
+    The structure of the jsonl files could be like this.
 
-    ```media files
-    sample_000001.2345ew.flac
-    sample_000001.35tags.mp4
-    sample_000001.as23ds.jpg
-    sample_000001.gd1dtg.wav
-    sample_000001.gds233.jpg
-    sample_000002.asf234.wav
-    ...
-    ```
+    Example media filenames::
 
-    ```json structure
-    {
-      "sound": ["sample_000001.2345ew.flac", "sample_000001.gd1dtg.wav"],
-      "video": "sample_000001.35tags.mp4",
-      "image": ["sample_000001.as23ds.jpg", "sample_000001.gds233.jpg"],
-      "conversations": [
+        sample_000001.2345ew.flac
+        sample_000001.35tags.mp4
+        sample_000001.as23ds.jpg
+        sample_000001.gd1dtg.wav
+        sample_000001.gds233.jpg
+        sample_000002.asf234.wav
+        ...
+
+    Example JSON structure::
+
         {
-          "from": "user",
-          "value": "<sound>"
-        },
-        {
-          "from": "assistant",
-          "value": "Automatic speech recognition is a technology that allows computers to recognize and transcribe spoken language. In the NeMo Framework, ASR is used for tasks such as speech-to-text and voice recognition."
-        },
-        {
-          "from": "user",
-          "value": "Describe what is NeMo based on the tutorial video: <video> and the information in the two images: <image> <image>. Combine that information with sound <sound>. Answer: "
-        },
-        {
-          "from": "assistant",
-          "value": "The NeMo Framework provides a range of tools and features for training and deploying ASR models, including model parallelism, data parallelism, and distributed checkpointing. This allows for faster training and inference times, as well as improved model accuracy and reliability."
+          "sound": ["sample_000001.2345ew.flac", "sample_000001.gd1dtg.wav"],
+          "video": "sample_000001.35tags.mp4",
+          "image": ["sample_000001.as23ds.jpg", "sample_000001.gds233.jpg"],
+          "conversations": [
+            {
+              "from": "user",
+              "value": "<sound>"
+            },
+            {
+              "from": "assistant",
+              "value": "Automatic speech recognition is a technology that allows computers to recognize and transcribe spoken language. In the NeMo Framework, ASR is used for tasks such as speech-to-text and voice recognition."
+            },
+            {
+              "from": "user",
+              "value": "Describe what is NeMo based on the tutorial video: <video> and the information in the two images: <image> <image>. Combine that information with sound <sound>. Answer: "
+            },
+            {
+              "from": "assistant",
+              "value": "The NeMo Framework provides a range of tools and features for training and deploying ASR models, including model parallelism, data parallelism, and distributed checkpointing. This allows for faster training and inference times, as well as improved model accuracy and reliability."
+            }
+          ]
         }
-      ]
-    }
-    ```
     """
 
     task_name = "general-conversation-jsonl"
