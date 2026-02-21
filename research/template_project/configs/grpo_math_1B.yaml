@@ -18,8 +18,8 @@ grpo:
   # Options: "grpo" (default) or "reinforce_plus_plus"
   adv_estimator:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
-    normalize_rewards: true
-    use_leave_one_out_baseline: false
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   async_grpo:
     enabled: false # Set to true to enable async training mode
