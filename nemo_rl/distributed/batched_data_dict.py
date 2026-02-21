@@ -550,7 +550,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     # or if shard_end calculation goes beyond total_batch_size
                     shard_start = min(shard_start, total_batch_size)
                     shard_end = min(shard_end, total_batch_size)
-                
+
                 if shard_start < shard_end:
                     shard_ranges.append((shard_start, shard_end))
 
@@ -576,7 +576,11 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         v.slice(list(range(start, end))) for start, end in shard_ranges
                     ]
 
-                    aggregated_shards[shard_idx][k] = PackedTensor.concat(packed_slices) if packed_slices else PackedTensor.empty_like(v)
+                    aggregated_shards[shard_idx][k] = (
+                        PackedTensor.concat(packed_slices)
+                        if packed_slices
+                        else PackedTensor.empty_like(v)
+                    )
                 else:
                     shard_values = []
                     for start, end in shard_ranges:
