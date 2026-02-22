@@ -211,7 +211,7 @@ overrides = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.9.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", specifier = "==2.9.0" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.12.0" },
 ]
 
 [[manifest.dependency-metadata]]
@@ -4855,8 +4855,8 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.8.0" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.12.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.12.0" },
     { name = "transformers", specifier = "==4.57.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "uvloop", marker = "extra == 'sglang'" },
@@ -5018,6 +5018,19 @@ dependencies = [
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "wheel" },
+]
+
+[[package]]
+name = "nvdlfw-inspect"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/86/94188e03e5d4dd7b73c390b0cddcde5618b3799c18e327b2bf15763f6137/nvdlfw_inspect-0.2.2-py3-none-any.whl", hash = "sha256:8a4dc2814c5a4cd19ae304170b9bfa514538ef3c3eb243a45a82404ec3cb279d", size = 30964, upload-time = "2025-12-03T10:52:01.933Z" },
 ]
 
 [[package]]
@@ -9178,13 +9191,10 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.8.0"
+version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "transformer-engine-cu12" },
-]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/be/a7cf5f28b7abbe966956217b18208fc34cc9bfaf62fa9472c0603db74899/transformer_engine-2.8.0-py3-none-any.whl", hash = "sha256:795b056d31b0f67f5d7432725177782dd5084090c1e3c52532577070947fe9a7", size = 638319, upload-time = "2025-10-07T04:55:34.115Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/1d/831c836ceb550b2273a68b25948dab870d4c8b3d62860855d5736be8829d/transformer_engine-2.12.0-py3-none-any.whl", hash = "sha256:5d0539c520c39445c62feab9d1fab774ed2e27a576d0feac2086ce86e0bff7c4", size = 739825, upload-time = "2026-02-21T06:04:03.335Z" },
 ]
 
 [package.optional-dependencies]
@@ -9194,7 +9204,7 @@ pytorch = [
 
 [[package]]
 name = "transformer-engine-cu12"
-version = "2.8.0"
+version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -9202,22 +9212,26 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/db/cde3e772cf5cd7e941b64d37e4a61e2762f36ecc2e6508525af536076f8d/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:3a92c781fc3c1a3a6a0009871a36903fa364b2d51ce06b06641d29aeefd59310", size = 480373707, upload-time = "2025-10-07T05:03:05.392Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/14/67860f2f1f9d0eca4a8e5e0cef5a0de5c4fc26340625051f032d16913d8c/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8ee5f9df586491a35fd1a01cb95b6970a9f01a5e8f935ecdacd56173c44d6a67", size = 480875025, upload-time = "2025-10-07T04:54:43.762Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/1a/3170941ab13fb230aaadb0b27b31ae3430d5cddb7a41ea0ee4891b0d15df/transformer_engine_cu12-2.12.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:4a9764526581adc8968aab21e22681a4690847c9e087a39df8ea21ceca0a4fe5", size = 311258513, upload-time = "2026-02-21T06:04:19.627Z" },
+    { url = "https://files.pythonhosted.org/packages/44/76/cd797712c9d0dad83d4874a84acac9f80d2b8e64bdaea800bfa3ea94787f/transformer_engine_cu12-2.12.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8bfb8137e17fb1d93d86d92d3c58dce14754d37b61263dc6cc3abac4165b1c03", size = 311834847, upload-time = "2026-02-21T06:04:18.865Z" },
 ]
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.8.0"
+version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
+    { name = "nvdlfw-inspect" },
     { name = "onnx" },
     { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "transformer-engine-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/63/1e3953244ed4f318f87889309a56cdd664759f007967eb850ee415a5584d/transformer_engine_torch-2.8.0.tar.gz", hash = "sha256:ce09f1bd9b8e532a5c347b9e9b3a3a771722095daddca673ae82ccce8e68d759", size = 209805, upload-time = "2025-10-07T04:54:11.134Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/aa/5872f0944e88b9a7a0074f207178e18d183916bc05887bf1d76947769d94/transformer_engine_torch-2.12.0.tar.gz", hash = "sha256:ca12cb27fa8b68818f2f11c5c4147c62ffec3d30f9db61642ea3f1b3baf3d428", size = 268222, upload-time = "2026-02-21T06:04:15.181Z" }
 
 [[package]]
 name = "transformers"

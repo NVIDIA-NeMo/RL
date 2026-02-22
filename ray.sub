@@ -5,7 +5,6 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
-#SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -581,8 +580,25 @@ done
 # At this stage the Ray cluster bringup has started on the physical nodes in the allocation
 # Before we launch a job on this cluster we need to make sure that the bringup is complete
 # We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
+
+# Helper function to get container PID using enroot (workaround for --container-name shebang issues)
+get_container_pid() {
+  local node=$1
+  local container_name=$2
+  # Use --overlap WITHOUT --container-name, then use enroot to find the container
+  srun --overlap --nodes=1 --ntasks=1 -w "$node" bash -c "enroot list -f | grep -E '($container_name|<unknown>)' | grep -oP '\s+\K\d+' | head -1"
+}
+
 extract_worker_units() {
-  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" ray status)
+  # Get the container PID for ray-head
+  head_container_pid=$(get_container_pid "$head_node" "ray-head")
+  if [[ -z "$head_container_pid" ]]; then
+    echo 0
+    return
+  fi
+
+  # Execute ray status inside the container using enroot exec
+  status_output=$(srun --overlap --nodes=1 --ntasks=1 -w "$head_node" enroot exec "$head_container_pid" ray status 2>/dev/null || true)
   if echo "$status_output" | grep -q "worker_units"; then
     worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
     echo $worker_units
@@ -614,7 +630,9 @@ echo "All workers connected!"
 _RAW_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 CONTAINER_CWD="${_RAW_CWD/\/scratch\/fsw\//\/lustre\/fsw\/}"
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+  # Use enroot exec to run the command inside the ray-head container (avoids --container-workdir chdir issues)
+  head_container_pid=$(get_container_pid "$head_node" "ray-head")
+  srun --overlap --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "cd $CONTAINER_CWD && $COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
@@ -622,34 +640,41 @@ else
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
 
-# Auto-setup cuDNN environment if available
+# Auto-setup cuDNN environment
 CUDNN_SETUP=""
 if [[ "$CUDNN_INSTALL" == "1" ]]; then
   CUDNN_SETUP="export CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} && export LD_LIBRARY_PATH=\\\${CUDNN_HOME}/lib:\\\${LD_LIBRARY_PATH:-} && "
 fi
 
+# Helper to get container PID
+get_container_pid() {
+  local node=\$1
+  local container_name=\$2
+  srun --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "enroot list -f | grep -E '(\$container_name|<unknown>)' | grep -oP '\s+\K\d+' | head -1"
+}
+
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
+  HEAD_PID=\$(get_container_pid "$head_node" "ray-head")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\${CUDNN_SETUP}\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}\$COMMAND"
   else
-    # Set up cuDNN environment and start interactive shell
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}exec bash"
   fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
-  # and use nodes_array[1] through nodes_array[N-1]
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
   fi
   nodes_array=($nodes)
+  node="\${nodes_array[\$WORKER_NUM]}"
+  WORKER_PID=\$(get_container_pid "\$node" "ray-worker-\$WORKER_NUM")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\${CUDNN_SETUP}\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}\$COMMAND"
   else
-    # Set up cuDNN environment and start interactive shell
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty env CUDNN_HOME=/tmp/${CUDNN_HOME_DIR} bash -c 'export LD_LIBRARY_PATH=\${CUDNN_HOME}/lib:\${LD_LIBRARY_PATH:-}; echo "[INFO] CUDNN_HOME=\$CUDNN_HOME"; echo "[INFO] cuDNN libs:"; ls \${CUDNN_HOME}/lib/libcudnn.so* 2>/dev/null | head -2 || echo "  (checking...)"; exec bash'
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}exec bash"
   fi
 fi
 EOF

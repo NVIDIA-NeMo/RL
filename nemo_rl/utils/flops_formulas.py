@@ -57,6 +57,10 @@ class FLOPSConfig:
     mamba_head_dim: Optional[int] = None
     mamba_num_groups: Optional[int] = None
     mamba_num_heads: Optional[int] = None
+    # GPT-OSS specific fields
+    swa_window_size: Optional[int] = None
+    window_attn_skip_freq: Optional[int] = None
+    kv_channels: Optional[int] = None
 
 
 def gpt3(config: FLOPSConfig):
@@ -542,3 +546,101 @@ def _hybrid_model_flops(config: FLOPSConfig):
 def nemotronh(config: FLOPSConfig):
     """Model FLOPs for NemotronH."""
     return _hybrid_model_flops(config)
+
+
+def _gpt_oss_attention_flops(
+    seqlen: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    num_query_groups: int,
+    kv_channels: Optional[int] = None,
+    is_swa: bool = False,
+    swa_window_size: int = 128,
+) -> float:
+    """Calculate the FLOPs for attention (full or sliding window)."""
+    kv_channels = kv_channels or (hidden_size // num_attention_heads)
+
+    # Linear projections for Q, K, V
+    linear_qkv = seqlen * hidden_size * (kv_channels * (num_attention_heads + num_query_groups * 2))
+    # Output projection
+    linear_proj = seqlen * hidden_size * (kv_channels * num_attention_heads)
+
+    if is_swa:
+        # Sliding window attention: reduced attention computation
+        attention_mask_nz_elem = (
+            swa_window_size * (swa_window_size + 1) / 2 + (seqlen - swa_window_size) * swa_window_size
+        )
+        attention = num_attention_heads * (attention_mask_nz_elem * kv_channels) * 2
+    else:
+        # Full causal attention
+        bmm_k = kv_channels
+        bmm_b = num_attention_heads
+        attention_mask_nz_elem = seqlen * (seqlen + 1) / 2
+        attention = bmm_b * attention_mask_nz_elem * bmm_k * 2
+
+    return (linear_qkv + linear_proj + attention) * 6
+
+
+def _gpt_oss_moe_mlp_flops(
+    seqlen: int,
+    hidden_size: int,
+    moe_ffn_hidden_size: int,
+    moe_router_topk: int,
+    gated_linear_unit: bool = True,
+) -> float:
+    """Calculate the FLOPs for MoE MLP layer."""
+    total_num_tokens = seqlen * moe_router_topk
+    linear_fc1 = total_num_tokens * hidden_size * moe_ffn_hidden_size * (2 if gated_linear_unit else 1)
+    linear_fc2 = total_num_tokens * moe_ffn_hidden_size * hidden_size
+    return (linear_fc1 + linear_fc2) * 6
+
+
+def gpt_oss(config: FLOPSConfig):
+    """Model FLOPs for GPT-OSS with Sliding Window Attention + MoE.
+
+    GPT-OSS uses a mix of full attention and sliding window attention,
+    alternating based on window_attn_skip_freq (e.g., every 2nd layer uses full attention).
+    """
+    seq_len = config.enc_seq_len
+    hidden_size = config.hs
+    num_layers = config.layers
+    num_attention_heads = config.attention_heads
+    num_query_groups = config.query_groups if config.query_groups else num_attention_heads
+    vocab_size = config.vocab_size
+    moe_ffn_hidden_size = config.moe_ffn_hidden_size if config.moe_ffn_hidden_size else config.ffn_hs
+    moe_router_topk = config.moe_router_topk if config.moe_router_topk else 1
+    kv_channels = config.kv_channels if config.kv_channels else (hidden_size // num_attention_heads)
+    swa_window_size = config.swa_window_size if config.swa_window_size else 128
+    window_attn_skip_freq = config.window_attn_skip_freq if config.window_attn_skip_freq else 2
+
+    total_flops = 0
+
+    # Calculate FLOPs per layer (attention + MLP)
+    for layer_idx in range(num_layers):
+        # Attention: full attention on every window_attn_skip_freq-th layer, SWA on others
+        if layer_idx % window_attn_skip_freq == 0:
+            # Full attention layer
+            attn_flops = _gpt_oss_attention_flops(
+                seq_len, hidden_size, num_attention_heads, num_query_groups,
+                kv_channels, is_swa=False
+            )
+        else:
+            # Sliding window attention layer
+            attn_flops = _gpt_oss_attention_flops(
+                seq_len, hidden_size, num_attention_heads, num_query_groups,
+                kv_channels, is_swa=True, swa_window_size=swa_window_size
+            )
+        total_flops += attn_flops
+
+        # MoE MLP layer
+        mlp_flops = _gpt_oss_moe_mlp_flops(
+            seq_len, hidden_size, moe_ffn_hidden_size, moe_router_topk
+        )
+        total_flops += mlp_flops
+
+    # Vocab/LM head FLOPs
+    vocab_flops = 6 * seq_len * hidden_size * vocab_size
+    total_flops += vocab_flops
+
+    # Multiply by batch size
+    return total_flops * config.gbs
