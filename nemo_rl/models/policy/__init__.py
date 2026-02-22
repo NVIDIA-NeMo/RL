@@ -187,7 +187,7 @@ class MegatronConfig(TypedDict):
     # Must set moe_token_dispatcher_type to 'flex'
     # Must set moe_shared_expert_overlap to False
     moe_enable_deepep: bool
-    # The type of token dispatcher to use. The default is 'allgather'.
+    # The type of token dispatcher to use. The default is 'alltoall'.
     # Options are 'allgather','alltoall' and 'flex'
     # Use 'flex' when using DeepEP
     moe_token_dispatcher_type: str

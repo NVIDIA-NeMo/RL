@@ -60,7 +60,7 @@ policy: &POLICY_BASE
         moe_per_layer_logging: False
         defer_fp32_logits: False
         moe_enable_deepep: false
-        moe_token_dispatcher_type: "allgather"
+        moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         
         optimizer:
