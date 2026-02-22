@@ -417,7 +417,7 @@ def setup(
     if nemo_gym_num_nodes:
         # Reserve the nemo_gym node(s) here before actually starting nemo_gym.
 
-        ray_nodes = ray.util.state.list_nodes()
+        ray_nodes = ray.util.state.list_nodes(limit=10000)
         for node in ray_nodes:
             assert node.node_ip not in all_node_infos
             all_node_infos[node.node_ip] = {
@@ -496,6 +496,11 @@ def setup(
         print(
             f"  ✓ Ray cluster for NeMo Gym reserved with {nemo_gym_num_nodes} nodes",
             flush=True,
+        )
+        print(f"DEBUG: grpo setup: nemo_gym_num_nodes = {nemo_gym_num_nodes}", flush=True)
+        print(f"DEBUG: grpo setup: nemo_gym_nodes     = {nemo_gym_nodes}", flush=True)
+        assert len(nemo_gym_nodes) == nemo_gym_num_nodes, (
+            f"expected {nemo_gym_num_nodes} nemo gym nodes, actual: {nemo_gym_nodes}"
         )
 
     else:
@@ -847,6 +852,8 @@ def setup(
         #   NeMo Gym
         # ==========================
         print("\n▶ Setting up NeMo Gym...", flush=True)
+
+        print(f"DEBUG: grpo setup: nemo gym nodes = {nemo_gym_nodes}", flush=True)
 
         nemo_gym_config = NemoGymConfig(
             model_name=policy_generation.cfg["model_name"],
