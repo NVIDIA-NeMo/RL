@@ -88,6 +88,12 @@ def create_local_venv(
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
 
+    # Ensure build_tools can be found when building transformer-engine-torch from sdist.
+    # setuptools runs setup.py via exec() which doesn't add the sdist root to sys.path,
+    # but PYTHONPATH="." resolves to the cwd (which setuptools sets to the sdist root).
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f".:{existing_pythonpath}" if existing_pythonpath else "."
+
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
     # Command doesn't matter, since `uv` syncs the environment no matter the command.

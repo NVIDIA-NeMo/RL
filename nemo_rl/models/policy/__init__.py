@@ -193,6 +193,8 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Attention backend to use: 'auto', 'flash', 'fused', 'unfused', 'local'. Defaults to 'auto'.
+    attention_backend: NotRequired[str]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
