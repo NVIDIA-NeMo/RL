@@ -144,6 +144,11 @@ class GRPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     normalize_rewards: bool
+    # Clipping bounds for normalized advantages to prevent extreme values
+    # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
+    # Default: null (no clipping)
+    advantage_clip_low: NotRequired[float | None]
+    advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
@@ -1976,6 +1981,14 @@ def grpo_train(
                     )
                     del baseline_for_log
 
+                    # Clip advantages to prevent extreme values from small std normalization
+                    clip_low = master_config["grpo"].get("advantage_clip_low")
+                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    if clip_low is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                    if clip_high is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
+
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -2956,9 +2969,36 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
-                    )
+                    # Apply overlong filtering - mask out truncated sequences from loss computation
+                    with timer.time("overlong_filter"):
+                        use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                        if use_overlong_filtering:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            truncated = repeated_batch["truncated"]
+
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
+
+                            loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Add loss mask to each message
+                    # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                    # not assistant messages that were part of the prompt history
+                    for i, message_log in enumerate(repeated_batch["message_log"]):
+                        for j, message in enumerate(message_log):
+                            if message["role"] == "assistant" and "generation_logprobs" in message:
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
+                            else:
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            if "generation_logprobs" not in message:
+                                message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -3085,6 +3125,14 @@ def async_grpo_train(
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
+
+                    # Clip advantages to prevent extreme values from small std normalization
+                    clip_low = master_config["grpo"].get("advantage_clip_low")
+                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    if clip_low is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                    if clip_high is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
