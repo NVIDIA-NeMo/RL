@@ -82,14 +82,14 @@ For detailed information on backend selection, configuration, and examples, see 
 ✅ _Available now_ | 🔜 _Coming in v0.6_
 - 🔜 **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - 🔜 **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
-- 🔜 **SGLang Inference** - SGLang rollout suport for optimized inference.
+- 🔜 **SGLang Inference** - SGLang rollout support for optimized inference.
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **New Models** -  Qwen3-Next, Nemotron-Super.
 - 🔜 **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
 - 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
-- 🔜 **Speculaive Decoding** - Speculative Decoding support for rollout acceleration
+- 🔜 **Speculative Decoding** - Speculative Decoding support for rollout acceleration
 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
@@ -104,7 +104,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
-- ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
+- ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
 - ✅ **Nemo-Gym Integration** - RL Environment Integration.
 - ✅ **GB200** - container support for GB200.
 
