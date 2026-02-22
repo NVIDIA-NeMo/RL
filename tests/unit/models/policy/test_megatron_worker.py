@@ -1087,6 +1087,12 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
 
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
+@pytest.mark.xfail(
+    reason="MCore DistribOptimizer._set_main_param_and_optimizer_states passes non-tensor "
+    "optimizer state (e.g. bool) to TE FusedAdam.set_scaled_state which expects a tensor. "
+    "Needs fix in MCore distrib_optimizer.py.",
+    strict=False,
+)
 @pytest.mark.parametrize(
     "num_gpus,tp,pp",
     [
