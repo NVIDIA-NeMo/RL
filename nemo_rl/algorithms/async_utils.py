@@ -73,9 +73,10 @@ class ReplayBuffer:
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)
-            self.last_target_weight_already_generated = max(
-                self.last_target_weight_already_generated, target_weight_version
-            )
+            # NOTE: We intentionally do NOT advance last_target_weight_already_generated here.
+            # Advancing it on buffering can jump ahead due to out-of-order arrivals and skip
+            # earlier incomplete targets. During normal training it advances when training
+            # CONSUMES a batch (in sample()); checkpoint restore may reset it.
             print(
                 f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
             )
@@ -224,6 +225,19 @@ class ReplayBuffer:
                 self.trajectory_versions.pop(idx)
                 self.target_weight_versions.pop(idx)
                 self.trajectories.pop(idx)
+
+            # Advance last_target_weight_already_generated ONLY when training consumes a batch.
+            # This prevents the collector from generating more trajectories for this target,
+            # avoiding over-generation when slow workers arrive after consumption.
+            old_last_target = self.last_target_weight_already_generated
+            self.last_target_weight_already_generated = max(
+                self.last_target_weight_already_generated, current_weight_version
+            )
+            if self.last_target_weight_already_generated > old_last_target:
+                print(
+                    f"🔒 Advanced last_target_weight_already_generated: {old_last_target} → {self.last_target_weight_already_generated} (training consumed batch for step {current_weight_version})"
+                )
+
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
@@ -554,9 +568,10 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
-        # Debug counters: track spawned vs successfully buffered per target weight
+        # Debug counters: track spawned vs successfully buffered vs completed per target weight
         self._spawned_per_target: dict[int, int] = {}
         self._buffered_per_target: dict[int, int] = {}
+        self._completed_per_target: dict[int, int] = {}  # Prompt-group completions (counts once per prompt_idx; success + failure)
         self._counter_lock: _threading.Lock = _threading.Lock()
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
@@ -596,15 +611,23 @@ class AsyncTrajectoryCollector:
         Checks all targets in the valid range (current weight version + 1 to max_age ahead)
         and returns the first one that needs trajectories and isn't already being generated.
 
-        This approach checks both:
-        1. last_target_weight_already_generated: Prevents re-selecting targets that already
-           have trajectories being generated/buffered (prevents over-generation)
-        2. get_trajectories_needed: Allows gap-filling for incomplete targets after checkpoint resume
+        This approach checks:
+        1. last_target_weight_already_generated: Skip targets that training has already consumed
+           (prevents over-generation for consumed targets with slow workers still arriving)
+        2. _generating_targets: Prevents duplicate concurrent generation for the same target
+        3. get_trajectories_needed: Allows gap-filling for incomplete targets after checkpoint resume
 
         Does the following:
         - Normal generation: new targets need full batches
         - Gap-filling after resume: incomplete targets need partial batches
+        - Skipping consumed targets: last_target_weight_already_generated check
         - Skipping complete targets: get_trajectories_needed returns 0
+
+        Note:
+            During normal training, last_target_weight_already_generated advances when training
+            CONSUMES a batch (in ReplayBuffer.sample()); checkpoint restore may reset it. This
+            prevents the race condition where a single trajectory for a higher target could skip
+            earlier incomplete targets, while still preventing over-generation for consumed targets.
         """
         num_prompts = int(self.master_config["grpo"]["num_prompts_per_step"])
         max_trajectory_age = int(
@@ -620,16 +643,18 @@ class AsyncTrajectoryCollector:
             target_start = generation_weight_version + 1
             target_end = generation_weight_version + max_trajectory_age + 1
 
-        # Get last completed target to avoid re-selecting
-        last_target_weight_already_generated = ray.get(
+        # Get the last target that training has consumed - skip anything at or below this
+        last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
 
         with self._generation_check_lock:
             for target_weight in range(target_start, target_end):
-                # Skip if target is already complete or being generated
-                if target_weight <= last_target_weight_already_generated:
+                # Skip if training has already consumed this target's batch
+                if target_weight <= last_consumed_target:
                     continue
+
+                # Skip if target is already being generated
                 if target_weight in self._generating_targets:
                     continue
 
@@ -668,7 +693,7 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits.
 
         Pauses when all targets in the valid range either:
-        - Are complete (target <= last_target_weight_already_generated)
+        - Have already been consumed by training (target <= last_target_weight_already_generated)
         - Are already being generated (in _generating_targets)
         - Don't need more trajectories (get_trajectories_needed returns 0)
         """
@@ -687,16 +712,17 @@ class AsyncTrajectoryCollector:
                 target_start = self.current_weight_version + 1
                 target_end = self.current_weight_version + max_trajectory_age + 1
 
-            # Get last completed target
-            last_target_weight_already_generated = ray.get(
+            # Get the last target that training has consumed
+            last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
 
             with self._generation_check_lock:
                 for target_weight in range(target_start, target_end):
-                    # Skip if already complete
-                    if target_weight <= last_target_weight_already_generated:
+                    # Skip if training has already consumed this target
+                    if target_weight <= last_consumed_target:
                         continue
+
                     # Skip if already generating
                     if target_weight in self._generating_targets:
                         continue
@@ -1107,16 +1133,7 @@ class AsyncTrajectoryCollector:
                             f"[{buffered_count}/{spawned_count} buffered for this target]"
                         )
 
-                        # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
+                        # Reservation release is handled in finally block when ALL workers complete
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second
@@ -1193,13 +1210,27 @@ class AsyncTrajectoryCollector:
             if _retry_spawned:
                 return
 
-            # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
+            # Track completed prompt groups (success or failure) and release reservation
+            # only when ALL spawned prompt groups for this target have completed.
+            # This prevents gap-filling from spawning duplicate workers while the
+            # initial batch is still in-flight.
+            with self._counter_lock:
+                self._completed_per_target[target_weight_version] = (
+                    self._completed_per_target.get(target_weight_version, 0) + 1
+                )
+                completed_count = self._completed_per_target[target_weight_version]
+                spawned_count = self._spawned_per_target.get(target_weight_version, 0)
+                buffered_count = self._buffered_per_target.get(target_weight_version, 0)
+                should_release = (completed_count >= spawned_count)
+
+            if should_release:
+                with self._generation_check_lock:
+                    if target_weight_version in self._generating_targets:
+                        self._generating_targets.discard(target_weight_version)
+                        print(
+                            f"🧹 Released reservation for target weight {target_weight_version} "
+                            f"(all {spawned_count} workers completed, {buffered_count} buffered)"
+                        )
 
             # Detach thread record when finished
             with self._threads_lock:
