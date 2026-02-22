@@ -428,7 +428,11 @@ class ClippedPGLossFn(LossFunction):
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+        tis_clipped_fraction = 0.0
         if self.truncated_importance_sampling_ratio is not None:
+            with torch.no_grad():
+                # Divide by global_valid_toks (not local mask.sum()) so that np.sum aggregation in grpo.py gives the correct global fraction
+                tis_clipped_fraction = ((actor_importance_weights_expanded > self.truncated_importance_sampling_ratio) & mask.bool()).sum().item() / max(global_valid_toks.item(), 1)
             if self.truncated_importance_sampling_type == "tis":
                 token_in_bounds = (
                     actor_importance_weights_expanded
@@ -598,6 +602,7 @@ class ClippedPGLossFn(LossFunction):
                 "policy_kl_error": policy_kl_error,
                 "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
+                "tis_clipped_fraction": tis_clipped_fraction,
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,

@@ -188,6 +188,8 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
+    penalize_invalid_tool_call: bool  # If True, assign a negative advantage to invalid tool call tokens
+    invalid_tool_call_advantage: NotRequired[float]  # Advantage value for invalid tool calls when penalize_invalid_tool_call is True (default: -5.0)
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -867,6 +869,7 @@ def setup(
             ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
             ray_namespace=ray_namespace,
             initial_global_config_dict=env_configs["nemo_gym"],
+            invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
         )
         nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
         if nemo_gym_py_exec.startswith("uv"):
@@ -1913,20 +1916,36 @@ def grpo_train(
                         # Add loss mask to each message in LLMMessageLogType
                         # Only unmask assistant messages that were actually generated (have generation_logprobs),
                         # not assistant messages that were part of the prompt history
+                        penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
+                        print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
+
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             for j, message in enumerate(message_log):
-                                if message["role"] == "assistant" and "generation_logprobs" in message:
-                                    message["token_loss_mask"] = torch.ones_like(
-                                        message["token_ids"]
-                                    )
+                                token_ids = message["token_ids"]
+                                is_assistant = message["role"] == "assistant" and "generation_logprobs" in message
+
+                                if is_assistant:
+                                    message["token_loss_mask"] = torch.ones_like(token_ids)
                                 else:
-                                    message["token_loss_mask"] = torch.zeros_like(
-                                        message["token_ids"]
-                                    )
+                                    message["token_loss_mask"] = torch.zeros_like(token_ids)
+
                                 if "generation_logprobs" not in message:
                                     message["generation_logprobs"] = torch.zeros_like(
-                                        message["token_ids"], dtype=torch.float32
+                                        token_ids, dtype=torch.float32
                                     )
+
+                                # For invalid tool calls with penalize_invalid_tool_call,
+                                # override advantage to push the model away from generating them.
+                                is_invalid = is_assistant and penalize_invalid_tool_call and message.get("is_invalid_tool_call", False)
+                                if is_invalid:
+                                    neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
+                                    message["advantages"] = neg_adv * torch.ones(token_ids.shape,
+                                        dtype=advantages[i].dtype,
+                                        device=advantages[i].device
+                                    )
+                                else:
+                                    message["advantages"] = advantages[i].expand(token_ids.shape)
 
                     with timer.time("message_to_flat"):
                         # Convert updated LLMMessageLogType to FlatMessagesType for training
@@ -3113,23 +3132,40 @@ def async_grpo_train(
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    # Add loss mask to each message
-                    # Only unmask assistant messages that were actually generated (have generation_logprobs),
-                    # not assistant messages that were part of the prompt history
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant" and "generation_logprobs" in message:
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    with timer.time("add_loss_mask"):
+                        # Add loss mask to each message
+                        # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                        # not assistant messages that were part of the prompt history
+                        penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
+                        print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
+
+                        for i, message_log in enumerate(repeated_batch["message_log"]):
+                            for j, message in enumerate(message_log):
+                                token_ids = message["token_ids"]
+                                is_assistant = message["role"] == "assistant" and "generation_logprobs" in message
+
+                                if is_assistant:
+                                    message["token_loss_mask"] = torch.ones_like(token_ids)
+                                else:
+                                    message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+                                if "generation_logprobs" not in message:
+                                    message["generation_logprobs"] = torch.zeros_like(
+                                        token_ids, dtype=torch.float32
+                                    )
+
+                                # For invalid tool calls with penalize_invalid_tool_call,
+                                # override advantage to push the model away from generating them.
+                                is_invalid = is_assistant and penalize_invalid_tool_call and message.get("is_invalid_tool_call", False)
+                                if is_invalid:
+                                    neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
+                                    message["advantages"] = neg_adv * torch.ones(token_ids.shape,
+                                        dtype=advantages[i].dtype,
+                                        device=advantages[i].device
+                                    )
+                                else:
+                                    message["advantages"] = advantages[i].expand(token_ids.shape)
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
