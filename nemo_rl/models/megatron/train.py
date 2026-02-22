@@ -220,7 +220,6 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
-    do_not_average_loss: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
@@ -241,7 +240,6 @@ def megatron_forward_backward(
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
-        do_not_average_loss: If True, do not average loss across microbatches
         straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
@@ -266,7 +264,6 @@ def megatron_forward_backward(
         micro_batch_size=mbs,
         decoder_seq_length=seq_length,
         forward_only=forward_only,
-        do_not_average_loss=do_not_average_loss,
     )
 
 
@@ -275,10 +272,12 @@ class LossPostProcessor:
         self,
         loss_fn: LossFunction,
         cfg: PolicyConfig,
+        num_microbatches: int = 1,
         cp_normalize: bool = True,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
+        self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
 
     def __call__(
@@ -325,13 +324,25 @@ class LossPostProcessor:
 
         if self.cp_normalize:
             cp_size = get_context_parallel_world_size()
-            orig_loss_fn_wrapped = loss_fn_wrapped
+            prev_loss_fn = loss_fn_wrapped
 
             def _div_by_cp_size(*args, **kwargs):
-                loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
+                loss, metrics = prev_loss_fn(*args, **kwargs)
                 return loss / cp_size, metrics
 
             loss_fn_wrapped = _div_by_cp_size
+
+        # Counteract Megatron's default loss averaging in schedules.py,
+        # which applies (* cp_size / num_microbatches) to the loss.
+        cp_size = get_context_parallel_world_size()
+        num_microbatches = self.num_microbatches
+        loss_fn_before_mcore_scaling = loss_fn_wrapped
+
+        def _counteract_mcore_loss_averaging(*args, **kwargs):
+            loss, metrics = loss_fn_before_mcore_scaling(*args, **kwargs)
+            return loss * num_microbatches / cp_size, metrics
+
+        loss_fn_wrapped = _counteract_mcore_loss_averaging
 
         return loss_fn_wrapped
 
