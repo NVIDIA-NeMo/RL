@@ -41,9 +41,9 @@ def convert_metadata(metadata: Dict[str, Any], return_inplace=False):
     if not return_inplace:
         data = metadata.copy()
 
-    for tag in multimodal_utils.media_tags_to_allowed:
+    for tag in multimodal_utils.MEDIA_TAGS_TO_ALLOWED:
         if tag in data:
-            tag_mapped = multimodal_utils.media_tags_to_allowed[tag]
+            tag_mapped = multimodal_utils.MEDIA_TAGS_TO_ALLOWED[tag]
             if tag_mapped not in data:
                 data[tag_mapped] = data[tag]
                 del  data[tag]
@@ -54,11 +54,11 @@ def convert_metadata(metadata: Dict[str, Any], return_inplace=False):
 
     for idx, message in enumerate(data["conversations"]):
         msg_str = message["value"]
-        for tag in multimodal_utils.media_tags_to_allowed:
+        for tag in multimodal_utils.MEDIA_TAGS_TO_ALLOWED:
             tag_str = '<' + tag + '>'
             if tag_str in msg_str:
-                tag_str_mapped = multimodal_utils.media_tags[
-                    multimodal_utils.media_tags_to_allowed[tag]
+                tag_str_mapped = multimodal_utils.MEDIA_TAGS[
+                    multimodal_utils.MEDIA_TAGS_TO_ALLOWED[tag]
                 ]
                 msg_str = msg_str.replace(tag_str, tag_str_mapped)
         message["value"] = msg_str
@@ -91,14 +91,14 @@ def conversation_process_message(
     if tried_default_extensions is None:
         tried_default_extensions = set()
     fragments = []    
-    parts = re.split(multimodal_utils.media_tag_pattern, message["value"])
+    parts = re.split(multimodal_utils.MEDIA_TAG_PATTERN, message["value"])
     
     # Convert the parts to message fragments
     empty_text = True
     for i, part in enumerate(parts):
-        if part in multimodal_utils.media_tags.values():
+        if part in multimodal_utils.MEDIA_TAGS.values():
             # process multimodal tags
-            tag = multimodal_utils.media_tags_reversed[part]
+            tag = multimodal_utils.MEDIA_TAGS_REVERSED[part]
             if tag not in metadata:
                 raise ValueError(f"{part} is found in the message, but no corresponding {tag} key can be found in {metadata}")
             if not isinstance(metadata[tag], list):
@@ -107,9 +107,9 @@ def conversation_process_message(
             ext = os.path.basename(metadata[tag][media_index[tag]]).split('.', 1)[1]
             if raw and ext not in raw and \
                 tag not in tried_default_extensions and \
-                tag in multimodal_utils.default_media_extensions:
+                tag in multimodal_utils.DEFAULT_MEDIA_EXTENSIONS:
                 # try the default extension
-                for ext in multimodal_utils.default_media_extensions[tag]:
+                for ext in multimodal_utils.DEFAULT_MEDIA_EXTENSIONS[tag]:
                     if ext in raw:
                         tried_default_extensions.add(ext)
                         break
@@ -210,7 +210,7 @@ class GeneralConversationsJsonlDataset(RawDataset):
     @classmethod
     def process_message_fragment(cls, tag: str, fragment: Any, media_directory: Optional[str] = None) -> dict[str, Any]:
         if media_directory is not None and \
-            tag in multimodal_utils.media_tags and \
+            tag in multimodal_utils.MEDIA_TAGS and \
             isinstance(fragment, str) and \
             not os.path.isfile(fragment):
             media_path = os.path.join(media_directory, fragment)

@@ -27,21 +27,18 @@ from transformers.audio_utils import load_audio
 from transformers.video_utils import load_video
 from transformers import PreTrainedTokenizerBase
 
-load_audio_kwargs = [param for param in inspect.signature(load_audio).parameters]
-load_video_kwargs = [param for param in inspect.signature(load_video).parameters]
-
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
-media_tags = {
+MEDIA_TAGS = {
     'image': '<image>',
     'video': '<video>',
     'audio': '<audio>',
     'video-audio': '<video-audio>',
 }
-media_tags_reversed = {v: k for k, v in media_tags.items()}
+MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
 
-default_media_extensions = {
+DEFAULT_MEDIA_EXTENSIONS = {
     'image': ['png','jpeg','jpg', 'img'],
     'video': ['mp4'],
     'video-audio': ['mp4'],
@@ -52,7 +49,7 @@ default_media_extensions = {
 # different media namings maybe used in the raw dataset,
 # in which case, they need to be mapped to the allowed ones
 # WARNING: values cannot be used as the keys in the same dict to avoid cyclic graph
-media_tags_to_allowed = {
+MEDIA_TAGS_TO_ALLOWED = {
     'speech': 'audio',
     'speeches': 'audio',
     'sound': 'audio',
@@ -63,8 +60,8 @@ media_tags_to_allowed = {
 
 
 # Build a pattern like: <image>|<video>|<audio>|<video-audio>
-media_tag_pattern = re.compile(
-    r"(" + "|".join(re.escape(tag) for tag in media_tags.values()) + ")"
+MEDIA_TAG_PATTERN = re.compile(
+    r"(" + "|".join(re.escape(tag) for tag in MEDIA_TAGS.values()) + ")"
 )
 
 
@@ -231,10 +228,14 @@ def get_multimodal_default_settings_from_processor(processor) -> dict[str, dict[
             "num_frames" in video_settings_dict and video_settings_dict["num_frames"] is None and \
             "max_frames" in video_settings_dict and video_settings_dict["max_frames"] is not None:
             video_settings_dict["num_frames"] = video_settings_dict["max_frames"]
-        default_settings["video"] = {arg: video_settings_dict[arg] for arg in load_video_kwargs if arg in video_settings_dict}
+        if not hasattr(get_multimodal_default_settings_from_processor, "load_video_kwargs"):
+            get_multimodal_default_settings_from_processor.load_video_kwargs = [param for param in inspect.signature(load_video).parameters]
+        default_settings["video"] = {arg: video_settings_dict[arg] for arg in get_multimodal_default_settings_from_processor.load_video_kwargs if arg in video_settings_dict}
     if hasattr(processor, "feature_extractor"):
+        if not hasattr(get_multimodal_default_settings_from_processor, "load_audio_kwargs"):
+            get_multimodal_default_settings_from_processor.load_audio_kwargs = [param for param in inspect.signature(load_audio).parameters]
         audio_settings_dict = processor.feature_extractor.to_dict()
-        default_settings["audio"] = {arg: audio_settings_dict[arg] for arg in load_audio_kwargs if arg in audio_settings_dict}
+        default_settings["audio"] = {arg: audio_settings_dict[arg] for arg in get_multimodal_default_settings_from_processor.load_audio_kwargs if arg in audio_settings_dict}
     return default_settings
 
 
@@ -288,7 +289,7 @@ def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
     media = defaultdict(list)
     for item in message["content"]:
         tag = item["type"]
-        if tag in media_tags:
+        if tag in MEDIA_TAGS:
             media[tag].extend(list(item[tag])) if isinstance(
                 item[tag], (list, tuple)
             ) else media[tag].append(item[tag])
