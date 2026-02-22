@@ -1056,6 +1056,7 @@ class AsyncTrajectoryCollector:
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    master_config=self.master_config,
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics

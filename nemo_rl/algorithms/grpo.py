@@ -1731,6 +1731,7 @@ def grpo_train(
                             genrm_agent_names=master_config["env"].get(
                                 "genrm_agent_names", ["genrm_simple_agent"]
                             ),
+                            master_config=master_config
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2523,6 +2524,7 @@ def validate(
                     genrm_agent_names=master_config["env"].get(
                         "genrm_agent_names", ["genrm_simple_agent"]
                     ),
+                    master_config=master_config
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
