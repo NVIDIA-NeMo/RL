@@ -1,0 +1,30 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+loss_fn:
+  use_importance_sampling_correction: true
+policy:
+  model_name: openai/gpt-oss-120b
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    enabled: true
+    expert_model_parallel_size: 8
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    moe_permute_fusion: true
+    defer_fp32_logits: true
+    activation_checkpointing: true
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.5
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8

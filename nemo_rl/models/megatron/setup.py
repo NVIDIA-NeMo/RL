@@ -453,6 +453,13 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
 
+    # Attention backend (auto/flash/fused/unfused/local)
+    attention_backend = config["megatron_cfg"].get("attention_backend", None)
+    if attention_backend is not None:
+        from megatron.core.transformer.enums import AttnBackend
+
+        model_cfg.attention_backend = AttnBackend[attention_backend]
+
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
