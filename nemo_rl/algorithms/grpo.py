@@ -155,6 +155,11 @@ class GRPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     normalize_rewards: bool
+    # Clipping bounds for normalized advantages to prevent extreme values
+    # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
+    # Default: null (no clipping)
+    advantage_clip_low: NotRequired[float | None]
+    advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
     val_batch_size: int
@@ -2064,6 +2069,14 @@ def grpo_train(
                     )
                     del baseline_for_log
 
+                    # Clip advantages to prevent extreme values from small std normalization
+                    clip_low = master_config["grpo"].get("advantage_clip_low")
+                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    if clip_low is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                    if clip_high is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
+
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -3087,6 +3100,19 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    # Apply overlong filtering - mask out truncated sequences from loss computation
+                    with timer.time("overlong_filter"):
+                        use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                        if use_overlong_filtering:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            truncated = repeated_batch["truncated"]
+
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
+
+                            loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
+
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
@@ -3225,6 +3251,14 @@ def async_grpo_train(
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
+
+                    # Clip advantages to prevent extreme values from small std normalization
+                    clip_low = master_config["grpo"].get("advantage_clip_low")
+                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    if clip_low is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                    if clip_high is not None:
+                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
