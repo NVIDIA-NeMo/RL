@@ -435,6 +435,10 @@ class BaseVllmGenerationWorker:
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
+        enable_prefix_caching = self.cfg["vllm_cfg"].get("enable_prefix_caching", None)
+        if enable_prefix_caching is None:
+            enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -445,7 +449,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=enable_prefix_caching,
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],

@@ -233,7 +233,9 @@ Depending on your data shape, you may want to change these values."""
         )
 
         nemo_rl_message_log = []
-        seen_token_ids: List[int] = []
+        seen_token_ids = torch.tensor([])
+
+        batch_decode_items = []  # Collect (output_item_dict, prompt_token_ids, generation_token_ids) for batch decode
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -243,45 +245,76 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
+            prompt_token_ids_tensor = torch.tensor(output_item_dict["prompt_token_ids"])
+            n_seen = len(seen_token_ids)
+            if n_seen > 0:
+                assert torch.equal(
+                    seen_token_ids, prompt_token_ids_tensor[:n_seen]
+                ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+Seen token IDs: {seen_token_ids.tolist()}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
+
+            n_seen = len(seen_token_ids)
+
+            # Create tensors for new tokens
+            new_prompt_token_ids = torch.tensor(
+                output_item_dict["prompt_token_ids"][n_seen:]
+            )
+            generation_token_ids = torch.tensor(
+                output_item_dict["generation_token_ids"]
+            )
+            generation_logprobs = torch.tensor(output_item_dict["generation_log_probs"])
+
 
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": new_prompt_token_ids,
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": generation_token_ids,
+                    "generation_logprobs": generation_logprobs,
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids = torch.cat(
+                [seen_token_ids, new_prompt_token_ids, generation_token_ids]
+            )
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            prompt_token_ids_for_decode = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids_for_decode = output_item_dict.pop(
+                "generation_token_ids"
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
-            )
+
             output_item_dict.pop("generation_log_probs")
+
+            batch_decode_items.append(
+                (
+                    output_item_dict,
+                    prompt_token_ids_for_decode,
+                    generation_token_ids_for_decode,
+                )
+            )
+
+        if batch_decode_items:
+            prompt_token_ids_batch = [item[1] for item in batch_decode_items]
+            generation_token_ids_batch = [item[2] for item in batch_decode_items]
+
+            prompt_strs = tokenizer.batch_decode(prompt_token_ids_batch)
+            generation_strs = tokenizer.batch_decode(generation_token_ids_batch)
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]

@@ -107,9 +107,11 @@ def _replace_prefix_tokens(
             model_cut_end -= 1
 
     # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
+    if len(template_token_ids) <= len(
         template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
+    ):
+
+        error_message = f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -118,6 +120,10 @@ Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
 """
+        with open(f"non_monotonic_trajectory_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+
+        raise ValueError(error_message)
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -127,9 +133,10 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
+    if (
+        template_cut_start < 0
+    ):
+        error_message = f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -137,6 +144,9 @@ Template token IDs (everything that was sent to the model endpoint): {template_t
 Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+        with open(f"no_eos_token_id_found_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+        raise ValueError(error_message)
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -365,8 +375,33 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
+                    if "content" in message:
+                        content = message["content"]
+                        if isinstance(content, (list, str)):
+                            continue
+                        # Convert ValidatorIterator to list to get actual content
+                        try:
+                            message["content"] = list(content)
+                        except Exception:
+                            message["content"] = []
+
                 # Deepcopy messages here since _preprocess_chat may be destructive.
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                # messages_for_replace_prefix_tokens = deepcopy(messages)
+                exclude_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        new_msg = {}
+                        for k, v in msg.items():
+                            if k not in exclude_fields:
+                                new_msg[k] = deepcopy(v)
+                        messages_for_replace_prefix_tokens.append(new_msg)
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(msg))
 
                 # res is conversation, [request_prompt], [engine_prompt]
                 try:
