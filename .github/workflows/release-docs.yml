@@ -20,6 +20,11 @@ on:
         required: true
         type: boolean
         default: true
+      publish-as-latest:
+        description: Publish as Latest stable version.
+        required: false
+        type: boolean
+        default: true
       docs-version-override:
         description: Docs version override. If not provided, defaults to the version of the commit's tag.
         required: false
@@ -41,7 +46,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.71.0
+          ref: v0.72.0
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
@@ -55,7 +60,7 @@ jobs:
           artifacts-name: docs-html
           artifacts-path: _build/html
           emails-csv: ${{ inputs.notify-emails && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
-          overwrite-latest-on-tag: false
+          overwrite-latest-on-tag: ${{ inputs.publish-as-latest }}
           docs-version-override: ${{ inputs.docs-version-override }}
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: rl-publish-docs-${{ github.run_id }}

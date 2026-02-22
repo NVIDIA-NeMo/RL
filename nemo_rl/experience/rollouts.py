@@ -979,6 +979,14 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
+    for m in message_logs:
+        m[key] = torch.tensor(m[key])
+
+
 @dataclass
 class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
@@ -1058,6 +1066,15 @@ def run_async_nemo_gym_rollout(
             )
         )
 
+        # Tensorize all token ids
+        for r in results:
+            _tensorize_by_key(r["input_message_log"], "token_ids")
+            _tensorize_by_key(r["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in r["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
+            )
+
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
@@ -1120,8 +1137,10 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_name = nemo_gym_row["agent_ref"]["name"]
+            agent_ref = nemo_gym_row["agent_ref"]
+            agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1168,6 +1187,7 @@ def run_async_nemo_gym_rollout(
 
     final_batch = BatchedDataDict[DatumSpec](
         {
+            "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
@@ -1181,6 +1201,10 @@ def run_async_nemo_gym_rollout(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            "truncated": torch.tensor(
+                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+            ),
         }
     )
 

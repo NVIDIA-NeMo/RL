@@ -57,7 +57,11 @@ def configure_generation_config(
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
-            if is_eval or config["stop_strings"] is not None:
+            if (
+                is_eval
+                or config["stop_strings"] is not None
+                or config["vllm_cfg"].get("expose_http_server", None)
+            ):
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
