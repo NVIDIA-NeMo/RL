@@ -127,11 +127,11 @@ RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
+    UV_LINK_MODE=symlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
+    UV_LINK_MODE=symlink bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -159,6 +159,9 @@ fi
 # Remove /tmp/ray because the previous script starts up a local ray cluster which creates a session
 # that we can just clean up.
 rm -rf /tmp/ray
+
+# Prune unreachable cache entries
+uv cache prune
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
