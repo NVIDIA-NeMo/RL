@@ -1416,16 +1416,26 @@ def compute_and_apply_seq_logprob_error_masking(
     # Use combined mask exactly as in loss function
     mask = token_mask * sample_mask.unsqueeze(-1)
 
-    # Calculate sequence-level multiplicative prob error
-    # EXACT same calculation as token_mult_prob_error but per-sequence
-    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(dim=-1) / mask.sum(
-        dim=-1
-    ).clamp(min=1)
+    # Calculate sequence-level multiplicative prob error.
+    #
+    # NOTE: When a sequence is fully masked (mask.sum == 0), it should not contribute to
+    # min/mean/max statistics; otherwise, it would yield a spurious 0 due to denominator
+    # clamping and incorrectly drag min_seq_mult_prob_error to 0.
+    denom = mask.sum(dim=-1)
+    valid_seq_mask = denom > 0
 
-    if seq_mult_prob_error.numel() > 0:
-        max_seq_mult_prob_error = seq_mult_prob_error.max().item()
-        mean_seq_mult_prob_error = seq_mult_prob_error.mean().item()
-        min_seq_mult_prob_error = seq_mult_prob_error.min().item()
+    # EXACT same calculation as token_mult_prob_error but per-sequence (for valid sequences)
+    seq_mult_prob_error = torch.zeros_like(denom, dtype=lp_error.dtype)
+    if valid_seq_mask.any():
+        num = (torch.exp(lp_error * mask) * mask).sum(dim=-1)
+        seq_mult_prob_error[valid_seq_mask] = num[valid_seq_mask] / denom[
+            valid_seq_mask
+        ].clamp(min=1)
+
+        valid_errors = seq_mult_prob_error[valid_seq_mask]
+        max_seq_mult_prob_error = valid_errors.max().item()
+        mean_seq_mult_prob_error = valid_errors.mean().item()
+        min_seq_mult_prob_error = valid_errors.min().item()
     else:
         max_seq_mult_prob_error = 0.0
         mean_seq_mult_prob_error = 0.0
