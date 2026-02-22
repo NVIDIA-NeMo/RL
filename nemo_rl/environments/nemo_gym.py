@@ -39,6 +39,7 @@ class GenRMCompareConfig(TypedDict, total=False):
     agent_names: List[str]
     server_name: str
     num_generations_per_prompt: int
+    policy_model_server_name: str
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -159,7 +160,7 @@ Depending on your data shape, you may want to change these values."""
                     genrm_compare_server_name=genrm_config.get(
                         "server_name", "genrm_compare"
                     ),
-                    policy_model_server_name="policy_model",
+                    policy_model_server_name=genrm_config.get("policy_model_server_name", "policy_model"),
                     num_generations_per_prompt=genrm_config.get(
                         "num_generations_per_prompt", 16
                     ),
