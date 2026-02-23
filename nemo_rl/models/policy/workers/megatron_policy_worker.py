@@ -1447,10 +1447,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         global_rank = local_rank + rank_offset
         self.refit_rank_offset = rank_offset
 
-        print(f"[REFIT] rank={global_rank} (local={local_rank}) init_refit_collective "
-              f"ws={world_size} ip={ip} port={port}", flush=True)
-
-        # Create TCP store for rendezvous (separate port from any other rendezvous)
+        # port+1 to avoid collision with the caller's rendezvous on `port`.
         store = torch.distributed.TCPStore(
             host_name=ip,
             port=port + 1,
@@ -1461,7 +1458,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         group_name = "refit"
         pg_prefix_store = PrefixStore(f"{group_name}/", store)
 
-        # Create ProcessGroup with Gloo backend (matches _new_process_group_helper pattern)
+        # Training and inference workers run in separate torch.distributed worlds
+        # (each has its own init_process_group). The public APIs (new_group,
+        # init_process_group) assume all ranks belong to one world — new_group
+        # validates ranks against the default PG, and init_process_group can only
+        # be called once. We construct the PG manually using the same internal
+        # pattern as _new_process_group_helper, skipping the single-world
+        # assumptions.
         pg = ProcessGroup(pg_prefix_store, global_rank, world_size)
         gloo_store = PrefixStore("cpu/", pg_prefix_store)
         gloo_backend = ProcessGroupGloo(gloo_store, global_rank, world_size)
@@ -1476,10 +1479,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self.refit_pg = pg
 
-        # Register in _world so PyTorch distributed operations work correctly.
-        # Identity mapping: all_gather_object uses this for get_rank(group) but
-        # the actual all_gather operation uses the PG's internal rank ordering,
-        # so the mapping doesn't need to be exact for cross-world PGs.
+        # Register in torch.distributed's global state so that high-level ops
+        # (all_gather_object, broadcast_object_list) work with this PG.
+        # These ops internally call get_rank(group) which looks up pg_group_ranks,
+        # and use pg_map for backend dispatch. The identity mapping works because
+        # our global_rank space (0..world_size-1) is already the group rank space.
         _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name

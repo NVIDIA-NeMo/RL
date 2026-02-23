@@ -723,7 +723,7 @@ def setup(
         world_size = train_world_size + inference_world_size
 
         if backend == "megatron":
-            # Non-colocated Megatron: use init_refit_collective (same pattern as vLLM)
+            # Non-colocated Megatron: use init_refit_collective
             refit_backend = policy_config.get("megatron_cfg", {}).get("refit_backend", "gloo")
             futures_train = policy.init_refit_collective(
                 ip, port, world_size,
@@ -734,7 +734,7 @@ def setup(
             futures_inference = policy_generation.init_collective(
                 ip, port, world_size, train_world_size=train_world_size,
                 refit_backend=refit_backend,
-            )  # type: ignore
+            )
             ray.get(futures_train + futures_inference)
         else:
             # vLLM path: init_collective
