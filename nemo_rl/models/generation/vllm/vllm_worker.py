@@ -37,6 +37,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -366,6 +367,7 @@ class BaseVllmGenerationWorker:
 
     def _load_model(self, bundle_indices, seed):
         """Perform model loading and engine creation."""
+        log_gpu_memory_diagnostics(label="load_model_start", worker_type="VllmGenerationWorker")
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_load_model")
@@ -514,10 +516,12 @@ class BaseVllmGenerationWorker:
         )
 
         self._create_engine(llm_kwargs)
+        log_gpu_memory_diagnostics(label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0)
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+        log_gpu_memory_diagnostics(label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0)
 
     def llm(self):
         return self.llm
