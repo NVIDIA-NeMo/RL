@@ -471,34 +471,19 @@ def setup(
             helpers.append(helper)
             nemo_gym_nodes.append(helper_node_info)
 
+        # Resolve any missing node IDs
+        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
+            node_id = nemo_gym_nodes[nemo_gym_node_idx]["node_id"]
+            node_ip = nemo_gym_nodes[nemo_gym_node_idx]["node_ip"]
+            if not node_id:
+                node_id = all_node_infos[node_ip]["node_id"]
+                assert node_id
+                nemo_gym_nodes[nemo_gym_node_idx]["node_id"] = node_id
+
         for helper in helpers:
             ray.kill(helper, no_restart=True)
 
-        helpers = []
-
-        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
-            helper_node_id = nemo_gym_nodes[nemo_gym_node_idx]["node_id"]
-            helper_node_ip = nemo_gym_nodes[nemo_gym_node_idx]["node_ip"]
-            if not helper_node_id:
-                helper_node_id = all_node_infos[helper_node_ip]["node_id"]
-                assert helper_node_id
-                nemo_gym_nodes[nemo_gym_node_idx]["node_id"] = helper_node_id
-            helper_options = {}
-            helper_options["num_gpus"] = nemo_gym_num_gpus_per_node
-            helper_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-                node_id=helper_node_id,
-                soft=False,
-            )
-            helper = RayClusterSetupHelper.options(**helper_options).remote()
-            helpers.append(helper)
-
-        for helper_pg in helper_pgs:
-            try:
-                remove_placement_group(helper_pg)
-            except Exception:
-                pass
-
-        nemo_gym_helpers = helpers
+        nemo_gym_judge_pgs = helper_pgs
 
         print(
             f"  ✓ Ray cluster for NeMo Gym reserved with {nemo_gym_num_nodes} nodes",
@@ -512,7 +497,7 @@ def setup(
 
     else:
         nemo_gym_nodes = []
-        nemo_gym_helpers = []
+        nemo_gym_judge_pgs = []
 
     if colocated_inference:
         if total_nodes == 1:
@@ -850,13 +835,11 @@ def setup(
                     nemo_gym_py_exec = create_local_venv_on_each_node(
                         nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
                     )
-                for helper in nemo_gym_helpers:
-                    ray.kill(helper, no_restart=True)
-
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
                     ray_gpu_nodes=[node["node_id"] for node in nemo_gym_nodes],
+                    ray_gpu_pgs=nemo_gym_judge_pgs,
                     ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
                     ray_namespace=ray_namespace,
                     initial_global_config_dict=env_configs["nemo_gym"],

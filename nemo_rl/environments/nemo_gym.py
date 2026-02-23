@@ -27,6 +27,7 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     ray_gpu_nodes: List[str]
+    ray_gpu_pgs: List
     ray_num_gpus_per_node: Optional[int]
     ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
@@ -97,6 +98,8 @@ Depending on your data shape, you may want to change these values."""
             print(f"Ray namespace: {ray_namespace}")
 
         initial_global_config_dict["ray_gpu_nodes"] = self.cfg["ray_gpu_nodes"]
+        # ray_gpu_pgs are Ray PlacementGroup objects — can't go through OmegaConf.
+        # They are passed separately to the scheduling helper via set_gpu_pgs().
         initial_global_config_dict["ray_num_gpus_per_node"] = self.cfg[
             "ray_num_gpus_per_node"
         ]
@@ -128,7 +131,9 @@ Depending on your data shape, you may want to change these values."""
                 / "nemo_gym_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
-            )
+            ),
+            ray_gpu_pgs=self.cfg["ray_gpu_pgs"],
+            ray_gpu_nodes=self.cfg["ray_gpu_nodes"],
         )
 
         # Setup for rollout collection
