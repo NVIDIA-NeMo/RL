@@ -99,6 +99,17 @@ def import_model_from_hf_name(
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
 
+    # initialize_model_parallel(seed=0) above initializes the global RNG
+    # tracker with default settings (te_rng_tracker=False).  The tracker
+    # is guarded by a global _CUDA_RNG_STATE_TRACKER_INITIALIZED flag that
+    # causes later calls (e.g. from initialize_megatron) to skip
+    # re-initialization.  Reset the flag so the caller can create the
+    # correct tracker type (e.g. TECudaRNGStatesTracker).
+    from megatron.core.tensor_parallel import random as tp_random
+
+    tp_random._CUDA_RNG_STATE_TRACKER = None
+    tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
 
 def export_model_from_megatron(
     hf_model_name: str,

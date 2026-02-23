@@ -1381,69 +1381,115 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_iter_func=lambda x: x[1],
         )
 
-    @torch.no_grad()
-    def update_weights_from_collective(self) -> bool:
-        """Receive updated weights from collective communication (inference side).
+    def init_refit_collective(self, ip, port, world_size, rank_offset, refit_backend="gloo"):
+        """Initialize the refit collective for non-colocated Megatron weight transfer.
 
-        This method is the consumer counterpart of broadcast_weights_for_collective.
-        It receives weights broadcast by the training workers and updates the local
-        model parameters.
-
-        TODO: Implement the actual weight update logic using packed_broadcast_consumer.
-        The implementation should:
-        1. Iterate over the stored state_dict_info
-        2. Use packed_broadcast_consumer to receive weights from the training side
-        3. Update the local Megatron model parameters with the received weights
-
-        Returns:
-            bool: True if weights were successfully updated.
-        """
-        raise NotImplementedError(
-            "update_weights_from_collective for MegatronPolicyWorker is not yet implemented. "
-            "This placeholder will be replaced with actual NCCL collective weight reception logic."
-        )
-
-    def init_collective_as_inference(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
-    ) -> None:
-        """Initialize collective communication for inference-side workers.
-
-        Unlike the base init_collective (used by training workers which use
-        self.rank directly), this method offsets the rank by train_world_size
-        so inference workers get globally unique ranks that don't collide
-        with training workers.
+        Creates a Gloo-backed ProcessGroup spanning training and inference
+        workers for metadata exchange (all_gather_object, broadcast), and a
+        CopyService for the actual data transfer (GlooCopyService for
+        CPU-staged P2P, or NVSHMEMCopyService for GPU-direct transfers).
 
         Args:
             ip: IP address for the process group rendezvous.
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
-            train_world_size: Number of training workers (used to offset ranks).
+            rank_offset: Offset for this side's ranks (0 for training, train_ws for inference).
+            refit_backend: Copy service backend ("gloo" or "nvshmem").
         """
-        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
-
-        # Offset rank by train_world_size so inference workers get unique global ranks
-        rank = train_world_size + self.rank
-        self.model_update_group = StatelessProcessGroup(
-            master_address=ip, port=port, rank=rank, world_size=world_size
+        from torch.distributed.distributed_c10d import (
+            PrefixStore,
+            ProcessGroup,
+            ProcessGroupGloo,
+            _world,
         )
-        device = torch.cuda.current_device()
-        self.model_update_group.init_nccl_communicator(device=device)
 
-    def store_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Store state dict metadata for weight refitting on the inference side.
+        local_rank = torch.distributed.get_rank()
+        global_rank = local_rank + rank_offset
+        self.refit_rank_offset = rank_offset
 
-        This is the inference-side counterpart of prepare_refit_info(). Instead of
-        calculating the metadata from the model, it accepts pre-computed metadata
-        from the training side.
+        # port+1 to avoid collision with the caller's rendezvous on `port`.
+        store = torch.distributed.TCPStore(
+            host_name=ip,
+            port=port + 1,
+            world_size=world_size,
+            is_master=(global_rank == 0),
+        )
 
-        TODO: Implement proper storage and use of state_dict_info for
-        update_weights_from_collective.
+        group_name = "refit"
+        pg_prefix_store = PrefixStore(f"{group_name}/", store)
+
+        # Training and inference workers run in separate torch.distributed worlds
+        # (each has its own init_process_group). The public APIs (new_group,
+        # init_process_group) assume all ranks belong to one world — new_group
+        # validates ranks against the default PG, and init_process_group can only
+        # be called once. We construct the PG manually using the same internal
+        # pattern as _new_process_group_helper, skipping the single-world
+        # assumptions.
+        pg = ProcessGroup(pg_prefix_store, global_rank, world_size)
+        gloo_store = PrefixStore("cpu/", pg_prefix_store)
+        gloo_backend = ProcessGroupGloo(gloo_store, global_rank, world_size)
+        gloo_backend._set_sequence_number_for_group()
+        pg._register_backend(
+            torch.device("cpu"),
+            ProcessGroup.BackendType.GLOO,
+            gloo_backend,
+        )
+        pg._set_default_backend(ProcessGroup.BackendType.GLOO)
+        pg._set_group_name(group_name)
+
+        self.refit_pg = pg
+
+        # Register in torch.distributed's global state so that high-level ops
+        # (all_gather_object, broadcast_object_list) work with this PG.
+        # These ops internally call get_rank(group) which looks up pg_group_ranks,
+        # and use pg_map for backend dispatch. The identity mapping works because
+        # our global_rank space (0..world_size-1) is already the group rank space.
+        _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+        _world.pg_map[pg] = ("gloo", pg_prefix_store)
+        _world.pg_names[pg] = group_name
+
+        if refit_backend == "nvshmem":
+            from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
+            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
+            self.refit_copy_service._ensure_initialized()
+        else:
+            from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
+
+        print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
+
+    @torch.no_grad()
+    def swap_weights_via_reshard(self, is_source: bool, dst_rank_offset: int = 0) -> bool:
+        """Transfer weights using Megatron's swap_model_weights resharding API.
+
+        Uses the CopyService initialized in init_refit_collective for data
+        transfer and the refit ProcessGroup for metadata exchange.
 
         Args:
-            state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples,
-                as returned by the training-side prepare_refit_info().
+            is_source: True for training workers (weight source), False for inference
+                       workers (weight destination).
+            dst_rank_offset: Rank offset of the inference (destination) side.
+
+        Returns:
+            True on success.
         """
-        self.state_dict_info = state_dict_info
+        from megatron.core.resharding.refit import swap_model_weights
+
+        if is_source:
+            src_model = self.model
+            dst_model = None
+        else:
+            src_model = None
+            dst_model = self.model
+
+        swap_model_weights(
+            src_model, dst_model,
+            refit_method=self.refit_copy_service,
+            group=self.refit_pg,
+            src_rank_offset=0,
+            dst_rank_offset=dst_rank_offset,
+        )
+        return True
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

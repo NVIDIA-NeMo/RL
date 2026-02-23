@@ -18,11 +18,8 @@ Megatron-based inference.
 This module wraps a Policy object (configured for inference only, without
 optimizer or reference model) and exposes it through the GenerationInterface.
 It enables non-colocated inference where training and generation run on
-separate GPU clusters, with weights synchronized via NCCL collective
-communication.
-
-The init_collective and update_weights_from_collective methods are currently
-placeholders that will be implemented in a future PR.
+separate GPU clusters, with weights synchronized via Megatron's
+swap_model_weights resharding API.
 """
 
 from typing import Any, Optional
@@ -49,8 +46,8 @@ class MegatronGeneration(GenerationInterface):
     It implements the GenerationInterface so it can be used as a drop-in
     replacement for VllmGeneration in the non-colocated inference flow.
 
-    The weight synchronization methods (init_collective, update_weights_from_collective)
-    are placeholders that will be implemented in a future PR.
+    Weight synchronization uses Megatron's swap_model_weights resharding API
+    with GlooCopyService or NVSHMEMCopyService for data transfer.
     """
 
     def __init__(
@@ -92,53 +89,56 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int,
+        refit_backend: str = "gloo",
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication for weight synchronization.
+        """Initialize the refit collective for weight synchronization.
 
-        This sets up NCCL communication between training workers and these
-        inference workers so that updated model weights can be broadcast
-        from the training cluster to the inference cluster.
+        Creates a Gloo-backed ProcessGroup spanning training and
+        inference workers so that updated model weights can be transferred
+        from the training cluster to the inference cluster using Megatron's
+        resharding API.
 
-        Uses init_collective_as_inference on the workers, which offsets each
-        worker's rank by train_world_size to avoid colliding with training
-        workers' ranks (rank = train_world_size + worker_rank).
+        Uses init_refit_collective on workers with rank_offset set to
+        train_world_size, so inference workers get globally unique ranks
+        (rank = train_world_size + worker_rank) that don't collide with
+        training workers' ranks.
 
         Args:
             ip: IP address for the process group rendezvous.
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
+            refit_backend: Copy service backend ("gloo" or "nvshmem").
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
+        self._train_world_size = train_world_size
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "init_collective_as_inference",
+            "init_refit_collective",
             ip=ip,
             port=port,
             world_size=world_size,
-            train_world_size=train_world_size,
+            rank_offset=train_world_size,
+            refit_backend=refit_backend,
         )
         return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication.
 
-        This method is called after the training side calls
-        policy.broadcast_weights_for_collective(). It receives the broadcast
-        weights and updates the local model parameters.
-
-        TODO: This is a placeholder. The actual implementation will:
-        1. Iterate over the model's state_dict info
-        2. Use packed_broadcast_consumer to receive weights from the training side
-        3. Update the local model parameters with the received weights
+        Uses Megatron's swap_model_weights resharding API with PyNcclCommunicator.
+        Each inference worker calls swap_weights_via_reshard(is_source=False) which
+        receives weights from training workers via the refit collective.
 
         Returns:
             List of Ray ObjectRefs for the weight update futures.
         """
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "update_weights_from_collective",
+            "swap_weights_via_reshard",
+            is_source=False,
+            dst_rank_offset=self._train_world_size,
         )
         return futures
 
@@ -176,21 +176,16 @@ class MegatronGeneration(GenerationInterface):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting.
 
-        This stores the state dict info (tensor names, shapes, dtypes) on each
-        inference worker so that update_weights_from_collective knows what
-        tensors to expect during the weight broadcast.
-
-        Note: This calls store_refit_info on workers (not prepare_refit_info),
-        because prepare_refit_info on MegatronPolicyWorker calculates and
-        returns metadata (training-side), while store_refit_info accepts and
-        stores metadata (inference-side).
+        Calls prepare_refit_info on the workers with the state_dict_info
+        argument, which triggers the inference-side storage path (as opposed
+        to the training-side calculation path when called without arguments).
 
         Args:
             state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples,
                 as returned by the training-side prepare_refit_info().
         """
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "store_refit_info",
+            "prepare_refit_info",
             state_dict_info=state_dict_info,
         )
         ray.get(futures)
