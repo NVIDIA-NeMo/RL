@@ -28,13 +28,17 @@ class TestAsyncSaveConfigPipeline:
     def test_create_checkpoint_config_async_save_true(self):
         from nemo_rl.models.megatron.setup import _create_checkpoint_config
 
-        cfg = _create_checkpoint_config("/fake/pretrained", "/fake/weights", async_save=True)
+        cfg = _create_checkpoint_config(
+            "/fake/pretrained", "/fake/weights", async_save=True
+        )
         assert cfg.async_save is True
 
     def test_create_checkpoint_config_async_save_false(self):
         from nemo_rl.models.megatron.setup import _create_checkpoint_config
 
-        cfg = _create_checkpoint_config("/fake/pretrained", "/fake/weights", async_save=False)
+        cfg = _create_checkpoint_config(
+            "/fake/pretrained", "/fake/weights", async_save=False
+        )
         assert cfg.async_save is False
 
     def test_create_checkpoint_config_default_is_false(self):
@@ -57,8 +61,12 @@ class TestColocatedValidation:
 
         with pytest.raises(ValueError, match="colocated"):
             validate_and_set_config(
-                config, rank=0, hf_model_name="test", pretrained_path="/fake",
-                weights_path=None, tokenizer=None,
+                config,
+                rank=0,
+                hf_model_name="test",
+                pretrained_path="/fake",
+                weights_path=None,
+                tokenizer=None,
             )
 
     def test_async_save_allowed_in_non_colocated_mode(self):
@@ -73,8 +81,12 @@ class TestColocatedValidation:
 
         try:
             validate_and_set_config(
-                config, rank=0, hf_model_name="test", pretrained_path="/fake",
-                weights_path=None, tokenizer=None,
+                config,
+                rank=0,
+                hf_model_name="test",
+                pretrained_path="/fake",
+                weights_path=None,
+                tokenizer=None,
             )
         except ValueError as e:
             if "colocated" in str(e).lower():
@@ -94,8 +106,12 @@ class TestColocatedValidation:
 
         try:
             validate_and_set_config(
-                config, rank=0, hf_model_name="test", pretrained_path="/fake",
-                weights_path=None, tokenizer=None,
+                config,
+                rank=0,
+                hf_model_name="test",
+                pretrained_path="/fake",
+                weights_path=None,
+                tokenizer=None,
             )
         except ValueError as e:
             if "async_save" in str(e).lower():
@@ -108,13 +124,17 @@ class TestBaseWorkerStubs:
     """Verify that AbstractPolicyWorker has no-op stubs so non-Megatron backends don't crash."""
 
     def test_base_worker_finalize_is_noop(self):
-        from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+        from nemo_rl.models.policy.workers.base_policy_worker import (
+            AbstractPolicyWorker,
+        )
 
         worker = MagicMock(spec=AbstractPolicyWorker)
         AbstractPolicyWorker.finalize_pending_checkpoint(worker)
 
     def test_base_worker_shutdown_async_is_noop(self):
-        from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+        from nemo_rl.models.policy.workers.base_policy_worker import (
+            AbstractPolicyWorker,
+        )
 
         worker = MagicMock(spec=AbstractPolicyWorker)
         AbstractPolicyWorker.shutdown_async_checkpoint_worker(worker)

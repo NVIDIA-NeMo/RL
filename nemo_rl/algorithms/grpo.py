@@ -1292,7 +1292,9 @@ def grpo_train(
     memory_tracker = MemoryTracker()
 
     kv_scales_cache = None  # Cache reused for computed kv scales
-    async_save = master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
+    async_save = (
+        master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
+    )
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -2370,7 +2372,9 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    async_save = master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
+    async_save = (
+        master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
+    )
     NEED_REFIT = True
 
     # Setup generation interface
