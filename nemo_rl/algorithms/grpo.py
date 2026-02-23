@@ -275,18 +275,30 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    batch_multiplier = grpo_config["batch_multiplier"]
+    # num_prompts_per_step and dataloader_batch_size will be different when using multiple dataloaders
+    num_prompts_per_step = grpo_config["num_prompts_per_step"]
     if data_config["use_multiple_dataloader"]:
         dataloader_batch_size = data_config["num_prompts_per_dataloader"]
     else:
-        dataloader_batch_size = grpo_config["num_prompts_per_step"]
+        dataloader_batch_size = num_prompts_per_step
 
     # Validate batch_multiplier
+    batch_multiplier = grpo_config["batch_multiplier"]
     if grpo_config["use_dynamic_sampling"]:
+        num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
     else:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+        )
+
+    # Validate number of prompts per step
+    if data_config["use_multiple_dataloader"]:
+        assert num_prompts_per_step % dataloader_batch_size == 0, (
+            "Expected num_prompts_per_step to be a multiple of num_prompts_per_dataloader, "
+            f"but got {num_prompts_per_step} and {dataloader_batch_size}. "
+            "Please check the configuration of num_prompts_per_step and num_prompts_per_dataloader. "
+            "If use_dynamic_sampling is enabled and batch_multiplier is used, please also check the configuration of batch_multiplier."
         )
 
     # Load train dataset
@@ -307,16 +319,6 @@ def setup(
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
-        # Validate number of prompts per step
-        num_prompts_per_step = grpo_config["num_prompts_per_step"]
-        expected_num_prompts = int(num_prompts_per_step * batch_multiplier)
-
-        assert expected_num_prompts % dataloader_batch_size == 0, (
-            "Expected int(num_prompts_per_step * batch_multiplier) to be a multiple of int(num_prompts_per_dataloader * batch_multiplier), "
-            f"but got {expected_num_prompts} and {dataloader_batch_size}. "
-            "Please check the configuration of num_prompts_per_step, num_prompts_per_dataloader, and batch_multiplier."
-        )
-
         # Initialize dataloaders
         dataloaders = {}
         for task_name, task_dataset in dataset.items():
@@ -334,7 +336,7 @@ def setup(
 
         # Wrap dataloader
         dataloader = MultipleDataloaderWrapper(
-            expected_num_prompts=expected_num_prompts,
+            expected_num_prompts=num_prompts_per_step,
             data_config=data_config,
             dataloaders=dataloaders,
         )
