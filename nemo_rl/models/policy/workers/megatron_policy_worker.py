@@ -47,6 +47,7 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     is_pipeline_last_stage,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
@@ -59,7 +60,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.common import get_moe_metrics
+from nemo_rl.models.megatron.common import get_moe_metrics, get_mtp_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -300,6 +301,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Pre-compute MTP loss mask from token_mask and sample_mask
+                # before microbatch processing, so process_microbatch can pack it
+                if "token_mask" in batch and "sample_mask" in batch:
+                    mtp_loss_mask = batch["token_mask"] * batch["sample_mask"].unsqueeze(-1)
+                    if self.cfg["megatron_cfg"].get("mtp_positive_only", False):
+                        mtp_loss_mask = (batch["advantages"] > 0) * mtp_loss_mask
+                    batch["mtp_loss_mask"] = mtp_loss_mask
+
                 (
                     data_iterator,
                     num_microbatches,
@@ -327,6 +336,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
+                    # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
+                    mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                    self._set_mtp_grad_scale_func(lambda: mtp_scale)
+
                     # Forward pass.
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
@@ -342,6 +355,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         global_valid_toks=global_valid_toks,
                         straggler_timer=self.mcore_state.straggler_timer,
                     )
+
+                # Clear mtp_grad_scale_func after the forward-backward pass so
+                # it doesn't get serialized in the run_config.yaml when saving
+                self._set_mtp_grad_scale_func(None)
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -444,6 +461,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+        # Collect MTP metrics
+        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            mtp_metrics = get_mtp_metrics()
+            if mtp_metrics:
+                metrics["mtp_metrics"] = mtp_metrics
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -913,6 +936,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _set_mtp_grad_scale_func(self, func):
+        """Set mtp_grad_scale_func on the model config for MTP loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.mtp_grad_scale_func = func
+
+    def _get_model_config(self):
+        """Get the underlying model config (handle Float16Module wrapper)."""
+        model = self.model
+        if hasattr(model, "module") and hasattr(model.module, "config"):
+            return model.module.config
+        elif hasattr(model, "config"):
+            return model.config
+        return None
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.

@@ -20,8 +20,8 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 
 # Parse command line arguments
-GIT_URL=${1:-https://github.com/guyueh1/vllm}
-GIT_REF=${2:-nemotronh-rl-2}
+GIT_URL=${1:-https://github.com/CentML/vllm}
+GIT_REF=${2:-nemotron-h-rl-2-mtp-fix-2}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # You need to export VLLM_PRECOMPILED_WHEEL_LOCATION to the full path of the wheel file.
 if [[ "$(uname -m)" == "aarch64" ]]; then

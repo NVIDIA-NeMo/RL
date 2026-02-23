@@ -41,6 +41,7 @@ class ProcessedInputs:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -67,6 +68,7 @@ class ProcessedMicrobatch:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
 
 
 def make_processed_microbatch_iterator(
@@ -120,6 +122,7 @@ def make_processed_microbatch_iterator(
             position_ids=processed_inputs.position_ids,
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
         )
 
 
@@ -234,6 +237,7 @@ def process_microbatch(
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
+        mtp_loss_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -264,6 +268,24 @@ def process_microbatch(
                 cp_size=get_context_parallel_world_size(),
             )
 
+            # Pack pre-computed mtp_loss_mask the same way as input_ids
+            if "mtp_loss_mask" in data_dict:
+                (
+                    _,
+                    mtp_loss_mask,
+                    _,
+                    _,
+                    _,
+                ) = _pack_sequences_for_megatron(
+                    data_dict["mtp_loss_mask"],
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information
             position_ids = None
@@ -279,6 +301,8 @@ def process_microbatch(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
+            if "mtp_loss_mask" in data_dict:
+                mtp_loss_mask = data_dict["mtp_loss_mask"]
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -286,6 +310,7 @@ def process_microbatch(
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
+        mtp_loss_mask=mtp_loss_mask,
     )
 
 

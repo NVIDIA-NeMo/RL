@@ -415,6 +415,11 @@ class BaseVllmGenerationWorker:
         vllm_kwargs["hf_overrides"].update(
             self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
         )
+        if "speculative_config" in vllm_kwargs and "num_speculative_tokens" in vllm_kwargs["speculative_config"] and vllm_kwargs["speculative_config"]["num_speculative_tokens"] == 0:
+            vllm_kwargs["speculative_config"] = None
+
+            if not vllm_kwargs.get("enable_prefix_caching", True):
+                print("without speculative decoding you should set prefix caching to be True")
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
