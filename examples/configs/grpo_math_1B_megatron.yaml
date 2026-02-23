@@ -102,7 +102,7 @@ policy:
     apply_rope_fusion: True
     moe_pad_experts_for_cuda_graph_inference: false
     cuda_graph_impl: "local"
-    cuda_graph_scope: null
+    cuda_graph_scope: "full_iteration_inference"
     use_te_rng_tracker: true
     inference_rng_tracker: true
     batch_invariant_mode: false
