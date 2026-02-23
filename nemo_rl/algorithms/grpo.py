@@ -190,6 +190,8 @@ class GRPOConfig(TypedDict):
     seq_logprob_error_threshold: float | None
     penalize_invalid_tool_call: bool  # If True, assign a negative advantage to invalid tool call tokens
     invalid_tool_call_advantage: NotRequired[float]  # Advantage value for invalid tool calls when penalize_invalid_tool_call is True (default: -5.0)
+    penalize_malformed_thinking: bool  # If True, assign a negative advantage to tokens with malformed <think>/</think> tags
+    malformed_thinking_advantage: NotRequired[float]  # Advantage value for malformed thinking when penalize_malformed_thinking is True (default: -5.0)
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1968,7 +1970,9 @@ def grpo_train(
                         # Only unmask assistant messages that were actually generated (have generation_logprobs),
                         # not assistant messages that were part of the prompt history
                         penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
+                        penalize_malformed_thinking = master_config["grpo"].get("penalize_malformed_thinking", False)
                         print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
+                        print(f"Penalize malformed thinking: {penalize_malformed_thinking}", flush=True)
 
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             for j, message in enumerate(message_log):
@@ -1988,9 +1992,19 @@ def grpo_train(
                                 # For invalid tool calls with penalize_invalid_tool_call,
                                 # override advantage to push the model away from generating them.
                                 is_invalid = is_assistant and penalize_invalid_tool_call and message.get("is_invalid_tool_call", False)
+                                # For malformed thinking tags (duplicated in reasoning or leaked into content),
+                                # override advantage to push the model away from generating them.
+                                is_malformed_thinking = is_assistant and penalize_malformed_thinking and message.get("has_malformed_thinking", False)
                                 if is_invalid:
                                     neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
-                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
+                                    print(f"Setting negative advantage ({neg_adv}) for invalid tool call in assistant message {i} {j}", flush=True)
+                                    message["advantages"] = neg_adv * torch.ones(token_ids.shape,
+                                        dtype=advantages[i].dtype,
+                                        device=advantages[i].device
+                                    )
+                                elif is_malformed_thinking:
+                                    neg_adv = master_config["grpo"].get("malformed_thinking_advantage", -5.0)
+                                    print(f"Setting negative advantage ({neg_adv}) for malformed thinking in assistant message {i} {j}", flush=True)
                                     message["advantages"] = neg_adv * torch.ones(token_ids.shape,
                                         dtype=advantages[i].dtype,
                                         device=advantages[i].device
@@ -3337,18 +3351,24 @@ def async_grpo_train(
                     # This modifies the per-sample advantage to a per-token tensor for affected samples,
                     # overriding with a negative advantage for invalid tool call tokens.
                     penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
-                    if penalize_invalid_tool_call:
+                    penalize_malformed_thinking = master_config["grpo"].get("penalize_malformed_thinking", False)
+                    if penalize_invalid_tool_call or penalize_malformed_thinking:
                         print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
-                        neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                        print(f"Penalize malformed thinking: {penalize_malformed_thinking}", flush=True)
+                        invalid_neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                        malformed_neg_adv = master_config["grpo"].get("malformed_thinking_advantage", -5.0)
                         # Build per-token advantage override using message metadata
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             for j, message in enumerate(message_log):
                                 is_assistant = message["role"] == "assistant" and "generation_logprobs" in message
-                                is_invalid = is_assistant and message.get("is_invalid_tool_call", False)
+                                is_invalid = is_assistant and penalize_invalid_tool_call and message.get("is_invalid_tool_call", False)
+                                is_malformed_thinking = is_assistant and penalize_malformed_thinking and message.get("has_malformed_thinking", False)
                                 if is_invalid:
-                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
-                                    # Override this sample's advantage with per-token negative value
-                                    train_data["advantages"][i] = neg_adv
+                                    print(f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}", flush=True)
+                                    train_data["advantages"][i] = invalid_neg_adv
+                                elif is_malformed_thinking:
+                                    print(f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}", flush=True)
+                                    train_data["advantages"][i] = malformed_neg_adv
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
