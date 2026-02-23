@@ -194,7 +194,7 @@ def example_custom_dataloader(
     data_iterators: dict[str, Iterator],
     dataloaders: dict[str, StatefulDataLoader],
     **kwargs,
-):
+) -> tuple[BatchedDataDict, dict[str, Iterator]]:
     ...
     reward = kwargs["reward"]
     ...
