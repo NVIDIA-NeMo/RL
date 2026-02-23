@@ -179,6 +179,26 @@ uv run examples/run_grpo.py \
     data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader
 ```
 
+For example, consider using `example_custom_dataloader`, which samples data from each dataloader sequentially.
+
+Given two datasets:
+- Dataset 1: `[a, b, c, d]`
+- Dataset 2: `[1, 2, 3, 4, 5, 6, 7, 8]`
+
+With `data.use_multiple_dataloader=false` and `grpo.num_prompts_per_step=4`:
+```
+Batch 1: [a, b, c, d]
+Batch 2: [1, 2, 3, 4]
+Batch 3: [5, 6, 7, 8]
+```
+
+With `data.use_multiple_dataloader=true`, `grpo.num_prompts_per_step=4`, and `data.num_prompts_per_dataloader=2`:
+```
+Batch 1: [a, b, 1, 2]
+Batch 2: [c, d, 3, 4]
+Batch 3: [a, b, 5, 6]
+```
+
 **Custom Dataloader**
 
 The file `examples/custom_dataloader/custom_dataloader.py` provides a reference implementation that samples `data.num_prompts_per_dataloader` entries from each dataloader.
