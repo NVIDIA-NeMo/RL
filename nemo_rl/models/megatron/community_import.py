@@ -76,23 +76,40 @@ def import_model_from_hf_name(
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
     model_provider.finalize()
-    model_provider.initialize_model_parallel(seed=0)
-    megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
-    # The above parallelism settings are used to load the model in a distributed manner.
-    # However, we do not want to save the parallelism settings to the checkpoint config
-    # because they may result in validation errors when loading the checkpoint.
-    config = megatron_model[0].config
-    config.tensor_model_parallel_size = orig_tensor_model_parallel_size
-    config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
-    config.context_parallel_size = orig_context_parallel_size
-    config.expert_model_parallel_size = orig_expert_model_parallel_size
-    config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
-    config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
-    config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
-    config.pipeline_dtype = orig_pipeline_dtype
+    try:
+        from megatron.bridge.training.model_load_save import (
+            temporary_distributed_context,
+        )
+    except ImportError:
+        raise ImportError("megatron.bridge.training is not available.")
 
-    bridge.save_megatron_model(megatron_model, output_path)
+    with temporary_distributed_context(backend="gloo"):
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+        # Don't need to call parallel_state.initialize_model_parallel() here, because it's already called in temporary_distributed_context
+        model_parallel_cuda_manual_seed(0)
+
+        megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+
+        # The above parallelism settings are used to load the model in a distributed manner.
+        # However, we do not want to save the parallelism settings to the checkpoint config
+        # because they may result in validation errors when loading the checkpoint.
+        config = megatron_model[0].config
+        config.tensor_model_parallel_size = orig_tensor_model_parallel_size
+        config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
+        config.context_parallel_size = orig_context_parallel_size
+        config.expert_model_parallel_size = orig_expert_model_parallel_size
+        config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
+        config.num_layers_in_first_pipeline_stage = (
+            orig_num_layers_in_first_pipeline_stage
+        )
+        config.num_layers_in_last_pipeline_stage = (
+            orig_num_layers_in_last_pipeline_stage
+        )
+        config.pipeline_dtype = orig_pipeline_dtype
+
+        bridge.save_megatron_model(megatron_model, output_path)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine
