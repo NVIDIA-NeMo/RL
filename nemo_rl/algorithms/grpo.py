@@ -637,6 +637,7 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    nemo_gym_actor = None  # May be set during overlapped init below
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -673,13 +674,6 @@ def setup(
             init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
-
-    def init_vllm():
-        """Initialize vLLM generation workers."""
-        t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
-        return pg, time.perf_counter() - t0
 
     def init_sglang():
         """Initialize SGLang generation workers."""
@@ -790,13 +784,131 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
+        # ---- NeMo Gym: pre-compute vLLM server URLs for overlapped init ----
+        # When NeMo Gym is enabled, we do a lightweight deferred VllmGeneration
+        # init (binds ports only, no model loading) so we can pass the URLs to
+        # NeMo Gym immediately. init_vllm() then completes the heavy loading.
+        deferred_vllm = None
+        if enable_nemo_gym:
+            print(
+                "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
+                flush=True,
+            )
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            print(
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.dp_openai_server_base_urls}",
+                flush=True,
+            )
+
+        # ---- Init functions ----
+        def init_vllm():
+            """Initialize vLLM generation workers.
+
+            When NeMo Gym is enabled, completes the deferred model loading
+            started above (ports already reserved). Otherwise creates
+            VllmGeneration from scratch.
+            """
+            t0 = time.perf_counter()
+            if deferred_vllm is not None:
+                deferred_vllm.load_and_start()
+                pg = deferred_vllm
+            else:
+                pg = VllmGeneration(
+                    cluster=inference_cluster, config=generation_config
+                )
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        # ---- Build init task list ----
+        # Colocated: vLLM and policy share GPUs -> must be sequential
+        # Non-colocated: separate GPU pools -> can run in parallel
+        init_tasks = {}
+
+        if colocated_inference:
+            def init_vllm_then_policy():
+                pg, vllm_t = init_vllm()
+                p, policy_t = init_policy()
+                return pg, vllm_t, p, policy_t
+            init_tasks["vllm_policy"] = init_vllm_then_policy
+        else:
+            init_tasks["vllm"] = init_vllm
+            init_tasks["policy"] = init_policy
+
+        if enable_nemo_gym:
+            def init_nemo_gym():
+                """Build NeMo Gym venv and spin up all servers with pre-assigned URLs."""
+                t0 = time.perf_counter()
+                nemo_gym_py_exec = get_actor_python_env(
+                    "nemo_rl.environments.nemo_gym.NemoGym"
+                )
+                if nemo_gym_py_exec.startswith("uv"):
+                    nemo_gym_py_exec = create_local_venv_on_each_node(
+                        nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+                    )
+                for helper in nemo_gym_helpers:
+                    ray.kill(helper, no_restart=True)
+
+                nemo_gym_cfg = NemoGymConfig(
+                    model_name=generation_config["model_name"],
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    ray_gpu_nodes=[node["node_id"] for node in nemo_gym_nodes],
+                    ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
+                    ray_namespace=ray_namespace,
+                    initial_global_config_dict=env_configs["nemo_gym"],
+                    invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
+                )
+                nemo_gym_opts = {}
+                if nemo_gym_num_nodes:
+                    nemo_gym_opts["scheduling_strategy"] = (
+                        NodeAffinitySchedulingStrategy(
+                            node_id=ray_cur_node_id,
+                            soft=True,
+                        )
+                    )
+                nemo_gym_opts["runtime_env"] = {
+                    "py_executable": nemo_gym_py_exec,
+                    "env_vars": {
+                        **os.environ,
+                        "VIRTUAL_ENV": nemo_gym_py_exec,
+                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+                    },
+                }
+                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+                ray.get(actor._spinup.remote())
+                return actor, time.perf_counter() - t0
+
+            init_tasks["nemo_gym"] = init_nemo_gym
+
+        # ---- Execute all tasks ----
+        print(
+            f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+            flush=True,
         )
+        parallel_start_time = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+            submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+            results = {k: f.result() for k, f in submitted.items()}
+        parallel_wall_time = time.perf_counter() - parallel_start_time
+
+        # ---- Collect results ----
+        if colocated_inference:
+            policy_generation, vllm_time, policy, policy_time = results["vllm_policy"]
+        else:
+            policy_generation, vllm_time = results["vllm"]
+            policy, policy_time = results["policy"]
+
+        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+
+        if enable_nemo_gym:
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -854,54 +966,6 @@ def setup(
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
 
-    if enable_nemo_gym:
-        # ==========================
-        #   NeMo Gym
-        # ==========================
-        print("\n▶ Setting up NeMo Gym...", flush=True)
-
-        print(f"DEBUG: grpo setup: nemo gym nodes = {nemo_gym_nodes}", flush=True)
-
-        nemo_gym_config = NemoGymConfig(
-            model_name=policy_generation.cfg["model_name"],
-            base_urls=policy_generation.dp_openai_server_base_urls,
-            ray_gpu_nodes=[node["node_id"] for node in nemo_gym_nodes],
-            ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
-            ray_namespace=ray_namespace,
-            initial_global_config_dict=env_configs["nemo_gym"],
-            invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
-        )
-        nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
-        if nemo_gym_py_exec.startswith("uv"):
-            # Lazily build a dedicated venv across all Ray nodes on-demand.
-            nemo_gym_py_exec = create_local_venv_on_each_node(
-                nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-            )
-        for nemo_gym_helper in nemo_gym_helpers:
-            ray.kill(nemo_gym_helper, no_restart=True)
-        del nemo_gym_helpers
-        nemo_gym_options = {}
-        if nemo_gym_num_nodes:
-            nemo_gym_head_node_id = ray_cur_node_id
-            nemo_gym_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-                node_id=nemo_gym_head_node_id,
-                soft=True,
-            )
-        nemo_gym_options["runtime_env"] = {
-            "py_executable": nemo_gym_py_exec,
-            "env_vars": {
-                **os.environ,
-                "VIRTUAL_ENV": nemo_gym_py_exec,
-                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-            },
-        }
-        nemo_gym_actor = NemoGym.options(**nemo_gym_options).remote(nemo_gym_config)
-        # Blocking wait for NeMo Gym to spin up
-        ray.get(nemo_gym_actor._spinup.remote())
-
-    else:
-        nemo_gym_actor = None
-
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -919,6 +983,10 @@ def setup(
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
+
+        nemo_gym_time = worker_init_timing_metrics.get("nemo_gym_init_time_s", 0)
+        if nemo_gym_time:
+            print(f"  NeMo Gym init: {nemo_gym_time:.1f}s (overlapped)")
 
         # Calculate "other" time (time after worker init completes)
         other_time = total_setup - worker_init_complete_time

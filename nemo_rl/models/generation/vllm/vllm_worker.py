@@ -121,6 +121,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        defer_model_load: bool = False,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,7 +131,25 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            defer_model_load: If True, skip model loading during init. Call
+                _load_model() later to perform the heavy model loading.
         """
+        self._init_config(config, bundle_indices, fraction_of_gpus, seed)
+
+        if not self.is_model_owner:
+            return
+
+        if not defer_model_load:
+            self._load_model(bundle_indices, seed)
+
+    def _init_config(
+        self,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]],
+        fraction_of_gpus: float,
+        seed: Optional[int],
+    ):
+        """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -145,7 +164,8 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        # Skip model loading if we're not the model owner
+        self._apply_vllm_patches()
+
         if not self.is_model_owner:
             self.llm = None
             self.tokenizer = None
@@ -158,10 +178,13 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
-        # Monkey patches for vLLM behavior. We avoid importing vllm modules
-        # here to prevent side effects during initialization and instead
-        # locate the files via importlib metadata.
+    def _apply_vllm_patches(self):
+        """Apply file-on-disk patches to vLLM source files.
 
+        These patches are idempotent (check before writing) and applied
+        early during ``_init_config`` so that **all** workers -- including
+        non-model-owners -- see the patched files before any vLLM import.
+        """
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_patch")
@@ -324,6 +347,12 @@ class BaseVllmGenerationWorker:
         logger.info("Successfully patched vllm vit flash attention backend.")
 
         _patch_vllm_speculative_decoding_post_step()
+
+    def _load_model(self, bundle_indices, seed):
+        """Perform model loading and engine creation."""
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_load_model")
 
         try:
             import vllm
