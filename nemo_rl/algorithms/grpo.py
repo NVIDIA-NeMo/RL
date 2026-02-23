@@ -721,21 +721,39 @@ def setup(
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
         world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
+
+        if backend == "megatron":
+            # Non-colocated Megatron: use init_refit_collective (same pattern as vLLM)
+            refit_backend = policy_config.get("megatron_cfg", {}).get("refit_backend", "gloo")
+            futures_train = policy.init_refit_collective(
+                ip, port, world_size,
+                rank_offset=0,
+                dst_rank_offset=train_world_size,
+                refit_backend=refit_backend,
+            )
+            futures_inference = policy_generation.init_collective(
+                ip, port, world_size, train_world_size=train_world_size,
+                refit_backend=refit_backend,
+            )  # type: ignore
+            ray.get(futures_train + futures_inference)
+        else:
+            # vLLM path: init_collective
+            futures_train = policy.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
+            futures_inference = policy_generation.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )  # type: ignore
+            ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    # prepare refit info (not needed for megatron non-colocated, which uses swap_model_weights)
+    if not colocated_inference and backend == "megatron":
+        pass
+    else:
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time

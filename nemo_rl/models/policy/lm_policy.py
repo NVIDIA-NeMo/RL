@@ -274,6 +274,42 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+        # Non-colocated Megatron uses swap_model_weights for refit
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        generation_cfg = config.get("generation", {}) or {}
+        colocated = generation_cfg.get("colocated", {}).get("enabled", True)
+        self._uses_megatron_refit = megatron_enabled and not colocated
+        self._refit_dst_rank_offset = 0
+        self._refit_backend = config.get("megatron_cfg", {}).get("refit_backend", "gloo")
+
+    def init_refit_collective(
+        self, ip: str, port: int, world_size: int, rank_offset: int = 0,
+        dst_rank_offset: int = 0, refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the refit collective for non-colocated Megatron weight transfer.
+
+        Args:
+            ip: IP address for the process group rendezvous.
+            port: Port for the process group rendezvous.
+            world_size: Total world size (train + inference workers).
+            rank_offset: Offset for this side's ranks (0 for training, train_ws for inference).
+            dst_rank_offset: Offset of the inference (destination) side, stored for
+                broadcast_weights_for_collective.
+            refit_backend: Copy service backend ("gloo" or "nvshmem").
+
+        Returns:
+            List of Ray ObjectRefs for the init futures.
+        """
+        self._refit_dst_rank_offset = dst_rank_offset
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_refit_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+        return futures
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -872,12 +908,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "broadcast_weights_for_collective",
-            kv_scales=kv_scales,
-        )
-        # this function should co-work with vllm, so we should wait for all futures to complete outside
-        return futures
+        if self._uses_megatron_refit:
+            # Non-colocated Megatron: use swap_model_weights via refit collective
+            futures = self.worker_group.run_all_workers_single_data(
+                "swap_weights_via_reshard",
+                is_source=True,
+                dst_rank_offset=self._refit_dst_rank_offset,
+            )
+            return futures
+        else:
+            # Existing packed_broadcast path for vLLM
+            futures = self.worker_group.run_all_workers_single_data(
+                "broadcast_weights_for_collective",
+                kv_scales=kv_scales,
+            )
+            # this function should co-work with vllm, so we should wait for all futures to complete outside
+            return futures
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""

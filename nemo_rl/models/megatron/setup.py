@@ -33,6 +33,7 @@ from megatron.bridge.training.config import (
     DistributedDataParallelConfig,
     LoggerConfig,
     OptimizerConfig,
+    RNGConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -598,6 +599,10 @@ def _create_megatron_config(
         model=model_cfg,
         checkpoint=checkpoint_config,
         logger=LoggerConfig(logging_level=0),
+        rng=RNGConfig(
+            te_rng_tracker=getattr(model_cfg, "use_te_rng_tracker", False),
+            inference_rng_tracker=getattr(model_cfg, "inference_rng_tracker", False),
+        ),
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
@@ -848,6 +853,13 @@ def handle_model_import(
         if parallel_state.model_parallel_is_initialized():
             print("Reinitializing model parallel after loading model state.")
             parallel_state.destroy_model_parallel()
+
+        # Reset the RNG tracker state so it can be properly re-initialized
+        # with the correct settings (e.g. inference_rng_tracker, te_rng_tracker)
+        # during model setup. The import path initializes it with defaults.
+        from megatron.core.tensor_parallel import random as tp_random
+        tp_random._CUDA_RNG_STATE_TRACKER = None
+        tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
 
 
 def setup_reference_model_state(
