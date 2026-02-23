@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import socket
 import sys
 import time
 from typing import Optional, TypedDict
@@ -66,9 +67,20 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
+# Default port range for master address allocation.
+# We avoid the OS ephemeral range (typically 32768-60999 on Linux) because
+# those ports can be grabbed by unrelated processes between the time we
+# probe and the time the distributed framework actually binds.
+DEFAULT_PORT_RANGE_LOW = 11001
+DEFAULT_PORT_RANGE_HIGH = 15000
+
+
 @ray.remote  # pragma: no cover
-def _get_node_ip_and_free_port() -> tuple[str, int]:
-    return _get_node_ip_local(), _get_free_port_local()
+def _get_node_ip_and_free_port(
+    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+) -> tuple[str, int]:
+    return _get_node_ip_local(), _get_free_port_local(port_range_low, port_range_high)
 
 
 def _get_node_ip_local() -> str:
@@ -78,13 +90,39 @@ def _get_node_ip_local() -> str:
     return node_ip
 
 
-def _get_free_port_local() -> int:
-    import socket
+def _bind_socket_in_range(
+    sock: socket.socket,
+    port_range_low: int,
+    port_range_high: int,
+    max_retries: int = 50,
+) -> int:
+    """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
+    import random
+
+    for _ in range(max_retries):
+        port = random.randint(port_range_low, port_range_high - 1)
+        try:
+            sock.bind(("", port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(
+        f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
+        f"after {max_retries} attempts."
+    )
+
+
+def _get_free_port_local(
+    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))  # Bind to port 0 to get a random free port
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        port = _bind_socket_in_range(s, port_range_low, port_range_high)
         s.listen(1)
-        port = s.getsockname()[1]
 
     return port
 
@@ -211,6 +249,8 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
+        port_range_low: int = DEFAULT_PORT_RANGE_LOW,
+        port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -222,6 +262,8 @@ class RayVirtualCluster:
             num_gpus_per_node: Number of GPUs per node
             name: Name prefix for placement groups
             placement_group_strategy: Ray placement group strategy ("STRICT_PACK", "PACK", or "SPREAD")
+            port_range_low: Lower bound (inclusive) of the port range used for master address allocation
+            port_range_high: Upper bound (exclusive) of the port range used for master address allocation
         """
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
@@ -237,6 +279,8 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
         self.placement_group_strategy = placement_group_strategy
+        self.port_range_low = port_range_low
+        self.port_range_high = port_range_high
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False
@@ -407,7 +451,7 @@ class RayVirtualCluster:
                     ),
                     # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
                     num_cpus=0,
-                ).remote()
+                ).remote(self.port_range_low, self.port_range_high)
             )
             return addr, port
 

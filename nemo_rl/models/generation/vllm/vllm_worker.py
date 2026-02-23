@@ -99,6 +99,19 @@ class BaseVllmGenerationWorker:
             # https://github.com/vllm-project/vllm/issues/18851
             env_vars["VLLM_CACHE_ROOT"] = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")) + f"_{seed}"
 
+            # Give each vLLM engine a deterministic starting port for TP/DP
+            # rendezvous, outside the OS ephemeral range (32768-60999) and
+            # non-overlapping with NeMo RL (11001-15000) and Gym (15001-20000).
+            # vLLM's _get_open_port() reads VLLM_PORT and auto-increments on
+            # collision, so 100-port spacing per engine provides headroom.
+            _VLLM_PORT_RANGE_LOW = 20001
+            _VLLM_PORTS_PER_ENGINE = 100
+            if len(local_bundle_indices) == 1:
+                engine_index_on_node = local_bundle_indices[0]
+            else:
+                engine_index_on_node = local_bundle_indices[0] // len(local_bundle_indices)
+            env_vars["VLLM_PORT"] = str(_VLLM_PORT_RANGE_LOW + engine_index_on_node * _VLLM_PORTS_PER_ENGINE)
+
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
         # or if it's a primary member of a group with multiple workers.

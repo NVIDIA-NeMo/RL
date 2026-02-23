@@ -18,7 +18,12 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
@@ -54,7 +59,9 @@ class NemoGym(EnvironmentInterface):
 
     def _spinup(self) -> None:
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(port_range_low, port_range_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -73,6 +80,18 @@ class NemoGym(EnvironmentInterface):
             "dummy_key"  # No key necessary for training.
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+
+        # Gym servers default to 15001-20000 so they don't collide with NeMo RL
+        # master-address ports (11001-15000) or vLLM engine ports (20001+).
+        _gym_port_low = self.cfg.get("port_range_low", 15001)
+        _gym_port_high = self.cfg.get("port_range_high", 20000)
+        if _gym_port_low < 15001 or _gym_port_high > 20000:
+            print(
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) overlaps "
+                f"with NeMo RL (11001-15000) or vLLM (20001+). Consider adjusting."
+            )
+        initial_global_config_dict["port_range_low"] = _gym_port_low
+        initial_global_config_dict["port_range_high"] = _gym_port_high
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384

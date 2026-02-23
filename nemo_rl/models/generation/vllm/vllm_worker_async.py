@@ -26,7 +26,13 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    _bind_socket_in_range,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -210,14 +216,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         """
         import socket
 
-        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._reserved_socket.bind(("", 0))
+        self._reserved_port = _bind_socket_in_range(self._reserved_socket, port_range_low, port_range_high)
         self._reserved_socket.listen(128)
         self._reserved_socket.setblocking(False)
-        self._reserved_port = self._reserved_socket.getsockname()[1]
         self._reserved_node_ip = _get_node_ip_local()
         print(
             f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
@@ -755,7 +761,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self._reserved_socket = None  # Transfer ownership to uvicorn
         else:
             node_ip = _get_node_ip_local()
-            free_port = _get_free_port_local()
+            port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+            port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+            free_port = _get_free_port_local(port_range_low, port_range_high)
             reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
