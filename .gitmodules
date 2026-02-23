@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/NVIDIA/Megatron-LM.git
-	branch = main
+	url = https://github.com/ahmadki/Megatron-LM.git
+	branch = ahmadki/dist_optim_non_tensor_fix
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
