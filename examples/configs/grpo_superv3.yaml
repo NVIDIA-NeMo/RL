@@ -24,6 +24,7 @@ grpo:
   advantage_clip_high: null
   val_period: 5
   val_at_start: false
+  val_at_end: false
   overlong_filtering: false
   max_val_samples: null
   val_batch_size: 256
@@ -41,6 +42,7 @@ grpo:
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -79,9 +81,12 @@ loss_fn:
   use_on_policy_kl_approximation: true
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
+  use_kl_in_reward: false
 
 policy:
   model_name: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/checkpoints/nano-v3-sft-64gbs-nickel-capybara-5e-5-constant-wd-0-load-bal-1e-4-lcx3-pretool-base-temp1-iter-0013600-hf"
@@ -131,6 +136,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_aux_loss_coeff: 0.0
     moe_router_enable_expert_bias: true
+    moe_shared_expert_overlap: false
     apply_rope_fusion: True
     bias_activation_fusion: False
     defer_fp32_logits: True
@@ -143,6 +149,8 @@ policy:
 
     mtp_loss_scaling_factor: 0.0
     mtp_use_repeated_layer: true
+    mtp_num_layers: 0
+    mtp_detach_heads: false
 
     optimizer:
       optimizer: "adam"
@@ -184,7 +192,11 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    fp8_cfg: null
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 
     env_vars: null
 
@@ -249,10 +261,19 @@ policy:
         num_nodes: null
 
 data:
-  train_jsonl_fpath: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.train.jsonl"
-  validation_jsonl_fpath: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.val.jsonl"
+  max_input_seq_length: null
   shuffle: false
   num_workers: 1
+  train:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.train.jsonl"
+  validation:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.val.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
 
 env:
   should_use_nemo_gym: true
