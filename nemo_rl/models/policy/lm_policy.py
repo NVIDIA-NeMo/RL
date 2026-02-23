@@ -894,6 +894,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         ray.get(futures)
 
+    def finalize_pending_checkpoint(self) -> None:
+        """Block until all workers complete any in-flight async checkpoint save."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "finalize_pending_checkpoint"
+        )
+        ray.get(futures)
+
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
         try:

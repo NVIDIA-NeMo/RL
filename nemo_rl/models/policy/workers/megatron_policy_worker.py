@@ -193,6 +193,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
 
+        self.mcore_state.initialize_async_checkpoint_worker()
+
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             self.megatron_cfg.param_sync_func = param_sync_func
@@ -1227,6 +1229,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ):
         """Save a training checkpoint.
 
+        Supports both synchronous and asynchronous saving. When async_save is
+        enabled (set at init via policy.megatron_cfg.async_save), the Bridge
+        schedules file writes in a background worker after completing the
+        synchronous D2H transfer. The caller must later invoke
+        finalize_pending_checkpoint() to block until writes complete.
+
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
@@ -1241,15 +1249,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
 
+        use_async = self.mcore_state.cfg.checkpoint.async_save
         original_save_path = self.mcore_state.cfg.checkpoint.save
-        # save_dir = os.path.dirname(weights_path)
-        release_name = os.path.basename(weights_path)
 
         try:
             maybe_finalize_async_save(
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=False,
+                blocking=True,
             )
             self.mcore_state.cfg.checkpoint.save = weights_path
 
@@ -1262,9 +1269,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 if self.scheduler is not None:
                     scheduler_to_save = self.scheduler
 
-            # Ensure model is in eval mode for consistent saving, unless actively training
-            # This is a common practice, though NeMo's save might handle this.
-            # For safety, if not in training loop, setting to eval.
             is_training = self.model.training
             if not is_training:
                 self.model.eval()
@@ -1279,17 +1283,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
                 checkpointing_context=self.checkpointing_context,
             )
-            print(f"Saved checkpoint to {weights_path}")
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-                terminate=True,
-            )
+
+            if use_async:
+                print(f"Scheduled async checkpoint save to {weights_path}")
+            else:
+                print(f"Saved checkpoint to {weights_path}")
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                    terminate=True,
+                )
+
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
-            if not is_training:  # Restore training state if it was changed
+            if not is_training:
                 self.model.train()
 
         except Exception as e:
@@ -1297,6 +1306,41 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_pending_checkpoint(self):
+        """Block until any in-flight async checkpoint save completes.
+
+        Safe to call when no async save is pending (no-op if the queue is
+        empty or async_save is disabled).
+        """
+        if self.mcore_state is not None and self.mcore_state.cfg.checkpoint.async_save:
+            maybe_finalize_async_save(
+                self.mcore_state,
+                ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                blocking=True,
+            )
+
+    def shutdown_async_checkpoint_worker(self):
+        """Finalize any pending save and terminate the persistent async worker.
+
+        Should be called once during worker shutdown. After this call, the
+        async queue is closed and no further async saves can be scheduled.
+        """
+        if self.mcore_state is not None and self.mcore_state.cfg.checkpoint.async_save:
+            maybe_finalize_async_save(
+                self.mcore_state,
+                ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                blocking=True,
+                terminate=True,
+            )
+
+    def shutdown(self) -> bool:
+        """Shutdown the policy, ensuring async checkpoint workers are cleaned up."""
+        try:
+            self.shutdown_async_checkpoint_worker()
+        except Exception:
+            pass
+        return super().shutdown()
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

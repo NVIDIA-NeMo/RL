@@ -106,6 +106,39 @@ class CheckpointManager:
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
 
+        self._in_flight: tuple[int, PathLike] | None = None
+
+        self.cleanup_orphaned_tmp_checkpoints()
+
+    def mark_in_flight(self, step: int, checkpoint_path: PathLike) -> None:
+        """Record that an async checkpoint save is in progress.
+
+        Args:
+            step: The training step number being saved.
+            checkpoint_path: Path to the temporary checkpoint directory.
+        """
+        self._in_flight = (step, checkpoint_path)
+
+    def has_in_flight(self) -> bool:
+        """Check whether an async checkpoint save is in progress."""
+        return self._in_flight is not None
+
+    def get_in_flight(self) -> tuple[int, PathLike] | None:
+        """Return the (step, path) tuple for the in-flight save, or None."""
+        return self._in_flight
+
+    def clear_in_flight(self) -> None:
+        """Clear the in-flight checkpoint state."""
+        self._in_flight = None
+
+    def cleanup_orphaned_tmp_checkpoints(self) -> None:
+        """Remove tmp_step_* directories left by prior crashed async saves."""
+        if not self.checkpoint_dir.exists():
+            return
+        for tmp_dir in self.checkpoint_dir.glob("tmp_step_*"):
+            print(f"Removing orphaned temporary checkpoint: {tmp_dir}")
+            shutil.rmtree(tmp_dir)
+
     def init_tmp_checkpoint(
         self,
         step: int,
@@ -177,6 +210,7 @@ class CheckpointManager:
                 shutil.rmtree(old_checkpoint_path)
         else:
             os.rename(checkpoint_path, to_checkpoint_path)
+        self.clear_in_flight()
         self.remove_old_checkpoints()
 
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:

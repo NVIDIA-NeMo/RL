@@ -1252,6 +1252,22 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _finalize_in_flight_checkpoint(checkpointer, policy) -> None:
+    """Finalize any pending async checkpoint and shut down the async worker."""
+    if checkpointer.has_in_flight():
+        prev_step, prev_path = checkpointer.get_in_flight()
+        print(
+            f"Finalizing remaining async checkpoint for step {prev_step}...",
+            flush=True,
+        )
+        policy.finalize_pending_checkpoint()
+        checkpointer.finalize_checkpoint(prev_path)
+    try:
+        policy.shutdown_async_checkpoint_worker()
+    except Exception:
+        pass
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1276,6 +1292,7 @@ def grpo_train(
     memory_tracker = MemoryTracker()
 
     kv_scales_cache = None  # Cache reused for computed kv scales
+    async_save = master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -1889,6 +1906,16 @@ def grpo_train(
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
+                    if checkpointer.has_in_flight():
+                        prev_step, prev_path = checkpointer.get_in_flight()
+                        with timer.time("checkpoint_finalize"):
+                            print(
+                                f"Finalizing async checkpoint for step {prev_step}...",
+                                flush=True,
+                            )
+                            policy.finalize_pending_checkpoint()
+                            checkpointer.finalize_checkpoint(prev_path)
+
                     policy.prepare_for_training()
 
                     # +1 because step is 0-indexed
@@ -1955,7 +1982,13 @@ def grpo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+
+                        if async_save:
+                            checkpointer.mark_in_flight(
+                                total_steps + 1, checkpoint_path
+                            )
+                        else:
+                            checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
             # Log training data
@@ -2109,6 +2142,7 @@ def grpo_train(
             if should_save_by_timeout:
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
+                _finalize_in_flight_checkpoint(checkpointer, policy)
                 return
             if total_steps >= max_num_steps:
                 memory_tracker.snapshot_start_of_stage("", dir())
@@ -2116,10 +2150,13 @@ def grpo_train(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                _finalize_in_flight_checkpoint(checkpointer, policy)
                 return
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    _finalize_in_flight_checkpoint(checkpointer, policy)
 
 
 def validate(
@@ -2333,6 +2370,7 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+    async_save = master_config["policy"].get("megatron_cfg", {}).get("async_save", False)
     NEED_REFIT = True
 
     # Setup generation interface
@@ -2915,6 +2953,16 @@ def async_grpo_train(
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
+                    if checkpointer.has_in_flight():
+                        prev_step, prev_path = checkpointer.get_in_flight()
+                        with timer.time("checkpoint_finalize"):
+                            print(
+                                f"Finalizing async checkpoint for step {prev_step}...",
+                                flush=True,
+                            )
+                            policy.finalize_pending_checkpoint()
+                            checkpointer.finalize_checkpoint(prev_path)
+
                     policy.prepare_for_training()
 
                     grpo_save_state["current_step"] = step + 1
@@ -2979,7 +3027,11 @@ def async_grpo_train(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+
+                        if async_save:
+                            checkpointer.mark_in_flight(step + 1, checkpoint_path)
+                        else:
+                            checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
             log_data = {"content": flat_messages_content}
@@ -3079,7 +3131,12 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
-        # Clean up
+        # Finalize any in-flight async checkpoint before killing workers
+        try:
+            _finalize_in_flight_checkpoint(checkpointer, policy)
+        except Exception as e:
+            print(f"Error finalizing in-flight checkpoint: {e}")
+
         print("🛑 Stopping trajectory collection...")
         try:
             ray.kill(trajectory_collector)
