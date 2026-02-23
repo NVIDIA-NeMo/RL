@@ -290,7 +290,7 @@ def setup(
         )
 
     # Load train dataset
-    def init_dataloader(dataset, suffix: str = ""):
+    def init_train_dataloader(dataset, suffix: str = ""):
         dataloader = StatefulDataLoader(
             dataset,
             batch_size=dataloader_batch_size,
@@ -318,10 +318,16 @@ def setup(
         )
 
         # Initialize dataloaders
-        dataloaders = {
-            task_name: init_dataloader(task_dataset, f"_{task_name}")
-            for task_name, task_dataset in dataset.items()
-        }
+        dataloaders = {}
+        for task_name, task_dataset in dataset.items():
+            dataloaders[task_name] = init_train_dataloader(
+                task_dataset, f"_{task_name}"
+            )
+            print(
+                f"  ✓ Training dataloader {task_name} loaded with {len(task_dataset)} samples",
+                flush=True,
+            )
+
         train_sample_count = sum(
             len(task_dataloader) for task_dataloader in dataloaders.values()
         )
@@ -333,11 +339,12 @@ def setup(
             dataloaders=dataloaders,
         )
     else:
-        dataloader = init_dataloader(dataset)
+        dataloader = init_train_dataloader(dataset)
         train_sample_count = len(dataloader)
-    print(
-        f"  ✓ Training dataloader loaded with {train_sample_count} samples", flush=True
-    )
+        print(
+            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
+            flush=True,
+        )
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None

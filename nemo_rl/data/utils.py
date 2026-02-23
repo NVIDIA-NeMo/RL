@@ -104,6 +104,9 @@ def setup_response_data(
             update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg)
         data_list.append(data)
+        print(
+            f"  - Loaded training dataset {data.task_name} with {len(data.dataset)} samples."
+        )
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
         task_data_processors[task_name] = (data.task_spec, data.processor)
@@ -152,6 +155,9 @@ def setup_response_data(
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
             val_data_list.append(data.val_dataset)
+            print(
+                f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
+            )
             # bind task_name to task_data_processors and task_to_env
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
@@ -173,6 +179,9 @@ def setup_response_data(
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
+            print(
+                f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
+            )
             # bind task_name to task_data_processors and task_to_env
             task_name = val_data.task_name
             val_task_data_processors[task_name] = (
