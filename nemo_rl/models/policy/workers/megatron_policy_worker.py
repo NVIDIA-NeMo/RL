@@ -876,92 +876,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         await self.dynamic_inference_engine.running.wait()
         self.dynamic_inference_engine.resume()
 
-    @contextmanager
-    def inference_mode(self, mcore_generation_config: dict):
-        """Context manager for inference mode, following Megatron RL's pattern.
-        
-        This mirrors megatron_rl_inference_mode from megatron/rl/rl_utils.py
-        
-        ENTER order:
-        1. Put model in eval mode
-        2. Clear rotary cache
-        3. Toggle CUDA graphs ON 
-        4. Initialize inference engine (first time only)
-        5. Resume engine (reallocates KV cache, recreates CUDA graphs as needed)
-        
-        EXIT order:
-        1. Suspend engine (deallocates KV cache and GPU state)
-        2. Toggle CUDA graphs OFF
-        3. Clear rotary cache
-        4. Put model back in train mode
-        
-        KV cache lifecycle is managed by the engine's suspend/resume mechanism
-        via KVCacheManagementMode in InferenceConfig.
-        
-        Yields:
-            The dynamic inference engine for use during inference.
-        """
-        # Get the language module (unwrap from precision wrappers if needed)
-        lang_module = self._get_lang_module()
-        
-        # Get config settings
-        cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "local")
-        
-        # Save training state
-        was_training = lang_module.training
-        
-        # === ENTER INFERENCE MODE ===
-        
-        # 1. Put model in eval mode
-        lang_module.eval()
-        
-        # 2. Clear rotary position embedding caches (Megatron RL does this)
-        rotary_module = getattr(lang_module, "rotary_pos_emb", None)
-        has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
-        if has_lru_cache:
-            rotary_module.forward.cache_clear()
-        
-        if cuda_graph_impl != "none":
-            toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
-        
-        # 4. Initialize inference engine if not already done
-        if not self._inference_engine_initialized:
-            self._initialize_inference_engine(mcore_generation_config)
-            # Start the coordinator and engine loop (first time only)
-            coordinator_port = self.cfg["generation"].get(
-                "inference_coordinator_port", 5995
-            )
-            self._run_async_coordinator_start(coordinator_port)
-
-        if self._inference_engine_alseep:
-            self._wake()
-        
-        try:
-            # Yield the inference engine for use
-            yield self.dynamic_inference_engine
-            
-        finally:
-            
-            # 1. pause the inference engine
-            if self._inference_engine_initialized and not self._inference_engine_alseep:
-                self._sleep()
-
-            # 2. Toggle CUDA graphs OFF 
-            if cuda_graph_impl != "none":
-                toggle_cuda_graphs(lang_module, set_to="none")
-            
-            # 3. Clear rotary embedding cache again (Megatron RL does this on exit too)
-            if has_lru_cache:
-                rotary_module.forward.cache_clear()
-            
-            # 4. Restore training state
-            if was_training:
-                lang_module.train()
-            
-            # 6. Force garbage collection and CUDA memory cleanup
-            gc.collect()
-            torch.cuda.empty_cache()
-
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
@@ -990,7 +904,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+
         from megatron.core.inference.sampling_params import SamplingParams
+
+        def _log_gpu_memory(tag: str):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            free, total = torch.cuda.mem_get_info()
+            free_gb, total_gb = free / (1024 ** 3), total / (1024 ** 3)
+            print(
+                f"[GPU Rank {rank}] {tag} | "
+                f"Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB, "
+                f"Free: {free_gb:.2f} GB, Total: {total_gb:.2f} GB"
+            )
+
+        _log_gpu_memory("generate START")
 
         self.model.config.flash_decode = False
         if self.should_disable_forward_pre_hook:
@@ -1017,10 +946,32 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         
 
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
-        # Use inference_mode context manager (mirrors megatron_rl_inference_mode from Megatron RL)
-        # This handles: eval mode, CUDA graph toggle, engine init/resume, and cleanup
-        with torch.no_grad(), self.inference_mode(mcore_generation_config) as inference_engine:
-            # Handle None values for top_k - convert to integer as required by Megatron
+        
+        lang_module = self._get_lang_module()
+        cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "local")
+        was_training = lang_module.training
+
+        lang_module.eval()
+        rotary_module = getattr(lang_module, "rotary_pos_emb", None)
+        has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
+        if has_lru_cache:
+            rotary_module.forward.cache_clear()
+        
+        with torch.no_grad():
+    
+            if cuda_graph_impl != "none":
+                toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
+
+            if not self._inference_engine_initialized:
+                self._initialize_inference_engine(mcore_generation_config)
+                coordinator_port = self.cfg["generation"].get(
+                    "inference_coordinator_port", 5995
+                )
+                self._run_async_coordinator_start(coordinator_port)
+
+            if self._inference_engine_alseep:
+                self._wake()
+
             top_k_cfg = self.cfg["generation"]["top_k"]
             top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
 
@@ -1040,7 +991,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 termination_id=self.megatron_tokenizer.eod,
             )
 
-            # Only rank 0 has actual data to submit
             if is_request_submitter:
                 input_ids = data["input_ids"]
                 print(f"[Rank {dist_rank}] input_ids: {input_ids.shape}")
@@ -1051,24 +1001,33 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 prompt_tokens_tensor = torch.empty(0, dtype=torch.long, device="cuda")
                 prompt_lengths_tensor = torch.empty(0, dtype=torch.long, device="cuda")
 
-            # Run the coordinator-based generation using the persistent engine
-            # Rank 0 submits requests, other ranks participate in engine loop
-            # Results are broadcast to all ranks inside this method
             result = self._run_async_generation_with_persistent_engine(
                 prompt_tokens_tensor,
                 prompt_lengths_tensor,
                 sampling_params,
             )
 
-        self.model.config.flash_decode = False
+            if self._inference_engine_initialized and not self._inference_engine_alseep:
+                self._sleep()
 
-        # Context manager has exited - CUDA graphs are now disabled, model is back in train mode
+            if cuda_graph_impl != "none":
+                toggle_cuda_graphs(lang_module, set_to="none")
+
+        if has_lru_cache:
+            rotary_module.forward.cache_clear()
+
+        if was_training:
+            lang_module.train()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self.model.config.flash_decode = False
 
         # Only rank 0 needs to format and return results
         # Other ranks return None (their results are ignored due to output_is_replicated)
         if not is_request_submitter:
-            # Return empty result for non-submitter ranks
-            # Use BatchedDataDict directly instead of from_batches to avoid padding issues with empty tensors
+            _log_gpu_memory("generate END (non-submitter)")
             return BatchedDataDict({
                 "output_ids": torch.empty(0, 0, dtype=torch.long),
                 "logprobs": torch.empty(0, 0, dtype=torch.float),
@@ -1124,6 +1083,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
 
+        _log_gpu_memory("generate END")
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
     def _start_inference_loop_thread(self):

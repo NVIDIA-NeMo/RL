@@ -105,6 +105,7 @@ policy:
     cuda_graph_scope: null
     use_te_rng_tracker: true
     inference_rng_tracker: true
+    batch_invariant_mode: false
     
     optimizer:
       optimizer: "adam"

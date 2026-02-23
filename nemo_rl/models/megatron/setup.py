@@ -377,6 +377,10 @@ def _apply_cuda_graph_and_rng_tracker_config(model_cfg: Any, config: PolicyConfi
     model_cfg.cuda_graph_scope = config["megatron_cfg"]["cuda_graph_scope"]
     model_cfg.use_te_rng_tracker = config["megatron_cfg"]["use_te_rng_tracker"]
     model_cfg.inference_rng_tracker = config["megatron_cfg"]["inference_rng_tracker"]
+    model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if model_cfg.batch_invariant_mode:
+        from megatron.core.transformer.enums import AttnBackend
+        model_cfg.attention_backend = AttnBackend.flash
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
