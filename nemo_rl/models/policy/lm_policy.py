@@ -909,7 +909,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         if self._uses_megatron_refit:
-            # Non-colocated Megatron: use swap_model_weights via refit collective
+            # Non-colocated Megatron: use megatron core swap_model_weights
             futures = self.worker_group.run_all_workers_single_data(
                 "swap_weights_via_reshard",
                 is_source=True,
@@ -917,7 +917,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
             return futures
         else:
-            # Existing packed_broadcast path for vLLM
             futures = self.worker_group.run_all_workers_single_data(
                 "broadcast_weights_for_collective",
                 kv_scales=kv_scales,

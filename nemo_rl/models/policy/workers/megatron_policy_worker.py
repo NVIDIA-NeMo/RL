@@ -1425,8 +1425,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Initialize the refit collective for non-colocated Megatron weight transfer.
 
         Creates a Gloo-backed ProcessGroup spanning training and inference
-        workers for both metadata exchange (all_gather_object, broadcast) and
-        data transfer (via Megatron Core's GlooCopyService or NVSHMEMCopyService).
+        workers for metadata exchange (all_gather_object, broadcast), and a
+        CopyService for the actual data transfer (GlooCopyService for
+        CPU-staged P2P, or NVSHMEMCopyService for GPU-direct transfers).
 
         Args:
             ip: IP address for the process group rendezvous.
@@ -1476,29 +1477,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.refit_pg = pg
 
         # Register in _world so PyTorch distributed operations work correctly.
-        # pg_group_ranks: identity mapping so get_group_rank(pg, i) == i for all i.
-        # pg_map: needed by get_backend(group) (used by all_gather_object in debug mode).
+        # Identity mapping: all_gather_object uses this for get_rank(group) but
+        # the actual all_gather operation uses the PG's internal rank ordering,
+        # so the mapping doesn't need to be exact for cross-world PGs.
         _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name
 
         if refit_backend == "nvshmem":
             from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
-            service = NVSHMEMCopyService(group=self.refit_pg)
-            service._ensure_initialized()
-            self.refit_copy_service = service
+            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
+            self.refit_copy_service._ensure_initialized()
         else:
-            # Create GlooCopyService manually (bypassing __init__ which calls dist.new_group())
-            # and inject our cross-world ProcessGroup.
             from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
-            service = GlooCopyService.__new__(GlooCopyService)
-            service.rank = global_rank
-            service.world_size = world_size
-            service.gloo_pg = self.refit_pg
-            service.send_ops = []
-            service.recv_ops = []
-            service._copy_stream = torch.cuda.Stream()
-            self.refit_copy_service = service
+            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
         print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
 
@@ -1506,8 +1498,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def swap_weights_via_reshard(self, is_source: bool, dst_rank_offset: int = 0) -> bool:
         """Transfer weights using Megatron's swap_model_weights resharding API.
 
-        Uses Megatron Core's GlooCopyService (CPU-staged P2P via Gloo) for data
-        transfer and the same refit ProcessGroup for metadata exchange.
+        Uses the CopyService initialized in init_refit_collective for data
+        transfer and the refit ProcessGroup for metadata exchange.
 
         Args:
             is_source: True for training workers (weight source), False for inference
