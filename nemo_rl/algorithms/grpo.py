@@ -3136,9 +3136,6 @@ def async_grpo_train(
                         # Add loss mask to each message
                         # Only unmask assistant messages that were actually generated (have generation_logprobs),
                         # not assistant messages that were part of the prompt history
-                        penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
-                        print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
-
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             for j, message in enumerate(message_log):
                                 token_ids = message["token_ids"]
@@ -3150,22 +3147,7 @@ def async_grpo_train(
                                     message["token_loss_mask"] = torch.zeros_like(token_ids)
 
                                 if "generation_logprobs" not in message:
-                                    message["generation_logprobs"] = torch.zeros_like(
-                                        token_ids, dtype=torch.float32
-                                    )
-
-                                # For invalid tool calls with penalize_invalid_tool_call,
-                                # override advantage to push the model away from generating them.
-                                is_invalid = is_assistant and penalize_invalid_tool_call and message.get("is_invalid_tool_call", False)
-                                if is_invalid:
-                                    neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
-                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
-                                    message["advantages"] = neg_adv * torch.ones(token_ids.shape,
-                                        dtype=advantages[i].dtype,
-                                        device=advantages[i].device
-                                    )
-                                else:
-                                    message["advantages"] = advantages[i].expand(token_ids.shape)
+                                    message["generation_logprobs"] = torch.zeros_like(token_ids, dtype=torch.float32)
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -3295,6 +3277,23 @@ def async_grpo_train(
                         train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
                     if clip_high is not None:
                         train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
+
+                    # Apply invalid tool call penalization on train_data["advantages"] directly.
+                    # This modifies the per-sample advantage to a per-token tensor for affected samples,
+                    # overriding with a negative advantage for invalid tool call tokens.
+                    penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
+                    if penalize_invalid_tool_call:
+                        print(f"Penalize invalid tool call: {penalize_invalid_tool_call}", flush=True)
+                        neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                        # Build per-token advantage override using message metadata
+                        for i, message_log in enumerate(repeated_batch["message_log"]):
+                            for j, message in enumerate(message_log):
+                                is_assistant = message["role"] == "assistant" and "generation_logprobs" in message
+                                is_invalid = is_assistant and message.get("is_invalid_tool_call", False)
+                                if is_invalid:
+                                    print(f"Setting negative advantage ({neg_adv}) for assistant message {i} {j}", flush=True)
+                                    # Override this sample's advantage with per-token negative value
+                                    train_data["advantages"][i] = neg_adv
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
