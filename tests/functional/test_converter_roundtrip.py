@@ -221,8 +221,16 @@ def create_megatron_checkpoint(model_name: str, temp_dir: str) -> str:
     """Create a Megatron checkpoint using community import."""
     print("Creating Megatron checkpoint...")
 
-    megatron_checkpoint_path = os.path.join(temp_dir, "megatron_checkpoint")
-    import_model_from_hf_name(model_name, megatron_checkpoint_path)
+    try:
+        from megatron.bridge.training.model_load_save import (
+            temporary_distributed_context,
+        )
+    except ImportError:
+        raise ImportError("megatron.bridge.training is not available.")
+
+    with temporary_distributed_context(backend="gloo"):
+        megatron_checkpoint_path = os.path.join(temp_dir, "megatron_checkpoint")
+        import_model_from_hf_name(model_name, megatron_checkpoint_path)
 
     print(f"✓ Megatron checkpoint saved to: {megatron_checkpoint_path}")
     return os.path.join(megatron_checkpoint_path, "iter_0000000")
