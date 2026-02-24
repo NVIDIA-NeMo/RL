@@ -17,7 +17,11 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+<<<<<<< HEAD
 mlruns/
+=======
+*.so
+>>>>>>> d7d334a (updating gitignore)
 
 # Test
 coverage.json
