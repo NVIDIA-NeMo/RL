@@ -176,6 +176,7 @@ def _normalize_text_field(
     return [default if value is None else str(value) for _ in range(batch_size)]
 
 
+
 def _build_cot_gt_texts(
     batch: BatchedDataDict[Any], batch_size: int
 ) -> list[str]:
@@ -196,29 +197,64 @@ def _build_cot_gt_texts(
     print(f"Average CoT length (in tokens): {avg_cot_length:.2f}")
     #print(cot_texts)
 
+    gt_lengths = [len(gt.split()) for gt in gt_texts]
+    avg_gt_length = sum(gt_lengths) / len(gt_lengths) if gt_lengths else 0
+    print(f"Average GT length (in tokens): {avg_gt_length:.2f}")
+
+
+    _PREFIX = "\nHere is a reference reasoning + solution:\n"
+    _TRANSITION = "\nAfter understanding the reference reasoning + solution, please try to solve this problem using your own approach below:\n"
+
     combined: list[str] = []
     for cot, gt in zip(cot_texts, gt_texts):
         cot = cot.strip() if cot else ""
         gt = gt.strip() if gt else ""
         if cot and gt:
-            combined.append(f"{cot}\n{gt}")
+            combined.append(f"{_PREFIX}\n{gt}{_TRANSITION}")
         else:
-            combined.append(cot or gt)
+            text = gt or ""
+            combined.append(f"{_PREFIX}{text}{_TRANSITION}" if text else text)
     return combined
 
 
-def _build_teacher_inputs_with_cot(
+def _build_teacher_inputs_with_cot_in_user_turn(
+    message_logs: list,
+    cot_texts: list[str],
+    tokenizer: TokenizerType,
     input_ids: torch.Tensor,
     input_lengths: torch.Tensor,
     token_mask: torch.Tensor,
-    cot_texts: list[str],
-    tokenizer: TokenizerType,
     max_seq_len: Optional[int],
     make_sequence_length_divisible_by: int,
+    chat_template_kwargs: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
-    """Insert COT+GT tokens before the first assistant token in each sequence."""
+    """Build teacher inputs by inserting COT+GT tokens into the user turn.
+
+    Rather than re-tokenizing via apply_chat_template (which would double-wrap
+    the already-formatted content stored in message_log), this function works
+    directly at the token level:
+
+      1. Locate the first <|im_end|> token in the user portion of the student
+         sequence.  This is the boundary between the user message content and the
+         `<|im_end|>\\n<|im_start|>assistant\\n` suffix.
+      2. Tokenize the reference text and splice it in right before that token.
+
+    Teacher sequence structure:
+        <|im_start|>user
+        {original problem}
+        {reference COT + GT + transition}
+        <|im_end|>
+        <|im_start|>assistant
+        {student's generated response}
+        <|im_end|>
+
+    insert_pos  = position of the first <|im_end|> in the user portion
+                  (used as the alignment boundary in _align_teacher_topk_to_student).
+    cot_len     = number of reference tokens inserted (= teacher_len - student_len).
+    """
     batch_size = input_ids.shape[0]
     pad_token_id = tokenizer.pad_token_id or 0
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
     teacher_ids_list: list[torch.Tensor] = []
     insert_positions: list[int] = []
@@ -226,39 +262,60 @@ def _build_teacher_inputs_with_cot(
 
     for i in range(batch_size):
         seq_len = int(input_lengths[i].item())
-        seq_ids = input_ids[i, :seq_len]
         seq_mask = token_mask[i, :seq_len]
 
+        # Position of first assistant token (used as fallback insert point)
         assistant_positions = (seq_mask == 1).nonzero(as_tuple=False)
-        if assistant_positions.numel() > 0:
-            insert_pos = int(assistant_positions[0].item())
-        else:
-            insert_pos = seq_len
+        first_assistant_pos = (
+            int(assistant_positions[0].item())
+            if assistant_positions.numel() > 0
+            else seq_len
+        )
 
         cot_text = cot_texts[i] if i < len(cot_texts) else ""
-        if cot_text:
-            cot_ids = tokenizer(
-                cot_text, return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0].to(seq_ids.device, dtype=seq_ids.dtype)
-        else:
-            cot_ids = seq_ids.new_empty((0,))
 
-        if max_seq_len is not None and cot_ids.numel() > 0:
-            max_extra = max(0, max_seq_len - seq_len)
-            if cot_ids.numel() > max_extra:
-                cot_ids = cot_ids[:max_extra]
+        if not cot_text:
+            teacher_ids_list.append(input_ids[i, :seq_len].clone())
+            insert_positions.append(first_assistant_pos)
+            cot_lengths.append(0)
+            continue
 
-        cot_len = int(cot_ids.numel())
-        insert_positions.append(insert_pos)
+        # Find the first <|im_end|> in the user portion of the student sequence.
+        # Everything before this position is user message content; everything from
+        # this position onward is the chat-template suffix + assistant response.
+        user_portion = input_ids[i, :first_assistant_pos]
+        im_end_positions = (user_portion == im_end_id).nonzero(as_tuple=False)
+        im_end_pos = (
+            int(im_end_positions[0].item())
+            if im_end_positions.numel() > 0
+            else first_assistant_pos
+        )
+
+        # Tokenize the reference text (no chat-template tokens)
+        cot_token_ids = tokenizer(
+            cot_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0].to(input_ids.device, dtype=input_ids.dtype)
+
+        # Clamp to max_seq_len budget
+        if max_seq_len is not None:
+            max_cot_len = max(0, max_seq_len - seq_len)
+            if cot_token_ids.shape[0] > max_cot_len:
+                cot_token_ids = cot_token_ids[:max_cot_len]
+
+        cot_len = int(cot_token_ids.shape[0])
+
+        # Splice: user content | cot tokens | <|im_end|> ... assistant ... response
+        teacher_ids_tensor = torch.cat(
+            [
+                input_ids[i, :im_end_pos],       # user content (before <|im_end|>)
+                cot_token_ids,                    # reference text
+                input_ids[i, im_end_pos:seq_len], # <|im_end|> + assistant turn
+            ]
+        )
+
+        teacher_ids_list.append(teacher_ids_tensor)
+        insert_positions.append(im_end_pos)  # alignment boundary
         cot_lengths.append(cot_len)
-
-        if cot_len > 0:
-            teacher_ids = torch.cat(
-                [seq_ids[:insert_pos], cot_ids, seq_ids[insert_pos:]], dim=0
-            )
-        else:
-            teacher_ids = seq_ids.clone()
-        teacher_ids_list.append(teacher_ids)
 
     teacher_padded = torch.nn.utils.rnn.pad_sequence(
         teacher_ids_list, batch_first=True, padding_value=pad_token_id
@@ -751,9 +808,11 @@ def setup(
     )
 
 
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
+
 
 
 def distillation_train(
@@ -859,7 +918,9 @@ def distillation_train(
                             master_config["distillation"]["num_generations_per_prompt"]
                         )
                     )
-
+                print(f"REPEATED BATCH")
+                #print(repeated_batch)
+                
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
@@ -964,14 +1025,19 @@ def distillation_train(
                     teacher_input_lengths,
                     insert_positions,
                     cot_lengths,
-                ) = _build_teacher_inputs_with_cot(
+                ) = _build_teacher_inputs_with_cot_in_user_turn(
+                    repeated_batch["message_log"],
+                    cot_texts,
+                    tokenizer,
                     train_data["input_ids"],
                     train_data["input_lengths"],
                     train_data["token_mask"],
-                    cot_texts,
-                    tokenizer,
                     max_seq_len,
                     make_seq_divisible_by,
+                    chat_template_kwargs=master_config["policy"]["tokenizer"].get(
+                        "chat_template_kwargs"
+                    )
+                    or {},
                 )
 
                 # DEBUG: verify COT tokens are inserted into teacher context
@@ -1027,6 +1093,51 @@ def distillation_train(
                         aligned_indices = aligned_indices.cpu()
                     train_data["teacher_topk_logits"] = aligned_logits
                     train_data["teacher_topk_indices"] = aligned_indices
+
+                # Diagnostic: on the first step, measure how much the COT actually
+                # changes the teacher's predictions vs. having no COT (student proxy).
+                # If top-1 agreement is ~1.0, the COT isn't influencing the model and
+                # the training signal will be effectively zero.
+                if total_steps == 0:
+                    print("\n check measuring COT effect on teacher predictions...", flush=True)
+                    with torch.no_grad():
+                        no_cot_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                    no_cot_indices = no_cot_topk["topk_indices"]
+                    if no_cot_indices.device.type != "cpu":
+                        no_cot_indices = no_cot_indices.cpu()
+
+                    # Compare at assistant token positions (shifted for next-token prediction)
+                    asst_mask = train_data["token_mask"][:, 1:].bool()  # [B, S-1]
+                    S = min(aligned_indices.shape[1] - 1, no_cot_indices.shape[1] - 1)
+
+                    cot_top1    = aligned_indices[:, :S, 0][asst_mask[:, :S]]
+                    no_cot_top1 = no_cot_indices[:, :S, 0][asst_mask[:, :S]]
+                    top1_agree = (cot_top1 == no_cot_top1).float().mean().item()
+
+                    # Top-k recall: fraction of teacher's (COT) top-k_diag tokens
+                    # that appear anywhere in the no-COT top-k_diag list.
+                    k_diag = min(aligned_indices.shape[-1], 50)
+                    n_diag = 500
+                    cot_flat    = aligned_indices[:, :S, :k_diag][asst_mask[:, :S]][:n_diag]
+                    no_cot_flat = no_cot_indices[:, :S, :k_diag][asst_mask[:, :S]][:n_diag]
+                    recall = (
+                        cot_flat.unsqueeze(2) == no_cot_flat.unsqueeze(1)
+                    ).any(dim=2).float().mean().item()
+
+                    print(f"  Assistant token positions sampled : {asst_mask.sum().item()}")
+                    print(f"  Top-1 token agreement (COT vs no-COT): {top1_agree:.3f}")
+                    print(f"  Top-{k_diag} recall (COT top-{k_diag} found in no-COT top-{k_diag}): {recall:.3f}")
+                    if top1_agree > 0.90:
+                        print("  ⚠️  WARNING: COT barely changes predictions — training signal will be near-zero")
+                    elif top1_agree < 0.60:
+                        print("  ✓  COT meaningfully shifts predictions")
+                    else:
+                        print("  COT has moderate effect on predictions")
+                    print(flush=True)
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
