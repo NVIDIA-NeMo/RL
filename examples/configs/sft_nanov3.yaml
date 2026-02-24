@@ -1,0 +1,194 @@
+# SFT Algorithm Configuration
+sft:
+  ## total number of steps to train will equal
+  ## min((max_num_epochs * len(train_dataloader)), max_num_steps)
+  max_num_epochs: 10000
+  max_num_steps: 18750
+
+  val_period: 100000
+  val_batches: 14
+  val_global_batch_size: 64
+  val_micro_batch_size: 1
+  val_at_start: false
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_nanov3"
+  metric_name: null # one of "val:" or "train:" followed by the metric name
+  higher_is_better: false
+  keep_top_k: null
+  save_period: 200
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: /mnt/nanov3_pretrained
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 #nvidia/NVIDIA-Nemotron-Nano-9B-v2 #${policy.model_name}
+    # chat_template can be a Jinja template string or path to a .jinja file
+    chat_template: /opt/nemo-rl/super_v3_sft/chat_template.jinja
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 262144
+  precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: false
+    env_vars: {}
+    cpu_offload: False
+    sequence_parallel: true
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+    
+  megatron_cfg:
+    enabled: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      UB_TIMEOUT: "720"
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+      NVTE_FWD_LAYERNORM_SM_MARGIN: "16"
+      NVTE_BWD_LAYERNORM_SM_MARGIN: "16"
+      NCCL_P2P_NET_CHUNKSIZE: "2097152"
+      NCCL_DEBUG: "WARN"
+      TORCHINDUCTOR_WORKER_START: "fork"
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: "seq_aux_loss"
+    moe_aux_loss_coeff: 1e-4
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: True
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: False #True
+    defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: True
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.00001e-5
+      min_lr: 5.0e-5
+      weight_decay: 0.0
+      bf16: true #false
+      fp16: false
+      params_dtype: "bfloat16" #"float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: false #true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 11719
+      lr_warmup_iters: 156
+      lr_warmup_init: 3e-7 #0.0
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true #false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: "none"  #"optim_grads_params"
+      use_custom_fsdp: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: false
+  add_eos: true
+  add_generation_prompt: true
+  shuffle: true
+  num_workers: 2
+  dataset_name: openai_format
+  train_data_path: /mnt/cache/nanov3_data/cinnamon-orca_consistent.jsonl
+  val_data_path: /mnt/cache/nanov3_data/cinnamon-orca_consistent.jsonl
+  chat_key: "messages"
+  system_key: null
+  system_prompt: null
+  tool_key: "tools"
+  use_preserving_dataset: false
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  wandb_enabled: True # Make sure you do a ``wandb login [Your API key]'' before running
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "ashors-nemotron-sft"
+    name: "nanov3"
+  tensorboard:
+    log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "sft-dev-${data.dataset_name}"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
