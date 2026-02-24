@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -160,13 +159,13 @@ def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
-    Optional[StatefulDataLoader],
+    dict[str, StatefulDataLoader],
     DistillationLossFn,
     Logger,
     CheckpointManager,
@@ -259,26 +258,27 @@ def setup(
     )
 
     # Load validation dataset if provided
-    val_dataloader: Optional[StatefulDataLoader] = None
+    val_dataloader: dict[str, StatefulDataLoader] = {}
     # If validation is enabled, load the validation dataloader
     if (
         distillation_config["val_period"] > 0
         or distillation_config["val_at_start"]
         or distillation_config["val_at_end"]
     ):
-        assert val_dataset is not None, (
+        assert len(val_dataset) > 0, (
             "Validation dataset is required if validation is enabled"
         )
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=distillation_config["val_batch_size"],
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-        )
-        print(
-            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
-            flush=True,
-        )
+        for task_name, val_data in val_dataset.items():
+            val_dataloader[task_name] = StatefulDataLoader(
+                val_data,
+                batch_size=distillation_config["val_batch_size"],
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+            )
+            print(
+                f"  ✓ Validation dataloader {task_name} loaded with {len(val_data)} samples",
+                flush=True,
+            )
 
     # ==========================
     #          Cluster
@@ -509,7 +509,7 @@ def distillation_train(
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: DistillationLossFn,
     task_to_env: dict[str, EnvironmentInterface],
@@ -944,14 +944,14 @@ def distillation_train(
 
 def validate(
     policy_generation: GenerationInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloaders: dict[str, StatefulDataLoader],
     tokenizer,
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
+    if len(val_dataloaders) == 0:
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
@@ -966,73 +966,76 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
+        accuracy = {}
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         all_message_logs = []  # Collect all message logs
-        all_task_names = []  # Collect all task names
 
-        max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        max_samples = master_config["distillation"]["max_val_samples"]
+        cur_samples = 0
+
+        for task_name, val_dataloader in val_dataloaders.items():
+            task_rewards = []
+
+            for val_batch in val_dataloader:
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                if _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+                rewards = val_batch["total_reward"]
+
+                task_rewards.extend(val_batch["total_reward"].tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
+                all_message_logs.extend(to_env)
+
+                cur_samples += len(val_batch)
+                if cur_samples >= max_samples:
+                    break
+
+            # Calculate task accuracy
+            rewards_t = torch.tensor(task_rewards, dtype=torch.float32)
+            accuracy[task_name] = rewards_t.mean().item()
+
+            total_rewards.extend(task_rewards)
+
+            if cur_samples >= max_samples:
                 break
 
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
-                )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
-                )
-            rewards = val_batch["total_reward"]
-
-            total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
-
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
-            all_message_logs.extend(to_env)
-
-            # Collect task names for statistics
-            all_task_names.extend(val_batch["task_name"])
-
         # Calculate validation metrics
-        # task accuracy
-        task_rewards = defaultdict(list)
-        for task_name, reward in zip(all_task_names, total_rewards):
-            task_rewards[task_name].append(reward)
-        accuracy = {
-            task_name: sum(rewards) / len(rewards)
-            for task_name, rewards in task_rewards.items()
-        }
-
-        # overall accuracy
         rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
         accuracy["total"] = rewards_t.mean().item()
 
