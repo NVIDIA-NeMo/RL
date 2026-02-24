@@ -37,10 +37,10 @@ def setup_response_data(
     env_configs: Optional[dict[str, Any]] = None,
     is_vlm: bool = False,
 ) -> Union[
-    tuple[AllTaskProcessedDataset, Optional[AllTaskProcessedDataset]],
+    tuple[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
     tuple[
         AllTaskProcessedDataset,
-        Optional[AllTaskProcessedDataset],
+        dict[str, AllTaskProcessedDataset],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
     ],
@@ -115,12 +115,12 @@ def setup_response_data(
     # setup validation dataset
     val_task_data_processors = {}
     val_task_to_env = {}
-    val_data_list = []
+    val_data_dict = {}
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
-            val_data_list.append(data.val_dataset)
+            val_data_dict[data.task_name] = data.val_dataset
             # bind task_name to task_data_processors and task_to_env
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
@@ -137,7 +137,7 @@ def setup_response_data(
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
-            val_data_list.append(val_data.dataset)
+            val_data_dict[val_data.task_name] = val_data.dataset
             # bind task_name to task_data_processors and task_to_env
             task_name = val_data.task_name
             val_task_data_processors[task_name] = (
@@ -147,17 +147,20 @@ def setup_response_data(
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
-    val_dataset = None
-    if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
-        val_dataset = AllTaskProcessedDataset(
-            merged_val_data,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+    val_dataset = {}
+    if len(val_data_dict) > 0:
+        val_dataset = {
+            task_name: AllTaskProcessedDataset(
+                val_data,
+                tokenizer,
+                None,
+                val_task_data_processors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for task_name, val_data in val_data_dict.items()
+        }
+        val_sample_count = sum(len(val_data) for val_data in val_data_dict.values())
+        print(f"  ✓ Validation dataset loaded with {val_sample_count} samples.")
 
     if has_envs:
         return dataset, val_dataset, task_to_env, val_task_to_env

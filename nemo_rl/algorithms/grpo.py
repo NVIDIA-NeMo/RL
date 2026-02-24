@@ -15,7 +15,6 @@ import gc
 import os
 import time
 import warnings
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -216,14 +215,14 @@ def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
-    val_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: dict[str, AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
-    Optional[StatefulDataLoader],
+    dict[str, StatefulDataLoader],
     ClippedPGLossFn,
     Logger,
     CheckpointManager,
@@ -302,27 +301,28 @@ def setup(
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
     # Load validation dataset if provided
-    val_dataloader: Optional[StatefulDataLoader] = None
+    val_dataloader: dict[str, StatefulDataLoader] = {}
     # If validation is enabled, load the validation dataloader
     if (
         grpo_config["val_period"] > 0
         or grpo_config["val_at_start"]
         or grpo_config["val_at_end"]
     ):
-        assert val_dataset is not None, (
+        assert len(val_dataset) > 0, (
             "Validation dataset is required if validation is enabled"
         )
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=grpo_config["val_batch_size"],
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-            num_workers=data_config["num_workers"],
-        )
-        print(
-            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
-            flush=True,
-        )
+        for task_name, val_data in val_dataset.items():
+            val_dataloader[task_name] = StatefulDataLoader(
+                val_data,
+                batch_size=grpo_config["val_batch_size"],
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+                num_workers=data_config["num_workers"],
+            )
+            print(
+                f"  ✓ Validation dataloader {task_name} loaded with {len(val_data)} samples",
+                flush=True,
+            )
 
     # ==========================
     #        Loss Function
@@ -1257,7 +1257,7 @@ def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
@@ -2117,7 +2117,7 @@ def grpo_train(
 
 def validate(
     policy_generation: GenerationInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloaders: dict[str, StatefulDataLoader],
     tokenizer,
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
@@ -2125,101 +2125,104 @@ def validate(
     logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
-        )
+    if len(val_dataloaders) == 0:
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
+    if val_task_to_env is None:
+        print(
+            "  ⚠️ No validation task to environment mapping provided, skipping validation",
+            flush=True,
+        )
+        return {}, {}
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
+        accuracy = {}
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
-        all_task_names = []  # Collect all task names
 
-        max_batches = (
-            master_config["grpo"]["max_val_samples"]
-            // master_config["grpo"]["val_batch_size"]
-        )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        max_samples = master_config["grpo"]["max_val_samples"]
+        cur_samples = 0
+
+        for task_name, val_dataloader in val_dataloaders.items():
+            task_rewards = []
+
+            for val_batch in val_dataloader:
+                additional_metrics_to_report = dict()
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
+                if _should_use_nemo_gym(master_config):
+                    generation_config = master_config["policy"]["generation"]
+                    nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=val_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=val_task_to_env,
+                        max_seq_len=None,
+                        generation_config=generation_config,
+                        max_rollout_turns=None,
+                        greedy=False,
+                    )
+                    val_batch = nemo_gym_rollout_result.final_batch
+                    gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                    additional_metrics_to_report = gen_metrics
+                elif _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+
+                task_rewards.extend(val_batch["total_reward"].tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
+                all_message_logs.extend(to_env)
+
+                cur_samples += len(val_batch)
+                if cur_samples >= max_samples:
+                    break
+
+            # Calculate task accuracy
+            rewards_t = torch.tensor(task_rewards, dtype=torch.float32)
+            accuracy[task_name] = rewards_t.mean().item()
+
+            total_rewards.extend(task_rewards)
+
+            if cur_samples >= max_samples:
                 break
 
-            additional_metrics_to_report = dict()
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
-            if _should_use_nemo_gym(master_config):
-                generation_config = master_config["policy"]["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=val_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=val_task_to_env,
-                    max_seq_len=None,
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
-                val_batch = nemo_gym_rollout_result.final_batch
-                gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                additional_metrics_to_report = gen_metrics
-            elif _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
-
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
-
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
-            all_message_logs.extend(to_env)
-
-            # Collect task names for statistics
-            all_task_names.extend(val_batch["task_name"])
-
         # Calculate validation metrics
-        num_samples = len(total_rewards)
-        accuracy = {"total": 0.0}
-        if num_samples > 0:
-            # task accuracy
-            task_rewards = defaultdict(list)
-            for task_name, reward in zip(all_task_names, total_rewards):
-                task_rewards[task_name].append(reward)
-            accuracy = {
-                task_name: sum(rewards) / len(rewards)
-                for task_name, rewards in task_rewards.items()
-            }
-
-            # overall accuracy
-            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            accuracy["total"] = rewards_t.mean().item()
+        rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+        accuracy["total"] = rewards_t.mean().item()
 
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
@@ -2270,7 +2273,6 @@ def validate(
     if logger is not None:
         val_log_data = {
             "content": all_message_logs,
-            "task_names": all_task_names,
             "rewards": total_rewards,
         }
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
@@ -2289,7 +2291,7 @@ def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
