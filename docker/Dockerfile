@@ -84,10 +84,6 @@ ENV RAY_USAGE_STATS_ENABLED=0
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
-# Config paths (relative to repo root) whose NeMo Gym venvs should be prefetched.
-# Override to prefetch venvs for different configs, or set to empty to skip.
-ARG NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml examples/nemo_gym/grpo_nanov3.yaml"
-
 
 FROM base AS hermetic
 
@@ -109,6 +105,9 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+# Config paths (relative to repo root) whose NeMo Gym venvs should be prefetched.
+# Override to prefetch venvs for different configs, or set to empty to skip.
+ARG NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml examples/nemo_gym/grpo_nanov3.yaml"
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -127,11 +126,11 @@ RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    UV_LINK_MODE=symlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
+    UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    UV_LINK_MODE=symlink bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
+    UV_LINK_MODE=hardlink bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -139,26 +138,41 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
-uv sync --link-mode symlink --locked --no-install-project
+# The venv uses hardlinks to avoid bloating the layer size
+UV_LINK_MODE=hardlink uv sync --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra mcore --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra automodel --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --all-groups --no-install-project
 
 # Prefetch NeMo Gym internal venvs (for gym servers like code_gen, math, etc.)
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
-    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    # Infer the index from RL's pyproject.toml. This ensures all venv creation that needs torch will use the RL prescribed version for consistency since RL dictates the container CUDA version.
+    UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
+    UV_LINK_MODE=hardlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
 fi
 
 # Remove /tmp/ray because the previous script starts up a local ray cluster which creates a session
 # that we can just clean up.
 rm -rf /tmp/ray
+
+NEGATIVE_FILTERS=""
+if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
+fi
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+fi
+if [[ -n "$NEGATIVE_FILTERS" ]]; then
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+else
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py
+fi
 
 # Prune unreachable cache entries
 uv cache prune
@@ -176,8 +190,6 @@ WORKDIR /opt/nemo-rl
 FROM hermetic AS release
 
 # Re-declare build args for this stage
-ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -188,23 +200,6 @@ ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
-
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-
-RUN <<"EOF" bash -exu
-NEGATIVE_FILTERS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
-fi
-if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
-else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
-EOF
 
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
