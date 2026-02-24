@@ -553,11 +553,13 @@ def rm_train(
                     "train_global_batch_size"
                 ]
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
+                # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
                 if master_config["checkpointing"]["enabled"] and (

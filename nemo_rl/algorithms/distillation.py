@@ -783,12 +783,12 @@ def distillation_train(
                 ]
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -797,6 +797,7 @@ def distillation_train(
                 ):
                     student_policy.prepare_for_training()
 
+                    # +1 because step is 0-indexed
                     distillation_save_state["current_epoch"] = current_epoch
                     distillation_save_state["current_step"] = current_step + 1
                     distillation_save_state["total_steps"] = total_steps + 1

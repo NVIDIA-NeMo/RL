@@ -546,18 +546,20 @@ def sft_train(
                     "train_global_batch_size"
                 ]
                 timeout.mark_iteration()
+
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
+                    # +1 because step is 0-indexed
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     sft_save_state["total_steps"] = total_steps + 1
                     sft_save_state["epoch"] = current_epoch

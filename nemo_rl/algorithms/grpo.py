@@ -1940,12 +1940,12 @@ def grpo_train(
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -2211,6 +2211,7 @@ def validate(
             flush=True,
         )
         return {}, {}
+
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
@@ -2993,11 +2994,11 @@ def async_grpo_train(
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (step + 1) % master_config["checkpointing"]["save_period"] == 0
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -3006,6 +3007,7 @@ def async_grpo_train(
                 ):
                     policy.prepare_for_training()
 
+                    # +1 because step is 0-indexed
                     grpo_save_state["current_step"] = step + 1
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
