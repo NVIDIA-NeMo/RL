@@ -51,9 +51,13 @@ class PreferenceDataset(RawDataset):
         split: Optional[str] = None,
         **kwargs,
     ):
-        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
-        if self.task_name[0] == "-":
-            self.task_name = self.task_name[1:]
+        # get default task name from data path
+        default_task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if default_task_name[0] == "-":
+            default_task_name = default_task_name[1:]
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name=default_task_name, **kwargs)
 
         # load from local or huggingface
         self.dataset = load_dataset_from_path(data_path, subset, split)

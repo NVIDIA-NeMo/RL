@@ -23,7 +23,8 @@ class DAPOMath17KDataset(RawDataset):
     """Simple wrapper around the DAPO Math 17K dataset with train split."""
 
     def __init__(self, **kwargs) -> None:
-        self.task_name = "DAPOMath17K"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="DAPOMath17K", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
@@ -51,9 +52,11 @@ class DAPOMath17KDataset(RawDataset):
 
 
 class DAPOMathAIME2024Dataset(DAPOMath17KDataset):
+    """Simple wrapper around the DAPO Math AIME 2024 dataset with train split."""
+
     def __init__(self, **kwargs) -> None:
-        """Initialize the DAPO Math AIME 2024 dataset with train split."""
-        self.task_name = "DAPOMathAIME2024"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="DAPOMathAIME2024", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")

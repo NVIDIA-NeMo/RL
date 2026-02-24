@@ -64,7 +64,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     if dataset_name in DATASET_REGISTRY:
         dataset_class = DATASET_REGISTRY[dataset_name]
         dataset = dataset_class(
-            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+            skip_set_processor=False,
+            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
     else:
         raise ValueError(
@@ -72,11 +73,6 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
             "Please either use a built-in dataset "
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
-
-    # bind prompt, system prompt and data processor
-    dataset.set_task_spec(data_config)
-    # Remove this after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658
-    dataset.set_processor()
 
     return dataset
 

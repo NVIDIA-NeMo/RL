@@ -14,19 +14,48 @@
 
 from datasets import Dataset
 
-from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class RawDataset:
-    # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
-    data_config: ResponseDatasetConfig | PreferenceDatasetConfig
+    """Base class for datasets with shared functionality."""
+
     dataset: Dataset
     # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
-    processor: TaskDataProcessFnCallable
+    task_name: str
     task_spec: TaskDataSpec
+    processor: TaskDataProcessFnCallable
+
+    def common_init(
+        self,
+        default_task_name: str,
+        skip_set_processor: bool,
+        task_name: str | None = None,
+        prompt_file: str | None = None,
+        system_prompt_file: str | None = None,
+        processor: str | None = None,
+        **kwargs,
+    ):
+        # 1. set task name, use task_name if provided, otherwise use default_task_name
+        self.task_name = task_name if task_name is not None else default_task_name
+
+        # 2. bind prompt and system prompt
+        self.task_spec = TaskDataSpec(
+            task_name=self.task_name,
+            prompt_file=prompt_file,
+            system_prompt_file=system_prompt_file,
+        )
+
+        # 3. bind processor (Remove after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658)
+        if not skip_set_processor:
+            if processor is None:
+                processor = "default"
+            assert processor in PROCESSOR_REGISTRY, (
+                f"Processor {processor} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."
+            )
+            self.processor = PROCESSOR_REGISTRY[processor]
 
     def split_train_validation(self, test_size: float, seed: int):
         if test_size > 0:
@@ -35,26 +64,3 @@ class RawDataset:
             )
             self.dataset = split_dataset["train"]
             self.val_dataset = split_dataset["test"]
-
-    def set_processor(self):
-        processor_name = "default"
-        if "processor" in self.data_config:
-            processor_name = self.data_config[
-                "processor"  # pyrefly: ignore[typed-dict-key-error]  `processor` is only required for response datasets and will be removed after data processor is refactored
-            ]
-        assert processor_name in PROCESSOR_REGISTRY, (
-            f"Processor {processor_name} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."
-        )
-        self.processor = PROCESSOR_REGISTRY[processor_name]
-
-    def set_task_spec(
-        self, data_config: ResponseDatasetConfig | PreferenceDatasetConfig
-    ):
-        self.data_config = data_config
-        system_prompt_file = self.data_config.get("system_prompt_file", None)
-        prompt_file = self.data_config.get("prompt_file", None)
-        self.task_spec = TaskDataSpec(
-            task_name=self.task_name,
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
-        )

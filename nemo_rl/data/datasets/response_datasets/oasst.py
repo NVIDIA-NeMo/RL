@@ -95,7 +95,8 @@ class OasstDataset(RawDataset):
     """
 
     def __init__(self, split_validation_size: float = 0.05, seed: int = 42, **kwargs):
-        self.task_name = "oasst"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="oasst", **kwargs)
 
         # load from huggingface
         filename = hf_hub_download(
