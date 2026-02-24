@@ -66,7 +66,8 @@ class Geometry3KDataset(RawDataset):
             f"Invalid split: {split}. Please use 'train' or 'validation' or 'test'."
         )
 
-        self.task_name = "geometry3k"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="geometry3k", **kwargs)
 
         # this dataset will process the image during training using `format_geometry3k_dataset`
         self.dataset = load_dataset("hiyouga/geometry3k")[split]

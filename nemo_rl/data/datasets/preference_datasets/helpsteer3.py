@@ -27,7 +27,8 @@ class HelpSteer3Dataset(RawDataset):
     """
 
     def __init__(self, split: str = "train", **kwargs):
-        self.task_name = "HelpSteer3"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="HelpSteer3", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("nvidia/HelpSteer3", "preference")[split]

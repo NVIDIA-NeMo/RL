@@ -188,7 +188,9 @@ class RefCOCODataset(RawDataset):
             )
 
         self.download_dir = download_dir
-        self.task_name = "refcoco"
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="refcoco", **kwargs)
 
         # check for images
         filename = SPLIT_TO_IMAGE_URL[split].split("/")[-1].split(".")[0]
