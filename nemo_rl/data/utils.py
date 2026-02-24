@@ -116,7 +116,10 @@ def setup_response_data(
             task_to_env[task_name] = envs[cfg["env_name"]]
 
     # merge datasets
-    if data_config["use_multiple_dataloader"]:
+    if (
+        "use_multiple_dataloader" in data_config
+        and data_config["use_multiple_dataloader"]
+    ):
         # merge datasets into a dictionary of task name to dataset
         dataset = {
             data.task_name: AllTaskProcessedDataset(
