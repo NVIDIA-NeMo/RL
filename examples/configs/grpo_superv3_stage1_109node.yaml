@@ -1,6 +1,6 @@
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo"
+  checkpoint_dir: "results/super_v3_prod_stage1"
   metric_name: "val:total_reward/mean"
   higher_is_better: true
   keep_top_k: 1000000
@@ -10,7 +10,7 @@ checkpointing:
   save_consolidated: false
 
 grpo:
-  num_prompts_per_step: 128
+  num_prompts_per_step: 256
   num_generations_per_prompt: 16
   num_val_generations_per_prompt: 2
   max_rollout_turns: 1
@@ -20,9 +20,9 @@ grpo:
   use_leave_one_out_baseline: true
   # Clipping bounds for normalized advantages to prevent extreme values from small std
   # Set to null to disable clipping (default), or e.g. -100/100 to clip
-  advantage_clip_low: null
-  advantage_clip_high: null
-  val_period: 5
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  val_period: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
@@ -53,9 +53,9 @@ grpo:
     target_max: 1.0
 
   async_grpo:
-    enabled: false
+    enabled: true
     max_trajectory_age_steps: 1
-    in_flight_weight_updates: false
+    in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
   use_best_at_k: false
@@ -82,12 +82,12 @@ loss_fn:
   ratio_clip_c: null
   use_on_policy_kl_approximation: true
   use_importance_sampling_correction: true
-  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: null
   truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
   token_level_loss: true
-  force_on_policy_ratio: false
+  force_on_policy_ratio: true
   use_kl_in_reward: false
 
 policy:
@@ -96,11 +96,11 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
-  train_global_batch_size: 2048
+  train_global_batch_size: 4096
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 16384
+  max_total_sequence_length: 65536
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
@@ -119,13 +119,13 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     activation_checkpointing: true
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
-    pipeline_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 4
+    context_parallel_size: 8
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
@@ -187,7 +187,7 @@ policy:
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
+      overlap_grad_reduce: false
       overlap_param_gather: true
       average_in_collective: false
       use_custom_fsdp: false
@@ -237,7 +237,7 @@ policy:
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
@@ -246,6 +246,7 @@ policy:
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
+      skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
@@ -255,22 +256,22 @@ policy:
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
-# compilation_config:
-# mode: 0
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
     colocated:
-      enabled: true
+      enabled: false
       resources:
-        gpus_per_node: null
-        num_nodes: null
+        gpus_per_node: 8
+        num_nodes: 72
 
 data:
   max_input_seq_length: null
   shuffle: false
   num_workers: 1
   train:
-    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.train.jsonl"
+    data_path: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/data/gym/rl-data-tools/blends/curriculum_v32_mindful-marmot.train.efforts0p3_qamath.safety_replaced.jsonl"
   validation:
-    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.val.jsonl"
+    data_path: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/data/gym/rl-data-tools/blends/curriculum_v32_mindful-marmot.train.jsonl"
   default:
     dataset_name: NemoGymDataset
     env_name: "nemo_gym"
@@ -286,7 +287,8 @@ env:
     - "genrm_simple_agent_reasoning_off"
   genrm_compare_server_name: "genrm_compare"
   nemo_gym:
-    num_gpu_nodes: 4
+    skip_venv_if_present: true
+    num_gpu_nodes: 5
     port_range_low: 15001
     port_range_high: 20000
     invalid_tool_call_patterns:
@@ -348,6 +350,8 @@ env:
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 2
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16]
           server_env:
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
@@ -379,6 +383,8 @@ env:
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 112
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16,32]
 
     inverse_if:
       resources_servers:
@@ -437,11 +443,11 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:8000/v1
           api_key: dummy_key
-          model: "/lustre/fsw/portfolios/llmservice/users/jiaqiz/models/qwen235b_principle_comparison_genrm_step1230"
+          model: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/models/qwen235b_principle_comparison_genrm_step1230"
           uses_reasoning_parser: True
           return_token_id_information: False
           spinup_server: True
-          router_dp_size: 4
+          router_dp_size: 2
           server_args:
             tensor_parallel_size: 8
             reasoning_parser: deepseek_r1
@@ -450,6 +456,8 @@ env:
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 112
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16,32]
 
 
     lc_judge:
@@ -496,7 +504,7 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
+  num_nodes: 109
 
 # uncomment to enable effort level training
 effort_levels:

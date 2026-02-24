@@ -1,0 +1,45 @@
+defaults: "grpo_superv3_stage1_109node.yaml"
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/super_v3_prod_stage1_21node"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 1024
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    expert_model_parallel_size: 16
+
+env:
+  nemo_gym:
+    genrm_model:
+      responses_api_models:
+        vllm_model:
+          router_dp_size: 2
+          server_args:
+            max_num_seqs: 16
+    nl2bash_judge_model:
+      responses_api_models:
+        vllm_model:
+          router_dp_size: 2
+          server_args:
+            max_num_seqs: 16
+    safety_judge_model:
+      responses_api_models:
+        vllm_model:
+          server_args:
+            max_num_seqs: 16
+
+cluster:
+  num_nodes: 21
