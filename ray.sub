@@ -32,7 +32,8 @@ maybe_gres_arg() {
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
     # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+    # Note: cut -d'(' -f1 removes the socket spec like "(S:0-3)" that some clusters append
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
       echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
@@ -47,9 +48,11 @@ maybe_gres_arg() {
 ########################################################
 # User defined variables
 ########################################################
+export OMP_NUM_THREADS=16
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -59,8 +62,9 @@ DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
 METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 
 # Ports for the head node
-PORT=${PORT:-54514}
-RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+# GCS head port and client server port -- kept below ephemeral range (32768-60999).
+PORT=${PORT:-9900}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-9901}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
@@ -84,11 +88,19 @@ elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
-# On our clusters, the largest port range on an idle worker appeared between 52369-64607
-# (not including the other ports set by this script). So this range is chosen to be
-# somewhere in the middle
-MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
+# Worker port range must NOT overlap with the OS ephemeral range (32768-60999)
+# to prevent TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern
+# (CheckPortFree) that can leave a window where the port is unguarded.
+# If the range overlaps with the ephemeral range, the kernel can assign the same
+# port as an ephemeral source port for outgoing TCP traffic during that window,
+# causing EADDRINUSE when the worker tries to bind.
+#
+# Port layout (all below ephemeral range):
+#   10002-11000  Ray worker gRPC (this setting)
+#   11001-15000  NeMo RL HTTP servers / TCPStore (policy.generation.port_range_low/high)
+#   15001-20000  NeMo Gym HTTP servers (Gym global config port_range_low/high)
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-10002}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-11000}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
@@ -111,6 +123,14 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
+# Write SETUP_COMMAND to a file to avoid heredoc escaping issues
+SETUP_COMMAND_FILE=""
+if [[ -n "$SETUP_COMMAND" ]]; then
+  SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
+  echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
+  chmod +x "$SETUP_COMMAND_FILE"
+fi
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
@@ -132,7 +152,7 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node
-CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-112}
 
 num_retries=3
 
@@ -295,6 +315,10 @@ chmod +x /launch-head.sh
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -304,9 +328,10 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+srun $COMMON_SRUN_ARGS --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
+sleep 120s
 NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Start Ray worker nodes
@@ -394,6 +419,10 @@ EOFINNER
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -403,7 +432,7 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  srun $COMMON_SRUN_ARGS --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
   SRUN_PIDS["ray-worker-$i"]=$!
   sleep 3
 done
@@ -414,11 +443,60 @@ while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_nod
   sleep 2
 done
 
+########################################################
+# Run sandbox in parallel on the head node (overlap)
+########################################################
+export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+
+# Check if SANDBOX_CONTAINER and SANDBOX_COMMAND are defined
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
+  mkdir -p "$SANDBOX_PORTS_DIR"
+  echo "[INFO] Starting sandbox on head node in parallel (ports_dir=$SANDBOX_PORTS_DIR)..."
+  srun --output "$LOG_DIR/sandbox.log" \
+    --error "$LOG_DIR/sandbox.log" \
+    --container-image="$SANDBOX_CONTAINER" \
+    --container-mounts="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR" \
+    --no-container-mount-home \
+    --mpi=pmix \
+    -A "$SLURM_JOB_ACCOUNT" \
+    -p "$SLURM_JOB_PARTITION" \
+    --wait=60 \
+    --kill-on-bad-exit=1 \
+    --overlap \
+    --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks-per-node=1 \
+    -w "$head_node" \
+    --export=ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR \
+    bash -c "$SANDBOX_COMMAND" &
+  SRUN_PIDS["sandbox"]=$!
+  echo "[INFO] Sandbox started in background (PID: ${SRUN_PIDS["sandbox"]})"
+else
+  echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
+fi
+
 # At this stage the Ray cluster bringup has started on the physical nodes in the allocation
 # Before we launch a job on this cluster we need to make sure that the bringup is complete
 # We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
+
+# Helper function to get container PID using enroot
+# Since we use -w to target specific nodes and only run one container per node,
+# we can just grab the first (and only) container PID on that node
+get_container_pid() {
+  local node=$1
+  srun --overlap --nodes=1 -w "$node" bash -c "enroot list -f | awk 'NR>1 && \$2 ~ /^[0-9]+\$/ {print \$2; exit}'"
+}
+
 extract_worker_units() {
-  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" ray status)
+  # Get the container PID for ray-head
+  head_container_pid=$(get_container_pid "$head_node")
+  if [[ -z "$head_container_pid" ]]; then
+    echo 0
+    return
+  fi
+  
+  # Execute ray status inside the container using enroot exec
+  status_output=$(srun --overlap --nodes=1 -w "$head_node" enroot exec "$head_container_pid" ray status)
   if echo "$status_output" | grep -q "worker_units"; then
     worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
     echo $worker_units
@@ -448,20 +526,30 @@ echo "All workers connected!"
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+  # Get container PID and execute command inside it
+  head_container_pid=$(get_container_pid "$head_node")
+  srun --overlap --nodes=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "cd $CONTAINER_CWD && $COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
+
+# Helper to get container PID
+get_container_pid() {
+  local node=\$1
+  srun --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "enroot list -f | awk 'NR>1 && \\\$2 ~ /^[0-9]+\\\$/ {print \\\$2; exit}'"
+}
+
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
+  HEAD_PID=\$(get_container_pid "$head_node")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && exec bash"
   fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
@@ -471,10 +559,12 @@ else
     exit 1
   fi
   nodes_array=($nodes)
+  node="\${nodes_array[\$WORKER_NUM]}"
+  WORKER_PID=\$(get_container_pid "\$node")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+    srun $GRES_ARG -A SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID --pty enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && exec bash"
   fi
 fi
 EOF
@@ -485,3 +575,4 @@ EOF
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
   sleep infinity
 fi
+
