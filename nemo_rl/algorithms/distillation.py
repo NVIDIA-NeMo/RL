@@ -257,9 +257,8 @@ def setup(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
     )
 
-    # Load validation dataset if provided
-    val_dataloader: dict[str, StatefulDataLoader] = {}
     # If validation is enabled, load the validation dataloader
+    val_dataloader: dict[str, StatefulDataLoader] = {}
     if (
         distillation_config["val_period"] > 0
         or distillation_config["val_at_start"]

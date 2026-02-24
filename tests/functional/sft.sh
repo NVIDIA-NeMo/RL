@@ -41,5 +41,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 5.9'
-
+    'data["train/loss"]["3"] < 5.9' \
+    'data["validation/val_loss"]["0"] < 8' \
+    'data["validation/val_loss_squad"]["0"] < 8'

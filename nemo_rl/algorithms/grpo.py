@@ -300,9 +300,8 @@ def setup(
 
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
-    # Load validation dataset if provided
-    val_dataloader: dict[str, StatefulDataLoader] = {}
     # If validation is enabled, load the validation dataloader
+    val_dataloader: dict[str, StatefulDataLoader] = {}
     if (
         grpo_config["val_period"] > 0
         or grpo_config["val_at_start"]
