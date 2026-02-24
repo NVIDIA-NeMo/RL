@@ -423,9 +423,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
-        if vllm_version < "0.11.1":
-            openai_serving_models_kwargs["model_config"] = model_config
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
