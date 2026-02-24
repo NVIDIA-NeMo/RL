@@ -226,10 +226,10 @@ jobs:
   build-container-gb200:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@e78a36019bbfffcb0005134827807fa610aad011
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@8c6389f1952bec001b553ac835dbb1c9a57e00b7
     with:
       build-ref: ${{ github.sha }}
-      image-name: nemo_rl_container
+      image-name: megatron-bridge
       dockerfile: docker/Dockerfile
       runner: nemo-ci-gcp-gpu-x2
       image-label: megatron-bridge
