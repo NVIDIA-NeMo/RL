@@ -57,37 +57,58 @@ def parse_args():
 
 
 # TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig
+) -> tuple[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]:
+    """Setup data for SFT training.
+
+    Args:
+        tokenizer: Tokenizer or processor.
+        data_config: Data config.
+
+    Returns:
+        A tuple of (train dataset, validation dataset).
+    """
     assert "train" in data_config, (
         "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
         "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
     )
 
+    # ==========================
+    # Setup Train Dataset
+    # ==========================
     print("\n▶ Setting up data...")
-    # setup train dataset
     task_data_processors = {}
     task_data_preprocessors = {}
     data_list = []
 
+    # wrap dataset config in a list if it is a dictionary
     if isinstance(data_config["train"], dict):
         data_config["train"] = [data_config["train"]]
 
     for cfg in data_config["train"]:
-        # load dataset
+        # update dataset config with default config
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
+
+        # load dataset
         data = load_response_dataset(cfg)
+        task_name = data.task_name
         data_list.append(data)
-        # bind task_name to task_data_processors
+        print(
+            f"  - Loaded training dataset {task_name} with {len(data.dataset)} samples."
+        )
+
+        # bind task specific stuffs
         data_processor = partial(
             data.processor,
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
         )
-        task_data_processors[data.task_name] = (data.task_spec, data_processor)
+        task_data_processors[task_name] = (data.task_spec, data_processor)
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
-            task_data_preprocessors[data.task_name] = data.preprocessor
+            task_data_preprocessors[task_name] = data.preprocessor
 
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
@@ -100,17 +121,24 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
-    # setup validation dataset
+    # ==========================
+    # Setup Validation Dataset
+    # ==========================
     val_task_data_processors = {}
     val_task_data_preprocessors = {}
-    val_data_list = []
+    val_data_dict = {}
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
-            val_data_list.append(data.val_dataset)
-            # bind task_name to task_data_processors
+            # extract val dataset from train dataset
             task_name = data.task_name
+            val_data_dict[task_name] = data.val_dataset
+            print(
+                f"  - Loaded validation dataset {task_name} with {len(data.val_dataset)} samples."
+            )
+
+            # bind task specific stuffs
             val_task_data_processors[task_name] = task_data_processors[task_name]
             if task_name in task_data_preprocessors:
                 val_task_data_preprocessors[task_name] = task_data_preprocessors[
@@ -119,41 +147,52 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
+        # wrap dataset config in a list if it is a dictionary
         if isinstance(data_config["validation"], dict):
             data_config["validation"] = [data_config["validation"]]
 
         for cfg in data_config["validation"]:
-            # load dataset
+            # update dataset config with default config
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
+
+            # load dataset
             val_data = load_response_dataset(cfg)
-            val_data_list.append(val_data.dataset)
-            # bind task_name to task_data_processors
+            task_name = val_data.task_name
+            val_data_dict[task_name] = val_data.dataset
+            print(
+                f"  - Loaded validation dataset {task_name} with {len(val_data.dataset)} samples."
+            )
+
+            # bind task specific stuffs
             val_data_processor = partial(
                 val_data.processor,
                 add_bos=data_config["add_bos"],
                 add_eos=data_config["add_eos"],
                 add_generation_prompt=data_config["add_generation_prompt"],
             )
-            val_task_data_processors[val_data.task_name] = (
+            val_task_data_processors[task_name] = (
                 val_data.task_spec,
                 val_data_processor,
             )
             if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
-                val_task_data_preprocessors[val_data.task_name] = val_data.preprocessor
+                val_task_data_preprocessors[task_name] = val_data.preprocessor
 
-    val_dataset = None
-    if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
-        val_dataset = AllTaskProcessedDataset(
-            merged_val_data,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            task_data_preprocessors=val_task_data_preprocessors,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+    val_dataset = {}
+    if len(val_data_dict) > 0:
+        val_dataset = {
+            task_name: AllTaskProcessedDataset(
+                val_data,
+                tokenizer,
+                None,
+                val_task_data_processors,
+                task_data_preprocessors=val_task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for task_name, val_data in val_data_dict.items()
+        }
+        val_sample_count = sum(len(val_data) for val_data in val_data_dict.values())
+        print(f"  ✓ Validation dataset loaded with {val_sample_count} samples.")
 
     return dataset, val_dataset
 
