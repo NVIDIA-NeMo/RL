@@ -106,13 +106,13 @@ def setup_response_data(
 
         # load dataset
         data = load_response_dataset(cfg)
+        task_name = data.task_name
         data_list.append(data)
         print(
-            f"  - Loaded training dataset {data.task_name} with {len(data.dataset)} samples."
+            f"  - Loaded training dataset {task_name} with {len(data.dataset)} samples."
         )
 
         # bind task specific stuffs
-        task_name = data.task_name
         task_data_processors[task_name] = (data.task_spec, data.processor)
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[task_name] = data.preprocessor
@@ -170,10 +170,6 @@ def setup_response_data(
 
             # bind task specific stuffs
             val_task_data_processors[task_name] = task_data_processors[task_name]
-            if task_name in task_data_preprocessors:
-                val_task_data_preprocessors[task_name] = task_data_preprocessors[
-                    task_name
-                ]
             if task_name in task_data_preprocessors:
                 val_task_data_preprocessors[task_name] = task_data_preprocessors[
                     task_name
