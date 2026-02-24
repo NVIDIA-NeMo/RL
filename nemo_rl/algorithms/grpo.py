@@ -15,6 +15,7 @@ import gc
 import os
 import time
 import warnings
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -2242,6 +2243,7 @@ def validate(
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        all_task_names = []  # Collect all task names
 
         max_batches = (
             master_config["grpo"]["max_val_samples"]
@@ -2301,26 +2303,39 @@ def validate(
                 )
                 for i in range(len(val_batch["message_log"]))
             ]
-
             all_message_logs.extend(to_env)
+
+            # Collect task names for statistics
+            all_task_names.extend(val_batch["task_name"])
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
+        accuracy = {"total": 0.0}
         if num_samples > 0:
+            # task accuracy
+            task_rewards = defaultdict(list)
+            for task_name, reward in zip(all_task_names, total_rewards):
+                task_rewards[task_name].append(reward)
+            accuracy = {
+                task_name: sum(rewards) / len(rewards)
+                for task_name, rewards in task_rewards.items()
+            }
+
+            # overall accuracy
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            accuracy = rewards_t.mean().item()
-        else:
-            accuracy = 0.0
+            accuracy["total"] = rewards_t.mean().item()
 
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
         val_metrics = {
-            "accuracy": accuracy,
+            "accuracy": accuracy["total"],
+            **{f"accuracy_{k}": v for k, v in accuracy.items()},
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
+        del val_metrics["accuracy_total"]
 
         # Print sample conversations only once at the end of validation
         try:
@@ -2343,7 +2358,10 @@ def validate(
 
     # Print summary of validation results
     print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
+    print(f"    • Accuracy: {accuracy['total']:.4f}")
+    for task_name, task_accuracy in accuracy.items():
+        if task_name != "total":
+            print(f"        • Accuracy for {task_name}: {task_accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -2356,6 +2374,7 @@ def validate(
     if logger is not None:
         val_log_data = {
             "content": all_message_logs,
+            "task_names": all_task_names,
             "rewards": total_rewards,
         }
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
