@@ -23,9 +23,6 @@ from nemo_rl.data import multimodal_utils
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 
-_DEBUG = True
-
-
 # map the senders from the sample to the allowed ones
 conversation_sender_mapping_sample_to_allowed = {
     "human": "user",
