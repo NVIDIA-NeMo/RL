@@ -17,7 +17,7 @@ distillation:
   # - ema_decay: 0.999 = separate EMA teacher that slowly tracks student (teacher = 0.999*teacher + 0.001*student)
   # - ema_decay: 0.9999 = slower EMA update (more stable but less responsive to student changes)
   # Set ema_decay < 1.0 to enable a separate teacher policy with EMA updates
-  ema_decay: 0.9999999
+  ema_decay: 0.99999
 
 loss_fn:
   kl_type: "mixed"
@@ -36,10 +36,11 @@ checkpointing:
   save_consolidated: false
 
 policy: &POLICY_BASE
-  model_name: "Qwen/Qwen3-1.7B"
+  model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${..model_name}
-    chat_template_kwargs: null
+    chat_template_kwargs: 
+      enable_thinking: true
   train_global_batch_size: 64
   train_micro_batch_size: 1
   generation_batch_size: 64

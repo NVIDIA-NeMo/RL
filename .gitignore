@@ -17,11 +17,11 @@ dist/
 *.vscode/
 release_run*
 ckpts/
-<<<<<<< HEAD
 mlruns/
-=======
+
 *.so
->>>>>>> d7d334a (updating gitignore)
+**/libcudnn*.so*
+**/libcudnn*.a
 
 # Test
 coverage.json
