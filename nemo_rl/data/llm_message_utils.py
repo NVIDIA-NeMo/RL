@@ -25,7 +25,10 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    get_dim_to_pack_along,
+    get_multimodal_default_settings_from_processor,
     get_multimodal_keys_from_processor,
+    load_media_from_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -422,24 +425,6 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
-def get_images_from_message(message: dict[str, Any]) -> list[Any]:
-    """Get all images from a message log item."""
-    # Handle None or missing content (e.g., assistant messages with only tool_calls)
-    if message.get("content") is None:
-        return []
-    # Handle string content (no images)
-    if isinstance(message["content"], str):
-        return []
-    # iterate over the content list
-    images = []
-    for item in message["content"]:
-        if item["type"] == "image":
-            images.extend(list(item["image"])) if isinstance(
-                item["image"], (list, tuple)
-            ) else images.append(item["image"])
-    return images
-
-
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -469,6 +454,7 @@ def get_formatted_message_log(
     )  # we just use the str:str parts here
 
     multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+    multimodal_load_kwargs = get_multimodal_default_settings_from_processor(tokenizer)
 
     def _format_content_helper(
         content: Union[str, list[dict[str, Any]]],
@@ -606,28 +592,41 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        images_cur_message = get_images_from_message(message)
+        media_cur_message = load_media_from_message(
+            message, multimodal_load_kwargs=multimodal_load_kwargs
+        )
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
-        if len(images_cur_message) == 0:
+        if len(media_cur_message) == 0:
             new_message["token_ids"] = tokenizer(
                 text=message_chunk, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            media_kwargs = {}
+            if "image" in media_cur_message:
+                media_kwargs["images"] = media_cur_message["image"]
+            if "audio" in media_cur_message:
+                media_kwargs["audio"] = media_cur_message["audio"]
+            if "video" in media_cur_message:
+                media_kwargs["videos"] = media_cur_message["video"]
+
             processed_chunk = tokenizer(
                 text=[message_chunk],
-                images=images_cur_message,
                 return_tensors="pt",
                 add_special_tokens=False,
+                **media_kwargs,
             )
             new_message["token_ids"] = processed_chunk["input_ids"][0]
 
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+                    new_message[key] = PackedTensor(
+                        processed_chunk[key],
+                        dim_to_pack=get_dim_to_pack_along(tokenizer, key),
+                    )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,

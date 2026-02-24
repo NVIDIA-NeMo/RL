@@ -66,6 +66,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     data_list = []
 
     if isinstance(data_config["train"], dict):
@@ -85,6 +86,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_generation_prompt=data_config["add_generation_prompt"],
         )
         task_data_processors[data.task_name] = (data.task_spec, data_processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[data.task_name] = data.preprocessor
 
     merged_data = concatenate_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
@@ -92,12 +95,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
+    val_task_data_preprocessors = {}
     val_data_list = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
@@ -107,6 +112,10 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             # bind task_name to task_data_processors
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[
+                    task_name
+                ]
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
@@ -130,6 +139,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                 val_data.task_spec,
                 val_data_processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[val_data.task_name] = val_data.preprocessor
 
     val_dataset = None
     if len(val_data_list) > 0:
@@ -139,6 +150,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
