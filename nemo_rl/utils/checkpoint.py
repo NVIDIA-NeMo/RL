@@ -106,6 +106,17 @@ class CheckpointManager:
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
 
+        # check metric name format
+        if self.metric_name is not None:
+            assert self.metric_name.startswith("train:") or self.metric_name.startswith(
+                "val:"
+            ), (
+                f"metric_name={self.metric_name} must start with 'val:' or 'train:',\n"
+                f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                f" e.g. 'val_reward --> 'val:reward'"
+            )
+
     def init_tmp_checkpoint(
         self,
         step: int,
