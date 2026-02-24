@@ -621,28 +621,17 @@ def setup(
             policy, policy_time = init_policy()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
         else:
-            # Non-colocated Megatron backend: separate inference workers
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated Megatron mode)",
-                flush=True,
-            )
+            # Non-colocated Megatron: initialize training first so HF→Megatron
+            # checkpoint conversion completes before inference workers start.
+            # Both sides target the same checkpoint path, so parallel init
+            # causes a write race during conversion.
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                megatron_gen_future = executor.submit(init_megatron_generation)
-                policy_future = executor.submit(init_policy)
-                policy_generation, megatron_gen_time = megatron_gen_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
+            policy_generation, megatron_gen_time = init_megatron_generation()
             worker_init_timing_metrics["megatron_generation_init_time_s"] = (
                 megatron_gen_time
             )
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
 
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy

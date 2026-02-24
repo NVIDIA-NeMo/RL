@@ -879,51 +879,61 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     @contextmanager
     def inference_mode(self, mcore_generation_config: dict):
         """Context manager for inference mode, following Megatron RL's pattern.
-        
+
         This mirrors megatron_rl_inference_mode from megatron/rl/rl_utils.py
-        
+
         ENTER order:
         1. Put model in eval mode
         2. Clear rotary cache
-        3. Toggle CUDA graphs ON 
+        3. Toggle CUDA graphs ON
         4. Initialize inference engine (first time only)
         5. Resume engine (reallocates KV cache, recreates CUDA graphs as needed)
-        
+
         EXIT order:
         1. Suspend engine (deallocates KV cache and GPU state)
         2. Toggle CUDA graphs OFF
         3. Clear rotary cache
         4. Put model back in train mode
-        
+
+        In non-colocated mode, the engine is NOT suspended/resumed between
+        iterations because training happens on separate GPUs. Only weight values
+        change (via swap_weights_via_reshard), not the compute graph structure,
+        so CUDA graphs remain valid and do not need to be rebuilt.
+
         KV cache lifecycle is managed by the engine's suspend/resume mechanism
         via KVCacheManagementMode in InferenceConfig.
-        
+
         Yields:
             The dynamic inference engine for use during inference.
         """
         # Get the language module (unwrap from precision wrappers if needed)
         lang_module = self._get_lang_module()
-        
+
         # Get config settings
         cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "local")
-        
+
+        # In non-colocated mode, we don't need to suspend/resume the engine
+        # between iterations since training runs on separate GPUs. The CUDA
+        # graphs and KV cache can stay allocated. Only weight values change.
+        needs_suspend_resume = self.is_generation_colocated
+
         # Save training state
         was_training = lang_module.training
-        
+
         # === ENTER INFERENCE MODE ===
-        
+
         # 1. Put model in eval mode
         lang_module.eval()
-        
+
         # 2. Clear rotary position embedding caches (Megatron RL does this)
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
         if has_lru_cache:
             rotary_module.forward.cache_clear()
-        
+
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
-        
+
         # 4. Initialize inference engine if not already done
         if not self._inference_engine_initialized:
             self._initialize_inference_engine(mcore_generation_config)
@@ -935,32 +945,34 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         if self._inference_engine_alseep:
             self._wake()
-        
+
         try:
             # Yield the inference engine for use
             yield self.dynamic_inference_engine
-            
+
         finally:
-            
-            # 1. pause the inference engine
-            if self._inference_engine_initialized and not self._inference_engine_alseep:
+
+            # 1. pause the inference engine (skip in non-colocated mode to
+            #    avoid deleting and recreating CUDA graphs unnecessarily)
+            if needs_suspend_resume and self._inference_engine_initialized and not self._inference_engine_alseep:
                 self._sleep()
 
-            # 2. Toggle CUDA graphs OFF 
-            if cuda_graph_impl != "none":
+            # 2. Toggle CUDA graphs OFF (skip in non-colocated mode to keep them alive)
+            if needs_suspend_resume and cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
-            
+
             # 3. Clear rotary embedding cache again (Megatron RL does this on exit too)
             if has_lru_cache:
                 rotary_module.forward.cache_clear()
-            
-            # 4. Restore training state
-            if was_training:
+
+            # 4. Restore training state (skip in non-colocated mode - model stays in eval)
+            if needs_suspend_resume and was_training:
                 lang_module.train()
-            
-            # 6. Force garbage collection and CUDA memory cleanup
-            gc.collect()
-            torch.cuda.empty_cache()
+
+            # 5. Force garbage collection and CUDA memory cleanup
+            if needs_suspend_resume:
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
