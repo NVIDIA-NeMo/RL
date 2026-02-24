@@ -24,7 +24,8 @@ class Tulu3PreferenceDataset(RawDataset):
     """Tulu3 preference dataset for DPO training."""
 
     def __init__(self, **kwargs):
-        self.task_name = "Tulu3Preference"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="Tulu3Preference", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("allenai/llama-3.1-tulu-3-8b-preference-mixture")[

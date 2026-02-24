@@ -23,7 +23,8 @@ class DeepScalerDataset(RawDataset):
     """Simple wrapper around the DeepScaler dataset with train split."""
 
     def __init__(self, **kwargs) -> None:
-        self.task_name = "DeepScaler"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="DeepScaler", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset(
