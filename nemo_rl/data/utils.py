@@ -39,11 +39,11 @@ def setup_response_data(
 ) -> Union[
     tuple[
         Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
-        Optional[AllTaskProcessedDataset],
+        dict[str, AllTaskProcessedDataset],
     ],
     tuple[
         Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
-        Optional[AllTaskProcessedDataset],
+        dict[str, AllTaskProcessedDataset],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
     ],
@@ -95,19 +95,23 @@ def setup_response_data(
     task_to_env = {}
     data_list = []
 
+    # wrap dataset config in a list if it is a dictionary
     if isinstance(data_config["train"], dict):
         data_config["train"] = [data_config["train"]]
 
     for cfg in data_config["train"]:
-        # load dataset
+        # update dataset config with default config
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
+
+        # load dataset
         data = load_response_dataset(cfg)
         data_list.append(data)
         print(
             f"  - Loaded training dataset {data.task_name} with {len(data.dataset)} samples."
         )
-        # bind task_name to task_data_processors and task_to_env
+
+        # bind task specific stuffs
         task_name = data.task_name
         task_data_processors[task_name] = (data.task_spec, data.processor)
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
@@ -152,18 +156,24 @@ def setup_response_data(
     val_task_data_processors = {}
     val_task_data_preprocessors = {}
     val_task_to_env = {}
-    val_data_list = []
+    val_data_dict = {}
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
-            val_data_list.append(data.val_dataset)
-            print(
-                f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
-            )
-            # bind task_name to task_data_processors and task_to_env
+            # extract val dataset from train dataset
             task_name = data.task_name
+            val_data_dict[task_name] = data.val_dataset
+            print(
+                f"  - Loaded validation dataset {task_name} with {len(data.val_dataset)} samples."
+            )
+
+            # bind task specific stuffs
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[
+                    task_name
+                ]
             if task_name in task_data_preprocessors:
                 val_task_data_preprocessors[task_name] = task_data_preprocessors[
                     task_name
@@ -173,20 +183,24 @@ def setup_response_data(
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
+        # wrap dataset config in a list if it is a dictionary
         if isinstance(data_config["validation"], dict):
             data_config["validation"] = [data_config["validation"]]
 
         for cfg in data_config["validation"]:
-            # load dataset
+            # update dataset config with default config
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
+
+            # load dataset
             val_data = load_response_dataset(cfg)
-            val_data_list.append(val_data.dataset)
-            print(
-                f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
-            )
-            # bind task_name to task_data_processors and task_to_env
             task_name = val_data.task_name
+            val_data_dict[task_name] = val_data.dataset
+            print(
+                f"  - Loaded validation dataset {task_name} with {len(val_data.dataset)} samples."
+            )
+
+            # bind task specific stuffs
             val_task_data_processors[task_name] = (
                 val_data.task_spec,
                 val_data.processor,
@@ -196,19 +210,21 @@ def setup_response_data(
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
-    # merge datasets
-    val_dataset = None
-    if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
-        val_dataset = AllTaskProcessedDataset(
-            merged_val_data,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            task_data_preprocessors=val_task_data_preprocessors,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+    val_dataset = {}
+    if len(val_data_dict) > 0:
+        val_dataset = {
+            task_name: AllTaskProcessedDataset(
+                val_data,
+                tokenizer,
+                None,
+                val_task_data_processors,
+                task_data_preprocessors=val_task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for task_name, val_data in val_data_dict.items()
+        }
+        val_sample_count = sum(len(val_data) for val_data in val_data_dict.values())
+        print(f"  ✓ Validation dataset loaded with {val_sample_count} samples.")
 
     if has_envs:
         return dataset, val_dataset, task_to_env, val_task_to_env

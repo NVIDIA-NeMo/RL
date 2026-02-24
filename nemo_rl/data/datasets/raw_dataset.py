@@ -19,7 +19,6 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
