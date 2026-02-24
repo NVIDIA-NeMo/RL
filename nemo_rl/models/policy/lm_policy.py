@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union
@@ -466,6 +467,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
+        _t0_sharding = time.perf_counter()
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -496,6 +498,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             for shard in sharded_data:
                 input_lengths = shard["input_lengths"]
                 self.flops_tracker.track_batch(input_lengths.tolist())
+
+        _t_data_sharding_and_packing = time.perf_counter() - _t0_sharding
 
         # Train each shard in parallel
         futures = self.worker_group.run_all_workers_sharded_data(
@@ -528,6 +532,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+
+        # Build combined timing breakdown
+        breakdown = {}
+        if "worker_timing_breakdown" in results[0]:
+            breakdown.update(results[0]["worker_timing_breakdown"])
+        breakdown["data_sharding_and_packing"] = _t_data_sharding_and_packing
+        aggregated_results["policy_training_breakdown"] = breakdown
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops

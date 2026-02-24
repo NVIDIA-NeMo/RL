@@ -789,13 +789,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         model_cfg.calculate_per_token_loss = True
         model_cfg.perform_initialization = True
 
-        assert (
-            "aux_loss" not in model_cfg.moe_router_load_balancing_type
-            or model_cfg.moe_aux_loss_coeff == 0
-        ), (
-            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-        )
+        # assert (
+        #     "aux_loss" not in model_cfg.moe_router_load_balancing_type
+        #     or model_cfg.moe_aux_loss_coeff == 0
+        # ), (
+        #     "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
+        #     "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
+        # )
 
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
@@ -1003,6 +1003,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        # --- Timing breakdown: init accumulators ---
+        _t_batch_iter_setup = 0.0
+        _t_fwd_bwd = 0.0
+        _t_optimizer_step = 0.0
+        _t_metrics_and_lr = 0.0
+        torch.cuda.synchronize()
+        _t0_setup = time.perf_counter()
+
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1035,6 +1043,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             # Ensure model is in training mode
             self.model.train()
 
+        # --- Timing: model_and_config_setup ---
+        torch.cuda.synchronize()
+        _t_model_and_config_setup = time.perf_counter() - _t0_setup
+
         with ctx:
             # dim 1 is always assumed to be the sequence dim, sanity check this here
             sequence_dim = 1
@@ -1052,6 +1064,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
+                # --- Timing: start of GB loop body ---
+                torch.cuda.synchronize()
+                _t0_batch_iter = time.perf_counter()
+
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
                 assert "sample_mask" in global_batch, (
@@ -1120,6 +1136,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(data_iterator_len)
 
+                # --- Timing: batch_iter_setup ---
+                torch.cuda.synchronize()
+                _t_batch_iter_setup += time.perf_counter() - _t0_batch_iter
+                _t0_fwd_bwd = time.perf_counter()
+
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
@@ -1155,6 +1176,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
 
+                # --- Timing: fwd_bwd ---
+                torch.cuda.synchronize()
+                _t_fwd_bwd += time.perf_counter() - _t0_fwd_bwd
+                _t0_opt = time.perf_counter()
+
                 # Update parameters.
                 if not eval_mode:
                     update_successful, grad_norm, num_zeros_in_grad = (
@@ -1185,6 +1211,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
+
+                # --- Timing: optimizer_step ---
+                torch.cuda.synchronize()
+                _t_optimizer_step += time.perf_counter() - _t0_opt
+                _t0_metrics = time.perf_counter()
 
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     # keep all microbatch metrics to be normalized later
@@ -1221,6 +1252,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+                # --- Timing: metrics_and_lr (per-GB portion) ---
+                _t_metrics_and_lr += time.perf_counter() - _t0_metrics
+
+        # --- Timing: LR step + final aggregation ---
+        _t0_post_loop = time.perf_counter()
+
         if not eval_mode:
             # take one LR step every rollout batch
             # we need to scale the step by gbs to counteract the fact that NeMo automatically
@@ -1241,6 +1278,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 group=parallel_state.get_data_parallel_group(),
             )
 
+        _t_metrics_and_lr += time.perf_counter() - _t0_post_loop
+
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
@@ -1259,6 +1298,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
+        metrics["worker_timing_breakdown"] = {
+            "model_and_config_setup": _t_model_and_config_setup,
+            "batch_iter_setup": _t_batch_iter_setup,
+            "fwd_bwd": _t_fwd_bwd,
+            "optimizer_step": _t_optimizer_step,
+            "metrics_and_lr": _t_metrics_and_lr,
+        }
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")

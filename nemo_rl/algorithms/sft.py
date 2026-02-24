@@ -599,12 +599,47 @@ def sft_train(
             print(f"  • Total step time: {total_time:.2f}s")
 
             # Display all other timing metrics (if any)
+            policy_training_breakdown = train_results.get(
+                "policy_training_breakdown", {}
+            )
             for k, v in sorted(
                 timing_metrics.items(), key=lambda item: item[1], reverse=True
             ):
                 if k != "total_step_time":
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
+                    # Print sub-breakdown for policy_training
+                    if k == "policy_training" and policy_training_breakdown:
+                        policy_time = v
+                        sub_total = sum(policy_training_breakdown.values())
+                        unaccounted = policy_time - sub_total
+                        print("    Policy training breakdown:")
+                        for sk, sv in sorted(
+                            policy_training_breakdown.items(),
+                            key=lambda item: item[1],
+                            reverse=True,
+                        ):
+                            sub_pct = (
+                                (sv / policy_time * 100)
+                                if policy_time > 0
+                                else 0
+                            )
+                            print(f"      - {sk}: {sv:.2f}s ({sub_pct:.1f}%)")
+                        if unaccounted > 0:
+                            unaccounted_pct = (
+                                (unaccounted / policy_time * 100)
+                                if policy_time > 0
+                                else 0
+                            )
+                            print(
+                                f"      - unaccounted (dispatch overhead): {unaccounted:.2f}s ({unaccounted_pct:.1f}%)"
+                            )
+
+            # Log sub-breakdown to W&B/TensorBoard
+            if policy_training_breakdown:
+                for sk, sv in policy_training_breakdown.items():
+                    timing_metrics[f"policy_training/{sk}"] = sv
 
             total_num_gpus = (
                 master_config["cluster"]["num_nodes"]
