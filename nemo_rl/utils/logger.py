@@ -87,6 +87,7 @@ class LoggerConfig(TypedDict):
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
+    num_val_samples_to_log: NotRequired[int]
 
 
 class LoggerInterface(ABC):

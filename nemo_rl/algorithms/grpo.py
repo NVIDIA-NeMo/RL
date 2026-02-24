@@ -26,6 +26,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from wandb import Table
 
 from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
@@ -50,7 +51,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
@@ -189,6 +190,9 @@ def _default_grpo_save_state() -> GRPOSaveState:
 
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
+    num_val_samples_to_log: NotRequired[
+        int
+    ]  # number of val samples to log to wandb table
 
 
 class MasterConfig(TypedDict):
@@ -2153,6 +2157,13 @@ def validate(
             "rewards": total_rewards,
         }
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
+        _log_validation_samples_to_wandb(
+            logger=logger,
+            message_logs=all_message_logs,
+            rewards=total_rewards,
+            step=step,
+            num_samples=master_config["logger"].get("num_val_samples_to_log", 0),
+        )
 
     # Make sure to reset the timer after validation
     timer.reset()
@@ -2162,6 +2173,69 @@ def validate(
     torch.cuda.empty_cache()
 
     return val_metrics, timing_metrics
+
+
+def _message_content_to_str(content: Any) -> str:
+    if isinstance(content, list):
+        return "".join(str(part) for part in content)
+    return str(content)
+
+
+def _select_sample_indices_for_logging(
+    rewards: list[float], num_samples: int
+) -> list[int]:
+    if num_samples <= 0:
+        return []
+    indices = list(range(len(rewards)))
+    if len(indices) <= num_samples:
+        return indices
+    sorted_indices = sorted(indices, key=lambda i: rewards[i], reverse=True)
+    half = num_samples // 2
+    selected = sorted_indices[:half] + sorted_indices[-half:]
+    if num_samples % 2 == 1:
+        middle_idx = len(sorted_indices) // 2
+        selected.append(sorted_indices[middle_idx])
+    return selected[:num_samples]
+
+
+def _log_validation_samples_to_wandb(
+    logger: Optional[Logger],
+    message_logs: list[LLMMessageLogType],
+    rewards: list[float],
+    step: int,
+    num_samples: int,
+) -> None:
+    if logger is None or logger.wandb_logger is None:
+        return
+    if not message_logs or not rewards or num_samples <= 0:
+        return
+
+    num_samples = min(num_samples, len(message_logs))
+    indices = _select_sample_indices_for_logging(rewards, num_samples)
+    rows: list[list[Any]] = []
+    for idx in indices:
+        message_log = message_logs[idx]
+        prompt = ""
+        response = ""
+        for msg in message_log:
+            role = msg.get("role")
+            content = _message_content_to_str(msg.get("content", ""))
+            if role == "user" and not prompt:
+                prompt = content
+            elif role == "assistant":
+                response = content
+        rows.append([prompt, response, float(rewards[idx])])
+
+    if rows:
+        table = Table(columns=["input", "output", "reward"], data=rows)
+        logger.wandb_logger.log_metrics(
+            {
+                "val/generations": table,
+                f"val/generations_step_{step}": table,
+            },
+            step=step,
+            prefix="",
+        )
 
 
 def async_grpo_train(
