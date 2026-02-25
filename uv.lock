@@ -211,7 +211,7 @@ overrides = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.9.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", specifier = "==2.9.0" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.9.0a0,<2.12.0" },
 ]
 
 [[manifest.dependency-metadata]]
@@ -553,6 +553,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/e3/befab77a55638394246bc0804cdb2d36222d78cf1ed9d4486b23a06ad2e3/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8f09299294b702c6cd381d098330db83590c2faf981342954711fdd02659c34", size = 1869760, upload-time = "2025-11-30T07:21:22.34Z" },
     { url = "https://files.pythonhosted.org/packages/1b/b3/2920bf4fee6db0086a6bad438371fc3d68fb625891f0130fe205063f3c6d/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d3a2c45c74ddc85c8d55dd927deae10fbaadaebcb1943ce6052cdb2223b056f5", size = 1976158, upload-time = "2025-11-30T07:21:23.949Z" },
     { url = "https://files.pythonhosted.org/packages/ae/69/fe387b0f70ed608a363a90036e08ef8c1e844e5c98145502160661012dc0/apache_tvm_ffi-0.1.4-cp314-cp314t-win_amd64.whl", hash = "sha256:1bceda57240d03a3cf026334521c0595d097ab92b6d0df7485cbb37b2c056c27", size = 1794928, upload-time = "2025-11-30T07:21:25.234Z" },
+]
+
+[[package]]
+name = "asgiref"
+version = "3.11.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/63/40/f03da1264ae8f7cfdbf9146542e5e7e8100a4c66ab48e791df9a03d3f6c0/asgiref-3.11.1.tar.gz", hash = "sha256:5f184dc43b7e763efe848065441eac62229c9f7b0475f41f80e207a114eda4ce", size = 38550, upload-time = "2026-02-03T13:30:14.33Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/0a/a72d10ed65068e115044937873362e6e32fab1b7dce0046aeb224682c989/asgiref-3.11.1-py3-none-any.whl", hash = "sha256:e8667a091e69529631969fd45dc268fa79b99c92c5fcdda727757e52146ec133", size = 24345, upload-time = "2026-02-03T13:30:13.039Z" },
 ]
 
 [[package]]
@@ -1924,16 +1933,16 @@ wheels = [
 
 [[package]]
 name = "fla-core"
-version = "0.3.2"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/67/c6/10a1149b07e6bab45b2cb2d07f6b827716c2baf5f3404161753f25c6389b/fla_core-0.3.2.tar.gz", hash = "sha256:d38db16bc4e1c6fa8c04df442f246da1e6926a209426bc6ef703d41bfbc37c92", size = 296725, upload-time = "2025-09-10T07:43:40.155Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/de/0d6bd5664ba2e711cabdde11ccb41ddcdd866c531e40900af3601bd7b8c6/fla_core-0.4.1.tar.gz", hash = "sha256:38ab28966eeadc2141b29e87c2bf72a8a4851e00af9d25bbbc3596b1fb53450d", size = 319608, upload-time = "2025-12-24T18:07:37.669Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/f5/74947b33c07682280e65adbdf17c4ee94b30232df2f728bafecf13d1d820/fla_core-0.3.2-py3-none-any.whl", hash = "sha256:e751d5a41e33eee721a6fb6588bd857f6f36e0d14719a23b1ebdbd617d307209", size = 413594, upload-time = "2025-09-10T07:43:37.786Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/43/945ef69eb48a14c30fd7323d3e0b560c821ae71e6d3ef979e06a901bc3b9/fla_core-0.4.1-py3-none-any.whl", hash = "sha256:93c6afe4c80fc7bc705fa8aeea6a46d2cf2d77383f9619a41863c7114c801bab", size = 437282, upload-time = "2025-12-24T18:07:34.41Z" },
 ]
 
 [[package]]
@@ -1952,17 +1961,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/e8/6d/7066d160bdffa2f9d
 
 [[package]]
 name = "flash-linear-attention"
-version = "0.3.2"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "datasets" },
     { name = "fla-core" },
-    { name = "pytest" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/84/f6/e62c1e562a288557eba7f06f168a7615813d1a227327b8beb8ba426da2c5/flash_linear_attention-0.3.2.tar.gz", hash = "sha256:9147747316c2951fed4ebeb4fa87977c05d807dc70c93b46250b68a6eb1183e2", size = 150880, upload-time = "2025-09-10T07:43:41.37Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/83/7d8ec7ffb5229080b1c9b772338ff588cbd63282ac355ede2a12a6e174a8/flash_linear_attention-0.4.1.tar.gz", hash = "sha256:127ee7273ed15ac17f72bcf4c75e1051719d8fbe0a2d1d047e59406f36d81ee2", size = 158280, upload-time = "2025-12-24T18:07:38.812Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/d0/35ce9eac5f52c72005095aaa12a393d2656ed7ffedf925b2381a6b76d10c/flash_linear_attention-0.3.2-py3-none-any.whl", hash = "sha256:604e73361437ba786420ab195e2caa3fd19280503761e703fa353c5ce5c65376", size = 274592, upload-time = "2025-09-10T07:43:39.107Z" },
+    { url = "https://files.pythonhosted.org/packages/63/d5/6327559a9d5b9243b10c3984f1bcef256ed2ad06d105a3bb8f7b2979659c/flash_linear_attention-0.4.1-py3-none-any.whl", hash = "sha256:d18bdfe9d1f4b424676444eac9d50fb8433b70e5d4e0e0878b20bcbcdbea57ce", size = 287415, upload-time = "2025-12-24T18:07:35.815Z" },
 ]
 
 [[package]]
@@ -2139,6 +2146,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/dc/6d/cfe3c0fcc5e477df242b98bfe186a4c34357b4847e87ecaef04507332dab/flask-3.1.2.tar.gz", hash = "sha256:bf656c15c80190ed628ad08cdfd3aaa35beb087855e2f494910aa3774cc4fd87", size = 720160, upload-time = "2025-08-19T21:03:21.205Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/f9/7f9263c5695f4bd0023734af91bedb2ff8209e8de6ead162f35d8dc762fd/flask-3.1.2-py3-none-any.whl", hash = "sha256:ca1d8112ec8a6158cc29ea4858963350011b5c846a414cdb7a954aa9e967d03c", size = 103308, upload-time = "2025-08-19T21:03:19.499Z" },
+]
+
+[package.optional-dependencies]
+async = [
+    { name = "asgiref" },
 ]
 
 [[package]]
@@ -2849,6 +2861,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/6d/8e/07e42bc434a847154083b315779b0a81d567154504624e181caf2c71cd98/hydra-core-1.3.2.tar.gz", hash = "sha256:8a878ed67216997c3e9d88a8e72e7b4767e81af37afb4ea3334b269a4390a824", size = 3263494, upload-time = "2023-02-23T18:33:43.03Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c6/50/e0edd38dcd63fb26a8547f13d28f7a008bc4a3fd4eb4ff030673f22ad41a/hydra_core-1.3.2-py3-none-any.whl", hash = "sha256:fa0238a9e31df3373b35b0bfb672c34cc92718d21f81311d8996a16de1141d8b", size = 154547, upload-time = "2023-02-23T18:33:40.801Z" },
+]
+
+[[package]]
+name = "hypercorn"
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h11" },
+    { name = "h2" },
+    { name = "priority" },
+    { name = "wsproto" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/44/01/39f41a014b83dd5c795217362f2ca9071cf243e6a75bdcd6cd5b944658cc/hypercorn-0.18.0.tar.gz", hash = "sha256:d63267548939c46b0247dc8e5b45a9947590e35e64ee73a23c074aa3cf88e9da", size = 68420, upload-time = "2025-11-08T13:54:04.78Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/35/850277d1b17b206bd10874c8a9a3f52e059452fb49bb0d22cbb908f6038b/hypercorn-0.18.0-py3-none-any.whl", hash = "sha256:225e268f2c1c2f28f6d8f6db8f40cb8c992963610c5725e13ccfcddccb24b1cd", size = 61640, upload-time = "2025-11-08T13:54:03.202Z" },
 ]
 
 [[package]]
@@ -3596,6 +3623,7 @@ dependencies = [
     { name = "hydra-core" },
     { name = "mamba-ssm" },
     { name = "megatron-core" },
+    { name = "mlflow" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf" },
     { name = "open-clip-torch" },
@@ -3606,6 +3634,8 @@ dependencies = [
     { name = "six" },
     { name = "tensorboard" },
     { name = "timm" },
+    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tqdm" },
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "transformers" },
@@ -3617,11 +3647,12 @@ dependencies = [
 requires-dist = [
     { name = "accelerate" },
     { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
-    { name = "datasets" },
+    { name = "datasets", specifier = ">=2.20.0" },
     { name = "flash-linear-attention" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-LM-workspace" },
+    { name = "mlflow", specifier = ">=3.5.0" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "open-clip-torch", specifier = ">=3.2.0" },
@@ -3632,8 +3663,10 @@ requires-dist = [
     { name = "six", specifier = ">=1.17.0" },
     { name = "tensorboard", specifier = ">=2.19.0" },
     { name = "timm" },
+    { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
     { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.10.0a0,<2.12.0" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], specifier = ">=2.10.0a0,<2.13.0" },
     { name = "transformers", specifier = "<5.0.0" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.19.10" },
@@ -3652,6 +3685,8 @@ dependencies = [
     { name = "flash-linear-attention" },
     { name = "flashinfer-python", version = "0.5.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang')" },
     { name = "flashinfer-python", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "flask", extra = ["async"] },
+    { name = "hypercorn" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"] },
     { name = "multi-storage-client" },
@@ -3661,6 +3696,7 @@ dependencies = [
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
     { name = "onnxscript" },
+    { name = "openai" },
     { name = "opentelemetry-api" },
     { name = "packaging" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3680,8 +3716,10 @@ requires-dist = [
     { name = "einops", specifier = "~=0.8" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
     { name = "fastapi", specifier = "~=0.50" },
-    { name = "flash-linear-attention", specifier = "~=0.3.2" },
+    { name = "flash-linear-attention", specifier = "~=0.4.0" },
     { name = "flashinfer-python", specifier = "~=0.5.0" },
+    { name = "flask", extras = ["async"] },
+    { name = "hypercorn" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
@@ -3691,11 +3729,12 @@ requires-dist = [
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
+    { name = "openai" },
     { name = "opentelemetry-api", specifier = "~=1.33.1" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "tensorstore", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
-    { name = "torch", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torch", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
     { name = "tqdm" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], specifier = ">=2.9.0a0,<2.12.0" },
     { name = "wget" },
@@ -4855,8 +4894,8 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.8.0" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = ">=2.9.0a0,<2.12.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = ">=2.9.0a0,<2.12.0" },
     { name = "transformers", specifier = "==4.57.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "uvloop", marker = "extra == 'sglang'" },
@@ -6130,6 +6169,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/99/b1/85e18ac92afd08c533603e3393977b6bc1443043115a47bb094f3b98f94f/prettytable-3.16.0.tar.gz", hash = "sha256:3c64b31719d961bf69c9a7e03d0c1e477320906a98da63952bc6698d6164ff57", size = 66276, upload-time = "2025-03-24T19:39:04.008Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/02/c7/5613524e606ea1688b3bdbf48aa64bafb6d0a4ac3750274c43b6158a390f/prettytable-3.16.0-py3-none-any.whl", hash = "sha256:b5eccfabb82222f5aa46b798ff02a8452cf530a352c31bddfa29be41242863aa", size = 33863, upload-time = "2025-03-24T19:39:02.359Z" },
+]
+
+[[package]]
+name = "priority"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/3c/eb7c35f4dcede96fca1842dac5f4f5d15511aa4b52f3a961219e68ae9204/priority-2.0.0.tar.gz", hash = "sha256:c965d54f1b8d0d0b19479db3924c7c36cf672dbf2aec92d43fbdaf4492ba18c0", size = 24792, upload-time = "2021-06-27T10:15:05.487Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/5f/82c8074f7e84978129347c2c6ec8b6c59f3584ff1a20bc3c940a3e061790/priority-2.0.0-py3-none-any.whl", hash = "sha256:6f8eefce5f3ad59baf2c080a664037bb4725cd0a790d53d59ab4059288faf6aa", size = 8946, upload-time = "2021-06-27T10:15:03.856Z" },
 ]
 
 [[package]]
@@ -9178,13 +9226,10 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.8.0"
+version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "transformer-engine-cu12" },
-]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/be/a7cf5f28b7abbe966956217b18208fc34cc9bfaf62fa9472c0603db74899/transformer_engine-2.8.0-py3-none-any.whl", hash = "sha256:795b056d31b0f67f5d7432725177782dd5084090c1e3c52532577070947fe9a7", size = 638319, upload-time = "2025-10-07T04:55:34.115Z" },
+    { url = "https://files.pythonhosted.org/packages/00/33/44571ec584c88e1715f4c2afefc0ddd45064c7065ac1c6ffc8e832bc3ba3/transformer_engine-2.11.0-py3-none-any.whl", hash = "sha256:7ee1eae8fa6b0cb471c6066aa3555304fda8537174e5019929dc0c8655071df3", size = 723110, upload-time = "2026-01-02T09:58:23.245Z" },
 ]
 
 [package.optional-dependencies]
@@ -9194,7 +9239,7 @@ pytorch = [
 
 [[package]]
 name = "transformer-engine-cu12"
-version = "2.8.0"
+version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -9202,22 +9247,25 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/db/cde3e772cf5cd7e941b64d37e4a61e2762f36ecc2e6508525af536076f8d/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:3a92c781fc3c1a3a6a0009871a36903fa364b2d51ce06b06641d29aeefd59310", size = 480373707, upload-time = "2025-10-07T05:03:05.392Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/14/67860f2f1f9d0eca4a8e5e0cef5a0de5c4fc26340625051f032d16913d8c/transformer_engine_cu12-2.8.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8ee5f9df586491a35fd1a01cb95b6970a9f01a5e8f935ecdacd56173c44d6a67", size = 480875025, upload-time = "2025-10-07T04:54:43.762Z" },
+    { url = "https://files.pythonhosted.org/packages/05/27/5c4c27cb245a3513e5ad7ccef50e2e9688996e2cc558edbbb575dfcca276/transformer_engine_cu12-2.11.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:ed5fda0925cb304d6864b451d8d012c579d5bd097bfefefca769b2704b06381a", size = 287630565, upload-time = "2026-01-02T09:56:43.645Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/a2/1439bbb6bc7d4d6045bad7d213884f7be92301c0982f009e3bbafa40e4ff/transformer_engine_cu12-2.11.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6e5c0707583b2a90b2570da6f57409c6802653e069dfec38cf07a3b77ba9b12d", size = 288159349, upload-time = "2026-01-02T09:57:56.435Z" },
 ]
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.8.0"
+version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
     { name = "onnx" },
     { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "transformer-engine-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/63/1e3953244ed4f318f87889309a56cdd664759f007967eb850ee415a5584d/transformer_engine_torch-2.8.0.tar.gz", hash = "sha256:ce09f1bd9b8e532a5c347b9e9b3a3a771722095daddca673ae82ccce8e68d759", size = 209805, upload-time = "2025-10-07T04:54:11.134Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/09/42/068a40f5b213a3a8899e3885eb178776662897abed03cd725953d1106c39/transformer_engine_torch-2.11.0.tar.gz", hash = "sha256:b58d6322bdf885dfab0646da572aff9cf090b332ad470559aa58883c231e1816", size = 242065, upload-time = "2026-01-02T09:58:58.423Z" }
 
 [[package]]
 name = "transformers"
@@ -9859,6 +9907,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/79/d9/7cfd5a312760ac4dd8bf0184a6ee9e43c33e47f3dadc303032ce012b8fa3/wrapt-1.17.3-cp314-cp314t-win_amd64.whl", hash = "sha256:73d496de46cd2cdbdbcce4ae4bcdb4afb6a11234a1df9c085249d55166b95116", size = 41334, upload-time = "2025-08-12T05:53:14.178Z" },
     { url = "https://files.pythonhosted.org/packages/46/78/10ad9781128ed2f99dbc474f43283b13fea8ba58723e98844367531c18e9/wrapt-1.17.3-cp314-cp314t-win_arm64.whl", hash = "sha256:f38e60678850c42461d4202739f9bf1e3a737c7ad283638251e79cc49effb6b6", size = 38471, upload-time = "2025-08-12T05:52:57.784Z" },
     { url = "https://files.pythonhosted.org/packages/1f/f6/a933bd70f98e9cf3e08167fc5cd7aaaca49147e48411c0bd5ae701bb2194/wrapt-1.17.3-py3-none-any.whl", hash = "sha256:7171ae35d2c33d326ac19dd8facb1e82e5fd04ef8c6c0e394d7af55a55051c22", size = 23591, upload-time = "2025-08-12T05:53:20.674Z" },
+]
+
+[[package]]
+name = "wsproto"
+version = "1.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/79/12135bdf8b9c9367b8701c2c19a14c913c120b882d50b014ca0d38083c2c/wsproto-1.3.2.tar.gz", hash = "sha256:b86885dcf294e15204919950f666e06ffc6c7c114ca900b060d6e16293528294", size = 50116, upload-time = "2025-11-20T18:18:01.871Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/f5/10b68b7b1544245097b2a1b8238f66f2fc6dcaeb24ba5d917f52bd2eed4f/wsproto-1.3.2-py3-none-any.whl", hash = "sha256:61eea322cdf56e8cc904bd3ad7573359a242ba65688716b0710a5eb12beab584", size = 24405, upload-time = "2025-11-20T18:18:00.454Z" },
 ]
 
 [[package]]
