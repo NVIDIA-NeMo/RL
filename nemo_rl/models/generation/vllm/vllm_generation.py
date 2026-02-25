@@ -626,6 +626,9 @@ class VllmGeneration(GenerationInterface):
             request_id=request_id,
         )
 
+        # Notify routing policy that prefill is starting for this request
+        self._routing_policy.on_prefill_complete(request_id)
+
         # Run the async method on the selected worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
             method_name=method_name,
@@ -714,8 +717,7 @@ class VllmGeneration(GenerationInterface):
             f"Worker task {routing_decision.worker_idx} should be done but isn't"
         )
 
-        # Notify routing policy of completion
-        self._routing_policy.on_prefill_complete(request_id)
+        # Notify routing policy that generation is complete for this request
         self._routing_policy.on_generation_complete(request_id)
 
     async def generate_text_async(
