@@ -1,22 +1,16 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 512
-  num_generations_per_prompt: 16
   batch_multiplier: 3 # Multiplier for dataloader batch size calculation (batch_multiplier × num_prompts_per_step). Following DAPO dynamic sampling, the actual training batch size equals num_prompts_per_step × num_generations_per_prompt.
-  max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_steps: 10000
   use_leave_one_out_baseline: false
   val_period: 20
   max_val_samples: 960
   val_batch_size: 960
   use_dynamic_sampling: true
-  dynamic_sampling_max_gen_batches: 10
   reward_scaling:
     enabled: true
-    source_min: 0.0
-    source_max: 1.0
     target_min: -1.0
-    target_max: 1.0
   reward_shaping:
     enabled: true
     overlong_buffer_length: 2048
@@ -41,7 +35,6 @@ policy:
     _v2: false
     context_parallel_size: 4
   megatron_cfg:
-    empty_unused_memory_level: 1
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     context_parallel_size: 2
@@ -82,13 +75,16 @@ policy:
       enforce_eager: true
 data:
   max_input_seq_length: 2048
-  prompt_file: null
-  dataset_name: DAPOMath17K
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
 env:
   math:
     num_workers: 16
-    math_verify_impl: "dapo_math_verify"
-
+    math_verify_impl: dapo_math_verify
 logger:
   monitor_gpus: false
   wandb:

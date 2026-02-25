@@ -14,6 +14,7 @@
 """Test script to debug high gradients with sequence packing + context parallelism."""
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -41,9 +42,13 @@ class SequencePackingGradientTestActor:
 
     def test_sequence_packing_gradients(self):
         from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-        from nemo_rl.models.megatron.common import (
+        from nemo_rl.models.megatron.data import (
             _pack_sequences_for_megatron,
-            forward_step_arbitrary_loss,
+            make_processed_microbatch_iterator,
+        )
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
         )
 
         # Initialize process group
@@ -286,10 +291,17 @@ class SequencePackingGradientTestActor:
             packed_grad, baseline_grad_store, atol=1e-5, rtol=1e-5
         )
 
-        # test 3: with forward_step_arbitrary_loss
+        # test 3: with forward_with_post_processing_fn
         # reset grad
         baseline_logits.grad.zero_()
         packed_logits = make_packed_logits(baseline_logits)
+
+        # mock straggler detector with dummy context manager
+        mock_straggler_timer = MagicMock()
+        mock_straggler_timer.return_value = MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        )
 
         # mock model forward
         class MockModel:
@@ -304,35 +316,39 @@ class SequencePackingGradientTestActor:
             ):
                 return self.logits
 
-        class MockMcoreState:
-            def __init__(self):
-                # context that does nothing, but supports both with straggler_timer and with straggler_timer(bdata=True)
-                from contextlib import nullcontext
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "dynamic_batching": {"enabled": False},
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": cp_size,
+            },
+        }
 
-                class DummyStragglerTimer:
-                    def __call__(self, *args, **kwargs):
-                        return nullcontext()
-
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, exc_type, exc_val, exc_tb):
-                        pass
-
-                self.straggler_timer = DummyStragglerTimer()
-
-        output_tensor, wrapped_loss_fn = forward_step_arbitrary_loss(
-            MockMcoreState(),
-            global_valid_seqs,
-            global_valid_toks,
-            data_iterator=iter([packed_data_dict]),
-            model=MockModel(),
+        post_processor = LossPostProcessor(
             loss_fn=base_loss_fn,
-            pack_sequences=True,
-            seq_length_key="input_lengths",
-            pad_individual_seqs_to_multiple_of=pad_to_multiple,
-            pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
+            cfg=cfg,
             cp_normalize=True,
+        )
+
+        output_tensor, wrapped_loss_fn = forward_with_post_processing_fn(
+            data_iterator=make_processed_microbatch_iterator(
+                iter([packed_data_dict]),
+                cfg=cfg,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=pad_to_multiple,
+                pad_packed_seq_to_multiple_of=1,
+                straggler_timer=mock_straggler_timer,
+                pad_full_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
+            ),
+            model=MockModel(),
+            cfg=cfg,
+            post_processing_fn=post_processor,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            straggler_timer=mock_straggler_timer,
         )
         loss, metrics = wrapped_loss_fn(output_tensor)
 

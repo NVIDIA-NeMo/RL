@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -80,6 +81,9 @@ def generate_responses(
     generation_lengths = generation_outputs["generation_lengths"]
     unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
 
+    # Extract truncated info if available (response hit max_tokens without stop token)
+    response_truncated = generation_outputs.get("truncated")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -113,6 +117,10 @@ def generate_responses(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+
+    # Add response_truncated to gen_metrics for use by caller
+    if response_truncated is not None:
+        gen_metrics["_response_truncated"] = response_truncated
 
     return batch, generated_ids, gen_metrics
 
@@ -175,6 +183,9 @@ async def generate_responses_async(
     generation_lengths = generation_outputs["generation_lengths"]
     unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
 
+    # Extract truncated info if available (response hit max_tokens without stop token)
+    response_truncated = generation_outputs.get("truncated")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -218,6 +229,10 @@ async def generate_responses_async(
             )
         except Exception as e:
             print(f"Error occurred while extracting gen_leader_worker_idx: {e}")
+
+    # Add response_truncated to gen_metrics for use by caller
+    if response_truncated is not None:
+        gen_metrics["_response_truncated"] = response_truncated
 
     return batch, generated_ids, gen_metrics
 
@@ -425,6 +440,13 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
+
+        # Record response truncation (response hit max_tokens without stop token)
+        response_truncated = gen_metrics.pop("_response_truncated", None)
+        if response_truncated is not None:
+            for i, global_idx in enumerate(active_indices.tolist()):
+                if response_truncated[i]:
+                    sample_truncated[global_idx] = True
 
         # Record token usage - assistant
         for i, global_idx in enumerate(active_indices.tolist()):
@@ -681,6 +703,11 @@ async def run_sample_multi_turn_rollout(
                 greedy=greedy,
             )
             current_message_log = updated_message_log
+
+            # Check if response was truncated (hit max_tokens without stop token)
+            response_truncated = gen_metrics.pop("_response_truncated", None)
+            if response_truncated is not None and response_truncated[0]:
+                truncated = True
 
             # Update token counts
             gen_token_count = len(generated_tokens)
@@ -952,6 +979,14 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
+    for m in message_logs:
+        m[key] = torch.tensor(m[key])
+
+
 @dataclass
 class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
@@ -967,7 +1002,7 @@ def _calculate_single_metric(
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
         f"{key_name}/histogram": Histogram(values),
     }
 
@@ -1031,6 +1066,15 @@ def run_async_nemo_gym_rollout(
             )
         )
 
+        # Tensorize all token ids
+        for r in results:
+            _tensorize_by_key(r["input_message_log"], "token_ids")
+            _tensorize_by_key(r["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in r["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
+            )
+
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
@@ -1093,8 +1137,10 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_name = nemo_gym_row["agent_ref"]["name"]
+            agent_ref = nemo_gym_row["agent_ref"]
+            agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1141,6 +1187,7 @@ def run_async_nemo_gym_rollout(
 
     final_batch = BatchedDataDict[DatumSpec](
         {
+            "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
@@ -1154,6 +1201,10 @@ def run_async_nemo_gym_rollout(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            "truncated": torch.tensor(
+                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+            ),
         }
     )
 

@@ -18,6 +18,7 @@ from hydra.utils import get_object
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 
 # Environment registry entry schema.
@@ -42,6 +43,12 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     },
     "code_jaccard": {
         "actor_class_fqn": "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment",
+    },
+    "vlm": {
+        "actor_class_fqn": "nemo_rl.environments.vlm_environment.VLMEnvironment",
+    },
+    "nemo_gym": {
+        "actor_class_fqn": "nemo_rl.environments.nemo_gym.NemoGym",
     },
 }
 
@@ -93,18 +100,29 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     return chunks
 
 
-def create_env(env_name: str, env_configs: dict) -> EnvironmentInterface:
+def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
     assert env_name in ENV_REGISTRY, (
         f"Env name {env_name} is not registered in ENV_REGISTRY. Please call register_env() to register the environment."
     )
     actor_class_fqn = ENV_REGISTRY[env_name]["actor_class_fqn"]
     actor_class = get_object(actor_class_fqn)
+    actor_py_exec = get_actor_python_env(actor_class_fqn)
+    extra_env_vars = {}
+    if actor_py_exec.startswith("uv"):
+        actor_py_exec = create_local_venv_on_each_node(
+            actor_py_exec,
+            actor_class_fqn,
+        )
+        extra_env_vars = {
+            "VIRTUAL_ENV": actor_py_exec,
+            "UV_PROJECT_ENVIRONMENT": actor_py_exec,
+        }
     env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
-            "py_executable": get_actor_python_env(actor_class_fqn),
-            "env_vars": dict(os.environ),
+            "py_executable": actor_py_exec,
+            "env_vars": {**dict(os.environ), **extra_env_vars},
         }
-    ).remote(env_configs[env_name])
+    ).remote(env_config)
     return env
 
 

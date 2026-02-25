@@ -1,0 +1,49 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 500
+  val_batch_size: 128
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-0.6b-1n8g-sglang
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: Qwen/Qwen3-0.6B
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    backend: "sglang"
+    max_new_tokens: 512
+    sglang_cfg:
+      model_path: ${policy.model_name}
+      gpus_per_server: 8
+      dtype: ${policy.precision}
+      context_length: 512
+      allow_auto_truncate: true
+      enable_memory_saver: false
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      max_running_requests: null
+      mem_fraction_static: 0.7
+      skip_server_warmup: true
+
+data:
+  max_input_seq_length: 512
+
+logger:
+  log_dir: logs/grpo-qwen3-0.6b-1n8g-sglang
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-0.6b-1n8g-sglang
+
+cluster:
+  gpus_per_node: 8
+

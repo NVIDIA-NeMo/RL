@@ -34,13 +34,13 @@ A **development workflow** is when you actively modify dependencies, submodules,
 When you execute a NeMo RL application, such as:
 
 ```bash
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 This command actually performs several steps behind the scenes:
 
 ```bash
-uv lock + uv sync + source .venv/bin/activate + python examples/run_grpo_math.py
+uv lock + uv sync + source .venv/bin/activate + python examples/run_grpo.py
 ```
 
 Let's break down each component:
@@ -61,7 +61,7 @@ The virtual environment location depends on your runtime environment:
 
 Activates the virtual environment, setting up the Python path and environment variables so your script runs with the correct dependencies.
 
-### 4. `python examples/run_grpo_math.py`
+### 4. `python examples/run_grpo.py`
 
 Executes your driver script within the activated environment.
 
@@ -69,7 +69,7 @@ Executes your driver script within the activated environment.
 
 ```mermaid
 graph TD
-    subgraph Container["uv run examples/run_grpo_math.py"]
+    subgraph Container["uv run examples/run_grpo.py"]
         A[Driver Script Environment<br/>Default dependencies from pyproject.toml]
         A --> B[Starts Ray Worker Groups]
         B --> C[Policy Workers<br/>Separate venv: MCORE]
@@ -78,7 +78,7 @@ graph TD
     end
 ```
 
-The driver script (`examples/run_grpo_math.py`) runs with the [default dependencies specified in `pyproject.toml`](https://github.com/NVIDIA-NeMo/RL/blob/main/pyproject.toml#L21-L54) (without optional extras like `mcore` or `vllm`). However, the application creates multiple worker groups, each potentially requiring different Python environments.
+The driver script (`examples/run_grpo.py`) runs with the [default dependencies specified in `pyproject.toml`](https://github.com/NVIDIA-NeMo/RL/blob/main/pyproject.toml#L21-L54) (without optional extras like `mcore` or `vllm`). However, the application creates multiple worker groups, each potentially requiring different Python environments.
 
 ### Worker Groups and Virtual Environments
 
@@ -104,7 +104,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
 
 ## Container Pre-caching
 
-When a [release container](../docker.md#release-image) is built, it pre-caches:
+When a [release container](../docker.md#building-the-release-image) is built, it pre-caches:
 
 1. **Virtual environments**: All worker virtual environments are created and stored in the container
 2. **UV cache**: Python packages are pre-downloaded into the UV cache directory
@@ -116,7 +116,7 @@ This pre-caching significantly speeds up application startup in production workf
 If your local NeMo RL checkout has the **same** Python dependencies and submodules as the container was built with, the pre-cached environments work seamlessly. You can simply run:
 
 ```bash
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 The workers will use the pre-cached virtual environments, and your application starts quickly.
@@ -131,7 +131,7 @@ Set the `NRL_FORCE_REBUILD_VENVS` environment variable to rebuild all worker vir
 
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 This approach works on both single-node and multi-node setups. On multi-node runs, each node will independently rebuild its virtual environments.
@@ -161,7 +161,7 @@ The rebuilt container will have all virtual environments pre-cached with your up
 
 ### Option 3: Classic Workflow - Mounting Modified Submodules
 
-For situations where you're **only changing submodules** (like nemo-automodel, Penguin, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
+For situations where you're **only changing submodules** (like nemo-automodel, NeMo Gym, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
 
 The container's NeMo RL code is located at `/opt/nemo-rl`. By mounting your local `3rdparty/` directory over the container's `/opt/nemo-rl/3rdparty/`, you can swap out submodules without rebuilding environments or containers.
 
@@ -193,7 +193,7 @@ This mounts:
 > [!IMPORTANT]
 > This workflow is **only suitable when**:
 > - Python package versions in `pyproject.toml` and `uv.lock` haven't changed
-> - You're only modifying code within submodules (nemo-automodel, Penguin, Megatron-LM, Megatron-Bridge)
+> - You're only modifying code within submodules (nemo-automodel, NeMo Gym, Megatron-LM, Megatron-Bridge)
 > - The submodule commits/branches are compatible with the installed package versions
 
 If you've changed Python package versions or dependencies outside of submodules, use Option 1 (`NRL_FORCE_REBUILD_VENVS=true`) or Option 2 (rebuild the container) instead.
@@ -253,14 +253,14 @@ Containers provide convenience symlinks for each worker type:
 ls /usr/local/bin/python-*
 
 # Examples:
-python                         # Default executable for driver scripts (e.g., examples/run_grpo_math.py)
+python                         # Default executable for driver scripts (e.g., examples/run_grpo.py)
 python-MegatronPolicyWorker    # For Megatron policy workers
 python-VllmGenerationWorker    # For vLLM generation workers
 python-MathEnvironment         # For environment workers
 ```
 
 > [!NOTE]
-> The `python` executable (without any suffix) corresponds to the default frozen environment used to launch driver scripts like `examples/run_grpo_math.py`. This environment contains the base dependencies from `pyproject.toml` without optional extras.
+> The `python` executable (without any suffix) corresponds to the default frozen environment used to launch driver scripts like `examples/run_grpo.py`. This environment contains the base dependencies from `pyproject.toml` without optional extras.
 
 To see which packages can be mounted for each executable:
 

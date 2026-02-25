@@ -33,7 +33,7 @@ from sphinx import addnodes
 from sphinx.application import Sphinx
 
 project = "NeMo-RL"
-copyright = "2025, NVIDIA Corporation"
+copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
 release = "latest"
 

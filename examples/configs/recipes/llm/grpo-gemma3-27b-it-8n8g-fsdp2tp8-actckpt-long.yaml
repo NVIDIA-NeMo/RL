@@ -11,7 +11,6 @@ policy:
   tokenizer:
     name: google/gemma-3-27b-it
   train_micro_batch_size: 1
-  logprob_batch_size: 2
   max_total_sequence_length: 16384
   dtensor_cfg:
     activation_checkpointing: true

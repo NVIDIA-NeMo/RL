@@ -171,6 +171,7 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 about/overview
 about/performance-summary
+about/model-support
 about/features
 about/backends
 about/quick-start
@@ -208,6 +209,7 @@ adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -217,6 +219,8 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/dtensor-tp-accuracy.md
+guides/ft-launcher-guide.md
 ```
 
 ```{toctree}
@@ -255,6 +259,7 @@ design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
+design-docs/nemo-gym-integration.md
 ```
 
 ```{toctree}

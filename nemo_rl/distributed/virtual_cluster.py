@@ -71,6 +71,8 @@ class PY_EXECUTABLES:
     MODELOPT_MCORE = (
         f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
     )
+    # Use NeMo-RL direct dependencies and SGLang.
+    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

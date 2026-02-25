@@ -19,25 +19,20 @@ from pathlib import Path
 from typing import Generator
 
 import ray
-import torch
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
 )
-from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+import nemo_rl.models.megatron.setup as megatron_setup
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.policy.utils import (
-    get_megatron_checkpoint_dir,
-    get_runtime_env_for_policy_worker,
-)
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
-    destroy_parallel_state,
 )
 from nemo_rl.models.policy.workers.quantization.utils import (
     get_tokenizer,
@@ -52,89 +47,18 @@ from nemo_rl.models.policy.workers.quantization.utils import (
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
-        # Turn on bridge quantization mapping
         os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
-        self._patch_setup_megatron_model()
-        with self.load_checkpoint_with_modelopt_state():
+        self._patch_validate_model_paths()
+        self._patch_setup_model_and_optimizer()
+        with self._patched_model_loading():
             super().__init__(config, *args, **kwargs)
 
-        # add quantizer states to reference state dict, so we don't need to modify use_reference_model logic
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():
                 if "_quantizer." in name:
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
-
-    def _import_model_from_hf(self, hf_model_name: str):
-        """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
-
-        This will quantize the model before saving. In cases like distillation, if the teacher model is same as the student
-        model, we need to save an extra quantized checkpoint.
-
-        Args:
-            hf_model_name: Hugging Face model ID or local path (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
-
-        Returns:
-            The path to the Megatron checkpoint.
-        """
-        # Check if the checkpoint already exists
-        hf_model_subdir = hf_model_name
-        self.rank = get_rank_safe()
-        if os.path.exists(hf_model_name):
-            hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
-
-        pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
-        iter0_path = os.path.join(pretrained_path, "iter_0000000")
-        pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-            iter0_path
-        )
-        # In cases like distillation, if the teacher model is same as the student model, we need to save an extra quantized checkpoint
-        if pt_checkpoint_exists and not has_modelopt_state(iter0_path):
-            pretrained_path += "_quantized"
-            iter0_path = os.path.join(pretrained_path, "iter_0000000")
-            pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-                iter0_path
-            )
-
-        pre_quantized_model_path = os.environ.get(
-            "NRL_PRE_QUANTIZED_MEGATRON_MODEL_PATH"
-        )
-        if pre_quantized_model_path is not None and not pt_checkpoint_exists:
-            # create a symlink to the pre-quantized model
-            print(f"Using pre-quantized model at: {pre_quantized_model_path}")
-            absolute_pre_quantized_model_path = Path(pre_quantized_model_path).resolve()
-            os.makedirs(pretrained_path, exist_ok=True)
-            os.symlink(
-                absolute_pre_quantized_model_path.as_posix(),
-                iter0_path,
-                target_is_directory=True,
-            )
-            assert os.path.exists(iter0_path)
-            return pretrained_path
-
-        # Ensure clean slate before import
-        destroy_parallel_state()
-
-        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-        torch.distributed.init_process_group("nccl")
-        if pt_checkpoint_exists:
-            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
-        else:
-            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
-            import_model_from_hf_name(
-                hf_model_name,
-                pretrained_path,
-                self.cfg["megatron_cfg"],
-                model_post_wrap_hook=self._quantize,
-                transformer_layer_spec=quantization_layer_spec,
-                **hf_config_overrides,
-            )
-
-            if parallel_state.model_parallel_is_initialized():
-                print("Reinitializing model parallel after loading model state.")
-                parallel_state.destroy_model_parallel()
-        return pretrained_path
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -159,34 +83,119 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
         return model
 
-    def _patch_setup_megatron_model(self):
-        """Patch the setup_megatron_model function to restore the modelopt state."""
-        if hasattr(megatron_policy_worker, "_original_setup_megatron_model"):
+    def _patch_validate_model_paths(self):
+        """Patch validate_model_paths to handle quantized checkpoint paths.
+
+        In cases like distillation where the teacher model is the same as the student model,
+        we need to save an extra quantized checkpoint. This patch checks for modelopt state
+        and redirects to a _quantized suffix path. It also handles pre-quantized model symlinks.
+
+        We patch in megatron_policy_worker's namespace because it uses
+        `from ... import validate_model_paths`, creating a local binding that won't see
+        changes to setup module's namespace.
+        """
+        if hasattr(megatron_policy_worker, "_original_validate_model_paths"):
             return
-        megatron_policy_worker._original_setup_megatron_model = (
-            megatron_policy_worker.setup_megatron_model
+        megatron_policy_worker._original_validate_model_paths = (
+            megatron_policy_worker.validate_model_paths
         )
 
-        def _setup_megatron_model(policy_cfg, cfg, *args, **kwargs):
-            print("Calling patched setup_megatron_model")
-            model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
-            print("model_path:", model_path)
+        def _validate_model_paths(config):
+            hf_model_name, pretrained_path, pt_checkpoint_exists = (
+                megatron_policy_worker._original_validate_model_paths(config)
+            )
+
+            iter0_path = os.path.join(pretrained_path, "iter_0000000")
+            if pt_checkpoint_exists and not has_modelopt_state(iter0_path):
+                pretrained_path += "_quantized"
+                iter0_path = os.path.join(pretrained_path, "iter_0000000")
+                pt_checkpoint_exists = os.path.exists(
+                    pretrained_path
+                ) and os.path.exists(iter0_path)
+
+            pre_quantized_model_path = os.environ.get(
+                "NRL_PRE_QUANTIZED_MEGATRON_MODEL_PATH"
+            )
+            if pre_quantized_model_path is not None and not pt_checkpoint_exists:
+                print(f"Using pre-quantized model at: {pre_quantized_model_path}")
+                absolute_path = Path(pre_quantized_model_path).resolve()
+                os.makedirs(pretrained_path, exist_ok=True)
+                os.symlink(
+                    absolute_path.as_posix(),
+                    iter0_path,
+                    target_is_directory=True,
+                )
+                assert os.path.exists(iter0_path)
+                pt_checkpoint_exists = True
+
+            return hf_model_name, pretrained_path, pt_checkpoint_exists
+
+        megatron_policy_worker.validate_model_paths = _validate_model_paths
+
+    def _patch_setup_model_and_optimizer(self):
+        """Patch setup_model_and_optimizer to restore modelopt state when loading quantized checkpoints.
+
+        Patched in megatron_policy_worker's namespace (same reason as _patch_validate_model_paths).
+        """
+        if hasattr(megatron_policy_worker, "_original_setup_model_and_optimizer"):
+            return
+        megatron_policy_worker._original_setup_model_and_optimizer = (
+            megatron_policy_worker.setup_model_and_optimizer
+        )
+
+        def _setup_model_and_optimizer(policy_cfg, megatron_cfg, *args, **kwargs):
+            model_path = (
+                megatron_cfg.checkpoint.pretrained_checkpoint
+                or megatron_cfg.checkpoint.load
+            )
             if os.path.exists(os.path.join(model_path, "iter_0000000")):
                 model_path = os.path.join(model_path, "iter_0000000")
             if has_modelopt_state(model_path):
                 print("setting restore_modelopt_state to True")
-                cfg.model.restore_modelopt_state = True
-                cfg.model.transformer_layer_spec = quantization_layer_spec
+                megatron_cfg.model.restore_modelopt_state = True
+                megatron_cfg.model.transformer_layer_spec = quantization_layer_spec
 
-            return megatron_policy_worker._original_setup_megatron_model(
-                policy_cfg, cfg, *args, **kwargs
+            return megatron_policy_worker._original_setup_model_and_optimizer(
+                policy_cfg, megatron_cfg, *args, **kwargs
             )
 
-        megatron_policy_worker.setup_megatron_model = _setup_megatron_model
+        megatron_policy_worker.setup_model_and_optimizer = _setup_model_and_optimizer
 
     @contextmanager
-    def load_checkpoint_with_modelopt_state(self):
-        """Context manager that temporarily loads the checkpoint with modelopt state."""
+    def _patched_model_loading(self):
+        """Context manager that patches handle_model_import and load_checkpoint for quantization.
+
+        Patches handle_model_import to pass quantization hooks during HF->Megatron conversion,
+        and patches load_checkpoint to restore modelopt state before loading checkpoint weights.
+
+        handle_model_import is patched in megatron_policy_worker's namespace (called from
+        __init__ via `from ... import` binding). load_checkpoint is patched in megatron_setup's
+        namespace (called from within setup_model_and_optimizer in setup.py).
+        """
+        original_handle_model_import = megatron_policy_worker.handle_model_import
+        original_load_checkpoint = megatron_setup.load_checkpoint
+
+        def _handle_model_import(
+            config, hf_model_name, pretrained_path, pt_checkpoint_exists
+        ):
+            if pt_checkpoint_exists:
+                print(
+                    f"Checkpoint already exists at {pretrained_path}. Skipping import."
+                )
+            else:
+                hf_config_overrides = config.get("hf_config_overrides", {}) or {}
+                import_model_from_hf_name(
+                    hf_model_name,
+                    pretrained_path,
+                    config["megatron_cfg"],
+                    model_post_wrap_hook=self._quantize,
+                    transformer_layer_spec=quantization_layer_spec,
+                    **hf_config_overrides,
+                )
+
+                if parallel_state.model_parallel_is_initialized():
+                    print("Reinitializing model parallel after loading model state.")
+                    parallel_state.destroy_model_parallel()
 
         def _load_checkpoint(state, model, *args, **kwargs):
             cfg = state.cfg
@@ -196,21 +205,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if has_modelopt_state(model_path):
                 unwrapped_model = unwrap_model(model)
                 load_modelopt_state(unwrapped_model, model_path)
-            return megatron_policy_worker._original_load_checkpoint(
-                state, model, *args, **kwargs
-            )
+            return original_load_checkpoint(state, model, *args, **kwargs)
 
         try:
-            megatron_policy_worker._original_load_checkpoint = (
-                megatron_policy_worker.load_checkpoint
-            )
-            megatron_policy_worker.load_checkpoint = _load_checkpoint
+            megatron_policy_worker.handle_model_import = _handle_model_import
+            megatron_setup.load_checkpoint = _load_checkpoint
             yield
         finally:
-            megatron_policy_worker.load_checkpoint = (
-                megatron_policy_worker._original_load_checkpoint
-            )
-            del megatron_policy_worker._original_load_checkpoint
+            megatron_policy_worker.handle_model_import = original_handle_model_import
+            megatron_setup.load_checkpoint = original_load_checkpoint
 
     @contextmanager
     def hide_tensor_quantizers(self):

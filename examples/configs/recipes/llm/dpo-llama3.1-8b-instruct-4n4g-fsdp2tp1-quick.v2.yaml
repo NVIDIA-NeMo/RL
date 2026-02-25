@@ -1,0 +1,10 @@
+defaults: ./dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+policy:
+  dtensor_cfg:
+    tensor_parallel_size: 1
+logger:
+  wandb:
+    name: dpo-llama3.1-8b-instruct-4n4g-fsdp2tp1-quick
+cluster:
+  gpus_per_node: 4
+

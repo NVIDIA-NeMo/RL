@@ -1004,6 +1004,7 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["use_importance_sampling_correction"] = True
     cfg["truncated_importance_sampling_ratio"] = 0.8
+    cfg["truncated_importance_sampling_type"] = "tis"
     if sequence_level_importance_ratios:
         cfg["sequence_level_importance_ratios"] = True
         cfg["token_level_loss"] = False
@@ -1119,6 +1120,106 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
         global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
     )
     torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
+
+
+def test_clipped_pg_loss_icepop_importance_sampling():
+    """Tests ClippedPGLossFn with ICE-POP truncated importance sampling.
+
+    Uses reference bounds min=0.5, max=5.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["use_importance_sampling_correction"] = True
+    cfg["truncated_importance_sampling_ratio"] = 5.0  # max (ref)
+    cfg["truncated_importance_sampling_type"] = "icepop"
+    cfg["truncated_importance_sampling_ratio_min"] = 0.5  # min (ref)
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # On-policy (curr = prev) → ratios = 1, clip_loss = -adv
+    prev_lp = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    # Token 1 has very stale gen logprob → IS weight > 5 → filtered by ICE-POP
+    gen_lp = torch.tensor([[-0.5, -3.5, -0.8]], device=device)
+    adv = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+
+    data["advantages"][0, 1:] = adv
+    data["prev_logprobs"][0, 1:] = prev_lp
+    data["generation_logprobs"][0, 1:] = gen_lp
+
+    # IS weights = exp(prev-gen) = exp([-0.5, 2.5, -0.2]) ≈ [0.6065, 12.182, 0.8187]
+    # ICE-POP [0.5, 5]: keep=[T, F, T] (12.182 > 5 → zeroed)
+    iw = torch.exp(prev_lp - gen_lp)
+    filtered_iw = torch.where((iw >= 0.5) & (iw <= 5.0), iw, torch.zeros_like(iw))
+    expected_loss = torch.mean(filtered_iw * (-adv))
+
+    dummy_logits = _create_exact_logits(
+        prev_lp, data["input_ids"], batch_size, seq_len, vocab_size, device
+    )
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
+
+
+def test_clipped_pg_loss_seq_mask_tis():
+    """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
+
+    Uses reference bounds min=0.999, max=1.002.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["use_importance_sampling_correction"] = True
+    cfg["truncated_importance_sampling_ratio"] = 1.002  # max (ref)
+    cfg["truncated_importance_sampling_type"] = "seq-mask-tis"
+    cfg["truncated_importance_sampling_ratio_min"] = 0.999  # min (ref)
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # On-policy (curr = prev), gen very close to prev
+    # geo_mean = exp(mean([0.0005]*3)) = exp(0.0005) ≈ 1.0005 → in [0.999, 1.002] → kept
+    prev_lp = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    gen_lp = torch.tensor([[-1.0005, -1.0005, -1.0005]], device=device)
+    adv = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+
+    data["advantages"][0, 1:] = adv
+    data["prev_logprobs"][0, 1:] = prev_lp
+    data["generation_logprobs"][0, 1:] = gen_lp
+
+    iw = torch.exp(prev_lp - gen_lp)
+    expected_loss = torch.mean(iw * (-adv))
+
+    dummy_logits = _create_exact_logits(
+        prev_lp, data["input_ids"], batch_size, seq_len, vocab_size, device
+    )
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
+
+    # nan_to_num: inject -inf → loss must stay finite
+    data["generation_logprobs"][0, 2] = float("-inf")
+    actual_loss2, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+    assert not torch.isnan(actual_loss2), "Loss is NaN — nan_to_num fix not working"
+    assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
 
 
 def test_masked_mean_all_zeros():
