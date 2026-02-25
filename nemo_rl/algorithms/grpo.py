@@ -1183,6 +1183,9 @@ def refit_policy_generation(
             )
             raise RuntimeError(error_message)
 
+        if isinstance(policy_generation, VllmGeneration):
+            policy_generation.notify_weights_updated()
+
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
