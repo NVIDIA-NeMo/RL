@@ -18,7 +18,7 @@ checkpointing:
   metric_name: null # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: null
-  save_period: 200
+  save_period: 120
   checkpoint_must_save_by: null
 
 policy:

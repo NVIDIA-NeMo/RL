@@ -786,7 +786,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ## so we handle the scaling in nemo-rl.
         ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
         ## on the TP-sharded parameters.
-        model_cfg.calculate_per_token_loss = True
+        model_cfg.calculate_per_token_loss = False
         model_cfg.perform_initialization = True
 
         # assert (
