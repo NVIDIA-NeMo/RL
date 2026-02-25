@@ -34,6 +34,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.megatron_policy_worker import MegatronPolicyWorker
 from tests.unit.test_utils import SimpleLoss
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
@@ -2590,3 +2591,33 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def test_megatron_policy_worker_raises_if_not_prepared(tiny_llama_model_path):
+    """Test that MegatronPolicyWorker methods raise if prepare_for_training or prepare_for_lp_inference is not called."""
+    config = PolicyConfig(model_name=tiny_llama_model_path)
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    worker = MegatronPolicyWorker(
+        config=config,
+        tokenizer=tokenizer,
+        worker_sharding_annotations=None,
+        pre_init_communication_queue=None,
+    )
+
+    dummy_data = BatchedDataDict({"input_ids": None, "input_lengths": None})
+
+    # train should raise
+    with pytest.raises(RuntimeError) as exc:
+        worker.train(dummy_data, loss_fn=None)
+    assert "prepared" in str(exc.value).lower()
+
+    # get_logprobs should raise
+    with pytest.raises(RuntimeError) as exc:
+        worker.get_logprobs(data=dummy_data)
+    assert "prepared" in str(exc.value).lower()
+
+    # generate should raise
+    with pytest.raises(RuntimeError) as exc:
+        worker.generate(data=dummy_data)
+    assert "prepared" in str(exc.value).lower()

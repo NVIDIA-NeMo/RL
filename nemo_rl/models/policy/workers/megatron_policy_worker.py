@@ -127,6 +127,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Initialize the MegatronPolicyWorker."""
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
+        self.is_generation_colocated = None
+        self.is_prepared = False
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        if not self.is_generation_colocated:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
         self.cfg = config
 
@@ -249,6 +258,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
+        self.model.zero_grad_buffer()
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -461,6 +476,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -677,6 +697,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 - generation_lengths: Lengths of each response
         """
         # 512 bATCH SIZE (200 tokens)
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model.config.flash_decode = False
@@ -1024,6 +1049,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     def prepare_for_lp_inference(self):
+        self.is_prepared = True
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -1047,6 +1073,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
+        self.is_prepared = True
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
@@ -1103,6 +1130,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
+        try:
+            self.is_prepared = False
+        except Exception:
+            pass
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
@@ -1153,14 +1184,26 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             # Ordinary offload case
             if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
+                for name, param in model.state_dict().items():
+                    new_state_dict = {}
+                    for name, item in model.state_dict().items():
+                        if isinstance(item, torch.Tensor):
+                            item = item.detach().to(
+                                device=device, non_blocking=True, copy=True
+                            )
+                        new_state_dict[name] = item
+                    model.load_state_dict(new_state_dict)
+        # Update prepared flag: only reflect parameter residency when we moved params
+        try:
+            if move_params:
+                any_on_cuda = any(
+                    (hasattr(p, "is_cuda") and p.is_cuda)
+                    for p in model.parameters()
+                    if isinstance(p, torch.Tensor)
+                )
+                self.is_prepared = bool(any_on_cuda)
+        except Exception:
+            pass
         return model
 
     def move_optimizer(self, device: str):
