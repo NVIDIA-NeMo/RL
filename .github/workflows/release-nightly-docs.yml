@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,11 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Secrets detector
+
+name: Release Nightly Docs
 
 on:
-  pull_request:
+  schedule:
+    - cron: "0 10 * * *"
 
 jobs:
-  secrets-detector:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_secrets-detector.yml@v0.74.0
+  call-release-docs:
+    uses: ./.github/workflows/release-docs.yml
+    with:
+      dry-run: false
+      publish-as-latest: false
+      docs-version-override: "nightly"
+      update-version-picker: false
+    secrets: inherit
