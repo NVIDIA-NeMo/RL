@@ -96,6 +96,14 @@ class AbstractPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
+    def finalize_pending_checkpoint(self):
+        """No-op for backends that don't support async checkpointing."""
+        pass
+
+    def shutdown_async_checkpoint_worker(self):
+        """No-op for backends that don't support async checkpointing."""
+        pass
+
     def shutdown(self) -> bool:
         """Shutdown the policy."""
         try:

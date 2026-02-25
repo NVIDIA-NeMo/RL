@@ -201,6 +201,13 @@ def validate_and_set_config(
     if "generation" in config and config["generation"] is not None:
         is_generation_colocated = config["generation"]["colocated"]["enabled"]
 
+    if config["megatron_cfg"].get("async_save", False) and is_generation_colocated:
+        raise ValueError(
+            "policy.megatron_cfg.async_save=true is not supported in colocated mode "
+            "(IPC handles pin GPU memory needed for generation). Use non-colocated mode "
+            "or set policy.megatron_cfg.async_save=false."
+        )
+
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
     if not is_generation_colocated:
@@ -329,7 +336,10 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Create checkpoint configs
-    checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+    async_save = config["megatron_cfg"].get("async_save", False)
+    checkpoint_config = _create_checkpoint_config(
+        pretrained_path, weights_path, async_save=async_save
+    )
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
@@ -498,15 +508,24 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    async_save: bool = False,
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
+    # Bridge CheckpointConfig.finalize() asserts save is not None when async_save=True,
+    # and initialize_async_checkpoint_worker() also requires it. On a fresh start (not
+    # resuming), weights_path is None. Use pretrained_path as a placeholder -- the real
+    # save path is set per-save in MegatronPolicyWorker.save_checkpoint().
+    save_path = weights_path
+    if save_path is None and async_save:
+        save_path = pretrained_path
     return CheckpointConfig(
         save_interval=100,
-        save=weights_path,
+        save=save_path,
         load=weights_path,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
+        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
