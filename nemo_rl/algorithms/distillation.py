@@ -1021,7 +1021,7 @@ def validate(
                 ]
                 all_message_logs.extend(to_env)
 
-                cur_samples += len(val_batch)
+                cur_samples += len(val_batch["message_log"])
                 if cur_samples >= max_samples:
                     break
 
