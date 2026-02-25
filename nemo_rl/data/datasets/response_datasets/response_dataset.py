@@ -53,12 +53,8 @@ class ResponseDataset(RawDataset):
         self.input_key = input_key
         self.output_key = output_key
 
-        # get default task name from data path
-        default_task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
-        if default_task_name[0] == "-":
-            default_task_name = default_task_name[1:]
-
         # initialize common attributes (task name, prompt, system prompt, processor)
+        default_task_name = self.extract_task_name_from_path(data_path)
         self.common_init(default_task_name=default_task_name, **kwargs)
 
         # load from local or huggingface

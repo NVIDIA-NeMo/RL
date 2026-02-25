@@ -64,3 +64,9 @@ class RawDataset:
             )
             self.dataset = split_dataset["train"]
             self.val_dataset = split_dataset["test"]
+
+    def extract_task_name_from_path(self, data_path: str) -> str:
+        task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if task_name[0] == "-":
+            task_name = task_name[1:]
+        return task_name
