@@ -22,6 +22,7 @@ from typing import (
     Optional,
     Union,
 )
+from uuid import uuid4
 
 import numpy as np
 import ray
@@ -37,6 +38,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.routing_policy import create_routing_policy
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
@@ -222,8 +224,17 @@ class VllmGeneration(GenerationInterface):
             f"Data parallel size mismatch. Expected {self.dp_size}, got {self.worker_group.dp_size}"
         )
 
-        # Used to track the round-robin selection of worker groups for generate_async
-        self.current_generate_dp_shard_idx = 0
+        # Pluggable routing policy for selecting DP shard and worker
+        routing_policy_cfg = self.cfg.get("routing_policy")
+        if routing_policy_cfg and routing_policy_cfg.get("type", "round_robin") != "round_robin":
+            assert self.cfg["vllm_cfg"]["async_engine"], (
+                f"Custom routing policy (type={routing_policy_cfg['type']!r}) requires async_engine=True. "
+                "The sync generation path fans out to all DP shards and does not use the routing policy."
+            )
+        self._routing_policy = create_routing_policy(
+            routing_policy_cfg,
+            dp_leader_worker_indices=self.worker_group.dp_leader_worker_indices,
+        )
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
@@ -607,22 +618,21 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
+        # Select DP shard and worker via routing policy
+        request_id = str(uuid4())
+
+        routing_decision = self._routing_policy.select_worker(
+            data=data,
+            request_id=request_id,
         )
 
-        # Run the async method on the selected leader worker
+        # Run the async method on the selected worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
             method_name=method_name,
-            worker_idx=leader_worker_idx,
+            worker_idx=routing_decision.worker_idx,
             data=data,
             greedy=greedy,
         )
-
-        # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
 
         # Create a queue to collect sample results from the worker as they complete
         result_queue = asyncio.Queue()
@@ -639,7 +649,7 @@ class VllmGeneration(GenerationInterface):
                     # Tag the result with worker index for downstream attribution
                     original_idx, result_batch = sample_result
                     # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
-                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                    result_batch["gen_leader_worker_idx"] = [routing_decision.worker_idx]
                     sample_result = (original_idx, result_batch)
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
@@ -655,7 +665,7 @@ class VllmGeneration(GenerationInterface):
 
         # Start the task to consume the worker generator
         worker_task = asyncio.create_task(
-            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
+            consume_worker_generator(routing_decision.worker_idx, worker_gen_proxy)
         )
 
         # Yield sample results as they become available from the worker
@@ -701,8 +711,12 @@ class VllmGeneration(GenerationInterface):
 
         # Verify the task is actually done
         assert worker_task.done(), (
-            f"Worker task {leader_worker_idx} should be done but isn't"
+            f"Worker task {routing_decision.worker_idx} should be done but isn't"
         )
+
+        # Notify routing policy of completion
+        self._routing_policy.on_prefill_complete(request_id)
+        self._routing_policy.on_generation_complete(request_id)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -870,6 +884,14 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def notify_weights_updated(self) -> None:
+        """Notify the routing policy that model weights have been updated.
+
+        Call this after all weight-update futures (from update_weights_via_ipc_zmq or
+        update_weights_from_collective) have been resolved with ray.get().
+        """
+        self._routing_policy.on_weights_updated()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

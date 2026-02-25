@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.routing_policy import RoutingPolicyConfig
 
 
 class VllmSpecificArgs(TypedDict):
@@ -44,3 +45,4 @@ class VllmSpecificArgs(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    routing_policy: NotRequired[RoutingPolicyConfig]
