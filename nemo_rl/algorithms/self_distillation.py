@@ -182,10 +182,14 @@ def _build_cot_gt_texts(
 ) -> list[str]:
     """Build COT + ground-truth strings from batch fields."""
     cot_texts = _normalize_text_field(batch.get("deepseek_reasoning"), batch_size)
-    gt_texts = _normalize_text_field(
-        batch.get("ground_truth_solution", batch.get("deepseek_solution")),
-        batch_size,
-    )
+    # Element-wise fallback: "ground_truth_solution" is present as a key in the
+    # batch for ALL rows (it's in passthrough_keys), but its value is None for
+    # rows where the HF dataset doesn't have that field.  dict.get() only uses
+    # its default when the key is ABSENT, so the fallback to deepseek_solution
+    # never fires.  Do the fallback element-wise instead.
+    _gt_primary = _normalize_text_field(batch.get("ground_truth_solution"), batch_size)
+    _gt_fallback = _normalize_text_field(batch.get("deepseek_solution"), batch_size)
+    gt_texts = [a or b for a, b in zip(_gt_primary, _gt_fallback)]
 
     print("=====================")
     print("CHAIN OF THOUGHT TEXTS")
@@ -201,14 +205,23 @@ def _build_cot_gt_texts(
     avg_gt_length = sum(gt_lengths) / len(gt_lengths) if gt_lengths else 0
     print(f"Average GT length (in tokens): {avg_gt_length:.2f}")
 
+    # ideally these should be the same? 
+    print(f"number of cot texts: {len(cot_texts)}")
+    print(f"number of gt texts: {len(gt_texts)}")
 
-    _PREFIX = "\nHere is a reference reasoning + solution:\n"
-    _TRANSITION = "\nAfter understanding the reference reasoning + solution, please try to solve this problem using your own approach below:\n"
+
+
+    _PREFIX = "\nHere is a reference solution to this problem:\n"
+    _TRANSITION = "\nAfter understanding the reference reasoning + solution, please try to solve this problem using your own approach below:\n Please reason step by step, and put your final answer within \\boxed{{}}"
 
     combined: list[str] = []
     for cot, gt in zip(cot_texts, gt_texts):
         cot = cot.strip() if cot else ""
         gt = gt.strip() if gt else ""
+
+
+        print("---------------------")
+        print(gt)
         if cot and gt:
             combined.append(f"{_PREFIX}\n{gt}{_TRANSITION}")
         else:
@@ -217,6 +230,17 @@ def _build_cot_gt_texts(
     return combined
 
 
+
+''' 
+In the original OPSD implementation, the data_collator takes care of constructing the proper format for the teacher user message 
+
+check https://github.com/siyan-zhao/OPSD/blob/main/data_collator.py
+
+The problem with doing that here is that the message_logs have already been flattened with the chat_template applied 
+
+So we work at token level and insert the COT + GT text right before the first <|im_end|> token in the user portion of the message log, which is the boundary between the user message content and the chat template suffix + assistant response.
+
+'''
 def _build_teacher_inputs_with_cot_in_user_turn(
     message_logs: list,
     cot_texts: list[str],
