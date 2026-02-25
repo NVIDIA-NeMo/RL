@@ -1391,6 +1391,13 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    if master_config["data"]["use_multiple_dataloader"]:
+        warnings.warn(
+            "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
+            "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used. "
+            "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
+        )
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")

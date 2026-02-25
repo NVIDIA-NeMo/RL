@@ -19,6 +19,9 @@ class MultipleDataloaderWrapper:
     """Wrapper for multiple dataloaders.
 
     This wrapper is used to sample data from multiple dataloaders using a custom dataloader function.
+
+    When a single dataloader is exhausted, the data iterator must be reset in the custom dataloader function (as demonstrated in `examples/custom_dataloader/custom_dataloader.py`).
+    This design ensures that the MultipleDataloaderWrapper operates as an infinite iterator, where __next__() will not raise StopIteration and __len__() is not supported.
     """
 
     def __init__(

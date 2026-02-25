@@ -29,6 +29,9 @@ def example_custom_dataloader(
     This function is used to sample data from multiple dataloaders using a custom dataloader function.
     In this example, we simply sample data from each dataloader.
 
+    When a single dataloader is exhausted, the data iterator must be reset (as demonstrated here).
+    This design ensures that the MultipleDataloaderWrapper operates as an infinite iterator.
+
     Args:
         data_iterators: A dictionary of data iterators.
         dataloaders: A dictionary of dataloaders. It is used to reset the data iterator when it is exhausted.
@@ -66,6 +69,9 @@ def example_custom_dataloader_with_chosen_task(
 
     This function will need to call `wrapped_dataloader.set_records({"chosen_task": ..., "expected_num_prompts": ...})` to set the records in `nemo_rl/algorithms/grpo.py`.
     A usage example is shown in the test case `test_multiple_dataloader_with_records` in `tests/unit/data/test_multiple_dataloader.py`.
+
+    When a single dataloader is exhausted, the data iterator must be reset (as demonstrated here).
+    This design ensures that the MultipleDataloaderWrapper operates as an infinite iterator.
 
     Args:
         data_iterators: A dictionary of data iterators.

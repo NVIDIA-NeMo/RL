@@ -203,6 +203,9 @@ Batch 3: [a, b, 5, 6]
 
 The file `examples/custom_dataloader/custom_dataloader.py` provides a reference implementation that samples `data.num_prompts_per_dataloader` entries from each dataloader.
 
+When a single dataloader is exhausted, the data iterator must be reset in the custom dataloader function (as demonstrated in `examples/custom_dataloader/custom_dataloader.py`).
+This design ensures that the [MultipleDataloaderWrapper](../../nemo_rl/data/dataloader.py) operates as an infinite iterator, where `__next__()` will not raise StopIteration and `__len__()` is not supported.
+
 Additionally, custom dataloaders can access recorded metrics from the training loop. Use `wrapped_dataloader.set_records()` in `nemo_rl/algorithms/grpo.py` to store relevant information, which can then be retrieved in your custom dataloader implementation:
 
 ```python
