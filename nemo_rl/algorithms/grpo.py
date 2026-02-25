@@ -2317,6 +2317,9 @@ def validate(
                 break
 
         # Calculate validation metrics
+        assert "total" not in accuracy, (
+            "total is a reserved task_name since it is used in the metrics as the aggregate label"
+        )
         rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
         accuracy["total"] = rewards_t.mean().item()
 
