@@ -39,8 +39,7 @@ policy: &POLICY_BASE
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${..model_name}
-    chat_template_kwargs: 
-      enable_thinking: true
+    chat_template_kwargs: null # for now dont use thinking template because the <think> tags messes with teacher prompt format 
   train_global_batch_size: 64
   train_micro_batch_size: 1
   generation_batch_size: 64

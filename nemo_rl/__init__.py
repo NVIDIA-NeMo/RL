@@ -36,6 +36,12 @@ megatron_path = (
 if megatron_path.exists() and str(megatron_path) not in sys.path:
     sys.path.append(str(megatron_path))
 
+automodel_path = (
+    Path(__file__).parent.parent / "3rdparty" / "Automodel-workspace" / "Automodel"
+)
+if automodel_path.exists() and str(automodel_path) not in sys.path:
+    sys.path.append(str(automodel_path))
+
 from nemo_rl.package_info import (
     __contact_emails__,
     __contact_names__,
