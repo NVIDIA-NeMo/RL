@@ -50,8 +50,7 @@ time uv run --no-sync bash ./tests/functional/sft_megatron.sh
 time uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
-# Re-enable once DTensor v2 converter is fixed.
-# time uv run --no-sync bash ./tests/functional/test_converters.sh
+time uv run --no-sync bash ./tests/functional/test_converters.sh
 time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
