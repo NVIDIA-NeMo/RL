@@ -332,7 +332,7 @@ def validate(
                     task_num_valid_tokens += num_valid_tokens
 
                 cur_batch_idx += 1
-                if val_batches > 0 and cur_batch_idx >= val_batches - 1:
+                if val_batches > 0 and cur_batch_idx >= val_batches:
                     break
 
             # Calculate task loss
@@ -341,7 +341,7 @@ def validate(
             total_val_loss += task_val_loss
             total_num_valid_tokens += task_num_valid_tokens
 
-            if val_batches > 0 and cur_batch_idx >= val_batches - 1:
+            if val_batches > 0 and cur_batch_idx >= val_batches:
                 break
 
         # Calculate validation metrics
