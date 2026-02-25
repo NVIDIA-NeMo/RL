@@ -1,0 +1,10 @@
+defaults: ./grpo-deepseek-v3-32n8g.yaml
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n8g
+  wandb:
+    name: grpo-deepseek-v3-64n8g
+cluster:
+  num_nodes: 64
