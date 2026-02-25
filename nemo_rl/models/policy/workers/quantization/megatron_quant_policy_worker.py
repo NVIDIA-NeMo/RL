@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
+import modelopt.torch.quantization as mtq
 import ray
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
@@ -59,6 +60,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
+        if self.rank == 0:
+            print(f"Quantized model: {self.model}")
+            mtq.print_quant_summary(self.model)
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -78,7 +82,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             is_megatron=True,
             batch_size=quant_batch_size,
             data=quant_calib_data,
-            force_all_expert_routing=True,
             max_sample_length=quant_sequence_length,
         )
         return model
@@ -89,10 +92,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         In cases like distillation where the teacher model is the same as the student model,
         we need to save an extra quantized checkpoint. This patch checks for modelopt state
         and redirects to a _quantized suffix path. It also handles pre-quantized model symlinks.
-
-        We patch in megatron_policy_worker's namespace because it uses
-        `from ... import validate_model_paths`, creating a local binding that won't see
-        changes to setup module's namespace.
         """
         if hasattr(megatron_policy_worker, "_original_validate_model_paths"):
             return
@@ -133,10 +132,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         megatron_policy_worker.validate_model_paths = _validate_model_paths
 
     def _patch_setup_model_and_optimizer(self):
-        """Patch setup_model_and_optimizer to restore modelopt state when loading quantized checkpoints.
-
-        Patched in megatron_policy_worker's namespace (same reason as _patch_validate_model_paths).
-        """
+        """Patch setup_model_and_optimizer to restore modelopt state when loading quantized checkpoints."""
         if hasattr(megatron_policy_worker, "_original_setup_model_and_optimizer"):
             return
         megatron_policy_worker._original_setup_model_and_optimizer = (
@@ -167,10 +163,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         Patches handle_model_import to pass quantization hooks during HF->Megatron conversion,
         and patches load_checkpoint to restore modelopt state before loading checkpoint weights.
-
-        handle_model_import is patched in megatron_policy_worker's namespace (called from
-        __init__ via `from ... import` binding). load_checkpoint is patched in megatron_setup's
-        namespace (called from within setup_model_and_optimizer in setup.py).
         """
         original_handle_model_import = megatron_policy_worker.handle_model_import
         original_load_checkpoint = megatron_setup.load_checkpoint
