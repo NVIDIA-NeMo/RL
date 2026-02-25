@@ -348,6 +348,9 @@ def validate(
 
         # Calculate validation metrics
         if total_num_valid_tokens > 0:
+            assert "total" not in val_loss, (
+                "total is a reserved task_name since it is used in the metrics as the aggregate label"
+            )
             val_loss["total"] = total_val_loss / total_num_valid_tokens
             val_metrics = {
                 "val_loss": val_loss["total"],

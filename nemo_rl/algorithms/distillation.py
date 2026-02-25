@@ -1008,7 +1008,6 @@ def validate(
                         ],
                         greedy=False,
                     )
-                rewards = val_batch["total_reward"]
 
                 task_rewards.extend(val_batch["total_reward"].tolist())
                 total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
@@ -1036,6 +1035,9 @@ def validate(
                 break
 
         # Calculate validation metrics
+        assert "total" not in accuracy, (
+            "total is a reserved task_name since it is used in the metrics as the aggregate label"
+        )
         rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
         accuracy["total"] = rewards_t.mean().item()
 
