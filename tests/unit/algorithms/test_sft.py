@@ -19,7 +19,11 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss_functions import NLLLoss
-from nemo_rl.algorithms.sft import _default_sft_save_state, sft_train
+from nemo_rl.algorithms.sft import (
+    _default_sft_save_state,
+    sft_train,
+    validate,
+)
 
 
 @pytest.fixture
@@ -47,13 +51,16 @@ def mock_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader: dict[str, StatefulDataLoader] = {}
+    val_dataloader["task1"] = MagicMock(spec=StatefulDataLoader)
+    val_dataloader["task2"] = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    for k in val_dataloader:
+        val_dataloader[k].__iter__ = val_iter
+        val_dataloader[k].__len__ = MagicMock(return_value=10)
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -247,3 +254,34 @@ def test_training_with_negative_val_period(mock_components):
     )
 
     assert mock_components["policy"].train.call_count == 3
+
+
+def test_validate_function(mock_components):
+    """Test independent validation function to ensure validation logic correctness."""
+    sft_config = mock_components["master_config"]["sft"]
+
+    for val_batches in [10, 11]:
+        # Run validation
+        val_metrics, validation_timings = validate(
+            mock_components["policy"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            step=0,
+            master_config=mock_components["master_config"],
+            val_batches=val_batches,
+            val_batch_size=sft_config["val_global_batch_size"],
+            val_mbs=sft_config["val_micro_batch_size"],
+        )
+
+        # Verify validation results
+        assert isinstance(val_metrics, dict)
+        assert isinstance(validation_timings, dict)
+
+        assert "val_loss" in val_metrics
+        assert "val_loss_task1" in val_metrics
+
+        if val_batches == 10:
+            assert "val_loss_task2" not in val_metrics
+        elif val_batches == 11:
+            assert "val_loss_task2" in val_metrics

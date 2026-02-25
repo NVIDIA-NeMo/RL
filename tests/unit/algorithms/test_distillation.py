@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,13 +95,16 @@ def mock_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader: dict[str, StatefulDataLoader] = {}
+    val_dataloader["task1"] = MagicMock(spec=StatefulDataLoader)
+    val_dataloader["task2"] = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    for k in val_dataloader:
+        val_dataloader[k].__iter__ = val_iter
+        val_dataloader[k].__len__ = MagicMock(return_value=10)
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -273,19 +277,33 @@ def test_exit_on_timeout(mock_components, capsys):
 
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
-    # Run validation
-    val_metrics, validation_timings = validate(
-        mock_components["student_generation"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["val_task_to_env"],
-        step=0,
-        master_config=mock_components["master_config"],
-    )
+    master_config = deepcopy(mock_components["master_config"])
 
-    # Verify validation results
-    assert isinstance(val_metrics, dict)
-    assert isinstance(validation_timings, dict)
+    for max_val_samples in [10, 11]:
+        # Run validation
+        master_config["distillation"]["max_val_samples"] = max_val_samples
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=master_config,
+        )
+
+        # Verify validation results
+        assert isinstance(val_metrics, dict)
+        assert isinstance(validation_timings, dict)
+
+        assert "accuracy" in val_metrics
+        assert "accuracy_task1" in val_metrics
+        assert "avg_length" in val_metrics
+
+        if max_val_samples == 10:
+            assert "accuracy_task2" not in val_metrics
+        elif max_val_samples == 11:
+            assert "accuracy_task2" in val_metrics
+
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
