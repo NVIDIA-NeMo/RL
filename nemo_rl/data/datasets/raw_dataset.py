@@ -31,7 +31,7 @@ class RawDataset:
     def common_init(
         self,
         default_task_name: str,
-        skip_set_processor: bool,
+        skip_set_processor: bool = True,
         task_name: str | None = None,
         prompt_file: str | None = None,
         system_prompt_file: str | None = None,

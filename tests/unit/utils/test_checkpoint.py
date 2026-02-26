@@ -32,7 +32,7 @@ def checkpoint_config(checkpoint_dir):
     return {
         "enabled": True,
         "checkpoint_dir": checkpoint_dir,
-        "metric_name": "loss",
+        "metric_name": "train:loss",
         "higher_is_better": False,
         "keep_top_k": 3,
     }
@@ -46,7 +46,11 @@ def checkpoint_manager(checkpoint_config):
 def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Test creating a new checkpoint
     step = 1
-    training_info = {"loss": 0.5, "tensor": torch.tensor(0.5), "numpy": np.array(0.5)}
+    training_info = {
+        checkpoint_manager.metric_name: 0.5,
+        "tensor": torch.tensor(0.5),
+        "numpy": np.array(0.5),
+    }
     run_config = {"model": "test"}
 
     save_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info, run_config)
@@ -58,7 +62,7 @@ def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Check if training metadata was saved correctly
     with open(save_dir / "training_info.json", "r") as f:
         saved_metadata = json.load(f)
-        assert saved_metadata["loss"] == 0.5
+        assert saved_metadata[checkpoint_manager.metric_name] == 0.5
         assert isinstance(saved_metadata["tensor"], (int, float))
         assert isinstance(saved_metadata["numpy"], (int, float))
 
@@ -71,7 +75,7 @@ def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
 def test_finalize_checkpoint(checkpoint_manager, checkpoint_dir):
     # Create a temporary checkpoint
     step = 1
-    training_info = {"loss": 0.5}
+    training_info = {checkpoint_manager.metric_name: 0.5}
     tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
 
     # Complete the checkpoint
@@ -88,7 +92,7 @@ def test_remove_old_checkpoints(checkpoint_manager, checkpoint_dir):
     losses = [0.5, 0.3, 0.7, 0.2, 0.4, 0.8]
 
     for step, loss in zip(steps, losses):
-        training_info = {"loss": loss}
+        training_info = {checkpoint_manager.metric_name: loss}
         tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
         checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -103,7 +107,7 @@ def test_remove_old_checkpoints(checkpoint_manager, checkpoint_dir):
     for dir_path in remaining_dirs:
         with open(dir_path / "training_info.json", "r") as f:
             metadata = json.load(f)
-            remaining_losses.append(metadata["loss"])
+            remaining_losses.append(metadata[checkpoint_manager.metric_name])
 
     assert sorted(remaining_losses) == sorted(losses)[
         : checkpoint_manager.keep_top_k
@@ -119,7 +123,7 @@ def test_remove_old_checkpoints_topk_bias_recent_if_equal(
     losses = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # All checkpoints have the same loss
 
     for step, loss in zip(steps, losses):
-        training_info = {"loss": loss}
+        training_info = {checkpoint_manager.metric_name: loss}
         tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
         checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -148,12 +152,12 @@ def test_remove_old_checkpoints_topk_some_missing_val_metric(
     steps = [1, 2, 3, 4, 10, 11, 12]
     # Some checkpoints have loss metrics, others don't have any validation metrics
     training_infos = [
-        {"loss": 0.5},  # step 1 - has loss
-        {"loss": 0.3},  # step 2 - has loss
+        {checkpoint_manager.metric_name: 0.5},  # step 1 - has loss
+        {checkpoint_manager.metric_name: 0.3},  # step 2 - has loss
         {"other_metric": 0.8},  # step 3 - missing loss metric
-        {"loss": 0.2},  # step 4 - has loss
+        {checkpoint_manager.metric_name: 0.2},  # step 4 - has loss
         {},  # step 10 - missing loss metric
-        {"loss": 1.0},  # has loss but not in top-k
+        {checkpoint_manager.metric_name: 1.0},  # has loss but not in top-k
         {},  # step 12 - missing loss (latest)
     ]
 
@@ -189,7 +193,7 @@ def test_remove_old_checkpoints_topk_most_missing_val_metric(
     steps = [1, 2, 3, 4, 10, 12]
     # Some checkpoints have loss metrics, others don't have any validation metrics
     training_infos = [
-        {"loss": 0.2},  # step 1 - has loss
+        {checkpoint_manager.metric_name: 0.2},  # step 1 - has loss
         {},  # step 2 - has loss
         {"other_metric": 0.8},  # step 3 - missing loss metric
         {},  # step 4 - has loss
@@ -226,7 +230,7 @@ def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
     losses = [0.5, 0.3, 0.7]
 
     for step, loss in zip(steps, losses):
-        training_info = {"loss": loss}
+        training_info = {checkpoint_manager.metric_name: loss}
         tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
         checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -236,7 +240,7 @@ def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Verify it's the checkpoint with lowest loss
     with open(Path(best_path) / "training_info.json", "r") as f:
         metadata = json.load(f)
-        assert metadata["loss"] == min(losses)
+        assert metadata[checkpoint_manager.metric_name] == min(losses)
 
 
 def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
@@ -244,7 +248,7 @@ def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     steps = [1, 2, 3]
 
     for step in steps:
-        training_info = {"loss": 0.5}
+        training_info = {checkpoint_manager.metric_name: 0.5}
         tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
         checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -259,7 +263,7 @@ def test_get_latest_checkpoint_path_with_suffixes(checkpoint_manager, checkpoint
     """Test that having step_*-hf dirs alongside step_* checkpoints doesn't crash."""
     # Create a checkpoint
     step = 1
-    training_info = {"loss": 0.5}
+    training_info = {checkpoint_manager.metric_name: 0.5}
     tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
     checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -276,7 +280,7 @@ def test_get_latest_checkpoint_path_with_suffixes(checkpoint_manager, checkpoint
 def test_load_training_metadata(checkpoint_manager, checkpoint_dir):
     # Create a checkpoint
     step = 1
-    training_info = {"loss": 0.5}
+    training_info = {checkpoint_manager.metric_name: 0.5}
     tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
     checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -292,7 +296,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
     config = {
         "enabled": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
+        "metric_name": "train:loss",
         "higher_is_better": False,
         "keep_top_k": None,
     }
@@ -301,7 +305,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
     # Create multiple checkpoints
     steps = [1, 2, 3]
     for step in steps:
-        training_info = {"loss": 0.5}
+        training_info = {manager.metric_name: 0.5}
         tmp_dir = manager.init_tmp_checkpoint(step, training_info)
         manager.finalize_checkpoint(tmp_dir)
 
@@ -330,7 +334,7 @@ def test_get_latest_checkpoint_path_across_digits(checkpoint_manager, checkpoint
     steps = [8, 9, 10, 11]
 
     for step in steps:
-        training_info = {"loss": 0.5}
+        training_info = {checkpoint_manager.metric_name: 0.5}
         tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
         checkpoint_manager.finalize_checkpoint(tmp_dir)
 
@@ -361,7 +365,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     config = {
         "enabled": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
+        "metric_name": "train:loss",
         "higher_is_better": False,
         "keep_top_k": None,  # Keep all checkpoints
     }
@@ -370,9 +374,9 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     # Create checkpoints where some have the metric and others don't
     steps = [1, 2, 3, 4]
     training_infos = [
-        {"loss": 0.5},  # step 1 - has loss
+        {manager.metric_name: 0.5},  # step 1 - has loss
         {"other_metric": 0.8},  # step 2 - missing loss
-        {"loss": 0.3},  # step 3 - has loss (best)
+        {manager.metric_name: 0.3},  # step 3 - has loss (best)
         {},  # step 4 - missing loss
     ]
 
@@ -395,7 +399,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     # Should return the checkpoint with the best (lowest) loss
     with open(Path(best_path) / "training_info.json", "r") as f:
         metadata = json.load(f)
-        assert metadata["loss"] == 0.3  # step 3 has the best loss
+        assert metadata[manager.metric_name] == 0.3  # step 3 has the best loss
 
 
 def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
@@ -404,7 +408,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
     config = {
         "enabled": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
+        "metric_name": "train:loss",
         "higher_is_better": False,
         "keep_top_k": None,  # Keep all checkpoints
     }
@@ -432,7 +436,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
         # Should have warned twice: once about ignoring all checkpoints, once about returning latest
         assert len(w) == 2
         assert "Ignoring 3 checkpoint(s)" in str(w[0].message)
-        assert "No checkpoints contain metric 'loss'" in str(w[1].message)
+        assert "No checkpoints contain metric 'train:loss'" in str(w[1].message)
         assert "Returning latest checkpoint" in str(w[1].message)
         assert "val_at_end" in str(w[1].message)
 
@@ -445,7 +449,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     config = {
         "enabled": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "accuracy",
+        "metric_name": "val:accuracy",
         "higher_is_better": True,
         "keep_top_k": None,  # Keep all
     }
@@ -456,7 +460,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     accuracies = [0.7, 0.9, 0.8]  # step 2 has the best accuracy
 
     for step, acc in zip(steps, accuracies):
-        training_info = {"accuracy": acc}
+        training_info = {manager.metric_name: acc}
         tmp_dir = manager.init_tmp_checkpoint(step, training_info)
         manager.finalize_checkpoint(tmp_dir)
 
@@ -466,4 +470,4 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     # Verify it's the checkpoint with highest accuracy
     with open(Path(best_path) / "training_info.json", "r") as f:
         metadata = json.load(f)
-        assert metadata["accuracy"] == 0.9  # step 2
+        assert metadata[manager.metric_name] == 0.9  # step 2
