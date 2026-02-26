@@ -260,7 +260,7 @@ policy:
       unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1
@@ -286,6 +286,10 @@ policy:
       resources:
         gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
         num_nodes: null # Decides number of nodes to be dedicated to generation
+    routing_policy:
+      type: cache_aware
+      router_class: "my_router.DynamoKvRouter"
+      router_kwargs: {}
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
@@ -359,5 +363,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
+  gpus_per_node: 2
   num_nodes: 1
