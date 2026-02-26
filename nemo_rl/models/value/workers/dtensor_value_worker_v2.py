@@ -16,7 +16,9 @@ import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from re import S
 from typing import Any, Generator, Optional
+from unittest import skip
 
 import ray
 import torch
@@ -45,6 +47,9 @@ from nemo_rl.models.automodel.setup import (
     validate_and_prepare_config,
 )
 from nemo_rl.models.automodel.train import (
+    LogprobsPostProcessor,
+    LossPostProcessor,
+    ScorePostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
@@ -88,126 +93,6 @@ def get_train_context(
         if autocast_enabled:
             stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
         yield
-
-
-class ValuePostProcessor:
-    """Post-processor for value function forward pass."""
-
-    def __init__(
-        self,
-        cfg: dict,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
-        cp_size: int,
-        enable_seq_packing: bool,
-    ):
-        self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
-        self.tp_mesh = tp_mesh
-        self.cp_size = cp_size
-        self.enable_seq_packing = enable_seq_packing
-
-    def __call__(
-        self,
-        logits: torch.Tensor,
-        processed_inputs: Any,
-    ) -> torch.Tensor:
-        """Process value model outputs.
-
-        Args:
-            logits: Raw output from value model [batch_size, seq_len, 1] or [batch_size, seq_len]
-            processed_inputs: Processed input batch
-
-        Returns:
-            Value predictions [batch_size, seq_len]
-        """
-        # Value model outputs a single scalar per token
-        # Squeeze the last dimension if present
-        if logits.dim() == 3 and logits.size(-1) == 1:
-            values = logits.squeeze(-1)
-        else:
-            values = logits
-
-        # Handle context parallelism if enabled
-        if self.cp_size > 1:
-            # Gather values across context parallel dimension
-            from torch.distributed._tensor import Replicate
-
-            values = values.redistribute(
-                placements=[Replicate()] * len(self.device_mesh.mesh_dim_names)
-            )
-            values = values.to_local()
-
-        return values
-
-
-class ValueLossPostProcessor:
-    """Post-processor for value function training with loss computation."""
-
-    def __init__(
-        self,
-        loss_fn: LossFunction,
-        cfg: dict,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
-        cp_size: int,
-        dp_size: int,
-        enable_seq_packing: bool,
-    ):
-        self.loss_fn = loss_fn
-        self.cfg = cfg
-        self.device_mesh = device_mesh
-        self.cp_mesh = cp_mesh
-        self.tp_mesh = tp_mesh
-        self.cp_size = cp_size
-        self.dp_size = dp_size
-        self.enable_seq_packing = enable_seq_packing
-
-    def __call__(
-        self,
-        logits: torch.Tensor,
-        processed_inputs: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Process value model outputs and compute loss.
-
-        Args:
-            logits: Raw output from value model [batch_size, seq_len, 1] or [batch_size, seq_len]
-            processed_inputs: Processed input batch containing target values
-
-        Returns:
-            Tuple of (loss, loss_metrics)
-            The loss is used both for logging and for backward() call in automodel_forward_backward.
-        """
-        # Extract values (squeeze if needed)
-        if logits.dim() == 3 and logits.size(-1) == 1:
-            values = logits.squeeze(-1)
-        else:
-            values = logits
-
-        # Handle context parallelism if enabled
-        if self.cp_size > 1:
-            from torch.distributed._tensor import Replicate
-
-            values = values.redistribute(
-                placements=[Replicate()] * len(self.device_mesh.mesh_dim_names)
-            )
-            values = values.to_local()
-
-        # Get original batch data
-        batch_data = processed_inputs.orig_batch
-
-        # Compute loss using the provided loss function
-        loss, loss_metrics = self.loss_fn.compute_loss(values=values, **batch_data)
-
-        # Track number of valid samples
-        mask = batch_data.get("mask", torch.ones_like(values))
-        num_valid_samples = mask.sum().item()
-        loss_metrics["num_valid_samples"] = num_valid_samples
-
-        return loss, loss_metrics
 
 
 def get_runtime_env_for_value_worker(worker_type: str) -> dict:
@@ -269,6 +154,10 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
+        if "hf_config_overrides" not in config:
+            config["hf_config_overrides"] = {}
+        config["hf_config_overrides"]["num_labels"] = 1
+
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
             config=config,
@@ -302,6 +191,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
+                "skip_task_head_prefixes_for_base_model": ["score."],
             },
         )
 
@@ -316,6 +206,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
+            optimizer_module_filter=["score."],
         )
 
         # Set instance attributes from model and optimizer state
@@ -383,7 +274,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.model.train()
 
         # Create loss post-processor
-        loss_post_processor = ValueLossPostProcessor(
+        loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=self.cfg,
             device_mesh=self.device_mesh,
@@ -545,13 +436,8 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         self.model.eval()
 
         # Create value post-processor
-        value_post_processor = ValuePostProcessor(
+        value_post_processor = ScorePostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
-            enable_seq_packing=self.enable_seq_packing,
         )
 
         with torch.no_grad():

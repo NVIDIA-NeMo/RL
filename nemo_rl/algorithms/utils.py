@@ -16,6 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
+from locale import normalize
 from typing import Any, Optional
 
 import numpy as np
@@ -180,6 +181,23 @@ def masked_mean(
         else global_normalization_factor
     )
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        variance = variance * (normalization_factor / (normalization_factor - 1))
+    return variance
 
 
 def set_seed(seed: int) -> None:

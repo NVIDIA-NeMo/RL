@@ -24,9 +24,16 @@ Reference papers:
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 """
 
+from string import whitespace
+
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    calculate_kl,
+    masked_mean,
+    masked_var,
+)
 
 
 class GRPOAdvantageEstimator:
@@ -167,6 +174,21 @@ class GeneralizedAdvantageEstimator:
         self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
         self.normalize_advantages = estimator_config.get("normalize_advantages", True)
 
+    def _reward_whiten(
+        self,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        shift_mean: bool = True,
+    ) -> torch.Tensor:
+        mean = masked_mean(rewards, mask)
+        var = masked_var(rewards, mask, mean)
+
+        whitened_rewards = (rewards - mean) * torch.rsqrt(var + 1e-8)
+
+        if not shift_mean:
+            whitened_rewards = whitened_rewards + mean
+        return whitened_rewards
+
     def compute_advantage(
         self,
         prompt_ids,
@@ -207,4 +229,7 @@ class GeneralizedAdvantageEstimator:
             )
             last_advantage = advantages[:, t]
 
+        advantages = torch.masked_fill(
+            self._reward_whiten(advantages, mask), ~(mask.bool()), 0
+        )
         return advantages
