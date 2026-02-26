@@ -1,6 +1,6 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/shanmugamr1992/Megatron-LM.git
+	url = https://github.com/NVIDIA/Megatron-LM.git
 	branch = main
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
