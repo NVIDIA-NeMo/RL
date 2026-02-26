@@ -59,6 +59,7 @@ class ExternalRouter(ABC):
     def __init__(
         self,
         dp_leader_worker_indices: list[int],
+        generation_cfg: dict[str, Any],
         **kwargs: Any,
     ) -> None:
         """Initialize the external router.
@@ -66,15 +67,18 @@ class ExternalRouter(ABC):
         Args:
             dp_leader_worker_indices: Maps dp_shard_idx -> leader worker global index.
                 Its length equals dp_size.
+            generation_cfg: The full generation config dict (includes vllm_cfg, etc.).
             **kwargs: Additional keyword arguments from router_kwargs config.
         """
 
     @abstractmethod
-    def route(self, data: BatchedDataDict) -> RoutingDecision:
+    def route(self, data: BatchedDataDict, request_id: str) -> RoutingDecision:
         """Select a DP shard and worker for routing a generation batch.
 
         Args:
             data: The generation input batch.
+            request_id: Unique ID for lifecycle tracking (same ID passed to
+                prefill_complete and generation_complete).
 
         Returns:
             RoutingDecision with dp_shard_idx and worker_idx.
@@ -171,7 +175,7 @@ class CacheAwareRoutingPolicy(RoutingPolicy):
         data: BatchedDataDict,
         request_id: str,
     ) -> RoutingDecision:
-        decision = self._external_router.route(data)
+        decision = self._external_router.route(data, request_id)
 
         dp_size = len(self._dp_leader_worker_indices)
         if not (0 <= decision.dp_shard_idx < dp_size):
@@ -202,6 +206,7 @@ class CacheAwareRoutingPolicy(RoutingPolicy):
 def create_routing_policy(
     config: RoutingPolicyConfig | None,
     dp_leader_worker_indices: list[int],
+    generation_cfg: dict[str, Any] | None = None,
 ) -> RoutingPolicy:
     """Factory function to create a routing policy from config.
 
@@ -209,6 +214,7 @@ def create_routing_policy(
         config: Routing policy configuration. None or missing 'type' defaults to round_robin.
         dp_leader_worker_indices: Maps dp_shard_idx -> leader worker global index.
             Its length equals dp_size.
+        generation_cfg: The full generation config dict, passed to external routers.
 
     Returns:
         An instantiated RoutingPolicy.
@@ -238,6 +244,7 @@ def create_routing_policy(
         router_kwargs = config.get("router_kwargs", {})
         external_router = router_cls(
             dp_leader_worker_indices=dp_leader_worker_indices,
+            generation_cfg=generation_cfg or {},
             **router_kwargs,
         )
 

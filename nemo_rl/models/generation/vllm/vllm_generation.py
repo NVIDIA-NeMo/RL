@@ -234,6 +234,7 @@ class VllmGeneration(GenerationInterface):
         self._routing_policy = create_routing_policy(
             routing_policy_cfg,
             dp_leader_worker_indices=self.worker_group.dp_leader_worker_indices,
+            generation_cfg=self.cfg,
         )
 
         # Save the device uuids for the workers
