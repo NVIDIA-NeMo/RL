@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
@@ -147,6 +148,90 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    def _patch_vllm_device_allocation(self) -> None:
+        """Fix device allocation for DP+EP. vLLM parser fails on single device ID."""
+        try:
+            import vllm.v1.engine.utils as vllm_utils
+
+            original_fn = vllm_utils.get_device_indices
+
+            def patched_get_device_indices(
+                device_control_env_var, local_dp_rank, world_size
+            ):
+                try:
+                    return original_fn(
+                        device_control_env_var, local_dp_rank, world_size
+                    )
+                except Exception:
+                    import os
+
+                    value = os.environ.get(device_control_env_var, "")
+                    # Return string for single device, list for multiple
+                    if value and "," not in value:
+                        return value  # Return as string, not list
+                    return [local_dp_rank * world_size + i for i in range(world_size)]
+
+            vllm_utils.get_device_indices = patched_get_device_indices
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: Could not patch vLLM device allocation: {e}")
+
+    def _patch_vllm_stats_address(self) -> None:
+        """Fix stats_update_address initialization for vLLM internal DP with EP != TP."""
+        vllm_dp_size = int(os.environ.get("VLLM_DP_SIZE", "1"))
+        if vllm_dp_size <= 1:
+            return
+
+        try:
+            import vllm.v1.engine.core_client as core_client_module
+
+            original_ensure = (
+                core_client_module.DPLBAsyncMPClient._ensure_stats_update_task
+            )
+
+            def patched_ensure(self):
+                if (
+                    not hasattr(self, "stats_update_address")
+                    or self.stats_update_address is None
+                ):
+                    import socket
+
+                    sock = socket.socket()
+                    sock.bind(("", 0))
+                    port = sock.getsockname()[1]
+                    sock.close()
+                    self.stats_update_address = f"tcp://127.0.0.1:{port}"
+
+                original_ensure(self)
+
+            core_client_module.DPLBAsyncMPClient._ensure_stats_update_task = (
+                patched_ensure
+            )
+
+            def patched_init(self, *args, **kwargs):
+                self.client_count = kwargs.get("client_count", 1)
+                self.reqs_in_flight = {}
+
+                super(core_client_module.DPLBAsyncMPClient, self).__init__(
+                    args[0],
+                    args[1],
+                    args[2],
+                    kwargs.get("client_addresses"),
+                    kwargs.get("client_count", 1),
+                    kwargs.get("client_index", 0),
+                )
+
+                if hasattr(self, "core_engines") and len(self.core_engines) > 1:
+                    self.eng_start_index = (
+                        len(self.core_engines) * kwargs.get("client_index", 0)
+                    ) // kwargs.get("client_count", 1)
+                else:
+                    self.eng_start_index = 0
+
+            core_client_module.DPLBAsyncMPClient.__init__ = patched_init
+
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: Could not patch vLLM stats address: {e}")
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -158,6 +243,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             llm_kwargs["compilation_config"] = CompilationConfig(
                 **llm_kwargs["compilation_config"]
             )
+
+        self._patch_vllm_device_allocation()
+        self._patch_vllm_stats_address()
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
