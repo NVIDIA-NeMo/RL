@@ -229,7 +229,7 @@ jobs:
       matrix:
         include:
           - script: Docs_Tests
-            runner: self-hosted-azure
+            runner: self-hosted-azure-13
     needs: [pre-flight, build-container]
     if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
