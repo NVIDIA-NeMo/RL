@@ -29,7 +29,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import StragglerDetector
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper, SequencePackingNLLLinearCEFusionLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -82,11 +82,14 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
+    use_linear_ce_fusion_loss = cfg["megatron_cfg"]["use_linear_ce_fusion_loss"]
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if use_linear_ce_fusion_loss:
+        additional_kwargs["labels"] = input_ids_cp_sharded
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -95,6 +98,7 @@ def model_forward(
             attention_mask=attention_mask,
             **additional_kwargs,
             **multimodal_data,
+            return_logprobs_for_linear_ce_fusion=use_linear_ce_fusion_loss,
         )
 
     return output_tensor
@@ -306,7 +310,8 @@ class LossPostProcessor:
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             # remove padding
-            loss_fn = SequencePackingLossWrapper(
+            sequence_packing_loss_wrapper_type = SequencePackingLossWrapper if not self.cfg["megatron_cfg"]["use_linear_ce_fusion_loss"] else SequencePackingNLLLinearCEFusionLossWrapper
+            loss_fn = sequence_packing_loss_wrapper_type(
                 loss_fn=loss_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,

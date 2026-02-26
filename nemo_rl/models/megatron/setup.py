@@ -56,6 +56,7 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
+from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
 try:
     from megatron.core.distributed import (
@@ -364,6 +365,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     if model_cfg.context_parallel_size > 1:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore"
+        )
+        assert not config["megatron_cfg"]["use_linear_ce_fusion_loss"], (
+            "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
         )
 
 
@@ -737,6 +741,12 @@ def setup_model_and_optimizer(
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
+    if policy_cfg["megatron_cfg"].get("use_linear_ce_fusion_loss", False):
+        patch_gpt_model_forward_for_linear_ce_fusion(
+            chunk_size=policy_cfg["megatron_cfg"].get(
+                "linear_ce_fusion_chunk_size", 256
+            )
+        )
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
