@@ -1351,38 +1351,27 @@ class NLLLinearCEFusionLoss(LossFunction):
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # hidden_states shape: [batch_size, seq_len, hidden_size]
         # Get the next token hidden states for each position
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
         seq_index = data.get("seq_index", None)
         token_logprobs = token_logprobs.to(torch.float32)
-        print(f"token_logprobs size: {token_logprobs.shape} and mask size: {mask.shape} and global_valid_toks size: {global_valid_toks.shape}")
         # Gather the logprobs for the actual next tokens
         # only support megatron lm tensor parallel for now
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
                 "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
             )
-            # token_logprobs = from_parallel_hidden_states_to_logprobs(
-            #     next_token_hidden_states,
-            #     model,
-            #     data["input_ids"],
-            #     vocab_start_index=vocab_parallel_rank * vocab_size,
-            #     vocab_end_index=(vocab_parallel_rank + 1) * vocab_size,
-            #     tp_group=vocab_parallel_group,
-            #     inference_only=False,
-            #     cp_group=context_parallel_group,
-            # )
-            # todo, need to pass the data in and do the masked_mean on the chunks to avoid generating the whole tensor at once
-            # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(token_logprobs, torch.distributed.tensor.DTensor):
-            raise NotImplementedError("Distributed tensor not supported for linear CE fusion loss")
+            raise NotImplementedError(
+                "Distributed tensor not supported for linear CE fusion loss"
+            )
         else:
-            # will add quickly later
-            raise NotImplementedError("Non-distributed tensor not supported for linear CE fusion loss")
+            raise NotImplementedError(
+                "Non-distributed tensor not supported for linear CE fusion loss"
+            )
 
         if dpo_loss:
             ## shape: [batch_size]
@@ -1394,8 +1383,6 @@ class NLLLinearCEFusionLoss(LossFunction):
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
-            print(f"token_logprobs size: {token_logprobs.shape} and mask size: {mask.shape} and global_valid_toks size: {global_valid_toks.shape}")
-            # print(f"inspect masks: {mask}, inspecting token_logprobs: {token_logprobs[:2, :20]}")
             loss = -masked_mean(
                 token_logprobs,
                 mask,
@@ -1465,13 +1452,11 @@ class SequencePackingNLLLinearCEFusionLossWrapper:
                 if context_parallel_group is None
                 else torch.distributed.get_world_size(context_parallel_group)
             )
-            # print(f"cp size in side of the sequence packing loss wrapper: {cp_size} and next_token_logits size: {token_logprobs.shape}")
             logit_slice_idxs = slice(
                 seq_start // cp_size,
                 (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
             )
             token_logprobs_slice = token_logprobs[:, logit_slice_idxs]
-            print(f"cp size in side of the sequence packing loss wrapper: {cp_size} and full token_logprobs size: {token_logprobs.shape} and sliced token_logprobs size: {token_logprobs_slice.shape} with index {seq_idx} and seq_start {seq_start} and seq_end {seq_end}")
             loss, metrics = self.loss_fn(
                 token_logprobs_slice,
                 unpadded_seq_data,
