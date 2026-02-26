@@ -848,7 +848,7 @@ async def run_hf_train_process(
             {
                 "input_ids": train_input_ids,
                 "input_lengths": generation_results["unpadded_sequence_lengths"],
-                "token_loss_mask": token_loss_mask,
+                "token_mask": token_loss_mask,
                 "sample_mask": torch.ones(train_input_ids.shape[0]),
             }
         )

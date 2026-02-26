@@ -31,7 +31,7 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -475,8 +475,8 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
         """
-        self.loss_fn = loss_fn
-        self.cfg = cfg
+        self.loss_fn: LossFunction = loss_fn
+        self.cfg: PolicyConfig = cfg
         self.device_mesh = device_mesh
         self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
@@ -506,14 +506,6 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
-        from nemo_rl.algorithms.loss_functions import (
-            ClippedPGLossFn,
-            DistillationLossFn,
-            DPOLossFn,
-            NLLLoss,
-            PreferenceLoss,
-        )
-
         # Handle CP redistribution
         if self.cp_size > 1:
             _, mb = prepare_data_for_cp(
@@ -527,7 +519,10 @@ class LossPostProcessor:
         def prepare_for_loss_fn(
             logits: torch.Tensor, mb: BatchedDataDict[Any]
         ) -> tuple[Any]:
-            if isinstance(self.loss_fn, (ClippedPGLossFn, NLLLoss, DPOLossFn)):
+            if self.loss_fn.input_type == LossInputType.LOGIT:
+                loss_fn_args = (logits,)
+
+            elif self.loss_fn.input_type == LossInputType.LOGPROB:
                 logprobs = get_logprobs_from_logits(
                     input_ids=mb["input_ids"],
                     next_token_logits=logits,
@@ -536,10 +531,7 @@ class LossPostProcessor:
 
                 loss_fn_args = (logprobs,)
 
-            elif isinstance(self.loss_fn, PreferenceLoss):
-                loss_fn_args = (logits,)
-
-            elif isinstance(self.loss_fn, DistillationLossFn):
+            elif self.loss_fn.input_type == LossInputType.DISTILLATION:
                 calculate_entropy = (
                     self.loss_fn.zero_outside_topk and self.loss_fn.kl_type != "forward"
                 )

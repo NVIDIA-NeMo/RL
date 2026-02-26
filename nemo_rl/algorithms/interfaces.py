@@ -25,6 +25,12 @@ class LossType(enum.Enum):
     SEQUENCE_LEVEL = "sequence_level"
 
 
+class LossInputType(enum.Enum):
+    LOGIT = "logit"
+    LOGPROB = "logprob"
+    DISTILLATION = "distillation"
+
+
 class LossFunction(Protocol):
     """Signature for loss functions used in reinforcement learning algorithms.
 
@@ -33,6 +39,7 @@ class LossFunction(Protocol):
     """
 
     loss_type: LossType
+    input_type: LossInputType
 
     def __call__(
         self,

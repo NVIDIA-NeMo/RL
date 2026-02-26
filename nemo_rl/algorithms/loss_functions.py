@@ -17,7 +17,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar
 import torch
 import torch.distributed
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -112,6 +112,8 @@ class ClippedPGLossFn(LossFunction):
 
     Due to potential numerical instability, we cast the logits to float32 before computing the loss.
     """
+
+    input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: ClippedPGLossConfig):
         self.ratio_clip_min = cfg["ratio_clip_min"]
@@ -557,6 +559,7 @@ class NLLLoss(LossFunction):
     """Negative Log Likelihood Loss function."""
 
     loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
 
     def __call__(
         self,
@@ -625,8 +628,8 @@ class PreferenceLoss(LossFunction):
                 - accuracy: Fraction of examples where chosen response has higher reward
     """
 
-    def __init__(self):
-        self.loss_type = LossType.SEQUENCE_LEVEL
+    loss_type = LossType.SEQUENCE_LEVEL
+    input_type = LossInputType.LOGIT
 
     def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
         # tensor is of shape (2*micro_batch_size,)
@@ -773,6 +776,9 @@ class DPOLossFn(PreferenceLoss):
                 - accuracy: Fraction of examples where chosen response has higher reward
     """
 
+    loss_type = LossType.SEQUENCE_LEVEL
+    input_type = LossInputType.LOGPROB
+
     def __init__(self, cfg: DPOLossConfig):
         self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
         self.preference_loss_weight = cfg["preference_loss_weight"]
@@ -780,8 +786,6 @@ class DPOLossFn(PreferenceLoss):
         self.preference_average_log_probs = cfg["preference_average_log_probs"]
         self.sft_average_log_probs = cfg["sft_average_log_probs"]
         self.sft_loss = NLLLoss()
-
-        self.loss_type = LossType.SEQUENCE_LEVEL
 
     def _dpo_loss(
         self,
@@ -978,12 +982,14 @@ class DistillationLossDataDict(TypedDict):
 class DistillationLossFn(LossFunction):
     """Distillation loss function."""
 
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DISTILLATION
+
     def __init__(self, cfg: DistillationLossConfig):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
-        self.loss_type = LossType.TOKEN_LEVEL
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
