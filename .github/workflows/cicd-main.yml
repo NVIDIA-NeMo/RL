@@ -237,6 +237,9 @@ jobs:
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     environment: nemo-ci
     steps:
+      - name: debug
+        run: |
+          whoami
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
