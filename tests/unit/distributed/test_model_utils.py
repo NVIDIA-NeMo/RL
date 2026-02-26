@@ -24,6 +24,7 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    from_parallel_hidden_states_to_logprobs,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
@@ -954,5 +955,230 @@ def test_distributed_logprob_all_tests(
 
         worker_group.shutdown(force=True)
 
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class HiddenStatesToLogprobsTestActor:
+    def __init__(self, tp_size, chunk_size):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.env_vars = dict(os.environ)
+        torch.distributed.init_process_group(backend="nccl")
+        self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    def test_forward_and_backward_against_baseline(self):
+        rank = int(os.environ["RANK"])
+
+        batch_size = 3
+        seq_len = 8
+        hidden_size = 16
+        full_vocab_size = 64
+
+        # Keep tensor-parallel partitions evenly divisible for clean baseline slicing.
+        local_seq = seq_len // self.tp_size
+        vocab_part_size = full_vocab_size // self.tp_size
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        torch.manual_seed(1337)
+        full_hidden_states = torch.randn(
+            seq_len, batch_size, hidden_size, device="cuda", requires_grad=True
+        )
+        full_weight = torch.randn(
+            full_vocab_size, hidden_size, device="cuda", requires_grad=True
+        )
+        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+        local_hidden_states = (
+            full_hidden_states[rank * local_seq : (rank + 1) * local_seq]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+        local_weight = (
+            full_weight[vocab_start_index:vocab_end_index]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+
+        # Baseline: compute full-vocab token logprobs on a single rank representation.
+        rolled_target = target.roll(shifts=-1, dims=-1)
+        baseline_logits = torch.matmul(full_hidden_states, full_weight.T).transpose(
+            0, 1
+        )  # [B, S, V]
+        baseline_log_probs = torch.nn.functional.log_softmax(
+            baseline_logits.float(), dim=-1
+        )
+        baseline_token_logprobs = torch.gather(
+            baseline_log_probs, dim=-1, index=rolled_target.unsqueeze(-1)
+        ).squeeze(-1)[:, :-1]
+
+        # Distributed implementation under test.
+        token_logprobs = from_parallel_hidden_states_to_logprobs(
+            local_hidden_states,
+            local_weight,
+            local_weight,
+            runtime_gather_output=False,
+            target=target,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            tp_group=self.tp_group,
+            inference_only=False,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(
+            token_logprobs, baseline_token_logprobs, rtol=1e-4, atol=1e-4
+        )
+
+        # Backward comparison for hidden-state grads and local weight grads.
+        baseline_loss = baseline_token_logprobs.sum()
+        baseline_loss.backward()
+        expected_hidden_grad = full_hidden_states.grad[
+            rank * local_seq : (rank + 1) * local_seq
+        ]
+        expected_weight_grad = full_weight.grad[vocab_start_index:vocab_end_index]
+
+        dist_loss = token_logprobs.sum()
+        dist_loss.backward()
+        actual_hidden_grad = local_hidden_states.grad
+        actual_weight_grad = local_weight.grad
+
+        torch.testing.assert_close(
+            actual_hidden_grad, expected_hidden_grad, rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            actual_weight_grad, expected_weight_grad, rtol=1e-4, atol=1e-4
+        )
+
+        return {
+            "forward_max_diff": torch.max(
+                torch.abs(token_logprobs - baseline_token_logprobs)
+            ).item(),
+            "hidden_grad_max_diff": torch.max(
+                torch.abs(actual_hidden_grad - expected_hidden_grad)
+            ).item(),
+            "weight_grad_max_diff": torch.max(
+                torch.abs(actual_weight_grad - expected_weight_grad)
+            ).item(),
+        }
+
+    def test_inference_only_forward(self):
+        rank = int(os.environ["RANK"])
+
+        batch_size = 2
+        seq_len = 6
+        hidden_size = 8
+        full_vocab_size = 32
+        local_seq = seq_len // self.tp_size
+        vocab_part_size = full_vocab_size // self.tp_size
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        torch.manual_seed(2026)
+        full_hidden_states = torch.randn(
+            seq_len, batch_size, hidden_size, device="cuda"
+        )
+        full_weight = torch.randn(full_vocab_size, hidden_size, device="cuda")
+        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+        local_hidden_states = full_hidden_states[
+            rank * local_seq : (rank + 1) * local_seq
+        ].clone()
+        local_weight = full_weight[vocab_start_index:vocab_end_index].clone()
+
+        token_logprobs = from_parallel_hidden_states_to_logprobs(
+            local_hidden_states,
+            local_weight,
+            local_weight,
+            runtime_gather_output=False,
+            target=target,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            tp_group=self.tp_group,
+            inference_only=True,
+            chunk_size=self.chunk_size,
+        )
+
+        assert token_logprobs.shape == (batch_size, seq_len - 1)
+        assert not torch.isnan(token_logprobs).any()
+        assert not torch.isinf(token_logprobs).any()
+        return {"ok": True}
+
+
+HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN = (
+    f"{HiddenStatesToLogprobsTestActor.__module__}.HiddenStatesToLogprobsTestActor"
+)
+
+
+@pytest.fixture
+def register_hidden_states_to_logprobs_test_actor():
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN
+
+    if HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize("tp_size,chunk_size", [(1, 4), (2, 4)])
+def test_chunked_hidden_states_to_logprobs_all_tests(
+    register_hidden_states_to_logprobs_test_actor, tp_size, chunk_size
+):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_hidden_states_to_logprobs_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size)
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        futures = worker_group.run_all_workers_single_data(
+            "test_forward_and_backward_against_baseline"
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["forward_max_diff"] < 1e-4, (
+                f"Worker {i} forward diff too large: {result['forward_max_diff']}"
+            )
+            assert result["hidden_grad_max_diff"] < 1e-4, (
+                f"Worker {i} hidden grad diff too large: {result['hidden_grad_max_diff']}"
+            )
+            assert result["weight_grad_max_diff"] < 1e-4, (
+                f"Worker {i} weight grad diff too large: {result['weight_grad_max_diff']}"
+            )
+
+        futures = worker_group.run_all_workers_single_data(
+            "test_inference_only_forward"
+        )
+        inference_results = ray.get(futures)
+        for i, result in enumerate(inference_results):
+            assert result["ok"], f"Worker {i} inference-only forward failed"
+
+        worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()

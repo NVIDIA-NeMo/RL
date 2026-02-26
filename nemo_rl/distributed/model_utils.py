@@ -20,8 +20,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
-from torch.distributed.tensor import DTensor, distribute_tensor
 from megatron.core.utils import deprecate_inference_params, get_pg_size
+from torch.distributed.tensor import DTensor, distribute_tensor
+
 
 @torch.no_grad()
 def _compute_distributed_log_softmax(
@@ -1062,40 +1063,20 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
 
 def from_parallel_hidden_states_to_logprobs(
-    tensor_parallel_hidden_states: torch.Tensor, # shape: [batch_size, seq_len // CP, hidden_size], last dimension is hidden_size and not sharded
+    tensor_parallel_hidden_states: torch.Tensor,
     output_weight_layer: torch.Tensor,
     output_weight: torch.Tensor,
     runtime_gather_output: bool,
     target: torch.Tensor,
-    vocab_start_index: int, # vocab start and end index are needed since the model.lm_head is shared across the vocabulary
+    vocab_start_index: int,
     vocab_end_index: int,
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Get log probabilities from TP sharded hidden states.
-    """
-    # TODO: implement this
+    """Get log probabilities from TP sharded hidden states."""
     target = target.roll(shifts=-1, dims=-1)
-
-    # cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
-    # print(f"cp size is {cp_size}, cp group is {cp_group}")
-    # pad_len = 0
-    # # if cp_size > 1:
-    # # Pad the targets to local size * cp_size
-    # # the sequence length is the first dimension so we need to pad the first dimension
-    # pad_len = tensor_parallel_hidden_states.shape[0] * cp_size - target.shape[1]
-    # if pad_len > 0:
-    #     target = torch.nn.functional.pad(target, (0, pad_len), value=0)
-
-    # Shard the targets by context parallelism
-    # cp_rank = torch.distributed.get_rank(cp_group)
-    # target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
-    # print(f"target shape after sharding: {target.shape} and pad len is {pad_len}")
-    # assert chunk_size is not None, "chunk_size is required for hidden states"
-    # TODO: implement this
-    # print(f"right before calling ChunkedDistributedHiddenStatesToLogprobs, target: {target[:2, :20]} of tp rank {get_tensor_model_parallel_rank()}")
     logprobs: torch.Tensor = ChunkedDistributedHiddenStatesToLogprobs.apply(  # type: ignore
         tensor_parallel_hidden_states,
         target,
@@ -1107,70 +1088,67 @@ def from_parallel_hidden_states_to_logprobs(
         inference_only,
     ).contiguous()
 
-    # if cp_size > 1:
-    #     # we need to gather the logits by context parallelism
-    #     logprobs = allgather_cp_sharded_tensor(
-    #         logprobs, cp_group, seq_dim=1
-    #     )  # , unpadded_seqlen=target.shape[1])
-
-    # if pad_len > 0:
-    #     logprobs = logprobs[:, :-pad_len]
-    # print(f"inspect logprobs inside from_parallel_hidden_states_to_logprobs: {logprobs[:2, :20]} and target: {target[:2, :20]} and pad len is {pad_len} of tp rank {get_tensor_model_parallel_rank()}")
     return logprobs[:, :-1]
 
 
 class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
-    """Compute distributed log-softmax once and gather logprobs at given global indices.
-    """
+    """Compute distributed log-softmax once and gather logprobs at given global indices."""
 
     @staticmethod
-    def forward(ctx: Any, tensor_parallel_hidden_states: torch.Tensor, target: torch.Tensor, output_weight_layer: torch.Tensor, vocab_start_index: int, vocab_end_index: int, chunk_size: int, tp_group: torch.distributed.ProcessGroup, inference_only: bool = False) -> torch.Tensor:
+    def forward(
+        ctx: Any,
+        tensor_parallel_hidden_states: torch.Tensor,
+        target: torch.Tensor,
+        output_weight_layer: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target - vocab_start_index
         masked_target[target_mask] = 0
-        # print(f"masked_target shape: {masked_target.shape}, target_mask shape: {target_mask.shape}, tensor_parallel_hidden_states shape: {tensor_parallel_hidden_states.shape}")
         tp_group_size = torch.distributed.get_world_size(tp_group)
         if tp_group_size > 1:
-            original_tensor_parallel_hidden_states = tensor_parallel_hidden_states.clone()
-            all_hidden_states = [torch.zeros_like(tensor_parallel_hidden_states) for _ in range(tp_group_size)]
-            torch.distributed.all_gather(all_hidden_states, tensor_parallel_hidden_states, group=tp_group)
+            original_tensor_parallel_hidden_states = (
+                tensor_parallel_hidden_states.clone()
+            )
+            all_hidden_states = [
+                torch.zeros_like(tensor_parallel_hidden_states)
+                for _ in range(tp_group_size)
+            ]
+            torch.distributed.all_gather(
+                all_hidden_states, tensor_parallel_hidden_states, group=tp_group
+            )
             tensor_parallel_hidden_states = torch.cat(all_hidden_states, dim=0)
         else:
             original_tensor_parallel_hidden_states = tensor_parallel_hidden_states
-        # print(f"in exp: global rank {torch.distributed.get_rank()}, tp rank {get_tensor_model_parallel_rank()}, tensor_parallel_hidden_states shape: {tensor_parallel_hidden_states.shape}, value: {tensor_parallel_hidden_states[:2,:, :20]} ")
-        # print(f"tp rank {get_tensor_model_parallel_rank()} all_hidden_states shape: {tensor_parallel_hidden_states.shape}, value: {tensor_parallel_hidden_states[:2, :20]} ")
         seq_size = int(tensor_parallel_hidden_states.shape[0])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
         all_log_probs = []
-        tp_rank = get_tensor_model_parallel_rank()
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
-            # this will produce a tensor of shape [batch_size, chunk_size * TP_size, vocab_size // TP_size]
-            #logits, _ = output_layer(tensor_parallel_hidden_states[chunk_start:chunk_end, :, :], weight=output_weight, runtime_gather_output=runtime_gather_output)
-            logits = torch.matmul(tensor_parallel_hidden_states[chunk_start:chunk_end, :, :], output_weight_layer.T)
-            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous() # [tp_rank * real_chunk_size: (tp_rank + 1) * real_chunk_size, :, :]
-            # print(f"logits shape: {logits.shape} at chunk {chunk_idx} after matmul using the weight layer directly")
-            if chunk_idx == 0:
-                print(f"rank {tp_rank}, logits shape: {logits.shape}, logits: {logits[:2, :20, :10]} ")
+            logits = torch.matmul(
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :],
+                output_weight_layer.T,
+            )
+            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()
             log_probs = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
             )
-            # print(f"log_probs shape: {log_probs.shape} at chunk {chunk_idx} after compute distributed log softmax")
-            # gather the log probabilities for the chosen tokens so the vocab size dimension is gone
-            # used_masked_target = [torch.zeros_like(masked_target[:, chunk_start:chunk_end])] * tp_rank + [masked_target[:, chunk_start:chunk_end]] + [torch.zeros_like(masked_target[:, chunk_start:chunk_end])] * (tp_group_size - tp_rank - 1)
-            # used_target_mask = [torch.ones_like(target_mask[:, chunk_start:chunk_end])] * tp_rank + [target_mask[:, chunk_start:chunk_end]] + [torch.ones_like(target_mask[:, chunk_start:chunk_end])] * (tp_group_size - tp_rank - 1)
-            # used_masked_target = torch.cat(used_masked_target, dim=1)
-            # used_target_mask = torch.cat(used_target_mask, dim=1)
-            log_probs = torch.gather(
-                log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
-            ).squeeze(-1).detach()
-            # print(f"log_probs shape: {log_probs.shape} at chunk {chunk_idx} after gather")
+
+            log_probs = (
+                torch.gather(
+                    log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
+                )
+                .squeeze(-1)
+                .detach()
+            )
             log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
-            # print(f"log_probs shape: {log_probs.shape} at chunk {chunk_idx} before all reduce, masked_target size: {masked_target[:, chunk_start:chunk_end].shape}")
-            # TODO: the following lines are buggy since the log probs are sharded by TP rank on the seq dimension and they should not be all reduced.
-            # Need to think about how to handle this.
+
             all_log_probs.append(log_probs)
 
         log_probs = torch.cat(all_log_probs, dim=1)
@@ -1179,46 +1157,51 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
             op=torch.distributed.ReduceOp.SUM,
             group=tp_group,
         )
-        # print(f"log_probs shape: {log_probs.shape} after all reduce")
-        # print(f"log_probs shape: {log_probs.shape} after cat at rank {tp_rank}")
-        # final_log_probs = [torch.zeros_like(log_probs)] * tp_group_size
-        # torch.distributed.all_gather(final_log_probs, log_probs, group=tp_group)
-        # final_log_probs = torch.cat(final_log_probs, dim=1)
-        # print(f"final_log_probs shape: {final_log_probs.shape} after all gather at rank {tp_rank}")
         if not inference_only:
             # only save for backward when we have inference only=False
             # save tensor_parallel_hidden_states and the output_layer to the context
-            ctx.save_for_backward(original_tensor_parallel_hidden_states.detach(), target_mask.detach(), masked_target.detach(), output_weight_layer.detach())
-            # ctx.output_weight_layer = output_weight_layer
+            ctx.save_for_backward(
+                original_tensor_parallel_hidden_states.detach(),
+                target_mask.detach(),
+                masked_target.detach(),
+                output_weight_layer.detach(),
+            )
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
-            # ctx.output_weight = output_weight
-            #ctx.runtime_gather_output = runtime_gather_output
-        print(f"log_probs shape: {log_probs.shape} after forward, seq_size: {seq_size}, chunk_size: {chunk_size}, num_chunks: {num_chunks}")
+        print(
+            f"log_probs shape: {log_probs.shape} after forward, seq_size: {seq_size}, chunk_size: {chunk_size}, num_chunks: {num_chunks}"
+        )
         return log_probs
 
     @staticmethod
-    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, torch.Tensor,  None, None, None, None, None]:
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, torch.Tensor, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         # the tensor_parallel_hidden_states is already all gathered in the forward pass
-        tensor_parallel_hidden_states, target_mask, masked_target, output_weight_layer = ctx.saved_tensors
+        (
+            tensor_parallel_hidden_states,
+            target_mask,
+            masked_target,
+            output_weight_layer,
+        ) = ctx.saved_tensors
         tp_group = ctx.tp_group
         tp_group_size = torch.distributed.get_world_size(tp_group)
         if tp_group_size > 1:
-            all_hidden_states = [torch.zeros_like(tensor_parallel_hidden_states) for _ in range(tp_group_size)]
-            torch.distributed.all_gather(all_hidden_states, tensor_parallel_hidden_states, group=tp_group)
+            all_hidden_states = [
+                torch.zeros_like(tensor_parallel_hidden_states)
+                for _ in range(tp_group_size)
+            ]
+            torch.distributed.all_gather(
+                all_hidden_states, tensor_parallel_hidden_states, group=tp_group
+            )
             tensor_parallel_hidden_states = torch.cat(all_hidden_states, dim=0)
-        # output_weight_layer = ctx.output_weight_layer
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
-        #output_weight = ctx.output_weight
-        #runtime_gather_output = ctx.runtime_gather_output
         # this is the vocab size for this partition when the output_layer is a ColumnParallelLinear
-        partition_vocab_size = output_weight_layer.size(0) # int(output_layer.output_size) // tp_group_size
+        partition_vocab_size = output_weight_layer.size(0)
         seq_size = int(tensor_parallel_hidden_states.shape[0])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
-        tp_rank = get_tensor_model_parallel_rank()
-        print(f"num_chunks: {num_chunks}, chunk_size: {chunk_size}, seq_size: {seq_size}, target_mask shape: {target_mask.shape}, masked_target shape: {masked_target.shape} at rank {tp_rank}, grad_output shape: {grad_output.shape}")
         all_grad_input_hidden_states = []
         all_grad_input_output_layer = []
         grad_input_output_layer = torch.zeros_like(output_weight_layer)
@@ -1226,78 +1209,70 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
             # recalculate the logits using the output_layer
-            # logits, _ = output_layer(tensor_parallel_hidden_states[chunk_start:chunk_end, :, :], weight=output_weight, runtime_gather_output=runtime_gather_output)
-            logits = torch.matmul(tensor_parallel_hidden_states[chunk_start:chunk_end, :, :], output_weight_layer.T)
-            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()# [tp_rank * real_chunk_size: (tp_rank + 1) * real_chunk_size, :, :]
-            # print(f"logits shape: {logits.shape} at chunk {chunk_idx} after matmul using the weight layer directly before compute distributed log softmax)
+            logits = torch.matmul(
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :],
+                output_weight_layer.T,
+            )
+            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()
             softmax_output = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
             )
             softmax_output = softmax_output.exp().detach()
-            # print(f"softmax_output shape: {softmax_output.shape} at chunk {chunk_idx} after compute distributed log softmax")
-            # 1 if it's the chosen log prob, 0 otherwise
-            # used_masked_target = [torch.zeros_like(masked_target[:, chunk_start:chunk_end])] * tp_rank + [masked_target[:, chunk_start:chunk_end]] + [torch.zeros_like(masked_target[:, chunk_start:chunk_end])] * (tp_group_size - tp_rank - 1)
-            # used_target_mask = [torch.ones_like(target_mask[:, chunk_start:chunk_end])] * tp_rank + [target_mask[:, chunk_start:chunk_end]] + [torch.ones_like(target_mask[:, chunk_start:chunk_end])] * (tp_group_size - tp_rank - 1)
-            # used_masked_target = torch.cat(used_masked_target, dim=1)
-            # used_target_mask = torch.cat(used_target_mask, dim=1)
-            # print(f"log_probs shape: {log_probs.shape} at chunk {chunk_idx} after gather")
-            # is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-            #     -1
-            # ) * torch.nn.functional.one_hot(
-            #     masked_target[:, chunk_start:chunk_end],
-            #     num_classes=partition_vocab_size,
-            # )
             is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
                 -1
             ) * torch.nn.functional.one_hot(
                 masked_target[:, chunk_start:chunk_end],
                 num_classes=partition_vocab_size,
             )
-            # print(f"is_chosen shape: {is_chosen.shape} at chunk {chunk_idx} after one hot")
             grad_input = is_chosen.float().sub_(softmax_output)
-            # print(f"grad_input shape: {grad_input.shape} at chunk {chunk_idx} at rank {tp_rank}")
-            # used_grad_outputs = [grad_output[:, tp_rank_local * seq_size + chunk_start:tp_rank_local * seq_size + chunk_end] for tp_rank_local in range(tp_group_size)]
-            # used_grad_outputs = torch.cat(used_grad_outputs, dim=1)
-            used_grad_output = grad_output[:, chunk_start: chunk_end]
-            # print(f"grad_output shape: {grad_output.shape}, used_grad_output shape: {used_grad_output.shape} at chunk {chunk_idx} at rank {tp_rank}")
+            used_grad_output = grad_output[:, chunk_start:chunk_end]
             grad_input.mul_(used_grad_output.unsqueeze(dim=-1))
-            # be careful with shape of the matrices
-            # print(f"grad_input shape: {grad_input.shape} at chunk {chunk_idx}")
-            grad_input_hidden_states = torch.matmul(grad_input, output_weight_layer.to(dtype=torch.float32))# [chunk_start:chunk_end, :, :]
-            # grad_input_hidden_states = grad_input_hidden_states_matmul # [:, real_chunk_size * tp_rank: real_chunk_size * (tp_rank + 1):]
-            # print(f"grad_input_hidden_states shape: {grad_input_hidden_states.shape}, grad_input_hidden_states_matmul shape: {grad_input_hidden_states_matmul.shape}, grad_input shape: {grad_input.shape}, output_layer.weight shape: {output_layer.weight.shape}")
-            # grad_input_output_layer = torch.matmul(tensor_parallel_hidden_states[:, chunk_start:chunk_end, :], grad_input)
-            grad_input_output_layer_local = torch.einsum('bsd, bsv -> dv', tensor_parallel_hidden_states[chunk_start:chunk_end, :, :].transpose(0, 1).contiguous().to(dtype=torch.float32), grad_input.to(dtype=torch.float32))
+            grad_input_hidden_states = torch.matmul(
+                grad_input, output_weight_layer.to(dtype=torch.float32)
+            )  # [chunk_start:chunk_end, :, :]
+            grad_input_output_layer_local = torch.einsum(
+                "bsd, bsv -> dv",
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :]
+                .transpose(0, 1)
+                .contiguous()
+                .to(dtype=torch.float32),
+                grad_input.to(dtype=torch.float32),
+            )
             all_grad_input_hidden_states.append(grad_input_hidden_states)
-            grad_input_output_layer.add_(grad_input_output_layer_local.transpose(0, 1).contiguous())
-            #all_grad_input_output_layer.append(grad_input_output_layer[None, ...])
-            # print(f"grad_input_output_layer shape: {grad_input_output_layer.shape} at chunk {chunk_idx}")
+            grad_input_output_layer.add_(
+                grad_input_output_layer_local.transpose(0, 1).contiguous()
+            )
 
-        grad_input_hidden_states = torch.cat(all_grad_input_hidden_states, dim=1).transpose(0, 1).contiguous()
-        # print(f"grad_input_hidden_states shape: {grad_input_hidden_states.shape} after cat at rank {tp_rank}")
-        # need to reduce the gradient of the hidden states across the tensor parallel group
-        #grad_input_hidden_states = torch.distributed.all_reduce(grad_input_hidden_states, group=tp_group)
-        # the gradient of the output layer is the mean of the gradients from all the chunks
-
-        # grad_input_output_layer = torch.cat(all_grad_input_output_layer).mean(dim=0)
-        # print(f"grad_input_output_layer shape: {grad_input_output_layer.shape} after cat and mean")
-        # output_weight_layer.grad = grad_input_output_layer.transpose(0, 1).contiguous()
+        grad_input_hidden_states = (
+            torch.cat(all_grad_input_hidden_states, dim=1).transpose(0, 1).contiguous()
+        )
         weight_grad = grad_input_output_layer
         local_seq_size = seq_size // tp_group_size
-        # grad_input_hidden_states = grad_input_hidden_states[local_seq_size * tp_rank:local_seq_size * (tp_rank + 1), :,  :]
-        sharded_grad_hidden_states = torch.empty_like(grad_input_hidden_states[:local_seq_size])
-        grad_input_hidden_states_list = list(torch.chunk(grad_input_hidden_states, chunks=tp_group_size, dim=0))
+
+        sharded_grad_hidden_states = torch.empty_like(
+            grad_input_hidden_states[:local_seq_size]
+        )
+        grad_input_hidden_states_list = list(
+            torch.chunk(grad_input_hidden_states, chunks=tp_group_size, dim=0)
+        )
         torch.distributed.reduce_scatter(
             sharded_grad_hidden_states,
             grad_input_hidden_states_list,
             op=torch.distributed.ReduceOp.SUM,
-            group=tp_group
+            group=tp_group,
         )
-        # grad_input_hidden_states = grad_input_hidden_states[:, local_seq_size * tp_rank:local_seq_size * (tp_rank + 1),  :]
-        # TODO: return the gradient of the model parameters
-        print(f"grad_input_hidden_states shape: {grad_input_hidden_states.shape} after all reduce at rank {tp_rank}, weight_grad shape: {weight_grad.shape}")
-        return sharded_grad_hidden_states, None, weight_grad, None, None, None, None, None
+
+        return (
+            sharded_grad_hidden_states,
+            None,
+            weight_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int = 256) -> None:
@@ -1308,7 +1283,6 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int = 256) -> No
     GPTModel._linear_ce_fusion_chunk_size = chunk_size
     GPTModel.forward = _gpt_forward_with_linear_ce_fusion
     GPTModel._linear_ce_fusion_forward_patched = True
-
 
 
 def _gpt_forward_with_linear_ce_fusion(
@@ -1413,7 +1387,7 @@ def _gpt_forward_with_linear_ce_fusion(
     vocab_end_index = min((tp_rank + 1) * (self.vocab_size // tp_size), self.vocab_size)
     output_weight_layer = self.output_layer.weight
     logprobs = from_parallel_hidden_states_to_logprobs(
-        hidden_states, #.transpose(0, 1).contiguous(),
+        hidden_states,  # .transpose(0, 1).contiguous(),
         output_weight_layer,
         self.shared_embedding_or_output_weight()
         if self.share_embeddings_and_output_weights
@@ -1427,5 +1401,4 @@ def _gpt_forward_with_linear_ce_fusion(
         cp_group=self.cp_group,
         chunk_size=getattr(self, "_linear_ce_fusion_chunk_size", 256),
     )
-    print(f"logprobs shape: {logprobs.shape}")
     return logprobs
