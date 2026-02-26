@@ -144,7 +144,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ github.run_id }}
+        docker pull nemoci.azurecr.io/${{ inputs.image }}:main
 
     - name: Create UUID
       id: uuid
@@ -182,7 +182,7 @@ runs:
           --volume /mnt/datadrive/TestData/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -eux -o pipefail -c '\
+          nemoci.azurecr.io/nemo_rl_container:main bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
