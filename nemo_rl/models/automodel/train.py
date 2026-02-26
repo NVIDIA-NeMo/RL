@@ -515,13 +515,13 @@ class LossPostProcessor:
 
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
-            loss_fn_ = SequencePackingLossWrapper(
+            loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
-            loss, loss_metrics = loss_fn_(
+            loss, loss_metrics = loss_fn(
                 logits,
                 mb,
                 global_valid_seqs,

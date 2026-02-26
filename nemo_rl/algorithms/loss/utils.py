@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -28,6 +28,9 @@ def prepare_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> dict[str, Any]:
     """Prepare loss input for a loss function.
 
@@ -47,6 +50,9 @@ def prepare_loss_input(
             input_ids=data["input_ids"],
             next_token_logits=logits,
             seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
         )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -60,6 +66,9 @@ def prepare_loss_input(
                 teacher_topk_indices=data["teacher_topk_indices"],
                 zero_outside_topk=loss_fn.zero_outside_topk,
                 calculate_entropy=calculate_entropy,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
             )
         )
 

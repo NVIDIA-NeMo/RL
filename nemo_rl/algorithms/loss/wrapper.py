@@ -94,9 +94,12 @@ class SequencePackingLossWrapper:
 
             # prepare data for loss function
             loss_input = self.prepare_fn(
-                next_token_logits_slice,
-                unpadded_seq_data,
-                self.loss_fn,
+                logits=next_token_logits_slice,
+                data=unpadded_seq_data,
+                loss_fn=self.loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
             )
 
             # call loss function
@@ -131,3 +134,36 @@ class SequencePackingLossWrapper:
                     metrics_accum[k] += val
 
         return loss_accum, metrics_accum
+
+
+def wrap_loss_fn_with_input_preparation(
+    next_token_logits: Tensor,
+    data: BatchedDataDict[Any],
+    global_valid_seqs: Tensor | None,
+    global_valid_toks: Tensor | None,
+    loss_fn: LossFunction,
+    prepare_fn: Callable[Any, Any],
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    """Wraps a loss function to handle input preparation for megatron policy worker."""
+    # prepare loss input
+    loss_input = prepare_fn(
+        logits=next_token_logits,
+        data=data,
+        loss_fn=loss_fn,
+        vocab_parallel_rank=vocab_parallel_rank,
+        vocab_parallel_group=vocab_parallel_group,
+        context_parallel_group=context_parallel_group,
+    )
+
+    # call loss function
+    loss, loss_metrics = loss_fn(
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        **loss_input,
+    )
+
+    return loss, loss_metrics
