@@ -518,9 +518,9 @@ class LossPostProcessor:
         # Prepare data for loss function
         def prepare_for_loss_fn(
             logits: torch.Tensor, mb: BatchedDataDict[Any]
-        ) -> tuple[Any]:
+        ) -> dict[str, Any]:
             if self.loss_fn.input_type == LossInputType.LOGIT:
-                loss_fn_args = (logits,)
+                loss_input = {"logits": logits}
 
             elif self.loss_fn.input_type == LossInputType.LOGPROB:
                 logprobs = get_logprobs_from_logits(
@@ -529,7 +529,7 @@ class LossPostProcessor:
                     seq_index=mb.get("seq_index", None),
                 )
 
-                loss_fn_args = (logprobs,)
+                loss_input = {"next_token_logprobs": logprobs}
 
             elif self.loss_fn.input_type == LossInputType.DISTILLATION:
                 calculate_entropy = (
@@ -545,12 +545,16 @@ class LossPostProcessor:
                     )
                 )
 
-                loss_fn_args = (student_topk_logprobs, teacher_topk_logprobs, H_all)
+                loss_input = {
+                    "student_topk_logprobs": student_topk_logprobs,
+                    "teacher_topk_logprobs": teacher_topk_logprobs,
+                    "H_all": H_all,
+                }
 
             else:
                 raise ValueError(f"Unknown loss function type: {type(self.loss_fn)}")
 
-            return loss_fn_args
+            return loss_input
 
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
@@ -567,12 +571,12 @@ class LossPostProcessor:
                 global_valid_toks,
             )
         else:
-            loss_fn_args = prepare_for_loss_fn(logits, mb)
+            loss_input = prepare_for_loss_fn(logits, mb)
             loss, loss_metrics = self.loss_fn(
-                *loss_fn_args,
-                mb,
-                global_valid_seqs,
-                global_valid_toks,
+                data=mb,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **loss_input,
             )
 
         return loss, loss_metrics

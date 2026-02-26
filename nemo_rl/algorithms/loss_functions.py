@@ -191,12 +191,13 @@ class ClippedPGLossFn(LossFunction):
 
     def __call__(
         self,
-        curr_logprobs: Tensor,
+        next_token_logprobs: Tensor,
         data: BatchedDataDict[ClippedPGLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
+        curr_logprobs = next_token_logprobs
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
@@ -563,7 +564,7 @@ class NLLLoss(LossFunction):
 
     def __call__(
         self,
-        token_logprobs: Tensor,
+        next_token_logprobs: Tensor,
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor,
@@ -580,14 +581,14 @@ class NLLLoss(LossFunction):
             ## shape: [batch_size]
             num_unmasked_tokens = torch.sum(mask, -1)
             ## multiply by sample_mask to zero out invalid samples
-            loss = -torch.sum(token_logprobs * mask, dim=-1)
+            loss = -torch.sum(next_token_logprobs * mask, dim=-1)
             if dpo_average_log_probs:
                 loss = loss / num_unmasked_tokens.clamp(min=1)
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
             loss = -masked_mean(
-                token_logprobs,
+                next_token_logprobs,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
@@ -789,7 +790,7 @@ class DPOLossFn(PreferenceLoss):
 
     def _dpo_loss(
         self,
-        token_logprobs: Tensor,
+        next_token_logprobs: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
         global_valid_seqs: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -798,7 +799,7 @@ class DPOLossFn(PreferenceLoss):
         sample_mask = data["sample_mask"]
 
         ref_logprobs = data["reference_policy_logprobs"][:, :-1]
-        diff = (token_logprobs - ref_logprobs) * token_mask
+        diff = (next_token_logprobs - ref_logprobs) * token_mask
 
         rewards = diff.sum(-1)
         if self.preference_average_log_probs:
@@ -811,7 +812,7 @@ class DPOLossFn(PreferenceLoss):
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLoss)
     def __call__(  # type: ignore
         self,
-        token_logprobs: Tensor,
+        next_token_logprobs: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
         global_valid_seqs: Tensor,
         global_valid_toks: Tensor | None,
@@ -822,7 +823,7 @@ class DPOLossFn(PreferenceLoss):
                 "global_valid_toks must be provided for SFT loss"
             )
             sft_loss, _ = self.sft_loss(
-                token_logprobs,
+                next_token_logprobs,
                 data,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,  ## unused because sft loss returned is at the sample level
@@ -841,7 +842,7 @@ class DPOLossFn(PreferenceLoss):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._dpo_loss(token_logprobs, data, global_valid_seqs)
+        ) = self._dpo_loss(next_token_logprobs, data, global_valid_seqs)
 
         dpo_loss = (
             self.sft_loss_weight * sft_loss_chosen

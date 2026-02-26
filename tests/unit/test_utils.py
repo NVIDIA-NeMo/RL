@@ -47,7 +47,7 @@ class SimpleNLLLoss:
 
     def __call__(
         self,
-        token_logprobs: torch.Tensor,
+        next_token_logprobs: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor | None,
         global_valid_toks: torch.Tensor | None,
@@ -55,7 +55,7 @@ class SimpleNLLLoss:
         # Only compute loss on generated tokens (not input tokens)
         # by applying the token_mask (shifted by 1 since we're predicting next tokens)
         mask = data["token_mask"][:, 1:].cuda()
-        loss = -torch.sum(token_logprobs * mask)
+        loss = -torch.sum(next_token_logprobs * mask)
 
         return loss, {
             "loss": loss.item(),
