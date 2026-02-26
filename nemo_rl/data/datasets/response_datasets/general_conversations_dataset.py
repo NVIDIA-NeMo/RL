@@ -32,10 +32,8 @@ conversation_sender_mapping_sample_to_allowed = {
 
 
 # convert
-def convert_metadata(metadata: Dict[str, Any], return_inplace=False):
-    data = metadata
-    if not return_inplace:
-        data = metadata.copy()
+def convert_metadata(metadata: Dict[str, Any]):
+    data = metadata.copy()
 
     for tag in multimodal_utils.MEDIA_TAGS_TO_ALLOWED:
         if tag in data:
@@ -60,8 +58,7 @@ def convert_metadata(metadata: Dict[str, Any], return_inplace=False):
         message["value"] = msg_str
         data["conversations"][idx] = message
 
-    if not return_inplace:
-        return data
+    return data
 
 
 def conversation_process_message(
