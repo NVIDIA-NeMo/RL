@@ -234,7 +234,7 @@ jobs:
       runner: nemo-ci-gcp-gpu-x2
       image-label: megatron-bridge
       target: release
-      registry: ${{ vars.GB200_CONTAINER_REGISTRY }}
+      registry: ${{ vars.GB200_CONTAINER_REGISTRY }}/megatron-bridge
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
