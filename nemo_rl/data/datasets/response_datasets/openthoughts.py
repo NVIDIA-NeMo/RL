@@ -20,7 +20,7 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class OpenThoughtsDataset(RawDataset):
-    """Wrapper around OpenThoughts-114k with train split."""
+    """Wrapper around siyanzhao/Openthoughts_math_30k_opsd with train split."""
 
     def __init__(self, **kwargs) -> None:
         self.task_name = "OpenThoughts"
@@ -29,43 +29,33 @@ class OpenThoughtsDataset(RawDataset):
         download_dir = kwargs.get("download_dir", None)
 
         self.dataset = load_dataset(
-            "open-thoughts/OpenThoughts-114k",
-            "metadata",
+            "siyanzhao/Openthoughts_math_30k_opsd",
             split=split,
-            
             cache_dir=download_dir,
         )
-
-
 
         self.dataset = self.dataset.map(
             self.format_data,
             remove_columns=self.dataset.column_names,
-            #load_from_cache_file = False,
         )
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        #print(data.keys())
-        assistant_answer = (
-            data.get("ground_truth_solution")
-            or data.get("deepseek_solution")
-            or ""
-        )
+        # Use 'problem' if available, fall back to 'Question'
+        problem = data.get("problem") or data.get("Question", "")
+        # Map new field names to internal keys used by the processor and self-distillation
+        ground_truth_solution = data.get("Answer")
+        deepseek_reasoning = data.get("COT_Reason")
 
-        #print(assistant_answer)
+        assistant_answer = ground_truth_solution or ""
 
         return {
             "messages": [
-                {"role": "user", "content": data.get("problem", "")},
+                {"role": "user", "content": problem},
                 {"role": "assistant", "content": assistant_answer},
             ],
             "task_name": self.task_name,
-            "problem": data.get("problem"),
-            "ground_truth_solution": data.get("ground_truth_solution"),
-            "deepseek_reasoning": data.get("deepseek_reasoning"),
-            "deepseek_solution": data.get("deepseek_solution"),
-            "domain": data.get("domain"),
+            "problem": problem,
+            "ground_truth_solution": ground_truth_solution,
+            "deepseek_reasoning": deepseek_reasoning,
             "source": data.get("source"),
-            "test_cases": data.get("test_cases"),
-            "starter_code": data.get("starter_code"),
         }

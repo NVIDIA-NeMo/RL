@@ -223,7 +223,7 @@ def _build_cot_gt_texts(
         print("---------------------")
         print(gt)
         if cot and gt:
-            combined.append(f"{_PREFIX}\n{gt}{_TRANSITION}")
+            combined.append(f"{_PREFIX}\n{cot}\n{gt}{_TRANSITION}")
         else:
             text = gt or ""
             combined.append(f"{_PREFIX}{text}{_TRANSITION}" if text else text)
@@ -1183,7 +1183,7 @@ def distillation_train(
                 if ema_decay < 1.0 and teacher_policy is not student_policy:
                     with timer.time("ema_update"):
                         print("▶ Updating EMA teacher parameters...", flush=True)
-                        _update_ema_teacher(student_policy, teacher_policy, ema_decay)
+                        #_update_ema_teacher(student_policy, teacher_policy, ema_decay)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
