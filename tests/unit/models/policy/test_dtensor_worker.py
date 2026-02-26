@@ -19,15 +19,15 @@ import ray
 import torch
 from transformers import AutoModelForCausalLM
 
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, NLLLoss
+from nemo_rl.algorithms.loss import ClippedPGLossFn, NLLLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 
 def create_test_config(
@@ -267,7 +267,7 @@ def _base_setup_impl(request, cluster):
 
         if mode == "train":
             # Create loss function
-            loss_fn: LossFunction = SimpleLoss()
+            loss_fn: LossFunction = SimpleLossFn()
             yield policy, data, loss_fn
         elif mode == "logprob":
             token_logprobs = calculate_token_logprobs(model_name, data)
@@ -424,7 +424,7 @@ class TestSingleGPUCluster:
 
             # Create test batch
             data = create_test_batch(mode="train")
-            loss_fn = SimpleLoss()
+            loss_fn = SimpleLossFn()
 
             # Test training
             policy.prepare_for_training()
@@ -977,8 +977,8 @@ class TestTwoGPUCluster:
             tokenizer=tokenizer,
         )
 
-        # Test NLLLoss and ClippedPGLossFn with mbs=1
-        nll_loss_fn = NLLLoss()
+        # Test NLLLossFn and ClippedPGLossFn with mbs=1
+        nll_loss_fn = NLLLossFn()
         pg_loss_fn = ClippedPGLossFn(
             {
                 "ratio_clip_min": 0.2,
@@ -1022,7 +1022,7 @@ class TestTwoGPUCluster:
             tokenizer=tokenizer,
         )
 
-        # Test NLLLoss and ClippedPGLossFn with mbs=2
+        # Test NLLLossFn and ClippedPGLossFn with mbs=2
         policy_mbs2.prepare_for_training()
         mbs2_nll_results = policy_mbs2.train(data, nll_loss_fn)
         mbs2_nll_loss = mbs2_nll_results["loss"]
@@ -1087,7 +1087,7 @@ class TestTwoGPUCluster:
         )
 
         # Create loss function
-        loss_fn = SimpleLoss()
+        loss_fn = SimpleLossFn()
 
         try:
             # Prepare for training

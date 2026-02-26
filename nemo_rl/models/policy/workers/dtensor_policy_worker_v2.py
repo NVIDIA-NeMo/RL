@@ -39,7 +39,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,

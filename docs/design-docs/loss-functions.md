@@ -23,8 +23,7 @@ For our simple example above, this would look like:
 
 ```{testcode}
 import torch
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import LossType
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 

@@ -31,15 +31,13 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossInputType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
-    get_distillation_topk_logprobs_from_logits,
     get_logprobs_from_vocab_parallel_logits,
-    get_next_token_logprobs_from_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
@@ -515,52 +513,11 @@ class LossPostProcessor:
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
 
-        # Prepare data for loss function
-        def prepare_for_loss_fn(
-            logits: torch.Tensor, mb: BatchedDataDict[Any]
-        ) -> dict[str, Any]:
-            if self.loss_fn.input_type == LossInputType.LOGIT:
-                loss_input = {"logits": logits}
-
-            elif self.loss_fn.input_type == LossInputType.LOGPROB:
-                logprobs = get_next_token_logprobs_from_logits(
-                    input_ids=mb["input_ids"],
-                    next_token_logits=logits,
-                    seq_index=mb.get("seq_index", None),
-                )
-
-                loss_input = {"next_token_logprobs": logprobs}
-
-            elif self.loss_fn.input_type == LossInputType.DISTILLATION:
-                calculate_entropy = (
-                    self.loss_fn.zero_outside_topk and self.loss_fn.kl_type != "forward"
-                )
-                student_topk_logprobs, teacher_topk_logprobs, H_all = (
-                    get_distillation_topk_logprobs_from_logits(
-                        student_logits=logits,
-                        teacher_topk_logits=mb["teacher_topk_logits"],
-                        teacher_topk_indices=mb["teacher_topk_indices"],
-                        zero_outside_topk=self.loss_fn.zero_outside_topk,
-                        calculate_entropy=calculate_entropy,
-                    )
-                )
-
-                loss_input = {
-                    "student_topk_logprobs": student_topk_logprobs,
-                    "teacher_topk_logprobs": teacher_topk_logprobs,
-                    "H_all": H_all,
-                }
-
-            else:
-                raise ValueError(f"Unknown loss function type: {type(self.loss_fn)}")
-
-            return loss_input
-
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
             loss_fn_ = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
-                prepare_fn=prepare_for_loss_fn,
+                prepare_fn=prepare_loss_input,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
@@ -571,7 +528,7 @@ class LossPostProcessor:
                 global_valid_toks,
             )
         else:
-            loss_input = prepare_for_loss_fn(logits, mb)
+            loss_input = prepare_loss_input(logits, mb, self.loss_fn)
             loss, loss_metrics = self.loss_fn(
                 data=mb,
                 global_valid_seqs=global_valid_seqs,

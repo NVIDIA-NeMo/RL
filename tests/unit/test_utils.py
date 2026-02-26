@@ -15,11 +15,11 @@ from typing import Any
 
 import torch
 
-from nemo_rl.algorithms.interfaces import LossInputType, LossType
+from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-class SimpleLoss:
+class SimpleLossFn:
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGIT
 
@@ -41,7 +41,7 @@ class SimpleLoss:
 
 
 # Create a simple masked NLL loss function
-class SimpleNLLLoss:
+class SimpleNLLLossFn:
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 

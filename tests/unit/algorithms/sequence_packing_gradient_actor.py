@@ -23,10 +23,7 @@ from unittest.mock import MagicMock
 import ray
 import torch
 
-from nemo_rl.algorithms.loss_functions import (
-    ClippedPGLossFn,
-    SequencePackingLossWrapper,
-)
+from nemo_rl.algorithms.loss import ClippedPGLossFn, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 

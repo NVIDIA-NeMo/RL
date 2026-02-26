@@ -46,8 +46,8 @@ from transformers import (
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,

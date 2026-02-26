@@ -21,7 +21,7 @@ from typing import Any, Iterator, Optional, Tuple
 import torch
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
