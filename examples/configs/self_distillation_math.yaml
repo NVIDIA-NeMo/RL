@@ -1,26 +1,26 @@
 # Self‑Distillation Algorithm Configuration
 distillation:
-  num_prompts_per_step: 128
+  num_prompts_per_step: 2
   num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 10
-  val_batch_size: 64
-  val_period: 10
+  val_batch_size: 32
+  val_period: 5
   val_at_start: false
   val_at_end: false
   max_val_samples: 512
-  topk_logits_k: 1024
+  topk_logits_k: 200
   seed: 42
   # EMA Teacher Configuration:
   # - ema_decay: 1.0 (default) = teacher shares parameters with student (standard self-distillation)
   # - ema_decay: 0.999 = separate EMA teacher that slowly tracks student (teacher = 0.999*teacher + 0.001*student)
   # - ema_decay: 0.9999 = slower EMA update (more stable but less responsive to student changes)
   # Set ema_decay < 1.0 to enable a separate teacher policy with EMA updates
-  ema_decay: 0.99999
+  ema_decay: 0.999999
 
 loss_fn:
-  kl_type: "mixed"
+  kl_type: "jsd"
   mixed_kl_weight: 0.5
   zero_outside_topk: false
 
@@ -40,9 +40,9 @@ policy: &POLICY_BASE
   tokenizer:
     name: ${..model_name}
     chat_template_kwargs: null # for now dont use thinking template because the <think> tags messes with teacher prompt format 
-  train_global_batch_size: 64
+  train_global_batch_size: 2
   train_micro_batch_size: 1
-  generation_batch_size: 64
+  generation_batch_size: 2
   logprob_batch_size: 1
   max_total_sequence_length: 16384
   precision: "bfloat16"
@@ -201,9 +201,6 @@ data:
   train:
     dataset_name: OpenThoughts
     processor: "openthoughts_processor"
-    config_name: "metadata"
-    # If your loader expects the HF dataset name, use:
-    # dataset_path: "open-thoughts/OpenThoughts-114k"
     # split: "train"
   validation:
     dataset_name: AIME2024
