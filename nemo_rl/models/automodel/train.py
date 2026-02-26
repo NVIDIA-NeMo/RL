@@ -37,9 +37,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
-    get_distilllation_topk_logprobs_from_logits,
-    get_logprobs_from_logits,
+    get_distillation_topk_logprobs_from_logits,
     get_logprobs_from_vocab_parallel_logits,
+    get_next_token_logprobs_from_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
@@ -523,7 +523,7 @@ class LossPostProcessor:
                 loss_input = {"logits": logits}
 
             elif self.loss_fn.input_type == LossInputType.LOGPROB:
-                logprobs = get_logprobs_from_logits(
+                logprobs = get_next_token_logprobs_from_logits(
                     input_ids=mb["input_ids"],
                     next_token_logits=logits,
                     seq_index=mb.get("seq_index", None),
@@ -536,7 +536,7 @@ class LossPostProcessor:
                     self.loss_fn.zero_outside_topk and self.loss_fn.kl_type != "forward"
                 )
                 student_topk_logprobs, teacher_topk_logprobs, H_all = (
-                    get_distilllation_topk_logprobs_from_logits(
+                    get_distillation_topk_logprobs_from_logits(
                         student_logits=logits,
                         teacher_topk_logits=mb["teacher_topk_logits"],
                         teacher_topk_indices=mb["teacher_topk_indices"],

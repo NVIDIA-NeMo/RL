@@ -27,8 +27,8 @@ from nemo_rl.algorithms.loss_functions import (
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    get_distilllation_topk_logprobs_from_logits,
-    get_logprobs_from_logits,
+    get_distillation_topk_logprobs_from_logits,
+    get_next_token_logprobs_from_logits,
 )
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
@@ -95,7 +95,9 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    token_logprobs = get_logprobs_from_logits(data["input_ids"], next_token_logits)
+    token_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], next_token_logits
+    )
     loss, metrics_dict = loss_fn(
         token_logprobs,
         data,
@@ -121,7 +123,9 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    token_logprobs = get_logprobs_from_logits(data["input_ids"], next_token_logits)
+    token_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], next_token_logits
+    )
     loss, metrics_dict = loss_fn(
         token_logprobs,
         data,
@@ -157,7 +161,9 @@ def test_dpo_loss():
         }
     )
 
-    token_logprobs = get_logprobs_from_logits(data["input_ids"], next_token_logits)
+    token_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], next_token_logits
+    )
     loss, metrics_dict = loss_fn(
         token_logprobs,
         data,
@@ -267,7 +273,9 @@ def test_dpo_loss_varying_sequence_lengths():
             "sample_mask": sample_mask,
         }
     )
-    token_logprobs = get_logprobs_from_logits(data["input_ids"], next_token_logits)
+    token_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], next_token_logits
+    )
 
     # Compute loss
     loss, metrics = dpo_loss_fn_no_avg(
@@ -330,7 +338,7 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute NLL loss
     nll_loss_fn = NLLLoss()
-    token_logprobs = get_logprobs_from_logits(
+    token_logprobs = get_next_token_logprobs_from_logits(
         sft_data["input_ids"], next_token_logits[::2]
     )
     nll_loss, nll_metrics = nll_loss_fn(
@@ -352,7 +360,9 @@ def test_dpo_sft_matches_nll_loss():
             "sft_average_log_probs": False,
         }
     )
-    token_logprobs = get_logprobs_from_logits(dpo_data["input_ids"], next_token_logits)
+    token_logprobs = get_next_token_logprobs_from_logits(
+        dpo_data["input_ids"], next_token_logits
+    )
     dpo_loss, dpo_metrics = dpo_loss_fn(
         token_logprobs,
         dpo_data,
@@ -516,7 +526,7 @@ def test_clipped_pg_loss_ppo_clipping():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -564,7 +574,7 @@ def test_clipped_pg_loss_reinforce_mode():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -610,7 +620,7 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, metrics = loss_fn(
         current_logprobs,
@@ -721,7 +731,7 @@ def test_clipped_pg_loss_kl_penalty():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -750,7 +760,9 @@ def test_clipped_pg_loss_masking():
     )
     # Need some realistic-ish logits and logprobs for masking test
     dummy_logits = torch.randn(batch_size, seq_len, vocab_size, device=device)
-    current_logprobs = get_logprobs_from_logits(data["input_ids"], dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], dummy_logits
+    )
 
     # Ensure logprobs used by the loss fn make sense relative to advantages
     data["prev_logprobs"] = torch.randn_like(data["prev_logprobs"]) * 0.1
@@ -823,7 +835,7 @@ def test_clipped_pg_loss_masking():
     data_only_b0 = BatchedDataDict(data_only_b0_dict)
 
     logits_only_b0 = dummy_logits[0:1]
-    current_logprobs_only_b0 = get_logprobs_from_logits(
+    current_logprobs_only_b0 = get_next_token_logprobs_from_logits(
         data_only_b0["input_ids"], logits_only_b0
     )
     loss_only_b0, _ = loss_fn(
@@ -847,7 +859,9 @@ def test_clipped_pg_loss_zero_mask():
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
     # Need dummy logits
     dummy_logits = torch.randn(1, seq_len, vocab_size, device=device)
-    current_logprobs = get_logprobs_from_logits(data["input_ids"], dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], dummy_logits
+    )
 
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["reference_policy_kl_penalty"] = 0.1
@@ -1002,7 +1016,7 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1135,7 +1149,7 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1357,7 +1371,7 @@ def test_clipped_pg_loss_dual_clip():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1407,7 +1421,9 @@ def test_clipped_pg_loss_entropy():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, data["input_ids"], batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(data["input_ids"], dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(
+        data["input_ids"], dummy_logits
+    )
 
     _, metrics = loss_fn(
         current_logprobs,
@@ -1492,7 +1508,7 @@ def test_clipped_pg_loss_gspo():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1591,7 +1607,7 @@ def test_clipped_pg_loss_gspo_batch_size_2():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1693,7 +1709,7 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    current_logprobs = get_logprobs_from_logits(input_ids, dummy_logits)
+    current_logprobs = get_next_token_logprobs_from_logits(input_ids, dummy_logits)
 
     actual_loss, _ = loss_fn(
         current_logprobs,
@@ -1757,7 +1773,7 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
     )
 
     calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=student_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -1810,7 +1826,7 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
     )
 
     calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=student_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -1858,7 +1874,7 @@ def test_distillation_loss_invalid_k_zero():
     # This should raise a ValueError for k=0
     with pytest.raises(ValueError, match="topk must be positive"):
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-        _ = get_distilllation_topk_logprobs_from_logits(
+        _ = get_distillation_topk_logprobs_from_logits(
             student_logits=student_logits,
             teacher_topk_logits=data["teacher_topk_logits"],
             teacher_topk_indices=data["teacher_topk_indices"],
@@ -1883,7 +1899,7 @@ def test_distillation_loss_gradient_flow():
     )
 
     calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=student_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -1925,7 +1941,7 @@ def test_distillation_loss_edge_cases():
     # Test with all-zero logits
     zero_logits = torch.zeros_like(student_logits)
     calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=zero_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -1946,7 +1962,7 @@ def test_distillation_loss_edge_cases():
 
     # Test with very large logits
     large_logits = torch.ones_like(student_logits) * 100.0
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=large_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -1967,7 +1983,7 @@ def test_distillation_loss_edge_cases():
 
     # Test with very small logits
     small_logits = torch.ones_like(student_logits) * -100.0
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=small_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],
@@ -2025,7 +2041,7 @@ def test_distillation_loss_fn_call():
     )
 
     calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-    loss_fn_args = get_distilllation_topk_logprobs_from_logits(
+    loss_fn_args = get_distillation_topk_logprobs_from_logits(
         student_logits=student_logits,
         teacher_topk_logits=data["teacher_topk_logits"],
         teacher_topk_indices=data["teacher_topk_indices"],

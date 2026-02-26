@@ -825,7 +825,7 @@ def get_logprobs_from_vocab_parallel_logits(
     )
 
 
-def get_logprobs_from_logits(
+def get_next_token_logprobs_from_logits(
     input_ids: torch.Tensor,
     next_token_logits: torch.Tensor,
     seq_index: Optional[torch.Tensor] = None,
@@ -833,7 +833,7 @@ def get_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Computes log probabilities from logits."""
+    """Computes next token log probabilities from logits."""
     next_token_logits = next_token_logits.to(torch.float32)
 
     if vocab_parallel_group is not None:
@@ -1026,7 +1026,7 @@ def gather_logits_at_global_indices(
     return gathered_logits
 
 
-def get_distilllation_topk_logprobs_from_logits(
+def get_distillation_topk_logprobs_from_logits(
     student_logits: torch.Tensor,
     teacher_topk_logits: torch.Tensor,
     teacher_topk_indices: torch.Tensor,
