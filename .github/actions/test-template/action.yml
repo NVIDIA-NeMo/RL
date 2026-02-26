@@ -67,6 +67,7 @@ runs:
       shell: bash
       run: |
         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        whoami
 
     - name: Azure Login
       if: ${{ inputs.has-azure-credentials == 'true' }}
