@@ -216,6 +216,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
+        init_reference_model: bool = True,
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
@@ -300,6 +301,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
+
+        # Initialize reference model if requested
+        self.reference_model_state_dict = None
+        if init_reference_model:
+            self.reference_model_state_dict = setup_reference_model_state(self.model)
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
