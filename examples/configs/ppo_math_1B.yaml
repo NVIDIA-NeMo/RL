@@ -7,12 +7,12 @@ ppo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-  max_num_epochs: 1
-  steps_per_epoch: 64
+  max_num_epochs: 32
+  steps_per_epoch: 4
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 10
-  val_at_start: false
+  val_period: 1
+  val_at_start: true
   val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
@@ -69,6 +69,8 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+
+  value_loss_scale: 0.4
 
 checkpointing:
   enabled: true
@@ -286,7 +288,7 @@ policy:
 
 # Value Model Configuration (for GAE advantage estimation in PPO)
 value:
-  model_name: "Qwen/Qwen3-Reranker-0.6B"  # Can use same model as policy or a smaller one
+  model_name: ${policy.model_name}  # Can use same model as policy or a smaller one
   tokenizer:
     name: ${value.model_name}
     chat_template_kwargs: null
@@ -306,6 +308,7 @@ value:
   reward_model_cfg:
     enabled: true
     reward_model_type: "regression"
+    only_head_unfreeze: true
 
   # DTensor backend configuration (only DTensor V2 is supported for value models)
   dtensor_cfg:

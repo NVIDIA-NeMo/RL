@@ -37,6 +37,7 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
+    MseValueLossFn,
 )
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -66,6 +67,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models import value
 from nemo_rl.models.automodel import train
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
@@ -331,6 +333,7 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
+    value_loss_fn = MseValueLossFn(loss_config["value_loss_scale"])
 
     # Validate force_on_policy_ratio
     if loss_config.get("force_on_policy_ratio", False):
@@ -542,16 +545,16 @@ def setup(
             value_optimizer_path = None
 
         # TODO: Proper implementation of the value model
-        # v = Value(
-        #     cluster=train_cluster,
-        #     config=value_config,
-        #     tokenizer=tokenizer,
-        #     name_prefix="lm_value",
-        #     weights_path=value_weights_path,
-        #     optimizer_path=value_optimizer_path,
-        #     init_optimizer=True,
-        # )
-        v = None
+        v = Value(
+            cluster=train_cluster,
+            config=value_config,
+            tokenizer=tokenizer,
+            name_prefix="lm_value",
+            weights_path=value_weights_path,
+            optimizer_path=value_optimizer_path,
+            init_optimizer=True,
+        )
+        # v = None
         return v, time.perf_counter() - t0
 
     def init_vllm():
@@ -790,6 +793,7 @@ def setup(
         dataloader,
         val_dataloader,
         loss_fn,
+        value_loss_fn,
         logger,
         checkpointer,
         grpo_save_state,
@@ -1173,6 +1177,7 @@ def ppo_train(
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
+    value_loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
@@ -1286,6 +1291,8 @@ def ppo_train(
                     )
                     POLICY_GENERATION_STALE = False
                 else:
+                    if colocated_inference:
+                        policy.offload_after_refit()
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
@@ -1344,29 +1351,26 @@ def ppo_train(
                     ],
                 )
 
-                values = (
-                    torch.arange(messages["token_ids"].shape[0])
-                    / messages["token_ids"].shape[0]
-                )[:, None].repeat(1, messages["token_ids"].shape[1])
-
-                train_data = BatchedDataDict(
+                train_data = BatchedDataDict[ClippedPGLossDataDict](
                     {
                         "input_ids": messages["token_ids"],
                         "input_lengths": input_lengths,
                         "generation_logprobs": messages["generation_logprobs"],
-                        "values": values,
                         "rewards": repeated_batch["total_reward"],
                         "sample_mask": repeated_batch["loss_multiplier"],
                         "token_mask": messages["token_loss_mask"],
                     }
                 )
 
+                values = value_model.get_values(train_data)
+                train_data["values"] = values["values"][..., 0]
+
             with timer.time("compute_advantages"):
                 print("▶ Computing advantages...", flush=True)
                 train_data["advantages"] = adv_estimator.compute_advantage(
                     prompt_ids=torch.arange(messages["token_ids"].shape[0]),
                     rewards=train_data["rewards"],
-                    mask=torch.ones_like(messages["token_ids"]),
+                    mask=train_data["token_mask"],
                     values=train_data["values"],
                     lengths=input_lengths,
                 )
@@ -1384,7 +1388,7 @@ def ppo_train(
             for step in range(steps_per_epoch):
                 print(f"▶ Step {step + 1}/{steps_per_epoch}...", flush=True)
                 permutation = torch.randperm(train_data["advantages"].shape[0])
-                train_data_permuted = BatchedDataDict(
+                train_data_permuted = BatchedDataDict[ClippedPGLossDataDict](
                     {
                         "input_ids": train_data["input_ids"][permutation],
                         "input_lengths": train_data["input_lengths"][permutation],
@@ -1410,22 +1414,54 @@ def ppo_train(
                         loss_fn,
                         timer=timer,
                     )
+                    policy.finish_training()
+                    POLICY_GENERATION_STALE = True
+
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
 
                 with timer.time("value_training"):
                     print("▶ Training value...", flush=True)
-                    pass
+                    value_results = value_model.train(
+                        train_data_permuted,
+                        value_loss_fn,
+                        timer=timer,
+                    )
+                    value_model.finish_training()
 
-            if current_epoch % val_period == 0 and current_step != 0:
+                print(f"▶ Step {step + 1}/{steps_per_epoch} training results:")
+                print(f"    • Policy loss: {train_results['loss'].item():.4f}")
+                print(f"    • Value loss: {value_results['loss'].item():.4f}")
+
+            if (current_epoch + 1) % val_period == 0:
                 with timer.time("validation"):
                     print("▶ Validating...", flush=True)
+
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        if colocated_inference:
+                            policy.offload_after_refit()
+                        policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
-                        policy,
+                        policy_generation,
                         val_dataloader,
                         tokenizer,
-                        loss_fn,
-                        step=total_steps + 1,
+                        val_task_to_env,
+                        step=0,
                         master_config=master_config,
                         logger=logger,
+                    )
+                    policy_generation.finish_generation()
+
+                    logger.log_metrics(
+                        validation_timings, total_steps + 1, prefix="timing/validation"
+                    )
+                    logger.log_metrics(
+                        val_metrics, total_steps + 1, prefix="validation"
                     )
 
 
@@ -1455,8 +1491,8 @@ def validate(
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
-            master_config["grpo"]["max_val_samples"]
-            // master_config["grpo"]["val_batch_size"]
+            master_config["ppo"]["max_val_samples"]
+            // master_config["ppo"]["val_batch_size"]
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -1470,7 +1506,7 @@ def validate(
                 tokenizer,
                 val_task_to_env,
                 max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
                 greedy=False,
             )
 
