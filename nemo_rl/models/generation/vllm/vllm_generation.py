@@ -38,7 +38,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.routing_policy import create_routing_policy
+from nemo_rl.models.generation.vllm.routing_policy import (
+    RoundRobinRoutingPolicy,
+    create_routing_policy,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
@@ -226,11 +229,6 @@ class VllmGeneration(GenerationInterface):
 
         # Pluggable routing policy for selecting DP shard and worker
         routing_policy_cfg = self.cfg.get("routing_policy")
-        if routing_policy_cfg and routing_policy_cfg.get("type", "round_robin") != "round_robin":
-            assert self.cfg["vllm_cfg"]["async_engine"], (
-                f"Custom routing policy (type={routing_policy_cfg['type']!r}) requires async_engine=True. "
-                "The sync generation path fans out to all DP shards and does not use the routing policy."
-            )
         self._routing_policy = create_routing_policy(
             routing_policy_cfg,
             dp_leader_worker_indices=self.worker_group.dp_leader_worker_indices,
@@ -494,6 +492,68 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def _sync_generate_routed(
+        self,
+        method_name: str,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool,
+        pad_value_dict: dict[str, int | float],
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Route each sample via the routing policy and dispatch to workers.
+
+        For each sample: call select_worker(), then on_prefill_complete().
+        Samples are grouped by dp_shard, dispatched as sub-batches, and
+        results are reassembled in the original order.
+        """
+        batch_size = len(data["input_ids"]) if "input_ids" in data else len(data["prompts"])
+
+        # Route every sample sequentially so the router sees updated state.
+        request_ids: list[str] = []
+        decisions: list[int] = []  # dp_shard_idx per sample
+        for i in range(batch_size):
+            sample = data.select_indices([i])
+            request_id = str(uuid4())
+            decision = self._routing_policy.select_worker(
+                data=sample, request_id=request_id,
+            )
+            self._routing_policy.on_prefill_complete(request_id)
+            request_ids.append(request_id)
+            decisions.append(decision.dp_shard_idx)
+
+        # Group sample indices by dp_shard and dispatch each sub-batch.
+        shard_to_indices: dict[int, list[int]] = defaultdict(list)
+        for i, dp_shard in enumerate(decisions):
+            shard_to_indices[dp_shard].append(i)
+
+        futures: list[tuple[list[int], ray.ObjectRef]] = []
+        for dp_shard, indices in shard_to_indices.items():
+            sub_batch = data.select_indices(indices)
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_shard)
+            future = self.worker_group.run_single_worker_single_data(
+                method_name,
+                worker_idx=worker_idx,
+                data=sub_batch,
+                greedy=greedy,
+            )
+            futures.append((indices, future))
+
+        # Collect results and map back to original order.
+        ordered: list[tuple[int, BatchedDataDict]] = []
+        for indices, future in futures:
+            result = ray.get(future)
+            for pos, orig_idx in enumerate(indices):
+                ordered.append((orig_idx, result.select_indices([pos])))
+
+        # Notify routing policy of completion.
+        for request_id in request_ids:
+            self._routing_policy.on_generation_complete(request_id)
+
+        ordered.sort(key=lambda x: x[0])
+        combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
+            [item for _, item in ordered], pad_value_dict=pad_value_dict,
+        )
+        return combined
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -505,7 +565,13 @@ class VllmGeneration(GenerationInterface):
             "input_ids and input_lengths are required in data for vLLM generation"
         )
 
-        # Shard the data across the tied worker groups
+        if not isinstance(self._routing_policy, RoundRobinRoutingPolicy):
+            return self._sync_generate_routed(
+                "generate", data, greedy,
+                pad_value_dict={"output_ids": self.cfg["_pad_token_id"]},
+            )
+
+        # Fast path: even sharding for round-robin.
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
@@ -556,7 +622,13 @@ class VllmGeneration(GenerationInterface):
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
 
-        # Shard the data across the tied worker groups
+        if not isinstance(self._routing_policy, RoundRobinRoutingPolicy):
+            return self._sync_generate_routed(
+                "generate_text", data, greedy,
+                pad_value_dict={"output_ids": self.cfg["_pad_token_id"]},
+            )
+
+        # Fast path: even sharding for round-robin.
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
