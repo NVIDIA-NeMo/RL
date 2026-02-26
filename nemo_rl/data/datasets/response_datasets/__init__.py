@@ -15,11 +15,15 @@
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
+from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMath17KDataset,
     DAPOMathAIME2024Dataset,
 )
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
+    GeneralConversationsJsonlDataset,
+)
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
@@ -39,6 +43,8 @@ DATASET_REGISTRY = {
     # built-in datasets
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
+    "daily-omni": DailyOmniDataset,
+    "general-conversation-jsonl": GeneralConversationsJsonlDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
@@ -84,6 +90,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 __all__ = [
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",
+    "DailyOmniDataset",
+    "GeneralConversationsJsonlDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
     "DeepScalerDataset",

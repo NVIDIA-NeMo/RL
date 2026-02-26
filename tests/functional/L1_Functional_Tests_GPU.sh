@@ -53,6 +53,7 @@ time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_cor
 time uv run --no-sync bash ./tests/functional/test_converters.sh
 time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
+time uv run --no-sync bash ./tests/functional/sft_avlm.sh
 
 # Research functional tests (self-discovery)
 for test_script in research/*/tests/functional/*.sh; do
