@@ -39,7 +39,8 @@ class Tulu3SftMixtureDataset(RawDataset):
             "WARNING: For reproducible experiments, preprocess the dataset once and define your own HfDataset subclass that directly uses the preprocessed datasets."
         )
 
-        self.task_name = "tulu3_sft_mixture"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="tulu3_sft_mixture", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("allenai/tulu-3-sft-mixture")["train"]

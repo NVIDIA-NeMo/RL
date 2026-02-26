@@ -27,7 +27,8 @@ class AIME2024Dataset(RawDataset):
     """
 
     def __init__(self, repeat: int = 16, **kwargs) -> None:
-        self.task_name = "AIME2024"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="AIME2024", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")

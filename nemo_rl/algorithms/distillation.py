@@ -159,13 +159,13 @@ def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
-    Optional[StatefulDataLoader],
+    dict[str, StatefulDataLoader],
     DistillationLossFn,
     Logger,
     CheckpointManager,
@@ -257,27 +257,27 @@ def setup(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
     )
 
-    # Load validation dataset if provided
-    val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
+    val_dataloader: dict[str, StatefulDataLoader] = {}
     if (
         distillation_config["val_period"] > 0
         or distillation_config["val_at_start"]
         or distillation_config["val_at_end"]
     ):
-        assert val_dataset is not None, (
+        assert len(val_dataset) > 0, (
             "Validation dataset is required if validation is enabled"
         )
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=distillation_config["val_batch_size"],
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-        )
-        print(
-            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
-            flush=True,
-        )
+        for task_name, val_data in val_dataset.items():
+            val_dataloader[task_name] = StatefulDataLoader(
+                val_data,
+                batch_size=distillation_config["val_batch_size"],
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+            )
+            print(
+                f"  ✓ Validation dataloader {task_name} loaded with {len(val_data)} samples",
+                flush=True,
+            )
 
     # ==========================
     #          Cluster
@@ -508,7 +508,7 @@ def distillation_train(
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: DistillationLossFn,
     task_to_env: dict[str, EnvironmentInterface],
@@ -783,12 +783,12 @@ def distillation_train(
                 ]
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -797,6 +797,7 @@ def distillation_train(
                 ):
                     student_policy.prepare_for_training()
 
+                    # +1 because step is 0-indexed
                     distillation_save_state["current_epoch"] = current_epoch
                     distillation_save_state["current_step"] = current_step + 1
                     distillation_save_state["total_steps"] = total_steps + 1
@@ -809,14 +810,6 @@ def distillation_train(
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -951,14 +944,14 @@ def distillation_train(
 
 def validate(
     policy_generation: GenerationInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloaders: dict[str, StatefulDataLoader],
     tokenizer,
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
+    if len(val_dataloaders) == 0:
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
@@ -973,71 +966,91 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
+        accuracy = {}
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        max_samples = master_config["distillation"]["max_val_samples"]
+        cur_samples = 0
+
+        for task_name, val_dataloader in val_dataloaders.items():
+            task_rewards = []
+
+            for val_batch in val_dataloader:
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                if _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+
+                task_rewards.extend(val_batch["total_reward"].tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
+                all_message_logs.extend(to_env)
+
+                cur_samples += len(val_batch["message_log"])
+                if cur_samples >= max_samples:
+                    break
+
+            # Calculate task accuracy
+            rewards_t = torch.tensor(task_rewards, dtype=torch.float32)
+            accuracy[task_name] = rewards_t.mean().item()
+
+            total_rewards.extend(task_rewards)
+
+            if cur_samples >= max_samples:
                 break
 
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
-                )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
-                )
-            rewards = val_batch["total_reward"]
-
-            total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
-
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
-
-            all_message_logs.extend(to_env)
-
         # Calculate validation metrics
-        accuracy = (
-            sum(total_rewards) / len(total_rewards) if len(total_rewards) > 0 else 0
+        assert "total" not in accuracy, (
+            "total is a reserved task_name since it is used in the metrics as the aggregate label"
         )
+        rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+        accuracy["total"] = rewards_t.mean().item()
+
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0
         )
 
         val_metrics = {
-            "accuracy": accuracy,
+            "accuracy": accuracy["total"],
+            **{f"accuracy_{k}": v for k, v in accuracy.items()},
             "avg_length": avg_length,
         }
+        del val_metrics["accuracy_total"]
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1060,7 +1073,10 @@ def validate(
 
     # Print summary of validation results
     print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
+    print(f"    • Accuracy: {accuracy['total']:.4f}")
+    for task_name, task_accuracy in accuracy.items():
+        if task_name != "total":
+            print(f"        • Accuracy for {task_name}: {task_accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 

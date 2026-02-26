@@ -92,12 +92,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    Optional[StatefulDataLoader],
+    dict[str, StatefulDataLoader],
     NLLLoss,
     Logger,
     CheckpointManager,
@@ -151,17 +151,33 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    if val_dataset is not None:
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=sft_config["val_global_batch_size"],
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-            drop_last=False,
-            num_workers=data_config["num_workers"],
+    print(
+        f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
+    )
+
+    # If validation is enabled, load the validation dataloader
+    val_dataloader: dict[str, StatefulDataLoader] = {}
+    if (
+        sft_config["val_period"] > 0
+        or sft_config["val_at_start"]
+        or sft_config["val_at_end"]
+    ):
+        assert len(val_dataset) > 0, (
+            "Validation dataset is required if validation is enabled"
         )
-    else:
-        val_dataloader = None
+        for task_name, val_data in val_dataset.items():
+            val_dataloader[task_name] = StatefulDataLoader(
+                val_data,
+                batch_size=sft_config["val_global_batch_size"],
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+                drop_last=False,
+                num_workers=data_config["num_workers"],
+            )
+            print(
+                f"  ✓ Validation dataloader {task_name} loaded with {len(val_data)} samples",
+                flush=True,
+            )
 
     # ==========================
     #          Cluster
@@ -235,7 +251,7 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloaders: dict[str, StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
@@ -245,100 +261,122 @@ def validate(
     val_mbs: int,
 ):
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
-        assert master_config["sft"]["val_period"] <= 0, (
-            "val_dataloader is None, so sft.val_period must be <= 0"
-        )
-        print("  ⚠️ No validation dataloader provided, skipping validation")
+    if len(val_dataloaders) == 0:
+        print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
     timer = Timer()
-
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        # Show a progress indicator for validation
-        # val_total = len(val_dataloader)
+        total_val_loss = 0.0
+        total_num_valid_tokens = 0
 
-        val_metrics = {"val_loss": 0.0}
-        sum_num_valid_tokens = 0
+        val_loss = {}
+        cur_batch_idx = 0
 
         policy.prepare_for_training()
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            ## add loss mask based on role to every message
-            add_loss_mask_to_message_log(
-                val_batch["message_log"],
-                roles_to_train_on=["assistant"],
-            )
+        for task_name, val_dataloader in val_dataloaders.items():
+            task_val_loss = 0.0
+            task_num_valid_tokens = 0
 
-            cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                val_batch["message_log"],
-                pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                make_sequence_length_divisible_by=master_config["policy"][
-                    "make_sequence_length_divisible_by"
-                ],
-            )
-
-            val_data: BatchedDataDict = BatchedDataDict(
-                {
-                    "input_ids": cat_and_padded["token_ids"],
-                    "input_lengths": input_lengths,
-                    "token_mask": cat_and_padded["token_loss_mask"],
-                    "sample_mask": val_batch["loss_multiplier"],
-                }
-            )
-
-            # update multimodal data
-            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
-            # When running validation with drop_last=False, we might end up with a partial batch.
-            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
-            if val_data.size < val_batch_size:
-                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
-
-            ## just run model fwd
-            val_results = policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                gbs=val_data.size,
-                mbs=val_mbs,
-            )
-
-            if len(val_results["all_mb_metrics"]) == 0:
-                warnings.warn(
-                    "No validation metrics were collected for this batch."
-                    " This is likely because there were no valid samples."
+            for val_batch in val_dataloader:
+                ## add loss mask based on role to every message
+                add_loss_mask_to_message_log(
+                    val_batch["message_log"],
+                    roles_to_train_on=["assistant"],
                 )
-            else:
-                num_valid_tokens = (
-                    val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
-                ).sum()
-                val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
-                sum_num_valid_tokens += num_valid_tokens
 
-            if val_batches > 0 and batch_idx >= val_batches - 1:
+                cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+                    val_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    make_sequence_length_divisible_by=master_config["policy"][
+                        "make_sequence_length_divisible_by"
+                    ],
+                )
+
+                val_data: BatchedDataDict = BatchedDataDict(
+                    {
+                        "input_ids": cat_and_padded["token_ids"],
+                        "input_lengths": input_lengths,
+                        "token_mask": cat_and_padded["token_loss_mask"],
+                        "sample_mask": val_batch["loss_multiplier"],
+                    }
+                )
+
+                # update multimodal data
+                val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+                # When running validation with drop_last=False, we might end up with a partial batch.
+                # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
+                if val_data.size < val_batch_size:
+                    dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                    val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
+
+                ## just run model fwd
+                val_results = policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                )
+
+                if len(val_results["all_mb_metrics"]) == 0:
+                    warnings.warn(
+                        "No validation metrics were collected for this batch."
+                        " This is likely because there were no valid samples."
+                    )
+                else:
+                    num_valid_tokens = (
+                        val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
+                    ).sum()
+                    task_val_loss += float(val_results["loss"]) * num_valid_tokens
+                    task_num_valid_tokens += num_valid_tokens
+
+                cur_batch_idx += 1
+                if val_batches > 0 and cur_batch_idx >= val_batches:
+                    break
+
+            # Calculate task loss
+            val_loss[task_name] = task_val_loss / task_num_valid_tokens
+
+            total_val_loss += task_val_loss
+            total_num_valid_tokens += task_num_valid_tokens
+
+            if val_batches > 0 and cur_batch_idx >= val_batches:
                 break
 
-        if sum_num_valid_tokens > 0:
-            val_metrics["val_loss"] /= sum_num_valid_tokens
+        # Calculate validation metrics
+        if total_num_valid_tokens > 0:
+            assert "total" not in val_loss, (
+                "total is a reserved task_name since it is used in the metrics as the aggregate label"
+            )
+            val_loss["total"] = total_val_loss / total_num_valid_tokens
+            val_metrics = {
+                "val_loss": val_loss["total"],
+                **{f"val_loss_{k}": v for k, v in val_loss.items()},
+            }
+            del val_metrics["val_loss_total"]
         else:
+            val_metrics = {"val_loss": 0.0}
             warnings.warn(
                 "No validation metrics were collected."
                 " This is likely because there were no valid samples in the validation set."
             )
 
-        # Calculate validation metrics
         policy.prepare_for_training()
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if sum_num_valid_tokens > 0:
+    if total_num_valid_tokens > 0:
         # Print summary of validation results
         print("\n📊 Validation Results:")
-        print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
+        print(f"    • Validation loss: {val_loss['total']:.4f}")
+        for task_name, task_val_loss in val_loss.items():
+            if task_name != "total":
+                print(f"        • Validation loss for {task_name}: {task_val_loss:.4f}")
 
         # Print timing information
         print("\n  ⏱️  Validation Timing:")
@@ -511,18 +549,20 @@ def sft_train(
                     "train_global_batch_size"
                 ]
                 timeout.mark_iteration()
+
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
+                    # +1 because step is 0-indexed
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     sft_save_state["total_steps"] = total_steps + 1
                     sft_save_state["epoch"] = current_epoch
@@ -530,14 +570,6 @@ def sft_train(
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:val_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1238,13 +1239,16 @@ def mock_grpo_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader: dict[str, StatefulDataLoader] = {}
+    val_dataloader["task1"] = MagicMock(spec=StatefulDataLoader)
+    val_dataloader["task2"] = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    for k in val_dataloader:
+        val_dataloader[k].__iter__ = val_iter
+        val_dataloader[k].__len__ = MagicMock(return_value=10)
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -1810,7 +1814,40 @@ def test_reinforce_plus_plus_global_normalization():
 class TestValidateFunction:
     """Tests for the validate() function."""
 
-    def test_validate_logs_data_when_logger_provided(self, tmp_path):
+    def test_validate_function(self, mock_grpo_components):
+        """Test independent validation function to ensure validation logic correctness."""
+        master_config = deepcopy(mock_grpo_components["master_config"])
+        master_config["policy"]["generation"]["vllm_cfg"]["async_engine"] = False
+        # set to 0 to avoid actual rollouts
+        master_config["grpo"]["max_rollout_turns"] = 0
+
+        for max_val_samples in [10, 11]:
+            # Run validation
+            master_config["grpo"]["max_val_samples"] = max_val_samples
+            val_metrics, validation_timings = validate(
+                None,
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["val_task_to_env"],
+                step=0,
+                master_config=master_config,
+                logger=None,
+            )
+
+            # Verify validation results
+            assert isinstance(val_metrics, dict)
+            assert isinstance(validation_timings, dict)
+
+            assert "accuracy" in val_metrics
+            assert "accuracy_task1" in val_metrics
+            assert "avg_length" in val_metrics
+
+            if max_val_samples == 10:
+                assert "accuracy_task2" not in val_metrics
+            elif max_val_samples == 11:
+                assert "accuracy_task2" in val_metrics
+
+    def test_validate_logs_data_when_logger_provided(self):
         """Test that validation data is logged to JSONL when logger is provided."""
 
         # Create mock components
@@ -1857,8 +1894,9 @@ class TestValidateFunction:
         )
 
         # Create mock dataloader that yields mock_batch
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_dataloader: dict[str, StatefulDataLoader] = {}
+        mock_dataloader["task1"] = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader["task1"].__iter__ = MagicMock(return_value=iter([mock_batch]))
 
         # Create mock environment
         mock_env = MagicMock(spec=EnvironmentInterface)
@@ -1926,110 +1964,18 @@ class TestValidateFunction:
         assert "content" in logged_data["data"]
         assert "rewards" in logged_data["data"]
 
-    def test_validate_works_without_logger(self):
-        """Test that validation works when logger is None (backward compat)."""
-        # Create mock components
-        mock_policy_gen = MagicMock()
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.pad_token_id = 0
-
-        # Create mock batch
-        mock_batch = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [
-                    [
-                        {
-                            "role": "user",
-                            "content": "test1",
-                            "token_ids": torch.tensor([1, 2, 3]),
-                        },
-                        {
-                            "role": "assistant",
-                            "content": "response1",
-                            "token_ids": torch.tensor([4, 5, 6]),
-                        },
-                    ],
-                ],
-                "task_name": ["math"],
-                "extra_env_info": [{}],
-                "loss_multiplier": torch.tensor([1.0]),
-                "idx": torch.tensor([0]),
-                "length": torch.tensor([6]),
-                "total_reward": torch.tensor([1.0]),
-            }
-        )
-
-        # Create mock dataloader
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
-
-        # Create mock environment
-        mock_env = MagicMock(spec=EnvironmentInterface)
-        mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
-
-        # Mock config
-        mock_config = {
-            "grpo": {
-                "max_val_samples": 10,
-                "val_batch_size": 1,
-                "max_rollout_turns": 1,
-            },
-            "policy": {
-                "max_total_sequence_length": 2048,
-                "generation": {
-                    "backend": "vllm",
-                    "colocated": {"enabled": True},
-                    "vllm_cfg": {"async_engine": False},
-                },
-            },
-            "logger": {
-                "num_val_samples_to_print": 1,
-            },
-        }
-
-        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
-
-        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
-            mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
-            with patch(
-                "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False
-            ):
-                with patch(
-                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
-                    return_value=False,
-                ):
-                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
-                        # Call validate without logger (should not raise exception)
-                        val_metrics, timing = validate(
-                            mock_policy_gen,
-                            mock_dataloader,
-                            mock_tokenizer,
-                            {"math": mock_env},
-                            step=5,
-                            master_config=mock_config,
-                            logger=None,
-                        )
-
-        # Verify metrics are returned correctly
-        assert "accuracy" in val_metrics
-        assert "avg_length" in val_metrics
-
     def test_validate_returns_empty_when_no_dataloader(self):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()
         mock_tokenizer = MagicMock()
 
-        mock_config = {
-            "dpo": {"val_period": 0},  # Required for the assertion
-        }
-
         val_metrics, timing = validate(
             mock_policy_gen,
-            None,  # No dataloader
+            {},  # No dataloader
             mock_tokenizer,
             None,
             step=0,
-            master_config=mock_config,
+            master_config={},
             logger=None,
         )
 

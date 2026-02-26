@@ -134,9 +134,12 @@ class OpenAIFormatDataset(RawDataset):
         self.system_prompt = system_prompt
         self.tool_key = tool_key
 
-        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
-        if self.task_name[0] == "-":
-            self.task_name = self.task_name[1:]
+        # initialize common attributes (task name, prompt, processor)
+        assert "system_prompt_file" not in kwargs, (
+            "system_prompt_file is not supported for OpenAIFormatDataset. Please use system_prompt instead."
+        )
+        default_task_name = self.extract_task_name_from_path(data_path)
+        self.common_init(default_task_name=default_task_name, **kwargs)
 
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)

@@ -27,7 +27,8 @@ class SquadDataset(RawDataset):
     """
 
     def __init__(self, split: str = "train", **kwargs) -> None:
-        self.task_name = "squad"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="squad", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("rajpurkar/squad")[split]

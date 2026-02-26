@@ -26,9 +26,9 @@ class NemoGymDataset(RawDataset):
     """
 
     def __init__(self, data_path: str, repeat: int = 1, **kwargs) -> None:
-        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
-        if self.task_name[0] == "-":
-            self.task_name = self.task_name[1:]
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        default_task_name = self.extract_task_name_from_path(data_path)
+        self.common_init(default_task_name=default_task_name, **kwargs)
 
         # load raw line from jsonl
         # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well

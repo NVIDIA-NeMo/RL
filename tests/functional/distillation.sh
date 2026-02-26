@@ -32,11 +32,12 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.max_total_sequence_length=2048 \
     teacher.dtensor_cfg.tensor_parallel_size=2 \
     teacher.dtensor_cfg.context_parallel_size=1 \
+    distillation.val_at_start=true \
+    distillation.max_val_samples=4 \
+    distillation.val_batch_size=4 \
+    distillation.val_period=3 \
     distillation.max_num_steps=3 \
     distillation.num_prompts_per_step=16 \
-    distillation.max_val_samples=16 \
-    distillation.val_batch_size=8 \
-    distillation.val_period=3 \
     data.train.dataset_name=OpenMathInstruct-2 \
     ++data.train.split_validation_size=0.05 \
     data.validation=null \
@@ -53,5 +54,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# Set accuracy check threshold to >= 0 to avoid flakiness. Ensures required keys are present.
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 1.0'
+  'data["train/loss"]["3"] < 1.0' \
+  'data["validation/accuracy"]["0"] >= 0' \
+  'data["validation/accuracy_OpenMathInstruct-2"]["0"] >= 0'

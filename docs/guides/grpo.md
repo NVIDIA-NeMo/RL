@@ -122,6 +122,21 @@ data:
     ...
 ```
 
+To use a specific validation dataset's accuracy for checkpointing, set `task_name` in the validation dataset config to override the default, and set `checkpointing.metric_name` to `val:accuracy_<TaskName>`. Checkpoints will then be saved based on that dataset's accuracy.
+```yaml
+data:
+  ...
+  validation:
+    - dataset_name: ResponseDataset
+      task_name: "dataset1"
+    - dataset_name: ResponseDataset
+    ...
+checkpointing:
+  metric_name: "val:accuracy_dataset1"  # this will save the checkpoint according to the accuracy of the first dataset
+  # metric_name: "val:accuracy"         # this will save the checkpoint according to the accuracy of all the datasets
+  ...
+```
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).

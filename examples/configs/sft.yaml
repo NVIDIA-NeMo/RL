@@ -16,7 +16,9 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft"
-  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
+  # one of "val:" or "train:" followed by the metric name
+  # if you want to use the val_loss from a specific dataset, you can use the format "val:val_loss_<TaskName>", task_name can be set at dataset config
+  metric_name: "val:val_loss"
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
@@ -231,6 +233,19 @@ data:
   # system_prompt: null                      # Default system prompt (optional)
   # tool_key: "tools"                        # Key for tools in the data
   # use_preserving_dataset: false            # If true, uses PreservingDataset to preserve heterogeneous schemas (e.g., tool calls with varying argument structures)
+
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  # data:
+  #   ...
+  #   validation:
+  #     - dataset_name: ResponseDataset
+  #       task_name: "dataset1"
+  #     - dataset_name: ResponseDataset
+  #     ...
+  # checkpointing:
+  #   metric_name: "val:val_loss_dataset1"  # this will save the checkpoint according to the val_loss of the first dataset
+  #   # metric_name: "val:val_loss"         # this will save the checkpoint according to the val_loss of all the datasets
+  #   ...
 
 logger:
   log_dir: "logs"  # Base directory for all logs
