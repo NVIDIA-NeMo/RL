@@ -217,6 +217,7 @@ jobs:
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
       target: release
+      runner: self-hosted-azure-13
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
