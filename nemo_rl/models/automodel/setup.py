@@ -413,10 +413,6 @@ def setup_model_and_optimizer(
     else:
         sdpa_method = None
 
-    print(
-        f"DEBUG: model_config.num_labels={model_config.num_labels}, model_class={model_class}"
-    )
-
     # Initialize empty model
     with init_empty_weights():
         model = model_class.from_pretrained(
