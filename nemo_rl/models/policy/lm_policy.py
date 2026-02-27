@@ -570,6 +570,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
         worker_batches = self.worker_group.get_all_worker_results(futures)
+
+        # If workers returned IPC handle dicts (GPU zero-copy path),
+        # pass them through as a list — no concatenation possible.
+        if worker_batches and isinstance(worker_batches[0], dict) and worker_batches[0].get('is_topk'):
+            return worker_batches
+
         all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
         all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
 
@@ -626,6 +632,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             for shard in sharded_data:
                 input_lengths = shard["input_lengths"]
                 self.flops_tracker.track_batch(input_lengths.tolist())
+
+        # If IPC handles are present, extract them before sharding (they're not
+        # tensors and can't be sharded). Each DP worker gets its own handle.
+        teacher_ipc_handles = None
+        if "teacher_topk_ipc_handles" in data:
+            teacher_ipc_handles = data["teacher_topk_ipc_handles"]
+            del data["teacher_topk_ipc_handles"]
+
+        if teacher_ipc_handles is not None:
+            for i, shard in enumerate(sharded_data):
+                shard["teacher_topk_logits"] = teacher_ipc_handles[i]
+                shard["teacher_topk_indices"] = teacher_ipc_handles[i]
 
         # Train each shard in parallel
         with (

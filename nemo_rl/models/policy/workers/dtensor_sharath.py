@@ -1,0 +1,2762 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import inspect
+import contextlib
+import gc
+import itertools
+import os
+import warnings
+from collections import defaultdict
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Any, Generator, Iterable, Optional, Set, Union, cast
+
+import ray
+import torch
+import zmq
+from accelerate import init_empty_weights
+from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
+)
+from torch.distributed.fsdp import (
+    FSDPModule,
+)
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import (
+    set_rotate_method,
+)
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+)
+from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+
+from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
+    get_logprobs_from_vocab_parallel_logits,
+    _compute_distributed_log_softmax,
+)
+from nemo_rl.models.dtensor.parallelize import (
+    _parallelize_model,
+    clip_grad_by_total_norm_,
+    get_grad_norm,
+    to_local_if_dtensor,
+)
+from nemo_rl.models.huggingface.common import (
+    get_flash_attention_kwargs,
+    pack_sequences,
+)
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import (
+    LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
+)
+from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
+    get_gpu_info,
+    get_runtime_env_for_policy_worker,
+    import_class_from_path,
+    resolve_model_class,
+    sliding_window_overwrite,
+    get_handle_from_tensor,
+    rebuild_cuda_tensor_from_ipc,
+)
+from nemo_rl.utils.native_checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+)
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+@contextmanager
+def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
+    """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
+    try:
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.unshard()
+        yield
+    finally:
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+
+@torch.no_grad()
+def get_cpu_state_dict(
+    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
+    pin_memory: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Copy the state dict generator to CPU memory.
+
+    Args:
+        state_generator (Iterable[tuple[str, Union[torch.Tensor, DTensor]]]):
+            An iterable that yields (key, tensor) pairs from a model state.
+        pin_memory (bool, optional):
+            Whether to allocate the CPU tensors in pinned memory for faster GPU transfer.
+            Defaults to False.
+
+    Returns:
+        dict[str, torch.Tensor]: A dictionary mapping parameter names to CPU tensors.
+    """
+    new_state_dict = {}
+    for k, v in state_generator:
+        val = to_local_if_dtensor(v)
+
+        if len(val.shape) == 0:
+            new_state_dict[k] = val.cpu()
+        else:
+            cpu_tensor = torch.empty(
+                *val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype
+            )
+            cpu_tensor.copy_(val, non_blocking=True)
+            new_state_dict[k] = cpu_tensor
+
+    torch.cuda.synchronize()
+    return new_state_dict
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+)  # pragma: no cover
+class DTensorPolicyWorker:
+    def __repr__(self) -> str:
+        """Customizes the actor's prefix in the Ray logs.
+
+        This makes it easier to identify which worker is producing specific log messages.
+        """
+        if torch.distributed.is_initialized():
+            return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
+        else:
+            return f"{self.__class__.__qualname__}"
+
+    def __init__(
+        self,
+        config: PolicyConfig,
+        tokenizer: AutoTokenizer,
+        processor: Optional[AutoProcessor] = None,
+        weights_path: Optional[str] = None,
+        optimizer_path: Optional[str] = None,
+        init_optimizer: bool = True,
+        init_reference_model: bool = True,
+        **kwargs: Any,
+    ):
+        """Initialize the DTensorPolicyWorker."""
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.is_vlm = processor is not None
+
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
+
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        if not self.is_generation_colocated:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
+        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+        # with different order of node_bundles
+        configure_dynamo_cache()
+
+        self.cfg = config
+        # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
+        torch.distributed.init_process_group(backend="nccl")
+        self.rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        model_name = self.cfg["model_name"]
+
+        self.teacher_logits = None
+        self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
+        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
+        self.max_grad_norm = self.cfg["max_grad_norm"]
+
+        if self.cfg["precision"] == "float32":
+            self.dtype = torch.float32
+        elif self.cfg["precision"] == "bfloat16":
+            self.dtype = torch.bfloat16
+        elif self.cfg["precision"] == "float16":
+            self.dtype = torch.float16
+        else:
+            raise ValueError(f"Unknown precision: {self.cfg['precision']}")
+
+        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        if self.enable_seq_packing:
+            assert not self.is_vlm, (
+                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
+            )
+            print(
+                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
+            )
+            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
+
+        hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
+
+        model_config = AutoConfig.from_pretrained(
+            model_name,
+            # Always load the model in float32 to keep master weights in float32.
+            # Keeping the master weights in lower precision has shown to cause issues with convergence.
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+            **sliding_window_overwrite(
+                model_name
+            ),  # due to https://github.com/huggingface/transformers/issues/38002
+            attn_implementation="flash_attention_2"
+            if self.enable_seq_packing
+            else None,
+            **hf_config_overrides,
+        )
+
+        # diffusion model
+        self._is_mdlm = self.cfg.get("is_mdlm", False)
+        self._is_dqwn = self.cfg.get("is_dqwn", False)
+
+        # reward model
+        self._is_reward_model = (
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
+        )
+        if self._is_reward_model:
+            # Ensure sequence packing is disabled.
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sequence packing is not supported for reward models"
+                )
+            # Load model as a Reward Model.
+            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
+            if rm_type == "bradley_terry":
+                model_class = AutoModelForSequenceClassification
+                if model_config.num_labels != 1:
+                    # For Bradley-Terry reward models, the linear head has a single output.
+                    # In the transformers library, the default setting for model_config.num_labels is 2
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
+                    # Since num_labels is used as the out_features for the linear head
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
+                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
+                    # from the model checkpoint and are instead initialized using model_config.initializer_range
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
+                    print(
+                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                        "for the linear head of Bradley-Terry reward models."
+                    )
+                    model_config.num_labels = 1
+            else:
+                raise ValueError(f"Unknown reward model type: {rm_type}")
+        else:
+            # Check if the model requires AutoModel instead of AutoModelForCausalLM
+            if model_name in ["nvidia/Nemotron-Diffusion-Research-4B-v0", "nvidia/Nemotron-Diffusion-Research-8B-v0"]:
+                print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
+                from transformers import AutoModel
+                model_class = AutoModel
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
+                    model_config.dlm_paradigm = "block_diff"
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
+                    model_config.block_size = self.cfg["mdlm"]["block_size"]
+                #model_config.seq_length = self.cfg["max_total_sequence_length"]
+            elif model_name in ["nvidia/Nemotron-Diffusion-Exp-Ministral-8B", "nvidia/Nemotron-Diffusion-Exp-Ministral-3B"]:
+                print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
+                from transformers import AutoModel
+                model_class = AutoModel
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
+                    model_config.dlm_paradigm = "sbd_block_diff"
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
+                    model_config.block_size = self.cfg["mdlm"]["block_size"]
+                print("set block size.........")
+                # import pdb; pdb.set_trace()
+                #model_config.seq_length = self.cfg["max_total_sequence_length"]
+            else:
+                # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
+                model_class = resolve_model_class(model_config.model_type)
+
+        full_state_dict = None
+        embed_weight_for_local = None
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+            model = model_class.from_pretrained(
+                model_name,
+                device_map="cpu",  # load weights onto CPU initially
+                trust_remote_code=True,
+                config=model_config,
+            )
+            full_state_dict = model.state_dict()
+            
+            # Extract embedding weight for local copy (before FSDP wrapping)
+            for key in full_state_dict:
+                # added 'backbone.embeddings.weight' for nano teacher model
+                if "embed_tokens.weight" in key or "embeddings.weight" in key:
+                    embed_weight_for_local = full_state_dict[key].clone()
+                    print(f"[Rank {self.rank}] Found embedding weight: {key}, shape={embed_weight_for_local.shape}")
+                    break
+            
+            del model
+
+        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+        # All ranks initialize model on meta device, so FSDP can shard it.
+        # The actual weights will be broadcast from rank 0.
+        with init_empty_weights():
+            self.model = model_class.from_config(
+                model_config,
+                trust_remote_code=True,
+            )
+
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = tokenizer.pad_token_id
+
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        if cp_size > 1 and self.enable_seq_packing:
+            raise ValueError(
+                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+        dp_size = world_size // tp_size // cp_size
+        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
+        assert world_size == dp_size * tp_size * cp_size, (
+            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
+        )
+
+        if sequence_parallel_enabled and tp_size == 1:
+            print(
+                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
+            )
+        elif sequence_parallel_enabled and tp_size > 1:
+            raise RuntimeError(
+                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
+            )
+
+        if cp_size > 1:
+            assert not isinstance(self.model, Gemma3ForCausalLM), (
+                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. "
+                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+
+            assert not (tp_size > 1 and sequence_parallel_enabled), (
+                "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
+                "Please either set cp_size = 1 or disable sequence parallel. "
+                "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
+            )
+
+            assert not self.is_vlm, (
+                "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
+            )
+
+        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
+        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
+        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
+        prev_local_rank = os.environ["LOCAL_RANK"]
+        os.environ["LOCAL_RANK"] = "0"
+
+        device_mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
+        )
+        os.environ["LOCAL_RANK"] = prev_local_rank
+
+        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+
+        self.dp_mesh, self.tp_mesh, self.cp_mesh = (
+            device_mesh["dp"],
+            device_mesh["tp"],
+            device_mesh["cp"],
+        )
+        self.dp_size = dp_size
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.device_mesh = device_mesh
+
+        # ------------------------------------------------
+        # 3) Move to GPU + Composable FSDP
+        #    (Initialize device mesh, shard submodules, then shard entire model)
+        # ------------------------------------------------
+        self.model = _parallelize_model(
+            self.model,
+            self.dp_cp_mesh,
+            self.tp_mesh,
+            param_dtype=self.dtype,
+            sequence_parallel=sequence_parallel_enabled,
+            cpu_offload=self.cpu_offload,
+            activation_checkpointing=self.cfg["dtensor_cfg"][
+                "activation_checkpointing"
+            ],
+            custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+        )
+
+        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
+        # This will broadcast the state dict from rank 0 to all other ranks
+        # and load it into the FSDP model.
+        set_model_state_dict(
+            self.model,
+            model_state_dict=full_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+            ),
+        )
+
+        # Handle tied word embeddings after loading the state dict
+        # We need to actually tie the parameters at the model level
+        is_tied_lm_head = hasattr(self.model, "lm_head") and getattr(
+            getattr(self.model, "config", {}), "tie_word_embeddings", False
+        )
+        if is_tied_lm_head:
+            embed_tokens_weight = None
+            for name, param in self.model.named_parameters():
+                if "embed_tokens" in name and name.endswith(".weight"):
+                    embed_tokens_weight = param
+                    break
+
+            if embed_tokens_weight is not None:
+                self.model.lm_head.weight = embed_tokens_weight
+
+        # Manually broadcast buffers
+        for _, buf in self.model.named_buffers():
+            torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
+
+        # Create local embedding layer (for latent thinking, avoids DTensor issues)
+        # First broadcast the embedding weight shape, then the weight itself
+        if self.rank == 0:
+            embed_shape = torch.tensor(list(embed_weight_for_local.shape), dtype=torch.long, device="cuda")
+        else:
+            embed_shape = torch.zeros(2, dtype=torch.long, device="cuda")
+        torch.distributed.broadcast(embed_shape, src=0)
+        vocab_size, hidden_dim = int(embed_shape[0].item()), int(embed_shape[1].item())
+        
+        if self.rank != 0:
+            embed_weight_for_local = torch.zeros(vocab_size, hidden_dim, dtype=self.dtype, device="cuda")
+        else:
+            embed_weight_for_local = embed_weight_for_local.to(dtype=self.dtype, device="cuda")
+        torch.distributed.broadcast(embed_weight_for_local, src=0)
+        
+        self.embed_layer_local = nn.Embedding(vocab_size, hidden_dim)
+        self.embed_layer_local.weight.data.copy_(embed_weight_for_local.cpu())
+        self.embed_layer_local.weight.requires_grad = False
+        print(f"[Rank {self.rank}] Created local embedding: vocab_size={vocab_size}, hidden_dim={hidden_dim}")
+        del embed_weight_for_local
+
+        if self.cpu_offload:
+            self.model = self.move_to_device(self.model, "cpu")
+
+        if init_reference_model:
+            self.reference_model_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+        if init_optimizer:
+            optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            self.optimizer = optimizer_cls(
+                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
+            )
+        else:
+            self.optimizer = None
+
+        if "scheduler" in self.cfg and self.optimizer is not None:
+            if isinstance(self.cfg["scheduler"], dict):
+                scheduler_cls = import_class_from_path(
+                    cast(str, self.cfg["scheduler"]["name"])
+                )
+                self.scheduler = scheduler_cls(
+                    self.optimizer, **self.cfg["scheduler"]["kwargs"]
+                )
+            else:
+                schedulers = []
+                for scheduler_cfg in self.cfg["scheduler"]:
+                    if "name" in scheduler_cfg:
+                        schedulers.append(
+                            import_class_from_path(scheduler_cfg["name"])(
+                                self.optimizer, **scheduler_cfg["kwargs"]
+                            )
+                        )
+                    else:
+                        assert "milestones" in scheduler_cfg, (
+                            "unknown scheduler config: ",
+                            scheduler_cfg,
+                        )
+                        milestones: list[int] = scheduler_cfg["milestones"]
+
+                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer, schedulers, milestones
+                )
+
+        elif self.optimizer is not None:
+            ## default to a passthrough LR schedule
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda epoch: 1
+            )
+
+        # restore
+        if weights_path:
+            self.load_checkpoint(weights_path, optimizer_path)
+        else:
+            print(
+                "No weights path provided. Starting from scratch (default policy init)"
+            )
+
+    # Refer to nemo impl. Below is original comment.
+    # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
+    @staticmethod
+    def create_context_parallel_ctx(
+        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
+        cp_buffers: list[torch.Tensor],
+        cp_seq_dims: list[int],
+        cp_no_restore_buffers: Set[torch.Tensor],
+        cp_rotate_method: Optional[str] = None,
+    ):
+        """Create a context parallel context.
+
+        Args:
+            cp_mesh (DeviceMesh): The device mesh for context parallel.
+            cp_buffers (list[torch.Tensor]): The buffers for context parallel.
+            cp_seq_dims (list[int]): The sequence dimensions for context parallel.
+            cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
+            cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
+        """
+        if cp_rotate_method is not None:
+            set_rotate_method(cp_rotate_method)
+
+        return context_parallel(
+            cp_mesh,
+            buffers=cp_buffers,
+            buffer_seq_dims=cp_seq_dims,
+            no_restore_buffers=cp_no_restore_buffers,
+        )
+
+    # Refer to nemo impl. Below is original comment.
+    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
+
+    def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            logits.div_(self.cfg["generation"]["temperature"])
+        return logits
+
+    @staticmethod
+    @contextlib.contextmanager
+    def train_context(cp_context: Optional[Generator[None, None, None]] = None):
+        with contextlib.ExitStack() as stack:
+            if cp_context is not None:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                # TODO (xilunwu): support cuDNN backend
+
+                stack.enter_context(
+                    sdpa_kernel(
+                        [
+                            SDPBackend.FLASH_ATTENTION,
+                            SDPBackend.EFFICIENT_ATTENTION,
+                        ]
+                    )
+                )
+
+                stack.enter_context(cp_context)
+
+            yield
+
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
+
+    def is_alive(self) -> bool:
+        return True
+
+    def reset_peak_memory_stats(self) -> None:
+        torch.cuda.reset_peak_memory_stats()
+
+    def get_gpu_info(self) -> dict[str, Any]:
+        """Return information about the GPU being used by this worker."""
+        return get_gpu_info(self.model)
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/train_latent_thinking")
+    def train_latent_thinking(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        num_iterations: int,
+        detach_across_iterations: bool = True,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        soft_mixing: bool = False,
+        soft_mixing_top_k: int = 5,
+        mask_token_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Train with latent thinking for diffusion LM.
+        
+        This method implements iterative training where:
+        - Thinking tokens use hidden features from previous iteration
+        - Answer tokens are always masked
+        - Loss is computed at each iteration only on answer tokens
+        
+        Args:
+            data: BatchedDataDict with:
+                - input_ids: Token IDs with thinking replaced by mask tokens
+                - token_ids: Original target token IDs
+                - thinking_mask: Boolean mask for thinking positions
+                - answer_mask: Boolean mask for answer positions
+                - token_mask: Mask for loss computation (only answer tokens)
+                - sample_mask: Sample validity mask
+            loss_fn: Loss function to use
+            num_iterations: Number of iterations (k)
+            detach_across_iterations: If True, detach gradients between iterations
+            gbs: Global batch size
+            mbs: Micro batch size
+            soft_mixing: If True, build thinking_hidden_features as weighted average of
+                top-k token embeddings mixed with mask token embedding. The mask token
+                weight is (1 - top1_confidence) and top-k tokens share the remaining
+                top1_confidence proportionally.
+            soft_mixing_top_k: Number of top tokens to use for soft mixing (default: 5)
+            mask_token_id: Token ID for mask token (required if soft_mixing=True)
+            
+        Returns:
+            Training metrics dictionary
+        """
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if mbs is None:
+            mbs = self.cfg["train_micro_batch_size"]
+        local_gbs = gbs // self.dp_size
+        
+        total_dataset_size = torch.tensor(data.size, device="cuda")
+        torch.distributed.all_reduce(
+            total_dataset_size,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.dp_mesh.get_group(),
+        )
+        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        sequence_dim = 1
+        
+        if eval_mode:
+            self.model.eval()
+        else:
+            self.model.train()
+        data.to("cuda")
+        
+        losses = []
+        all_mb_metrics = []
+        
+        for gb_idx in range(num_global_batches):
+            global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
+            
+            assert "sample_mask" in global_batch, "sample_mask must be present in the data!"
+            local_valid_seqs = torch.sum(global_batch["sample_mask"])
+            
+            local_valid_toks = torch.sum(
+                global_batch["token_mask"] * global_batch["sample_mask"].unsqueeze(-1)
+            )
+            
+            to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+            torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+            global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+            
+            self.optimizer.zero_grad()
+            mb_losses = []
+            batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
+            
+            # Setup microbatch iterator based on sequence packing
+            if self.enable_seq_packing:
+                mb_iterator = batch.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    batch.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+                
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = batch.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+                mb_iterator = itertools.chain(mb_iterator, dummy_iterator)
+            else:
+                mb_iterator = batch.make_microbatch_iterator(mbs)
+                iterator_len = batch.size // mbs
+            
+            for mb_idx, mb in enumerate(mb_iterator):
+                # Get the required tensors
+                # input_ids has thinking AND answer tokens set to mask tokens
+                input_ids = mb.get("input_ids").cuda()
+                # target_ids has answer tokens as original (for loss computation)
+                target_ids = mb.get("target_ids").cuda() if "target_ids" in mb else input_ids
+                thinking_mask = mb.get("thinking_mask").cuda()  # Boolean mask for thinking positions
+                token_mask = mb.get("token_mask").cuda()  # Loss mask (answer tokens only)
+                
+                batch_size, seq_len = input_ids.shape
+                
+                # Handle sequence packing
+                if self.enable_seq_packing:
+                    input_lengths = mb["input_lengths"]
+                    packed_sequence_size = [len(input_lengths)]
+                    
+                    # Pack input_ids
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=packed_sequence_size,
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                        min_seq_len=self.cfg["sequence_packing"]["train_mb_tokens"],
+                    )
+                    
+                    # Pack target_ids
+                    target_ids, _, _ = pack_sequences(
+                        input_ids=target_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=packed_sequence_size,
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                        min_seq_len=self.cfg["sequence_packing"]["train_mb_tokens"],
+                    )
+                    
+                    # Pack thinking_mask (convert to int for packing, then back to bool)
+                    thinking_mask_int = thinking_mask.int()
+                    thinking_mask_int, _, _ = pack_sequences(
+                        input_ids=thinking_mask_int,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=packed_sequence_size,
+                        padding_value=0,
+                        return_attention_mask=False,
+                        min_seq_len=self.cfg["sequence_packing"]["train_mb_tokens"],
+                    )
+                    thinking_mask = thinking_mask_int.bool()
+                    
+                    # Pack token_mask
+                    token_mask, _, _ = pack_sequences(
+                        input_ids=token_mask,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=packed_sequence_size,
+                        padding_value=0,
+                        return_attention_mask=False,
+                        min_seq_len=self.cfg["sequence_packing"]["train_mb_tokens"],
+                    )
+                    
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(input_lengths=input_lengths)
+                else:
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                    flash_attn_kwargs = {}
+                
+                # Initialize hidden features for thinking positions (None for first iteration)
+                thinking_hidden_features = None
+                
+                # Track metrics across iterations
+                iteration_metrics = []
+                total_loss_value = 0.0
+                
+                for iter_idx in range(num_iterations):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        # Build input embeddings
+                        # input_ids already has mask tokens at thinking AND answer positions
+                        # Use self.embed_layer_local - a non-parallelized copy of embedding layer
+                        # This avoids DTensor mixing issues with FSDP2
+                        assert self.embed_layer_local is not None, "Local embedding layer not initialized"
+                        self.embed_layer_local = self.embed_layer_local.to(input_ids.device)
+                        base_embeddings = self.embed_layer_local(input_ids)
+                        
+                        if iter_idx > 0 and thinking_hidden_features is not None:
+                            # For subsequent iterations, use hidden features at thinking positions
+                            # thinking_hidden_features shape: [batch, seq_len, hidden_dim]
+                            # thinking_mask shape: [batch, seq_len]
+                            
+                            # Replace thinking positions with hidden features from previous iteration
+                            inputs_embeds = base_embeddings.clone()
+                            thinking_mask_expanded = thinking_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                            inputs_embeds = torch.where(
+                                thinking_mask_expanded,
+                                thinking_hidden_features,
+                                inputs_embeds
+                            )
+                        else:
+                            inputs_embeds = base_embeddings
+                        
+                        # Forward pass with inputs_embeds instead of input_ids
+                        model_args = dict(
+                            input_ids=None,
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            output_hidden_states=True,  # Need hidden states for next iteration
+                            flash_attn_kwargs=flash_attn_kwargs,
+                        )
+                        
+                        # Handle MDLM/DiffQwen specific args
+                        if self._is_dqwn:
+                            del model_args["use_cache"]
+                            del model_args["attention_mask"]
+                            del model_args["position_ids"]
+                            del model_args["flash_attn_kwargs"]
+                            model_args["masked_indices"] = token_mask
+                            model_args["labels"] = target_ids
+                            model_args["skip_loss"] = True
+                        elif self._is_mdlm:
+                            del model_args["position_ids"]
+                            del model_args["flash_attn_kwargs"]
+                        
+                        outputs = self.model(**model_args)
+                        
+                        # Get logits first (needed for both loss and soft_mixing)
+                        if not hasattr(outputs, "logits"):
+                            logits = self.model.lm_head(outputs.last_hidden_state)
+                        else:
+                            logits = outputs.logits
+                        
+                        # Get hidden states for next iteration
+                        if soft_mixing:
+                            # Build thinking_hidden_features as weighted average of top-k token embeddings
+                            # mixed with mask token embedding
+                            assert mask_token_id is not None, "mask_token_id must be provided when soft_mixing=True"
+                            
+                            # Use self.embed_layer_local for embedding lookup (no DTensor issues)
+                            self.embed_layer_local = self.embed_layer_local.to(logits.device)
+                            embed_weight_for_mixing = self.embed_layer_local.weight.data
+                            
+                            # Compute probabilities from logits
+                            probs = torch.softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+                            
+                            # Get top-k tokens and their probabilities
+                            top_k_probs, top_k_indices = torch.topk(probs, k=soft_mixing_top_k, dim=-1)  # [batch, seq_len, k]
+                            
+                            # Get top-1 confidence (probability of the most likely token)
+                            top1_confidence = top_k_probs[..., 0:1]  # [batch, seq_len, 1]
+                            
+                            # Normalize top-k weights to sum to top1_confidence
+                            # weight for each top-k token = (prob_i / sum(top_k_probs)) * top1_confidence
+                            top_k_sum = top_k_probs.sum(dim=-1, keepdim=True)  # [batch, seq_len, 1]
+                            top_k_weights = (top_k_probs / (top_k_sum + 1e-8)) * top1_confidence  # [batch, seq_len, k]
+                            
+                            # Get mask token embedding
+                            mask_embedding = embed_weight_for_mixing[mask_token_id]  # [hidden_dim]
+                            
+                            # Weight for mask embedding is (1 - top1_confidence)
+                            mask_weight = 1.0 - top1_confidence  # [batch, seq_len, 1]
+                            
+                            # Get embeddings for top-k tokens
+                            # top_k_indices: [batch, seq_len, k]
+                            batch_size_mix, seq_len_mix, k = top_k_indices.shape
+                            hidden_dim = embed_weight_for_mixing.shape[-1]
+                            
+                            # Flatten indices for indexing
+                            flat_top_k_indices = top_k_indices.view(-1)  # [batch * seq_len * k]
+                            top_k_embeddings_flat = embed_weight_for_mixing[flat_top_k_indices]  # [batch * seq_len * k, hidden_dim]
+                            top_k_embeddings = top_k_embeddings_flat.view(batch_size_mix, seq_len_mix, k, hidden_dim)  # [batch, seq_len, k, hidden_dim]
+                            
+                            # Compute weighted sum of top-k embeddings
+                            # top_k_weights: [batch, seq_len, k] -> [batch, seq_len, k, 1]
+                            top_k_weights_expanded = top_k_weights.unsqueeze(-1)  # [batch, seq_len, k, 1]
+                            weighted_top_k = (top_k_embeddings * top_k_weights_expanded).sum(dim=2)  # [batch, seq_len, hidden_dim]
+                            
+                            # Add weighted mask embedding
+                            # mask_embedding: [hidden_dim] -> broadcast to [batch, seq_len, hidden_dim]
+                            # mask_weight: [batch, seq_len, 1]
+                            weighted_mask = mask_weight * mask_embedding  # [batch, seq_len, hidden_dim]
+                            
+                            # Final thinking_hidden_features is the sum
+                            thinking_hidden_features = weighted_top_k + weighted_mask  # [batch, seq_len, hidden_dim]
+                        else:
+                            # Original approach: use hidden states from forward pass
+                            if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+                                # Use the last hidden state
+                                thinking_hidden_features = outputs.hidden_states
+                            else:
+                                raise ValueError("Could not find hidden states in outputs")
+                        
+                        del outputs
+                        
+                        # Detach hidden features if needed (for memory efficiency)
+                        if detach_across_iterations and thinking_hidden_features is not None:
+                            thinking_hidden_features = thinking_hidden_features.detach()
+                        
+                        # Apply temperature scaling
+                        logits = self._apply_temperature_scaling(logits)
+                        
+                        # Compute loss only on answer tokens
+                        # Create a data dict for the loss function
+                        loss_data = BatchedDataDict({
+                            "input_ids": target_ids,  # Target tokens
+                            "token_mask": token_mask,  # Only answer tokens
+                            "sample_mask": mb["sample_mask"].cuda(),
+                            "p_mask": mb["p_mask"].cuda(),
+                            "seq_index": mb["seq_index"].cuda() if "seq_index" in mb else None,
+                        })
+                        
+                        # Use sequence packing loss wrapper if enabled
+                        if self.enable_seq_packing:
+                            loss_fn_ = SequencePackingLossWrapper(
+                                loss_fn=loss_fn,
+                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                            )
+                        else:
+                            loss_fn_ = loss_fn
+                        
+                        loss, loss_metrics = loss_fn_(
+                            logits,
+                            loss_data,
+                            global_valid_seqs,
+                            global_valid_toks,
+                        )
+                        del logits
+                        
+                        iteration_metrics.append(loss_metrics)
+                        
+                        # Scale loss by dp_size for gradient averaging
+                        scaled_loss = loss * self.dp_size * self.cp_size
+                        total_loss_value += loss.item()
+                        
+                        if not eval_mode:
+                            if detach_across_iterations:
+                                # Backward after each iteration to save memory
+                                # Gradients accumulate in model parameters
+                                scaled_loss.backward()
+                            else:
+                                # Accumulate loss for single backward at the end
+                                if iter_idx == 0:
+                                    accumulated_loss = scaled_loss
+                                else:
+                                    accumulated_loss = accumulated_loss + scaled_loss
+                
+                # If not detaching, do single backward with accumulated loss
+                if not eval_mode and not detach_across_iterations:
+                    accumulated_loss.backward()
+                
+                # Aggregate metrics across iterations
+                aggregated_metrics = {}
+                for m in iteration_metrics:
+                    for k, v in m.items():
+                        if k not in aggregated_metrics:
+                            aggregated_metrics[k] = 0
+                        aggregated_metrics[k] += v / num_iterations
+                
+                aggregated_metrics["num_iterations"] = num_iterations
+                aggregated_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                aggregated_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                aggregated_metrics["global_valid_toks"] = global_valid_toks.item()
+                
+                mb_losses.append(total_loss_value)
+                all_mb_metrics.append(aggregated_metrics)
+            
+            # Gradient clipping and optimizer step
+            grad_norm = None
+            if not eval_mode:
+                with torch.no_grad():
+                    grad_norm = get_grad_norm(
+                        self.model.parameters(),
+                        dp_cp_group=self.dp_cp_mesh.get_group(),
+                        tp_group=self.tp_mesh.get_group(),
+                        dtype=torch.float32,
+                    )
+                    if self.max_grad_norm is not None:
+                        clip_grad_by_total_norm_(
+                            self.model.parameters(),
+                            max_grad_norm=self.max_grad_norm,
+                            total_norm=grad_norm,
+                        )
+                    grad_norm = torch.tensor([grad_norm])
+                
+                self.optimizer.step()
+            losses.append(torch.tensor(mb_losses).sum().item())
+        
+        # Clean up
+        self.optimizer.zero_grad()
+        if not eval_mode:
+            self.scheduler.step()
+        torch.cuda.empty_cache()
+        
+        # Compute global loss
+        with torch.no_grad():
+            global_loss = torch.tensor(losses, device="cuda")
+            torch.distributed.all_reduce(
+                global_loss, group=self.dp_mesh.get_group()
+            )
+        
+        # Aggregate metrics
+        mb_metrics = defaultdict(list)
+        for m in all_mb_metrics:
+            for k, v in m.items():
+                mb_metrics[k].append(v)
+        
+        metrics = {
+            "global_loss": global_loss.cpu(),
+            "grad_norm": grad_norm,
+            "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
+            "all_mb_metrics": dict(mb_metrics),
+        }
+        
+        return metrics
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/train")
+    def train(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        is_teacher: Optional[bool] = False,
+        teacher_logits: Optional = None,
+        topk_logits: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a batch of data with a given loss function."""
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if mbs is None:
+            mbs = self.cfg["train_micro_batch_size"]
+        local_gbs = gbs // self.dp_size
+        total_dataset_size = torch.tensor(data.size, device="cuda")
+        torch.distributed.all_reduce(
+            total_dataset_size,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.dp_mesh.get_group(),
+        )
+        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        # dim 1 is always assumed to be the sequence dim, sanity check this here
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+
+        if is_teacher:
+            if self.teacher_logits is not None:
+                # With the reusable buffer approach, we no longer need to free old IPC handles.
+                # The same buffer and IPC handle are reused across iterations.
+                print(f" rank {torch.distributed.get_rank()} Teacher GPU memory at start: {torch.cuda.memory_allocated() / 1e9} {torch.cuda.memory_reserved() / 1e9}")
+        
+        if eval_mode:
+            ctx: AbstractContextManager[Any] = torch.no_grad()
+            self.model.eval()
+        else:
+            ctx = nullcontext()
+            # Ensure model is in training mode
+            self.model.train()
+
+        with ctx:
+            # Get data from batch and move to device
+            data.to("cuda")
+
+            losses = []
+            all_mb_metrics = []
+            for gb_idx in range(num_global_batches):
+                global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
+
+                assert "sample_mask" in global_batch, (
+                    "sample_mask must be present in the data!"
+                )
+                ## get the normalization factor for the loss
+                local_valid_seqs = torch.sum(global_batch["sample_mask"])
+
+                if not "token_mask" in global_batch:
+                    local_valid_toks = (
+                        local_valid_seqs * global_batch["input_ids"].shape[1]
+                    )
+                else:
+                    if self._is_dqwn:
+                        local_valid_toks = torch.sum(
+                            global_batch["token_mask"]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
+                    elif self._is_mdlm and "noise_mask" in global_batch:
+                        local_valid_toks = torch.sum(
+                            global_batch["noise_mask"]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
+                    else:
+                        local_valid_toks = torch.sum(
+                            global_batch["token_mask"][:, 1:]
+                            * global_batch["sample_mask"].unsqueeze(-1)
+                        )
+
+                to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+                torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+                global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+                
+                global_valid_toks_ar = None
+                if self._is_dqwn and "token_mask_ar" in global_batch:
+                    local_valid_toks_ar = torch.sum(
+                        global_batch["token_mask_ar"]
+                        * global_batch["sample_mask"].unsqueeze(-1)
+                    )
+                    to_reduce = torch.tensor([local_valid_toks_ar]).cuda()
+                    torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+                    global_valid_toks_ar = to_reduce[0]
+
+                if (
+                    hasattr(loss_fn, "loss_type")
+                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
+                ):
+                    assert "token_mask" in global_batch, (
+                        "token_mask must be present in the data when using token-level loss"
+                    )
+
+                if not is_teacher:
+                    self.optimizer.zero_grad()
+                mb_losses = []
+                batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
+                # Calculate number of microbatches to process
+                # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
+                # so its safe to not check for the case where the last data slice is smaller than mbs
+                dummy_iterator = iter([])
+                if self.cfg["dynamic_batching"]["enabled"]:
+                    mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
+                    iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
+                elif self.enable_seq_packing:
+                    mb_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
+                    iterator_len, max_seqlen = (
+                        batch.get_microbatch_iterator_for_packable_sequences_len()
+                    )
+                    max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                    torch.distributed.all_reduce(
+                        max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                    )
+
+                    # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                    # We add dummy batches to the end of the iterator to make the batch counts equal.
+                    dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                    dummy_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
+                    dummy_iterator = itertools.islice(
+                        itertools.cycle(dummy_iterator), dummy_batch_ct
+                    )
+                else:
+                    mb_iterator = batch.make_microbatch_iterator(mbs)
+                    iterator_len = batch.size // mbs
+
+                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+                    "clear_cache_every_n_steps"
+                )
+                if empty_cache_steps:
+                    warnings.warn(
+                        f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
+                    )
+
+                all_teacher_logits = None
+
+                # Reconstruct teacher tensor from IPC ONCE before the microbatch loop.
+                # Previously, rebuild_cuda_tensor_from_ipc was called inside the loss function
+                # on every microbatch, opening a new cudaIpcOpenMemHandle mapping each time.
+                # This caused unnecessary memory pressure and potential IPC mapping leaks.
+                teacher_logits_tensor = None
+                teacher_topk_indices_tensor = None
+                if not is_teacher and teacher_logits is not None:
+                    list_index = torch.distributed.get_rank()
+                    dict_index = list_index
+                    current_device_id = torch.cuda.current_device()
+                    actual_shape = teacher_logits[list_index].get('actual_shape') if isinstance(teacher_logits[list_index], dict) else None
+                    is_topk = teacher_logits[list_index].get('is_topk', False) if isinstance(teacher_logits[list_index], dict) else False
+                    teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                        teacher_logits[list_index][dict_index], current_device_id
+                    ).detach()
+                    # Slice to actual data dimensions if buffer was larger (grow-only IPC buffer)
+                    if actual_shape is not None:
+                        aB, aS, aV = actual_shape
+                        teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aV].clone()
+                    else:
+                        teacher_logits_tensor = teacher_logits_tensor.clone()
+
+                    # If topk mode, also reconstruct the indices tensor from its IPC buffer
+                    if is_topk and 'topk_indices_ipc' in teacher_logits[list_index]:
+                        teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
+                            teacher_logits[list_index]['topk_indices_ipc'], current_device_id
+                        ).detach()
+                        if actual_shape is not None:
+                            teacher_topk_indices_tensor = teacher_topk_indices_tensor[:aB, :aS, :aV].clone()
+                        else:
+                            teacher_topk_indices_tensor = teacher_topk_indices_tensor.clone()
+
+                for mb_idx, mb in enumerate(
+                    itertools.chain(mb_iterator, dummy_iterator)
+                ):
+                    # Conditioanlly empty cache when sensitive to fragmentation
+                    if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                        torch.cuda.empty_cache()
+
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        if self.enable_seq_packing:
+                            input_ids = mb.get("input_ids").cuda()
+                            input_ids, position_ids, _ = pack_sequences(
+                                input_ids=input_ids,
+                                input_lengths=mb["input_lengths"],
+                                packed_sequence_size=[
+                                    len(mb["input_lengths"])
+                                ],  # flash attention 2 expects flattened input
+                                padding_value=self.tokenizer.eos_token_id,
+                                return_attention_mask=False,
+                                min_seq_len=self.cfg["sequence_packing"][
+                                    "train_mb_tokens"
+                                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+                            )
+                            seq_len = input_ids.shape[1]
+                            attention_mask = None
+                            flash_attn_kwargs = get_flash_attention_kwargs(
+                                input_lengths=mb["input_lengths"],
+                            )
+
+                        else:
+                            input_ids = mb.get("input_ids").cuda()
+                            batch_size, seq_len = input_ids.shape
+
+                            attention_mask = torch.ones(
+                                (batch_size, seq_len),
+                                dtype=torch.bool,
+                                device=input_ids.device,
+                            )
+                            position_ids = torch.arange(
+                                seq_len, device=input_ids.device
+                            ).repeat(batch_size, 1)
+                            flash_attn_kwargs = {}
+                            masked_indices = None
+                            if self._is_dqwn and self._is_mdlm:
+                                masked_indices = mb.get("token_mask").cuda()
+
+                        # add vlm kwargs to model call
+                        vlm_kwargs = mb.get_multimodal_dict(
+                            as_tensors=True, device=input_ids.device
+                        )
+                        if len(vlm_kwargs) > 0:
+                            position_ids = None
+                            assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
+                                "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
+                            )
+
+                    context_parallel_ctx = None
+                    if self.cp_size > 1:
+                        assert len(vlm_kwargs) == 0, (
+                            f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
+                        )
+                        seq_index = torch.arange(
+                            seq_len, device=input_ids.device
+                        ).repeat(1, 1)
+                        cp_buffers = (
+                            [input_ids, masked_indices, seq_index] if self._is_dqwn and self._is_mdlm else [input_ids, position_ids, seq_index]
+                            if self.cp_size > 1
+                            else []
+                        )
+
+                        # Create context parallel context
+                        context_parallel_ctx = self.create_context_parallel_ctx(
+                            cp_mesh=self.cp_mesh,
+                            cp_buffers=cp_buffers,
+                            cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                            cp_no_restore_buffers=set(cp_buffers),
+                        )
+
+                    with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                        with torch.autocast(device_type="cuda", dtype=self.dtype):
+                            model_args = dict(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                use_cache=False,
+                                flash_attn_kwargs=flash_attn_kwargs,
+                                **vlm_kwargs,
+                            )
+                            if self._is_mdlm:
+                                del model_args["position_ids"]
+                                del model_args["flash_attn_kwargs"]
+
+                            if self._is_dqwn:
+                                assert self._is_mdlm, "DiffQwen is only supported for MDLM"
+
+                                del model_args["use_cache"]
+                                # internally uses block diffusion attention mask 
+                                del model_args["attention_mask"]
+
+                                model_args = {
+                                    **model_args, 
+                                    #"masked_indices": mb["token_mask"],
+                                    "masked_indices": masked_indices,
+                                    #"p_mask": mb["p_mask"],
+                                    "labels": input_ids,
+                                    "skip_loss": True,
+                                }
+
+                            if self._is_reward_model:
+                                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
+                                # Note that it should be empty anyway since sequence packing
+                                # is not supported for reward models.
+                                assert not flash_attn_kwargs
+                                del model_args["flash_attn_kwargs"]
+                            # remove flash_attn_kwargs if there are multimodal kwargs
+                            if len(vlm_kwargs) > 0:
+                                del model_args["flash_attn_kwargs"]
+
+                            # print("input_ids shape:", input_ids.shape)
+
+                            outputs = self.model(**model_args)
+
+                        # with torch.no_grad(is_teacher):
+                        with torch.set_grad_enabled(not is_teacher):
+                            # Get logprobs
+                            causal_logits = None
+                            if not hasattr(outputs, "logits"):
+                                logits = self.model.lm_head(outputs.last_hidden_state)
+                            else:
+                                logits = outputs.logits
+                            if hasattr(outputs, "causal_logits") and outputs.causal_logits is not None:
+                                causal_logits = outputs.causal_logits
+                                del outputs
+                                logits = torch.cat([logits, causal_logits], dim=1)
+                            else:
+                                del outputs
+
+                            # Apply temperature scaling
+                            logits = self._apply_temperature_scaling(logits)
+                            
+                            #if causal_logits is not None:
+                            #    causal_logits = self._apply_temperature_scaling(causal_logits)
+
+                            if self.cp_size > 1:
+                                seq_index_dtensor = (
+                                    DTensor.from_local(
+                                        seq_index,
+                                        device_mesh=self.cp_mesh,
+                                        placements=[Shard(1)],
+                                    )
+                                    .full_tensor()
+                                    .squeeze(0)
+                                )
+
+                                mb["seq_index"] = seq_index_dtensor
+                                
+                                
+                                token_mask_dtensor_orig = (
+                                    DTensor.from_local(
+                                        masked_indices,
+                                        device_mesh=self.cp_mesh,
+                                        placements=[Shard(sequence_dim)],
+                                    )
+                                    .full_tensor()
+                                )
+                                
+                                _, sorted_indices = torch.sort(seq_index_dtensor)
+                                token_mask_dtensor = token_mask_dtensor_orig[:, sorted_indices]
+                                
+                                mb["token_mask"] = token_mask_dtensor
+
+                                for tensor_name in mb:
+                                    current_tensor = mb[tensor_name]
+                                    for buffer in cp_buffers:
+                                        if current_tensor is buffer:
+                                            assert type(current_tensor) == torch.Tensor, (
+                                                f"tensor {tensor_name} is not a tensor"
+                                            )
+                                            mb[tensor_name] = DTensor.from_local(
+                                                current_tensor,
+                                                device_mesh=self.cp_mesh,
+                                                placements=[Shard(sequence_dim)],
+                                            )
+                                            break
+
+                                # print("full logits shape prior to CP redistribution:", logits.shape)
+                                # print("full logits shape prior to CP redistribution with local:", logits.to_local().shape)
+                                if isinstance(logits, DTensor):
+                                    # Must be tp sharded
+                                    assert (
+                                        logits.device_mesh.ndim == 1
+                                        and logits.device_mesh.mesh_dim_names[0] == "tp"
+                                    ), "logits must be tp sharded"
+
+                                    # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                                    logits = DTensor.from_local(
+                                        logits.to_local(),
+                                        device_mesh=self.device_mesh[("cp", "tp")],
+                                        placements=[Shard(sequence_dim), Shard(-1)],
+                                    )
+                                else:
+                                    logits = DTensor.from_local(
+                                        logits,
+                                        device_mesh=self.device_mesh[("cp", "tp")],
+                                        placements=[Shard(sequence_dim), Shard(-1)],
+                                    )
+
+                        
+                        if is_teacher:
+                            with torch.no_grad():
+                                if all_teacher_logits is None:
+                                    all_teacher_logits = logits
+                                else:
+                                    all_teacher_logits = torch.cat([all_teacher_logits, logits], dim=0)
+                        else:
+                            if self.enable_seq_packing:
+                                loss_fn_ = SequencePackingLossWrapper(
+                                    loss_fn=loss_fn,
+                                    cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                                    cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                                )
+                            else:
+                                loss_fn_ = loss_fn
+
+                            if teacher_logits_tensor is not None:
+                                loss, loss_metrics = loss_fn_(
+                                    logits,
+                                    mb,
+                                    global_valid_seqs,
+                                    torch.cat([global_valid_toks.unsqueeze(0), global_valid_toks_ar.unsqueeze(0)], dim=0) if (causal_logits is not None and global_valid_toks_ar is not None) else global_valid_toks,
+                                    teacher_logits=teacher_logits_tensor,
+                                    mb_idx=mb_idx,
+                                    mbs=mbs,
+                                    teacher_topk_indices_ipc=teacher_topk_indices_tensor,
+                                )
+                            else:
+                                loss, loss_metrics = loss_fn_(
+                                    logits,
+                                    mb,
+                                    global_valid_seqs,
+                                    torch.cat([global_valid_toks.unsqueeze(0), global_valid_toks_ar.unsqueeze(0)], dim=0) if (causal_logits is not None and global_valid_toks_ar is not None) else global_valid_toks,
+                                )
+
+                            del logits, causal_logits
+
+                            # skip the update for dummy batches
+                            if mb_idx < iterator_len:
+                                ## scale by the number of global batches so we get the correct
+                                ## value when summing metrics across all microbatches
+                                for k in loss_metrics.keys():
+                                    loss_metrics[k] /= num_global_batches
+                                num_valid_samples = loss_metrics["num_valid_samples"]
+                                loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                                loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                                loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                            else:
+                                loss *= 0
+
+                            # Backward pass
+                            if not eval_mode:
+                                ## NOTE: invalid samples should be multiplied
+                                ## by zero in the loss function to prevent them
+                                ## from affecting the gradient calculation
+
+                                # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+                                # but we want to sum them so we cancel out the average here
+                                loss *= self.dp_size * self.cp_size
+                                loss.backward()
+
+                    if not is_teacher:
+                        if num_valid_samples > 0:
+                            mb_losses.append(loss.item())
+                            all_mb_metrics.append(loss_metrics)
+
+                # end of all micro batches in the global batch
+                # Clean up pre-reconstructed teacher tensor after all microbatches
+                if teacher_logits_tensor is not None:
+                    del teacher_logits_tensor
+                    teacher_logits_tensor = None
+                if teacher_topk_indices_tensor is not None:
+                    del teacher_topk_indices_tensor
+                    teacher_topk_indices_tensor = None
+                
+                if is_teacher:
+
+                    with torch.no_grad():
+                        seq_index = data.get("seq_index", None)
+
+                        if isinstance(all_teacher_logits, DTensor):
+                            all_teacher_logits_local = all_teacher_logits.to_local()  # [B, S, V_local]
+                        else:
+                            all_teacher_logits_local = all_teacher_logits
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(all_teacher_logits_local.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
+                        
+                        all_teacher_logits_local = all_teacher_logits_local.to(torch.float32)
+                        all_teacher_logits_local_log_prob = _compute_distributed_log_softmax(all_teacher_logits_local, group=tp_group)
+                        # Delete intermediate tensors to free memory immediately
+                        del all_teacher_logits, all_teacher_logits_local
+                        
+                        if isinstance(all_teacher_logits_local_log_prob, DTensor):
+                            all_teacher_logits_local_log_prob = all_teacher_logits_local_log_prob.to_local()#.cpu()
+                        else:
+                            all_teacher_logits_local_log_prob = all_teacher_logits_local_log_prob#.cpu()
+
+                        #Check if teacher is a MDLM model in order to extract only the causal logits for KD
+                        if self.cfg['is_mdlm']:
+                            # extract only the causal logits for KD
+                            shared_sequence_length = int(all_teacher_logits_local_log_prob.shape[1] / 2)
+                            all_teacher_logits_local_log_prob_causal = all_teacher_logits_local_log_prob[:, shared_sequence_length:, :]
+                            del all_teacher_logits_local_log_prob
+                        else:
+                            all_teacher_logits_local_log_prob_causal = all_teacher_logits_local_log_prob
+
+                        if topk_logits is not None:
+                            # ===== TOP-K PATH =====
+                            # Use distributed_vocab_topk on teacher's TP-local log probs
+                            # to get the k most probable tokens and their (full-vocab-
+                            # normalized) log probabilities.  Both topk_logprobs and
+                            # topk_indices are replicated across TP ranks.
+                            topk_logprobs, topk_indices = distributed_vocab_topk(
+                                all_teacher_logits_local_log_prob_causal,  # [B, S, V_local]
+                                k=topk_logits,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                            # topk_logprobs: [B, S, k]  (replicated, full-vocab log probs)
+                            # topk_indices:  [B, S, k]  (global token ids, replicated)
+                            del all_teacher_logits_local_log_prob_causal
+
+                            B, S, K = topk_logprobs.shape
+                            target_dtype = topk_logprobs.dtype
+                            target_device = topk_logprobs.device
+
+                            # Pre-allocate two IPC buffers (values + indices) exactly once.
+                            if not hasattr(self, '_teacher_topk_vals_buffer') or self._teacher_topk_vals_buffer is None:
+                                max_S = self.cfg.get("max_total_sequence_length", S)
+                                vals_buf_shape = (B, max_S, K)
+                                self._teacher_topk_vals_buffer = torch.empty(
+                                    vals_buf_shape, dtype=target_dtype, device=target_device
+                                )
+                                self._teacher_topk_vals_ipc = {
+                                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_vals_buffer)
+                                }
+                                idx_buf_shape = (B, max_S, K)
+                                self._teacher_topk_idx_buffer = torch.empty(
+                                    idx_buf_shape, dtype=topk_indices.dtype, device=target_device
+                                )
+                                self._teacher_topk_idx_ipc = {
+                                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_idx_buffer)
+                                }
+                                print(f" rank {torch.distributed.get_rank()} Allocated topk IPC buffers: "
+                                      f"vals={vals_buf_shape} ({self._teacher_topk_vals_buffer.numel() * self._teacher_topk_vals_buffer.element_size() / 1e9:.4f} GB), "
+                                      f"idx={idx_buf_shape} ({self._teacher_topk_idx_buffer.numel() * self._teacher_topk_idx_buffer.element_size() / 1e9:.4f} GB) "
+                                      f"(actual data: [{B}, {S}, {K}])")
+
+                            # Copy actual data into the top-left slice of the buffers
+                            self._teacher_topk_vals_buffer[:B, :S, :K].copy_(topk_logprobs)
+                            self._teacher_topk_idx_buffer[:B, :S, :K].copy_(topk_indices)
+                            del topk_logprobs, topk_indices
+
+                            rank = torch.distributed.get_rank()
+                            self.teacher_logits = {
+                                rank: self._teacher_topk_vals_ipc[rank],
+                                'actual_shape': (B, S, K),
+                                'topk_indices_ipc': self._teacher_topk_idx_ipc[rank],
+                                'is_topk': True,
+                            }
+                            return self.teacher_logits
+
+                        # ===== FULL-LOGPROB PATH (no top-k) =====
+                        # IPC buffer for teacher logits (knowledge distillation).
+                        # Pre-allocate at max possible S dimension on first call so the buffer
+                        # and its IPC handle are created exactly ONCE.  Each subsequent call just
+                        # copies the actual data into a slice.
+                        #
+                        # Why pre-allocate?  Every call to get_handle_from_tensor →
+                        # reduce_tensor → _share_cuda_ creates a CudaIPCSentData entry in
+                        # PyTorch's C++ layer that holds a smart-pointer to the underlying
+                        # allocation.  That pointer prevents cudaFree even after all Python
+                        # references are dropped, until the cross-process reference counter
+                        # reaches 0 AND PyTorch's IPC GC runs.  Growing the buffer means
+                        # creating a new allocation + IPC handle while the old one is still
+                        # pinned → leaked memory.  Pre-allocating avoids the problem entirely.
+                        B, S, V = all_teacher_logits_local_log_prob_causal.shape
+                        target_dtype = all_teacher_logits_local_log_prob_causal.dtype
+                        target_device = all_teacher_logits_local_log_prob_causal.device
+
+                        # Initialize buffer on first call — allocate at max S from config
+                        if not hasattr(self, '_teacher_logits_buffer') or self._teacher_logits_buffer is None:
+                            # Use max_total_sequence_length from config to compute the
+                            # upper-bound S so we never need to grow.
+                            max_S = self.cfg.get("max_total_sequence_length", S)
+
+                            # For MDLM models the causal logits are the second half of
+                            # the sequence (see slicing above), so max causal S = max_S / 2.
+                            # if self.cfg.get('is_mdlm', False):
+                            #     max_S = max_S // 2
+                            
+                            # B and V are fixed across iterations
+                            buf_shape = (B, max_S, V)
+                            self._teacher_logits_buffer = torch.empty(
+                                buf_shape, dtype=target_dtype, device=target_device
+                            )
+                            self._teacher_logits_ipc_handle = {
+                                torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_logits_buffer)
+                            }
+                            print(f" rank {torch.distributed.get_rank()} Allocated IPC buffer: shape={buf_shape}, "
+                                  f"size={self._teacher_logits_buffer.numel() * self._teacher_logits_buffer.element_size() / 1e9:.4f} GB "
+                                  f"(actual data: [{B}, {S}, {V}])")
+
+                        # Copy actual data into the top-left slice of the buffer
+                        self._teacher_logits_buffer[:B, :S, :V].copy_(all_teacher_logits_local_log_prob_causal)
+                        del all_teacher_logits_local_log_prob_causal
+
+                        # Return the IPC handle dict with actual shape metadata
+                        # Consumer must slice the reconstructed tensor to [:B, :S, :V]
+                        self.teacher_logits = {
+                            torch.distributed.get_rank(): self._teacher_logits_ipc_handle[torch.distributed.get_rank()],
+                            'actual_shape': (B, S, V),
+                        }
+                        
+                        # print(f" rank {torch.distributed.get_rank()} Teacher GPU memory used: {torch.cuda.memory_allocated() / 1e9} {torch.cuda.memory_reserved() / 1e9}")
+                        return self.teacher_logits
+                        # return all_teacher_logits_local_log_prob#.cpu()
+                
+                # Clean up teacher_logits parameter after all microbatches (student side)
+                # Note: This is the IPC handle dict passed from the teacher, not self.teacher_logits
+                # if teacher_logits is not None:
+                #     del teacher_logits
+
+                grad_norm: Optional[float | torch.Tensor] = None
+                if not eval_mode:
+                    with torch.no_grad():
+                        grad_norm = get_grad_norm(
+                            self.model.parameters(),
+                            dp_cp_group=self.dp_cp_mesh.get_group(),
+                            tp_group=self.tp_mesh.get_group(),
+                            dtype=torch.float32,
+                        )
+                        if self.max_grad_norm is not None:
+                            clip_grad_by_total_norm_(
+                                self.model.parameters(),
+                                max_grad_norm=self.max_grad_norm,
+                                total_norm=grad_norm,
+                            )
+                        grad_norm = torch.tensor([grad_norm])
+
+                    # Update parameters
+                    self.optimizer.step()
+
+                losses.append(torch.tensor(mb_losses).sum().item())
+
+            # release gradient memory before rollouts
+            self.optimizer.zero_grad()
+            # increment scheduler after all batches in rollout are processed
+            if not eval_mode:
+                self.scheduler.step()
+            # dynamic batch and sequence dims causes alot of fragmentation, so clear
+            # the memory allocator before moving on
+            torch.cuda.empty_cache()
+
+            # Compute global loss across all ranks
+            with torch.no_grad():
+                global_loss = torch.tensor(losses, device="cuda")
+                torch.distributed.all_reduce(
+                    global_loss, group=self.dp_mesh.get_group()
+                )
+            # Aggregate metrics across all microbatches
+            mb_metrics = defaultdict(list)
+            for m in all_mb_metrics:
+                for k, v in m.items():
+                    mb_metrics[k].append(v)
+
+            metrics = {
+                "global_loss": global_loss.cpu(),
+                "grad_norm": grad_norm,
+                "rank": torch.distributed.get_rank(),
+                "gpu_name": torch.cuda.get_device_name(),
+                "model_dtype": self.dtype,
+                "all_mb_metrics": dict(mb_metrics),
+            }
+
+            return metrics
+
+    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
+    def get_logprobs(
+        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get the logprobs of the model for a batch of data.
+
+        Uses the configured logprob_batch_size to do microbatching.
+
+        Input data is assumed to be right-padded. The method internally converts to
+        left-padded format for computation, and returns outputs in right-padded format.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+
+        # dim 1 is always assumed to be the sequence dim, sanity check this here
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+
+        all_log_probs = []
+        self.model.eval()
+
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
+                iterator_len = data.size // logprob_batch_size
+
+            step = 0
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                step += 1
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+                vlm_kwargs = lp_batch.get_multimodal_dict(
+                    as_tensors=True, device=input_ids.device
+                )
+
+                batch_size, seq_len = input_ids.shape
+                if self.enable_seq_packing:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for sequence packing"
+                    )
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Create post_attention_mask for right-padded data for masking token after forwarding.
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        # For right-padded sequence, set 1s at the beginning of the sequence
+                        post_attention_mask[i, :length] = 1
+
+                    # explicitly create position ids for the input, otherwise the sharding
+                    # for DTensor will be incorrect
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+                    flash_attn_kwargs = {}
+
+                    # DTensor requires the casual attention kernel to hit,
+                    # yet our attention mask above is not always all 1s
+                    # this is fine because we mask with the actual attention mask
+                    # later, but for input it has to be all 1s
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+
+                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
+                if len(vlm_kwargs) > 0:
+                    position_ids = None
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for context parallel"
+                    )
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                            **vlm_kwargs,
+                        )
+                        if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        outputs = self.model(**model_args)
+
+                    logits = outputs.logits
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+
+                    if self.cp_size > 1:
+                        seq_index_tensor = (
+                            DTensor.from_local(
+                                seq_index,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(1)],
+                            )
+                            .full_tensor()
+                            .squeeze(0)
+                        )
+
+                        input_ids_dtensor = DTensor.from_local(
+                            input_ids,
+                            device_mesh=self.cp_mesh,
+                            placements=[Shard(sequence_dim)],
+                        )
+
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                            logits,
+                            input_ids_dtensor,
+                            seq_index_tensor,
+                            chunk_size=logprob_chunk_size,
+                        )
+
+                        assert token_logprobs.shape[1] == seq_len - 1
+                    else:
+                        if isinstance(logits, DTensor):
+                            token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                                logits,
+                                input_ids,
+                                chunk_size=logprob_chunk_size,
+                            )
+                        else:
+                            if logprob_chunk_size is not None:
+                                logits_seq_len = int(logits.shape[1])
+                                num_chunks = (
+                                    logits_seq_len + logprob_chunk_size - 1
+                                ) // logprob_chunk_size
+                                chunked_log_probs = []
+                                for chunk_idx in range(num_chunks):
+                                    chunk_start = chunk_idx * logprob_chunk_size
+                                    chunk_end = min(
+                                        logits_seq_len,
+                                        (chunk_idx + 1) * logprob_chunk_size,
+                                    )
+                                    chunk_logits = logits[
+                                        :, chunk_start:chunk_end, :
+                                    ].to(torch.float32)
+                                    log_probs = torch.nn.functional.log_softmax(
+                                        chunk_logits, dim=-1
+                                    )
+                                    chunked_log_probs.append(log_probs)
+                                log_probs = torch.cat(chunked_log_probs, dim=1)
+                                del chunked_log_probs
+                            else:
+                                logits = logits.to(torch.float32)
+                                log_probs = torch.nn.functional.log_softmax(
+                                    logits, dim=-1
+                                )
+                            # Extract logprobs for each token in the sequence by gathering the logprob
+                            # corresponding to the next token at each position
+                            # Input shapes:
+                            #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
+                            #   token_ids: [batch_size, sequence_length] - actual tokens
+                            # Output shape: [batch_size, sequence_length] - logprob of each token given previous
+                            # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
+                            next_tokens = input_ids[:, 1:]
+                            log_probs = log_probs[:, :-1]
+                            token_logprobs = log_probs.gather(
+                                dim=-1, index=next_tokens.unsqueeze(-1)
+                            ).squeeze(-1)
+                            del log_probs
+
+                del outputs, logits
+
+                token_logprobs = torch.cat(
+                    [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+                )
+
+                # skip keeping the logprobs for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
+                if not self.enable_seq_packing:
+                    # Apply mask to zero out padding tokens logprobs
+                    token_logprobs = token_logprobs * post_attention_mask
+                else:
+                    # For packed sequences, unpack logprobs
+                    unpacked_logprobs = torch.zeros(
+                        (batch_size, seq_dim_size),
+                        dtype=token_logprobs.dtype,
+                        device=token_logprobs.device,
+                    )
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+                    for i in range(batch_size):
+                        start = cu_seqlens[i].item() + 1
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+                        unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[
+                            0, start:end
+                        ]
+                    token_logprobs = unpacked_logprobs
+
+                all_log_probs.append(token_logprobs)
+
+        # Concatenate all batches
+        return_data = BatchedDataDict[LogprobOutputSpec]()
+
+        all_log_probs_padded = []
+        for lp in all_log_probs:
+            padding_needed = seq_dim_size - lp.shape[1]
+            if padding_needed > 0:
+                lp = torch.nn.functional.pad(
+                    lp, (0, padding_needed), mode="constant", value=0.0
+                )
+            all_log_probs_padded.append(lp)
+        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+
+        return return_data
+
+    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
+    @wrap_with_nvtx_name("dtensor_policy_worker/score")
+    def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        global_batch_size = min(self.cfg["batch_size"], data.size)
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+        self.model.eval()
+
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(global_batch_size)
+                iterator_len = data.size // global_batch_size
+
+            step = 0
+            all_rm_scores = []
+            for batch_idx, generate_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                step += 1
+                input_ids = generate_batch.get("input_ids").cuda()
+                input_lengths = generate_batch.get("input_lengths")
+                batch_size, seq_len = input_ids.shape
+                if self.enable_seq_packing:
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Create attention mask for right-padded data
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        # For right-padded sequence, set 1s at the beginning of the sequence
+                        post_attention_mask[i, :length] = 1
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                        )
+                        outputs = self.model(**model_args)
+
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+                if isinstance(logits, DTensor):
+                    logits = logits.to(torch.float32)
+                else:
+                    logits = outputs.logits.to(torch.float32)
+
+                rm_scores = to_local_if_dtensor(logits)
+                rm_scores = rm_scores.squeeze(-1)
+                all_rm_scores.append(rm_scores)
+
+        all_rm_scores = torch.cat(all_rm_scores, dim=0)
+        all_rm_scores = all_rm_scores.squeeze(-1).cpu()
+        return_data = BatchedDataDict[ScoreOutputSpec](
+            {
+                "scores": all_rm_scores,
+            }
+        )
+        return return_data
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-position top-k logits and corresponding global indices.
+
+        Notes:
+        - Return shapes are [B, S, k].
+        - Computes top-k over the full sequence (no trimming of the last position).
+        - If alignment with next-token targets is required, the caller should handle it.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
+        - Otherwise, computes local top-k on full-vocab tensor.
+        """
+        print(f"config: {self.cfg}")
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        out_topk_vals = []
+        out_topk_idx = []
+        self.model.eval()
+
+        with torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                # dynamic batching support (no CP/packed)
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(topk_batch_size)
+                iterator_len = data.size // topk_batch_size
+
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+                vlm_kwargs = lp_batch.get_multimodal_dict(
+                    as_tensors=True, device=input_ids.device
+                )
+                batch_size, seq_len = input_ids.shape
+
+                # Store original shapes for unpacking later
+                original_batch_size = batch_size
+                original_seq_len = seq_len
+
+                if self.enable_seq_packing:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for sequence packing"
+                    )
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Build attention mask (right-padded inputs)
+                    attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        attention_mask[i, :length] = 1
+
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+
+                    flash_attn_kwargs = {}
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+
+                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
+                if len(vlm_kwargs) > 0:
+                    position_ids = None
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for context parallel"
+                    )
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                            **vlm_kwargs,
+                        )
+                        if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        outputs = self.model(**model_args)
+
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    del outputs
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+
+                    if self.cp_size > 1:
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        # deal with TP first
+                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
+
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(local_logits.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
+
+                        vals, idx = distributed_vocab_topk(
+                            local_logits,
+                            k=k,
+                            tp_group=tp_group,
+                            vocab_start_index=vocab_start_index,
+                            vocab_end_index=vocab_end_index,
+                        )
+                        # [B, S_cp, k]
+
+                        cp_group = self.cp_mesh.get_group()
+
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
+                        )
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
+                        )
+                        # [B, S, k]
+                    else:
+                        # Compute top-k over full sequence length (do not drop last position)
+                        if isinstance(logits, DTensor):
+                            local_logits = logits.to_local()  # [B, S, V_local]
+                            tp_group = self.tp_mesh.get_group()
+                            tp_rank = torch.distributed.get_rank(tp_group)
+                            V_local = int(local_logits.shape[-1])
+                            vocab_start_index = tp_rank * V_local
+                            vocab_end_index = (tp_rank + 1) * V_local
+
+                            vals, idx = distributed_vocab_topk(
+                                local_logits,
+                                k=k,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                        else:
+                            full_logits = logits.to(torch.float32)
+                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
+
+                # Handle sequence packing unpacking
+                if self.enable_seq_packing:
+                    # Unpack top-k results from packed format back to original batch format
+                    # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+
+                    # Create tensors to store unpacked results
+                    unpacked_vals = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=vals.dtype,
+                        device=vals.device,
+                    )
+                    unpacked_idx = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=idx.dtype,
+                        device=idx.device,
+                    )
+
+                    # Get cumulative sequence lengths for unpacking
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+
+                    for i in range(original_batch_size):
+                        start = cu_seqlens[i].item()
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+
+                        # Extract the corresponding portion from packed results
+                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+
+                    # Replace with unpacked results
+                    vals = unpacked_vals
+                    idx = unpacked_idx
+
+                    # Update batch_size and seq_len for consistency
+                    batch_size = original_batch_size
+                    seq_len = original_seq_len
+
+                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
+                # Shapes remain [B, S, k].
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
+        all_topk_vals_padded = []
+        all_topk_idx_padded = []
+        target_seq_len = seq_dim_size
+        for vals, idx in zip(out_topk_vals, out_topk_idx):
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
+            all_topk_vals_padded.append(vals)
+            all_topk_idx_padded.append(idx)
+
+        ret["topk_logits"] = (
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
+
+    @contextmanager
+    def use_reference_model(self) -> Generator[None, None, None]:
+        """Context manager that temporarily swaps the reference model and active model.
+
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
+        On exit: Restores original references and re-flips cuda/cpu
+        """
+        with torch.no_grad():
+            try:
+                # Save train model state_dict
+                curr_state_dict = get_cpu_state_dict(
+                    self.model.state_dict().items(), pin_memory=True
+                )
+
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    val = to_local_if_dtensor(v)
+                    val.copy_(self.reference_model_state_dict[k])
+
+                # - self.model is the original reference_model, now on CUDA
+                # - curr_state_dict is the train model, now on CPU
+                yield
+
+            finally:
+                # Restore train model state_dict
+                for k, v in self.model.state_dict().items():
+                    val = to_local_if_dtensor(v)
+                    val.copy_(curr_state_dict[k])
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
+    def get_reference_policy_logprobs(
+        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Get the logprobs from the reference policy for a batch of data.
+
+        Returns:
+          a BatchedDataDict with key "reference_logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        with self.use_reference_model():
+            reference_logprobs = self.get_logprobs(data, micro_batch_size)
+
+        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return return_data
+
+    def _add_noise_to_weights(self) -> None:
+        """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
+        noise_std = 0.01  # Standard deviation for the noise
+        for p in self.model.parameters():
+            if p.requires_grad:
+                noise = torch.randn_like(p.data) * noise_std
+                p.data.add_(noise)  # Add noise in-place
+        torch.cuda.synchronize()
+
+    def return_state_dict(self):
+        return self.model.state_dict()
+
+    def return_model_config(self) -> dict[str, Any]:
+        """Return the model configuration as a dictionary.
+
+        Returns:
+            dict: Model configuration dictionary
+        """
+        return self.model.config
+
+    def report_device_id(self) -> str:
+        """Report the UUID of the current CUDA device using NVML.
+
+        Returns:
+            str: UUID of the device in the format "GPU-xxxxx"
+        """
+        from nemo_rl.utils.nvml import get_device_uuid
+
+        # Get current device index from torch
+        device_idx = torch.cuda.current_device()
+        # Get device UUID using NVML
+        return get_device_uuid(device_idx)
+
+    def get_zmq_address(self):
+        """Get the ZMQ address for the current device."""
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
+
+    def maybe_init_zmq(self):
+        """Initialize the ZMQ socket if it doesn't exist."""
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_socket.bind(self.get_zmq_address())
+
+    @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
+        state_dict_info = {}
+        for name, tensor in self.model.state_dict().items():
+            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+            state_dict_info[name] = (tensor.shape, self.dtype)
+
+        return state_dict_info
+
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
+        from nemo_rl.utils.nvml import get_free_memory_bytes
+
+        device_idx = torch.cuda.current_device()
+        return get_free_memory_bytes(device_idx)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        self.maybe_init_zmq()
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        def dtensor_params_generator():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            for name, tensor in self.model.state_dict().items():
+                if isinstance(tensor, DTensor):
+                    # Convert DTensor to full tensor for streaming
+                    full_tensor = tensor.full_tensor()
+                    # Convert to target dtype
+                    yield (
+                        name,
+                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                    )
+                else:
+                    # Convert to target dtype
+                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=dtensor_params_generator(),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+        )
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(self) -> None:
+        """Broadcast the weights for collective communication."""
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        def _dtensor_post_iter_func(tensor, dtype):
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            tensor = tensor.to(dtype, non_blocking=True)
+            return tensor
+
+        # param_iterator will return (name, tensor), we only need tensor
+        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+
+        packed_broadcast_producer(
+            iterator=iter(self.model.state_dict().items()),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=dtensor_post_iter_func,
+        )
+
+        # Manually move model to cpu for cpu offload case
+        # cpu offload needs model on CPU before model forward
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
+    def prepare_for_lp_inference(self) -> None:
+        # onload model to cuda
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            self.model = self.move_buffer_to_device(self.model, "cuda")
+
+        self.model.eval()
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
+    def prepare_for_training(self, *args, **kwargs) -> None:
+        # onload models and optimizer state to cuda
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            # when cpu offload is enabled, the buffers do not get moved
+            # to cuda automatically, so we need to do that manually
+            self.model = self.move_buffer_to_device(self.model, "cuda")
+
+        self.model.train()
+        # Move optimizer state to CUDA if it exists
+        # colocated generation will always offload optimizer to cuda before refit
+        if (
+            self.optimizer is not None
+            and not self.cpu_offload
+            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
+        ):
+            self.move_optimizer_to_device("cuda")
+
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
+    def offload_before_refit(self) -> None:
+        """Offload the optimizer to the CPU."""
+        torch.randn(1).cuda()  # wake up torch allocator
+        if self.optimizer is not None:
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
+    def offload_after_refit(self) -> None:
+        """Offload as much as possible on the CPU."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+        torch.randn(1).cuda()  # wake up torch allocator
+        self.offload_before_refit()  # rerun the old offload function
+
+        # Print memory stats after offloading
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+
+    def move_optimizer_to_device(self, device: str | torch.device) -> None:
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, (DTensor, torch.Tensor)):
+                    state[k] = v.to(device)
+
+    def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
+        model = self.move_buffer_to_device(model, device)
+        return model.to(device)
+
+    def move_buffer_to_device(
+        self, model: nn.Module, device: str | torch.device
+    ) -> nn.Module:
+        # FSDP modules do not move buffers to the device automatically
+        for v in model.buffers():
+            v.data = v.data.to(device)
+
+        return model
+
+    def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
+        model = self.move_to_device(model, "cuda")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return model
+
+    def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
+        model = self.move_to_device(model, "cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return model
+
+    def save_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
+    ) -> None:
+        """Save a checkpoint of the model.
+
+        the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
+        """
+        save_checkpoint(
+            model=self.model,
+            weights_path=weights_path,
+            optimizer=self.optimizer if optimizer_path else None,
+            scheduler=self.scheduler if optimizer_path else None,
+            optimizer_path=optimizer_path,
+            tokenizer=self.tokenizer if tokenizer_path else None,
+            tokenizer_path=tokenizer_path,
+        )
+
+    def load_checkpoint(
+        self, weights_path: str, optimizer_path: Optional[str] = None
+    ) -> None:
+        """Load a checkpoint into the model."""
+        load_checkpoint(
+            model=self.model,
+            weights_path=weights_path,
+            optimizer=self.optimizer if optimizer_path else None,
+            scheduler=self.scheduler if optimizer_path else None,
+            optimizer_path=optimizer_path,
+        )
+
+    def shutdown(self) -> None:
+        """Shutdown the policy."""
+        # Clean up extension resources like ZMQ sockets
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()
+
+    def get_model_config(self):
+        return self.model.config.to_dict()
+
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Report the node IP and GPU ID of the current worker."""
+        ip = ray._private.services.get_node_ip_address()
+        gpu_id = ray.get_gpu_ids()[0]
+        return (ip, gpu_id)

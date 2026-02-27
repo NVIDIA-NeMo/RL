@@ -1,0 +1,104 @@
+defaults: distillation_math.yaml
+distillation:
+  num_prompts_per_step: 768
+  max_num_steps: 1000
+  max_val_samples: 128
+  val_period: 0
+  loss_on_all_tokens: true
+  topk_logits_k: 8192
+loss_fn:
+  kl_type: "forward"
+data:
+  dataset_name: "arrow_text"
+  # Full dataset: ".../*.arrow" (2118 files, ~296M samples — too slow to preprocess)
+  # Using 10 files (~1.4M samples, plenty for 1000 steps x 768 batch = 768K samples)
+  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-0000[0-9]-of-02476.arrow"
+  prompt_file: null
+policy:
+  model_name: "meta-llama/Llama-3.2-1B"
+  tokenizer:
+    name: ${..model_name}
+    chat_template: null
+  train_global_batch_size: 768
+  max_total_sequence_length: 4096
+  generation:
+    backend: "vllm"
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: "bfloat16"
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: 2048
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      distributed_executor_backend: null
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: False
+      fused: False
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 950
+        eta_min: 0.0
+    - milestones: [50]
+teacher:
+  model_name: "meta-llama/Llama-3.1-8B"
+  tokenizer:
+    name: ${..model_name}
+    chat_template: null
+eval:
+  val_period: 50
+  val_at_start: false
+  max_val_samples: 512
+  val_batch_size: 64
+  max_rollout_turns: 1
+  benchmarks:
+    math:
+      dataset_name: "math"
+      prompt_file: "examples/prompts/cot.txt"
+      env:
+        num_workers: 8
+    mmlu:
+      dataset_name: "mmlu"
+      prompt_file: "examples/prompts/mmlu.txt"
+      env:
+        num_workers: 8
+        verifier_type: "multilingual_multichoice"
+checkpointing:
+  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-4node-${policy.model_name}"
+  metric_name: "train:loss"
+  higher_is_better: false
+logger:
+  log_dir: logs/off-policy-distillation-arrow-llama-topk8192-4node
+  wandb:
+    project: nemo-off-policy-distillation-eval
+    name: distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-4node
+cluster:
+  num_nodes: 4

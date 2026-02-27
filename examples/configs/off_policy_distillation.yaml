@@ -1,0 +1,209 @@
+# Off-Policy Distillation Configuration
+#
+# This config is for off-policy distillation where:
+# - A fixed dataset of prompt-response pairs is used (no student generation)
+# - Teacher provides logits for the fixed responses
+# - Student aligns with teacher using KL divergence loss
+#
+# Reference: https://github.com/NVIDIA-NeMo/RL/discussions/1445
+#
+# Usage:
+#   python run_off_policy_distillation.py --config configs/off_policy_distillation.yaml
+#
+# For arrow dataset:
+#   python run_off_policy_distillation.py --config configs/off_policy_distillation.yaml \
+#       data.arrow_files="/path/to/your/*.arrow"
+
+distillation:
+    num_prompts_per_step: 64  # Batch size
+    max_num_steps: 1000
+    max_num_epochs: 10
+    topk_logits_k: 64  # Top-k logits for sparse KL loss (saves memory)
+    seed: 42
+
+loss_fn:
+    kl_type: "mixed"  # Options: "forward", "reverse", "mixed"
+    mixed_kl_weight: 0.5  # Weight for forward KL when kl_type="mixed"
+    zero_outside_topk: false  # Zero teacher logits outside top-k for forward KL
+
+checkpointing:
+    enabled: true
+    checkpoint_dir: "checkpoints/off-policy-distillation-${policy.model_name}"
+    metric_name: null  # No validation in off-policy mode
+    higher_is_better: true
+    keep_top_k: 3
+    save_period: 50
+    checkpoint_must_save_by: null
+    model_save_format: "safetensors"
+    save_consolidated: false
+
+policy: &POLICY_BASE
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    tokenizer:
+        name: ${..model_name}
+        chat_template_kwargs: null
+    train_global_batch_size: 64
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 8192
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
+
+    dtensor_cfg: &DTENSOR_BASE
+        enabled: true
+        _v2: true
+        cpu_offload: False
+        sequence_parallel: false
+        activation_checkpointing: true
+        tensor_parallel_size: 2
+        context_parallel_size: 2
+        custom_parallel_plan: null
+
+    dynamic_batching:
+        enabled: true
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        sequence_length_round: 64
+
+    sequence_packing:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        algorithm: "modified_first_fit_decreasing"
+        sequence_length_round: 64
+
+    max_grad_norm: 1.0
+    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    
+    optimizer:
+        name: "torch.optim.AdamW"
+        kwargs:
+            lr: 2.0e-5
+            weight_decay: 0.01
+            betas: [0.9, 0.999]
+            eps: 1e-8
+            foreach: False
+            fused: False
+
+    megatron_cfg: &MEGATRON_BASE
+        enabled: false
+        empty_unused_memory_level: 0
+        activation_checkpointing: false
+        converter_type: "Qwen3ForCausalLM"
+        tensor_model_parallel_size: 2
+        expert_tensor_parallel_size: 1
+        expert_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
+        num_layers_in_first_pipeline_stage: null
+        num_layers_in_last_pipeline_stage: null
+        context_parallel_size: 2
+        pipeline_dtype: ${policy.precision}
+        sequence_parallel: false
+        freeze_moe_router: true
+        moe_router_dtype: "fp64"
+        moe_router_load_balancing_type: "none"
+        moe_router_bias_update_rate: 0.0
+        moe_permute_fusion: false
+        apply_rope_fusion: True
+        bias_activation_fusion: True
+        defer_fp32_logits: False
+        moe_per_layer_logging: False
+        
+        optimizer:
+            optimizer: "adam"
+            lr: 2.00001e-5
+            min_lr: 2.0e-5
+            weight_decay: 0.01
+            bf16: true
+            fp16: false
+            params_dtype: "float32"
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            adam_eps: 1e-8
+            sgd_momentum: 0.9
+            use_distributed_optimizer: true
+            use_precision_aware_optimizer: true
+            optimizer_cpu_offload: false
+            optimizer_offload_fraction: 0.0
+            clip_grad: ${policy.max_grad_norm}
+
+        scheduler:
+            start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            weight_decay_incr_style: "constant"
+            lr_decay_style: "constant"
+            lr_decay_iters: 1000
+            lr_warmup_iters: 10
+            lr_warmup_init: 2.0e-6
+
+        distributed_data_parallel_config:
+            grad_reduce_in_fp32: false
+            overlap_grad_reduce: true
+            overlap_param_gather: true
+            use_custom_fsdp: false
+            data_parallel_sharding_strategy: "optim_grads_params"
+
+    scheduler:
+        - name: "torch.optim.lr_scheduler.LinearLR"
+          kwargs:
+              start_factor: 0.1
+              end_factor: 1.0
+              total_iters: 10
+        - name: "torch.optim.lr_scheduler.ConstantLR"
+          kwargs:
+              factor: 1.0
+              total_iters: 10000000000
+        - milestones: [10]
+
+    # No generation config needed for off-policy distillation
+    generation: null
+
+teacher:
+    <<: *POLICY_BASE
+    model_name: "Qwen/Qwen3-4B"
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        context_parallel_size: 2
+        tensor_parallel_size: 4
+
+data:
+    max_input_seq_length: ${policy.max_total_sequence_length}
+    prompt_file: null  # Optional: path to prompt template
+    system_prompt_file: null  # Optional: path to system prompt
+    shuffle: true
+    
+    # Arrow files dataset
+    arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/*.arrow"
+    
+    # Alternative options (comment out arrow_files and uncomment one of these):
+    # train_data_path: "path/to/train.jsonl"  # JSON/JSONL file
+    # hf_dataset:
+    #     name: "nvidia/AceReason-1.1-SFT"
+    #     subset: null
+    #     split: "train"
+
+logger:
+    log_dir: "logs/off-policy-distillation"
+    num_val_samples_to_print: 0  # No validation in off-policy mode
+    wandb_enabled: true
+    tensorboard_enabled: true
+    mlflow_enabled: false
+    swanlab_enabled: false
+    monitor_gpus: true
+    wandb:
+        project: "nemo-off-policy-distillation"
+        name: "off-policy-${teacher.model_name}-to-${policy.model_name}"
+    tensorboard:
+        log_dir: "tb_logs-off-policy-distillation"
+    mlflow:
+        experiment_name: "off-policy-distillation"
+        run_name: "off-policy-distillation"
+    gpu_monitoring:
+        collection_interval: 10
+        flush_interval: 10
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1
