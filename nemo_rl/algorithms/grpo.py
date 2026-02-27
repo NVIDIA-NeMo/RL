@@ -60,6 +60,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -395,11 +396,6 @@ def setup(
         )
 
     else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
-
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = policy_nodes
@@ -539,6 +535,18 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
+    def init_megatron_generation():
+        """Initialize Megatron generation workers for non-colocated inference."""
+        t0 = time.perf_counter()
+        mg = MegatronGeneration(
+            cluster=inference_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+        )
+        return mg, time.perf_counter() - t0
+
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
@@ -603,14 +611,38 @@ def setup(
     # Handle generation-specific setup
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
-        policy_generation = None
-        print(
-            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
+        if colocated_inference:
+            policy_generation = None
+            print(
+                f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
+                flush=True,
+            )
 
-        policy, policy_time = init_policy()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        else:
+            # Non-colocated Megatron backend: separate inference workers
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated Megatron mode)",
+                flush=True,
+            )
+
+            # Execute both initializations in parallel
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                megatron_gen_future = executor.submit(init_megatron_generation)
+                policy_future = executor.submit(init_policy)
+                policy_generation, megatron_gen_time = megatron_gen_future.result()
+                policy, policy_time = policy_future.result()
+            parallel_wall_time = time.perf_counter() - parallel_start_time
+
+            # Store timing metrics
+            worker_init_timing_metrics["megatron_generation_init_time_s"] = (
+                megatron_gen_time
+            )
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
 
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy

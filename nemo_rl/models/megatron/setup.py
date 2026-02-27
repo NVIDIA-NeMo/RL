@@ -318,6 +318,10 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
+    # Apply generation settings
+    if config["generation"][f"backend"] == "megatron":
+        _apply_cuda_graph_and_rng_tracker_config(model_cfg, config)
+
     # Validate optimizer configuration
     _validate_optimizer_config(config)
 
@@ -367,6 +371,18 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
 
+def _apply_cuda_graph_and_rng_tracker_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply CUDA GRAPH and RNG TRACKER configuration."""
+    model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
+    model_cfg.cuda_graph_scope = config["megatron_cfg"]["cuda_graph_scope"]
+    model_cfg.use_te_rng_tracker = config["megatron_cfg"]["use_te_rng_tracker"]
+    model_cfg.inference_rng_tracker = config["megatron_cfg"]["inference_rng_tracker"]
+    model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if model_cfg.batch_invariant_mode:
+        from megatron.core.transformer.enums import AttnBackend
+        model_cfg.attention_backend = AttnBackend.flash
+
+
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
     model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
@@ -398,6 +414,9 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
+    ]
+    model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+        "moe_pad_experts_for_cuda_graph_inference"
     ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
@@ -850,6 +869,10 @@ def setup_reference_model_state(
 
     ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
 
+    megatron_cfg.model.cuda_graph_impl = "none"
+    megatron_cfg.model.use_te_rng_tracker = False
+    megatron_cfg.model.inference_rng_tracker = False
+    
     # Create a separate megatron config for the reference model
     ref_megatron_cfg = ConfigContainer(
         model=megatron_cfg.model,
