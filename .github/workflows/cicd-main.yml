@@ -35,9 +35,9 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only, Lfast = fast subset (reuses nightly container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+        description: Test level to run. docs = doc tests only, Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
       image_tag:
-        description: "Override container image tag (e.g. 'nightly'). Skips container build."
+        description: "Override container image tag (e.g. 'main'). Skips container build."
         required: false
         default: ""
   # TODO: Due to limited compute, disabling pushes to main. This is okay to do since we force PRs to be up to date and the CI tests on pull/$PR_NUM/merge
@@ -118,10 +118,10 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast uses nightly, workflow_dispatch can override
+          # Determine image tag: Lfast uses main, workflow_dispatch can override
           IMAGE_TAG=""
           if [[ "$TEST_LEVEL" == "Lfast" ]]; then
-            IMAGE_TAG="nightly"
+            IMAGE_TAG="main"
           fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.image_tag }}" ]]; then
             IMAGE_TAG="${{ inputs.image_tag }}"
@@ -394,25 +394,6 @@ jobs:
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
-
-  tag-nightly-container:
-    name: Tag nightly container
-    runs-on: ubuntu-latest
-    needs: [CI_QA_Gate, build-container]
-    if: ${{ github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'success' }}
-    environment: nemo-ci
-    steps:
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Re-tag container as nightly
-        run: |
-          az acr import --name nemoci \
-            --source nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} \
-            --image nemo_rl_container:nightly --force
 
   notify-nightly-failure:
     name: Notify nightly test failure
