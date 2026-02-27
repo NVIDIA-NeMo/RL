@@ -23,6 +23,7 @@ Usage:
     python 5.prefix_caching_nan.py
     python 5.prefix_caching_nan.py --model meta-llama/Llama-3.1-8B-Instruct
 """
+
 import argparse
 import math
 
@@ -84,12 +85,14 @@ if out2.logprobs:
             break
 
 if nan_count > 0:
-    print(f"\n  Sample logprobs from iteration 2:")
+    print("\n  Sample logprobs from iteration 2:")
     for idx in [0, 1, 2, len(out2.logprobs) - 1]:
         if idx < len(out2.logprobs) and out2.logprobs[idx] is not None:
             for tid, lp_obj in out2.logprobs[idx].items():
                 lp = lp_obj.logprob if hasattr(lp_obj, "logprob") else lp_obj
-                decoded = lp_obj.decoded_token if hasattr(lp_obj, "decoded_token") else "?"
+                decoded = (
+                    lp_obj.decoded_token if hasattr(lp_obj, "decoded_token") else "?"
+                )
                 print(f"    token[{idx}] id={tid}: logprob={lp} decoded={decoded!r}")
                 break
 
