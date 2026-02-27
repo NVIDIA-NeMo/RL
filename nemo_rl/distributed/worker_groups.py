@@ -864,8 +864,8 @@ class RayWorkerGroup:
             if os.getenv("NRL_WG_USE_RAY_REF", "0") == "1":
                 _args = []
                 for arg in args:
-                    _args = [ray.put(a) for a in arg]
-                    _args.append(_args)
+                    put_args = [ray.put(a) for a in arg]
+                    _args.append(put_args)
                 args = tuple(_args)
                 _kwargs = dict()
                 for key, value in kwargs.items():
