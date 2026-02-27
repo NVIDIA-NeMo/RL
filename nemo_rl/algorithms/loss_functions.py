@@ -1139,12 +1139,11 @@ class DistillationLossFn(LossFunction):
                 student_topk_logits, dim=-1
             )
 
-        # Move teacher tensors to the same device/dtype as student_topk_logits
-        teacher_topk_logits = teacher_topk_logits.to(
+        # Teacher values are already full-vocab-normalized log probabilities
+        # from _compute_distributed_log_softmax. Use them directly without
+        # re-normalizing over the top-k slice (which would be incorrect).
+        teacher_topk_logprobs = teacher_topk_logits.to(
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
-        )
-        teacher_topk_logprobs = torch.nn.functional.log_softmax(
-            teacher_topk_logits, dim=-1
         )
 
         # Single point of next-token alignment after TP/CP processing

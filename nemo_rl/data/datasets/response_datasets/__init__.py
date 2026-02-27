@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import Any
 
+from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import ArrowTextDataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
@@ -67,6 +68,13 @@ def load_response_dataset(data_config, seed: int = 42):
             data_config["system_prompt"],
             data_config["tool_key"],
             data_config["use_preserving_dataset"],
+        )
+    elif dataset_name == "arrow_text":
+        base_dataset = ArrowTextDataset(
+            arrow_files=data_config["arrow_files"],
+            val_split=data_config.get("val_split", 0.05),
+            seed=seed,
+            text_key=data_config.get("text_key", "text"),
         )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":
@@ -142,6 +150,7 @@ def load_response_dataset(data_config, seed: int = 42):
         "clevr_cogent",
         "openai_format",
         "tulu3_sft_mixture",
+        "arrow_text",
     ]:
         base_dataset.set_processor()
 
@@ -149,6 +158,7 @@ def load_response_dataset(data_config, seed: int = 42):
 
 
 __all__ = [
+    "ArrowTextDataset",
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
     "DAPOMath17KDataset",

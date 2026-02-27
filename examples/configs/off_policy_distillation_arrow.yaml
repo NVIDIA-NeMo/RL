@@ -1,0 +1,25 @@
+defaults: distillation_math.yaml
+distillation:
+  num_prompts_per_step: 512
+  max_num_steps: 500
+  loss_on_all_tokens: true  # arrow text has single assistant message per row; explicit loss on all tokens
+data:
+  dataset_name: "arrow_text"
+  # arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/*.arrow"
+  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00000-of-02476.arrow"
+  prompt_file: null
+checkpointing:
+  metric_name: "val:val_loss"  # off-policy has no accuracy, use val_loss instead
+  higher_is_better: false  # lower val_loss is better
+policy:
+  train_global_batch_size: 512
+  generation: null  # No student generation for off-policy
+teacher:
+  model_name: "Qwen/Qwen3-32B"
+logger:
+  log_dir: logs/off-policy-distillation-arrow
+  wandb:
+    project: nemo-off-policy-distillation
+    name: off-policy-arrow
+cluster:
+  num_nodes: 1

@@ -1,0 +1,21 @@
+# MMLU evaluation for Llama 3.2 1B (base model)
+# Override generation.model_name with checkpoint path at runtime:
+#   generation.model_name=/path/to/checkpoint/policy/weights
+defaults: "eval.yaml"
+
+generation:
+  model_name: "meta-llama/Llama-3.2-1B"
+  vllm_cfg:
+    max_model_len: 2048
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: null  # base model, no chat formatting
+
+data:
+  prompt_file: "examples/prompts/mmlu.txt"
+  dataset_name: "mmlu"
+
+env:
+  math:
+    verifier_type: "multilingual_multichoice"

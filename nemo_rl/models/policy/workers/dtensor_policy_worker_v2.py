@@ -66,10 +66,12 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _compute_distributed_log_softmax,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.policy.utils import get_handle_from_tensor, rebuild_cuda_tensor_from_ipc
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -481,6 +483,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             if embed_tokens_weight is not None:
                 self.model.lm_head.weight = embed_tokens_weight
+                print(
+                    f"[Rank {self.rank}] lm_head weight tied: "
+                    f"same object = {self.model.lm_head.weight is embed_tokens_weight}, "
+                    f"embed norm = {embed_tokens_weight.data.float().norm().item():.4f}, "
+                    f"lm_head norm = {self.model.lm_head.weight.data.float().norm().item():.4f}"
+                )
+            else:
+                print(f"[Rank {self.rank}] WARNING: embed_tokens weight not found, lm_head NOT tied")
+        else:
+            print(
+                f"[Rank {self.rank}] lm_head tying skipped: "
+                f"has_lm_head={hasattr(self.model, 'lm_head')}, "
+                f"tie_word_embeddings={getattr(getattr(self.model, 'config', {}), 'tie_word_embeddings', 'MISSING')}"
+            )
 
         if self.cpu_offload:
             self.model = self.move_to_device(self.model, "cpu")
@@ -533,15 +549,26 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         # restore
         if weights_path:
+            print(f"Loading weights from {weights_path}")
             self.load_checkpoint(weights_path, optimizer_path)
+            if self.rank == 0:
+                for name, param in self.model.named_parameters():
+                    _p = param.data.float()
+                    if torch.isnan(_p).any() or torch.isinf(_p).any():
+                        print(f"  [NaN debug rank-0] CORRUPTED param after checkpoint load: {name}, has_nan={torch.isnan(_p).any().item()}, has_inf={torch.isinf(_p).any().item()}")
+                    break
         else:
             print(
                 "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
             )
 
-    def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
+    def _apply_temperature_scaling(self, logits: torch.Tensor, skip: bool = False) -> torch.Tensor:
+        if skip:
+            return logits
         if "generation" in self.cfg and self.cfg["generation"] is not None:
-            logits.div_(self.cfg["generation"]["temperature"])
+            temp = self.cfg["generation"]["temperature"]
+            if temp > 0:
+                logits.div_(temp)
         return logits
 
     def check_model_allow_flash_attn_args(self, model_config) -> bool:
@@ -596,6 +623,34 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model.train()
 
         with ctx:
+            # Reconstruct teacher top-k tensors from IPC handles if present.
+            # The teacher worker stored them in GPU IPC buffers and returned
+            # only tiny handle dicts through Ray. We open those handles here
+            # on the student worker (same GPU) to access the data directly.
+            if "teacher_topk_logits" in data and isinstance(data["teacher_topk_logits"], dict):
+                teacher_ipc = data["teacher_topk_logits"]
+                current_device_id = torch.cuda.current_device()
+                rank = torch.distributed.get_rank()
+                actual_shape = teacher_ipc.get('actual_shape')
+                is_topk = teacher_ipc.get('is_topk', False)
+
+                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                    teacher_ipc[rank], current_device_id
+                ).detach()
+                if actual_shape is not None:
+                    aB, aS, aK = actual_shape
+                    teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
+
+                data["teacher_topk_logits"] = teacher_logits_tensor
+
+                if is_topk and 'topk_indices_ipc' in teacher_ipc:
+                    teacher_idx_tensor = rebuild_cuda_tensor_from_ipc(
+                        teacher_ipc['topk_indices_ipc'], current_device_id
+                    ).detach()
+                    if actual_shape is not None:
+                        teacher_idx_tensor = teacher_idx_tensor[:aB, :aS, :aK].clone()
+                    data["teacher_topk_indices"] = teacher_idx_tensor
+
             # Get data from batch and move to device
             data.to("cuda")
 
@@ -788,8 +843,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             logits = outputs.logits
                         del outputs
 
-                        # Apply temperature scaling
-                        logits = self._apply_temperature_scaling(logits)
+                        # Temperature scaling is only for inference/generation, not training
+                        logits = self._apply_temperature_scaling(logits, skip=True)
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (
@@ -846,6 +901,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             )
                         else:
                             loss_fn_ = loss_fn
+
+                        # ── NaN debug: inspect logits on first microbatch of first 2 steps ──
+                        if mb_idx == 0 and gb_idx == 0 and self.rank == 0 and len(losses) < 2:
+                            _local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+                            _lf = _local_logits.float()
+                            print(
+                                f"  [NaN debug rank-0] logits shape={_local_logits.shape}, "
+                                f"dtype={_local_logits.dtype}, "
+                                f"min={_lf.min().item():.4f}, max={_lf.max().item():.4f}, "
+                                f"has_nan={torch.isnan(_lf).any().item()}, "
+                                f"has_inf={torch.isinf(_lf).any().item()}, "
+                                f"global_valid_toks={global_valid_toks.item():.0f}, "
+                                f"global_valid_seqs={global_valid_seqs.item():.0f}",
+                                flush=True,
+                            )
+                            del _local_logits, _lf
 
                         loss, loss_metrics = loss_fn_(
                             logits,
@@ -1570,13 +1641,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             vocab_start_index = tp_rank * V_local
                             vocab_end_index = (tp_rank + 1) * V_local
 
+                            local_logits = local_logits.to(torch.float32)
+                            local_log_probs = _compute_distributed_log_softmax(local_logits, group=tp_group)
+                            del logits, local_logits
+
+                            if isinstance(local_log_probs, DTensor):
+                                local_log_probs = local_log_probs.to_local()
+
+                            if self.cfg.get('is_mdlm', False):
+                                shared_sequence_length = int(local_log_probs.shape[1] // 2)
+                                local_log_probs = local_log_probs[:, shared_sequence_length:, :]
+
                             vals, idx = distributed_vocab_topk(
-                                local_logits,
+                                local_log_probs,
                                 k=k,
                                 tp_group=tp_group,
                                 vocab_start_index=vocab_start_index,
                                 vocab_end_index=vocab_end_index,
                             )
+                            del local_log_probs
                         else:
                             full_logits = logits.to(torch.float32)
                             vals, idx = torch.topk(full_logits, k=k, dim=-1)
@@ -1620,40 +1703,45 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     batch_size = original_batch_size
                     seq_len = original_seq_len
 
-                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
-                out_topk_vals.append(vals.cpu())
-                out_topk_idx.append(idx.cpu())
+                B_mb, S_mb, K_mb = vals.shape
+                target_dtype = vals.dtype
+                target_device = vals.device
 
-        ret = BatchedDataDict[Any]()
-        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
-        all_topk_idx_padded = []
-        target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
-            pad_needed = target_seq_len - vals.shape[1]
-            if pad_needed > 0:
-                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
-                )
-                idx = torch.nn.functional.pad(
-                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
-                )
-            all_topk_vals_padded.append(vals)
-            all_topk_idx_padded.append(idx)
+                # Pre-allocate two IPC buffers (values + indices) exactly once.
+                if not hasattr(self, '_teacher_topk_vals_buffer') or self._teacher_topk_vals_buffer is None:
+                    max_S = self.cfg.get("max_total_sequence_length", S_mb)
+                    vals_buf_shape = (B_mb, max_S, K_mb)
+                    self._teacher_topk_vals_buffer = torch.empty(
+                        vals_buf_shape, dtype=target_dtype, device=target_device
+                    )
+                    self._teacher_topk_vals_ipc = {
+                        torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_vals_buffer)
+                    }
+                    idx_buf_shape = (B_mb, max_S, K_mb)
+                    self._teacher_topk_idx_buffer = torch.empty(
+                        idx_buf_shape, dtype=idx.dtype, device=target_device
+                    )
+                    self._teacher_topk_idx_ipc = {
+                        torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_idx_buffer)
+                    }
+                    print(f" rank {torch.distributed.get_rank()} Allocated topk IPC buffers: "
+                          f"vals={vals_buf_shape} ({self._teacher_topk_vals_buffer.numel() * self._teacher_topk_vals_buffer.element_size() / 1e9:.4f} GB), "
+                          f"idx={idx_buf_shape} ({self._teacher_topk_idx_buffer.numel() * self._teacher_topk_idx_buffer.element_size() / 1e9:.4f} GB) "
+                          f"(actual data: [{B_mb}, {S_mb}, {K_mb}])")
 
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
-        ).cpu()
-        ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0)
-            if len(all_topk_idx_padded) > 1
-            else all_topk_idx_padded[0]
-        ).cpu()
-        return ret
+                # Copy actual data into the top-left slice of the buffers
+                self._teacher_topk_vals_buffer[:B_mb, :S_mb, :K_mb].copy_(vals)
+                self._teacher_topk_idx_buffer[:B_mb, :S_mb, :K_mb].copy_(idx)
+                del vals, idx
+
+                rank = torch.distributed.get_rank()
+                return {
+                    rank: self._teacher_topk_vals_ipc[rank],
+                    'actual_shape': (B_mb, S_mb, K_mb),
+                    'topk_indices_ipc': self._teacher_topk_idx_ipc[rank],
+                    'is_topk': True,
+                }
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

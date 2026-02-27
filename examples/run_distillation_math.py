@@ -16,11 +16,16 @@ import argparse
 import os
 from collections import defaultdict
 from typing import Any, Optional
+import glob
+import torch
+from torch.utils.data import Dataset as TorchDataset
+from datasets import load_dataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.distillation import MasterConfig, distillation_train, setup
+from nemo_rl.algorithms.distillation import MasterConfig, distillation_train, offpolicy_distillation_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
@@ -192,6 +197,38 @@ def main() -> None:
         checkpointer,
         distillation_state,
         master_config,
+    )
+
+    # Initialize Dataset
+    print("\n▶ Initializing Off-Policy Dataset...")
+    train_dataset = OffPolicyDistillationDataset(
+        data_path='/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/*.arrow',
+        tokenizer=tokenizer,
+        max_seq_length=master_config["data"]["max_input_seq_length"],
+    )
+
+    # Initialize Dataloader
+    train_dataloader = StatefulDataLoader(
+        dataset=train_dataset,
+        batch_size=master_config["distillation"]["batch_size"],
+        collate_fn=offpolicy_collate_fn,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # Now call your training function
+    offpolicy_distillation_train(
+        student_policy=student_policy,
+        teacher_policy=teacher_policy,
+        dataloader=train_dataloader,  # Pass the new dataloader here
+        val_dataloader=None,
+        tokenizer=tokenizer,
+        loss_fn=loss_fn,
+        logger=logger,
+        checkpointer=checkpointer,
+        distillation_save_state=distillation_state,
+        master_config=master_config,
     )
 
 
