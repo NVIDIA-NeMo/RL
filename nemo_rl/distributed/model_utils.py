@@ -1168,9 +1168,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
             )
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
-        print(
-            f"log_probs shape: {log_probs.shape} after forward, seq_size: {seq_size}, chunk_size: {chunk_size}, num_chunks: {num_chunks}"
-        )
+
         return log_probs
 
     @staticmethod
