@@ -1082,6 +1082,19 @@ class AsyncTrajectoryCollector:
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    # GenRM compare config
+                    use_genrm_compare=env_cfg.get(
+                        "use_genrm_compare", False
+                    ),
+                    num_generations_per_prompt=self.master_config["grpo"][
+                        "num_generations_per_prompt"
+                    ],
+                    genrm_compare_server_name=env_cfg.get(
+                        "genrm_compare_server_name", "genrm_compare"
+                    ),
+                    genrm_agent_names=env_cfg.get(
+                        "genrm_agent_names", ["genrm_simple_agent"]
+                    ),
                     master_config=self.master_config,
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
