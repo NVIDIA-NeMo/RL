@@ -1,0 +1,31 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_at_start: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-8b-base-1n8g-megatron-lora
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    peft:
+      enabled: true
+      dim: 128
+      alpha: 128
+    scheduler:
+      lr_warmup_iters: 50
+
+  sequence_packing:
+    enabled: false
+logger:
+  log_dir: logs/grpo-qwen3-8b-base-1n8g-megatron-lora
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-8b-base-1n8g-megatron-lora
+cluster:
+  gpus_per_node: 8

@@ -108,6 +108,24 @@ class RewardModelConfig(TypedDict):
     reward_model_type: str
 
 
+class MegatronPeftConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class MegatronPeftConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init_method: str
+    lora_B_init_method: str
+    a2a_experimental: bool
+    lora_dtype: str | None
+
+
 class MegatronOptimizerConfig(TypedDict):
     optimizer: str
     lr: float
@@ -193,6 +211,7 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
