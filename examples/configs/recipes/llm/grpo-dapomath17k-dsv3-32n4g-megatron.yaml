@@ -1,0 +1,23 @@
+defaults: ./grpo-dapomath17k-dsv3-megatron.yaml
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 4
+    context_parallel_size: 2
+    num_layers_in_first_pipeline_stage: 15
+    num_layers_in_last_pipeline_stage: 14
+  make_sequence_length_divisible_by: 4
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 16
+checkpointing:
+  checkpoint_dir: results/grpo-dapomath17k-dsv3-32n4g-megatron
+logger:
+  wandb:
+    name: grpo-dapomath17k-dsv3-32n4g-megatron
+  mlflow:
+    run_name: grpo-dapomath17k-dsv3-32n4g-megatron
+cluster:
+  gpus_per_node: 4
+

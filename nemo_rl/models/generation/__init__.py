@@ -42,11 +42,26 @@ def configure_generation_config(
         config = cast(VllmConfig, config)
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        is_spec = "speculative_config" in config.get("vllm_kwargs", {})
+        if is_spec:
+            # When speculative decoding is enabled but the draft model is not co-trained
+            # with the policy (i.e., no weight sync for the draft model), we must use
+            # load_format='auto' to load actual weights. Using 'dummy' would leave the
+            # draft model with random weights that never get updated.
+            warnings.warn(
+                "Speculative decoding is enabled. Setting vllm_cfg['load_format'] to 'auto'. "
+                "This may result in slower startup times as full model weights are loaded."
+            )
+            config["vllm_cfg"]["load_format"] = "auto"
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
-            if is_eval or config["stop_strings"] is not None:
+            if (
+                is_eval
+                or config["stop_strings"] is not None
+                or config["vllm_cfg"].get("expose_http_server", None)
+            ):
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True

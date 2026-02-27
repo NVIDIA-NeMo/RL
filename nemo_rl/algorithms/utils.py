@@ -320,6 +320,39 @@ def get_tokenizer(
         processor.bos_token_id = tokenizer.bos_token_id
         # copy name_or_path from tokenizer to processor for logging
         processor.name_or_path = tokenizer.name_or_path
+        if hasattr(processor, "feature_extractor") and "audio" in tokenizer_config:
+            if (
+                "sampling_rate" in tokenizer_config["audio"]
+                and tokenizer_config["audio"]["sampling_rate"]
+                != processor.feature_extractor.sampling_rate
+            ):
+                new_sampling_rate = tokenizer_config["audio"]["sampling_rate"]
+                warnings.warn(
+                    f"Overriding audio sampling rate from {processor.feature_extractor.sampling_rate} to {new_sampling_rate}"
+                )
+                processor.feature_extractor.sampling_rate = new_sampling_rate
+        if hasattr(processor, "video_processor") and "video" in tokenizer_config:
+            if (
+                "fps" in tokenizer_config["video"]
+                and tokenizer_config["video"]["fps"] != processor.video_processor.fps
+            ):
+                # override the video loading fps
+                new_fps = tokenizer_config["video"]["fps"]
+                warnings.warn(
+                    f"Overriding video fps from {processor.video_processor.fps} to {new_fps}"
+                )
+                processor.video_processor.fps = new_fps
+            # fps and num_frames cannot co-exist, but let it crash later
+            if (
+                "num_frames" in tokenizer_config["video"]
+                and tokenizer_config["video"]["num_frames"]
+                != processor.video_processor.num_frames
+            ):
+                new_num_frames = tokenizer_config["video"]["num_frames"]
+                warnings.warn(
+                    f"Overriding video num_frames from {processor.video_processor.num_frames} to {new_num_frames}"
+                )
+                processor.video_processor.num_frames = new_num_frames
 
     return tokenizer if processor is None else processor
 
@@ -520,9 +553,10 @@ def print_performance_metrics(
     ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
-    if is_vllm_metrics_logger_enabled:
-        vllm_logger_metrics = metrics["vllm_logger_metrics"]
-        # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
+    generation_logger_metrics = metrics.get("generation_logger_metrics", {})
+    if is_vllm_metrics_logger_enabled and generation_logger_metrics:
+        vllm_logger_metrics = generation_logger_metrics
+        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
 
         assert "inflight_batch_sizes" in vllm_logger_metrics, (

@@ -1,0 +1,106 @@
+# ProRLv2 Algorithm Configuration
+# 
+# This configuration implements ProRLv2 with TIS techniques:
+# - Dynamic Sampling: Filter prompts with zero reward variance
+# - Decoupled Clipping: Asymmetric ratio clipping (clip_max > clip_min)
+# - Token-level Loss: Fine-grained policy gradient
+# - Truncated Importance Sampling (TIS) / IcePop for MoE models
+# - REINFORCE++: Decoupled local and global advantage normalization estimator
+# - Stop properly penalty: Reward scale coefficient for truncated responses
+#
+# Inherits from grpo_math_1B.yaml
+#
+# Usage:
+#   python examples/run_grpo_math.py --config examples/configs/prorlv2.yaml
+#
+# Reference papers and blogs:
+# ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
+# REINFORCE++: https://arxiv.org/abs/2501.03262
+# The Online IcePop Solution for MoE models: https://hijkzzz.notion.site/online-ice-pop
+# DLER (for Stop properly penalty): https://arxiv.org/pdf/2510.15110
+
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  # ============================================================================
+  # DAPO: Dynamic Sampling
+  # Filter out prompts where all generations have the same reward (std=0)
+  # This focuses training on "learnable" examples with mixed outcomes
+  # ============================================================================
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10  # Max batches before error
+  batch_multiplier: 1.5  # Generate more prompts to account for filtering
+
+
+  # ============================================================================
+  # Advantage Estimator
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  # ============================================================================
+  adv_estimator:
+    name: "reinforce_plus_plus"  # Use "grpo" for standard GRPO
+    # Global normalization of rewards
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    # Reinforce++-Baseline specific
+    minus_baseline: true
+
+  # ============================================================================
+  # Reward Shaping
+  # Applied to rewards before advantage calculation
+  # Includes DAPO overlong penalty and stop properly penalty
+  # ============================================================================
+  reward_shaping:
+    enabled: true
+    # Stop properly penalty: scale factor for truncated responses (0-1)
+    # 0 = zero reward for truncated (default), 1 = no penalty
+    stop_properly_penalty_coef: 0.0  # Set to e.g., 0.1 to halve truncated rewards
+
+# ============================================================================
+# Loss Function Configuration
+# ============================================================================
+loss_fn:
+  # KL regularization
+  reference_policy_kl_penalty: 0.0001
+  reference_policy_kl_type: "k2"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+
+  # ============================================================================
+  # DAPO: Decoupled (Asymmetric) Clipping
+  # ratio_clip_max > ratio_clip_min allows more exploration
+  # Standard PPO uses symmetric clipping (both = 0.2)
+  # ============================================================================
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.27  # Slightly larger for exploration
+
+  # Dual-clipping (set to e.g., 3.0 to enable, null to disable)
+  ratio_clip_c: null
+
+  # ============================================================================
+  # DAPO: Token-level Loss
+  # Compute loss per-token instead of per-sequence
+  # ============================================================================
+  token_level_loss: true
+
+  # ============================================================================
+  # Truncated Importance Sampling (TIS / ICE-POP)
+  # Requires use_importance_sampling_correction: true
+  # ============================================================================
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0  # Upper bound
+  truncated_importance_sampling_ratio_min: 0.5  # Lower bound (ICE-POP only)
+  # Type: "tis" (clamp to max) or "icepop" (filter outside [min, max])
+  truncated_importance_sampling_type: "icepop"
+
+  # Reinforce++: add KL penalty to reward instead of loss
+  # Set to false to use external KL loss (reference_policy_kl_penalty) for better stability
+  use_kl_in_reward: false
+
+# ============================================================================
+# Output directories
+# ============================================================================
+checkpointing:
+  checkpoint_dir: "results/prorl"
+
+logger:
+  log_dir: "logs/prorl"

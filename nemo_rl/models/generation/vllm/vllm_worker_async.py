@@ -727,12 +727,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     device=input_ids_single_row.device,
                 )
 
+                # Not truncated since no generation was attempted (length constraint)
+                truncated_tensor = torch.tensor(
+                    [False], dtype=torch.bool, device=input_ids_single_row.device
+                )
+
                 result_batch = BatchedDataDict[GenerationOutputSpec](
                     {
                         "output_ids": output_ids_single_item_batched,
                         "logprobs": logprobs_single_item,
                         "generation_lengths": generation_lengths_tensor,
                         "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                        "truncated": truncated_tensor,
                     }
                 )
 
@@ -832,12 +838,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation_details.finish_reason == "length"
+            truncated_tensor = torch.tensor(
+                [is_truncated],
+                dtype=torch.bool,
+                device=original_input_ids_single_row.device,
+            )
+
             result_batch = BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": output_ids_single_item_batched,
                     "logprobs": logprobs_single_item,
                     "generation_lengths": generation_lengths_tensor,
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    "truncated": truncated_tensor,
                 }
             )
 

@@ -45,6 +45,13 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
+    # Type of truncated importance sampling:
+    #   "tis"          – clamp IS weights to max
+    #   "icepop"       – zero out tokens with IS weight outside [min, max]
+    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    truncated_importance_sampling_type: NotRequired[str | None]
+    # Lower bound for ICE-POP / seq-mask-tis filtering
+    truncated_importance_sampling_ratio_min: NotRequired[float | None]
     token_level_loss: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
@@ -57,6 +64,8 @@ class ClippedPGLossConfig(TypedDict):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: NotRequired[bool]
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -132,6 +141,14 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio = cfg[
             "truncated_importance_sampling_ratio"
         ]
+        # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
+        self.truncated_importance_sampling_type = cfg.get(
+            "truncated_importance_sampling_type"
+        )
+        # Lower bound for ICE-POP / seq-mask-tis filtering
+        self.truncated_importance_sampling_ratio_min = cfg.get(
+            "truncated_importance_sampling_ratio_min"
+        )
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(
             "sequence_level_importance_ratios",
@@ -151,6 +168,33 @@ class ClippedPGLossFn(LossFunction):
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
             )
+            assert self.truncated_importance_sampling_type in (
+                "tis",
+                "icepop",
+                "seq-mask-tis",
+            ), (
+                f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
+                f"got {self.truncated_importance_sampling_type}"
+            )
+            if self.truncated_importance_sampling_type == "seq-mask-tis":
+                assert not self.sequence_level_importance_ratios, (
+                    "seq-mask-tis uses token-level IS correction with sequence-level masking, "
+                    "and is incompatible with sequence_level_importance_ratios=True"
+                )
+        else:
+            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
+            ignored_params = []
+            if cfg.get("truncated_importance_sampling_type") is not None:
+                ignored_params.append("truncated_importance_sampling_type")
+            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
+                ignored_params.append("truncated_importance_sampling_ratio_min")
+            if ignored_params:
+                print(
+                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
+                    f"parameters are ignored: {', '.join(ignored_params)}. "
+                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
+                    flush=True,
+                )
 
     def __call__(
         self,
@@ -168,7 +212,8 @@ class ClippedPGLossFn(LossFunction):
         advantages = data["advantages"][:, 1:]
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
-        reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        if self.reference_policy_kl_penalty != 0:
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
@@ -351,6 +396,7 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
+        _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
         if self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
@@ -369,12 +415,87 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
-        # TIS see https://fengyao.notion.site/off-policy-rl
+        # ---- Truncated Importance Sampling ----
+        # "tis"          – clamp IS weights to [0, max]
+        # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
+        # "seq-mask-tis" – zero out entire sequences whose geometric-mean
+        #                  IS ratio ∉ [min, max]; retained sequences keep
+        #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
+        #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         if self.truncated_importance_sampling_ratio is not None:
-            actor_importance_weights_expanded = torch.clamp(
-                actor_importance_weights_expanded,
-                max=self.truncated_importance_sampling_ratio,
-            )
+            if self.truncated_importance_sampling_type == "tis":
+                token_in_bounds = (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_ratio
+                )
+                _is_filter_metrics = {
+                    "is_oob_ratio": 1.0
+                    - masked_mean(
+                        token_in_bounds.float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
+                actor_importance_weights_expanded = torch.clamp(
+                    actor_importance_weights_expanded,
+                    max=self.truncated_importance_sampling_ratio,
+                )
+            elif self.truncated_importance_sampling_type == "icepop":
+                token_kept_mask = (
+                    actor_importance_weights_expanded
+                    >= self.truncated_importance_sampling_ratio_min
+                ) & (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_ratio
+                )
+                _is_filter_metrics = {
+                    "is_oob_ratio": 1.0
+                    - masked_mean(
+                        token_kept_mask.float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                }
+                actor_importance_weights_expanded = torch.where(
+                    token_kept_mask,
+                    actor_importance_weights_expanded,
+                    torch.zeros_like(actor_importance_weights_expanded),
+                )
+            elif self.truncated_importance_sampling_type == "seq-mask-tis":
+                # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
+                log_is_ratio = torch.nan_to_num(
+                    prev_logprobs - generation_logprobs,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                seq_log_is_ratio_mean = masked_mean(
+                    log_is_ratio, token_mask, dim=-1
+                )  # [B]
+                seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
+                seq_kept_mask = (
+                    (
+                        seq_geomean_is_ratio
+                        >= self.truncated_importance_sampling_ratio_min
+                    )
+                    & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
+                ).float()  # [B]
+                _is_filter_metrics = {
+                    "is_oob_ratio": 1.0
+                    - masked_mean(
+                        seq_kept_mask,
+                        sample_mask,
+                        global_normalization_factor=global_valid_seqs,
+                    ).item(),
+                }
+                actor_importance_weights_expanded = (
+                    actor_importance_weights_expanded * seq_kept_mask.unsqueeze(-1)
+                )
+            else:
+                raise ValueError(
+                    f"Invalid truncated importance sampling type: {self.truncated_importance_sampling_type}"
+                )
+
         actor_importance_weights = actor_importance_weights_expanded
         del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
@@ -473,6 +594,7 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                **_is_filter_metrics,
             },
         )
 

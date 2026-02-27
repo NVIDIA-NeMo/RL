@@ -183,6 +183,16 @@ class MegatronConfig(TypedDict):
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
     moe_per_layer_logging: bool
+    # Set to true to enable DeepEP for expert parallel communication
+    # Must set moe_token_dispatcher_type to 'flex'
+    # Must set moe_shared_expert_overlap to False
+    moe_enable_deepep: bool
+    # The type of token dispatcher to use. The default is 'allgather'.
+    # Options are 'allgather','alltoall' and 'flex'
+    # Use 'flex' when using DeepEP
+    moe_token_dispatcher_type: str
+    # Can be used only with 'alltoall' token dispatcher
+    moe_shared_expert_overlap: bool
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
@@ -193,6 +203,9 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Multimodal configs
+    audio: NotRequired[dict[str, Any]]
+    video: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):
