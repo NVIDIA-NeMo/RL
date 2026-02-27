@@ -675,14 +675,14 @@ class PreferenceLossFn(LossFunction):
 
     def __call__(
         self,
-        rewards: Tensor,
+        logits: Tensor,
         data: BatchedDataDict[PreferenceLossDataDict],
         global_valid_seqs: Tensor,
         global_valid_toks: Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         sample_mask = data["sample_mask"]
 
-        rewards = rewards.squeeze(-1)
+        rewards = logits.squeeze(-1)
 
         (
             preference_loss,
