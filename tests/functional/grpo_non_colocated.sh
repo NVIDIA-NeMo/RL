@@ -19,7 +19,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo_math.py \
+    $PROJECT_ROOT/examples/run_grpo.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
@@ -27,6 +27,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=1 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
+    policy.generation.vllm_cfg.async_engine=true \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \

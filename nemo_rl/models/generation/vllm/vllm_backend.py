@@ -47,19 +47,16 @@ class VllmInternalWorkerExtension:
         train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank()
         # Place vLLM ranks after all training ranks so all training workers can join
         rank = train_world_size + rank_prefix + local_rank
 
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size
+        self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+            master_address=ip, port=port, rank=rank, world_size=world_size
         )
-        self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-            pg, device=self.device
-        )
+        self.model_update_group.init_nccl_communicator(device=self.device)
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -177,7 +174,7 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
                 # Load weights into the model
-                from nemo_rl.models.generation import fp8
+                from nemo_rl.models.generation.vllm.quantization import fp8
 
                 if fp8.is_fp8_model(self.model_runner.vllm_config):
                     # the fp8 load_weights additionally casts bf16 weights into fp8
@@ -230,7 +227,7 @@ class VllmInternalWorkerExtension:
             Returns:
                 None
             """
-            from nemo_rl.models.generation import fp8
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
             if fp8.is_fp8_model(model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8

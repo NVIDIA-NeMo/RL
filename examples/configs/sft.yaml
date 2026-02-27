@@ -10,6 +10,7 @@ sft:
   val_global_batch_size: 32
   val_micro_batch_size: 1
   val_at_start: true
+  val_at_end: false
   seed: 42
 
 checkpointing:
@@ -113,12 +114,29 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+
 
     optimizer:
-      optimizer: "adam"
+      optimizer: "adam" # When weight decay is set, it actually uses AdamW 
       lr: 5.0e-6
       min_lr: 4.9999e-6
-      weight_decay: 0.1
+      weight_decay: 0.1 # When weight decay is set, it actually uses AdamW
       bf16: true
       fp16: false
       params_dtype: "float32"
@@ -157,6 +175,12 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
       use_custom_fsdp: false
 
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true
@@ -165,26 +189,41 @@ data:
   shuffle: true
   num_workers: 1
 
-  dataset_name: "squad"
+  # dataset
+  train:
+    dataset_name: "squad"
+    split: "train"
+  validation:
+    dataset_name: "squad"
+    split: "validation"
+  # default settings for all datasets
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "sft_processor"
+
+  # You can also use multiple datasets by using a list of datasets.
+  # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
+
   # You can use custom response datasets for training and validation. For example:
-  #   data:
-  #     dataset_name: ResponseDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
-  #     input_key: <QuestionKey>, default is "input"
-  #     output_key: <AnswerKey>, default is "output"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # train:
+  #   # this dataset will override input_key and use the default values for other vars
+  #   data_path: /path/to/local/train_dataset.jsonl
+  #   input_key: question
+  # validation:
+  #   # this dataset will use the default values for other vars except data_path
+  #   data_path: /path/to/local/val_dataset.jsonl
+  # default:
+  #   # will use below vars as default values if dataset doesn't specify it
+  #   dataset_name: ResponseDataset
+  #   input_key: input
+  #   output_key: output
+  #   prompt_file: null
+  #   system_prompt_file: null
+  #   processor: "sft_processor"
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
-  ## unused with squad dataset
-  prompt_file: null
-  split: null
-  output_key: null
-  seed: null
-
-
-  ## OpenAI format specific configs
+  # OpenAI format specific configs
   # train_data_path: "/path/to/train.jsonl"  # Path to training data
   # val_data_path: "/path/to/val.jsonl"      # Path to validation data
   # chat_key: "messages"                     # Key for messages in the data
@@ -202,15 +241,15 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
-    name: "sft-dev-${data.dataset_name}"
+    name: "sft-dev-${data.train.dataset_name}"
   swanlab:
     project: "sft-dev"
-    name: "sft-dev-${data.dataset_name}"
+    name: "sft-dev-${data.train.dataset_name}"
   tensorboard:
-    log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+    log_dir: "tb_logs-sft-dev-${data.train.dataset_name}"
   mlflow:
     experiment_name: "sft-dev"
-    run_name: "sft-dev-${data.dataset_name}"
+    run_name: "sft-dev-${data.train.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

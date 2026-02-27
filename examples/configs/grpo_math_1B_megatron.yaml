@@ -10,6 +10,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  val_at_end: false
   max_val_samples: 256
   val_batch_size: 256
   async_grpo:
@@ -43,7 +44,7 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 64 # Only used when generating using megatron backend
-  logprob_batch_size: 8
+  logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 512
   precision: "bfloat16"
 
@@ -94,6 +95,9 @@ policy:
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     
@@ -144,25 +148,17 @@ policy:
     top_k: null
     mcore_generation_config:
       buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
-      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
       num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
+      enable_chunked_prefill: false  # Split long prefills into chunks for better memory management
       unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-      max_tokens: 16384  # Maximum number of tokens to use in a single step
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       
     vllm_cfg:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
-
-data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
-  dataset_name: "OpenMathInstruct-2"
-  shuffle: true
 
 env:
   math:

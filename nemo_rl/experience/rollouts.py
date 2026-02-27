@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -80,6 +81,9 @@ def generate_responses(
     generation_lengths = generation_outputs["generation_lengths"]
     unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
 
+    # Extract truncated info if available (response hit max_tokens without stop token)
+    response_truncated = generation_outputs.get("truncated")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -113,6 +117,10 @@ def generate_responses(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+
+    # Add response_truncated to gen_metrics for use by caller
+    if response_truncated is not None:
+        gen_metrics["_response_truncated"] = response_truncated
 
     return batch, generated_ids, gen_metrics
 
@@ -175,6 +183,9 @@ async def generate_responses_async(
     generation_lengths = generation_outputs["generation_lengths"]
     unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
 
+    # Extract truncated info if available (response hit max_tokens without stop token)
+    response_truncated = generation_outputs.get("truncated")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -218,6 +229,10 @@ async def generate_responses_async(
             )
         except Exception as e:
             print(f"Error occurred while extracting gen_leader_worker_idx: {e}")
+
+    # Add response_truncated to gen_metrics for use by caller
+    if response_truncated is not None:
+        gen_metrics["_response_truncated"] = response_truncated
 
     return batch, generated_ids, gen_metrics
 
@@ -436,6 +451,13 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
+
+        # Record response truncation (response hit max_tokens without stop token)
+        response_truncated = gen_metrics.pop("_response_truncated", None)
+        if response_truncated is not None:
+            for i, global_idx in enumerate(active_indices.tolist()):
+                if response_truncated[i]:
+                    sample_truncated[global_idx] = True
 
         # Record token usage - assistant
         for i, global_idx in enumerate(active_indices.tolist()):
@@ -703,6 +725,11 @@ async def run_sample_multi_turn_rollout(
                 greedy=greedy,
             )
             current_message_log = updated_message_log
+
+            # Check if response was truncated (hit max_tokens without stop token)
+            response_truncated = gen_metrics.pop("_response_truncated", None)
+            if response_truncated is not None and response_truncated[0]:
+                truncated = True
 
             # Update token counts
             gen_token_count = len(generated_tokens)
@@ -1011,7 +1038,7 @@ def _calculate_single_metric(
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
         f"{key_name}/histogram": Histogram(values),
     }
 

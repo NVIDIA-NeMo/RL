@@ -8,6 +8,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
@@ -19,6 +20,13 @@ grpo:
     overlong_buffer_length: 512
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -28,6 +36,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+  seq_logprob_error_threshold: null
 loss_fn:
   reference_policy_kl_penalty: 0.01
   # Can be set to k1, k2, k3
@@ -146,6 +155,9 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -178,15 +190,28 @@ policy:
       overlap_param_gather: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  prompt_file: examples/prompts/clevr_cogent_cot.txt
-  system_prompt_file: null
-  dataset_name: clevr-cogent
-  env_name: "clevr-cogent"
-  split: trainA
   shuffle: true
   num_workers: 1
+  # dataset
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  # default settings for all datasets
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "clevr-cogent"
 env:
   clevr-cogent:
     num_workers: 8

@@ -35,6 +35,13 @@ class LoRAConfig(TypedDict):
 
 
 class AutomodelBackendConfig(TypedDict):
+    """Configuration for custom MoE implementation backend in Automodel.
+
+    Used when setting the backend in automodel_kwargs in your config.
+    Alternatively, pass `force_hf: true` in automodel_kwargs to fall back
+    to the HuggingFace implementation.
+    """
+
     # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
     _target_: str
     # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
@@ -47,7 +54,8 @@ class AutomodelBackendConfig(TypedDict):
     enable_deepep: NotRequired[bool]
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
-    # Enable HuggingFace state dict adapter for checkpoint loading
+    # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
+    # This should almost always be set to True when using a custom MoE implementation. Set to False only for specific use cases like debugging or performance testing.
     enable_hf_state_dict_adapter: NotRequired[bool]
     # Enable FSDP-specific optimizations
     enable_fsdp_optimizations: NotRequired[bool]
@@ -60,6 +68,8 @@ class AutomodelKwargs(TypedDict):
     use_liger_kernel: NotRequired[bool]
     # Backend configuration for MoE models
     backend: NotRequired[AutomodelBackendConfig]
+    # Whether to force use of the HuggingFace implementation for MoE models
+    force_hf: NotRequired[bool]
 
 
 class DTensorConfigDisabled(TypedDict):
@@ -173,6 +183,16 @@ class MegatronConfig(TypedDict):
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
     moe_per_layer_logging: bool
+    # Set to true to enable DeepEP for expert parallel communication
+    # Must set moe_token_dispatcher_type to 'flex'
+    # Must set moe_shared_expert_overlap to False
+    moe_enable_deepep: bool
+    # The type of token dispatcher to use. The default is 'allgather'.
+    # Options are 'allgather','alltoall' and 'flex'
+    # Use 'flex' when using DeepEP
+    moe_token_dispatcher_type: str
+    # Can be used only with 'alltoall' token dispatcher
+    moe_shared_expert_overlap: bool
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig

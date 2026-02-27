@@ -281,11 +281,49 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
+        def _patch_vllm_speculative_decoding_post_step():
+            """Patch vLLM speculative decoding post_step call.
+
+            Related PR:
+            - https://github.com/vllm-project/vllm/pull/30319
+
+            This patch fixes the InprocessClient.get_output method to properly
+            call post_step with the model_executed flag from step_fn.
+            """
+            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            old_snippet = (
+                "    def get_output(self) -> EngineCoreOutputs:\n"
+                "        outputs, _ = self.engine_core.step_fn()\n"
+                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
+            )
+
+            new_snippet = (
+                "    def get_output(self) -> EngineCoreOutputs:\n"
+                "        outputs, model_executed = self.engine_core.step_fn()\n"
+                "        self.engine_core.post_step(model_executed=model_executed)\n"
+                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
+            )
+
+            if new_snippet in content or old_snippet not in content:
+                return
+
+            content = content.replace(old_snippet, new_snippet)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+            logger.info("Successfully patched vllm speculative decoding post_step.")
+
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
         _patch_vllm_vit_flash_attn_backend()
         logger.info("Successfully patched vllm vit flash attention backend.")
+
+        _patch_vllm_speculative_decoding_post_step()
 
         try:
             import vllm
@@ -362,7 +400,7 @@ class BaseVllmGenerationWorker:
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
-            from nemo_rl.models.generation.fp8 import init_fp8
+            from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
@@ -415,7 +453,8 @@ class BaseVllmGenerationWorker:
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
-            disable_log_stats=True,
+            # Set disable_log_stats=False so that self.llm.get_metrics() works.
+            disable_log_stats=False,
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
@@ -485,6 +524,35 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
+    def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
+        """Get speculative decoding metrics from the vLLM engine.
+
+        Collects spec decode counters including number of drafts,
+        draft tokens, and accepted tokens for monitoring acceptance rates.
+
+        Returns:
+            Dictionary mapping metric names to their values.
+            Values may be floats or lists of floats (for per-position metrics).
+
+        Raises:
+            AssertionError: If called before vLLM engine is initialized.
+        """
+        metrics: dict[str, float | list[float]] = {}
+        if self.llm is not None:
+            if hasattr(self.llm, "get_metrics"):
+                vllm_prom_metrics = self.llm.get_metrics()
+            else:
+                # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
+                from vllm.v1.metrics.reader import get_metrics_snapshot
+
+                vllm_prom_metrics = get_metrics_snapshot()
+            for metric in vllm_prom_metrics:
+                if hasattr(metric, "values"):
+                    metrics[metric.name] = metric.values
+                elif hasattr(metric, "value"):
+                    metrics[metric.name] = metric.value
+        return metrics
+
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
@@ -543,6 +611,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                    "truncated": torch.zeros(0, dtype=torch.bool),
                 }
             )
 
@@ -575,6 +644,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
+        truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
@@ -621,6 +691,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
+
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation.finish_reason == "length"
+            truncated_list.append(is_truncated)
+
             assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
                 f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
             )
@@ -639,6 +714,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "unpadded_sequence_lengths": torch.tensor(
                     unpadded_sequence_lengths, dtype=torch.long
                 ),
+                "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
 

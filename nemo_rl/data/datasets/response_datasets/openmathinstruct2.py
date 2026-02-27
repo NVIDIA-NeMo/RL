@@ -12,96 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
 
-from typing import Any, Optional
-
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-def format_math(
-    data: dict[str, str | float | int],
-    output_key: str = "expected_answer",
-    task_name: str = "OpenMathInstruct-2",
-) -> dict[str, list[Any] | str]:
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": data["problem"],
-            },
-            {
-                "role": "assistant",
-                "content": data[output_key],
-            },
-        ],
-        "task_name": task_name,
-    }
-
-
-def prepare_openinstructmath2_dataset(
-    split: str = "train_1M",
-    seed: int = 42,
-    test_size: float = 0.05,
-    output_key: str = "expected_answer",
-    task_name: str = "OpenMathInstruct-2",
-) -> dict[str, Dataset | None]:
-    """Load and split the OpenMathInstruct-2 dataset into train and validation sets using HF's train_test_split."""
-    print(
-        "WARNING: For reproducible experiments, preprocess the dataset once and define your own HfDataset subclass that directly uses the preprocessed datasets."
-    )
-
-    # Load the original dataset
-    original_ds = load_dataset("nvidia/OpenMathInstruct-2", split=split)
-
-    # Split into train and validation sets using HF's train_test_split
-    split_ds = original_ds.train_test_split(test_size=test_size, seed=seed)
-
-    # Format the examples, removing original columns
-    train_formatted = split_ds["train"].map(
-        format_math,
-        remove_columns=split_ds["train"].column_names,
-        fn_kwargs={"output_key": output_key, "task_name": task_name},
-    )
-    val_formatted = split_ds["test"].map(
-        format_math,
-        remove_columns=split_ds["test"].column_names,
-        fn_kwargs={"output_key": output_key, "task_name": task_name},
-    )
-
-    return {
-        "train": train_formatted,
-        "validation": val_formatted,
-    }
-
-
 class OpenMathInstruct2Dataset(RawDataset):
+    """Simple wrapper around the OpenMathInstruct2 dataset.
+
+    Args:
+        output_key: Key for the output text, default is "expected_answer"
+        split: Split name for the dataset, default is "train_1M"
+        split_validation_size: Size of the validation data, default is 0.05
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
+    """
+
     def __init__(
         self,
-        split: str = "train_1M",
-        seed: int = 42,
-        test_size: float = 0.05,
         output_key: str = "expected_answer",
-        prompt_file: Optional[str] = None,
+        split: str = "train_1M",
+        split_validation_size: float = 0.05,
+        seed: int = 42,
+        **kwargs,
     ):
-        """Initialize the OpenMathInstruct2 dataset with train/validation split.
-
-        Args:
-            seed: Random seed for reproducible splitting
-            test_size: Proportion of data to use for validation (0.0-1.0)
-        """
         # train, train_1M, train_2M, and train_5M are supported splits.
         if split not in ["train", "train_1M", "train_2M", "train_5M"]:
             raise ValueError(
                 f"Invalid split: {split}. Please use 'train', 'train_1M', 'train_2M', or 'train_5M'."
             )
 
+        self.input_key = "problem"
+        self.output_key = output_key
         self.task_name = "OpenMathInstruct-2"
-        self.formatted_ds = prepare_openinstructmath2_dataset(
-            split=split,
-            seed=seed,
-            test_size=test_size,
-            output_key=output_key,
-            task_name=self.task_name,
+
+        # load from huggingface
+        self.dataset = load_dataset("nvidia/OpenMathInstruct-2", split=split)
+
+        # format the dataset
+        self.dataset = self.dataset.map(
+            self.format_data,
+            remove_columns=self.dataset.column_names,
         )
+
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
+        self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "messages": [
+                {"role": "user", "content": data[self.input_key]},
+                {"role": "assistant", "content": data[self.output_key]},
+            ],
+            "task_name": self.task_name,
+        }

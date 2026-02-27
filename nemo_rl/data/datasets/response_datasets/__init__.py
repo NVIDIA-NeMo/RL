@@ -11,14 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
 
+from nemo_rl.data import ResponseDatasetConfig
+from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
+<<<<<<< HEAD
 from nemo_rl.data.datasets.response_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import gsm8kDataset
+=======
+from nemo_rl.data.datasets.response_datasets.dapo_math import (
+    DAPOMath17KDataset,
+    DAPOMathAIME2024Dataset,
+)
+>>>>>>> upstream/main
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -30,14 +39,33 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
-from nemo_rl.data.datasets.utils import get_extra_kwargs
+
+DATASET_REGISTRY = {
+    # built-in datasets
+    "AIME2024": AIME2024Dataset,
+    "clevr-cogent": CLEVRCoGenTDataset,
+    "DAPOMath17K": DAPOMath17KDataset,
+    "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
+    "DeepScaler": DeepScalerDataset,
+    "geometry3k": Geometry3KDataset,
+    "HelpSteer3": HelpSteer3Dataset,
+    "open_assistant": OasstDataset,
+    "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "refcoco": RefCOCODataset,
+    "squad": SquadDataset,
+    "tulu3_sft_mixture": Tulu3SftMixtureDataset,
+    # load from local JSONL file or HuggingFace
+    "openai_format": OpenAIFormatDataset,
+    "NemoGymDataset": NemoGymDataset,
+    "ResponseDataset": ResponseDataset,
+}
 
 
-# TODO: refactor this to use the new processor interface and RawDataset interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-def load_response_dataset(data_config, seed: int = 42):
+def load_response_dataset(data_config: ResponseDatasetConfig):
     """Loads response dataset."""
     dataset_name = data_config["dataset_name"]
 
+<<<<<<< HEAD
     # TODO @yukih: remove duplicated dataset_name (openmathinstruct2, clevr_cogent)
     # for sft training
     if dataset_name == "open_assistant":
@@ -132,6 +160,13 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset = ResponseDataset(
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
+=======
+    # load dataset
+    if dataset_name in DATASET_REGISTRY:
+        dataset_class = DATASET_REGISTRY[dataset_name]
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+>>>>>>> upstream/main
         )
     else:
         raise ValueError(
@@ -140,33 +175,29 @@ def load_response_dataset(data_config, seed: int = 42):
             "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
-    base_dataset.set_task_spec(data_config)
-    # Skip sft datasets, the run_sft.py has not been refactored yet.
-    # TODO: refactor run_sft.py to use the new processor interface. https://github.com/NVIDIA-NeMo/RL/issues/1552
-    if dataset_name not in [
-        "open_assistant",
-        "squad",
-        "openmathinstruct2",
-        "clevr_cogent",
-        "openai_format",
-        "tulu3_sft_mixture",
-    ]:
-        base_dataset.set_processor()
+    # bind prompt, system prompt and data processor
+    dataset.set_task_spec(data_config)
+    # Remove this after the data processor is refactored. https://github.com/NVIDIA-NeMo/RL/issues/1658
+    dataset.set_processor()
 
-    return base_dataset
+    return dataset
 
 
 __all__ = [
+    "AIME2024Dataset",
     "CLEVRCoGenTDataset",
-    "DeepScalerDataset",
     "DAPOMath17KDataset",
+    "DAPOMathAIME2024Dataset",
+    "DeepScalerDataset",
     "Geometry3KDataset",
-    "OpenAIFormatDataset",
+    "HelpSteer3Dataset",
+    "NemoGymDataset",
     "OasstDataset",
+    "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
-    "HelpSteer3Dataset",
+    "load_response_dataset",
 ]
