@@ -58,6 +58,10 @@ inputs:
     description: "Whether this is a pull request from a fork"
     required: false
     default: "false"
+  image-tag:
+    description: "Override container image tag. If set, infers NRL_FORCE_REBUILD_VENVS=true and FAST=1."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -144,7 +148,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ github.run_id }}
+        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}
 
     - name: Create UUID
       id: uuid
@@ -176,13 +180,14 @@ runs:
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
           ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
+          ${{ inputs.image-tag != '' && '--env NRL_FORCE_REBUILD_VENVS=true --env FAST=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
           --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
           --volume /mnt/datadrive/TestData/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \
           --volume /mnt/datadrive/TestData/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -eux -o pipefail -c '\
+          nemoci.azurecr.io/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
