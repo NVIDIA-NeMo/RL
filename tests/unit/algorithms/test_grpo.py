@@ -755,7 +755,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -829,7 +834,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -993,7 +1003,12 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "reward_shaping": {"enabled": False},
             "overlong_filtering": False,
         },
-        "data": {"shuffle": False, "num_workers": 0, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 0,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {"num_val_samples_to_print": 0},
         "checkpointing": {"enabled": False},
         "cluster": {"num_nodes": 1, "gpus_per_node": 4},
@@ -1342,6 +1357,9 @@ def mock_grpo_components():
         },
         "logger": {
             "num_val_samples_to_print": 5,
+        },
+        "data": {
+            "use_multiple_dataloader": False,
         },
     }
 
