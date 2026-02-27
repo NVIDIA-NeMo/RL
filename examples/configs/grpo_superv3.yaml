@@ -501,6 +501,6 @@ cluster:
 # uncomment to enable effort level training
 effort_levels:
   low_string: "{reasoning effort: low}"
-  low_weight: 0.2
+  low_weight: 0.1
   low_penalty: 1
   low_ub: 3000

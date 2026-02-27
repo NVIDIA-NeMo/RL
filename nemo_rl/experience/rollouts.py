@@ -1106,7 +1106,7 @@ def run_async_nemo_gym_rollout(
         low_string = ""
         if 'low_weight' in master_config['effort_levels']:
             low_weight = master_config['effort_levels']['low_weight']
-        if 'low_penlty' in master_config['effort_levels']:
+        if 'low_penalty' in master_config['effort_levels']:
             low_penlty = master_config['effort_levels']['low_penalty']
         if 'low_ub' in master_config['effort_levels']:
             low_ub = master_config['effort_levels']['low_ub']
