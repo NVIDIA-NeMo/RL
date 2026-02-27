@@ -571,7 +571,7 @@ def _get_tokens_on_this_cp_rank(
 
     for ind in shard_inds:
         slices[seq_dim] = slice(ind * shard_size, (ind + 1) * shard_size)
-        ids_chunks.append(input_ids[slices])
+        ids_chunks.append(input_ids[tuple(slices)])
 
     ids = torch.cat(ids_chunks, dim=seq_dim)
     return ids
