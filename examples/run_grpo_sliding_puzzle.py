@@ -33,6 +33,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -157,7 +158,12 @@ def setup_puzzle_data(
     length: int,
     val_length: int,
     add_system_prompt: bool,
-) -> tuple[IterableDataset, IterableDataset | None, dict, dict]:
+) -> tuple[
+    IterableDataset,
+    dict[str, IterableDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
     """Sets up the iterable data generator and env map for the sliding puzzle task."""
     print("Setting up Sliding Puzzle iterable data and environment...")
     env_config = env_cfg[task_name]
@@ -186,6 +192,7 @@ def setup_puzzle_data(
         add_system_prompt=add_system_prompt,
         length=val_length,
     )
+    validation_dataset = {"sliding_puzzle_game": validation_dataset}
     val_task_to_env = task_to_env
 
     return training_dataset, validation_dataset, task_to_env, val_task_to_env
