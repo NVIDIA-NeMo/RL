@@ -1379,9 +1379,6 @@ def _gpt_forward_with_linear_ce_fusion(
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_pg_size(get_tensor_model_parallel_group())
-    print(
-        f"hidden_states shape: {hidden_states.shape}, tp_rank: {tp_rank}, tp_size: {tp_size}, cp size {get_pg_size(self.cp_group)}"
-    )
     # calculate the logprobs for the last token and then return the logprobs
     vocab_start_index = tp_rank * (self.vocab_size // tp_size)
     vocab_end_index = min((tp_rank + 1) * (self.vocab_size // tp_size), self.vocab_size)
