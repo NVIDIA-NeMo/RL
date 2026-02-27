@@ -37,7 +37,7 @@ time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
 time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
 time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-time uv run --no-sync bash ./tests/functional/grpo_multiple_datasets.sh
+time uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders.sh
 time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
