@@ -45,7 +45,7 @@ __all__ = [
     "NLLLossFn",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
-    "SequencePackingLossWrapper",
     "prepare_loss_input",
+    "SequencePackingLossWrapper",
     "wrap_loss_fn_with_input_preparation",
 ]

@@ -24,6 +24,7 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
@@ -63,6 +64,7 @@ def mock_model():
 def mock_loss_fn():
     loss_fn = MagicMock()
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
+    loss_fn.input_type = LossInputType.LOGIT
     return loss_fn
 
 
@@ -310,10 +312,10 @@ class TestLossPostProcessor:
 
         # Verify loss function was called
         mock_loss_fn.assert_called_once()
-        call_args = mock_loss_fn.call_args[0]
-        assert torch.is_tensor(call_args[0])  # logits
-        assert call_args[2] == global_valid_seqs  # global_valid_seqs
-        assert call_args[3] == global_valid_toks  # global_valid_toks
+        call_kwargs = mock_loss_fn.call_args[1]
+        assert torch.is_tensor(call_kwargs["logits"])
+        assert call_kwargs["global_valid_seqs"] == global_valid_seqs
+        assert call_kwargs["global_valid_toks"] == global_valid_toks
 
     @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_loss_with_sequence_packing(
@@ -1896,9 +1898,11 @@ class TestAutomodelForwardBackwardWithGradients:
         )
 
         # Create loss function that returns requires_grad tensor
-        def loss_fn(logits, mb, global_valid_seqs, global_valid_toks):
+        def loss_fn(logits, data, global_valid_seqs, global_valid_toks):
             loss = logits.mean()
             return loss, {"loss": loss.item()}
+
+        loss_fn.input_type = LossInputType.LOGIT
 
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(

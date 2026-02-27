@@ -894,13 +894,13 @@ async def run_hf_train_process(
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        # (True, False, "bfloat16", False),
-        # (False, True, "bfloat16", False),
-        # (True, False, "fp8", False),
-        # (False, True, "fp8", False),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
         # LoRA tests
         (False, False, "bfloat16", True),
-        # (True, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
