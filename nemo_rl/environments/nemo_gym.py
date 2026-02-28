@@ -114,7 +114,11 @@ Depending on your data shape, you may want to change these values."""
         sc = ServerClient.load_from_global_config(self.head_server_config)
         self._model_server_base_urls: list[str] = []
         for key, value in sc.global_config_dict.items():
-            if isinstance(value, dict) and "responses_api_models" in value:
+            try:
+                has_models = "responses_api_models" in value
+            except TypeError:
+                has_models = False
+            if has_models:
                 try:
                     cfg = get_first_server_config_dict(sc.global_config_dict, key)
                     self._model_server_base_urls.append(
