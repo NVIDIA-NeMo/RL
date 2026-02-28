@@ -79,6 +79,13 @@ runs:
       run: |
         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
+    - name: Install uuidgen
+      shell: bash -x -e -u -o pipefail {0}
+      if: ${{ contains(inputs.runner, 'gcp') }}
+      run: |
+        apt-get update
+        apt-get install -y uuid-runtime
+
     - name: Azure Login
       if: ${{ inputs.has-azure-credentials == 'true' }}
       uses: azure/login@v2
@@ -194,7 +201,7 @@ runs:
           --volume ${{ inputs.test_data_path }}/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
           --volume ${{ inputs.test_data_path }}/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
           --volume ${{ inputs.test_data_path }}/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          ${{ inputs.registry }}/${{ inputs.image_name }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
+          ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
