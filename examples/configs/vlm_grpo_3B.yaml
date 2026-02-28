@@ -249,6 +249,9 @@ data:
   shuffle: true
   num_workers: 1
 
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+
   # dataset
   train:
     dataset_name: clevr-cogent

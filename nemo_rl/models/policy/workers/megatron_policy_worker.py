@@ -36,9 +36,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -702,14 +700,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         model_cfg = self.megatron_cfg.model
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=model_cfg.hidden_size,
-            inference_batch_times_seqlen_threshold=1000000,
-            fp32_residual_connection=model_cfg.fp32_residual_connection,
-            params_dtype=model_cfg.params_dtype,
-            padded_vocab_size=self.final_padded_vocab_size,  # Use the potentially updated value
-            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],  # type: ignore
-            inference_max_requests=self.cfg["generation_batch_size"],
+        mcore_generation_config = cast(
+            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
         )
 
         from megatron.core.inference.contexts.dynamic_context import (
@@ -723,44 +715,31 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        mcore_generation_config = cast(
-            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
-        )
-        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
-
-        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
-        block_size_tokens = mcore_generation_config["block_size_tokens"]
-        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
-            "use_cuda_graphs_for_non_decode_steps"
-        ]
-        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
-        unified_memory_level = mcore_generation_config["unified_memory_level"]
-        max_tokens = mcore_generation_config["max_tokens"]
-
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
 
-        dynamic_context = DynamicInferenceContext(
-            params_dtype=inference_wrapper_config.params_dtype,
-            num_layers=model_config.num_layers,
-            kv_channels=model_config.kv_channels,
-            num_attention_heads=model_config.num_query_groups,
+        local_rank = torch.cuda.current_device()
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
+
+        inference_config = InferenceConfig(
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_size_gb=buffer_size_gb,
-            materialize_only_last_token_logits=False,
-            num_cuda_graphs=num_cuda_graphs,
-            block_size_tokens=block_size_tokens,
-            tensor_model_parallel_size=self.cfg["megatron_cfg"][
-                "tensor_model_parallel_size"
+            buffer_size_gb=mcore_generation_config["buffer_size_gb"],
+            num_cuda_graphs=mcore_generation_config["num_cuda_graphs"],
+            block_size_tokens=mcore_generation_config["block_size_tokens"],
+            use_cuda_graphs_for_non_decode_steps=mcore_generation_config[
+                "use_cuda_graphs_for_non_decode_steps"
             ],
-            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+            enable_chunked_prefill=mcore_generation_config["enable_chunked_prefill"],
+            unified_memory_level=mcore_generation_config["unified_memory_level"],
+            max_tokens=mcore_generation_config["max_tokens"],
+            materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=False,
-            unified_memory_level=unified_memory_level,
-            max_tokens=max_tokens,
         )
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, dynamic_context
-        )
+
+        dynamic_context = DynamicInferenceContext(model_config, inference_config)
+        inference_wrapped_model = GPTInferenceWrapper(self.model, dynamic_context)
 
         inference_wrapped_model.prep_model_for_inference()
         # Set pipeline parallel flag
@@ -773,21 +752,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             tokenizer=self.megatron_tokenizer,
         )
 
-        # Calculate seed based on node and rank to ensure reproducibility across workers
-        local_rank = torch.cuda.current_device()  # Local GPU index on the node
-        num_gpus_per_node = torch.cuda.device_count()
-        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        seed = (node_idx * 1024) + local_rank
-
-        # New API: DynamicInferenceEngine has additional parameters
         dynamic_engine = DynamicInferenceEngine(
             text_generation_controller,
             dynamic_context,
-            enable_cuda_graph=True,
-            random_seed=seed,
-            track_paused_request_events=False,
-            enable_chunked_prefill=enable_chunked_prefill,
-            inference_logging_step_interval=0,
         )
 
         # Handle None values for top_k - convert to integer as required by Megatron

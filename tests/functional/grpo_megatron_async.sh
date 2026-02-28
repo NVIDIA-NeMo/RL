@@ -20,17 +20,21 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
-    --config $PROJECT_ROOT/examples/configs/grpo_multiple_datasets.yaml \
+    --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
-    grpo.val_at_start=true \
-    grpo.max_val_samples=4 \
-    grpo.val_batch_size=4 \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
-    grpo.max_num_steps=2 \
+    grpo.max_num_steps=20 \
+    grpo.async_grpo.enabled=true \
+    grpo.async_grpo.max_trajectory_age_steps=1 \
+    policy.generation.vllm_cfg.async_engine=true \
+    loss_fn.use_importance_sampling_correction=true \
+    policy.generation.colocated.enabled=false \
+    policy.generation.colocated.resources.num_nodes=1 \
+    policy.generation.colocated.resources.gpus_per_node=1 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
@@ -42,4 +46,5 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/gen_kl_error"]) < 0.001'
+    'max(data["train/token_mult_prob_error"]) < 1.05'
+
