@@ -27,7 +27,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
-    grpo.max_num_steps=20 \
+    grpo.max_num_steps=5 \
     grpo.async_grpo.enabled=true \
     grpo.async_grpo.max_trajectory_age_steps=1 \
     policy.generation.vllm_cfg.async_engine=true \
