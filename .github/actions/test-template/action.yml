@@ -61,10 +61,6 @@ inputs:
   registry:
     description: "Registry to use for test"
     required: false
-  image_name:
-    description: "Image name to use for test"
-    required: false
-    default: "rl_container"
   test_data_path:
     description: "Test data path"
     required: false
