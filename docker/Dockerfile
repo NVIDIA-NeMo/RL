@@ -15,11 +15,22 @@
 # Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+#
+# Custom setup (override the default apptainer install):
+#   docker buildx build --build-context custom-setup=my-setup-dir/ --build-arg CUSTOM_SETUP_FNAME=my_script.sh -f docker/Dockerfile ...
+#
+# To skip custom setup entirely:
+#   docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# Default custom-setup stage: installs apptainer.
+# Override with: --build-context custom-setup=<your-dir>
+FROM scratch AS custom-setup
+COPY docker/install_apptainer.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -184,6 +195,18 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
+# To skip: --build-arg CUSTOM_SETUP_FNAME=
+ARG CUSTOM_SETUP_FNAME=install_apptainer.sh
+RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup <<"EOF" bash -exu
+if [[ -z "${CUSTOM_SETUP_FNAME}" ]]; then
+    echo "CUSTOM_SETUP_FNAME is empty, skipping custom setup"
+    exit 0
+fi
+cp /tmp/custom-setup/${CUSTOM_SETUP_FNAME} /opt/${CUSTOM_SETUP_FNAME}
+bash -x /opt/${CUSTOM_SETUP_FNAME}
+EOF
 
 WORKDIR /opt/nemo-rl
 
