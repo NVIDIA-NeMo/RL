@@ -965,18 +965,43 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
         return param_info
 
+    def _is_fp8_weights_enabled(self) -> bool:
+        """Check if the generation side uses FP8 weight quantization."""
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
+            return vllm_cfg.get("precision") == "fp8"
+        return False
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
+        When FP8 weight quantization is enabled for generation, eligible weights
+        are quantized to FP8 on the training worker and yielded as
+        (name, fp8_data) + (name + "_scale_inv", scale) pairs.  This reduces
+        the broadcast payload from bf16 to fp8.
+
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            FP8_WEIGHT_BLOCK_SIZE,
+            cast_tensor_to_fp8_blockwise,
             get_vllm_qkv_scale_names,
+            should_quantize_to_fp8,
         )
+
+        use_fp8_weights = self._is_fp8_weights_enabled()
+        use_pow2_scale = False
+        if use_fp8_weights:
+            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
+            use_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False)
 
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
@@ -984,9 +1009,18 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # Yield the original parameters first.
         for name, tensor in base_iter:
-            yield name, tensor
+            if use_fp8_weights and should_quantize_to_fp8(name, tensor):
+                fp8_data, scale = cast_tensor_to_fp8_blockwise(
+                    tensor.to(torch.float),
+                    weight_block_size=FP8_WEIGHT_BLOCK_SIZE,
+                    use_pow2_scale=use_pow2_scale,
+                )
+                scale = torch.squeeze(scale, dim=-1)
+                yield name, fp8_data
+                yield name + "_scale_inv", scale
+            else:
+                yield name, tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
