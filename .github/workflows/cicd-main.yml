@@ -244,7 +244,7 @@ jobs:
   #       NEMO_RL_COMMIT=${{ github.sha }}
 
   build-container-gb200:
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
+    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@8c6389f1952bec001b553ac835dbb1c9a57e00b7
     with:
