@@ -34,7 +34,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
-from transformers.utils import TRANSFORMERS_CACHE
+from huggingface_hub.constants import HF_HUB_CACHE as TRANSFORMERS_CACHE
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 

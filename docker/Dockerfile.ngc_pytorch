@@ -105,7 +105,7 @@ uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --no-group transformers-v4 --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs

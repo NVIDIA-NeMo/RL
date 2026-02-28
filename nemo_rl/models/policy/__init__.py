@@ -42,7 +42,7 @@ class AutomodelBackendConfig(TypedDict):
     to the HuggingFace implementation.
     """
 
-    # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
+    # Hydra target class path (e.g., "nemo_automodel.components.models.common.utils.BackendConfig")
     _target_: str
     # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
     attn: NotRequired[str]

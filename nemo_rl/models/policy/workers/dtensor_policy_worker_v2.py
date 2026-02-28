@@ -246,22 +246,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             rank=0,  # Temporary, will be updated after distributed init
         )
 
-        # Set up distributed environment (returns FSDP2Manager)
-        distributed_manager = setup_distributed(
+        # Set up distributed environment (returns DistributedContext)
+        distributed_context = setup_distributed(
             config=config,
             runtime_config=runtime_config,
         )
-        # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
+        # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
-        self.device_mesh = distributed_manager.device_mesh
+        self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
-        self.moe_mesh = distributed_manager.moe_mesh
-        self.dp_size = distributed_manager.dp_size
-        self.tp_size = distributed_manager.tp_size
-        self.cp_size = distributed_manager.cp_size
+        self.moe_mesh = distributed_context.moe_mesh
+        self.dp_size = distributed_context.dp_size
+        self.tp_size = distributed_context.tp_size
+        self.cp_size = distributed_context.cp_size
 
         # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
@@ -279,7 +279,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             config=config,
             tokenizer=tokenizer,
             runtime_config=runtime_config,
-            distributed_manager=distributed_manager,
+            distributed_context=distributed_context,
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,

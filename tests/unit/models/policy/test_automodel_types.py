@@ -18,7 +18,7 @@ import pytest
 
 # Check if nemo_automodel is available for tests that need it
 try:
-    from nemo_automodel.components.moe.utils import BackendConfig  # noqa: F401
+    from nemo_automodel.components.models.common.utils import BackendConfig  # noqa: F401
 
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
@@ -47,7 +47,7 @@ class TestAutoModelBackendConfig:
         backend_keys = {k for k in keys if k != "_target_"}
 
         config_dict: AutomodelBackendConfig = {
-            "_target_": "nemo_automodel.components.moe.utils.BackendConfig",
+            "_target_": "nemo_automodel.components.models.common.utils.BackendConfig",
             "attn": "te",
             "linear": "te",
             "rms_norm": "te",

@@ -18,25 +18,23 @@ import os
 from typing import Any, Optional
 
 import torch
-from accelerate import init_empty_weights
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components._peft.lora import (
-    PeftConfig,
-    apply_lora_to_linear_modules,
-)
+from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.config.loader import _resolve_target
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
-from nemo_automodel.components.moe.parallelizer import (
-    parallelize_model as moe_parallelize_model,
-)
+from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedModel
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from nemo_rl.models.automodel.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.automodel.config import (
+    DistributedContext,
+    ModelAndOptimizerState,
+    RuntimeConfig,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
@@ -222,25 +220,18 @@ def setup_reference_model_state(
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
-) -> FSDP2Manager:
-    """Set up distributed training environment and create FSDP2Manager.
+) -> DistributedContext:
+    """Set up distributed training environment and create device meshes.
 
-    Initializes torch.distributed process group and creates an FSDP2Manager
-    with the appropriate parallelization and precision settings.
+    Initializes torch.distributed process group and creates FSDP2Config,
+    MoEParallelizerConfig, and device meshes for distributed training.
 
     Args:
         config: Policy configuration dictionary
         runtime_config: RuntimeConfig named tuple from validate_and_prepare_config
 
     Returns:
-        FSDP2Manager instance with all distributed configuration
-
-    Note:
-        The returned FSDP2Manager contains all distributed attributes:
-        - dp_size, tp_size, cp_size, ep_size: parallelization sizes
-        - dp_mesh, tp_mesh, cp_mesh, device_mesh: device meshes
-        - moe_mesh: MoE mesh if expert parallelism is used
-        - dp_replicate_size, dp_shard_size, ep_shard_size: sharding sizes
+        DistributedContext containing device meshes and distributed configuration
     """
     # Initialize process group
     backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
@@ -258,46 +249,60 @@ def setup_distributed(
     dp_size = config["dtensor_cfg"].get("data_parallel_size", None)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
-    # Create FSDP2 manager
-    manager = FSDP2Manager(
-        dp_size=dp_size,
-        dp_replicate_size=1,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        ep_size=ep_size,
-        pp_size=1,
+    # Create FSDP2Config
+    fsdp2_config = FSDP2Config(
         sequence_parallel=sequence_parallel_enabled,
-        use_hf_tp_plan=config["dtensor_cfg"].get("use_hf_tp_plan", False),
+        tp_plan=config["dtensor_cfg"].get("custom_parallel_plan", None),
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
-        backend="nccl",
-        world_size=world_size,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
-        custom_tp_plan=config["dtensor_cfg"].get("custom_parallel_plan", None),
         defer_fsdp_grad_sync=config["dtensor_cfg"].get("defer_fsdp_grad_sync", True),
+        backend="nccl",
     )
 
-    # Force setup distributed for world size 1 as FSDP2Manager skips it
-    if world_size == 1:
-        if cpu_offload:
-            raise NotImplementedError(
-                "CPUOffload doesn't work on single GPU for AutoModel. "
-                "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
-            )
-        manager._setup_distributed()
+    # Create MoEParallelizerConfig from nested moe_parallelizer options
+    moe_parallelizer_cfg = config["dtensor_cfg"].get("moe_parallelizer", {})
+    moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
 
-    return manager
+    # Create device mesh
+    device_mesh, moe_mesh = create_device_mesh(
+        fsdp2_config,
+        dp_size=dp_size,
+        dp_replicate_size=1,
+        tp_size=tp_size,
+        pp_size=1,
+        cp_size=cp_size,
+        ep_size=ep_size,
+        world_size=world_size,
+    )
+
+    # Derive sizes from mesh
+    # Note: "dp" is a flattened submesh (dp_replicate + dp_shard) and may not appear
+    # in mesh_dim_names directly, so we access it without the conditional check.
+    resolved_dp_size = device_mesh["dp"].size()
+    resolved_tp_size = device_mesh["tp"].size()
+    resolved_cp_size = device_mesh["cp"].size()
+
+    return DistributedContext(
+        device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+        fsdp2_config=fsdp2_config,
+        moe_config=moe_config,
+        dp_size=resolved_dp_size,
+        tp_size=resolved_tp_size,
+        cp_size=resolved_cp_size,
+    )
 
 
 def setup_model_and_optimizer(
     config: PolicyConfig,
     tokenizer: AutoTokenizer,
     runtime_config: RuntimeConfig,
-    distributed_manager: FSDP2Manager,
+    distributed_context: DistributedContext,
     checkpoint_manager: Any,
     is_vlm: bool = False,
     init_optimizer: bool = True,
@@ -306,14 +311,15 @@ def setup_model_and_optimizer(
 ) -> ModelAndOptimizerState:
     """Set up model, parallelization, and optimizer.
 
-    Creates the model from config, applies parallelization strategies (FSDP2, TP, CP),
-    loads base weights, and optionally initializes optimizer and scheduler.
+    Creates the model via from_pretrained with device meshes and distributed
+    config, letting Automodel handle meta-device init, FSDP/EP sharding,
+    and base weight loading internally.
 
     Args:
         config: Policy configuration dictionary
         tokenizer: Tokenizer for the model
         runtime_config: RuntimeConfig named tuple from validate_and_prepare_config
-        distributed_manager: FSDP2Manager from setup_distributed
+        distributed_context: DistributedContext from setup_distributed
         checkpoint_manager: Checkpoint manager for loading/saving weights
         is_vlm: Whether this is a vision-language model
         init_optimizer: Whether to initialize optimizer
@@ -322,13 +328,6 @@ def setup_model_and_optimizer(
 
     Returns:
         ModelAndOptimizerState containing model, optimizer, scheduler, and metadata
-
-    Note:
-        The function handles special cases for:
-        - MoE models (uses custom parallelization)
-        - LoRA (applies adapter layers)
-        - Context parallel validation
-        - Tied word embeddings
     """
     # Extract configuration values
     model_config = runtime_config.model_config
@@ -338,13 +337,16 @@ def setup_model_and_optimizer(
     cpu_offload = runtime_config.cpu_offload
     is_reward_model = runtime_config.is_reward_model
 
-    # Extract distributed configuration from manager
+    # Extract distributed configuration from context
     rank = torch.distributed.get_rank()
-    device_mesh = distributed_manager.device_mesh
-    moe_mesh = distributed_manager.moe_mesh
-    tp_size = distributed_manager.tp_size
-    cp_size = distributed_manager.cp_size
-    sequence_parallel_enabled = distributed_manager.sequence_parallel
+    device_mesh = distributed_context.device_mesh
+    moe_mesh = distributed_context.moe_mesh
+    fsdp2_config = distributed_context.fsdp2_config
+    moe_config = distributed_context.moe_config
+    tp_size = distributed_context.tp_size
+    cp_size = distributed_context.cp_size
+    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
     model_name = config["model_name"]
 
@@ -361,7 +363,7 @@ def setup_model_and_optimizer(
         cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
         peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
 
-    print(f"[Rank {rank}] Initializing empty model for FSDP...")
+    print(f"[Rank {rank}] Initializing model for FSDP...")
 
     # Prepare automodel kwargs
     automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
@@ -381,17 +383,11 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in `cp_utils.py` where only
-        # flash and efficient backends are supported
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
         ]
     elif config["dtensor_cfg"]["activation_checkpointing"]:
-        # For activation checkpointing, we must disable the cudnn SDPA backend because
-        # it may not be selected during recomputation.
-        # In that case, we will get the following error:
-        # "Recomputed values have different metadata than during forward pass."
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
@@ -400,40 +396,11 @@ def setup_model_and_optimizer(
     else:
         sdpa_method = None
 
-    # Initialize empty model
-    with init_empty_weights():
-        model = model_class.from_pretrained(
-            model_name,
-            attn_implementation=attn_impl,
-            torch_dtype=str(model_config.torch_dtype),
-            trust_remote_code=True,
-            config=model_config,
-            sdpa_method=sdpa_method,
-            **automodel_kwargs,
-        )
-        if lora_enabled:
-            apply_lora_to_linear_modules(model, peft_config)
-
-    # For activation checkpointing, we also must globally disable the cudnn SDPA backend
-    # to ensure that cudnn does not get selected during recomputation.
-    if config["dtensor_cfg"]["activation_checkpointing"]:
-        from torch.backends import cuda
-
-        cuda.enable_cudnn_sdp(False)
-
-    # Store original state dict keys
-    model_state_dict_keys = list(model.state_dict().keys())
-
-    # Set pad token ID if needed
-    if model.config.pad_token_id is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    # Validate CP configuration with model type
+    # Validate CP configuration before model creation
     if cp_size > 1:
-        if isinstance(model, Gemma3ForCausalLM):
+        if model_config.model_type == "gemma3":
             raise AssertionError(
                 "Context parallel is not supported for Gemma3ForCausalLM. "
-                "Torch context parallel has many limitations. "
                 "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
 
@@ -449,7 +416,51 @@ def setup_model_and_optimizer(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-    # Parallelize model
+    # Build from_pretrained kwargs from hf_config_overrides so from_pretrained
+    # applies them when loading the config internally (avoids passing config=
+    # which causes duplicate 'config' arg for custom model implementations).
+    from_pretrained_kwargs: dict[str, Any] = {
+        **(hf_config_overrides or {}),
+    }
+    if is_reward_model and model_config.num_labels == 1:
+        from_pretrained_kwargs["num_labels"] = 1
+
+    # Create model via from_pretrained — Automodel handles meta device init,
+    # FSDP/EP parallelization, and base weight loading internally.
+    model = model_class.from_pretrained(
+        model_name,
+        device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+        distributed_config=fsdp2_config,
+        moe_config=moe_config if ep_size > 1 else None,
+        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        peft_config=peft_config,
+        attn_implementation=attn_impl,
+        torch_dtype=str(model_config.torch_dtype),
+        trust_remote_code=True,
+        sdpa_method=sdpa_method,
+        **from_pretrained_kwargs,
+        **automodel_kwargs,
+    )
+
+    # For activation checkpointing, we also must globally disable the cudnn SDPA backend
+    # to ensure that cudnn does not get selected during recomputation.
+    if config["dtensor_cfg"]["activation_checkpointing"]:
+        from torch.backends import cuda
+
+        cuda.enable_cudnn_sdp(False)
+
+    # Compute model metadata after from_pretrained
+    model_state_dict_keys = list(model.state_dict().keys())
+
+    # Set model state dict keys in checkpoint manager for saving
+    checkpoint_manager.set_model_state_dict_keys(model_state_dict_keys)
+
+    # Set pad token ID if needed
+    if model.config.pad_token_id is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    # Determine model characteristics
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
     is_hf_model = (
         model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
@@ -457,47 +468,8 @@ def setup_model_and_optimizer(
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
 
-    if not isinstance(model, PreTrainedModel) and is_moe_model and not is_hf_model:
-        assert tp_size == 1, (
-            f"Using custom implementation {model.__class__.__name__} for MoE model {model_name} which doesn't support tp_size > 1. "
-            "Please use expert_parallel_size > 1 for custom implementation or set force_hf=True in your config at policy->dtensor_cfg->automodel_kwargs to use the HuggingFace implementation."
-        )
-        assert cp_size == 1, (
-            f"Using custom implementation {model.__class__.__name__} for MoE model {model_name} which doesn't support cp_size > 1. "
-            "Please set force_hf=True in your config at policy->dtensor_cfg->automodel_kwargs to use the HuggingFace implementation."
-        )
-        moe_parallelize_model(
-            model=model,
-            world_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            pp_enabled=False,
-            dp_axis_names=(
-                ("dp_replicate", "dp_shard_cp")
-                if "dp_replicate" in device_mesh.mesh_dim_names
-                and "dp_shard_cp" in device_mesh.mesh_dim_names
-                else ("dp_shard_cp",)
-            ),
-            cp_axis_name="cp",
-            tp_axis_name="tp",
-            ep_axis_name="ep",
-            ep_shard_axis_names=("ep_shard",),
-        )
-    else:
-        model = distributed_manager.parallelize(model)
-
-    print(model)
-
-    # Set model state dict keys in checkpoint manager
-    checkpoint_manager.set_model_state_dict_keys(model_state_dict_keys)
-
-    # Load base HF weights
-    checkpoint_manager.load_base_model(
-        model,
-        model_name=model_name,
-        hf_cache_dir=hf_config_overrides.get("cache_dir", None),
-        dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
-        peft_init_method=peft_config.lora_A_init if peft_config is not None else None,
-    )
+    if rank == 0:
+        print(model)
 
     # Handle tied word embeddings
     is_tied_lm_head = hasattr(model, "lm_head") and getattr(
@@ -568,7 +540,7 @@ def setup_model_and_optimizer(
         )
     else:
         print(
-            "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
+            "No weights path provided. Loaded base HF weights via from_pretrained (default policy init)"
         )
 
     return ModelAndOptimizerState(
