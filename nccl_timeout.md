@@ -5,9 +5,14 @@
 After several successful GRPO training steps (anywhere from step 5 to step 20+), the job crashes with NCCL collective operation timeouts during the generation phase. The errors look like:
 
 ```
-[Rank 5] Watchdog caught collective operation timeout:
-  WorkNCCL(SeqNum=10707, OpType=COALESCED, ..., Timeout(ms)=600000)
-  ran for 600030 milliseconds before timing out.
+(MegatronPolicyWorker[rank=1] pid=151407) [rank1]:[E228 00:10:27.202494521 ProcessGroupNCCL.cpp:2057] [PG ID 12 PG GUID 99(EXPERT_MODEL_PARALLEL_GROUP) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=1145527, OpType=ALLTOALL_BASE, NumelIn=206438400, NumelOut=206438400, Timeout(ms)=600000) ran for 600016 milliseconds before timing out.
+(MegatronPolicyWorker[rank=1] pid=151407)
+(MegatronPolicyWorker[rank=1] pid=151407) [2026-02-28 00:10:27,258 E 151407 153013] logging.cc:118: Unhandled exception: N3c1016DistBackendErrorE. what(): [PG ID 12 PG GUID 99(EXPERT_MODEL_PARALLEL_GROUP) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=1145527, OpType=ALLTOALL_BASE, NumelIn=206438400, NumelOut=206438400, Timeout(ms)=600000) ran for 600016 milliseconds before timing out.
+(MegatronPolicyWorker[rank=1] pid=151407)
+(MegatronPolicyWorker[rank=1] pid=151407)
+(MegatronPolicyWorker[rank=7] pid=151429) [rank7]:[E228 00:10:27.168785312 ProcessGroupNCCL.cpp:2057] [PG ID 5 PG GUID 36(TENSOR_MODEL_PARALLEL_GROUP) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=2036074, OpType=_REDUCE_SCATTER_BASE, NumelIn=3225600, NumelOut=1612800, Timeout(ms)=600000) ran for 600000 milliseconds before timing out.
+(MegatronPolicyWorker[rank=7] pid=151429)
+(MegatronPolicyWorker[rank=7] pid=151429) [2026-02-28 00:10:27,224 E 151429 152962] logging.cc:118: Unhandled exception: N3c1016DistBackendErrorE. what(): [PG ID 5 PG GUID 36(TENSOR_MODEL_PARALLEL_GROUP) Rank 1] Process group watchdog thread terminated with exception: [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=2036074, OpType=_REDUCE_SCATTER_BASE, NumelIn=3225600, NumelOut=1612800, Timeout(ms)=600000) ran for 600000 milliseconds before timing out.
 ```
 
 Key signatures:
