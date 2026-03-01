@@ -22,7 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss_functions import (
-    NLLLoss,
+    NLLLoss, NLLLinearCEFusionLoss
 )
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
@@ -210,7 +210,7 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLinearCEFusionLoss() if policy_config["megatron_cfg"].get("enabled", False) and policy_config["megatron_cfg"].get("use_linear_ce_fusion_loss", False) else NLLLoss()
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

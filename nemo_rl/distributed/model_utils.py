@@ -15,6 +15,12 @@
 from typing import Any, Optional
 
 import torch
+from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+)
+from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 
@@ -1054,3 +1060,340 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
         grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
         return grad_input, None, None, None
+
+
+def from_parallel_hidden_states_to_logprobs(
+    tensor_parallel_hidden_states: torch.Tensor,
+    output_weight_layer: torch.Tensor,
+    output_weight: torch.Tensor,
+    runtime_gather_output: bool,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup,
+    inference_only: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Get log probabilities from TP sharded hidden states."""
+    target = target.roll(shifts=-1, dims=-1)
+    logprobs: torch.Tensor = ChunkedDistributedHiddenStatesToLogprobs.apply(  # type: ignore
+        tensor_parallel_hidden_states,
+        target,
+        output_weight_layer,
+        vocab_start_index,
+        vocab_end_index,
+        chunk_size,
+        tp_group,
+        inference_only,
+    ).contiguous()
+
+    return logprobs[:, :-1]
+
+
+class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
+    """Compute distributed log-softmax once and gather logprobs at given global indices."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        tensor_parallel_hidden_states: torch.Tensor,
+        target: torch.Tensor,
+        output_weight_layer: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target = target - vocab_start_index
+        masked_target[target_mask] = 0
+        tp_group_size = torch.distributed.get_world_size(tp_group)
+        if tp_group_size > 1:
+            original_tensor_parallel_hidden_states = (
+                tensor_parallel_hidden_states.clone()
+            )
+            all_hidden_states = [
+                torch.zeros_like(tensor_parallel_hidden_states)
+                for _ in range(tp_group_size)
+            ]
+            torch.distributed.all_gather(
+                all_hidden_states, tensor_parallel_hidden_states, group=tp_group
+            )
+            tensor_parallel_hidden_states = torch.cat(all_hidden_states, dim=0)
+        else:
+            original_tensor_parallel_hidden_states = tensor_parallel_hidden_states
+        seq_size = int(tensor_parallel_hidden_states.shape[0])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        all_log_probs = []
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+            logits = torch.matmul(
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :],
+                output_weight_layer.T,
+            )
+            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()
+            log_probs = _compute_distributed_log_softmax(
+                logits,
+                group=tp_group,
+            )
+
+            log_probs = (
+                torch.gather(
+                    log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
+                )
+                .squeeze(-1)
+                .detach()
+            )
+            log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
+
+            all_log_probs.append(log_probs)
+
+        log_probs = torch.cat(all_log_probs, dim=1)
+        torch.distributed.all_reduce(
+            log_probs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+        if not inference_only:
+            # only save for backward when we have inference only=False
+            # save tensor_parallel_hidden_states and the output_layer to the context
+            ctx.save_for_backward(
+                original_tensor_parallel_hidden_states.detach(),
+                target_mask.detach(),
+                masked_target.detach(),
+                output_weight_layer.detach(),
+            )
+            ctx.chunk_size = chunk_size
+            ctx.tp_group = tp_group
+
+        return log_probs
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, torch.Tensor, None, None, None, None, None]:
+        grad_output = grad_outputs[0]
+        # the tensor_parallel_hidden_states is already all gathered in the forward pass
+        (
+            tensor_parallel_hidden_states,
+            target_mask,
+            masked_target,
+            output_weight_layer,
+        ) = ctx.saved_tensors
+        tp_group = ctx.tp_group
+        tp_group_size = torch.distributed.get_world_size(tp_group)
+        if tp_group_size > 1:
+            all_hidden_states = [
+                torch.zeros_like(tensor_parallel_hidden_states)
+                for _ in range(tp_group_size)
+            ]
+            torch.distributed.all_gather(
+                all_hidden_states, tensor_parallel_hidden_states, group=tp_group
+            )
+            tensor_parallel_hidden_states = torch.cat(all_hidden_states, dim=0)
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+        # this is the vocab size for this partition when the output_layer is a ColumnParallelLinear
+        partition_vocab_size = output_weight_layer.size(0)
+        seq_size = int(tensor_parallel_hidden_states.shape[0])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        all_grad_input_hidden_states = []
+        all_grad_input_output_layer = []
+        grad_input_output_layer = torch.zeros_like(output_weight_layer)
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+            # recalculate the logits using the output_layer
+            logits = torch.matmul(
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :],
+                output_weight_layer.T,
+            )
+            logits = logits.to(dtype=torch.float32).transpose(0, 1).contiguous()
+            softmax_output = _compute_distributed_log_softmax(
+                logits,
+                group=tp_group,
+            )
+            softmax_output = softmax_output.exp().detach()
+            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
+                -1
+            ) * torch.nn.functional.one_hot(
+                masked_target[:, chunk_start:chunk_end],
+                num_classes=partition_vocab_size,
+            )
+            grad_input = is_chosen.float().sub_(softmax_output)
+            used_grad_output = grad_output[:, chunk_start:chunk_end]
+            grad_input.mul_(used_grad_output.unsqueeze(dim=-1))
+            grad_input_hidden_states = torch.matmul(
+                grad_input, output_weight_layer.to(dtype=torch.float32)
+            )  # [chunk_start:chunk_end, :, :]
+            grad_input_output_layer_local = torch.einsum(
+                "bsd, bsv -> dv",
+                tensor_parallel_hidden_states[chunk_start:chunk_end, :, :]
+                .transpose(0, 1)
+                .contiguous()
+                .to(dtype=torch.float32),
+                grad_input.to(dtype=torch.float32),
+            )
+            all_grad_input_hidden_states.append(grad_input_hidden_states)
+            grad_input_output_layer.add_(
+                grad_input_output_layer_local.transpose(0, 1).contiguous()
+            )
+
+        grad_input_hidden_states = (
+            torch.cat(all_grad_input_hidden_states, dim=1).transpose(0, 1).contiguous()
+        )
+        weight_grad = grad_input_output_layer
+        local_seq_size = seq_size // tp_group_size
+
+        sharded_grad_hidden_states = torch.empty_like(
+            grad_input_hidden_states[:local_seq_size]
+        )
+        grad_input_hidden_states_list = list(
+            torch.chunk(grad_input_hidden_states, chunks=tp_group_size, dim=0)
+        )
+        torch.distributed.reduce_scatter(
+            sharded_grad_hidden_states,
+            grad_input_hidden_states_list,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+
+        return (
+            sharded_grad_hidden_states,
+            None,
+            weight_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int = 256) -> None:
+    if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
+        GPTModel._linear_ce_fusion_chunk_size = chunk_size
+        return
+    GPTModel._original_forward_for_linear_ce_fusion = GPTModel.forward
+    GPTModel._linear_ce_fusion_chunk_size = chunk_size
+    GPTModel.forward = _gpt_forward_with_linear_ce_fusion
+    GPTModel._linear_ce_fusion_forward_patched = True
+
+
+def _gpt_forward_with_linear_ce_fusion(
+    self: GPTModel,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    decoder_input: torch.Tensor = None,
+    labels: torch.Tensor = None,
+    inference_context: Any = None,
+    packed_seq_params: Any = None,
+    extra_block_kwargs: Optional[dict] = None,
+    runtime_gather_output: Optional[bool] = None,
+    *,
+    inference_params: Optional[Any] = None,
+    loss_mask: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+    return_logprobs_for_linear_ce_fusion: bool = False,
+) -> torch.Tensor:
+    if not return_logprobs_for_linear_ce_fusion:
+        return self._original_forward_for_linear_ce_fusion(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            runtime_gather_output=runtime_gather_output,
+            inference_params=inference_params,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+        )
+    """
+    original forward function signature:
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+    """
+    if labels is None:
+        raise ValueError("labels must be provided when linear CE fusion is enabled")
+
+    inference_context = deprecate_inference_params(inference_context, inference_params)
+
+    preproc_output = self._preprocess(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        decoder_input=decoder_input,
+        inference_context=inference_context,
+        packed_seq_params=packed_seq_params,
+        padding_mask=padding_mask,
+    )
+    (
+        decoder_input,
+        rotary_pos_emb,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        sequence_len_offset,
+        padding_mask,
+    ) = preproc_output[:6]
+    rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+
+    hidden_states = self.decoder(
+        hidden_states=decoder_input,
+        attention_mask=attention_mask,
+        inference_context=inference_context,
+        rotary_pos_emb=rotary_pos_emb,
+        rotary_pos_cos=rotary_pos_cos,
+        rotary_pos_sin=rotary_pos_sin,
+        rotary_pos_cos_sin=rotary_pos_cos_sin,
+        packed_seq_params=packed_seq_params,
+        sequence_len_offset=sequence_len_offset,
+        padding_mask=padding_mask,
+        **(extra_block_kwargs or {}),
+    )
+
+    # Non post-process pipeline stages do not own the output layer.
+    if not self.post_process or not hasattr(self, "output_layer"):
+        return hidden_states
+
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_pg_size(get_tensor_model_parallel_group())
+    # calculate the logprobs for the last token and then return the logprobs
+    vocab_start_index = tp_rank * (self.vocab_size // tp_size)
+    vocab_end_index = min((tp_rank + 1) * (self.vocab_size // tp_size), self.vocab_size)
+    output_weight_layer = self.output_layer.weight
+    logprobs = from_parallel_hidden_states_to_logprobs(
+        hidden_states,  # .transpose(0, 1).contiguous(),
+        output_weight_layer,
+        self.shared_embedding_or_output_weight()
+        if self.share_embeddings_and_output_weights
+        else self.output_layer.weight,
+        runtime_gather_output,
+        labels,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        inference_only=inference_context is not None and not self.training,
+        tp_group=get_tensor_model_parallel_group(),
+        cp_group=self.cp_group,
+        chunk_size=getattr(self, "_linear_ce_fusion_chunk_size", 256),
+    )
+    return logprobs
