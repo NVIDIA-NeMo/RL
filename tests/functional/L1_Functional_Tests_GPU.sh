@@ -46,13 +46,11 @@ run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/eval.sh
 run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_async.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_async.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
