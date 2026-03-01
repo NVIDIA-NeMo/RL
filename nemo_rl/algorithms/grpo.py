@@ -3059,11 +3059,24 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
-            log_data = {"content": flat_messages_content}
+            # Logging
+            # Log training data (match sync GRPO logging payload for parity)
+            log_data = {}
+            if "agent_ref" in repeated_batch:
+                log_data["agent_ref"] = repeated_batch["agent_ref"]
+            log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
+            if master_config["grpo"]["use_dynamic_sampling"]:
+                # In dynamic sampling, `rewards` corresponds to filtered rewards
+                log_data["filtered_rewards"] = rewards.tolist()
+                log_data["rewards"] = repeated_batch["total_reward"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            log_data["token_ids"] = train_data["input_ids"].tolist()
+            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
