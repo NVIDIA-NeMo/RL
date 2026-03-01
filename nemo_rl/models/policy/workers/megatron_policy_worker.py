@@ -325,6 +325,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
+                    from megatron.bridge.training.train import (
+                        _handle_mxfp8_param_buffer_copy,
+                    )
+
+                    _handle_mxfp8_param_buffer_copy(
+                        optimizer=self.optimizer,
+                        reuse_grad_buf_for_mxfp8_param_ag=self.cfg["megatron_cfg"][
+                            "optimizer"
+                        ]["reuse_grad_buf_for_mxfp8_param_ag"],
+                        overlap_param_gather=self.cfg["megatron_cfg"][
+                            "distributed_data_parallel_config"
+                        ]["overlap_param_gather"],
+                    )
+
                     # Forward pass.
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
@@ -461,6 +475,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.model.zero_grad_buffer()
+
+        from megatron.bridge.training.train import (
+            _handle_mxfp8_param_buffer_copy,
+        )
+
+        _handle_mxfp8_param_buffer_copy(
+            optimizer=self.optimizer,
+            reuse_grad_buf_for_mxfp8_param_ag=self.cfg["megatron_cfg"][
+                "optimizer"
+            ]["reuse_grad_buf_for_mxfp8_param_ag"],
+            overlap_param_gather=self.cfg["megatron_cfg"][
+                "distributed_data_parallel_config"
+            ]["overlap_param_gather"],
+        )
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -1024,13 +1054,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     def prepare_for_lp_inference(self):
-        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        self.model = self.move_model(self.model, "cuda", move_grads=True)
         self.model.eval()
 
-        # offload grads to cpu
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+        # # offload grads to cpu
+        # self.model = self.move_model(
+        #     self.model, "cpu", move_params=False, move_grads=True
+        # )  # get rid of grad buffers
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
