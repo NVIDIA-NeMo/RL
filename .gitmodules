@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/yaoyu-33/Megatron-LM.git
-	branch = yifu/remove_do_not_average_loss
+	url = https://github.com/NVIDIA/Megatron-LM.git
+	branch = main
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge

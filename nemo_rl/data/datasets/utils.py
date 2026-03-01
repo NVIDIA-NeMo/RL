@@ -15,10 +15,12 @@
 import base64
 import io
 import os
+from pathlib import Path
 from typing import Optional, Union
 
 import torch
 from datasets import DatasetDict, load_dataset, load_from_disk
+from huggingface_hub.utils._cache_manager import _scan_cached_repo
 from PIL import Image
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -141,3 +143,34 @@ def extract_necessary_env_names(data_config: dict) -> list[str]:
         ):
             necessary_env_names.add(data_config[key]["env_name"])
     return list(necessary_env_names)
+
+
+def get_huggingface_cache_path(repo_id, branch="main", repo_type="datasets"):
+    cache_path = None
+    try:
+        cache_list = ["HUGGINGFACE_HUB_CACHE", "HF_HOME"]
+        for cache_name in cache_list:
+            if cache_name in os.environ and os.path.exists(os.environ[cache_name]):
+                if os.environ[cache_name].split("/")[-1] == "hub":
+                    cache_path = os.environ[cache_name]
+                else:
+                    cache_path = os.path.join(os.environ[cache_name], "hub")
+        if not cache_path:
+            home = os.path.expanduser("~")
+            cache_path = os.path.join(home, ".cache", "huggingface", "hub")
+        if cache_path and os.path.isdir(cache_path):
+            org, repo_name = repo_id.split("/")
+            repo_path = Path(
+                os.path.join(cache_path, f"{repo_type}--{org}--{repo_name}/")
+            )
+            hf_cache_info = _scan_cached_repo(repo_path=repo_path)
+            revs = {r.refs: r for r in hf_cache_info.revisions}
+            if branch is not None:
+                revs = {refs: r for refs, r in revs.items() if branch in refs}
+            rev2keep = max(revs.values(), key=lambda r: r.last_modified)
+            return str(rev2keep.snapshot_path)
+        else:
+            return None
+    except Exception as e:
+        print(f"{type(e)}: {e}")
+        return None

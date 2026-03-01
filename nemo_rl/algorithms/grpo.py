@@ -49,6 +49,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -214,14 +215,14 @@ class MasterConfig(TypedDict):
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset,
+    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
-    StatefulDataLoader,
+    StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
     Logger,
@@ -274,31 +275,78 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    # num_prompts_per_step and dataloader_batch_size will be different when using multiple dataloaders
+    num_prompts_per_step = grpo_config["num_prompts_per_step"]
+    if data_config["use_multiple_dataloader"]:
+        dataloader_batch_size = data_config["num_prompts_per_dataloader"]
+    else:
+        dataloader_batch_size = num_prompts_per_step
+
     # Validate batch_multiplier
     batch_multiplier = grpo_config["batch_multiplier"]
-    dataloader_batch_size = grpo_config["num_prompts_per_step"]
-    if not grpo_config["use_dynamic_sampling"]:
+    if grpo_config["use_dynamic_sampling"]:
+        num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
+        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
+    else:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
         )
-    else:
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
 
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
-    if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+    # Validate number of prompts per step
+    if data_config["use_multiple_dataloader"]:
+        assert num_prompts_per_step % dataloader_batch_size == 0, (
+            "Expected num_prompts_per_step to be a multiple of num_prompts_per_dataloader, "
+            f"but got {num_prompts_per_step} and {dataloader_batch_size}. "
+            "Please check the configuration of num_prompts_per_step and num_prompts_per_dataloader. "
+            "If use_dynamic_sampling is enabled and batch_multiplier is used, please also check the configuration of batch_multiplier."
         )
-        dataloader.load_state_dict(dataloader_state_dict)
 
-    print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
+    # Load train dataset
+    def init_train_dataloader(dataset, suffix: str = ""):
+        dataloader = StatefulDataLoader(
+            dataset,
+            batch_size=dataloader_batch_size,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
+        if last_checkpoint_path is not None:
+            dataloader_state_dict = torch.load(
+                os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
+            )
+            dataloader.load_state_dict(dataloader_state_dict)
+        return dataloader
+
+    if data_config["use_multiple_dataloader"]:
+        # Initialize dataloaders
+        dataloaders = {}
+        for task_name, task_dataset in dataset.items():
+            dataloaders[task_name] = init_train_dataloader(
+                task_dataset, f"_{task_name}"
+            )
+            print(
+                f"  ✓ Training dataloader {task_name} loaded with {len(task_dataset)} samples",
+                flush=True,
+            )
+
+        train_sample_count = sum(
+            len(task_dataloader) for task_dataloader in dataloaders.values()
+        )
+
+        # Wrap dataloader
+        dataloader = MultipleDataloaderWrapper(
+            expected_num_prompts=num_prompts_per_step,
+            data_config=data_config,
+            dataloaders=dataloaders,
+        )
+    else:
+        dataloader = init_train_dataloader(dataset)
+        train_sample_count = len(dataloader)
+        print(
+            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
+            flush=True,
+        )
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -506,7 +554,7 @@ def setup(
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
             grpo_config["max_num_steps"],
-            grpo_config["max_num_epochs"] * len(dataloader),
+            grpo_config["max_num_epochs"] * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -1255,7 +1303,7 @@ def compute_and_apply_seq_logprob_error_masking(
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    dataloader: StatefulDataLoader,
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
@@ -1343,6 +1391,13 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    if master_config["data"]["use_multiple_dataloader"]:
+        warnings.warn(
+            "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
+            "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used. "
+            "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
+        )
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1352,15 +1407,22 @@ def grpo_train(
         dynamic_sampling_num_gen_batches = 0
 
         # Run grpo/dapo training loop (single-turn)
-        for batch in dataloader:
+        for batch in wrapped_dataloader:
             # A central place to store logging data that won't be deleted until the loop ends
             metrics_logging_data = dict()
             metrics = dict()
 
-            print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
-                flush=True,
-            )
+            if master_config["data"]["use_multiple_dataloader"]:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(wrapped_dataloader), max_num_steps)} {'=' * 25}",
+                    flush=True,
+                )
+
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -1759,10 +1821,12 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = (total_steps + 1 >= max_num_steps) or (
-                    (current_epoch + 1 == max_num_epochs)
-                    and (current_step + 1 == len(dataloader))
-                )
+                is_last_step = total_steps + 1 >= max_num_steps
+                if not master_config["data"]["use_multiple_dataloader"]:
+                    is_last_step = is_last_step or (
+                        (current_epoch + 1 == max_num_epochs)
+                        and (current_step + 1 == len(wrapped_dataloader))
+                    )
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
@@ -1801,7 +1865,6 @@ def grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -1952,31 +2015,52 @@ def grpo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        if master_config["data"]["use_multiple_dataloader"]:
+                            for (
+                                task_name,
+                                task_dataloader,
+                            ) in wrapped_dataloader.dataloaders.items():
+                                torch.save(
+                                    task_dataloader.state_dict(),
+                                    os.path.join(
+                                        checkpoint_path,
+                                        f"train_dataloader_{task_name}.pt",
+                                    ),
+                                )
+                        else:
+                            torch.save(
+                                wrapped_dataloader.state_dict(),
+                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {"content": metrics_logging_data["content"]}
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
-
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
+
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
                 del log_data
+            del flat_messages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -2975,11 +3059,24 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
-            log_data = {"content": flat_messages_content}
+            # Logging
+            # Log training data (match sync GRPO logging payload for parity)
+            log_data = {}
+            if "agent_ref" in repeated_batch:
+                log_data["agent_ref"] = repeated_batch["agent_ref"]
+            log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
+            if master_config["grpo"]["use_dynamic_sampling"]:
+                # In dynamic sampling, `rewards` corresponds to filtered rewards
+                log_data["filtered_rewards"] = rewards.tolist()
+                log_data["rewards"] = repeated_batch["total_reward"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            log_data["token_ids"] = train_data["input_ids"].tolist()
+            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )

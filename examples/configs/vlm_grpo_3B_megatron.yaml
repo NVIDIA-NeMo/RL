@@ -24,8 +24,8 @@ grpo:
   # Options: "grpo" (default) or "reinforce_plus_plus"
   adv_estimator:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
-    normalize_rewards: true
-    use_leave_one_out_baseline: false
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
@@ -199,6 +199,10 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 1
+
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+
   # dataset
   train:
     dataset_name: clevr-cogent

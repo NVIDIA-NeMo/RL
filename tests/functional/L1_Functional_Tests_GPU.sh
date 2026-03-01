@@ -19,49 +19,66 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
 cd ${PROJECT_ROOT}
-# This test is intentionally not run with uv run --no-sync to verify that the frozen environment is working correctly.
-time bash ./tests/functional/grpo_frozen_env.sh
-time bash ./tests/functional/test_frozen_env.sh
 
-time uv run --no-sync bash ./tests/functional/distillation.sh
-time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
-time uv run --no-sync bash ./tests/functional/dpo.sh
-time uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
-time uv run --no-sync bash ./tests/functional/dpo_megatron.sh
-time uv run --no-sync bash ./tests/functional/eval.sh
-time uv run --no-sync bash ./tests/functional/eval_async.sh
-time uv run --no-sync bash ./tests/functional/grpo.sh
-time uv run --no-sync bash ./tests/functional/grpo_async.sh
-time uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
-time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
-time uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-time uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-time uv run --no-sync bash ./tests/functional/grpo_multiple_datasets.sh
-time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
-time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-time uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
-time uv run --no-sync bash ./tests/functional/grpo_sglang.sh
-time uv run --no-sync bash ./tests/functional/prorlv2.sh
-time uv run --no-sync bash ./tests/functional/rm.sh
-time uv run --no-sync bash ./tests/functional/sft.sh
-time uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
-time uv run --no-sync bash ./tests/functional/sft_megatron.sh
-time uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
-time uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
-time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
-# Re-enable once DTensor v2 converter is fixed.
-# time uv run --no-sync bash ./tests/functional/test_converters.sh
-time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
-time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
+# run_test [fast] <command...>
+# - "run_test fast <cmd>" = always runs (both fast and full modes)
+# - "run_test <cmd>"      = only runs in full mode; skipped when FAST=1
+run_test() {
+    if [[ "$1" == "fast" ]]; then
+        shift
+        time "$@"
+    elif [[ "${FAST:-0}" == "1" ]]; then
+        echo "FAST: Skipping: $*"
+    else
+        time "$@"
+    fi
+}
+
+# This test is intentionally not run with uv run --no-sync to verify that the frozen environment is working correctly.
+run_test      bash ./tests/functional/grpo_frozen_env.sh
+run_test      bash ./tests/functional/test_frozen_env.sh
+
+run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
+run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
+run_test      uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
+run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/eval.sh
+run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
+run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
+run_test      uv run --no-sync bash ./tests/functional/rm.sh
+run_test fast uv run --no-sync bash ./tests/functional/sft.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_avlm.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
+run_test      uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
+run_test fast uv run --no-sync bash ./tests/functional/test_converters.sh
+run_test      uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
+run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
 # Research functional tests (self-discovery)
-for test_script in research/*/tests/functional/*.sh; do
-    project_dir=$(echo $test_script | cut -d/ -f1-2)
-    pushd $project_dir
-    time uv run --no-sync bash $(echo $test_script | cut -d/ -f3-)
-    popd
-done
+if [[ "${FAST:-0}" != "1" ]]; then
+    for test_script in research/*/tests/functional/*.sh; do
+        project_dir=$(echo $test_script | cut -d/ -f1-2)
+        pushd $project_dir
+        time uv run --no-sync bash $(echo $test_script | cut -d/ -f3-)
+        popd
+    done
+fi
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*

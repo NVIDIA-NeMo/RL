@@ -34,6 +34,7 @@ project-includes = [
   "docs/helpers.py",
   "examples/converters/convert_dcp_to_hf.py",
   "examples/converters/convert_megatron_to_hf.py",
+  "examples/custom_dataloader/custom_dataloader.py",
   "examples/custom_parallel/custom_parallel.py",
   "examples/custom_parallel/llama_nemotron_super_49b_custom_plan.py",
   "nemo_rl/algorithms/__init__.py",
@@ -44,6 +45,7 @@ project-includes = [
   "nemo_rl/data/__init__.py",
   "nemo_rl/data/chat_templates.py",
   "nemo_rl/data/collate_fn.py",
+  "nemo_rl/data/dataloader.py",
   "nemo_rl/data/datasets/__init__.py",
   "nemo_rl/data/datasets/eval_datasets/__init__.py",
   "nemo_rl/data/datasets/eval_datasets/aime.py",
@@ -132,6 +134,7 @@ project-includes = [
   "tools/model_diagnostics/1.max_model_len_respected.py",
   "tools/model_diagnostics/2.long_generation_decode_vs_prefill.py",
   "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
+  "tools/model_diagnostics/5.prefix_caching_nan.py",
 ]
 
 # Disable TypedDict mutation errors since TypedDict objects are regular dicts at runtime
