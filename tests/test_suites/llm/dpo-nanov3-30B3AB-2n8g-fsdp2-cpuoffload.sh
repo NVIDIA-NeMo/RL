@@ -11,18 +11,15 @@ NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
-rm -rf $CKPT_DIR
-begin_time=$(date +%s)
 
 # Run the experiment
 cd $PROJECT_ROOT
-NRL_FORCE_REBUILD_VENVS=true \
 uv run examples/run_dpo.py \
     --config $CONFIG_PATH \
     dpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=ruit_personal_debug \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
@@ -47,7 +44,3 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
-
-end_time=$(date +%s)
-duration=$((end_time - begin_time))
-echo "Duration: $duration seconds"
