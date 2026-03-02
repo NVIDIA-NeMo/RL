@@ -119,6 +119,9 @@ class AutomodelCheckpointManager:
             dequantize_base_checkpoint=config_updates.get(
                 "dequantize_base_checkpoint", False
             ),
+            skip_task_head_prefixes_for_base_model=config_updates.get(
+                "skip_task_head_prefixes_for_base_model", None
+            ),
         )
         self.checkpoint_config = base_cfg
         self.checkpointer = Checkpointer(

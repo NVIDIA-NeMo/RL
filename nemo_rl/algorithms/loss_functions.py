@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from ntpath import samefile
+from random import sample
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -1332,3 +1334,43 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+class MseValueLossFn(LossFunction):
+    """Mean Squared Error value loss function."""
+
+    def __init__(self, scale: float = 1.0):
+        self.scale = scale
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        values: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute Mean Squared Error value loss."""
+
+        if values.shape[-1] != 1:
+            values = values[..., 0]
+
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+
+        loss = torch.nn.functional.mse_loss(
+            values, data["rewards"].unsqueeze(-1), reduction="none"
+        )
+
+        loss = self.scale * masked_mean(
+            loss,
+            token_mask * sample_mask.unsqueeze(-1),
+            global_normalization_factor=global_valid_toks,
+        )
+
+        metrics = {
+            "loss": float(loss.item()),
+            "num_valid_samples": int(values.shape[0]),
+        }
+
+        return loss, metrics

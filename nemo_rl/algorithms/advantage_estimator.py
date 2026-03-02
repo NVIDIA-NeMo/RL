@@ -17,14 +17,23 @@
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
+- GAEAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
+- GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 """
+
+from string import whitespace
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    calculate_kl,
+    masked_mean,
+    masked_var,
+)
 
 
 class GRPOAdvantageEstimator:
@@ -142,3 +151,85 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv = (adv - adv_mean) * adv_rstd
 
         return adv
+
+
+class GeneralizedAdvantageEstimator:
+    """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
+
+    GAE computes advantages using temporal difference (TD) and exponentially-weighted averages:
+        δ_t = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
+        A_t = Σ_{l=0}^{∞} (γλ)^l * δ_{t+l}
+
+    This is computed recursively backwards:
+        A_t = δ_t + γλ * (1 - done_t) * A_{t+1}
+
+    Args:
+        gae_lambda: GAE λ parameter (decay factor for advantage estimation, typically 0.95-0.98)
+        gae_gamma: Discount factor γ (typically 0.99)
+        normalize_advantages: If True, normalize advantages globally across batch
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.gae_lambda = estimator_config.get("gae_lambda", 0.95)
+        self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
+        self.normalize_advantages = estimator_config.get("normalize_advantages", True)
+
+    def _reward_whiten(
+        self,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        shift_mean: bool = True,
+    ) -> torch.Tensor:
+        mean = masked_mean(rewards, mask)
+        var = masked_var(rewards, mask, mean)
+
+        whitened_rewards = (rewards - mean) * torch.rsqrt(var + 1e-8)
+
+        if not shift_mean:
+            whitened_rewards = whitened_rewards + mean
+        return whitened_rewards
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        lengths,
+        values,
+        **kwargs,
+    ):
+        """Compute GAE advantages with temporal bootstrapping.
+
+        Args:
+            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+                    In PPO, this is typically the final reward at the end of the trajectory.
+            mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            lengths: Input lengths of shape [batch_size].
+            values: Value predictions of shape [batch_size, seq_len]. Required for GAE.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Advantages tensor of shape [batch_size, seq_len].
+        """
+        rewards_expanded = torch.zeros_like(values)
+        advantages = torch.zeros_like(values)
+        values_next = torch.zeros_like(values)
+        values_next[:, :-1] = values[:, 1:]
+
+        for i, l in enumerate(lengths):
+            rewards_expanded[i, l - 1] = rewards[i]
+
+        deltas = rewards_expanded + self.gae_gamma * values_next - values
+
+        last_advantage = 0
+        for t in reversed(range(values.shape[1])):
+            advantages[:, t] = (
+                deltas[:, t] + self.gae_gamma * self.gae_lambda * last_advantage
+            )
+            last_advantage = advantages[:, t]
+
+        advantages = torch.masked_fill(
+            self._reward_whiten(advantages, mask), ~(mask.bool()), 0
+        )
+        return advantages

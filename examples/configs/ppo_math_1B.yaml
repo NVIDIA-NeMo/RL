@@ -1,0 +1,444 @@
+# PPO Algorithm Configuration
+# This config supports multiple advantage estimators:
+# - "grpo": GRPO with leave-one-out baseline
+# - "reinforce_plus_plus": Reinforce++ with optional baseline
+# - "gae": Generalized Advantage Estimation (requires value model)
+ppo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_epochs: 32
+  steps_per_epoch: 4
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 1
+  val_at_start: true
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  # Advantage Estimator Configuration
+  # Options: "grpo", "reinforce_plus_plus", or "gae"
+  adv_estimator:
+    name: "gae"  # Use GAE with value model for PPO
+    # GAE-specific parameters
+    gae_lambda: 0.95  # GAE λ parameter (decay factor, typically 0.95-0.98)
+    gae_gamma: 0.99   # Discount factor γ (typically 0.99)
+    normalize_advantages: true  # Normalize advantages globally across batch
+    # Legacy GRPO/Reinforce++ parameters (not used with GAE)
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  # Can be set to k1, k2, k3
+  # For more details, see http://joschu.net/blog/kl-approx.html
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: false
+  # Async GRPO requires importance sampling correction enabled
+  # Set to true when async_grpo.enabled is true
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
+  truncated_importance_sampling_type: tis  # "tis" (clamp to max) or "icepop" (filter outside [min, max])
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+
+  value_loss_scale: 0.4
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/ppo"
+  metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+  hf_config_overrides: {} 
+  train_global_batch_size: 512
+  train_micro_batch_size: 4
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 512
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    
+    # LoRA (Low-Rank Adaptation) Configuration
+    lora_cfg:
+      enabled: False  # Set to True to enable LoRA fine-tuning
+      target_modules: []  # List of module names to apply LoRA (empty list with match_all_linear=true applies to all linear layers)
+      exclude_modules: []  # List of module names to exclude from LoRA
+      match_all_linear: true  # If True, applies LoRA to all linear layers (overrides target_modules)
+      dim: 8  # LoRA rank (r): lower rank = fewer parameters but less capacity. Typical values: 4, 8, 16, 32, 64
+      alpha: 32  # LoRA scaling factor: effective learning rate multiplier = alpha/dim. Typical values: 16, 32, 64
+      dropout: 0.0  # Dropout probability applied to LoRA layers (0.0 = no dropout)
+      dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
+      lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
+      use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+  
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    activation_checkpointing: false
+    converter_type: "Qwen2ForCausalLM"
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6
+      min_lr: 5.0e-7
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 1000
+      lr_warmup_iters: 13
+      lr_warmup_init: 5.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg: null
+
+    env_vars: null
+
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # for more details on dynamic batching and sequence packing.
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    mcore_generation_config:
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
+      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
+      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
+      # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
+      # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+    vllm_kwargs: {}
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
+
+# Value Model Configuration (for GAE advantage estimation in PPO)
+value:
+  model_name: ${policy.model_name}  # Can use same model as policy or a smaller one
+  tokenizer:
+    name: ${value.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+
+  # Training batch sizes
+  train_global_batch_size: 512
+  train_micro_batch_size: 4
+  # Sequence length settings
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  make_sequence_length_divisible_by: ${value.dtensor_cfg.tensor_parallel_size}
+
+  # Precision
+  precision: "bfloat16"
+
+  # Reward model configuration (value models use regression head)
+  reward_model_cfg:
+    enabled: true
+    reward_model_type: "regression"
+    only_head_unfreeze: true
+
+  # DTensor backend configuration (only DTensor V2 is supported for value models)
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    # LoRA configuration for value model
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  # Batching strategies (same as policy)
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # Optimizer (typically similar to policy but can use different learning rate)
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6  # Can tune separately from policy
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  # Scheduler (typically similar to policy)
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  shuffle: true
+  num_workers: 1
+
+  # dataset
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05 # use 5% of the training data as validation data
+    seed: ${ppo.seed} # seed for train/validation split when split_validation_size > 0
+  validation: null
+  # default settings for all datasets
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+  # You can also use multiple datasets by using a list of datasets.
+  # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
+
+  # You can use custom response datasets for training and validation. For example:
+  # train:
+  #   # this dataset will override input_key and use the default values for other vars
+  #   data_path: /path/to/local/train_dataset.jsonl
+  #   input_key: question
+  # validation:
+  #   # this dataset will use the default values for other vars except data_path
+  #   data_path: /path/to/local/val_dataset.jsonl
+  # default:
+  #   # will use below vars as default values if dataset doesn't specify it
+  #   dataset_name: ResponseDataset
+  #   input_key: input
+  #   output_key: output
+  #   prompt_file: null
+  #   system_prompt_file: null
+  #   processor: "math_hf_data_processor"
+  #   env_name: math
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
+
+env:
+  math:
+    num_workers: 8
+    math_verify_impl: "hf_math_verify"
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  swanlab:
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-logger"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
