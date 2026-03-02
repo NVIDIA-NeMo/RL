@@ -552,16 +552,19 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+    target_is_pre_rolled: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
     Args:
         vocab_parallel_logits (torch.Tensor): Packed logits tensor with shape [1, T // CP, vocab_size//TP]
             where T is the total number of tokens across all packed sequences.
-        target (torch.Tensor): Packed target token indices with shape [1, T].
-            NOTE: Must be the unmodified targets as this function will shift them internally.
-        cu_seqlens (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
-            cu_seqlens[i] indicates the start position of sequence i in the packed format.
+        target (torch.Tensor): Packed target token indices.
+            If target_is_pre_rolled=False: shape [1, T] — unmodified targets, rolled internally.
+            If target_is_pre_rolled=True: shape [1, T // CP] — pre-rolled and pre-CP-sharded.
+        cu_seqlens_padded (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
+            cu_seqlens_padded[i] indicates the start position of sequence i in the packed format
+            (full, not CP-adjusted).
         unpacked_seqlen (int): The length of the unpacked sequence tensor.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
@@ -569,43 +572,46 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
+        target_is_pre_rolled (bool): If True, target is already shifted and CP-sharded to match
+            vocab_parallel_logits shape, skipping the internal per-sequence roll+CP-shard loop.
 
     Returns:
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
             The total length is reduced by batch_size due to target shifting (one token per sequence).
     """
-    # Remove batch dimension to work with [T, vocab_size] and [T]
-    vocab_parallel_logits = vocab_parallel_logits.squeeze(0)
-    target = target.squeeze(0)
-
     batch_size = cu_seqlens_padded.shape[0] - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
-    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
-    # Roll each sequence individually
-    rolled_targets = torch.zeros(
-        target.shape[0] // cp_size, dtype=target.dtype, device=target.device
-    )
-    for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+    if not target_is_pre_rolled:
+        # Roll each sequence individually and CP-shard the targets
+        # Remove batch dimension to work with [T, vocab_size] and [T]
+        vocab_parallel_logits = vocab_parallel_logits.squeeze(0)
+        target = target.squeeze(0)
+        cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
-        # Get the sequence targets and roll by -1
-        seq_targets = target[start_idx:end_idx]
-        rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-        rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
-            _get_tokens_on_this_cp_rank(rolled_seq_targets, cp_rank, cp_size, seq_dim=0)
+        rolled_targets = torch.zeros(
+            target.shape[0] // cp_size, dtype=target.dtype, device=target.device
         )
+        for i in range(batch_size):
+            start_idx = cu_seqlens_padded[i].item()
+            end_idx = cu_seqlens_padded[i + 1].item()
 
-    # Add batch dimension back for DistributedLogprob
-    rolled_targets = rolled_targets.unsqueeze(0)
-    vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
+            seq_targets = target[start_idx:end_idx]
+            rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
+            rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+                _get_tokens_on_this_cp_rank(
+                    rolled_seq_targets, cp_rank, cp_size, seq_dim=0
+                )
+            )
+
+        target = rolled_targets.unsqueeze(0)
+        vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
     # Apply distributed log probability computation
     if chunk_size is not None:
         probs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
             vocab_parallel_logits,
-            rolled_targets,
+            target,
             vocab_start_index,
             vocab_end_index,
             chunk_size,
@@ -615,7 +621,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     else:
         probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
             vocab_parallel_logits,
-            rolled_targets,
+            target,
             vocab_start_index,
             vocab_end_index,
             group,
