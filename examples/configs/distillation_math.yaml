@@ -21,7 +21,9 @@ loss_fn:
 checkpointing:
     enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
-    metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
+    # one of "val:" or "train:" followed by the metric name
+    # if you want to use the accuracy from a specific dataset, you can use the format "val:accuracy_<TaskName>", task_name can be set at dataset config
+    metric_name: "val:accuracy"
     higher_is_better: true
     keep_top_k: 3
     save_period: 10

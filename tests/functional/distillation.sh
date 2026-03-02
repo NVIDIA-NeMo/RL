@@ -53,5 +53,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# Ensure required keys are present. Set accuracy check threshold to >= 0 to avoid flakiness.
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 1.0'
+  'data["train/loss"]["3"] < 1.0' \
+  'data["validation/accuracy"]["3"] >= 0' \
+  'data["validation/accuracy_OpenMathInstruct-2"]["3"] >= 0'
