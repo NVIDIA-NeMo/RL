@@ -39,6 +39,10 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # List of logits processor class paths to load (e.g., ["module.path:ClassName"])
+    logits_processors: NotRequired[list[str]]
+    # Environment variables for logits processor configuration (global defaults)
+    logits_processor_env_vars: NotRequired[dict[str, str]]
 
 
 class VllmConfig(GenerationConfig):
