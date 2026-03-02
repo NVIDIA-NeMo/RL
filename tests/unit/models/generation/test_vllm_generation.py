@@ -194,7 +194,7 @@ def get_basic_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "moe_enable_deepep": False,
-            "moe_token_dispatcher_type": "allgather",
+            "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
