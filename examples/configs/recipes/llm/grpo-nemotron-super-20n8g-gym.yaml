@@ -1,0 +1,411 @@
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-nemotron-super-8n8g-gym"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  checkpoint_must_save_by: "00:03:30:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 5
+  val_at_start: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  
+  use_best_at_k: false
+  best_at_k_k: 8
+  best_at_k_m: 1000
+  
+  use_combined_training: false
+  combined_training_weight_mode: "auto"
+  combined_training_best_at_k_weight: 0.2
+  combined_training_pass_at_1_weight: 1.0
+  
+  dynamic_sampling_oversample_ratio: 1.0
+
+  seq_logprob_error_threshold: 2
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+
+policy:
+  model_name: dummy # TODO: update this to public HF name
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 1024
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 49152
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  
+  megatron_cfg:
+    error_path: ${checkpointing.checkpoint_dir}/error_logs
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false 
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    apply_rope_fusion: True
+    bias_activation_fusion: False
+    defer_fp32_logits: True
+    track_moe_metrics: True
+    moe_per_layer_logging: True
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+  scheduler: null
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+      fp8_cfg:
+        is_mx: true
+        dynamic_weight_quant: false
+      skip_tokenizer_init: false
+
+
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+# compilation_config:
+# mode: 0
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 8
+
+data:
+  train_jsonl_fpath: /data/train.jsonl # TODO: update this
+  validation_jsonl_fpath: /data/validation.jsonl # TODO: update this
+  shuffle: false
+  num_workers: 1
+
+env:
+  should_use_nemo_gym: true
+  use_genrm_compare: true
+  genrm_agent_names:
+    - "genrm_simple_agent"
+    - "genrm_simple_agent_reasoning_off"
+  genrm_compare_server_name: "genrm_compare"
+  nemo_gym:
+    num_gpu_nodes: 4
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+    - resources_servers/calendar/configs/calendar.yaml
+    - resources_servers/genrm_compare/configs/genrm_compare.yaml 
+    - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+    - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+    - resources_servers/terminal_pivot/configs/terminal_pivot.yaml
+    - resources_servers/ns_tools/configs/ns_tools.yaml
+    - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+    - resources_servers/swerl_gen/configs/swerl_gen.yaml
+
+    terminal_pivot_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          model_server:
+            name: policy_model
+
+    nl2bash_judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://127.0.0.1:10000/v1
+          api_key: dummy_key
+          model: dummy # TODO: update this to public HF name
+          return_token_id_information: False
+          uses_reasoning_parser: False
+          spinup_server: True
+          router_dp_size: 2
+          server_args:
+            tensor_parallel_size: 8
+            data_parallel_size: 1
+            enable_expert_parallel: True
+            enable_auto_tool_choice: true
+            tool_call_parser: hermes
+            gpu_memory_utilization: 0.85
+            max_model_len: 131072
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+          
+ 
+    equivalence_llm_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          judge_model_server:
+            name: nl2bash_judge_model
+
+    genrm_compare:
+      resources_servers:
+        genrm_compare:
+          # Points to the GenRM model server defined above
+          genrm_model_server:
+            type: responses_api_models
+            name: genrm_model
+          # GenRM request parameters
+          genrm_responses_create_params:
+            max_output_tokens: 16384
+            temperature: 0.6
+            top_p: 0.95
+          # Comparison settings
+          comparison_strategy: "circular"
+          num_judges_per_comparison: 1
+          use_principle: true
+          default_principle: "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
+          aggregator_method: "simple_tiebreaker"
+          reasoning_bonus: 0.5
+          answer_bonus: 0.5
+          top_percentile: 0.2
+          group_reasoning_length_penalty_coeff: 0
+          group_answer_length_penalty_coeff: 0
+          group_style_penalty_coeff: 0.03
+          default_score: 3.0
+          default_ranking: 3.5
+
+    genrm_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://127.0.0.1:8000/v1
+          api_key: dummy_key
+          model: dummy # TODO: update this to public HF name
+          uses_reasoning_parser: True
+          return_token_id_information: False
+          spinup_server: True
+          router_dp_size: 2
+          server_args:
+            tensor_parallel_size: 8
+            reasoning_parser: deepseek_r1
+            gpu_memory_utilization: 0.85
+            max_model_len: 60000
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+          
+ 
+    lc_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          judge_model_server:
+            name: nl2bash_judge_model
+
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: nl2bash_judge_model
+          should_use_judge: true
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "nemo-rl"
+    name: "grpo-nemotron-super-8n8g-gym-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "nemo-rl"
+    run_name: "grpo-nemotron-super-8n8g-gym-logger"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 20
