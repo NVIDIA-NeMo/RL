@@ -220,7 +220,9 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        all_grad_input = []
+        grad_input: torch.Tensor = torch.empty_like(
+            vocab_parallel_logits, dtype=torch.float32
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -243,13 +245,18 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
                 num_classes=partition_vocab_size,
             )
 
-            grad_input = is_chosen.float().sub_(softmax_output)
+            # Inplace index into the preallocated grad_input tensor
+            grad_input_chunk = grad_input[:, chunk_start:chunk_end, :]
 
-            grad_input.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
+            grad_input_chunk.copy_(
+                is_chosen.float().sub_(softmax_output)
+            )  # inplace copy
+            grad_input_chunk.mul_(
+                grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
+            )
 
-            all_grad_input.append(grad_input)
-
-        grad_input = torch.cat(all_grad_input, dim=1)
+            # Explicitly free before next iteration allocates
+            del softmax_output, is_chosen, logits
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -326,7 +333,10 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
-        all_grad_input: list[torch.Tensor] = []
+
+        grad_input: torch.Tensor = torch.empty_like(
+            vocab_parallel_logits, dtype=torch.float32
+        )
 
         for chunk_idx in range(num_chunks):
             s0 = chunk_idx * chunk_size
@@ -344,41 +354,29 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             go_chunk = grad_output[:, s0:s1, :]  # [B, Sc, K]
             go_sum = go_chunk.sum(dim=-1, keepdim=True)  # [B, Sc, 1]
 
-            grad_input = softmax_output.neg()
-            grad_input = grad_input.mul_(go_sum)
+            # Inplace index into the preallocated grad_input tensor
+            grad_input_chunk = grad_input[:, s0:s1, :]
+
+            grad_input_chunk.copy_(softmax_output.neg().mul_(go_sum))  # inplace copy
 
             # Positive scatter term: add gradients to selected indices
-            # Mask grad_output for indices not on this shard
             go_masked = go_chunk * in_range.to(dtype=go_chunk.dtype)
-            # Flatten for scatter_add
-            flat_grad = grad_input.view(-1)
-            # compute flattened indices positions
-            Bc, Sc = go_masked.shape[0], go_masked.shape[1]
-            # row offset per [B, Sc]
-            row = (
-                torch.arange(Bc, device=grad_input.device)
-                .view(-1, 1)
-                .expand(-1, Sc)
-                .reshape(-1)
+            grad_input_chunk.scatter_add_(2, li, go_masked)
+
+            # Explicitly free before next iteration allocates
+            del (
+                softmax_output,
+                log_probs,
+                logits,
+                gi,
+                in_range,
+                li,
+                go_chunk,
+                go_sum,
+                go_masked,
             )
-            col = torch.arange(Sc, device=grad_input.device).expand(Bc, -1).reshape(-1)
-            flat_idx_base = (row * Sc + col) * V_local  # [Bc*Sc]
-            # selected flat indices
-            flat_li = li.reshape(-1, li.shape[-1])  # [Bc*Sc, K]
-            flat_base_expanded = flat_idx_base.unsqueeze(-1).expand_as(flat_li)
-            flat_chosen = (flat_base_expanded + flat_li).reshape(-1)
-            flat_go = go_masked.reshape(-1)
-            flat_grad.scatter_add_(0, flat_chosen, flat_go)
 
-            all_grad_input.append(grad_input)
-
-        grad_input_total = (
-            torch.cat(all_grad_input, dim=1)
-            if len(all_grad_input) > 1
-            else all_grad_input[0]
-        )
-
-        return grad_input_total, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 def dtensor_from_parallel_logits_to_logprobs(
@@ -1033,7 +1031,10 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
-        grads: list[torch.Tensor] = []
+
+        grad_input: torch.Tensor = torch.empty_like(
+            vocab_parallel_logits, dtype=torch.float32
+        )
 
         for chunk_idx in range(num_chunks):
             s0 = chunk_idx * chunk_size
@@ -1047,10 +1048,16 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
                 H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
             )
 
-            # dH/dz = softmax * (log_probs - H_all)
-            grad_chunk = softmax_output * (log_probs - H_local.unsqueeze(-1))
-            grad_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
-            grads.append(grad_chunk)
+            # Inplace index into the preallocated grad_input tensor
+            grad_input_chunk = grad_input[:, s0:s1, :]
 
-        grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
+            # dH/dz = softmax * (log_probs - H_all)
+            grad_input_chunk.copy_(
+                softmax_output.mul_(log_probs - H_local.unsqueeze(-1))
+            )  # inplace copy
+            grad_input_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
+
+            # Explicitly free before next iteration allocates
+            del softmax_output, log_probs, logits, H_local
+
         return grad_input, None, None, None
