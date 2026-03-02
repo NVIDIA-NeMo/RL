@@ -1,0 +1,47 @@
+defaults: ../../grpo_math_1B.yaml
+loss_fn:
+  use_importance_sampling_correction: true
+grpo:
+  max_num_steps: 30
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v3-2n8g-mxfp8-e2e
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    vllm_cfg:
+      precision: fp8
+      gpu_memory_utilization: 0.5
+      fp8_cfg:
+        is_mx: true
+        dynamic_weight_quant: false
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-nano-v2-12b-1n8g-megatron
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nano-v2-12b-1n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

@@ -821,9 +821,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             )
             worker_result = result_or_coro[0]
 
-            if not worker_result:
+            if not worker_result[0]:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {worker_result[1]}"
                 )
                 return False
             return True
@@ -852,9 +852,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             )
             worker_result = result_or_coro[0]
 
-            if not worker_result:
+            if not worker_result[0]:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {worker_result[1]}"
                 )
                 return False
             return True
