@@ -43,7 +43,7 @@ megatron_core_cpp_extension_source_file = "megatron/core/datasets/helpers.cpp"
 # VCS dependencies use full "pkg @ git+URL@rev" format matching pyproject.toml [tool.uv.sources]
 CACHED_DEPENDENCIES = [
     # Default dependencies from pyproject.toml
-    "torch",
+    "torch>=2.6.0",
     "numpy",
     "packaging>=24.2",
     # Dev dependencies from pyproject.toml
@@ -58,7 +58,7 @@ CACHED_DEPENDENCIES = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "flash-linear-attention~=0.3.2",
+    "flash-linear-attention~=0.4.0",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
@@ -69,6 +69,9 @@ CACHED_DEPENDENCIES = [
     "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
     "datasets",
     "fastapi~=0.50",
+    "flask[async]",
+    "hypercorn",
+    "openai",
 ]
 
 
