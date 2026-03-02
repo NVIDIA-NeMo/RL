@@ -343,7 +343,7 @@ logger.wandb.name='${WANDB_NAME}'"
     # ========================================
     # 5c. Optimized 2-Node UNFUSED Attention (16 GPUs)
     # Uses attention_backend=unfused via Megatron config
-    # Forces unfused attention for performance comparison
+    # moe_permute_fusion: uses YAML default (true). If Triton "cpu tensor" error appears, set policy.megatron_cfg.moe_permute_fusion=false
     # ========================================
     optimized_2node_unfused)
         NUM_NODES=2
@@ -353,17 +353,18 @@ logger.wandb.name='${WANDB_NAME}'"
         T_TP=4
         T_PP=1
         T_CP=1
-        WANDB_NAME="GPTOSS20B_optimized_2node_unfused"
+        WANDB_NAME="GPTOSS20B_2node_unfused_attn_kernel"
         
-        echo "[INFO] Running optimized 2-node configuration with UNFUSED Attention"
+        echo "[INFO] Running optimized 2-node with UNFUSED attention (for comparison)"
         echo "  - Nodes: ${NUM_NODES} (16 GPUs)"
         echo "  - Training: EP=${T_EP}, TP=${T_TP}, PP=${T_PP}"
         echo "  - Generation: TP=${G_TP}"
-        echo "  - attention_backend=unfused"
+        echo "  - attention_backend=unfused (Megatron config)"
+        echo "  - NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 (shows UnfusedAttention)"
         echo "  - defer_fp32_logits: true"
         echo "  - activation_checkpointing: true"
         
-        COMMAND="${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
 --config ${CONFIG_FILE} \
 cluster.num_nodes=${NUM_NODES} \
 cluster.gpus_per_node=${GPUS_PER_NODE} \
@@ -373,13 +374,14 @@ policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
 policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
 policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
 policy.megatron_cfg.context_parallel_size=${T_CP} \
+policy.megatron_cfg.attention_backend=unfused \
 policy.megatron_cfg.defer_fp32_logits=true \
 policy.megatron_cfg.activation_checkpointing=true \
-policy.megatron_cfg.attention_backend=unfused \
+policy.sequence_packing.enabled=false \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
 checkpointing.enabled=false \
-grpo.max_num_steps=20 \
+grpo.max_num_steps=3 \
 logger.wandb_enabled=True \
 logger.wandb.project='${WANDB_PROJECT}' \
 logger.wandb.name='${WANDB_NAME}'"
@@ -398,19 +400,17 @@ logger.wandb.name='${WANDB_NAME}'"
         T_TP=4
         T_PP=1
         T_CP=1
-        WANDB_NAME="GPTOSS20B_optimized_2node_unfused_debug"
+        WANDB_NAME="GPTOSS20B_2node_unfused_attn_kernel_debug"
         
-        echo "[INFO] Running optimized 2-node configuration with UNFUSED Attention + DEBUG"
+        echo "[INFO] Running optimized 2-node with UNFUSED attention + DEBUG (for comparison)"
         echo "  - Nodes: ${NUM_NODES} (16 GPUs)"
         echo "  - Training: EP=${T_EP}, TP=${T_TP}, PP=${T_PP}"
         echo "  - Generation: TP=${G_TP}"
-        echo "  - attention_backend=unfused"
-        echo "  - NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 (shows attention backend)"
+        echo "  - attention_backend=unfused (Megatron config)"
+        echo "  - NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 (shows UnfusedAttention)"
         echo "  - defer_fp32_logits: true"
         echo "  - activation_checkpointing: true"
         
-        # NVTE_DEBUG shows Transformer Engine attention backend selection for verification
-        # Note: export is required for Ray workers to inherit these env vars
         COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
 --config ${CONFIG_FILE} \
 cluster.num_nodes=${NUM_NODES} \
@@ -421,13 +421,14 @@ policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
 policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
 policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
 policy.megatron_cfg.context_parallel_size=${T_CP} \
+policy.megatron_cfg.attention_backend=unfused \
 policy.megatron_cfg.defer_fp32_logits=true \
 policy.megatron_cfg.activation_checkpointing=true \
-policy.megatron_cfg.attention_backend=unfused \
+policy.sequence_packing.enabled=false \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
 checkpointing.enabled=false \
-grpo.max_num_steps=20 \
+grpo.max_num_steps=3 \
 logger.wandb_enabled=True \
 logger.wandb.project='${WANDB_PROJECT}' \
 logger.wandb.name='${WANDB_NAME}'"
@@ -1070,6 +1071,209 @@ logger.wandb.name='${WANDB_NAME}'"
         ;;
 
     # ========================================
+    # GPT-OSS-120B: 4 Nodes (32 B200 GPUs, 192GB each)
+    # EP=8, TP=2 → DP=2, distributed optimizer works!
+    # No CPU offload needed (~127GB/192GB per GPU)
+    # ========================================
+    gptoss120b_4node)
+        NUM_NODES=4
+        CONFIG_FILE="examples/configs/recipes/llm/grpo-gptoss-120b-4n8g-megatron.yaml"
+        G_TP=8
+        G_PP=1
+        T_EP=8
+        T_TP=2
+        T_PP=1
+        T_CP=1
+        WANDB_NAME="GPTOSS120B_4node"
+        
+        echo "[INFO] Running GPT-OSS-120B on 4 nodes (32 B200 GPUs)"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (32 GPUs × 192GB = 6144GB total)"
+        echo "  - Training: EP=${T_EP}, TP=${T_TP}, DP=2"
+        echo "  - Generation: vLLM TP=${G_TP}"
+        echo "  - No optimizer CPU offload needed (DP=2 distributes optimizer)"
+        echo "  - 512 total samples (64 prompts × 8 gen), 10 steps"
+        
+        COMMAND="${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+--config ${CONFIG_FILE} \
+cluster.num_nodes=${NUM_NODES} \
+cluster.gpus_per_node=${GPUS_PER_NODE} \
+policy.generation.vllm_cfg.tensor_parallel_size=${G_TP} \
+policy.generation.vllm_cfg.pipeline_parallel_size=${G_PP} \
+policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
+policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
+policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
+policy.megatron_cfg.context_parallel_size=${T_CP} \
+grpo.num_prompts_per_step=64 \
+grpo.num_generations_per_prompt=8 \
+policy.train_global_batch_size=512 \
+grpo.async_grpo.enabled=false \
+grpo.val_period=1000 \
+checkpointing.enabled=false \
+grpo.max_num_steps=10 \
+logger.wandb_enabled=True \
+logger.wandb.project='${WANDB_PROJECT}' \
+logger.wandb.name='${WANDB_NAME}'"
+        ;;
+
+    # ========================================
+    # GPT-OSS-120B: 8 Nodes (64 B200 GPUs)
+    # EP=8, TP=4, PP=2 → 64 GPUs, grpo 64 prompts × 32 generations
+    # ========================================
+    gptoss120b_8node)
+        NUM_NODES=8
+        CONFIG_FILE="examples/configs/recipes/llm/grpo-gptoss-120b-8n8g-megatron.yaml"
+        G_TP=8
+        G_PP=1
+        T_EP=8
+        T_TP=4
+        T_PP=2
+        T_CP=1
+        WANDB_NAME="GPTOSS120B_8node"
+        
+        echo "[INFO] Running GPT-OSS-120B on 8 nodes (64 B200 GPUs)"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (64 GPUs × 192GB)"
+        echo "  - Training: EP=${T_EP}, TP=${T_TP}, PP=${T_PP}"
+        echo "  - Generation: vLLM TP=${G_TP}"
+        echo "  - grpo: 64 prompts/step, 32 generations/prompt"
+        
+        COMMAND="${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+--config ${CONFIG_FILE} \
+cluster.num_nodes=${NUM_NODES} \
+cluster.gpus_per_node=${GPUS_PER_NODE} \
+policy.generation.vllm_cfg.tensor_parallel_size=${G_TP} \
+policy.generation.vllm_cfg.pipeline_parallel_size=${G_PP} \
+policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
+policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
+policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
+policy.megatron_cfg.context_parallel_size=${T_CP} \
+grpo.async_grpo.enabled=false \
+grpo.val_period=1000 \
+checkpointing.enabled=false \
+grpo.max_num_steps=20 \
+logger.wandb_enabled=True \
+logger.wandb.project='${WANDB_PROJECT}' \
+logger.wandb.name='${WANDB_NAME}'"
+        ;;
+
+    # ========================================
+    # GPT-OSS-120B: 4 Nodes UNFUSED Attention
+    # Same as gptoss120b_4node but with unfused attention backend
+    # For fused vs unfused attention kernel performance comparison
+    # ========================================
+    gptoss120b_4node_unfused)
+        NUM_NODES=4
+        CONFIG_FILE="examples/configs/recipes/llm/grpo-gptoss-120b-4n8g-megatron.yaml"
+        G_TP=8
+        G_PP=1
+        T_EP=8
+        T_TP=2
+        T_PP=1
+        T_CP=1
+        WANDB_NAME="GPTOSS120B_4node_unfused_attn_kernel"
+        
+        echo "[INFO] Running GPT-OSS-120B on 4 nodes with UNFUSED attention (for comparison)"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (32 GPUs × 192GB)"
+        echo "  - Training: EP=${T_EP}, TP=${T_TP}, DP=2"
+        echo "  - Generation: vLLM TP=${G_TP}"
+        echo "  - attention_backend=unfused (TE UnfusedDotProductAttention)"
+        echo "  - NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 (shows UnfusedAttention)"
+        echo "  - defer_fp32_logits: true"
+        echo "  - activation_checkpointing: true"
+        echo "  - 512 total samples (64 prompts × 8 gen), 10 steps"
+        
+        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+--config ${CONFIG_FILE} \
+cluster.num_nodes=${NUM_NODES} \
+cluster.gpus_per_node=${GPUS_PER_NODE} \
+policy.generation.vllm_cfg.tensor_parallel_size=${G_TP} \
+policy.generation.vllm_cfg.pipeline_parallel_size=${G_PP} \
+policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
+policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
+policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
+policy.megatron_cfg.context_parallel_size=${T_CP} \
+policy.megatron_cfg.attention_backend=unfused \
+policy.megatron_cfg.defer_fp32_logits=true \
+policy.megatron_cfg.activation_checkpointing=true \
+policy.sequence_packing.enabled=false \
+grpo.num_prompts_per_step=64 \
+grpo.num_generations_per_prompt=8 \
+policy.train_global_batch_size=512 \
+grpo.async_grpo.enabled=false \
+grpo.val_period=1000 \
+checkpointing.enabled=false \
+grpo.max_num_steps=10 \
+logger.wandb_enabled=True \
+logger.wandb.project='${WANDB_PROJECT}' \
+logger.wandb.name='${WANDB_NAME}'"
+        ;;
+
+    # ========================================
+    # GPT-OSS-120B: INTERACTIVE 4 Nodes
+    # Ray cluster only, no auto command
+    # ========================================
+    gptoss120b_interactive_4node)
+        NUM_NODES=4
+        WANDB_NAME="GPTOSS120B_interactive_4node"
+        
+        echo "[INFO] Launching INTERACTIVE 4-node Ray cluster for GPT-OSS-120B"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (32 B200 GPUs × 192GB)"
+        echo "  - Training: EP=8, TP=2, DP=2 (no optimizer CPU offload needed)"
+        echo "  - No command will be executed automatically"
+        echo ""
+        echo "  After job starts:"
+        echo "    1. Run: bash JOBID-attach.sh"
+        echo "    2. Then run your command:"
+        echo ""
+        echo "    uv run ./examples/run_grpo.py \\"
+        echo "      --config examples/configs/recipes/llm/grpo-gptoss-120b-4n8g-megatron.yaml \\"
+        echo "      cluster.num_nodes=4 cluster.gpus_per_node=8 \\"
+        echo "      policy.generation.vllm_cfg.tensor_parallel_size=8 \\"
+        echo "      policy.megatron_cfg.tensor_model_parallel_size=2 \\"
+        echo "      policy.megatron_cfg.expert_model_parallel_size=8 \\"
+        echo "      grpo.max_num_steps=3 \\"
+        echo "      checkpointing.enabled=false"
+        echo ""
+        
+        COMMAND=""
+        ;;
+
+    # ========================================
+    # GPT-OSS-120B: INTERACTIVE 8 Nodes
+    # Ray cluster only, no auto command
+    # ========================================
+    gptoss120b_interactive_8node)
+        NUM_NODES=8
+        WANDB_NAME="GPTOSS120B_interactive_8node"
+        
+        echo "[INFO] Launching INTERACTIVE 8-node Ray cluster for GPT-OSS-120B"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (64 B200 GPUs × 192GB)"
+        echo "  - Training: EP=8, TP=4, PP=2 (use grpo-gptoss-120b-8n8g-megatron.yaml)"
+        echo "  - No command will be executed automatically"
+        echo ""
+        echo "  After job starts:"
+        echo "    1. Run: bash JOBID-attach.sh"
+        echo "    2. Then run your command (e.g. 8-node 120B with grpo 64×32):"
+        echo ""
+        echo "    uv run ./examples/run_grpo.py \\"
+        echo "      --config examples/configs/recipes/llm/grpo-gptoss-120b-8n8g-megatron.yaml \\"
+        echo "      cluster.num_nodes=8 cluster.gpus_per_node=8 \\"
+        echo "      policy.generation.vllm_cfg.tensor_parallel_size=8 \\"
+        echo "      policy.megatron_cfg.tensor_model_parallel_size=4 \\"
+        echo "      policy.megatron_cfg.expert_model_parallel_size=8 \\"
+        echo "      policy.megatron_cfg.pipeline_model_parallel_size=2 \\"
+        echo "      grpo.max_num_steps=3 \\"
+        echo "      checkpointing.enabled=false"
+        echo ""
+        
+        COMMAND=""
+        ;;
+
+    # ========================================
     # GPT-OSS-120B: INTERACTIVE 2 Nodes
     # Ray cluster only, no auto command
     # ========================================
@@ -1133,8 +1337,17 @@ logger.wandb.name='${WANDB_NAME}'"
         echo "  qwen_comp_2node  - 2 nodes, Match Qwen 2node (TP=4, PP=2, EP=2)"
         echo "  qwen_comp_8node  - 8 nodes, Match Qwen 8node (TP=4, PP=4, EP=4)"
         echo ""
-        echo "  === GPT-OSS-120B (2 nodes, 16 B200 GPUs) ==="
-        echo "  gptoss120b_2node       - 120B model, EP=8, TP=2 (reduced batch/seq)"
+        echo "  === GPT-OSS-120B (4 nodes, 32 B200 GPUs - recommended) ==="
+        echo "  gptoss120b_4node       - 120B, EP=8, TP=2, DP=2 (no CPU offload needed)"
+        echo "  gptoss120b_4node_unfused - 120B + UNFUSED Attention (for fused vs unfused comparison)"
+        echo "  gptoss120b_interactive_4node - 120B interactive 4-node"
+        echo ""
+        echo "  === GPT-OSS-120B (8 nodes, 64 B200 GPUs) ==="
+        echo "  gptoss120b_8node             - 120B, EP=8, TP=4, PP=2, grpo 64×32"
+        echo "  gptoss120b_interactive_8node - 120B interactive 8-node (run: bash JOBID-attach.sh)"
+        echo ""
+        echo "  === GPT-OSS-120B (2 nodes, 16 B200 GPUs - requires CPU offload) ==="
+        echo "  gptoss120b_2node       - 120B model, EP=8, TP=2, optimizer CPU offload"
         echo "  gptoss120b_2node_debug - 120B + NVTE_DEBUG"
         echo "  gptoss120b_2node_fp8   - 120B + FP8 training"
         echo "  gptoss120b_interactive_2node - 120B interactive mode"
@@ -1167,10 +1380,10 @@ if [[ -z "$COMMAND" ]]; then
         --nodes=${NUM_NODES} \
         --account=${account} \
         --job-name=gptoss-${EXPERIMENT} \
-        --partition=${PARTITION:-interactive} \
+        --partition=${PARTITION:-batch} \
         --time=${TIME:-04:00:00} \
         ${GRES_FLAG} \
-        ray.sub
+        ray-lbd.sub
     
     echo ""
     echo "[INFO] After job starts, run: bash JOBID-attach.sh"
@@ -1202,7 +1415,7 @@ else
         --time=04:00:00 \
         --comment="${GPU_IDLE_EXEMPTION}" \
         ${GRES_FLAG} \
-        ray.sub
+        ray-lbd.sub
 fi
 
 
