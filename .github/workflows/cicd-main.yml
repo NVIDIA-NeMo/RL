@@ -278,11 +278,13 @@ jobs:
     needs: [pre-flight, build-container, cicd-doc-tests]
     if: >-
       ${{
-        always() &&
-        contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
-        needs.pre-flight.result == 'success' &&
-        (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-        (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
+        (
+          always() &&
+          contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.result == 'success' &&
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
+          (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
+        ) && !cancelled()
       }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
