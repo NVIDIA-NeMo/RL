@@ -188,7 +188,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -252,7 +252,6 @@ jobs:
     if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
-    environment: nemo-ci
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -312,7 +311,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
-    environment: nemo-ci
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -387,6 +385,8 @@ jobs:
                 )
               )
             }}
+
+
           CI_SKIP: ${{ github.event.label.name == 'Skip CICD' }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |
@@ -399,7 +399,6 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    environment: main
     if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
     steps:
       - name: Send Slack notification
