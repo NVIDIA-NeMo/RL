@@ -31,7 +31,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     validate,
 )
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
