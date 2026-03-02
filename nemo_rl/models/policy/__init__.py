@@ -108,6 +108,24 @@ class RewardModelConfig(TypedDict):
     reward_model_type: str
 
 
+class MegatronPeftConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class MegatronPeftConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init_method: str
+    lora_B_init_method: str
+    a2a_experimental: bool
+    lora_dtype: str | None
+
+
 class MegatronOptimizerConfig(TypedDict):
     optimizer: str
     lr: float
@@ -195,6 +213,7 @@ class MegatronConfig(TypedDict):
     moe_shared_expert_overlap: bool
     # Attention backend to use: 'auto', 'flash', 'fused', 'unfused', 'local'. Defaults to 'auto'.
     attention_backend: NotRequired[str]
+    peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
@@ -205,6 +224,9 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Multimodal configs
+    audio: NotRequired[dict[str, Any]]
+    video: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):

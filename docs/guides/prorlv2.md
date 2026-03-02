@@ -106,7 +106,7 @@ loss_fn:
 
 This keeps PPO/GRPO-style clipping behavior but allows a larger expansion region than the contraction region, which can help exploration and reduce early collapse.
 
-- **Implementation**: `ClippedPGLossFn` documents decoupled clipping in [`nemo_rl/algorithms/loss_functions.py`](../../nemo_rl/algorithms/loss_functions.py).
+- **Implementation**: `ClippedPGLossFn` documents decoupled clipping in [`nemo_rl/algorithms/loss/loss_functions.py`](../../nemo_rl/algorithms/loss/loss_functions.py).
 
 ## Loss: Token-level Policy Gradient
 
@@ -153,7 +153,7 @@ loss_fn:
   - `"icepop"`: set weights outside \([min, max]\) to zero (filter outliers)
   - `"seq-mask-tis"`: sequence-level geometric-mean mask + non-truncated token-level IS correction (see below)
 
-- **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss_functions.py`](../../nemo_rl/algorithms/loss_functions.py).
+- **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss/loss_functions.py`](../../nemo_rl/algorithms/loss/loss_functions.py).
 
 ### Seq-mask-tis: Sequence-level Geometric-Mean Mask
 

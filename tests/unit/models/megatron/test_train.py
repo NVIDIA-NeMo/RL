@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.algorithms.loss.interfaces import LossInputType
+
 
 class TestModelForward:
     """Tests for model_forward function."""
@@ -685,6 +687,7 @@ class TestLossPostProcessor:
         from nemo_rl.models.megatron.train import LossPostProcessor
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
@@ -723,6 +726,7 @@ class TestLossPostProcessor:
         from nemo_rl.models.megatron.train import LossPostProcessor
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(
