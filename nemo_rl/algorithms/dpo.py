@@ -15,7 +15,6 @@ import os
 import warnings
 from collections import defaultdict
 from functools import partial
-from pathlib import Path
 from typing import Optional, TypedDict, cast
 
 import numpy as np
@@ -236,16 +235,14 @@ def setup(
                 if "iters" in k:
                     policy_config["megatron_cfg"]["scheduler"][k] *= 2
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=True,
     )
@@ -699,7 +696,9 @@ def dpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

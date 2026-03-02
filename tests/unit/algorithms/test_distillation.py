@@ -581,6 +581,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get = MagicMock(return_value=None)
 
         # Should not raise

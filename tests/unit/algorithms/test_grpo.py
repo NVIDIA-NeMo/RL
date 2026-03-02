@@ -892,6 +892,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         def load_training_info(self, _path):
             return None
 
+        def get_resume_paths(self, _path):
+            return None, None
+
     class DummyLoader:
         def __init__(self, *_args, **_kwargs):
             pass
