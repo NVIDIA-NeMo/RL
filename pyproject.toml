@@ -49,6 +49,7 @@ dependencies = [
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "decord; platform_machine == 'x86_64'",
   "nvidia-resiliency-ext",
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
@@ -350,7 +351,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=15 -s -rA -x"
+addopts = "--durations=100 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
