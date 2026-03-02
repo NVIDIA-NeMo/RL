@@ -321,32 +321,32 @@ jobs:
   #         cpu-only: ${{ matrix.cpu-only || false }}
   #         is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
-  # cicd-functional-tests:
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - script: L1_Functional_Tests_GPU
-  #           runner: self-hosted-azure
-  #   needs: [pre-flight, build-container, cicd-unit-tests]
-  #   runs-on: ${{ matrix.runner }}
-  #   if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
-  #   name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
-  #   environment: nemo-ci
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #     - name: main
-  #       uses: ./.github/actions/test-template
-  #       env:
-  #         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-  #       with:
-  #         runner: ${{ runner.name }}
-  #         registry: ${{ vars.GB200_CONTAINER_REGISTRY }}/megatron-bridge
-  #         image_name: megatron-bridge
-  #         test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
-  #         script: ${{ matrix.script }}
-  #         is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+  cicd-functional-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L1_Functional_Tests_GPU
+            runner: nemo-ci-gcp-gpu-x2
+    needs: [pre-flight, build-container, cicd-unit-tests]
+    runs-on: ${{ matrix.runner }}
+    if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
+    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    environment: nemo-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          runner: ${{ runner.name }}
+          registry: ${{ vars.GB200_CONTAINER_REGISTRY }}/megatron-bridge
+          image: megatron-bridge
+          test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
+          script: ${{ matrix.script }}
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   cicd-fast-functional-tests:
     strategy:
@@ -372,6 +372,7 @@ jobs:
           script: ${{ matrix.script }}
           registry: ${{ vars.GB200_CONTAINER_REGISTRY }}/megatron-bridge
           image: megatron-bridge
+          test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   # CI_QA_Gate:
