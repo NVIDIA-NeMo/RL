@@ -35,6 +35,22 @@ class SequencePackingLossWrapper:
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        """Wrap a loss function to handle sequence packing.
+
+        Args:
+            loss_fn: Loss function.
+            prepare_fn: Prepare function.
+            cu_seqlens_q: Unpadded cu seqlens q.
+            cu_seqlens_q_padded: Padded cu seqlens q.
+            vocab_parallel_rank: Vocab parallel rank.
+            vocab_parallel_group: Vocab parallel group.
+            context_parallel_group: Context parallel group.
+
+            vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+
+        Returns:
+            Sequence packing loss wrapper.
+        """
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q

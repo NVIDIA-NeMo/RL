@@ -38,6 +38,11 @@ def prepare_loss_input(
         logits: Logits from the model.
         data: Microbatch data.
         loss_fn: Loss function.
+        vocab_parallel_rank: Vocab parallel rank.
+        vocab_parallel_group: Vocab parallel group.
+        context_parallel_group: Context parallel group.
+
+        vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
 
     Returns:
         Loss input.

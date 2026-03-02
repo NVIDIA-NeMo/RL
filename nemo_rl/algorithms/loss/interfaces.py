@@ -43,30 +43,29 @@ class LossFunction(Protocol):
 
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss and metrics from logprobs and other data.
 
         Args:
-            next_token_logits: Logits from the model, typically with shape [batch_size, seq_len, vocab_size].
-                               For each position (b, i), contains the logit distribution over the entire vocabulary
-                               for predicting the next token (at position i+1). For example, if processing "The cat sat on",
-                               then next_token_logits[b, 3] would contain the logits for predicting the word
-                               that follows "on".
             data: Dictionary containing all relevant data for loss computation
                   such as rewards, values, actions, advantages, masks, and other
                   algorithm-specific information needed for the particular loss calculation.
             global_valid_seqs: torch.Tensor
-                this tensor should contain the number of valid sequences in the microbatch.
+                This tensor should contain the number of valid sequences in the microbatch.
                 It's used for global normalization for losses/metrics that are computed at the sequence level
                 and needs to be aggregated across all microbatches.
             global_valid_toks: torch.Tensor
                 This tensor should contain the number of valid tokens in the microbatch.
                 It's used for global normalization for losses/metrics that are computed at the token level
                 and needs to be aggregated across all microbatches.
+            **kwargs: Loss function input, which varies by input_type:
+                - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
+                - For LossInputType.LOGIT: logits (torch.Tensor)
+                - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
 
         Returns:
             tuple: (loss, metrics)
