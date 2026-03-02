@@ -39,7 +39,9 @@ project-includes = [
   "examples/custom_parallel/llama_nemotron_super_49b_custom_plan.py",
   "nemo_rl/algorithms/__init__.py",
   "nemo_rl/algorithms/advantage_estimator.py",
-  "nemo_rl/algorithms/interfaces.py",
+  "nemo_rl/algorithms/loss/__init__.py",
+  "nemo_rl/algorithms/loss/interfaces.py",
+  "nemo_rl/algorithms/loss/utils.py",
   "nemo_rl/algorithms/reward_functions.py",
   "nemo_rl/algorithms/utils.py",
   "nemo_rl/data/__init__.py",
@@ -134,6 +136,7 @@ project-includes = [
   "tools/model_diagnostics/1.max_model_len_respected.py",
   "tools/model_diagnostics/2.long_generation_decode_vs_prefill.py",
   "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
+  "tools/model_diagnostics/5.prefix_caching_nan.py",
 ]
 
 # Disable TypedDict mutation errors since TypedDict objects are regular dicts at runtime
