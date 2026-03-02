@@ -20,6 +20,7 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
+import decord
 import requests
 import torch
 from PIL import Image
@@ -325,8 +326,6 @@ def load_media_from_message(
     processor=None,
     multimodal_load_kwargs: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, list[Any]]:
-    import decord
-
     loaded_media = defaultdict(list)
     media_in_message = get_media_from_message(message)
 
