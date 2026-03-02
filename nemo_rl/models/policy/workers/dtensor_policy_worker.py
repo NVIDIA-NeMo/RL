@@ -46,8 +46,8 @@ from transformers import (
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -776,20 +776,28 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
 
+                        # Wrap loss function for sequence packing if needed
                         if self.enable_seq_packing:
                             loss_fn_ = SequencePackingLossWrapper(
                                 loss_fn=loss_fn,
+                                prepare_fn=prepare_loss_input,
                                 cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
                                 cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
                             )
+                            loss, loss_metrics = loss_fn_(
+                                logits,
+                                mb,
+                                global_valid_seqs,
+                                global_valid_toks,
+                            )
                         else:
-                            loss_fn_ = loss_fn
-                        loss, loss_metrics = loss_fn_(
-                            logits,
-                            mb,
-                            global_valid_seqs,
-                            global_valid_toks,
-                        )
+                            loss_input = prepare_loss_input(logits, mb, loss_fn)
+                            loss, loss_metrics = loss_fn(
+                                data=mb,
+                                global_valid_seqs=global_valid_seqs,
+                                global_valid_toks=global_valid_toks,
+                                **loss_input,
+                            )
                         del logits
 
                         # skip the update for dummy batches
