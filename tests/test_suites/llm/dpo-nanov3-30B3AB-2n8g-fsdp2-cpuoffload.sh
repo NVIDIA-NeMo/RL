@@ -3,23 +3,26 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=4
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=2
+STEPS_PER_RUN=15
+MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
+rm -rf $CKPT_DIR
+begin_time=$(date +%s)
 
 # Run the experiment
 cd $PROJECT_ROOT
+NRL_FORCE_REBUILD_VENVS=true \
 uv run examples/run_dpo.py \
     --config $CONFIG_PATH \
     dpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=nemo-rl \
+    logger.wandb.project=ruit_personal_debug \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
@@ -34,13 +37,17 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 3.6' \
-        'data["train/loss"]["20"] < 3.4' \
+        'data["train/loss"]["1"] < 0.69316' \
+        'data["train/loss"]["15"] < 0.63263' \
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["20"] < 0.6' \
-        'mean(data["timing/train/total_step_time"], -10, -1) < 7.8'
+        'data["train/preference_loss"]["15"] < 0.63263' \
+        'mean(data["timing/train/total_step_time"], -5, -1) < 70'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
+
+end_time=$(date +%s)
+duration=$((end_time - begin_time))
+echo "Duration: $duration seconds"
