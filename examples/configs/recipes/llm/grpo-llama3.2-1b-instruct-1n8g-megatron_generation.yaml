@@ -1,6 +1,8 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
   max_num_steps: 500
+loss_fn:
+  force_on_policy_ratio: true
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron_generation

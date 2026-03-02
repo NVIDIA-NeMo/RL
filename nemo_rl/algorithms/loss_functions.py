@@ -210,11 +210,52 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        prev_logprobs = data["prev_logprobs"][:, 1:]
+        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
+
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            curr_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+                next_token_logits, data["input_ids"], seq_index=seq_index
+            )
+        else:
+            next_token_logits_wo_last = next_token_logits[
+                :, :-1
+            ]  # Remove last position's logits
+            next_token_logprobs = torch.nn.functional.log_softmax(
+                next_token_logits_wo_last, dim=-1
+            )
+            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            curr_logprobs = next_token_logprobs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+
+        # For truly on-policy training, use curr_logprobs as prev_logprobs
+        # This avoids computing prev_logprobs upstream
+        if self.force_on_policy_ratio:
+            prev_logprobs = curr_logprobs.detach()
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -281,39 +322,6 @@ class ClippedPGLossFn(LossFunction):
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
-
-        next_token_logits = next_token_logits.to(torch.float32)
-
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
-        else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:

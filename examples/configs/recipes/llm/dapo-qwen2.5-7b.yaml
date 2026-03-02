@@ -15,6 +15,7 @@ grpo:
     enabled: true
     overlong_buffer_length: 2048
     max_response_length: 14336
+  skip_reference_policy_logprobs_calculation: true
 loss_fn:
   reference_policy_kl_penalty: 0.0
   ratio_clip_max: 0.28
