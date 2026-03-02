@@ -444,6 +444,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
+        # Flush all async GPU work (e.g. fused attention kernels) so that the
+        # subsequent refit/prepare_for_generation doesn't absorb training tail latency.
+        # torch.cuda.synchronize()
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")

@@ -13,7 +13,7 @@ policy:
     expert_model_parallel_size: 8
     tensor_model_parallel_size: 4
     sequence_parallel: true
-    moe_permute_fusion: true
+    moe_permute_fusion: false
   dtensor_cfg:
     enabled: false
   sequence_packing:
