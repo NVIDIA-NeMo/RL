@@ -158,6 +158,18 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
     optimizer:
       optimizer: adam
       lr: 2.0e-07
