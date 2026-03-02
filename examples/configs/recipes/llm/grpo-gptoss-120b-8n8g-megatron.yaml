@@ -1,0 +1,46 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: "results/grpo_math_oss_120B_8n8g_minimum"
+policy:
+  model_name: openai/gpt-oss-120b
+  tokenizer:
+    name: ${policy.model_name}
+    pad_token_id: 199999
+    padding_side: right
+    eos_token_id: 200002
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 4
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    expert_model_parallel_size: 8
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    sequence_parallel: true
+    moe_permute_fusion: true
+    defer_fp32_logits: true
+    activation_checkpointing: true
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: true
+  generation:
+    env_vars:
+      NEMO_HOME: ${checkpointing.checkpoint_dir}/nemo_cache
+    eos_token_id: ${policy.tokenizer.eos_token_id}
+    stop_token_ids:
+      - ${policy.tokenizer.eos_token_id}
+    vllm_cfg:
+      tokenizer: ${policy.model_name}
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.5
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8
