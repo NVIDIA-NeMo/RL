@@ -248,7 +248,7 @@ jobs:
       runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
       image-label: megatron-bridge
       target: release
-      registry: ${{ needs.org-member-pre-flight.outputs.registry }}/megatron-bridge
+      registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
