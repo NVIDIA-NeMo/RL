@@ -69,6 +69,10 @@ inputs:
     description: "Override container image tag. If set, infers FAST=1 and prefetches venvs + regenerates fingerprint at startup."
     required: false
     default: ""
+secrets:
+  registry:
+    description: "GB200 Container Registry"
+    required: true
 
 runs:
   using: "composite"
