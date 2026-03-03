@@ -122,6 +122,8 @@ build = [
   "pybind11",
   # Build requirement for flash-attn
   "psutil",
+  # Build requirement for vllm (VCS install uses setuptools-scm for versioning)
+  "setuptools-scm>=8.0",
 ]
 docs = [
   "sphinx",
