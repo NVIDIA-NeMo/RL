@@ -333,6 +333,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
