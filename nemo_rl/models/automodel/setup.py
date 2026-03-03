@@ -36,6 +36,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedModel
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.models.automodel.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
@@ -89,6 +90,16 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
+
+    # Sampling parameters configuration
+    sampling_params = None
+    if "generation" in config and config["generation"] is not None:
+        generation_cfg = config["generation"]
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg.get("top_k", None),
+            top_p=generation_cfg.get("top_p", 1.0),
+            temperature=generation_cfg.get("temperature", 1.0),
+        )
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
@@ -193,6 +204,7 @@ def validate_and_prepare_config(
         cpu_offload=cpu_offload,
         offload_optimizer_for_logprob=offload_optimizer_for_logprob,
         is_generation_colocated=is_generation_colocated,
+        sampling_params=sampling_params,
         is_reward_model=is_reward_model,
     )
 
