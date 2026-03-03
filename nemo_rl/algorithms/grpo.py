@@ -79,6 +79,8 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -845,6 +847,13 @@ def setup(
                     nemo_gym_py_exec = create_local_venv_on_each_node(
                         nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
                     )
+                nemo_gym_dict = env_configs["nemo_gym"]
+                uv_cache_dir = get_nemo_gym_uv_cache_dir()
+                if uv_cache_dir is not None:
+                    nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+                uv_venv_dir = get_nemo_gym_venv_dir()
+                if uv_venv_dir is not None:
+                    nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
@@ -852,7 +861,7 @@ def setup(
                     ray_gpu_pgs=nemo_gym_judge_pgs,
                     ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
                     ray_namespace=ray_namespace,
-                    initial_global_config_dict=env_configs["nemo_gym"],
+                    initial_global_config_dict=nemo_gym_dict,
                     invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
                 )
                 nemo_gym_opts = {}
