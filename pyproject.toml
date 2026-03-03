@@ -310,7 +310,7 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 sgl-kernel = [{ requirement = "torch", match-runtime = true }]
-vllm = [{ requirement = "torch", match-runtime = true }]
+vllm = [{ requirement = "torch", match-runtime = true }, "setuptools-scm>=8.0"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
