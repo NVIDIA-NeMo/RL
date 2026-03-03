@@ -328,7 +328,7 @@ jobs:
         include:
           - script: L1_Functional_Tests_GPU
             runner: nemo-ci-gcp-gpu-x2
-    needs: [pre-flight, build-container-gb200]
+    needs: [pre-flight, build-container]
     runs-on: ${{ matrix.runner }}
     if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
@@ -355,7 +355,7 @@ jobs:
         include:
           - script: L1_Functional_Tests_GPU
             runner: nemo-ci-gcp-gpu-x2
-    needs: [pre-flight, build-container-gb200]
+    needs: [pre-flight, build-container]
     if: ${{ needs.pre-flight.outputs.test_level == 'Lfast' }}
     runs-on: ${{ matrix.runner }}
     name: fast_${{ matrix.script }}
