@@ -1,4 +1,5 @@
 # SFT Algorithm Configuration
+defaults: sft.yaml
 sft:
   max_num_epochs: 1
   max_num_steps: 1000000
@@ -86,6 +87,7 @@ data:
   # default settings for all datasets
   default:
     prompt_file: examples/prompts/math.txt
+    processor: "sft_processor"
 
 logger:
   log_dir: "logs"  # Base directory for all logs
