@@ -278,7 +278,7 @@ class ClippedPGLossFn(LossFunction):
         if self.reference_policy_kl_penalty != 0:
             # When top-k/top-p filtering is enabled, we need special handling for KL:
             # - reference_policy_logprobs is computed **without** filtering (see use_reference_model)
-            # - curr_logprobs is computed **with** filtering (for actor loss compatibility)
+            # - curr_logprobs/prev_logprobs are computed **with** filtering (for actor loss compatibility)
             # - For KL, we need curr_logprobs **without** filtering to be consistent with ref logprobs
             # - For importance weights, we also use unfiltered curr_logprobs_for_kl since we're
             #   reweighting samples from π_gen_filtered to π_curr_unfiltered

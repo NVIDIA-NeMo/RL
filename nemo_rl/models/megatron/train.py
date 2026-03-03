@@ -184,6 +184,9 @@ def forward_with_post_processing_fn(
         post_processing_fn,
         (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
+        # Temperature scaling is element-wise, directly applying it here.
+        # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
+        # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
         apply_temperature_scaling(output_tensor, cfg)
 
     # Use type checking to dispatch to the correct post-processing method
