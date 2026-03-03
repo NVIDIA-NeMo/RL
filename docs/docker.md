@@ -62,3 +62,32 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 > [!NOTE]
 > If you skip vLLM or SGLang during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+
+## Verifying the Build
+
+After building the image, verify that key dependencies are correctly installed:
+
+```sh
+docker run --rm nemo-rl:latest uv run python -c "
+from omegaconf import OmegaConf
+import ray
+print('Core dependencies OK')
+"
+```
+
+To also verify optional extras:
+
+```sh
+# Verify vLLM extra
+docker run --rm nemo-rl:latest uv run python -c "import vllm; print('vLLM OK')"
+
+# Verify automodel extra
+docker run --rm nemo-rl:latest uv run python -c "import nemo_automodel; print('automodel OK')"
+```
+
+If any of these checks fail, the image may have been built with incomplete dependencies. Try rebuilding with `--no-cache`:
+
+```sh
+docker buildx build --no-cache -f docker/Dockerfile \
+    --tag nemo-rl:latest .
+```

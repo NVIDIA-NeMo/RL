@@ -6,6 +6,38 @@ This guide details the Group Relative Policy Optimization (GRPO) implementation 
 
 To get started quickly, use the script [examples/run_grpo.py](../../examples/run_grpo.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
+### Prerequisites
+
+Before launching a GRPO run, ensure your environment has the required extras installed. The extras you need depend on your chosen inference backend:
+
+```bash
+# For vLLM inference backend (recommended):
+uv sync --extra automodel --extra vllm
+
+# For SGLang inference backend:
+uv sync --extra sglang
+```
+
+> [!NOTE]
+> If you are running inside a pre-built Docker container, these extras are already installed. If you encounter import errors (e.g., `No module named 'nemo_automodel'` or `No module named 'vllm'`), re-run the appropriate `uv sync` command above.
+
+Set the required environment variables:
+
+```bash
+# Required: HuggingFace and Weights & Biases
+export HF_HOME=/path/to/huggingface/cache
+export WANDB_API_KEY=your_wandb_key
+# For Llama models, also run: huggingface-cli login
+
+# Recommended: Disable DeepGEMM if not available on your GPU (e.g., H20)
+export VLLM_USE_DEEP_GEMM=0
+
+# Recommended: Ensure CUDA libraries are discoverable by Ray workers
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+```
+
+### Launch
+
 We recommend launching the job using `uv`:
 
 ```bash
@@ -14,7 +46,25 @@ uv run examples/run_grpo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+### Troubleshooting Common Setup Issues
+
+If you encounter issues during the first run, try the following:
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| `No module named 'nemo_automodel'` | Missing `automodel` extra | `uv sync --extra automodel` |
+| `No module named 'vllm'` or `No module named 'vllm.logger'` | Missing or incomplete `vllm` extra | `uv sync --extra vllm` |
+| `cannot import name 'OmegaConf'` | Virtual environment not synced | `uv venv && uv sync --extra automodel --extra vllm` |
+| `No module named 'ray._private.node'` | Corrupted Ray installation | `uv pip install "ray[default]==2.49.2" --force-reinstall` |
+| `libcudnn.so.9: cannot open shared object` | cuDNN not visible to Ray workers | Set `LD_LIBRARY_PATH` (see Prerequisites) or `export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION` |
+| `DeepGEMM backend is not available` | DeepGEMM not compiled for your GPU | `export VLLM_USE_DEEP_GEMM=0` |
+
+For Ray worker virtual environment issues, clearing and rebuilding may help:
+
+```bash
+ray stop
+rm -rf /opt/ray_venvs/*
+```
 
 In this guide, we'll walk through how we handle:
 
