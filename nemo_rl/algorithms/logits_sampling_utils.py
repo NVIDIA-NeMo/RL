@@ -26,21 +26,6 @@ import torch
 TOP_K_TOP_P_CHUNK_SIZE: int = 256
 
 
-def need_top_k_filtering(top_k: int | None) -> bool:
-    """Check if top-k filtering is needed."""
-    return top_k is not None and top_k != -1
-
-
-def need_top_p_filtering(top_p: float | None) -> bool:
-    """Check if top-p filtering is needed."""
-    return top_p is not None and top_p != 1.0
-
-
-def need_top_k_or_top_p_filtering(top_k: int | None, top_p: float | None) -> bool:
-    """Check if top-k or top-p filtering is needed."""
-    return need_top_k_filtering(top_k) or need_top_p_filtering(top_p)
-
-
 @dataclass
 class TrainingSamplingParams:
     """Training-specific sampling parameters to match generation parameters.
@@ -57,6 +42,28 @@ class TrainingSamplingParams:
     top_k: int | None = None
     top_p: float = 1.0
     temperature: float = 1.0
+
+
+def _need_top_k_filtering(top_k: int | None) -> bool:
+    """Check if top-k filtering is needed."""
+    return top_k is not None and top_k != -1
+
+
+def _need_top_p_filtering(top_p: float | None) -> bool:
+    """Check if top-p filtering is needed."""
+    return top_p is not None and top_p != 1.0
+
+
+def need_top_k_or_top_p_filtering(
+    sampling_params: Optional[TrainingSamplingParams],
+) -> bool:
+    """Check if top-k or top-p filtering is needed."""
+    if sampling_params is None:
+        return False
+
+    top_k = sampling_params.top_k
+    top_p = sampling_params.top_p
+    return _need_top_k_filtering(top_k) or _need_top_p_filtering(top_p)
 
 
 @torch.no_grad()
@@ -83,7 +90,7 @@ def _apply_top_k_only_fn(
         keep_mask: Mask tensor with the same shape as input logits, where 1 (True) indicates tokens to be
             kept, 0 (False) indicates tokens to be masked. None if top-k filtering is not needed.
     """
-    if not need_top_k_filtering(top_k):
+    if not _need_top_k_filtering(top_k):
         return logits, None
 
     # Get top-k values and create mask
@@ -133,8 +140,8 @@ def _apply_top_k_top_p_fn(
         keep_mask: Mask tensor with the same shape as input logits, where 1 (True) indicates
             tokens to be kept, 0 (False) indicates tokens to be masked.
     """
-    if not need_top_p_filtering(top_p):
-        if not need_top_k_filtering(top_k):
+    if not _need_top_p_filtering(top_p):
+        if not _need_top_k_filtering(top_k):
             return logits, None
         # Avoid sorting vocab for top-k only case
         filtered_logits, top_k_keep_mask = _apply_top_k_only_fn(logits, top_k)
@@ -162,7 +169,7 @@ def _apply_top_k_top_p_fn(
         logits_sort, logits_idx = chunk_logits.sort(dim=-1, descending=False)
         top_k_keep_mask_chunk = None
 
-        if need_top_k_filtering(top_k):
+        if _need_top_k_filtering(top_k):
             assert top_k is not None  # Type narrowing
             # Apply top-k first
             top_k_index = logits_sort.size(-1) - top_k
@@ -203,7 +210,7 @@ def _apply_top_k_top_p_fn(
     return filtered_logits, keep_mask
 
 
-class ApplyTopKTopP(torch.autograd.Function):
+class _ApplyTopKTopP(torch.autograd.Function):
     """Autograd function for top-k and top-p filtering with proper gradient handling."""
 
     @staticmethod
@@ -273,6 +280,6 @@ def apply_top_k_top_p(
         keep_mask: Mask tensor with the same shape as input logits, where 1 (True) indicates tokens to be
             kept, 0 (False) indicates tokens to be masked.
     """
-    if not need_top_k_or_top_p_filtering(top_k, top_p):
+    if not _need_top_k_filtering(top_k) and not _need_top_p_filtering(top_p):
         return logits, None
-    return ApplyTopKTopP.apply(logits, top_k, top_p, chunk_size)
+    return _ApplyTopKTopP.apply(logits, top_k, top_p, chunk_size)
