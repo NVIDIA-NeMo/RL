@@ -824,10 +824,11 @@ def handle_model_import(
     pt_checkpoint_exists: bool,
 ) -> None:
     """Handle HF model import if checkpoint doesn't exist."""
-    if pt_checkpoint_exists:
+    hf_config_overrides = config.get("hf_config_overrides", {}) or {}
+
+    if pt_checkpoint_exists and hf_config_overrides == {}:
         print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
     else:
-        hf_config_overrides = config.get("hf_config_overrides", {}) or {}
         import_model_from_hf_name(
             hf_model_name,
             pretrained_path,
