@@ -1,0 +1,21 @@
+diff --git a/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py b/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
+index 449ecb7d..a962d31c 100644
+--- a/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
++++ b/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
+@@ -29,6 +29,7 @@ from megatron.bridge.models.conversion.param_mapping import (
+     QKVMapping,
+ )
+ from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.models.gpt_oss.gpt_oss_provider import GPTOSSProvider
+ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+ from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+ 
+@@ -40,7 +41,7 @@ except ImportError:
+     quick_gelu = torch.nn.functional.gelu
+ 
+ 
+-@MegatronModelBridge.register_bridge(source=GptOssForCausalLM, target=GPTModel, model_type="gpt_oss")
++@MegatronModelBridge.register_bridge(source=GptOssForCausalLM, target=GPTModel, provider=GPTOSSProvider, model_type="gpt_oss")
+ class GPTOSSBridge(MegatronModelBridge):
+     """
+     Megatron Hub Bridge for GPT-OSS models.
