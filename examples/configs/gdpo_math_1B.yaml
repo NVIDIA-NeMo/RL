@@ -24,14 +24,25 @@ policy:
 # GDPO uses a single flat data config (GSM8K + math_gdpo_data_processor); replace parent's train/validation/default.
 data:
   _override_: true
+
   max_input_seq_length: ${policy.max_total_sequence_length}
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: "examples/prompts/gsm8k.txt"
   shuffle: true
   num_workers: 1
-  processor: "math_gdpo_data_processor"
-  env_name: "math"
-  dataset_name: "gsm8k"
+
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "gsm8k"
+    split: train
+  validation:
+    dataset_name: "gsm8k"
+    split: test
+
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: "examples/prompts/gsm8k.txt"
+    processor: "math_gdpo_data_processor"
+    env_name: "math"
 
 env:
   math:

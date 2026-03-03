@@ -37,46 +37,43 @@ def _extract_hash_answer(text: str) -> str | None:
 
 
 class GSM8KDataset(RawDataset):
-    """Simple wrapper around the GSM8K dataset with train and validation splits.
+    """Simple wrapper around the GSM8K dataset.
 
     Args:
-        seed: Random seed for shuffling the training set (default 42).
-        system_prompt_file: Optional path to a text file containing the system prompt
-            (e.g. examples/prompts/gsm8k.txt). If not provided, system prompt is empty.
+        split: Split name for the dataset, default is "train"
+        extract_answer: Whether to extract the answer from the dataset, default is True
     """
 
-    def __init__(
-        self,
-        seed: int = 42,
+    def __init__(self,
+        split: str = "train",
+        extract_answer: bool = True,
         system_prompt_file: str | None = None,
         **kwargs,
     ) -> None:
         self.task_name = "gsm8k"
+        self.extract_answer = extract_answer
         self._system_prompt = _load_system_prompt(system_prompt_file)
 
-        # Load from HuggingFace
-        train_ds = load_dataset("openai/gsm8k", "main")["train"]
-        val_ds = load_dataset("openai/gsm8k", "main")["test"]
+        # load from huggingface
+        self.dataset = load_dataset("openai/gsm8k", "main")[split]
 
-        # Shuffle training with seed
-        train_ds = train_ds.shuffle(seed=seed)
-
-        # Format the datasets
-        self.dataset = train_ds.map(
+        # format the dataset
+        self.dataset = self.dataset.map(
             self.format_data,
-            remove_columns=train_ds.column_names,
-        )
-        self.val_dataset = val_ds.map(
-            self.format_data,
-            remove_columns=val_ds.column_names,
+            remove_columns=self.dataset.column_names,
         )
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        if self.extract_answer:
+            answer = _extract_hash_answer(data["answer"])
+        else:
+            answer = data["answer"]
+
         return {
             "messages": [
                 {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": data["question"]},
-                {"role": "assistant", "content": _extract_hash_answer(data["answer"])},
+                {"role": "assistant", "content": answer},
             ],
             "task_name": self.task_name,
         }
