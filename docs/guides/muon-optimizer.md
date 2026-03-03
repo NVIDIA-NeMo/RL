@@ -20,7 +20,7 @@ To use Muon with NeMo RL, you need to configure the optimizer through the Megatr
 ```bash
 uv run examples/run_sft.py \
     policy.megatron_cfg.enabled=true \
-    policy.dtensor_cfg.enabled=true \
+    policy.dtensor_cfg.enabled=false \
     ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
     ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
     ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
@@ -88,9 +88,11 @@ For example, the following is a comparison between Adam and Muon for running SFT
 
 The full Muon command used for this run is:
 
-```
-uv run examples/run_sft.py 
+```bash
+uv run examples/run_sft.py \
   --config examples/configs/sft_openmathinstruct2_megatron.yaml \
+  policy.megatron_cfg.enabled=true \
+  policy.dtensor_cfg.enabled=false \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
@@ -107,7 +109,8 @@ uv run examples/run_sft.py
   policy.megatron_cfg.tensor_model_parallel_size=8 \
   policy.sequence_packing.enabled=True \
   policy.model_name=Qwen/Qwen3-235B-A22B \
-  policy.tokenizer.name=Qwen/Qwen3-235B-A22B checkpointing.enabled=True \
+  policy.tokenizer.name=Qwen/Qwen3-235B-A22B \
+  checkpointing.enabled=True \
   cluster.num_nodes=16 \
   policy.megatron_cfg.num_layers_in_first_pipeline_stage=11 \
   policy.megatron_cfg.num_layers_in_last_pipeline_stage=11
@@ -123,9 +126,11 @@ Here is a comparison of Muon vs Adam for DAPO with Qwen3.5-7B:
 
 The command to generate the Muon results is:
 
-```
+```bash
 uv run examples/run_grpo_math.py \
   --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml \
+  policy.megatron_cfg.enabled=true \
+  policy.dtensor_cfg.enabled=false \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
