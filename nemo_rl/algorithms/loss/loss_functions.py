@@ -966,53 +966,37 @@ class NLLLinearCEFusionLoss(LossFunction):
     """Negative Log Likelihood Loss function with linear CE fusion."""
 
     loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
 
     def __call__(
         self,
-        token_logprobs: Tensor,
+        next_token_logprobs: Tensor,
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
+        **_: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # Get the next token hidden states for each position
+        # next_token_logprobs are produced directly by the patched GPT forward.
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
-        seq_index = data.get("seq_index", None)
-        token_logprobs = token_logprobs.to(torch.float32)
-        # Gather the logprobs for the actual next tokens
-        # only support megatron lm tensor parallel for now
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(token_logprobs, torch.distributed.tensor.DTensor):
-            raise NotImplementedError(
-                "Distributed tensor not supported for linear CE fusion loss"
-            )
-        else:
-            raise NotImplementedError(
-                "Non-distributed tensor not supported for linear CE fusion loss"
-            )
+        next_token_logprobs = next_token_logprobs.to(torch.float32)
+        next_token_logprobs = next_token_logprobs[:, : data["input_ids"].shape[1] - 1]
 
         if dpo_loss:
             ## shape: [batch_size]
             num_unmasked_tokens = torch.sum(mask, -1)
             ## multiply by sample_mask to zero out invalid samples
-            loss = -torch.sum(token_logprobs * mask, dim=-1)
+            loss = -torch.sum(next_token_logprobs * mask, dim=-1)
             if dpo_average_log_probs:
                 loss = loss / num_unmasked_tokens.clamp(min=1)
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
             loss = -masked_mean(
-                token_logprobs,
+                next_token_logprobs,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )

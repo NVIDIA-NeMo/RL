@@ -96,6 +96,9 @@ def model_forward(
         additional_kwargs["fp32_output"] = False
     if use_linear_ce_fusion_loss:
         additional_kwargs["labels"] = input_ids_cp_sharded
+        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+        # GPTModel.forward signatures do not accept it.
+        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -104,7 +107,6 @@ def model_forward(
             attention_mask=attention_mask,
             **additional_kwargs,
             **multimodal_data,
-            return_logprobs_for_linear_ce_fusion=use_linear_ce_fusion_loss,
         )
 
     return output_tensor
@@ -315,20 +317,22 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            sequence_packing_loss_wrapper_type = (
-                SequencePackingLossWrapper
-                if not self.cfg["megatron_cfg"]["use_linear_ce_fusion_loss"]
-                else SequencePackingNLLLinearCEFusionLossWrapper
-            )
-            loss_fn_wrapped = sequence_packing_loss_wrapper_type(
-                loss_fn=self.loss_fn,
-                prepare_fn=prepare_loss_input,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
-            )
+            if self.cfg["megatron_cfg"]["use_linear_ce_fusion_loss"]:
+                loss_fn_wrapped = SequencePackingNLLLinearCEFusionLossWrapper(
+                    loss_fn=self.loss_fn,
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                )
+            else:
+                loss_fn_wrapped = SequencePackingLossWrapper(
+                    loss_fn=self.loss_fn,
+                    prepare_fn=prepare_loss_input,
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
