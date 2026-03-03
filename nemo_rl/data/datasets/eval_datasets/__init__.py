@@ -14,6 +14,7 @@
 
 from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
+from nemo_rl.data.datasets.eval_datasets.livecodebench import LiveCodeBenchDataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
@@ -82,6 +83,20 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    # livecodebench
+    elif dataset_name == "livecodebench":
+        base_dataset = LiveCodeBenchDataset(
+            variant="release_v5",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    elif dataset_name.startswith("livecodebench_"):
+        variant = dataset_name.split("_", 1)[1]
+        base_dataset = LiveCodeBenchDataset(
+            variant=variant,
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
     # fall back to local dataset
     else:
         print(f"Loading dataset from {dataset_name}...")
@@ -101,6 +116,7 @@ def load_eval_dataset(data_config):
 __all__ = [
     "AIMEDataset",
     "GPQADataset",
+    "LiveCodeBenchDataset",
     "LocalMathDataset",
     "MathDataset",
     "MMLUDataset",

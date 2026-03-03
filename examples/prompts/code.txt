@@ -1,0 +1,3 @@
+Solve the following programming problem. Write a complete Python solution that reads from standard input and writes to standard output.
+
+{0}

@@ -24,6 +24,9 @@ from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
     GeneralConversationsJsonlDataset,
 )
+from nemo_rl.data.datasets.response_datasets.livecodebench import (
+    LiveCodeBenchDataset as LiveCodeBenchResponseDataset,
+)
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
@@ -50,6 +53,7 @@ DATASET_REGISTRY = {
     "DeepScaler": DeepScalerDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
+    "LiveCodeBench": LiveCodeBenchResponseDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
     "refcoco": RefCOCODataset,
