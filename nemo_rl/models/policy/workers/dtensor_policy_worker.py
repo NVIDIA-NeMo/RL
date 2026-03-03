@@ -49,8 +49,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
-    need_top_k_filtering,
-    need_top_p_filtering,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
@@ -499,10 +498,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
-        if self.sampling_params is not None and (
-            need_top_k_filtering(self.sampling_params.top_k)
-            or need_top_p_filtering(self.sampling_params.top_p)
-        ):
+        if need_top_k_or_top_p_filtering(self.sampling_params):
             logits, _ = apply_top_k_top_p(
                 logits,
                 top_k=self.sampling_params.top_k,

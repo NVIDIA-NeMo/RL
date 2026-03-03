@@ -783,12 +783,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     else:
         target = target.roll(shifts=-1, dims=-1)
 
-    use_sampling = sampling_params is not None and need_top_k_or_top_p_filtering(
-        sampling_params.top_k, sampling_params.top_p
-    )
-
-    if use_sampling:
-        assert sampling_params is not None  # Type narrowing
+    if need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
             logprobs: torch.Tensor = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
                 vocab_parallel_logits,
@@ -884,12 +879,7 @@ def from_parallel_logits_to_logprobs(
     cp_rank = torch.distributed.get_rank(cp_group)
     target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
 
-    use_sampling = sampling_params is not None and need_top_k_or_top_p_filtering(
-        sampling_params.top_k, sampling_params.top_p
-    )
-
-    if use_sampling:
-        assert sampling_params is not None  # Type narrowing
+    if need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
             logprobs: torch.Tensor = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
                 vocab_parallel_logits,
@@ -1004,12 +994,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
     # Apply distributed log probability computation
-    use_sampling = sampling_params is not None and need_top_k_or_top_p_filtering(
-        sampling_params.top_k, sampling_params.top_p
-    )
-
-    if use_sampling:
-        assert sampling_params is not None  # Type narrowing
+    if need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
             probs: torch.Tensor = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
                 vocab_parallel_logits,

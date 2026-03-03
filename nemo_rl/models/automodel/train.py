@@ -156,9 +156,7 @@ def apply_top_k_top_p_filtering_for_local_logits(
     Returns:
         torch.Tensor: Filtered logits
     """
-    if sampling_params is not None and need_top_k_or_top_p_filtering(
-        sampling_params.top_k, sampling_params.top_p
-    ):
+    if need_top_k_or_top_p_filtering(sampling_params):
         logits, _ = apply_top_k_top_p(
             logits,
             top_k=sampling_params.top_k,

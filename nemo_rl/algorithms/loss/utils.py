@@ -102,9 +102,7 @@ def prepare_loss_input(
         )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if sampling_params is not None and need_top_k_or_top_p_filtering(
-            sampling_params.top_k, sampling_params.top_p
-        ):
+        if need_top_k_or_top_p_filtering(sampling_params):
             # mask out negative infinity logprobs
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
             logprobs = _mask_out_neg_inf_logprobs(
