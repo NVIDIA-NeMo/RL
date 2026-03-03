@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -42,7 +43,6 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.utils import TrainingSamplingParams
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[

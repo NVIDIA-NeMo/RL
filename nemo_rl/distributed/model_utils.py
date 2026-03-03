@@ -17,7 +17,7 @@ from typing import Any, Optional
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-from nemo_rl.models.policy.utils import (
+from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
