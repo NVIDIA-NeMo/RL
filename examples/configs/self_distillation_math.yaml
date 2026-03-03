@@ -5,9 +5,9 @@ distillation:
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 10
-  val_batch_size: 32
-  val_period: 5
-  val_at_start: false
+  val_batch_size: 16
+  val_period: 40
+  val_at_start: true
   val_at_end: false
   max_val_samples: 512
   topk_logits_k: 200
@@ -59,6 +59,17 @@ policy: &POLICY_BASE
     tensor_parallel_size: 2
     context_parallel_size: 2
     custom_parallel_plan: null
+    lora_cfg:
+      enabled: true
+      dim: 64
+      alpha: 128
+      match_all_linear: true
+      # target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+      # exclude_modules: []
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: false  # must be false when tensor_parallel_size > 1
 
   dynamic_batching:
     enabled: true
@@ -166,7 +177,7 @@ policy: &POLICY_BASE
   generation:
     backend: "vllm"
     max_new_tokens: ${..max_total_sequence_length}
-    temperature: 1.0
+    temperature: 1.2
     top_p: 1.0
     top_k: null
     stop_token_ids: null
