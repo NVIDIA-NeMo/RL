@@ -285,6 +285,8 @@ policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
 policy.megatron_cfg.context_parallel_size=${T_CP} \
 policy.megatron_cfg.defer_fp32_logits=true \
 policy.megatron_cfg.activation_checkpointing=true \
+policy.megatron_cfg.moe_permute_fusion=true \
+policy.sequence_packing.enabled=true \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
 checkpointing.enabled=false \
@@ -331,6 +333,8 @@ policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
 policy.megatron_cfg.context_parallel_size=${T_CP} \
 policy.megatron_cfg.defer_fp32_logits=true \
 policy.megatron_cfg.activation_checkpointing=true \
+policy.megatron_cfg.moe_permute_fusion=true \
+policy.sequence_packing.enabled=true \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
 checkpointing.enabled=false \
@@ -1104,9 +1108,60 @@ policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
 policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
 policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
 policy.megatron_cfg.context_parallel_size=${T_CP} \
+policy.megatron_cfg.moe_permute_fusion=true \
+policy.sequence_packing.enabled=true \
 grpo.num_prompts_per_step=64 \
 grpo.num_generations_per_prompt=8 \
 policy.train_global_batch_size=512 \
+grpo.async_grpo.enabled=false \
+grpo.val_period=1000 \
+checkpointing.enabled=false \
+grpo.max_num_steps=10 \
+logger.wandb_enabled=True \
+logger.wandb.project='${WANDB_PROJECT}' \
+logger.wandb.name='${WANDB_NAME}'"
+        ;;
+
+    # ========================================
+    # GPT-OSS-120B: 4 Nodes, 2048 GBS (32 B200 GPUs)
+    # Same parallelism as gptoss120b_4node but with larger rollout:
+    # 64 prompts × 32 generations = 2048 total samples per step
+    # moe_permute_fusion + sequence_packing enabled
+    # ========================================
+    gptoss120b_4node_2048gbs)
+        NUM_NODES=4
+        CONFIG_FILE="examples/configs/recipes/llm/grpo-gptoss-120b-4n8g-megatron.yaml"
+        G_TP=8
+        G_PP=1
+        T_EP=8
+        T_TP=2
+        T_PP=1
+        T_CP=1
+        WANDB_NAME="GPTOSS120B_4n8g_fused_2048gbs"
+        
+        echo "[INFO] Running GPT-OSS-120B on 4 nodes (32 B200 GPUs) - 2048 GBS"
+        echo "  - Model: openai/gpt-oss-120b (117B params, 128 experts)"
+        echo "  - Nodes: ${NUM_NODES} (32 GPUs × 192GB = 6144GB total)"
+        echo "  - Training: EP=${T_EP}, TP=${T_TP}, DP=2"
+        echo "  - Generation: vLLM TP=${G_TP}"
+        echo "  - 2048 total samples (64 prompts × 32 gen), 10 steps"
+        echo "  - moe_permute_fusion=true, sequence_packing=true"
+        
+        COMMAND="${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+--config ${CONFIG_FILE} \
+cluster.num_nodes=${NUM_NODES} \
+cluster.gpus_per_node=${GPUS_PER_NODE} \
+policy.generation.vllm_cfg.tensor_parallel_size=${G_TP} \
+policy.generation.vllm_cfg.pipeline_parallel_size=${G_PP} \
+policy.megatron_cfg.tensor_model_parallel_size=${T_TP} \
+policy.megatron_cfg.expert_model_parallel_size=${T_EP} \
+policy.megatron_cfg.pipeline_model_parallel_size=${T_PP} \
+policy.megatron_cfg.context_parallel_size=${T_CP} \
+policy.megatron_cfg.moe_permute_fusion=true \
+policy.sequence_packing.enabled=true \
+grpo.num_prompts_per_step=64 \
+grpo.num_generations_per_prompt=32 \
+policy.train_global_batch_size=2048 \
 grpo.async_grpo.enabled=false \
 grpo.val_period=1000 \
 checkpointing.enabled=false \
@@ -1339,6 +1394,7 @@ logger.wandb.name='${WANDB_NAME}'"
         echo ""
         echo "  === GPT-OSS-120B (4 nodes, 32 B200 GPUs - recommended) ==="
         echo "  gptoss120b_4node       - 120B, EP=8, TP=2, DP=2 (no CPU offload needed)"
+        echo "  gptoss120b_4node_2048gbs - 120B, 2048 GBS (64×32), moe_permute+seqpack"
         echo "  gptoss120b_4node_unfused - 120B + UNFUSED Attention (for fused vs unfused comparison)"
         echo "  gptoss120b_interactive_4node - 120B interactive 4-node"
         echo ""
