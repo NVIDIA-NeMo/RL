@@ -46,6 +46,12 @@ from transformers import (
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+    need_top_k_filtering,
+    need_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -71,12 +77,8 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    TrainingSamplingParams,
-    apply_top_k_top_p,
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
-    need_top_k_filtering,
-    need_top_p_filtering,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker

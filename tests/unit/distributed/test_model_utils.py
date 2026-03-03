@@ -17,6 +17,7 @@ import pytest
 import ray
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
@@ -36,9 +37,6 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-from nemo_rl.models.policy.utils import (
-    apply_top_k_top_p,
-)
 
 
 @ray.remote(num_gpus=1)

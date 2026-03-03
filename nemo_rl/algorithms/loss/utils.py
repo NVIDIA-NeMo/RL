@@ -16,15 +16,15 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
-)
-from nemo_rl.models.policy.utils import (
-    TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
 )
 
 
@@ -114,7 +114,7 @@ def prepare_loss_input(
                 data["prev_logprobs"], mask, "prev_logprobs"
             )
 
-            # currently only used for ClippedPGLossFn
+            # compute unfiltered logprobs for reference policy KL penalty
             if (
                 hasattr(loss_fn, "reference_policy_kl_penalty")
                 and loss_fn.reference_policy_kl_penalty != 0

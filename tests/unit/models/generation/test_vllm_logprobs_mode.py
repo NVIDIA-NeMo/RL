@@ -59,7 +59,7 @@ def test_processed_logprobs_matches_manual_computation():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from vllm import LLM, SamplingParams
 
-    from nemo_rl.models.policy.utils import apply_top_k_top_p
+    from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 
     # Use a small model for fast testing
     model_name = "facebook/opt-125m"
@@ -243,7 +243,7 @@ def test_apply_top_k_top_p_matches_vllm_upstream(top_k, top_p, test_name):
         apply_top_k_top_p as vllm_apply_top_k_top_p,
     )
 
-    from nemo_rl.models.policy.utils import apply_top_k_top_p
+    from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 
     # Test configuration
     batch_size = 4
