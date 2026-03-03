@@ -13,12 +13,25 @@
 # limitations under the License.
 
 from dataclasses import asdict
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import torch
 from packaging.version import Version as PkgVersion
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+# GPT-OSS may not be available in all transformers versions
+try:
+    from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+
+    _HAS_GPT_OSS = True
+except ImportError:
+    _HAS_GPT_OSS = False
+    GptOssConfig = None
 
 from nemo_rl.utils.flops_formulas import (
     FLOPSConfig,
@@ -43,144 +56,99 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
     )
 
 
-# =============================================================================
-# Config Builders: Functions that extract FLOPSConfig from HuggingFace configs
-# =============================================================================
-
-
-def _build_qwen2_config(config: Any) -> FLOPSConfig:
-    """Build FLOPSConfig for Qwen2 models."""
-    return FLOPSConfig(
-        gbs=0,
-        hs=config.hidden_size,
-        layers=config.num_hidden_layers,
-        ffn_hs=config.intermediate_size,
-        vocab_size=config.vocab_size,
-    )
-
-
-def _build_qwen3_config(config: Any) -> FLOPSConfig:
-    """Build FLOPSConfig for Qwen3/Qwen3MoE models."""
-    return FLOPSConfig(
-        gbs=0,
-        hs=config.hidden_size,
-        layers=config.num_hidden_layers,
-        ffn_hs=config.intermediate_size,
-        vocab_size=config.vocab_size,
-        query_groups=config.num_key_value_heads,
-        attention_heads=config.num_attention_heads,
-        moe_ffn_hidden_size=config.intermediate_size,
-        moe_router_topk=1,
-    )
-
-
-def _build_llama_config(config: Any) -> FLOPSConfig:
-    """Build FLOPSConfig for Llama models."""
-    return FLOPSConfig(
-        gbs=0,
-        hs=config.hidden_size,
-        layers=config.num_hidden_layers,
-        ffn_hs=config.intermediate_size,
-        query_groups=config.num_key_value_heads,
-        attention_heads=config.num_attention_heads,
-        vocab_size=config.vocab_size,
-    )
-
-
-def _build_deepseekv3_config(config: Any) -> FLOPSConfig:
-    """Build FLOPSConfig for DeepSeek V3 models."""
-    return FLOPSConfig(
-        gbs=0,
-        hs=config.hidden_size,
-        layers=config.num_hidden_layers,
-        ffn_hs=config.intermediate_size,
-        attention_heads=config.num_attention_heads,
-        moe_router_topk=config.num_experts_per_tok,
-        query_groups=config.num_key_value_heads,
-        vocab_size=config.vocab_size,
-        q_lora_rank=config.q_lora_rank,
-        kv_lora_rank=config.kv_lora_rank,
-        qk_head_dim=config.qk_nope_head_dim,
-        qk_pos_emb_head_dim=config.qk_rope_head_dim,
-        v_head_dim=config.v_head_dim,
-        moe_layer_freq=1,
-        moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-        moe_ffn_hidden_size=config.moe_intermediate_size,
-        mtp_num_layers=0,
-        causal_self_attn=True,
-    )
-
-
-def _build_gpt_oss_config(config: Any) -> FLOPSConfig:
-    """Build FLOPSConfig for GPT-OSS models (SWA + MoE)."""
-    return FLOPSConfig(
-        gbs=0,
-        hs=config.hidden_size,
-        layers=config.num_hidden_layers,
-        ffn_hs=config.intermediate_size,
-        attention_heads=config.num_attention_heads,
-        query_groups=getattr(config, "num_key_value_heads", config.num_attention_heads),
-        vocab_size=config.vocab_size,
-        moe_router_topk=getattr(config, "num_experts_per_tok", 1),
-        moe_ffn_hidden_size=getattr(config, "moe_ffn_hidden_size", config.intermediate_size),
-        kv_channels=getattr(config, "kv_channels", None),
-        swa_window_size=config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128,
-        window_attn_skip_freq=getattr(config, "window_attn_skip_freq", 2),
-    )
-
-
-# =============================================================================
-# Registry: Maps config class names to (config_builder, flops_formula) tuples
-# =============================================================================
-
-# Registry mapping class names to (config_builder, formula) tuples
-_FLOPS_REGISTRY: dict[str, tuple[Callable[[Any], FLOPSConfig], Callable]] = {
-    # Qwen family
-    "Qwen2Config": (_build_qwen2_config, qwen2),
-    "Qwen3Config": (_build_qwen3_config, qwen3),
-    "Qwen3MoeConfig": (_build_qwen3_config, qwen3),
-    # Llama family
-    "LlamaConfig": (_build_llama_config, llama),
-    # DeepSeek V3
-    "DeepseekV3Config": (_build_deepseekv3_config, deepseekv3),
-    # GPT-OSS
-    "GptOssConfig": (_build_gpt_oss_config, gpt_oss),
-}
-
-# Fallback registry by model_type (for configs loaded via AutoConfig with trust_remote_code)
-_MODEL_TYPE_REGISTRY: dict[str, tuple[Callable[[Any], FLOPSConfig], Callable]] = {
-    "qwen2": (_build_qwen2_config, qwen2),
-    "qwen3": (_build_qwen3_config, qwen3),
-    "qwen3_moe": (_build_qwen3_config, qwen3),
-    "llama": (_build_llama_config, llama),
-    "deepseek_v3": (_build_deepseekv3_config, deepseekv3),
-    "gpt_oss": (_build_gpt_oss_config, gpt_oss),
-}
-
-
 def convert_config_to_flops_config(
     config: PretrainedConfig,
 ) -> tuple[FLOPSConfig, Callable]:
-    """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula.
+    """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula."""
+    if isinstance(config, Qwen2Config):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+        ), qwen2
+    elif isinstance(config, (Qwen3Config, Qwen3MoeConfig)):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            query_groups=config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            # for non-MoE models, we use the intermediate size as the ffn hidden size
+            moe_ffn_hidden_size=config.intermediate_size,
+            moe_router_topk=1,
+        ), qwen3
+    elif isinstance(config, LlamaConfig):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            query_groups=config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            vocab_size=config.vocab_size,
+        ), llama
+    elif _HAS_GPT_OSS and isinstance(config, GptOssConfig):
+        # GPT-OSS: MoE model with sliding window attention
+        # Extract MoE FFN hidden size (may be different from intermediate_size)
+        moe_ffn_hidden_size = getattr(
+            config, "moe_ffn_hidden_size", config.intermediate_size
+        )
 
-    Uses a registry-based approach for extensibility:
-    1. First tries to match by config class name
-    2. Falls back to matching by model_type attribute
-    """
-    config_class_name = config.__class__.__name__
+        # Extract sliding window attention parameters
+        # window_size is typically a tuple (left, right), we use left as the window size
+        window_size = getattr(config, "window_size", None)
+        swa_window_size = window_size[0] if window_size else 128
 
-    # Try exact class name match first
-    if config_class_name in _FLOPS_REGISTRY:
-        config_builder, formula = _FLOPS_REGISTRY[config_class_name]
-        return config_builder(config), formula
+        # window_attn_skip_freq: if N, every Nth layer uses full attention
+        window_attn_skip_freq = getattr(config, "window_attn_skip_freq", 2)
 
-    # Fallback: try model_type attribute
-    model_type = getattr(config, "model_type", None)
-    if model_type and model_type in _MODEL_TYPE_REGISTRY:
-        config_builder, formula = _MODEL_TYPE_REGISTRY[model_type]
-        return config_builder(config), formula
+        # kv_channels may be explicitly set or derived from hidden_size / num_heads
+        kv_channels = getattr(
+            config, "kv_channels", config.hidden_size // config.num_attention_heads
+        )
 
-    raise ValueError(f"Unsupported config type: {type(config)}")
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            moe_ffn_hidden_size=moe_ffn_hidden_size,
+            moe_router_topk=config.num_experts_per_tok,
+            swa_window_size=swa_window_size,
+            window_attn_skip_freq=window_attn_skip_freq,
+            kv_channels=kv_channels,
+            gated_linear_unit=True,  # GPT-OSS uses SwiGLU
+        ), gpt_oss
+    elif config.__class__.model_type == "deepseek_v3":
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            moe_router_topk=config.num_experts_per_tok,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_head_dim=config.qk_nope_head_dim,
+            qk_pos_emb_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            moe_layer_freq=1,
+            moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            mtp_num_layers=0,
+            causal_self_attn=True,
+        ), deepseekv3
+    else:
+        raise ValueError(f"Unsupported config type: {type(config)}")
 
 
 def is_using_tf32() -> bool:
