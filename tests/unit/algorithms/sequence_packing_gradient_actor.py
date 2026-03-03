@@ -150,7 +150,9 @@ class SequencePackingGradientTestActor:
         global_valid_seqs = torch.tensor(batch_size, dtype=torch.float, device="cuda")
 
         # Forward pass
-        loss_input = prepare_loss_input(baseline_logits, data_dict, base_loss_fn)
+        loss_input, data_dict = prepare_loss_input(
+            baseline_logits, data_dict, base_loss_fn
+        )
         baseline_loss, _ = base_loss_fn(
             data=data_dict,
             global_valid_seqs=global_valid_seqs,

@@ -174,18 +174,17 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
 
         self.is_generation_colocated = None
+        self.sampling_params = None
         if "generation" in config and config["generation"] is not None:
-            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
-
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            generation_cfg = self.cfg["generation"]
+            generation_cfg = config["generation"]
+            # set generation colocated
+            self.is_generation_colocated = generation_cfg["colocated"]["enabled"]
+            # set sampling params
             self.sampling_params = TrainingSamplingParams(
                 top_k=generation_cfg.get("top_k", None),
                 top_p=generation_cfg.get("top_p", 1.0),
                 temperature=generation_cfg.get("temperature", 1.0),
             )
-        else:
-            self.sampling_params = None
 
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -816,7 +815,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 global_valid_toks,
                             )
                         else:
-                            loss_input = prepare_loss_input(logits, mb, loss_fn)
+                            loss_input, mb = prepare_loss_input(logits, mb, loss_fn)
                             loss, loss_metrics = loss_fn(
                                 data=mb,
                                 global_valid_seqs=global_valid_seqs,

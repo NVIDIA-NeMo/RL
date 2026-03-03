@@ -359,7 +359,7 @@ def forward_with_post_processing_fn(
 
 def automodel_forward_backward(
     model: nn.Module,
-    cfg: PolicyConfig,
+    sampling_params: TrainingSamplingParams,
     data_iterator: Iterator[ProcessedMicrobatch],
     post_processing_fn: PostProcessingFunction,
     forward_only: bool = False,
@@ -385,7 +385,7 @@ def automodel_forward_backward(
 
     Args:
         model: The model to train
-        cfg: Configuration dictionary
+        sampling_params: Sampling parameters
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         num_microbatches: Number of microbatches to process
         post_processing_fn: Post-processing function to apply to the logits
@@ -430,7 +430,7 @@ def automodel_forward_backward(
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
-                cfg=cfg,
+                sampling_params=sampling_params,
                 post_processing_fn=post_processing_fn,
                 processed_mb=processed_mb,
                 is_reward_model=is_reward_model,

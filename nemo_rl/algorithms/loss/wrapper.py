@@ -165,7 +165,7 @@ def wrap_loss_fn_with_input_preparation(
 ) -> tuple[Tensor, dict[str, Any]]:
     """Wraps a loss function to handle input preparation for megatron policy worker."""
     # prepare loss input
-    loss_input = prepare_fn(
+    loss_input, data = prepare_fn(
         logits=next_token_logits,
         data=data,
         loss_fn=loss_fn,

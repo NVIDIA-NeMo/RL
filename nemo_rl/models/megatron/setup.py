@@ -196,10 +196,19 @@ def validate_and_set_config(
     pretrained_path,
     weights_path,
 ):
-    # Handle generation colocation
+    # Handle generation configuration
     is_generation_colocated = None
+    sampling_params = None
     if "generation" in config and config["generation"] is not None:
-        is_generation_colocated = config["generation"]["colocated"]["enabled"]
+        generation_cfg = config["generation"]
+        # set generation colocated
+        is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg.get("top_k", None),
+            top_p=generation_cfg.get("top_p", 1.0),
+            temperature=generation_cfg.get("temperature", 1.0),
+        )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -217,16 +226,6 @@ def validate_and_set_config(
     # Optimizer configuration
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
-
-    # Sampling parameters configuration
-    sampling_params = None
-    if "generation" in config and config["generation"] is not None:
-        generation_cfg = config["generation"]
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg.get("top_k", None),
-            top_p=generation_cfg.get("top_p", 1.0),
-            temperature=generation_cfg.get("temperature", 1.0),
-        )
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
