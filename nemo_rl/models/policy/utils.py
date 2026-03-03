@@ -275,11 +275,21 @@ def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]
 
     Note: expandable_segments configuration is handled directly in the worker init methods
     to ensure proper GPU detection after CUDA initialization.
+
+    Propagates CUDNN_HOME and LD_LIBRARY_PATH from the driver so that transformer_engine
+    in Ray workers loads the same cuDNN as the head (avoids undefined symbol errors with
+    libcudnn_graph.so.9 when TE and system cuDNN versions differ).
     """
-    runtime_env = {
+    runtime_env: dict[str, Any] = {
         **get_nsight_config_if_pattern_matches(policy_worker_name),
     }
-
+    env_vars = runtime_env.get("env_vars") or {}
+    for key in ("CUDNN_HOME", "LD_LIBRARY_PATH"):
+        val = os.environ.get(key)
+        if val:
+            env_vars[key] = val
+    if env_vars:
+        runtime_env["env_vars"] = env_vars
     return runtime_env
 
 
