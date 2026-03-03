@@ -44,7 +44,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     observations: list[dict[str, str]]
     metadata: list[MetadataT]
     next_stop_strings: list[list[str] | None] | list[None]
-    rewards: Tensor
+    rewards: Tensor ## This could be of different shape
     terminateds: Tensor
     answers: list[str | None] | None
 
