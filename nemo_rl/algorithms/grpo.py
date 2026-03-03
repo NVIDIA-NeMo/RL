@@ -17,7 +17,6 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -542,13 +541,7 @@ def setup(
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths
-    if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
@@ -2009,7 +2002,9 @@ def grpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -3042,7 +3037,9 @@ def async_grpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
