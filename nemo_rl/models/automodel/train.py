@@ -547,14 +547,15 @@ class LossPostProcessor:
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
 
-        # Wrap loss function for sequence packing if needed
-        wrapped_prepare_loss_input = partial(
+        # Wrap prepare_loss_input with sampling_params
+        prepare_loss_input_wrapped = partial(
             prepare_loss_input, sampling_params=self.sampling_params
         )
+        # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
-                prepare_fn=wrapped_prepare_loss_input,
+                prepare_fn=prepare_loss_input_wrapped,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
@@ -565,7 +566,7 @@ class LossPostProcessor:
                 global_valid_toks,
             )
         else:
-            loss_input, mb = wrapped_prepare_loss_input(logits, mb, self.loss_fn)
+            loss_input, mb = prepare_loss_input_wrapped(logits, mb, self.loss_fn)
             loss, loss_metrics = self.loss_fn(
                 data=mb,
                 global_valid_seqs=global_valid_seqs,

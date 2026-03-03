@@ -66,6 +66,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
@@ -194,7 +195,6 @@ def validate_and_set_config(
     hf_model_name,
     pretrained_path,
     weights_path,
-    tokenizer,
 ):
     # Handle generation colocation
     is_generation_colocated = None
@@ -217,6 +217,16 @@ def validate_and_set_config(
     # Optimizer configuration
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
+
+    # Sampling parameters configuration
+    sampling_params = None
+    if "generation" in config and config["generation"] is not None:
+        generation_cfg = config["generation"]
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg.get("top_k", None),
+            top_p=generation_cfg.get("top_p", 1.0),
+            temperature=generation_cfg.get("temperature", 1.0),
+        )
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
@@ -242,6 +252,7 @@ def validate_and_set_config(
         optimizer_cpu_offload,
         offload_optimizer_for_logprob,
         is_generation_colocated,
+        sampling_params,
         final_padded_vocab_size,
     )
 
