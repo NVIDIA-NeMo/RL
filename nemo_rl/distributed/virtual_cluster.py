@@ -153,9 +153,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
             return
 
-    except ConnectionError:
+    except (ConnectionError, ValueError):
         logger.debug("No existing Ray cluster found, will start a new one.")
         # If ConnectionError, proceed to start a new local cluster without further action here.
+        # ValueError can occur when a stale session directory exists but the Ray daemon is dead
+        # (e.g. node_ip_address.json never written → 60s timeout → ValueError).
         # Clear driver-side package cache so working_dir is re-uploaded
         ray.shutdown()
         pass
