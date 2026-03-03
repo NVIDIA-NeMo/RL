@@ -274,7 +274,7 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           runner: ${{ runner.name }}
-          registry: ${{ needs.org-member-pre-flight.outputs.registry }}/megatron-bridge
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: megatron-bridge
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
