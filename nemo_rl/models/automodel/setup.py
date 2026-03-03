@@ -73,8 +73,17 @@ def validate_and_prepare_config(
     # Set basic configuration
     is_vlm = processor is not None
     is_generation_colocated = None
+    sampling_params = None
     if "generation" in config and config["generation"] is not None:
-        is_generation_colocated = config["generation"]["colocated"]["enabled"]
+        generation_cfg = config["generation"]
+        # set generation colocated
+        is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg.get("top_k", None),
+            top_p=generation_cfg.get("top_p", 1.0),
+            temperature=generation_cfg.get("temperature", 1.0),
+        )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -90,16 +99,6 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
-
-    # Sampling parameters configuration
-    sampling_params = None
-    if "generation" in config and config["generation"] is not None:
-        generation_cfg = config["generation"]
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg.get("top_k", None),
-            top_p=generation_cfg.get("top_p", 1.0),
-            temperature=generation_cfg.get("temperature", 1.0),
-        )
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
