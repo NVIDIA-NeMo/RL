@@ -23,10 +23,8 @@ from unittest.mock import MagicMock
 import ray
 import torch
 
-from nemo_rl.algorithms.loss_functions import (
-    ClippedPGLossFn,
-    SequencePackingLossWrapper,
-)
+from nemo_rl.algorithms.loss import ClippedPGLossFn, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss.utils import prepare_loss_input
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -152,11 +150,12 @@ class SequencePackingGradientTestActor:
         global_valid_seqs = torch.tensor(batch_size, dtype=torch.float, device="cuda")
 
         # Forward pass
-        baseline_loss, baseline_metrics = base_loss_fn(
-            baseline_logits,
-            data_dict,
-            global_valid_seqs,
-            global_valid_toks,
+        loss_input = prepare_loss_input(baseline_logits, data_dict, base_loss_fn)
+        baseline_loss, _ = base_loss_fn(
+            data=data_dict,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
         )
 
         # Backward pass
@@ -218,26 +217,26 @@ class SequencePackingGradientTestActor:
         packed_logits = make_packed_logits(baseline_logits)
 
         # Create sequence packing wrapper
+        tp_group = torch.distributed.new_group(ranks=[rank])
         wrapper = SequencePackingLossWrapper(
             loss_fn=base_loss_fn,
+            prepare_fn=prepare_loss_input,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_q_padded=cu_seqlens_padded,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group,
         )
 
         # Create data dict for packed sequences
         packed_data_dict = BatchedDataDict(original_data)
 
-        tp_group = torch.distributed.new_group(ranks=[rank])
-
         # Forward pass
-        packed_loss, packed_metrics = wrapper(
+        packed_loss, _ = wrapper(
             packed_logits,
             packed_data_dict,
             global_valid_seqs,
             global_valid_toks,
-            vocab_parallel_rank=0,
-            vocab_parallel_group=tp_group,
-            context_parallel_group=cp_group,
         )
 
         # Backward pass

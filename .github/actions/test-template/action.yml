@@ -58,6 +58,10 @@ inputs:
     description: "Whether this is a pull request from a fork"
     required: false
     default: "false"
+  image-tag:
+    description: "Override container image tag. If set, infers FAST=1 and prefetches venvs + regenerates fingerprint at startup."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -144,7 +148,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ github.run_id }}
+        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}
 
     - name: Create UUID
       id: uuid
@@ -176,16 +180,24 @@ runs:
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
           ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
+          ${{ inputs.image-tag != '' && '--env FAST=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
           --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
           --volume /mnt/datadrive/TestData/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \
           --volume /mnt/datadrive/TestData/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
           --volume /mnt/datadrive/TestData/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -eux -o pipefail -c '\
+          nemoci.azurecr.io/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
+            # When reusing a pre-built container (FAST=1), prefetch venvs and regenerate the
+            # fingerprint once upfront instead of using NRL_FORCE_REBUILD_VENVS=true which
+            # rebuilds on every Ray remote call.
+            if [[ "${FAST:-0}" == "1" ]]; then
+              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+              python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+            fi
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
 

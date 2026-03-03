@@ -48,7 +48,7 @@ from megatron.core.parallel_state import (
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import (
@@ -541,10 +541,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                     model_state_dict[name] = item
 
-                self.model.load_state_dict(self.reference_state_dict, strict=True)
-                # for name, item in self.reference_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(self.reference_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -556,11 +556,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
-                self.model.load_state_dict(model_state_dict, strict=True)
-                # for name, item in model_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
-                # self.model.state_dict()[name] = item
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(model_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()

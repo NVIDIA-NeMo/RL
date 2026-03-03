@@ -31,8 +31,8 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -473,8 +473,8 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
         """
-        self.loss_fn = loss_fn
-        self.cfg = cfg
+        self.loss_fn: LossFunction = loss_fn
+        self.cfg: PolicyConfig = cfg
         self.device_mesh = device_mesh
         self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
@@ -515,20 +515,26 @@ class LossPostProcessor:
 
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
-            loss_fn_ = SequencePackingLossWrapper(
+            loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
+                prepare_fn=prepare_loss_input,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
+            loss, loss_metrics = loss_fn(
+                logits,
+                mb,
+                global_valid_seqs,
+                global_valid_toks,
+            )
         else:
-            loss_fn_ = self.loss_fn
-
-        loss, loss_metrics = loss_fn_(
-            logits,
-            mb,
-            global_valid_seqs,
-            global_valid_toks,
-        )
+            loss_input = prepare_loss_input(logits, mb, self.loss_fn)
+            loss, loss_metrics = self.loss_fn(
+                data=mb,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **loss_input,
+            )
 
         return loss, loss_metrics
 
