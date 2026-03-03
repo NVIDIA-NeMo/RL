@@ -109,7 +109,7 @@ class SequencePackingLossWrapper:
             )
 
             # prepare data for loss function
-            loss_input = self.prepare_fn(
+            loss_input, unpadded_seq_data = self.prepare_fn(
                 logits=next_token_logits_slice,
                 data=unpadded_seq_data,
                 loss_fn=self.loss_fn,
