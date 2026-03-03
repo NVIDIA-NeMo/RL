@@ -32,7 +32,11 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -124,20 +128,42 @@ def extract_logits(
 
 
 def apply_temperature_scaling(
-    logits: torch.Tensor,
-    cfg: PolicyConfig,
+    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
     """Apply temperature scaling to logits.
 
     Args:
         logits: Logits tensor to scale
-        cfg: Configuration dictionary containing generation settings
+        sampling_params: Sampling parameters
 
     Returns:
         torch.Tensor: Temperature-scaled logits
     """
-    if "generation" in cfg and cfg["generation"] is not None:
-        logits.div_(cfg["generation"]["temperature"])
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        logits.div_(sampling_params.temperature)
+    return logits
+
+
+def apply_top_k_top_p_filtering_for_local_logits(
+    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
+) -> torch.Tensor:
+    """Apply top-k and top-p filtering to the non-distributed logits.
+
+    Args:
+        logits: Logits tensor to filter
+        sampling_params: Sampling parameters
+
+    Returns:
+        torch.Tensor: Filtered logits
+    """
+    if sampling_params is not None and need_top_k_or_top_p_filtering(
+        sampling_params.top_k, sampling_params.top_p
+    ):
+        logits, _ = apply_top_k_top_p(
+            logits,
+            top_k=sampling_params.top_k,
+            top_p=sampling_params.top_p,
+        )
     return logits
 
 
@@ -233,7 +259,7 @@ def prepare_data_for_cp(
 
 def forward_with_post_processing_fn(
     model: nn.Module,
-    cfg: PolicyConfig,
+    sampling_params: TrainingSamplingParams,
     post_processing_fn: PostProcessingFunction,
     processed_mb: ProcessedMicrobatch,
     is_reward_model: bool = False,
@@ -253,7 +279,7 @@ def forward_with_post_processing_fn(
 
     Args:
         model: The model to run forward pass on
-        cfg: Configuration dictionary
+        sampling_params: Sampling parameters
         post_processing_fn: Post-processing function to apply to the logits
         processed_mb: Pre-fetched ProcessedMicrobatch containing data and processed inputs
         is_reward_model: Whether this is a reward model
@@ -290,7 +316,10 @@ def forward_with_post_processing_fn(
         post_processing_fn,
         (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
-        logits = apply_temperature_scaling(logits, cfg)
+        # Temperature scaling is element-wise, directly applying it here.
+        # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
+        # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
+        logits = apply_temperature_scaling(logits, sampling_params)
 
     # Apply the post-processing function directly based on type
     if isinstance(post_processing_fn, LossPostProcessor):
@@ -558,6 +587,7 @@ class LogprobsPostProcessor:
         tp_mesh: Any,
         cp_size: int,
         enable_seq_packing: bool = False,
+        sampling_params: Optional[TrainingSamplingParams] = None,
     ):
         """Initialize LogprobsPostProcessor.
 
@@ -568,6 +598,7 @@ class LogprobsPostProcessor:
             tp_mesh: Tensor parallel mesh
             cp_size: Context parallel size
             enable_seq_packing: Whether sequence packing is enabled
+            sampling_params: Sampling parameters
         """
         self.cfg = cfg
         self.device_mesh = device_mesh
@@ -575,6 +606,7 @@ class LogprobsPostProcessor:
         self.tp_mesh = tp_mesh
         self.cp_size = cp_size
         self.enable_seq_packing = enable_seq_packing
+        self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
 
     def __call__(
@@ -627,17 +659,21 @@ class LogprobsPostProcessor:
                 input_ids_dtensor,
                 seq_index_tensor,
                 chunk_size=self.logprob_chunk_size,
+                sampling_params=self.sampling_params,  # top-k and top-p filtering
             )
 
             assert token_logprobs.shape[1] == seq_len - 1
         else:
             if isinstance(logits, DTensor):
+                # DTensor path with TP sharding
                 token_logprobs = get_logprobs_from_vocab_parallel_logits(
                     logits,
                     processed_inputs.input_ids,
                     chunk_size=self.logprob_chunk_size,
+                    sampling_params=self.sampling_params,  # top-k and top-p filtering
                 )
             else:
+                # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
                     logits, processed_inputs.input_ids
                 )
@@ -703,12 +739,18 @@ class LogprobsPostProcessor:
                     (chunk_idx + 1) * self.logprob_chunk_size,
                 )
                 chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
+                chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
+                    chunk_logits, self.sampling_params
+                )
                 log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
                 chunked_log_probs.append(log_probs)
             log_probs = torch.cat(chunked_log_probs, dim=1)
             del chunked_log_probs
         else:
             logits = logits.to(torch.float32)
+            logits = apply_top_k_top_p_filtering_for_local_logits(
+                logits, self.sampling_params
+            )
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         # Extract logprobs for each token in the sequence by gathering the logprob
