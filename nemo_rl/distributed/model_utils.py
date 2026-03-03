@@ -1261,8 +1261,27 @@ def get_next_token_logprobs_from_logits(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-):
-    """Computes next token log probabilities from logits."""
+    sampling_params: Optional[TrainingSamplingParams] = None,
+) -> torch.Tensor:
+    """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
+
+    This function handles three cases:
+    1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs
+    2. DTensor: uses get_logprobs_from_vocab_parallel_logits
+    3. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather
+
+    Args:
+        input_ids: Input token IDs of shape [batch_size, seq_len]
+        next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size]
+        seq_index: Sequence index tensor for DTensor path
+        vocab_parallel_rank: Rank in the vocab parallel group (required if vocab_parallel_group is provided)
+        vocab_parallel_group: Process group for vocab parallelism
+        context_parallel_group: Process group for context parallelism
+        sampling_params: Sampling parameters for top-k/top-p filtering
+
+    Returns:
+        Token log-probabilities of shape [batch_size, seq_len - 1]
+    """
     next_token_logits = next_token_logits.to(torch.float32)
 
     if vocab_parallel_group is not None:
@@ -1277,16 +1296,29 @@ def get_next_token_logprobs_from_logits(
             tp_group=vocab_parallel_group,
             inference_only=False,
             cp_group=context_parallel_group,
+            sampling_params=sampling_params,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
+
     elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
         logprobs = get_logprobs_from_vocab_parallel_logits(
-            next_token_logits, input_ids, seq_index=seq_index
+            next_token_logits,
+            input_ids,
+            seq_index=seq_index,
+            sampling_params=sampling_params,
         )
+
     else:
         # Remove last position's logits
         next_token_logits_wo_last = next_token_logits[:, :-1]
+        # Apply top-k and top-p filtering
+        next_token_logits_wo_last, _ = apply_top_k_top_p(
+            next_token_logits_wo_last,
+            top_k=sampling_params.top_k if sampling_params is not None else None,
+            top_p=sampling_params.top_p if sampling_params is not None else 1.0,
+        )
+        # Compute logprobs
         next_token_logprobs = torch.nn.functional.log_softmax(
             next_token_logits_wo_last, dim=-1
         )
@@ -1703,80 +1735,6 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
             del softmax_output, log_probs, logits, H_local
 
         return grad_input, None, None, None
-
-
-def compute_logprobs_from_logits(
-    next_token_logits: torch.Tensor,
-    input_ids: torch.Tensor,
-    vocab_parallel_rank: Optional[int],
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
-    context_parallel_group: Optional[torch.distributed.ProcessGroup],
-    seq_index: Optional[torch.Tensor],
-    sampling_params: Optional[TrainingSamplingParams],
-) -> torch.Tensor:
-    """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
-
-    This function handles three cases:
-    1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs
-    2. DTensor: uses get_logprobs_from_vocab_parallel_logits
-    3. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather
-
-    Args:
-        next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size]
-        input_ids: Input token IDs of shape [batch_size, seq_len]
-        vocab_parallel_rank: Rank in the vocab parallel group (required if vocab_parallel_group is provided)
-        vocab_parallel_group: Process group for vocab parallelism
-        context_parallel_group: Process group for context parallelism
-        seq_index: Sequence index tensor for DTensor path
-        sampling_params: Sampling parameters for top-k/top-p filtering
-
-    Returns:
-        Token log-probabilities of shape [batch_size, seq_len - 1]
-    """
-    next_token_logits = next_token_logits.to(torch.float32)
-
-    if vocab_parallel_group is not None:
-        assert vocab_parallel_rank is not None, (
-            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-        )
-        token_logprobs = from_parallel_logits_to_logprobs(
-            next_token_logits,
-            input_ids,
-            vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-            vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-            tp_group=vocab_parallel_group,
-            inference_only=False,
-            cp_group=context_parallel_group,
-            sampling_params=sampling_params,
-        )
-        # slice off to the correct length to remove potential CP padding
-        token_logprobs = token_logprobs[:, : input_ids.shape[1] - 1]
-    elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-        token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            next_token_logits,
-            input_ids,
-            seq_index=seq_index,
-            sampling_params=sampling_params,
-        )
-    else:
-        next_token_logits_wo_last = next_token_logits[
-            :, :-1
-        ]  # Remove last position's logits
-        # Apply top-k and top-p filtering
-        next_token_logits_wo_last, _ = apply_top_k_top_p(
-            next_token_logits_wo_last,
-            top_k=sampling_params.top_k if sampling_params is not None else None,
-            top_p=sampling_params.top_p if sampling_params is not None else 1.0,
-        )
-        next_token_logprobs = torch.nn.functional.log_softmax(
-            next_token_logits_wo_last, dim=-1
-        )
-        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
-        token_logprobs = next_token_logprobs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
-
-    return token_logprobs
 
 
 def all_to_all_vp2sq(

@@ -24,6 +24,7 @@ Key differences from megatron approach:
 """
 
 from collections import defaultdict
+from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 import torch
@@ -41,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.utils import TrainingSamplingParams
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -460,6 +462,7 @@ class LossPostProcessor:
         cp_size: int,
         dp_size: int,
         enable_seq_packing: bool = False,
+        sampling_params: Optional[TrainingSamplingParams] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -472,6 +475,7 @@ class LossPostProcessor:
             cp_size: Context parallel size
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
+            sampling_params: Sampling parameters
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -481,6 +485,7 @@ class LossPostProcessor:
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
+        self.sampling_params = sampling_params
 
     def __call__(
         self,
@@ -514,10 +519,13 @@ class LossPostProcessor:
             )
 
         # Wrap loss function for sequence packing if needed
+        wrapped_prepare_loss_input = partial(
+            prepare_loss_input, sampling_params=self.sampling_params
+        )
         if self.enable_seq_packing:
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
-                prepare_fn=prepare_loss_input,
+                prepare_fn=wrapped_prepare_loss_input,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
@@ -528,7 +536,7 @@ class LossPostProcessor:
                 global_valid_toks,
             )
         else:
-            loss_input = prepare_loss_input(logits, mb, self.loss_fn)
+            loss_input, mb = wrapped_prepare_loss_input(logits, mb, self.loss_fn)
             loss, loss_metrics = self.loss_fn(
                 data=mb,
                 global_valid_seqs=global_valid_seqs,
