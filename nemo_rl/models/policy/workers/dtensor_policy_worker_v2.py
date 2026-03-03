@@ -781,8 +781,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
             try:
@@ -796,10 +798,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     val = to_local_if_dtensor(v)
                     val.copy_(self.reference_model_state_dict[k])
 
-                # - self.model is the original reference_model, now on CUDA
-                # - curr_state_dict is the train model, now on CPU
-
-                # Save and adjust sampling_params for reference model
+                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+                # The reference policy has different weights, so its top-k/top-p set is
+                # inherently different from the current policy. Using filtered logprobs
+                # would cause -inf mismatches that cannot be resolved by masking.
+                # Note: We keep temperature scaling since it was applied to prev_logprobs.
                 saved_sampling_params = self.sampling_params
                 if saved_sampling_params is not None:
                     self.sampling_params = TrainingSamplingParams(
@@ -810,6 +813,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 else:
                     self.sampling_params = None
 
+                # - self.model is the original reference_model, now on CUDA
+                # - curr_state_dict is the train model, now on CPU
                 yield
 
             finally:

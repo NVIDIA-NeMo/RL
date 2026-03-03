@@ -48,6 +48,7 @@ from megatron.core.parallel_state import (
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -157,7 +158,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             hf_model_name,
             pretrained_path,
             weights_path,
-            tokenizer,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -167,6 +167,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             runtime_config.offload_optimizer_for_logprob
         )
         self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.sampling_params = runtime_config.sampling_params
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
@@ -317,6 +318,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
+                    sampling_params=self.sampling_params,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -328,7 +330,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Forward pass.
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
-                        cfg=self.cfg,
+                        sampling_params=self.sampling_params,
                         data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
@@ -486,14 +488,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            sampling_params=self.sampling_params,
+        )
+
         list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
+            sampling_params=self.sampling_params,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
             num_microbatches=num_microbatches,
-            post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
+            post_processing_fn=logprobs_post_processor,
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             straggler_timer=self.mcore_state.straggler_timer,
@@ -523,8 +530,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self):
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
@@ -550,11 +559,29 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     gc.collect()
                     torch.cuda.empty_cache()
 
+                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+                # The reference policy has different weights, so its top-k/top-p set is
+                # inherently different from the current policy. Using filtered logprobs
+                # would cause -inf mismatches that cannot be resolved by masking.
+                # Note: We keep temperature scaling since it was applied to prev_logprobs.
+                saved_sampling_params = self.sampling_params
+                if saved_sampling_params is not None:
+                    self.sampling_params = TrainingSamplingParams(
+                        top_k=None,
+                        top_p=1.0,
+                        temperature=saved_sampling_params.temperature,
+                    )
+                else:
+                    self.sampling_params = None
+
                 # - self.model is the original reference_model, now on CUDA
                 # - self.reference_model is the original model, now on CPU
                 yield
 
             finally:
+                # Restore sampling_params
+                self.sampling_params = saved_sampling_params
+
                 # Restore original references and device placement
                 for k, v in self.model.state_dict().items():
                     if isinstance(v, torch.Tensor):
@@ -613,7 +640,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
+            sampling_params=self.sampling_params,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
