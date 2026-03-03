@@ -42,10 +42,10 @@ data:
     prompt_file: "examples/prompts/cot.txt"
     system_prompt_file: "examples/prompts/gsm8k.txt"
     processor: "math_gdpo_data_processor"
-    env_name: "math"
+    env_name: "math_multi_reward"
 
 env:
-  math:
+  math_multi_reward:
     num_workers: 8
     math_verify_impl: "hf_math_verify"
 
