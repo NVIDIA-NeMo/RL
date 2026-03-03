@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -34,6 +36,30 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def get_nemo_gym_uv_cache_dir() -> str | None:
+    """Return the uv cache directory inside a container, or None outside one.
+
+    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
+    stores its caches in the expected shared path. Returns None outside a
+    container, meaning the caller should omit this arg and let Gym create the
+    cache locally (the default when you may not be able to write to /opt).
+    """
+    if not os.environ.get("NRL_CONTAINER"):
+        return None
+    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
+
+
+def get_nemo_gym_venv_dir() -> str | None:
+    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
+
+    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
+    the caller should omit this arg and let Gym create venvs locally (the
+    default when a container is not used since you may not be able to write
+    to /opt).
+    """
+    return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
 class NemoGymConfig(TypedDict):
