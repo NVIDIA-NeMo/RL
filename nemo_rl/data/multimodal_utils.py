@@ -20,7 +20,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -358,7 +357,7 @@ def load_media_from_message(
                     )
                 except (RuntimeError, FileNotFoundError, OSError) as e:
                     logger.warning("Audio loading failed. Fall back to decord.")
-                    # use decord
+                    import decord
                     loaded_audio = decord.AudioReader(
                         aud,
                         sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],

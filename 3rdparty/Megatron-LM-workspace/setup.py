@@ -48,7 +48,7 @@ CACHED_DEPENDENCIES = [
     "packaging>=24.2",
     # Dev dependencies from pyproject.toml
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.13.0",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
