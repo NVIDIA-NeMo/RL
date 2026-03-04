@@ -264,6 +264,7 @@ data:
 
   train:
     dataset_name: LiveCodeBench
+    variant: "release_v5"
     split_validation_size: 0.1
     seed: ${grpo.seed}
   validation: null

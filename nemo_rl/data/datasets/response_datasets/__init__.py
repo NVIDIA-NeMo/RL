@@ -101,6 +101,7 @@ __all__ = [
     "DeepScalerDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "LiveCodeBenchResponseDataset",
     "NemoGymDataset",
     "OasstDataset",
     "OpenAIFormatDataset",

@@ -37,6 +37,27 @@ VARIANT_TO_FILE = {
 }
 
 
+def _load_livecodebench(variant: str, data_file: str) -> Any:
+    """Load LiveCodeBench dataset with JSONL fallback for datasets>=4.x.
+
+    Uses JSONL loading by default (no remote code execution). Falls back to
+    the dataset script with trust_remote_code only if JSONL loading fails.
+    """
+    try:
+        return load_dataset(
+            "json",
+            data_files=f"hf://datasets/livecodebench/code_generation_lite/{data_file}",
+            split="train",
+        )
+    except Exception:
+        return load_dataset(
+            "livecodebench/code_generation_lite",
+            variant,
+            split="test",
+            trust_remote_code=True,
+        )
+
+
 class LiveCodeBenchDataset(RawDataset):
     """LiveCodeBench dataset for code generation GRPO training.
 
@@ -49,29 +70,17 @@ class LiveCodeBenchDataset(RawDataset):
         self.task_name = "LiveCodeBench"
         self.val_dataset = None
 
-        variant = kwargs.get("variant", "release_v5")
-        data_file = VARIANT_TO_FILE.get(variant, "test5.jsonl")
-        try:
-            ds = load_dataset(
-                "livecodebench/code_generation_lite",
-                variant,
-                split="test",
-                trust_remote_code=True,
-            )
-        except (RuntimeError, ValueError):
-            ds = load_dataset(
-                "json",
-                data_files=f"hf://datasets/livecodebench/code_generation_lite/{data_file}",
-                split="train",
-            )
+        variant = kwargs["variant"]
+        data_file = VARIANT_TO_FILE[variant]
+        ds = _load_livecodebench(variant, data_file)
 
         self.dataset = ds.map(
             self.format_data,
             remove_columns=ds.column_names,
         )
 
-        split_validation_size = kwargs.get("split_validation_size", 0)
-        seed = kwargs.get("seed", 42)
+        split_validation_size = kwargs["split_validation_size"]
+        seed = kwargs["seed"]
         self.split_train_validation(split_validation_size, seed)
 
     def _parse_test_cases(self, raw: Any) -> list[dict[str, str]]:

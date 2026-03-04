@@ -84,14 +84,8 @@ def load_eval_dataset(data_config):
             system_prompt_file=data_config["system_prompt_file"],
         )
     # livecodebench
-    elif dataset_name == "livecodebench":
-        base_dataset = LiveCodeBenchDataset(
-            variant="release_v5",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name.startswith("livecodebench_"):
-        variant = dataset_name.split("_", 1)[1]
+    elif dataset_name == "livecodebench" or dataset_name.startswith("livecodebench_"):
+        variant = data_config.get("variant", "release_v5") if dataset_name == "livecodebench" else dataset_name.split("_", 1)[1]
         base_dataset = LiveCodeBenchDataset(
             variant=variant,
             prompt_file=data_config["prompt_file"],

@@ -148,6 +148,9 @@ class CodeTestCaseVerifyWorker:
 
             all_passed = True
             for tc in test_cases:
+                if not isinstance(tc, dict):
+                    all_passed = False
+                    break
                 test_input = tc.get("input", "")
                 expected_output = tc.get("expected_output", tc.get("output", ""))
                 if not run_single_test(code, test_input, expected_output, timeout):

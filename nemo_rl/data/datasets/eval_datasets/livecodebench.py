@@ -47,6 +47,27 @@ VariantType = Literal[
 ]
 
 
+def _load_livecodebench(variant: str, data_file: str) -> Any:
+    """Load LiveCodeBench dataset with JSONL fallback for datasets>=4.x.
+
+    Uses JSONL loading by default (no remote code execution). Falls back to
+    the dataset script with trust_remote_code only if JSONL loading fails.
+    """
+    try:
+        return load_dataset(
+            "json",
+            data_files=f"hf://datasets/livecodebench/code_generation_lite/{data_file}",
+            split="train",
+        )
+    except Exception:
+        return load_dataset(
+            "livecodebench/code_generation_lite",
+            variant,
+            split="test",
+            trust_remote_code=True,
+        )
+
+
 class LiveCodeBenchDataset:
     """LiveCodeBench evaluation dataset.
 
@@ -60,20 +81,8 @@ class LiveCodeBenchDataset:
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
-        data_file = VARIANT_TO_FILE.get(variant, f"test{variant.replace('release_v', '')}.jsonl")
-        try:
-            ds = load_dataset(
-                "livecodebench/code_generation_lite",
-                variant,
-                split="test",
-                trust_remote_code=True,
-            )
-        except (RuntimeError, ValueError):
-            ds = load_dataset(
-                "json",
-                data_files=f"hf://datasets/livecodebench/code_generation_lite/{data_file}",
-                split="train",
-            )
+        data_file = VARIANT_TO_FILE[variant]
+        ds = _load_livecodebench(variant, data_file)
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
             task_name="livecodebench",
