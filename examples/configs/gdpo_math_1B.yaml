@@ -39,7 +39,7 @@ data:
     split: test
 
   default:
-    prompt_file: "examples/prompts/cot.txt"
+    prompt_file: null
     system_prompt_file: "examples/prompts/gsm8k.txt"
     processor: "math_gdpo_data_processor"
     env_name: "math_multi_reward"

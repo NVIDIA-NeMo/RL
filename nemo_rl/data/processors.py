@@ -381,6 +381,7 @@ def math_data_processor(
     return output
 
 
+# TODO: @yukih: unify to math_hf_data_processor once https://github.com/NVIDIA-NeMo/RL/issues/2060 is resolved.
 def math_gdpo_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -389,44 +390,36 @@ def math_gdpo_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
-
     user_message = datum_dict["messages"]
-    
-    # print(f"user_message {user_message}")
+    problem = user_message[0]["content"]
+    extra_env_info = {"ground_truth": user_message[1]["content"]}
 
-    problem = user_message[1]["content"]
-
-    extra_env_info = {"ground_truth": user_message[2]["content"]}
-
-    message_log: LLMMessageLogType = []
-
-
-    system_message = {
-        "role": "system",
-        "content": user_message[0]["content"]
-
-    }
-
-    user_message = {
-        "role": "user",
-        "content": problem,
-    }
-
+    # merge system prompt and user prompt
+    message_list = []
+    # system prompt
+    if task_data_spec.system_prompt:
+        message_list.append({
+            "role": "system",
+            "content": task_data_spec.system_prompt,
+        })
+    # user prompt
+    if task_data_spec.prompt:
+        problem = task_data_spec.prompt.format(problem)
+    message_list.append({"role": "user", "content": problem})
 
     message: list[str] = tokenizer.apply_chat_template(  # type: ignore
-        [system_message, user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-
-    user_message["token_ids"] = tokenizer(
-        message,
-        return_tensors="pt",
-        add_special_tokens=False,
+    token_ids = tokenizer(
+        message, return_tensors="pt", add_special_tokens=False
     )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 

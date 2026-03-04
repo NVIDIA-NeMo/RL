@@ -12,22 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any
 
 from datasets import load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
-
-
-def _load_system_prompt(system_prompt_file: str | None) -> str:
-    """Load system prompt from file. Returns empty string if path is None or missing."""
-    if not system_prompt_file:
-        return ""
-    if os.path.exists(system_prompt_file):
-        with open(system_prompt_file, "r", encoding="utf-8") as f:
-            return f.read()
-    raise FileNotFoundError(f"System prompt file {system_prompt_file!r} not found.")
 
 
 def _extract_hash_answer(text: str) -> str | None:
@@ -52,7 +41,6 @@ class GSM8KDataset(RawDataset):
     ) -> None:
         self.task_name = "gsm8k"
         self.extract_answer = extract_answer
-        self._system_prompt = _load_system_prompt(system_prompt_file)
 
         # load from huggingface
         self.dataset = load_dataset("openai/gsm8k", "main")[split]
@@ -71,7 +59,6 @@ class GSM8KDataset(RawDataset):
 
         return {
             "messages": [
-                {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": data["question"]},
                 {"role": "assistant", "content": answer},
             ],
