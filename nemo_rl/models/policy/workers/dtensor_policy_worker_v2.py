@@ -709,21 +709,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     )
 
                 all_teacher_logits = None
-                teacher_batch_offset = 0
 
                 # Reconstruct teacher tensor from IPC ONCE before the microbatch loop.
-                # teacher_logits is a merged dict: {rank: {vals_ipc, idx_ipc, actual_shape, is_topk}, ...}
                 teacher_logits_tensor = None
                 teacher_topk_indices_tensor = None
                 if not is_teacher and teacher_logits is not None:
-                    rank = torch.distributed.get_rank()
+                    list_index = torch.distributed.get_rank()
+                    dict_index = list_index
                     current_device_id = torch.cuda.current_device()
-                    rank_data = teacher_logits[rank]
-                    actual_shape = rank_data.get('actual_shape')
-                    is_topk = rank_data.get('is_topk', False)
-
+                    actual_shape = teacher_logits[list_index].get('actual_shape') if isinstance(teacher_logits[list_index], dict) else None
+                    is_topk = teacher_logits[list_index].get('is_topk', False) if isinstance(teacher_logits[list_index], dict) else False
                     teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
-                        rank_data['vals_ipc'], current_device_id
+                        teacher_logits[list_index][dict_index], current_device_id
                     ).detach()
                     if actual_shape is not None:
                         aB, aS, aV = actual_shape
@@ -731,9 +728,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     else:
                         teacher_logits_tensor = teacher_logits_tensor.clone()
 
-                    if is_topk and 'idx_ipc' in rank_data:
+                    if is_topk and 'topk_indices_ipc' in teacher_logits[list_index]:
                         teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
-                            rank_data['idx_ipc'], current_device_id
+                            teacher_logits[list_index]['topk_indices_ipc'], current_device_id
                         ).detach()
                         if actual_shape is not None:
                             teacher_topk_indices_tensor = teacher_topk_indices_tensor[:aB, :aS, :aV].clone()
@@ -936,18 +933,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 del _local_logits, _lf
 
                             if teacher_logits_tensor is not None and not self.enable_seq_packing:
-                                actual_mb_size = mb.get("input_ids").shape[0]
                                 loss, loss_metrics = loss_fn_(
                                     logits,
                                     mb,
                                     global_valid_seqs,
                                     global_valid_toks,
                                     teacher_logits=teacher_logits_tensor,
-                                    mb_offset=teacher_batch_offset,
-                                    mb_size=actual_mb_size,
+                                    mb_idx=mb_idx,
+                                    mbs=mbs,
                                     teacher_topk_indices_ipc=teacher_topk_indices_tensor,
                                 )
-                                teacher_batch_offset += actual_mb_size
                             else:
                                 loss, loss_metrics = loss_fn_(
                                     logits,
@@ -1052,12 +1047,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                             rank = torch.distributed.get_rank()
                             self.teacher_logits = {
-                                rank: {
-                                    'vals_ipc': self._teacher_topk_vals_ipc[rank],
-                                    'idx_ipc': self._teacher_topk_idx_ipc[rank],
-                                    'actual_shape': (B, S, K),
-                                    'is_topk': True,
-                                },
+                                rank: self._teacher_topk_vals_ipc[rank],
+                                'actual_shape': (B, S, K),
+                                'topk_indices_ipc': self._teacher_topk_idx_ipc[rank],
+                                'is_topk': True,
                             }
                             return self.teacher_logits
 
@@ -1078,13 +1071,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         self._teacher_logits_buffer[:B, :S, :V].copy_(all_teacher_logits_local_log_prob_causal)
                         del all_teacher_logits_local_log_prob_causal
 
-                        rank = torch.distributed.get_rank()
                         self.teacher_logits = {
-                            rank: {
-                                'vals_ipc': self._teacher_logits_ipc_handle[rank],
-                                'actual_shape': (B, S, V),
-                                'is_topk': False,
-                            },
+                            torch.distributed.get_rank(): self._teacher_logits_ipc_handle[torch.distributed.get_rank()],
+                            'actual_shape': (B, S, V),
                         }
                         return self.teacher_logits
 
