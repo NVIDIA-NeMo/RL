@@ -25,6 +25,9 @@ export HF_DATASETS_CACHE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ge
 # uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow.py \
 
 # Run Off-Policy Distillation with MATH/MMLU eval (Llama 1B student, Llama 8B teacher, Arrow dataset)
+# uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow_with_eval.py \
+
+# Run Off-Policy Distillation with IPC teacher logits + MATH/MMLU eval
 uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow_with_eval.py \
   --config /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/configs/llama_off_policy_arrow.yaml \
   cluster.num_nodes=${NUM_ACTOR_NODES}

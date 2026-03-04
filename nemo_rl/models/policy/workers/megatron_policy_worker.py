@@ -1011,6 +1011,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        **kwargs,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         self.model.zero_grad_buffer()

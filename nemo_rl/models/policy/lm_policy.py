@@ -68,6 +68,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
+        worker_builder_cls_override: Optional[str] = None,
+        extra_worker_kwargs: Optional[dict[str, Any]] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -165,7 +167,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             ],
         )
 
+        if worker_builder_cls_override is not None:
+            worker_builder_cls = worker_builder_cls_override
+
         pre_init_queue = RayQueue()
+        _extra = extra_worker_kwargs or {}
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
             config,
@@ -177,6 +183,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             init_reference_model=init_reference_model,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
+            **_extra,
         )
 
         if cluster._sorted_bundle_indices is not None:
@@ -453,11 +460,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
         worker_batches = self.worker_group.get_all_worker_results(futures)
 
-        # If workers returned IPC handle dicts (GPU zero-copy path),
-        # pass them through as a list — no concatenation possible.
-        if worker_batches and isinstance(worker_batches[0], dict) and worker_batches[0].get('is_topk'):
-            return worker_batches
-
         all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
         all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
 
@@ -470,6 +472,53 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def teacher_forward(
+        self,
+        data: BatchedDataDict,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> None:
+        """Dispatch teacher_forward to workers (distillation worker only).
+
+        Each worker runs the teacher model forward pass and stores top-k
+        logprobs in GPU IPC buffers. No data is returned through Ray —
+        the subsequent train() call reads from self.teacher_logits on
+        each worker directly.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "teacher_forward",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+        self.worker_group.get_all_worker_results(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -477,10 +526,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        is_teacher: bool = False,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+
         # Shard and replicate the batch
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         if self.use_dynamic_batches:
@@ -513,19 +566,30 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 input_lengths = shard["input_lengths"]
                 self.flops_tracker.track_batch(input_lengths.tolist())
 
-        # If IPC handles are present, extract them before sharding (they're not
-        # tensors and can't be sharded). Each DP worker gets its own handle.
-        teacher_ipc_handles = None
-        if "teacher_topk_ipc_handles" in data:
-            teacher_ipc_handles = data["teacher_topk_ipc_handles"]
-            del data["teacher_topk_ipc_handles"]
-
-        if teacher_ipc_handles is not None:
-            for i, shard in enumerate(sharded_data):
-                shard["teacher_topk_logits"] = teacher_ipc_handles[i]
-                shard["teacher_topk_indices"] = teacher_ipc_handles[i]
-
         # Train each shard in parallel
+        common_kwargs = {
+            "loss_fn": loss_fn,
+            "eval_mode": eval_mode,
+            "gbs": batch_size,
+            "mbs": micro_batch_size,
+            "is_teacher": is_teacher,
+            "teacher_logits": teacher_logits,
+            "topk_logits": topk_logits,
+        }
+
+        # For the teacher path, disable ALL output deduplication so we get
+        # IPC handles from every single worker (DP * TP * CP). Each worker's
+        # IPC buffer is GPU-local and can only be read by the colocated
+        # student worker at the same rank.
+        if is_teacher:
+            output_replicated = []
+        else:
+            output_replicated = [
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ]
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "train",
             data=sharded_data,
@@ -535,19 +599,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            output_is_replicated=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            common_kwargs={
-                "loss_fn": loss_fn,
-                "eval_mode": eval_mode,
-                "gbs": batch_size,
-                "mbs": micro_batch_size,
-            },
+            output_is_replicated=output_replicated,
+            common_kwargs=common_kwargs,
         )
         results = self.worker_group.get_all_worker_results(futures)
+
+        # Teacher path: build a dict keyed by worker rank so each student
+        # worker can look up its corresponding teacher IPC handle.
+        # Each worker result is {rank_int: ipc_handle, 'actual_shape': ..., ...}.
+        if is_teacher:
+            merged = {}
+            for r in results:
+                merged.update(r)
+            return merged
 
         # Aggregate the results
         aggregated_results = {

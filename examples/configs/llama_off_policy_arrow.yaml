@@ -5,13 +5,15 @@ distillation:
   max_val_samples: 128
   val_period: 0
   loss_on_all_tokens: true
-  topk_logits_k: 4096
+  topk_logits_k: 8192
 loss_fn:
   kl_type: "forward"
 data:
   dataset_name: "arrow_text"
-  # Full dataset: ".../*.arrow" (2118 files, ~296M samples — too slow to preprocess)
-  # Using 10 files (~1.4M samples, plenty for 1000 steps x 768 batch = 768K samples)
+  # arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/*.arrow"
+  # arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00000-of-02476.arrow"
+   # Full dataset: ".../*.arrow" (2118 files, ~296M samples — too slow to preprocess)
+  # Using 10 files (~1.4M samples, plenty for 50 steps x 512 batch = 25K samples)
   arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-0000[0-9]-of-02476.arrow"
   prompt_file: null
 policy:
@@ -92,13 +94,13 @@ eval:
         num_workers: 8
         verifier_type: "multilingual_multichoice"
 checkpointing:
-  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-${policy.model_name}"
+  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-16node-${policy.model_name}"
   metric_name: "train:loss"
   higher_is_better: false
 logger:
-  log_dir: logs/off-policy-distillation-arrow-llama-topk8192
+  log_dir: logs/off-policy-distillation-arrow-llama-topk8192-16node
   wandb:
     project: nemo-off-policy-distillation-eval
-    name: distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-8node
+    name: distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-16node
 cluster:
   num_nodes: 8

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Off-policy distillation on arrow data with inline MATH/MMLU evaluation.
+"""Off-policy distillation v2: single dual-model Policy with GPU-local IPC.
 
-Extends run_off_policy_distillation_arrow.py with periodic generation-based
-evaluation (MATH, MMLU) using a colocated vLLM generation engine, following
-the same pattern as run_sft_arrow_with_eval.py.
+Uses DTensorDistillationWorker which holds both teacher and student models
+in the same Ray actor. Teacher logprobs stay on GPU via IPC buffers —
+no Ray object store transfer.
 
 Usage:
-    uv run examples/run_off_policy_distillation_arrow_with_eval.py \
+    uv run examples/run_off_policy_distillation_v2.py \
         --config examples/configs/llama_off_policy_arrow.yaml
 """
 
@@ -36,15 +36,15 @@ from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss_functions import (
-    DistillationLossFn,
-)
+from nemo_rl.algorithms.loss_functions import DistillationLossFn
 from nemo_rl.algorithms.off_policy_distillation import (
     OffPolicyDistillationSaveState,
     OffPolicyMasterConfig,
     _default_distillation_save_state,
     check_vocab_equality,
-    off_policy_distillation_train,
+)
+from nemo_rl.algorithms.off_policy_distillation_v2 import (
+    off_policy_distillation_train_v2,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -71,22 +71,18 @@ import ray
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b, replace=True)
 OmegaConf.register_new_resolver("max", lambda a, b: max(a, b), replace=True)
 
+DISTILLATION_WORKER_CLS = "nemo_rl.models.policy.workers.dtensor_distillation_worker.DTensorDistillationWorker"
 
-# =========================================================================
-# CLI
-# =========================================================================
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Off-policy distillation on arrow data with inline MATH/MMLU eval"
+        description="Off-policy distillation v2 (dual-model worker, GPU-local IPC)"
     )
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
     args, overrides = parser.parse_known_args()
     return args, overrides
 
 
-# =========================================================================
-# Arrow-text training data (reused from run_off_policy_distillation_arrow.py)
-# =========================================================================
 def _sft_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -134,7 +130,7 @@ def _sft_preprocessor(
 def setup_train_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     from nemo_rl.data.datasets import load_response_dataset
 
-    print("\n▶ Setting up training data...")
+    print("\n Setting up training data...")
     data = load_response_dataset(data_config, seed)
     train_dataset_raw = data.formatted_ds["train"]
     task_spec = data.task_spec
@@ -151,22 +147,16 @@ def setup_train_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: in
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
-    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples")
+    print(f"  Training dataset loaded with {len(train_dataset)} samples")
     return train_dataset, task_spec
 
 
-# =========================================================================
-# Eval data + environments (from run_sft_arrow_with_eval.py)
-# =========================================================================
 def setup_eval_data(
     tokenizer: AutoTokenizer,
     eval_config: dict[str, Any],
     max_seq_length: int,
-) -> tuple[
-    dict[str, StatefulDataLoader],
-    dict[str, dict[str, EnvironmentInterface]],
-]:
-    print("\n▶ Setting up evaluation benchmarks...")
+):
+    print("\n Setting up evaluation benchmarks...")
     eval_dataloaders: dict[str, StatefulDataLoader] = {}
     eval_envs: dict[str, dict[str, EnvironmentInterface]] = {}
 
@@ -219,14 +209,11 @@ def setup_eval_data(
 
         eval_dataloaders[bench_name] = dataloader
         eval_envs[bench_name] = task_to_env
-        print(f"  ✓ {bench_name}: {len(dataset)} samples, env={dataset_name}")
+        print(f"  {bench_name}: {len(dataset)} samples, env={dataset_name}")
 
     return eval_dataloaders, eval_envs
 
 
-# =========================================================================
-# Generation-based validation (from run_sft_arrow_with_eval.py)
-# =========================================================================
 def gen_validate(
     generation: GenerationInterface,
     eval_dataloaders: dict[str, StatefulDataLoader],
@@ -247,7 +234,7 @@ def gen_validate(
 
     with timer.time("total_eval_time"):
         for bench_name, dataloader in eval_dataloaders.items():
-            print(f"\n▶ Evaluating {bench_name} at step {step}...", flush=True)
+            print(f"\n Evaluating {bench_name} at step {step}...", flush=True)
             total_rewards = []
             total_lengths = []
             all_message_logs = []
@@ -257,9 +244,7 @@ def gen_validate(
                     break
 
                 val_batch, gen_metrics = run_multi_turn_rollout(
-                    generation,
-                    val_batch,
-                    tokenizer,
+                    generation, val_batch, tokenizer,
                     eval_envs[bench_name],
                     max_seq_len=max_seq_len,
                     max_rollout_turns=max_rollout_turns,
@@ -271,64 +256,42 @@ def gen_validate(
                 total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
                 to_env = [
-                    get_keys_from_message_log(
-                        val_batch["message_log"][i], ["role", "content"]
-                    )
+                    get_keys_from_message_log(val_batch["message_log"][i], ["role", "content"])
                     for i in range(len(val_batch["message_log"]))
                 ]
                 all_message_logs.extend(to_env)
 
-            accuracy = (
-                sum(total_rewards) / len(total_rewards)
-                if len(total_rewards) > 0
-                else 0
-            )
-            avg_length = (
-                sum(total_lengths) / len(total_lengths)
-                if len(total_lengths) > 0
-                else 0
-            )
+            accuracy = sum(total_rewards) / len(total_rewards) if total_rewards else 0
+            avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0
 
             all_val_metrics[f"{bench_name}_accuracy"] = accuracy
             all_val_metrics[f"{bench_name}_avg_length"] = avg_length
 
-            print(f"\n📊 {bench_name} Results:")
-            print(f"    • Accuracy: {accuracy:.4f}")
-            print(f"    • Avg response length: {avg_length:.1f} tokens")
-            print(f"    • Samples processed: {len(total_rewards)}", flush=True)
+            print(f"\n {bench_name} Results:")
+            print(f"    Accuracy: {accuracy:.4f}")
+            print(f"    Avg response length: {avg_length:.1f} tokens")
+            print(f"    Samples processed: {len(total_rewards)}", flush=True)
 
             try:
-                num_to_print = master_config["logger"].get(
-                    "num_val_samples_to_print", 3
-                )
+                num_to_print = master_config["logger"].get("num_val_samples_to_print", 3)
                 print_message_log_samples(
-                    all_message_logs,
-                    total_rewards,
+                    all_message_logs, total_rewards,
                     num_samples=min(num_to_print, len(all_message_logs)),
                     step=step,
                 )
             except Exception as e:
-                print(f"  ⚠️ Error displaying samples: {e}", flush=True)
+                print(f"  Error displaying samples: {e}", flush=True)
 
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     eval_time = timing_metrics.get("total_eval_time", 0)
-    print(f"\n  ⏱️  Total eval time: {eval_time:.2f}s", flush=True)
+    print(f"\n  Total eval time: {eval_time:.2f}s", flush=True)
     timer.reset()
 
     return all_val_metrics, timing_metrics
 
 
-# =========================================================================
-# Eval hook factory for generation-based evaluation (MATH/MMLU)
-# =========================================================================
 def make_gen_eval_hook(generation, eval_dataloaders, eval_envs,
                        eval_config, master_config, tokenizer, colocated_inference):
-    """Create a closure that wraps gen_validate for use as an eval_hook callback.
-
-    The returned function manages vLLM weight refitting and generation lifecycle
-    so the shared training loop in off_policy_distillation.py doesn't need to
-    know about generation-based evaluation details.
-    """
     generation_stale = True
 
     def hook(step, student_policy, teacher_policy, logger):
@@ -352,9 +315,6 @@ def make_gen_eval_hook(generation, eval_dataloaders, eval_envs,
     return hook
 
 
-# =========================================================================
-# Main
-# =========================================================================
 def main():
     args, overrides = parse_args()
 
@@ -375,28 +335,23 @@ def main():
     pprint.pprint(config)
 
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
+    print(f"Using log directory: {config['logger']['log_dir']}")
 
     init_ray()
 
-    # ── Tokenizer ──
     from nemo_rl.algorithms.utils import get_tokenizer
-
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
-    # ── Configure generation (for eval only) ──
     generation_config = config["policy"].get("generation")
     if generation_config is not None:
         config["policy"]["generation"] = configure_generation_config(
             generation_config, tokenizer
         )
 
-    # ── Training data (arrow) ──
     train_dataset, task_spec = setup_train_data(
         tokenizer, config["data"], config["distillation"]["seed"]
     )
 
-    # ── Core setup ──
     set_seed(config["distillation"]["seed"])
 
     policy_config = config["policy"]
@@ -417,7 +372,6 @@ def main():
     if distillation_save_state is None:
         distillation_save_state = _default_distillation_save_state()
 
-    # ── Dataloader ──
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=distillation_config["num_prompts_per_step"],
@@ -431,66 +385,34 @@ def main():
         )
 
     has_generation = generation_config is not None
-    max_colocated = 4 if has_generation else 3
+    max_colocated = 3 if has_generation else 2
 
-    # ── Cluster ──
-    print("\n▶ Setting up compute cluster...")
+    print("\n Setting up compute cluster...")
     cluster = RayVirtualCluster(
-        name="off_policy_distillation_eval_cluster",
+        name="off_policy_distillation_v2_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
         * cluster_config["num_nodes"],
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=max_colocated,
     )
-    print(
-        f"  ✓ Cluster: {cluster_config['num_nodes']} nodes, max_colocated={max_colocated}"
-    )
+    print(f"  Cluster: {cluster_config['num_nodes']} nodes, max_colocated={max_colocated}")
 
-    # ── Vocab check ──
     if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
         check_vocab_equality(
             tokenizer, policy_config["model_name"], teacher_config["model_name"]
         )
 
-    # ── Teacher Policy ──
-    print("\n▶ Setting up teacher policy...")
-    if teacher_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(train_dataloader),
-        )
-        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    teacher_policy = Policy(
-        name_prefix="teacher",
-        cluster=cluster,
-        config=teacher_config,
-        tokenizer=tokenizer,
-        weights_path=None,
-        optimizer_path=None,
-        init_optimizer=False,
-        init_reference_model=False,
-    )
-    teacher_policy.offload_after_refit()
-
-    # ── Student Policy ──
-    print("\n▶ Setting up student policy...")
+    # Single Policy with both student + teacher models in each worker
+    print("\n Setting up dual-model policy (student + teacher)...")
     weights_path = None
     optimizer_path = None
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
         optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
 
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(train_dataloader),
-        )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    student_policy = Policy(
-        name_prefix="student",
+    policy = Policy(
+        name_prefix="distillation",
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
@@ -498,14 +420,16 @@ def main():
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
+        worker_builder_cls_override=DISTILLATION_WORKER_CLS,
+        extra_worker_kwargs={"teacher_config": teacher_config},
     )
 
     loss_fn = DistillationLossFn(config["loss_fn"])
 
-    # ── vLLM Generation (colocated, for eval only) ──
+    # vLLM Generation (colocated, for eval only)
     generation: Optional[GenerationInterface] = None
     if has_generation:
-        print("\n▶ Setting up vLLM generation (colocated, for eval)...")
+        print("\n Setting up vLLM generation (colocated, for eval)...")
         gen_cfg = config["policy"]["generation"]
         gen_cfg["model_name"] = policy_config["model_name"]
         if "vllm_cfg" in gen_cfg:
@@ -518,27 +442,24 @@ def main():
         )
         generation.finish_generation()
 
-        state_dict_info = student_policy.prepare_refit_info()
+        state_dict_info = policy.prepare_refit_info()
         generation.prepare_refit_info(state_dict_info)
-        print(f"  ✓ vLLM generation ready (model={policy_config['model_name']})")
+        print(f"  vLLM generation ready (model={policy_config['model_name']})")
 
-    # ── Eval datasets + environments ──
-    eval_dataloaders: Optional[dict[str, StatefulDataLoader]] = None
-    eval_envs: Optional[dict[str, dict[str, EnvironmentInterface]]] = None
-
+    eval_dataloaders = None
+    eval_envs = None
     eval_config = config.get("eval")
     if eval_config and has_generation:
         eval_dataloaders, eval_envs = setup_eval_data(
-            tokenizer,
-            eval_config,
+            tokenizer, eval_config,
             max_seq_length=policy_config["max_total_sequence_length"],
         )
 
     print("\n" + "=" * 60)
-    print(" " * 10 + "OFF-POLICY DISTILLATION + EVAL SETUP COMPLETE")
+    print(" " * 10 + "OFF-POLICY DISTILLATION V2 SETUP COMPLETE")
     print("=" * 60 + "\n")
 
-    # ── Build eval hook ──
+    # Build eval hook
     eval_hook = None
     eval_hook_period = 0
     eval_hook_at_start = False
@@ -555,12 +476,10 @@ def main():
         eval_hook_period = eval_config["val_period"]
         eval_hook_at_start = eval_config.get("val_at_start", False)
 
-    # ── Train ──
-    off_policy_distillation_train(
-        student_policy=student_policy,
-        teacher_policy=teacher_policy,
+    # Train
+    off_policy_distillation_train_v2(
+        policy=policy,
         dataloader=train_dataloader,
-        val_dataloader=None,
         tokenizer=tokenizer,
         loss_fn=loss_fn,
         logger=logger,
