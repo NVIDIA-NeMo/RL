@@ -14,13 +14,10 @@
 name: "CICD NeMo RL"
 
 on:
-  pull_request:
+  push:
     branches:
-      - "main"
-      - "r**"
-    types: [labeled, opened, synchronize, reopened]
-  merge_group:
-    types: [checks_requested]
+      - main
+      - "pull-request/[0-9]+"
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
