@@ -330,7 +330,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Forward pass.
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
-                        sampling_params=self.sampling_params,
                         data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
@@ -340,6 +339,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
                     )
 
@@ -495,7 +495,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            sampling_params=self.sampling_params,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -503,6 +502,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_processing_fn=logprobs_post_processor,
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
@@ -640,7 +640,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,
-            sampling_params=self.sampling_params,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -648,6 +647,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
