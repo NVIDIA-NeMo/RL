@@ -934,35 +934,25 @@ def run_async_multi_turn_rollout(
 
         # Reconstruct batch from sample results
         batch_size = len(final_sample_states)
-        final_batch_dict = {
-            "message_log": [state["message_log"] for state in final_sample_states],
-            "extra_env_info": [
-                state["extra_env_info"] for state in final_sample_states
-            ],
-            "task_name": [state["task_name"] for state in final_sample_states],
-            "total_reward": torch.stack(
-                [state["total_reward"] for state in final_sample_states]
-            ),
-            "idx": [
-                state.get("idx", i) for i, state in enumerate(final_sample_states)
-            ],
-            "truncated": torch.tensor(
-                [metrics["truncated"] for metrics in all_sample_metrics],
-                dtype=torch.bool,
-            ),
-        }
-
-        # Add any reward component keys (reward1, reward2, ...) from the first state
-        reward_keys = [
-            k for k in final_sample_states[0]
-            if k.startswith("reward") and k[6:].isdigit()
-        ]
-        reward_keys = sorted(reward_keys, key=lambda k: int(k[6:]))
-        for key in reward_keys:
-            final_batch_dict[key] = torch.stack(
-                [state[key] for state in final_sample_states]
-            )
-        final_batch = BatchedDataDict[DatumSpec](final_batch_dict)
+        final_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [state["message_log"] for state in final_sample_states],
+                "extra_env_info": [
+                    state["extra_env_info"] for state in final_sample_states
+                ],
+                "task_name": [state["task_name"] for state in final_sample_states],
+                "total_reward": torch.stack(
+                    [state["total_reward"] for state in final_sample_states]
+                ),
+                "idx": [
+                    state.get("idx", i) for i, state in enumerate(final_sample_states)
+                ],
+                "truncated": torch.tensor(
+                    [metrics["truncated"] for metrics in all_sample_metrics],
+                    dtype=torch.bool,
+                ),
+            }
+        )
 
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():
@@ -1237,42 +1227,28 @@ def run_async_nemo_gym_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
-    final_batch_dict = {
-        "agent_ref": [r["agent_ref"] for r in results],
-        "message_log": [r["message_log"] for r in results],
-        # length is used downstream for mean_prompt_length
-        "length": torch.tensor(
-            [len(r["input_message_log"][0]["token_ids"]) for r in results]
-        ),
-        "loss_multiplier": input_batch["loss_multiplier"],
-        # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
-        # extra_env_info: dict[str, Any]
-        # idx: int
-        # task_name: NotRequired[str]
-        # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
-        # Extra information not in the DatumSpec used by the GRPO algorithm
-        "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-        # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
-        "truncated": torch.tensor(
-            [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
-        ),
-    }
-
-    # Add any reward component keys (reward1, reward2, ...) from full_result
-    if results:
-        full_result = results[0].get("full_result", {})
-        reward_keys = sorted(
-            [
-                k for k in full_result
-                if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit()
-            ],
-            key=lambda k: int(k[6:]),
-        )
-        for key in reward_keys:
-            final_batch_dict[key] = torch.tensor(
-                [r["full_result"][key] for r in results]
-            )
-    final_batch = BatchedDataDict[DatumSpec](final_batch_dict)
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "agent_ref": [r["agent_ref"] for r in results],
+            "message_log": [r["message_log"] for r in results],
+            # length is used downstream for mean_prompt_length
+            "length": torch.tensor(
+                [len(r["input_message_log"][0]["token_ids"]) for r in results]
+            ),
+            "loss_multiplier": input_batch["loss_multiplier"],
+            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+            # extra_env_info: dict[str, Any]
+            # idx: int
+            # task_name: NotRequired[str]
+            # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+            # Extra information not in the DatumSpec used by the GRPO algorithm
+            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            "truncated": torch.tensor(
+                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+            ),
+        }
+    )
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
