@@ -254,9 +254,14 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Relax megatron-core workspace member's flashinfer ceiling (<0.6) so vllm's ==0.6.4 can resolve.
-  # Use a range (not ==0.6.4) so each conflict split can pick its own compatible version.
-  "flashinfer-python>=0.5.0,<0.7.0",
+  # Pin flashinfer globally — flashinfer-python must match flashinfer-cubin at runtime, and
+  # they're resolved independently by uv so ranges risk version mismatch.
+  # When changing this version, check what each backend expects:
+  #   vllm extra (this file, [project.optional-dependencies].vllm): flashinfer-python==0.6.4
+  #   sglang dependency-metadata (this file, [[tool.uv.dependency-metadata]] name="sglang"): flashinfer_python==0.6.4, flashinfer_cubin==0.6.4
+  #   megatron-core (3rdparty/Megatron-LM-workspace/Megatron-LM/pyproject.toml): flashinfer-python~=0.5.0
+  "flashinfer-python==0.6.4",
+  "flashinfer-cubin==0.6.4",
   # flashinfer 0.6.4 needs nvidia-cutlass-dsl>=4.3.4, but sglang pins 4.2.1. Relax to allow both.
   "nvidia-cutlass-dsl>=4.2.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
