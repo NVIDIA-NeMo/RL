@@ -889,7 +889,6 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping for gb200 for now")
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -915,6 +914,12 @@ async def test_vllm_generation_with_hf_training_colocated(
         if major_capability < 9:
             pytest.skip(
                 f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
+        device_name = torch.cuda.get_device_name(0)
+        if "GB200" in device_name:
+            pytest.skip(
+                f"Skipping FP8 test on GB200 ({device_name}) until fixed."
             )
 
     # Create VllmGeneration Policy
@@ -956,7 +961,6 @@ async def test_vllm_generation_with_hf_training_colocated(
     )
 
 
-@pytest.mark.skip(reason="Skipping for gb200 for now")
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -985,6 +989,11 @@ async def test_vllm_generation_with_hf_training_non_colocated(
         if major_capability < 9:
             pytest.skip(
                 f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+        device_name = torch.cuda.get_device_name(0)
+        if "GB200" in device_name:
+            pytest.skip(
+                f"Skipping FP8 test on GB200 ({device_name}) until fixed."
             )
 
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
