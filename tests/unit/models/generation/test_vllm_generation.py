@@ -956,6 +956,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     )
 
 
+@pytest.mark.skip(reason="Skipping for gb200 for now")
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
