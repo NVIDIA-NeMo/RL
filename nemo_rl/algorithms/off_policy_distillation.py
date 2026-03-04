@@ -29,7 +29,7 @@ Key difference from on-policy distillation (in distillation.py):
 import os
 import warnings
 from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import torch
@@ -468,16 +468,23 @@ def validate(
                 )
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
-            # Get teacher top-k logits
+            # Get teacher top-k logits via IPC (use student batch sizes for alignment)
             teacher_policy.prepare_for_lp_inference()
-            teacher_topk = teacher_policy.get_topk_logits(
-                val_data, k=master_config["distillation"]["topk_logits_k"]
+            teacher_logits = teacher_policy.train(
+                val_data,
+                loss_fn,
+                eval_mode=True,
+                is_teacher=True,
+                topk_logits=master_config["distillation"]["topk_logits_k"],
+                gbs=val_data.size,
+                mbs=master_config["distillation"].get(
+                    "val_micro_batch_size",
+                    master_config["distillation"].get(
+                        "val_global_batch_size",
+                        master_config["distillation"]["num_prompts_per_step"],
+                    ),
+                ),
             )
-            if isinstance(teacher_topk, list):
-                val_data["teacher_topk_ipc_handles"] = teacher_topk
-            else:
-                val_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                val_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
             teacher_policy.offload_after_refit()
 
             # Compute student validation loss (eval mode, no gradient updates)
@@ -488,7 +495,9 @@ def validate(
                 eval_mode=True,
                 gbs=val_data.size,
                 mbs=val_mbs,
+                teacher_logits=teacher_logits,
             )
+            del teacher_logits
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
@@ -545,6 +554,9 @@ def off_policy_distillation_train(
     checkpointer: CheckpointManager,
     distillation_save_state: OffPolicyDistillationSaveState,
     master_config: OffPolicyMasterConfig,
+    eval_hook: Optional[Callable] = None,
+    eval_hook_period: int = 0,
+    eval_hook_at_start: bool = False,
 ) -> None:
     """Run off-policy distillation training algorithm.
     
@@ -558,6 +570,13 @@ def off_policy_distillation_train(
     2. Add loss masks (train on assistant tokens only)
     3. Get teacher top-k logits for the fixed responses
     4. Train student with KL divergence loss
+
+    Args:
+        eval_hook: Optional callback ``(step, student_policy, teacher_policy, logger) -> dict``
+            called every *eval_hook_period* steps.  Return value (if dict) is
+            logged under ``prefix="eval_hook"`` and used for checkpoint metric lookup.
+        eval_hook_period: How often (in steps) to call *eval_hook*. 0 = disabled.
+        eval_hook_at_start: If True, call eval_hook before the first training step.
     """
     timer = Timer()
     timeout = TimeoutChecker(
@@ -601,6 +620,19 @@ def off_policy_distillation_train(
         )
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
+
+    # Run eval hook at start if configured
+    eval_hook_metrics = None
+    if eval_hook and eval_hook_at_start and total_steps == 0:
+        print("\n🔍 Running initial eval hook...", flush=True)
+        eval_hook_metrics = eval_hook(
+            step=0,
+            student_policy=student_policy,
+            teacher_policy=teacher_policy,
+            logger=logger,
+        )
+        if isinstance(eval_hook_metrics, dict):
+            logger.log_metrics(eval_hook_metrics, 0, prefix="eval_hook")
 
     # Run off-policy distillation training
     batch: BatchedDataDict[DatumSpec]
@@ -663,31 +695,36 @@ def off_policy_distillation_train(
                     )
                     train_data.to("cpu")
 
-                # ==== Teacher Logprob Inference ====
+                # ==== Teacher Logprob Inference (IPC) ====
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
+                    student_policy.offload_after_refit()
                     teacher_policy.prepare_for_lp_inference()
 
-                print("▶ Computing teacher logprobs...", flush=True)
+                print("▶ Computing teacher logprobs (IPC)...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data, k=master_config["distillation"]["topk_logits_k"]
+                    teacher_logits = teacher_policy.train(
+                        train_data,
+                        loss_fn,
+                        eval_mode=True,
+                        is_teacher=True,
+                        topk_logits=master_config["distillation"]["topk_logits_k"],
+                        gbs=master_config["policy"]["train_global_batch_size"],
+                        mbs=master_config["policy"]["train_micro_batch_size"],
                     )
-                    if isinstance(teacher_topk, list):
-                        train_data["teacher_topk_ipc_handles"] = teacher_topk
-                    else:
-                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 # ==== Student Training ====
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     teacher_policy.offload_after_refit()
-                    student_policy.prepare_for_training()  # set model train and reload optim to GPU
+                    student_policy.prepare_for_training()
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(train_data, loss_fn)
+                    train_results = student_policy.train(
+                        train_data, loss_fn, teacher_logits=teacher_logits
+                    )
+                    del teacher_logits
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -711,6 +748,20 @@ def off_policy_distillation_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+
+                # ==== Eval Hook (e.g., generation-based MATH/MMLU eval) ====
+                if eval_hook and eval_hook_period > 0 and (total_steps + 1) % eval_hook_period == 0:
+                    print(f"\n🔍 Running eval hook at step {total_steps + 1}...", flush=True)
+                    with timer.time("eval_hook"):
+                        eval_hook_metrics = eval_hook(
+                            step=total_steps + 1,
+                            student_policy=student_policy,
+                            teacher_policy=teacher_policy,
+                            logger=logger,
+                        )
+                    if isinstance(eval_hook_metrics, dict):
+                        logger.log_metrics(eval_hook_metrics, total_steps + 1, prefix="eval_hook")
+                    student_policy.prepare_for_training()
 
                 # ==== Metrics ====
                 metrics = {

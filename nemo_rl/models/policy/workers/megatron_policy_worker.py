@@ -245,6 +245,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        **kwargs,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         # Note: zero_grad_buffer is called at the start of each global batch iteration

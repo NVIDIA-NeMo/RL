@@ -1002,199 +1002,283 @@ class DistillationLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        teacher_logits: Optional[torch.Tensor] = None,
+        mb_offset: Optional[int] = None,
+        mb_size: Optional[int] = None,
+        teacher_topk_indices_ipc: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
 
-        # CP support: get CP group and size
+        # CP support: get CP group and size.
+        # Prefer the explicitly-passed group; fall back to the DTensor device
+        # mesh so the IPC path works even when the caller doesn't pass it.
         cp_group = context_parallel_group
+        if cp_group is None and isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            mesh = next_token_logits.device_mesh
+            if mesh.mesh_dim_names is not None and "cp" in mesh.mesh_dim_names:
+                cp_group = mesh.get_group("cp")
         cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
         per_token_kl = None
-        # Preferred truncated-KL path: teacher provides top-k support per position
-        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
-        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
-        if teacher_topk_indices.shape[-1] <= 0:
-            raise ValueError(
-                f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
-                "topk=0 is not supported as it would result in empty tensor operations."
-            )
-
-        # Determine processing path and setup variables
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            V_local = int(next_token_logits.shape[-1])
-            vocab_start_index = vocab_parallel_rank * V_local
-            vocab_end_index = (vocab_parallel_rank + 1) * V_local
-            parallel_group = vocab_parallel_group
-            logits_tensor = next_token_logits
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            device_mesh = next_token_logits.device_mesh
-            tp_group = device_mesh.get_group("tp")
-            tp_rank = tp_group.rank()
-            local_student_logits = next_token_logits.to_local()
-            V_local = int(local_student_logits.shape[-1])
-            vocab_start_index = tp_rank * V_local
-            vocab_end_index = (tp_rank + 1) * V_local
-            parallel_group = tp_group
-            logits_tensor = local_student_logits
-            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
-            # For DTensor, derive CP group/size from the device mesh to ensure CP-aware alignment
-            if (
-                device_mesh.mesh_dim_names is not None
-                and "cp" in device_mesh.mesh_dim_names
-            ):
-                cp_group = device_mesh.get_group("cp")
-                cp_size = cp_group.size()
+        # ===== IPC PATH: teacher logits passed as pre-reconstructed tensor =====
+        if teacher_logits is not None and teacher_topk_indices_ipc is not None:
+            # Resolve TP-local student logits
+            if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                device_mesh = next_token_logits.device_mesh
+                tp_group = device_mesh.get_group("tp")
+                tp_rank = tp_group.rank()
+                local_student_logits = next_token_logits.to_local()
+                V_local = int(local_student_logits.shape[-1])
+                vocab_start_index = tp_rank * V_local
+                vocab_end_index = (tp_rank + 1) * V_local
             else:
-                cp_group = None
-                cp_size = 1
-        else:
-            parallel_group = None
-            logits_tensor = next_token_logits
+                tp_group = None
+                tp_rank = 0
+                local_student_logits = next_token_logits
+                V_local = int(local_student_logits.shape[-1])
+                vocab_start_index = 0
+                vocab_end_index = V_local
 
-        # Process based on zero_outside_topk setting
-        if self.zero_outside_topk and parallel_group is not None:
-            # Distributed processing with chunking
-            indices_local = teacher_topk_indices
-            pad_len = 0
-            if cp_size > 1:
-                pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
-                if pad_len > 0:
-                    indices_local = torch.nn.functional.pad(
-                        indices_local, (0, 0, 0, pad_len), value=0
-                    )
-                cp_rank = torch.distributed.get_rank(cp_group)
-                indices_local = _get_tokens_on_this_cp_rank(
-                    indices_local, cp_rank, cp_size, seq_dim=1
+            # Slice the microbatch from the pre-reconstructed IPC tensors using
+            # the actual cumulative batch offset (not mb_idx * mbs, which breaks
+            # with dynamic batching where microbatch sizes vary).
+            # Also truncate seq dim to match student's actual length.
+            student_seq_len = local_student_logits.shape[1]
+            with torch.no_grad():
+                mb_start = mb_offset
+                mb_end = mb_offset + mb_size
+                teacher_topk_logprobs = teacher_logits[mb_start:mb_end, :student_seq_len, :].clone().detach()
+                teacher_topk_logprobs = teacher_topk_logprobs.to(device=local_student_logits.device)
+                topk_indices = teacher_topk_indices_ipc[mb_start:mb_end, :student_seq_len, :].clone().detach()
+                topk_indices = topk_indices.to(device=local_student_logits.device)
+
+            # Gather student log probs at teacher's top-k global indices
+            if tp_group is not None:
+                S_local = int(local_student_logits.shape[1])
+                chunk_size = max(1, min(S_local, 1024))
+                student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(
+                    local_student_logits,
+                    topk_indices,
+                    vocab_start_index,
+                    vocab_end_index,
+                    chunk_size,
+                    tp_group,
+                    False,
+                )
+            else:
+                student_logprobs = torch.nn.functional.log_softmax(
+                    local_student_logits, dim=-1
+                )
+                student_topk_logprobs = torch.gather(
+                    student_logprobs, dim=-1, index=topk_indices
+                )
+                del student_logprobs
+            del local_student_logits
+
+            if self.kl_type == "reverse":
+                teacher_topk_logprobs, student_topk_logprobs = student_topk_logprobs, teacher_topk_logprobs
+
+            # Build (k+1)-dim distributions with a "rest" bucket
+            teacher_topk_probs = teacher_topk_logprobs.exp()
+            teacher_rest_prob = (1.0 - teacher_topk_probs.sum(dim=-1, keepdim=True)).clamp(min=1e-10)
+            teacher_probs_full = torch.cat([teacher_topk_probs, teacher_rest_prob], dim=-1)
+            teacher_logprobs_full = torch.cat([teacher_topk_logprobs, teacher_rest_prob.log()], dim=-1)
+
+            student_topk_probs = student_topk_logprobs.exp()
+            student_rest_prob = (1.0 - student_topk_probs.sum(dim=-1, keepdim=True)).clamp(min=1e-10)
+            student_logprobs_full = torch.cat([student_topk_logprobs, student_rest_prob.log()], dim=-1)
+
+            per_token_kl = (teacher_probs_full * (teacher_logprobs_full - student_logprobs_full)).sum(dim=-1)
+
+            del teacher_topk_logprobs, teacher_topk_probs, teacher_rest_prob
+            del teacher_probs_full, teacher_logprobs_full
+            del student_topk_logprobs, student_topk_probs, student_rest_prob
+            del student_logprobs_full, topk_indices
+
+            # Next-token alignment
+            per_token_kl = per_token_kl[:, :-1]
+
+        # ===== STANDARD PATH: teacher top-k in data dict =====
+        else:
+            teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
+            teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
+
+            if teacher_topk_indices.shape[-1] <= 0:
+                raise ValueError(
+                    f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
+                    "topk=0 is not supported as it would result in empty tensor operations."
                 )
 
-            S_local = int(logits_tensor.shape[1])
-            chunk_size = max(1, min(S_local, 1024))
-            student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
-                logits_tensor,
-                indices_local,
-                vocab_start_index,
-                vocab_end_index,
-                chunk_size,
-                parallel_group,
-                False,
-            )
+            # Determine processing path and setup variables
+            if vocab_parallel_group is not None:
+                assert vocab_parallel_rank is not None, (
+                    "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+                )
+                V_local = int(next_token_logits.shape[-1])
+                vocab_start_index = vocab_parallel_rank * V_local
+                vocab_end_index = (vocab_parallel_rank + 1) * V_local
+                parallel_group = vocab_parallel_group
+                logits_tensor = next_token_logits
+            elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                device_mesh = next_token_logits.device_mesh
+                tp_group = device_mesh.get_group("tp")
+                tp_rank = tp_group.rank()
+                local_student_logits = next_token_logits.to_local()
+                V_local = int(local_student_logits.shape[-1])
+                vocab_start_index = tp_rank * V_local
+                vocab_end_index = (tp_rank + 1) * V_local
+                parallel_group = tp_group
+                logits_tensor = local_student_logits
+                teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+                if (
+                    device_mesh.mesh_dim_names is not None
+                    and "cp" in device_mesh.mesh_dim_names
+                ):
+                    cp_group = device_mesh.get_group("cp")
+                    cp_size = cp_group.size()
+                else:
+                    cp_group = None
+                    cp_size = 1
+            else:
+                parallel_group = None
+                logits_tensor = next_token_logits
 
-            if self.kl_type != "forward":
-                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+            # Process based on zero_outside_topk setting
+            if self.zero_outside_topk and parallel_group is not None:
+                indices_local = teacher_topk_indices
+                pad_len = 0
+                if cp_size > 1:
+                    pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
+                    if pad_len > 0:
+                        indices_local = torch.nn.functional.pad(
+                            indices_local, (0, 0, 0, pad_len), value=0
+                        )
+                    cp_rank = torch.distributed.get_rank(cp_group)
+                    indices_local = _get_tokens_on_this_cp_rank(
+                        indices_local, cp_rank, cp_size, seq_dim=1
+                    )
+
+                S_local = int(logits_tensor.shape[1])
+                chunk_size = max(1, min(S_local, 1024))
+                student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
                     logits_tensor,
+                    indices_local,
+                    vocab_start_index,
+                    vocab_end_index,
                     chunk_size,
                     parallel_group,
                     False,
                 )
 
-            if cp_size > 1:
-                student_topk_logprobs = allgather_cp_sharded_tensor(
-                    student_topk_logprobs, cp_group, seq_dim=1
+                if self.kl_type != "forward":
+                    H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+                        logits_tensor,
+                        chunk_size,
+                        parallel_group,
+                        False,
+                    )
+
+                if cp_size > 1:
+                    student_topk_logprobs = allgather_cp_sharded_tensor(
+                        student_topk_logprobs, cp_group, seq_dim=1
+                    )
+                    if self.kl_type != "forward":
+                        H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
+                    if pad_len > 0:
+                        student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
+                        if self.kl_type != "forward":
+                            H_all = H_all[:, :-pad_len]
+            elif self.zero_outside_topk:
+                student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
+                student_topk_logprobs = student_logprobs.gather(
+                    dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
                 )
                 if self.kl_type != "forward":
-                    H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
-                if pad_len > 0:
-                    student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
-                        H_all = H_all[:, :-pad_len]
-        elif self.zero_outside_topk:
-            # Non-distributed processing
-            student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
-            student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
+                    H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+            else:
+                if (parallel_group is not None) or (cp_size > 1):
+                    student_topk_logits = gather_logits_at_global_indices(
+                        logits_tensor,
+                        teacher_topk_indices,
+                        tp_group=parallel_group,
+                        cp_group=cp_group,
+                        vocab_start_index=(
+                            vocab_start_index if parallel_group is not None else 0
+                        ),
+                        vocab_end_index=(
+                            vocab_end_index
+                            if parallel_group is not None
+                            else int(logits_tensor.shape[-1])
+                        ),
+                    )
+                else:
+                    student_topk_logits = logits_tensor.gather(
+                        dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
+                    )
+                student_topk_logprobs = torch.nn.functional.log_softmax(
+                    student_topk_logits, dim=-1
+                )
+
+            teacher_topk_logprobs = teacher_topk_logits.to(
+                student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
             )
-            if self.kl_type != "forward":
-                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
-        else:
-            # Gather logits at global indices
-            if (parallel_group is not None) or (cp_size > 1):
-                student_topk_logits = gather_logits_at_global_indices(
-                    logits_tensor,
-                    teacher_topk_indices,
-                    tp_group=parallel_group,
-                    cp_group=cp_group,
-                    vocab_start_index=(
-                        vocab_start_index if parallel_group is not None else 0
-                    ),
-                    vocab_end_index=(
-                        vocab_end_index
-                        if parallel_group is not None
-                        else int(logits_tensor.shape[-1])
-                    ),
+
+            # Single point of next-token alignment after TP/CP processing
+            teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
+            student_topk_logprobs = student_topk_logprobs[:, :-1, :]
+            if self.zero_outside_topk and self.kl_type != "forward":
+                H_all = H_all[:, :-1]
+
+            student_probs = student_topk_logprobs.exp()
+            teacher_probs = teacher_topk_logprobs.exp()
+
+            loss_correction_term = torch.zeros_like(student_probs[..., 0])
+            if self.zero_outside_topk and self.kl_type != "forward":
+                H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
+                P_rest = 1 - (student_probs.sum(-1))
+                loss_correction_term = H_rest - self.log_infinitesimal * P_rest
+                if self.kl_type == "mixed":
+                    loss_correction_term = loss_correction_term * (
+                        1.0 - self.mixed_kl_weight
+                    )
+
+            if self.kl_type == "forward":
+                per_token_kl = teacher_probs * (
+                    teacher_topk_logprobs - student_topk_logprobs
+                )
+            elif self.kl_type == "reverse":
+                per_token_kl = student_probs * (
+                    student_topk_logprobs - teacher_topk_logprobs
                 )
             else:
-                student_topk_logits = logits_tensor.gather(
-                    dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
-                )
-            student_topk_logprobs = torch.nn.functional.log_softmax(
-                student_topk_logits, dim=-1
-            )
-
-        # Teacher values are already full-vocab-normalized log probabilities
-        # from _compute_distributed_log_softmax. Use them directly without
-        # re-normalizing over the top-k slice (which would be incorrect).
-        teacher_topk_logprobs = teacher_topk_logits.to(
-            student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
-        )
-
-        # Single point of next-token alignment after TP/CP processing
-        teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
-        student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            # Align H_all with next-token prediction
-            H_all = H_all[:, :-1]
-
-        student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
-        teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
-
-        loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
-            P_rest = 1 - (student_probs.sum(-1))
-            # The entropy and prob of the rest of the tokens [B, S-1]
-            loss_correction_term = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
-            if self.kl_type == "mixed":
-                loss_correction_term = loss_correction_term * (
-                    1.0 - self.mixed_kl_weight
+                kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
+                kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
+                per_token_kl = (
+                    self.mixed_kl_weight * kl_forward
+                    + (1.0 - self.mixed_kl_weight) * kl_reverse
                 )
 
-        if self.kl_type == "forward":
-            per_token_kl = teacher_probs * (
-                teacher_topk_logprobs - student_topk_logprobs
-            )
-        elif self.kl_type == "reverse":
-            per_token_kl = student_probs * (
-                student_topk_logprobs - teacher_topk_logprobs
-            )
-        else:
-            # mixed KL
-            kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
-            kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-            per_token_kl = (
-                self.mixed_kl_weight * kl_forward
-                + (1.0 - self.mixed_kl_weight) * kl_reverse
-            )
-
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+            per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
-            # Align mask length to current per_token_kl
             max_len = per_token_kl.shape[1]
-            token_mask = token_mask[:, :max_len]
-            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            # align mask shape to per_token_kl
+            if cp_size > 1:
+                cp_rank = torch.distributed.get_rank(cp_group)
+                S_local = max_len + 1
+                start = cp_rank * S_local
+                token_mask = token_mask[:, start:start + max_len]
+            else:
+                token_mask = token_mask[:, :max_len]
+            mask = token_mask * sample_mask.unsqueeze(-1)
             kl_loss = masked_mean(
                 per_token_kl,
                 mask,

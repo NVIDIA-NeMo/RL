@@ -590,6 +590,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        is_teacher: bool = False,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
@@ -614,43 +617,17 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
 
-        if eval_mode:
+        if is_teacher:
             ctx: AbstractContextManager[Any] = torch.no_grad()
+            self.model.eval()
+        elif eval_mode:
+            ctx = torch.no_grad()
             self.model.eval()
         else:
             ctx = nullcontext()
-            # Ensure model is in training mode
             self.model.train()
 
         with ctx:
-            # Reconstruct teacher top-k tensors from IPC handles if present.
-            # The teacher worker stored them in GPU IPC buffers and returned
-            # only tiny handle dicts through Ray. We open those handles here
-            # on the student worker (same GPU) to access the data directly.
-            if "teacher_topk_logits" in data and isinstance(data["teacher_topk_logits"], dict):
-                teacher_ipc = data["teacher_topk_logits"]
-                current_device_id = torch.cuda.current_device()
-                rank = torch.distributed.get_rank()
-                actual_shape = teacher_ipc.get('actual_shape')
-                is_topk = teacher_ipc.get('is_topk', False)
-
-                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
-                    teacher_ipc[rank], current_device_id
-                ).detach()
-                if actual_shape is not None:
-                    aB, aS, aK = actual_shape
-                    teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
-
-                data["teacher_topk_logits"] = teacher_logits_tensor
-
-                if is_topk and 'topk_indices_ipc' in teacher_ipc:
-                    teacher_idx_tensor = rebuild_cuda_tensor_from_ipc(
-                        teacher_ipc['topk_indices_ipc'], current_device_id
-                    ).detach()
-                    if actual_shape is not None:
-                        teacher_idx_tensor = teacher_idx_tensor[:aB, :aS, :aK].clone()
-                    data["teacher_topk_indices"] = teacher_idx_tensor
-
             # Get data from batch and move to device
             data.to("cuda")
 
@@ -687,7 +664,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         "token_mask must be present in the data when using token-level loss"
                     )
 
-                self.optimizer.zero_grad()
+                if not is_teacher:
+                    self.optimizer.zero_grad()
                 mb_losses = []
                 batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
                 # Calculate number of microbatches to process
@@ -729,6 +707,38 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     warnings.warn(
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
+
+                all_teacher_logits = None
+                teacher_batch_offset = 0
+
+                # Reconstruct teacher tensor from IPC ONCE before the microbatch loop.
+                # teacher_logits is a merged dict: {rank: {vals_ipc, idx_ipc, actual_shape, is_topk}, ...}
+                teacher_logits_tensor = None
+                teacher_topk_indices_tensor = None
+                if not is_teacher and teacher_logits is not None:
+                    rank = torch.distributed.get_rank()
+                    current_device_id = torch.cuda.current_device()
+                    rank_data = teacher_logits[rank]
+                    actual_shape = rank_data.get('actual_shape')
+                    is_topk = rank_data.get('is_topk', False)
+
+                    teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                        rank_data['vals_ipc'], current_device_id
+                    ).detach()
+                    if actual_shape is not None:
+                        aB, aS, aV = actual_shape
+                        teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aV].clone()
+                    else:
+                        teacher_logits_tensor = teacher_logits_tensor.clone()
+
+                    if is_topk and 'idx_ipc' in rank_data:
+                        teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
+                            rank_data['idx_ipc'], current_device_id
+                        ).detach()
+                        if actual_shape is not None:
+                            teacher_topk_indices_tensor = teacher_topk_indices_tensor[:aB, :aS, :aV].clone()
+                        else:
+                            teacher_topk_indices_tensor = teacher_topk_indices_tensor.clone()
 
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
@@ -893,69 +903,193 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
 
-                        if self.enable_seq_packing:
-                            loss_fn_ = SequencePackingLossWrapper(
-                                loss_fn=loss_fn,
-                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
-                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
-                            )
+                        if is_teacher:
+                            with torch.no_grad():
+                                if all_teacher_logits is None:
+                                    all_teacher_logits = logits
+                                else:
+                                    all_teacher_logits = torch.cat([all_teacher_logits, logits], dim=0)
                         else:
-                            loss_fn_ = loss_fn
+                            if self.enable_seq_packing:
+                                loss_fn_ = SequencePackingLossWrapper(
+                                    loss_fn=loss_fn,
+                                    cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                                    cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                                )
+                            else:
+                                loss_fn_ = loss_fn
 
-                        # ── NaN debug: inspect logits on first microbatch of first 2 steps ──
-                        if mb_idx == 0 and gb_idx == 0 and self.rank == 0 and len(losses) < 2:
-                            _local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
-                            _lf = _local_logits.float()
-                            print(
-                                f"  [NaN debug rank-0] logits shape={_local_logits.shape}, "
-                                f"dtype={_local_logits.dtype}, "
-                                f"min={_lf.min().item():.4f}, max={_lf.max().item():.4f}, "
-                                f"has_nan={torch.isnan(_lf).any().item()}, "
-                                f"has_inf={torch.isinf(_lf).any().item()}, "
-                                f"global_valid_toks={global_valid_toks.item():.0f}, "
-                                f"global_valid_seqs={global_valid_seqs.item():.0f}",
-                                flush=True,
-                            )
-                            del _local_logits, _lf
+                            # ── NaN debug: inspect logits on first microbatch of first 2 steps ──
+                            if mb_idx == 0 and gb_idx == 0 and self.rank == 0 and len(losses) < 2:
+                                _local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+                                _lf = _local_logits.float()
+                                print(
+                                    f"  [NaN debug rank-0] logits shape={_local_logits.shape}, "
+                                    f"dtype={_local_logits.dtype}, "
+                                    f"min={_lf.min().item():.4f}, max={_lf.max().item():.4f}, "
+                                    f"has_nan={torch.isnan(_lf).any().item()}, "
+                                    f"has_inf={torch.isinf(_lf).any().item()}, "
+                                    f"global_valid_toks={global_valid_toks.item():.0f}, "
+                                    f"global_valid_seqs={global_valid_seqs.item():.0f}",
+                                    flush=True,
+                                )
+                                del _local_logits, _lf
 
-                        loss, loss_metrics = loss_fn_(
-                            logits,
-                            mb,
-                            global_valid_seqs,
-                            global_valid_toks,
-                        )
-                        del logits
+                            if teacher_logits_tensor is not None and not self.enable_seq_packing:
+                                actual_mb_size = mb.get("input_ids").shape[0]
+                                loss, loss_metrics = loss_fn_(
+                                    logits,
+                                    mb,
+                                    global_valid_seqs,
+                                    global_valid_toks,
+                                    teacher_logits=teacher_logits_tensor,
+                                    mb_offset=teacher_batch_offset,
+                                    mb_size=actual_mb_size,
+                                    teacher_topk_indices_ipc=teacher_topk_indices_tensor,
+                                )
+                                teacher_batch_offset += actual_mb_size
+                            else:
+                                loss, loss_metrics = loss_fn_(
+                                    logits,
+                                    mb,
+                                    global_valid_seqs,
+                                    global_valid_toks,
+                                )
+                            del logits
 
-                        # skip the update for dummy batches
-                        if mb_idx < iterator_len:
-                            ## scale by the number of global batches so we get the correct
-                            ## value when summing metrics across all microbatches
-                            for k in loss_metrics.keys():
-                                loss_metrics[k] /= num_global_batches
-                            num_valid_samples = loss_metrics["num_valid_samples"]
-                            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                            # skip the update for dummy batches
+                            if mb_idx < iterator_len:
+                                ## scale by the number of global batches so we get the correct
+                                ## value when summing metrics across all microbatches
+                                for k in loss_metrics.keys():
+                                    loss_metrics[k] /= num_global_batches
+                                num_valid_samples = loss_metrics["num_valid_samples"]
+                                loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                                loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                                loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                            else:
+                                loss *= 0
+
+                            # Backward pass
+                            if not eval_mode:
+                                loss *= self.dp_size * self.cp_size
+                                loss.backward()
+
+                    if not is_teacher:
+                        if num_valid_samples > 0:
+                            mb_losses.append(loss.item())
+                            all_mb_metrics.append(loss_metrics)
+
+                # Clean up pre-reconstructed teacher tensors after all microbatches
+                if teacher_logits_tensor is not None:
+                    del teacher_logits_tensor
+                    teacher_logits_tensor = None
+                if teacher_topk_indices_tensor is not None:
+                    del teacher_topk_indices_tensor
+                    teacher_topk_indices_tensor = None
+
+                if is_teacher:
+
+                    with torch.no_grad():
+                        if isinstance(all_teacher_logits, DTensor):
+                            all_teacher_logits_local = all_teacher_logits.to_local()
                         else:
-                            loss *= 0
+                            all_teacher_logits_local = all_teacher_logits
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(all_teacher_logits_local.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
 
-                        # Backward pass
-                        if not eval_mode:
-                            ## NOTE: invalid samples should be multiplied
-                            ## by zero in the loss function to prevent them
-                            ## from affecting the gradient calculation
+                        all_teacher_logits_local = all_teacher_logits_local.to(torch.float32)
+                        all_teacher_logits_local_log_prob = _compute_distributed_log_softmax(all_teacher_logits_local, group=tp_group)
+                        del all_teacher_logits, all_teacher_logits_local
 
-                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                            # but we want to sum them so we cancel out the average here
-                            loss *= self.dp_size * self.cp_size
-                            loss.backward()
+                        if isinstance(all_teacher_logits_local_log_prob, DTensor):
+                            all_teacher_logits_local_log_prob = all_teacher_logits_local_log_prob.to_local()
 
-                    if num_valid_samples > 0:
-                        mb_losses.append(loss.item())
-                        all_mb_metrics.append(loss_metrics)
+                        if self.cfg.get('is_mdlm', False):
+                            shared_sequence_length = int(all_teacher_logits_local_log_prob.shape[1] / 2)
+                            all_teacher_logits_local_log_prob_causal = all_teacher_logits_local_log_prob[:, shared_sequence_length:, :]
+                            del all_teacher_logits_local_log_prob
+                        else:
+                            all_teacher_logits_local_log_prob_causal = all_teacher_logits_local_log_prob
+
+                        if topk_logits is not None:
+                            topk_logprobs, topk_indices = distributed_vocab_topk(
+                                all_teacher_logits_local_log_prob_causal,
+                                k=topk_logits,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                            del all_teacher_logits_local_log_prob_causal
+
+                            B, S, K = topk_logprobs.shape
+                            target_dtype = topk_logprobs.dtype
+                            target_device = topk_logprobs.device
+
+                            if not hasattr(self, '_teacher_topk_vals_buffer') or self._teacher_topk_vals_buffer is None:
+                                max_S = self.cfg.get("max_total_sequence_length", S)
+                                vals_buf_shape = (B, max_S, K)
+                                self._teacher_topk_vals_buffer = torch.empty(
+                                    vals_buf_shape, dtype=target_dtype, device=target_device
+                                )
+                                self._teacher_topk_vals_ipc = {
+                                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_vals_buffer)
+                                }
+                                idx_buf_shape = (B, max_S, K)
+                                self._teacher_topk_idx_buffer = torch.empty(
+                                    idx_buf_shape, dtype=topk_indices.dtype, device=target_device
+                                )
+                                self._teacher_topk_idx_ipc = {
+                                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_idx_buffer)
+                                }
+
+                            self._teacher_topk_vals_buffer[:B, :S, :K].copy_(topk_logprobs)
+                            self._teacher_topk_idx_buffer[:B, :S, :K].copy_(topk_indices)
+                            del topk_logprobs, topk_indices
+
+                            rank = torch.distributed.get_rank()
+                            self.teacher_logits = {
+                                rank: {
+                                    'vals_ipc': self._teacher_topk_vals_ipc[rank],
+                                    'idx_ipc': self._teacher_topk_idx_ipc[rank],
+                                    'actual_shape': (B, S, K),
+                                    'is_topk': True,
+                                },
+                            }
+                            return self.teacher_logits
+
+                        B, S, V = all_teacher_logits_local_log_prob_causal.shape
+                        target_dtype = all_teacher_logits_local_log_prob_causal.dtype
+                        target_device = all_teacher_logits_local_log_prob_causal.device
+
+                        if not hasattr(self, '_teacher_logits_buffer') or self._teacher_logits_buffer is None:
+                            max_S = self.cfg.get("max_total_sequence_length", S)
+                            buf_shape = (B, max_S, V)
+                            self._teacher_logits_buffer = torch.empty(
+                                buf_shape, dtype=target_dtype, device=target_device
+                            )
+                            self._teacher_logits_ipc_handle = {
+                                torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_logits_buffer)
+                            }
+
+                        self._teacher_logits_buffer[:B, :S, :V].copy_(all_teacher_logits_local_log_prob_causal)
+                        del all_teacher_logits_local_log_prob_causal
+
+                        rank = torch.distributed.get_rank()
+                        self.teacher_logits = {
+                            rank: {
+                                'vals_ipc': self._teacher_logits_ipc_handle[rank],
+                                'actual_shape': (B, S, V),
+                                'is_topk': False,
+                            },
+                        }
+                        return self.teacher_logits
 
                 grad_norm: Optional[float | torch.Tensor] = None
-                if not eval_mode:
+                if not is_teacher and not eval_mode:
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -979,15 +1113,13 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Update parameters
                     self.optimizer.step()
 
-                losses.append(torch.tensor(mb_losses).sum().item())
+                if not is_teacher:
+                    losses.append(torch.tensor(mb_losses).sum().item())
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
-            # increment scheduler after all batches in rollout are processed
             if not eval_mode:
                 self.scheduler.step()
-            # dynamic batch and sequence dims causes alot of fragmentation, so clear
-            # the memory allocator before moving on
             torch.cuda.empty_cache()
 
             # Compute global loss across all ranks
@@ -1735,13 +1867,36 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._teacher_topk_idx_buffer[:B_mb, :S_mb, :K_mb].copy_(idx)
                 del vals, idx
 
-                rank = torch.distributed.get_rank()
-                return {
-                    rank: self._teacher_topk_vals_ipc[rank],
-                    'actual_shape': (B_mb, S_mb, K_mb),
-                    'topk_indices_ipc': self._teacher_topk_idx_ipc[rank],
-                    'is_topk': True,
-                }
+                out_topk_vals.append(self._teacher_topk_vals_buffer[:B_mb, :S_mb, :K_mb].cpu())
+                out_topk_idx.append(self._teacher_topk_idx_buffer[:B_mb, :S_mb, :K_mb].cpu())
+
+        ret = BatchedDataDict[Any]()
+        all_topk_vals_padded = []
+        all_topk_idx_padded = []
+        target_seq_len = seq_dim_size
+        for vals, idx in zip(out_topk_vals, out_topk_idx):
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
+            all_topk_vals_padded.append(vals)
+            all_topk_idx_padded.append(idx)
+
+        ret["topk_logits"] = (
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
