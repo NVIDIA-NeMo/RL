@@ -367,6 +367,7 @@ jobs:
         with:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
