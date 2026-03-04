@@ -39,6 +39,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -323,7 +324,7 @@ def forward_with_post_processing_fn(
     if isinstance(post_processing_fn, LossPostProcessor):
         result, metrics = post_processing_fn(
             logits=logits,
-            mb=data_dict,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
@@ -334,8 +335,8 @@ def forward_with_post_processing_fn(
     ):
         result = post_processing_fn(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=data_dict["input_lengths"],
             original_batch_size=processed_mb.original_batch_size,
             original_seq_len=processed_mb.original_seq_len,
             sequence_dim=sequence_dim,
@@ -517,7 +518,7 @@ class LossPostProcessor:
     def __call__(
         self,
         logits: torch.Tensor,
-        mb: BatchedDataDict[Any],
+        data_dict: BatchedDataDict[Any],
         processed_inputs: ProcessedInputs,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
@@ -527,7 +528,7 @@ class LossPostProcessor:
 
         Args:
             logits: Model output logits
-            mb: Microbatch data
+            data_dict: Microbatch data
             processed_inputs: Processed inputs
             global_valid_seqs: Global valid sequence count
             global_valid_toks: Global valid token count
@@ -538,8 +539,8 @@ class LossPostProcessor:
         """
         # Handle CP redistribution
         if self.cp_size > 1:
-            _, mb = prepare_data_for_cp(
-                mb, processed_inputs, self.cp_mesh, sequence_dim
+            _, data_dict = prepare_data_for_cp(
+                data_dict, processed_inputs, self.cp_mesh, sequence_dim
             )
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
@@ -559,14 +560,16 @@ class LossPostProcessor:
             )
             loss, loss_metrics = loss_fn(
                 logits,
-                mb,
+                data_dict,
                 global_valid_seqs,
                 global_valid_toks,
             )
         else:
-            loss_input, mb = prepare_loss_input_wrapped(logits, mb, self.loss_fn)
+            loss_input, data_dict = prepare_loss_input_wrapped(
+                logits, data_dict, self.loss_fn
+            )
             loss, loss_metrics = self.loss_fn(
-                data=mb,
+                data=data_dict,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
                 **loss_input,
@@ -611,8 +614,8 @@ class LogprobsPostProcessor:
     def __call__(
         self,
         logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
         processed_inputs: ProcessedInputs,
-        input_lengths: torch.Tensor,
         original_batch_size: int,
         original_seq_len: int,
         sequence_dim: int = 1,
@@ -621,8 +624,8 @@ class LogprobsPostProcessor:
 
         Args:
             logits: Model output logits
+            data_dict: Microbatch data
             processed_inputs: Processed inputs
-            input_lengths: Sequence lengths
             original_batch_size: Original batch size before packing
             original_seq_len: Original sequence length before packing
             sequence_dim: Sequence dimension
@@ -631,6 +634,7 @@ class LogprobsPostProcessor:
             Token log probabilities tensor [batch_size, seq_length]
         """
         seq_len = processed_inputs.seq_len
+        input_lengths = data_dict["input_lengths"]
 
         if self.cp_size > 1:
             seq_index_tensor = (
@@ -708,6 +712,13 @@ class LogprobsPostProcessor:
                 # For right-padded sequence, set 1s at the beginning of the sequence
                 post_attention_mask[i, :length] = 1
             token_logprobs = token_logprobs * post_attention_mask
+
+        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+            token_logprobs = mask_out_neg_inf_logprobs(
+                token_logprobs, mask, "prev_logprobs"
+            )
 
         return token_logprobs
 
@@ -804,8 +815,8 @@ class TopkLogitsPostProcessor:
     def __call__(
         self,
         logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
         processed_inputs: ProcessedInputs,
-        input_lengths: torch.Tensor,
         original_batch_size: int,
         original_seq_len: int,
         sequence_dim: int = 1,
@@ -814,8 +825,8 @@ class TopkLogitsPostProcessor:
 
         Args:
             logits: Model output logits
+            data_dict: Microbatch data
             processed_inputs: Processed inputs
-            input_lengths: Sequence lengths
             original_batch_size: Original batch size before packing
             original_seq_len: Original sequence length before packing
             sequence_dim: Sequence dimension
@@ -823,6 +834,8 @@ class TopkLogitsPostProcessor:
         Returns:
             Tuple of (top-k values, top-k indices) tensors
         """
+        input_lengths = data_dict["input_lengths"]
+
         if self.cp_size > 1:
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
