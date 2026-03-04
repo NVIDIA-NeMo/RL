@@ -327,7 +327,7 @@ jobs:
         include:
           - script: L1_Functional_Tests_GPU
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
-    needs: [pre-flight, build-container, org-member-pre-flight]
+    needs: [pre-flight, build-container, cicd-unit-tests, org-member-pre-flight]
     runs-on: ${{ matrix.runner }}
     if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
