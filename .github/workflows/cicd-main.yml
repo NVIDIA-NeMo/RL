@@ -243,10 +243,10 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@44284233576b11eb867ae55ac41fb291debc414d
     with:
       build-ref: ${{ github.sha }}
-      image-name: megatron-bridge
+      image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
       runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
-      image-label: megatron-bridge
+      image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
@@ -275,7 +275,7 @@ jobs:
         with:
           runner: ${{ runner.name }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-          image: megatron-bridge
+          image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
@@ -315,7 +315,7 @@ jobs:
           script: ${{ matrix.script }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
-          image: megatron-bridge
+          image: ${{ vars.CI_CONTAINER_NAME }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
@@ -343,7 +343,7 @@ jobs:
         with:
           runner: ${{ runner.name }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-          image: megatron-bridge
+          image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
@@ -371,7 +371,7 @@ jobs:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-          image: megatron-bridge
+          image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
