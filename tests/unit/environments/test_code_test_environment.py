@@ -24,7 +24,7 @@ from nemo_rl.environments.code_test_environment import (
 )
 
 
-cfg: CodeTestEnvConfig = {
+G_CODE_TEST_ENV_CFG: CodeTestEnvConfig = {
     "num_workers": 2,
     "timeout_per_test": 5,
 }
@@ -32,7 +32,7 @@ cfg: CodeTestEnvConfig = {
 
 @pytest.fixture(scope="function")
 def code_test_env():
-    env_actor = CodeTestCaseEnvironment.remote(cfg)
+    env_actor = CodeTestCaseEnvironment.remote(G_CODE_TEST_ENV_CFG)
     yield env_actor
     ray.kill(env_actor)
 

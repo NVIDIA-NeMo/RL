@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, NotRequired, TypedDict, Union
 
 import ray
@@ -37,12 +38,16 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 
 class CodeTestEnvConfig(TypedDict):
+    """Configuration for CodeTestCaseEnvironment."""
+
     num_workers: int
-    timeout_per_test: NotRequired[int]
+    timeout_per_test: int
     stop_strings: NotRequired[list[str] | None]
 
 
 class CodeTestMetadata(TypedDict):
+    """Metadata for each code evaluation sample."""
+
     test_cases: list[dict[str, str]]
     ground_truth: str
 
@@ -52,6 +57,12 @@ def extract_code(response: str) -> str:
 
     Supports markdown code blocks (```python ... ``` or ``` ... ```)
     and falls back to using the full response as code.
+
+    Args:
+        response: The model's text response potentially containing code blocks.
+
+    Returns:
+        Extracted Python code string.
     """
     patterns = [
         r"```python\s*\n(.*?)```",
@@ -65,23 +76,46 @@ def extract_code(response: str) -> str:
 
 
 def run_single_test(code: str, test_input: str, expected_output: str, timeout: int) -> bool:
-    """Run code with test_input as stdin and check stdout against expected_output."""
+    """Run code in an isolated subprocess and check stdout against expected output.
+
+    The subprocess is hardened with Python isolation flags (-I, -S),
+    a temporary working directory, and a minimal environment.
+
+    Args:
+        code: Python source code to execute.
+        test_input: String to feed via stdin.
+        expected_output: Expected stdout content.
+        timeout: Maximum execution time in seconds.
+
+    Returns:
+        True if code exits successfully and stdout matches expected output.
+    """
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            input=test_input,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        with tempfile.TemporaryDirectory() as sandbox_dir:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", code],
+                input=test_input,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=sandbox_dir,
+                env={"PYTHONNOUSERSITE": "1"},
+            )
+        return (
+            result.returncode == 0
+            and result.stdout.strip() == expected_output.strip()
         )
-        return result.stdout.strip() == expected_output.strip()
-    except (subprocess.TimeoutExpired, Exception):
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         return False
 
 
 @ray.remote  # pragma: no cover
 class CodeTestCaseVerifyWorker:
-    """Worker that executes generated code against test cases."""
+    """Worker that executes generated code against test cases.
+
+    Distributes across Ray workers for parallel evaluation of multiple
+    code samples. Each worker handles a chunk of the batch.
+    """
 
     def verify(
         self,
@@ -90,10 +124,21 @@ class CodeTestCaseVerifyWorker:
         return_extracted_answer: bool = False,
         timeout: int = 5,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+        """Verify code responses against test cases.
+
+        Args:
+            pred_responses: Model-generated responses containing code.
+            test_cases_batch: Test cases for each response.
+            return_extracted_answer: If True, also return extracted code.
+            timeout: Timeout per test case in seconds.
+
+        Returns:
+            Scores (and optionally extracted answers) for each response.
+        """
         results: list[float] = []
         extracted_answers: list[str | None] = []
 
-        for response, test_cases in zip(pred_responses, test_cases_batch):
+        for response, test_cases in zip(pred_responses, test_cases_batch, strict=True):
             code = extract_code(response)
 
             if not code or not test_cases:
@@ -122,14 +167,20 @@ class CodeTestCaseVerifyWorker:
 class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
     """Environment for evaluating code generation using test cases.
 
-    Extracts code from model responses, runs it against input/output test cases,
-    and returns binary pass/fail rewards (1.0 if all tests pass, 0.0 otherwise).
+    Extracts code from model responses, runs it against input/output test cases
+    in isolated subprocesses, and returns binary pass/fail rewards (1.0 if all
+    tests pass, 0.0 otherwise). Follows the MathEnvironment pattern for metrics.
     """
 
-    def __init__(self, cfg: CodeTestEnvConfig):
+    def __init__(self, cfg: CodeTestEnvConfig) -> None:
+        """Initialize the environment with worker pool.
+
+        Args:
+            cfg: Environment configuration with num_workers and timeout_per_test.
+        """
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        self.timeout = cfg.get("timeout_per_test", 5)
+        self.timeout = cfg["timeout_per_test"]
         self.workers = [
             CodeTestCaseVerifyWorker.options(
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
@@ -138,6 +189,7 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
         ]
 
     def shutdown(self) -> None:
+        """Shutdown all Ray workers."""
         for worker in self.workers:
             ray.kill(worker)
 
@@ -147,6 +199,16 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
         metadata: list[CodeTestMetadata],
         return_extracted_answer: bool = False,
     ) -> EnvironmentReturn[CodeTestMetadata]:
+        """Execute generated code against test cases and return rewards.
+
+        Args:
+            message_log_batch: Batch of conversation histories with assistant responses.
+            metadata: Test cases and ground truth for each sample.
+            return_extracted_answer: If True, return extracted code in answers.
+
+        Returns:
+            EnvironmentReturn with rewards (1.0=pass, 0.0=fail) and observations.
+        """
         assistant_response_batch = []
         for conversation in message_log_batch:
             assistant_responses = [
@@ -156,7 +218,7 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
             ]
             assistant_response_batch.append("".join(assistant_responses))
 
-        test_cases_batch = []
+        test_cases_batch: list[list[dict[str, str]]] = []
         for m in metadata:
             raw = m.get("test_cases", [])
             if isinstance(raw, str):
@@ -164,6 +226,8 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
                     raw = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     raw = []
+            if not isinstance(raw, list):
+                raw = []
             test_cases_batch.append(raw)
 
         chunked_responses = chunk_list_to_workers(
@@ -181,7 +245,7 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
                 timeout=self.timeout,
             )
             for i, (resp_chunk, tc_chunk) in enumerate(
-                zip(chunked_responses, chunked_test_cases)
+                zip(chunked_responses, chunked_test_cases, strict=True)
             )
         ]
 
@@ -226,6 +290,14 @@ class CodeTestCaseEnvironment(EnvironmentInterface[CodeTestMetadata]):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
+        """Compute metrics for the batch after all rollouts complete.
+
+        Args:
+            batch: Global rollout batch with rewards, generation lengths, etc.
+
+        Returns:
+            Tuple of (updated batch, metrics dict with accuracy, pass@k, etc.)
+        """
         batch["rewards"] = batch["rewards"] * batch["is_end"]
 
         if (batch["rewards"] == 1).float().sum() > 0:

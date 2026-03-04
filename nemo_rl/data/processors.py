@@ -692,7 +692,18 @@ def code_data_processor(
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
-    """Process a datum dictionary into a DatumSpec for the CodeTestCase Environment."""
+    """Process a datum dictionary into a DatumSpec for the CodeTestCase Environment.
+
+    Args:
+        datum_dict: Raw data with 'problem', 'test_cases', and optional 'expected_answer'.
+        task_data_spec: Task specification with prompt templates.
+        tokenizer: Tokenizer for encoding messages.
+        max_seq_length: Maximum allowed sequence length.
+        idx: Sample index.
+
+    Returns:
+        DatumSpec with message_log, extra_env_info containing test_cases and ground_truth.
+    """
     problem = datum_dict["problem"]
 
     test_cases_raw = datum_dict.get("test_cases", "[]")

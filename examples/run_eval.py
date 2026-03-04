@@ -55,7 +55,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    env_name = data_config.get("env_name", "math")
+    env_name = data_config["env_name"]
     env = create_env(env_name, env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(

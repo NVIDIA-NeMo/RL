@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LiveCodeBench dataset for code generation evaluation."""
+"""LiveCodeBench dataset for code generation evaluation.
+
+Loads coding problems from the LiveCodeBench benchmark on HuggingFace
+and formats them for evaluation with CodeTestCaseEnvironment.
+"""
 
 import json
 from typing import Any, Literal, Optional
@@ -32,11 +36,27 @@ VARIANT_TO_FILE = {
     "release_latest": "test6.jsonl",
 }
 
+VariantType = Literal[
+    "release_v1",
+    "release_v2",
+    "release_v3",
+    "release_v4",
+    "release_v5",
+    "release_v6",
+    "release_latest",
+]
+
 
 class LiveCodeBenchDataset:
+    """LiveCodeBench evaluation dataset.
+
+    Loads coding problems from HuggingFace livecodebench/code_generation_lite
+    and formats them with problem text and public test cases for evaluation.
+    """
+
     def __init__(
         self,
-        variant: Literal["release_v5", "release_v4", "release_v3", "release_latest"] = "release_v5",
+        variant: VariantType = "release_v5",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
@@ -63,6 +83,7 @@ class LiveCodeBenchDataset:
         self.processor = processors.code_data_processor
 
     def _rekey(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Rekey a LiveCodeBench example into the format expected by code_data_processor."""
         public_tests = data.get("public_test_cases", [])
         if isinstance(public_tests, str):
             try:
@@ -70,12 +91,14 @@ class LiveCodeBenchDataset:
             except (json.JSONDecodeError, TypeError):
                 public_tests = []
 
-        test_cases = []
-        for tc in public_tests:
-            test_cases.append({
-                "input": tc.get("input", ""),
-                "expected_output": tc.get("output", ""),
-            })
+        test_cases: list[dict[str, str]] = []
+        if isinstance(public_tests, list):
+            for tc in public_tests:
+                if isinstance(tc, dict):
+                    test_cases.append({
+                        "input": str(tc.get("input", "")),
+                        "expected_output": str(tc.get("output", "")),
+                    })
 
         starter = data.get("starter_code", "")
         problem = data["question_content"]
