@@ -17,8 +17,8 @@ requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
-  "pip", # Required for frozen environments; uv venv --seed may not reliably install pip
-  "ninja", # for flash-attn parallel build
+  "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
+  "ninja",                                                                                                            # for flash-attn parallel build
   "torch==2.9.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
@@ -44,17 +44,16 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=11.3.0",
   "torchvision>=0.22.0",
-  "num2words>=0.5.14", # for SmolVLM
+  "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.5.0,<3.6.0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
   "decord2",
   "nvidia-resiliency-ext",
-  "nccl4py", # for non-colocated refit
-  "cuda-bindings", # for non-colocated refit
-  "pybase64", # for sglang refit
-  "decord>=0.6.0",
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
 ]
 
 [project.optional-dependencies]
