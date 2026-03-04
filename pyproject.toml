@@ -206,7 +206,16 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" }, vllm = { VLLM_USE_PRECOMPILED = "1" } }
+# These vllm env vars are only necessary while vllm is a VCS (git) install. Without
+# VLLM_PRECOMPILED_WHEEL_COMMIT, vllm's setup.py cannot determine the base commit on main
+# (since we're building from a fork) and falls back to the "nightly" wheel which is a moving
+# target and may not have wheels for all architectures at any given time.
+# VLLM_PRECOMPILED_WHEEL_COMMIT is the latest upstream main commit on the vllm fork's branch —
+# vllm's setup.py uses it to fetch
+# the correct arch-specific wheel from wheels.vllm.ai (supports both x86_64 and aarch64).
+# This commit must also be set in the Dockerfile ENV for runtime ray worker venv rebuilds.
+# TODO(https://github.com/NVIDIA-NeMo/RL/issues/2065): Remove once vllm releases with transformers v5.
+extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" }, vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "b66a74649e40022c6b1180b98fbb1b6e4b4af74a" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -357,6 +366,7 @@ version = "0.3.21"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[tool.uv.dependency-metadata]]
+# TODO(https://github.com/NVIDIA-NeMo/RL/issues/2065): Remove once vllm releases with transformers v5.
 name = "vllm"
 # VCS install from terrykong/vllm@v5-upgrade-from-30566
 # Version is dynamic (setuptools-scm), use a placeholder.
