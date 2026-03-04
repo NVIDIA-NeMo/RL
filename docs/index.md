@@ -116,6 +116,48 @@ Learn how to add support for new model architectures in NeMo RL.
 
 ::::
 
+## Experiment Reports
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`beaker` 4k Repro Runbook
+:link: repro-specdec-window-sweep-vs-nospec-grpo-5steps-4k-2026-02-18
+:link-type: doc
+
+Step-by-step reproducibility guide for the 4k GRPO experiment comparing no-spec with speculative window sweep (`2`, `7`, `10`) using a 1.7B draft model.
+:::
+
+:::{grid-item-card} {octicon}`graph` 4k Full Report
+:link: specdec-window-sweep-vs-nospec-grpo-5steps-4k-2026-02-18
+:link-type: doc
+
+Full metrics report with setup/runtime, per-step timing, throughput, acceptance, and direct speedups versus no-spec.
+:::
+
+:::{grid-item-card} {octicon}`pulse` 4k Temp=1 Sweep Report
+:link: specdec-window-sweep-temp1-vs-nospec-grpo-5steps-4k-2026-02-18
+:link-type: doc
+
+Full temp=1 window sweep report (`1`, `2`, `4`, `7`, `10`) with side-by-side no-spec comparison, per-step generation timing, acceptance, and speedups.
+:::
+
+:::{grid-item-card} {octicon}`diff` TAR Drift A/B Setups
+:link: tar-drift-ab-setups-report-2026-02-25
+:link-type: doc
+
+Comparison report for baseline vs aggressive A/B setups, with intuition, metrics, and exact reproduction steps.
+:::
+
+:::{grid-item-card} {octicon}`rocket` EAGLE3 TAR Drift 5-Seed Runbook
+:link: repro-eagle3-tar-drift-grpo-ab-5seed-2026-03-01
+:link-type: doc
+
+Step-by-step instructions to generate Slurm submit scripts and run train/frozen A/B GRPO arms across 5 seeds.
+:::
+
+::::
+
 ## Advanced Topics
 
 ::::{grid} 1 1 2 2
@@ -220,6 +262,17 @@ model-quirks.md
 guides/async-grpo.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
+```
+
+```{toctree}
+:caption: Experiment Reports
+:hidden:
+
+repro-specdec-window-sweep-vs-nospec-grpo-5steps-4k-2026-02-18.md
+specdec-window-sweep-vs-nospec-grpo-5steps-4k-2026-02-18.md
+specdec-window-sweep-temp1-vs-nospec-grpo-5steps-4k-2026-02-18.md
+tar-drift-ab-setups-report-2026-02-25.md
+repro-eagle3-tar-drift-grpo-ab-5seed-2026-03-01.md
 ```
 
 ```{toctree}

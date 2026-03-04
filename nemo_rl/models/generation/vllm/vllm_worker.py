@@ -246,7 +246,16 @@ class BaseVllmGenerationWorker:
 
             This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
             """
-            file_to_patch = _get_vllm_file("attention/layer.py")
+            try:
+                file_to_patch = _get_vllm_file("attention/layer.py")
+            except RuntimeError as e:
+                # Newer vLLM layouts may move this file or already include the
+                # upstream fix. In that case, skip this compatibility patch.
+                logger.warning(
+                    "Skipping vLLM ViT flash-attn backend patch: %s",
+                    e,
+                )
+                return
             with open(file_to_patch, "r") as f:
                 content = f.read()
 

@@ -40,13 +40,22 @@ def configure_generation_config(
     # vllm setting
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
-        # set load_format
-        config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # Respect explicit load_format overrides. If unset, keep existing default:
+        # eval -> auto, train -> dummy.
+        if "load_format" not in config["vllm_cfg"]:
+            config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
-            if is_eval or config["stop_strings"] is not None:
+            if (
+                is_eval
+                or config["stop_strings"] is not None
+                or config["stop_token_ids"] is not None
+            ):
+                # vLLM V1 fetches EOS token id from the tokenizer each request.
+                # Keep tokenizer initialized when stop-token-based termination is
+                # configured to avoid dropping EOS id to None.
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True

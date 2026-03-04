@@ -171,6 +171,11 @@ def _default_grpo_save_state() -> GRPOSaveState:
     }
 
 
+def _is_truthy_env_var(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
@@ -273,10 +278,22 @@ def setup(
         num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        dataloader.load_state_dict(dataloader_state_dict)
+        dataloader_state_path = os.path.join(last_checkpoint_path, "train_dataloader.pt")
+        if _is_truthy_env_var("NRL_SKIP_TRAIN_DATALOADER_RESUME"):
+            print(
+                "  ⚠ Skipping train dataloader state restore "
+                "(NRL_SKIP_TRAIN_DATALOADER_RESUME is set).",
+                flush=True,
+            )
+        elif os.path.exists(dataloader_state_path):
+            dataloader_state_dict = torch.load(dataloader_state_path)
+            dataloader.load_state_dict(dataloader_state_dict)
+        else:
+            warnings.warn(
+                f"Checkpoint is missing train_dataloader.pt: {dataloader_state_path}. "
+                "Resuming without training dataloader state.",
+                stacklevel=2,
+            )
 
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
