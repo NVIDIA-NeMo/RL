@@ -467,20 +467,19 @@ def run_multi_turn_rollout(
 
         # Infer number of reward components on first turn (supports single- and multi-reward envs)
         if number_of_rewards is None:
-            number_of_rewards = (
-                int(env_output.rewards.shape[1])
-                if env_output.rewards.ndim >= 2
-                else 1
-            )
-            multi_rewards = torch.zeros(
-                batch_size, number_of_rewards, dtype=torch.float32
-            )
+            if env_output.rewards.ndim >= 2:
+                number_of_rewards = int(env_output.rewards.shape[1])
+                multi_rewards = torch.zeros(
+                    batch_size, number_of_rewards, dtype=torch.float32
+                )
+            else:
+                number_of_rewards = 1
+                # multi_rewards left None: GRPO uses total_reward only; reward1 unused
         # Accumulate rewards: env may return shape (N,) or (N, K)
         if env_output.rewards.ndim >= 2:
             multi_rewards[active_indices] += env_output.rewards
             total_rewards[active_indices] += env_output.rewards.sum(dim=1)
         else:
-            multi_rewards[active_indices, 0] += env_output.rewards
             total_rewards[active_indices] += env_output.rewards
 
         
@@ -560,7 +559,7 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
-    # Expose per-component rewards (reward1, reward2, ... rewardN); single-reward envs get reward1 only
+    # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
     if multi_rewards is not None:
         num_reward_components = multi_rewards.shape[1]
         for i in range(num_reward_components):

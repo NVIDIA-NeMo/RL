@@ -48,6 +48,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
+    get_gdpo_reward_component_keys
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -936,15 +937,6 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
-def _get_reward_component_keys(batch: BatchedDataDict[Any]) -> list[str]:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order.
-
-    Enables environments to expose any number of rewards without code changes elsewhere.
-    """
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
-
-
 def scale_rewards(
     repeated_batch: BatchedDataDict[DatumSpec], reward_scaling_cfg: RewardScalingConfig
 ) -> BatchedDataDict[DatumSpec]:
@@ -983,12 +975,9 @@ def scale_rewards(
                 source_max - source_min
             ) * (target_max - target_min)
 
-        rewards = torch.clamp(rewards, min=source_min, max=source_max)
-        scaled_rewards = target_min + (rewards - source_min) / (
-            source_max - source_min
-        ) * (target_max - target_min)
+        scaled_rewards = _scale(rewards)
         repeated_batch["total_reward"] = scaled_rewards
-        for key in _get_reward_component_keys(repeated_batch):
+        for key in get_gdpo_reward_component_keys(repeated_batch):
             repeated_batch[key] = _scale(repeated_batch[key])
 
     return repeated_batch
@@ -1043,15 +1032,11 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
-def _create_advantage_estimator(
-    master_config: MasterConfig, use_multi_reward_advantages: bool = False
-):
+def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
     Args:
         master_config: The master configuration dictionary.
-        use_multi_reward_advantages: If True and name is "gdpo", use GDPO.
-            When False and name is "gdpo", use GRPO (single-reward fallback).
 
     Returns:
         An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
@@ -1075,14 +1060,9 @@ def _create_advantage_estimator(
     )
 
     adv_estimator_name = adv_estimator_config["name"]
-    # GDPO only when we have multi-reward data; otherwise "gdpo" config uses GRPO
-    if use_multi_reward_advantages and adv_estimator_name == "gdpo":
+    if adv_estimator_name == "gdpo":
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
-    elif adv_estimator_name == "gdpo":
-        # GDPO config but single-reward batch: use GRPO
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GRPO advantage estimator (gdpo config, single-reward)")
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
@@ -1392,6 +1372,10 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
+    # Create advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
+
+
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
@@ -1614,19 +1598,7 @@ def grpo_train(
                 print("▶ Processing rewards...,", flush=True)
                 # GDPO
                 with timer.time("reward_calculation"):
-                    # Use GDPO when adv_estimator name is "gdpo" and batch has
-                    # multiple reward components (reward1, reward2, ...).
                     rewards = repeated_batch["total_reward"]
-                    adv_estimator_config = master_config["grpo"].get(
-                        "adv_estimator", {"name": "grpo"}
-                    )
-                    adv_estimator_name = adv_estimator_config.get("name", "grpo")
-                    reward_component_keys = _get_reward_component_keys(repeated_batch)
-                    use_multi_reward_advantages = (
-                        adv_estimator_name == "gdpo"
-                        and len(reward_component_keys) >= 2
-                    )
-
                     # Store input_ids in batch so that after dynamic_sampling it stays aligned with
                     # the (possibly filtered) batch: select_indices / from_batches / slice all
                     # apply to this key, so per-reward baselines use the same prompts as reward components.
@@ -1685,12 +1657,6 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
-
-                    # Create advantage estimator for this batch (GDPO when multi-reward, else GRPO/Reinforce++)
-                    adv_estimator = _create_advantage_estimator(
-                        master_config,
-                        use_multi_reward_advantages=use_multi_reward_advantages,
-                    )
 
                     gen_step_metrics = {}
                     if hasattr(policy_generation, "get_step_metrics"):
@@ -1824,27 +1790,12 @@ def grpo_train(
 
                     
 
-                    if use_multi_reward_advantages:
-                        # GDPO adv_estimation
-                        train_data["advantages"] = adv_estimator.compute_advantage(
-                            repeated_batch=repeated_batch,
-                            mask=mask,
-                            logprobs_policy=train_data["prev_logprobs"],
-                            logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        )
-
-                    else:
-
-                        train_data["advantages"] = adv_estimator.compute_advantage(
-                            prompt_ids=prompt_ids_for_adv,
-                            rewards=rewards,
-                            mask=mask,
-                            logprobs_policy=train_data["prev_logprobs"],
-                            logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        )
-
-
-
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        repeated_batch=repeated_batch,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information
@@ -2494,6 +2445,9 @@ def async_grpo_train(
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
+    # Create advantage estimator
+    adv_estimator = _create_advantage_estimator(master_config)
+
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
@@ -2784,23 +2738,8 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
-                    adv_estimator_config = master_config["grpo"].get(
-                        "adv_estimator", {"name": "grpo"}
-                    )
-                    adv_estimator_name = adv_estimator_config.get("name", "grpo")
-                    reward_component_keys = _get_reward_component_keys(repeated_batch)
-                    use_multi_reward_advantages = (
-                        adv_estimator_name == "gdpo"
-                        and len(reward_component_keys) >= 2
-                    )
-                    if use_multi_reward_advantages:
-                        repeated_batch["_input_ids_for_baseline"] = prompt_ids_for_adv
-
-                    # Create advantage estimator (GDPO when name is "gdpo" and batch has multi-reward)
-                    adv_estimator = _create_advantage_estimator(
-                        master_config,
-                        use_multi_reward_advantages=use_multi_reward_advantages,
-                    )
+                    # All estimators read _input_ids_for_baseline from repeated_batch
+                    repeated_batch["_input_ids_for_baseline"] = prompt_ids_for_adv
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -2883,19 +2822,12 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    if use_multi_reward_advantages:
-                        train_data["advantages"] = adv_estimator.compute_advantage(
-                            repeated_batch=repeated_batch,
-                            mask=mask,
-                        )
-                    else:
-                        train_data["advantages"] = adv_estimator.compute_advantage(
-                            prompt_ids=prompt_ids_for_adv,
-                            rewards=rewards,
-                            mask=mask,
-                            logprobs_policy=train_data["prev_logprobs"],
-                            logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        )
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        repeated_batch=repeated_batch,
+                        mask=mask,
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
+                    )
                     del prompt_ids_for_adv
 
                     # Log advantages stats

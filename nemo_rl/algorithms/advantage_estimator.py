@@ -26,14 +26,7 @@ Reference papers:
 import re
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl
-
-
-def _get_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
-
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl, get_gdpo_reward_component_keys
 
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
@@ -45,12 +38,11 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
-    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+    def compute_advantage(self, repeated_batch, mask, **kwargs):
         """Compute GRPO advantages.
 
         Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
-            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            repeated_batch: Batch containing _input_ids_for_baseline and total_reward.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
             **kwargs: Additional arguments (unused).
@@ -58,6 +50,8 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
+        prompt_ids = repeated_batch["_input_ids_for_baseline"]
+        rewards = repeated_batch["total_reward"]
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
@@ -99,10 +93,12 @@ class GDPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        reward_component_keys = _get_reward_component_keys(repeated_batch)
-        if not reward_component_keys:
+        reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
+        if len(reward_component_keys) < 2:
             raise ValueError(
-                "GDPOAdvantageEstimator requires reward component keys (reward1, reward2, ...) in repeated_batch"
+                f"GDPO requires multiple reward components (reward1, reward2, ...). "
+                f"This batch has {len(reward_component_keys)} component(s). "
+                "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
         current_input_ids = repeated_batch["_input_ids_for_baseline"]
         valid = torch.ones_like(
@@ -158,20 +154,11 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.kl_coef = loss_config["reference_policy_kl_penalty"]
         self.kl_type = loss_config["reference_policy_kl_type"]
 
-    def compute_advantage(
-        self,
-        prompt_ids,
-        rewards,
-        mask,
-        logprobs_policy=None,
-        logprobs_reference=None,
-        **kwargs,
-    ):
+    def compute_advantage(self, repeated_batch, mask, logprobs_policy=None, logprobs_reference=None, **kwargs):
         """Compute Reinforce++ advantages with optional KL penalty.
 
         Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
-            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            repeated_batch: Batch containing _input_ids_for_baseline and total_reward.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used for: (1) expanding advantages to token-level shape, (2) global normalization
                   that only considers valid tokens.
@@ -182,6 +169,8 @@ class ReinforcePlusPlusAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
         """
+        prompt_ids = repeated_batch["_input_ids_for_baseline"]
+        rewards = repeated_batch["total_reward"]
         # minus baseline
         if self.minus_baseline:
             mean, _ = calculate_baseline_and_std_per_prompt(
