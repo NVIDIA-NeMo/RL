@@ -358,44 +358,86 @@ requires-dist = ["torch", "scikit-build-core", "wheel"]
 [[tool.uv.dependency-metadata]]
 name = "vllm"
 # VCS install from terrykong/vllm@v5-upgrade-from-30566
-# Version is dynamic (setuptools-scm), use a placeholder
+# Version is dynamic (setuptools-scm), use a placeholder.
+#
+# Since vllm declares dependencies dynamically via requirements/*.txt (not static
+# pyproject.toml metadata), uv cannot extract them without a full build. We provide
+# them here so uv can resolve without building.
+#
+# HOW TO UPDATE: This list must mirror requirements/cuda.txt (which includes
+# requirements/common.txt) from the vllm commit pinned in [tool.uv.sources].
+# 1. Open https://github.com/terrykong/vllm/tree/<COMMIT>/requirements
+# 2. Concatenate common.txt + cuda.txt (cuda includes common via `-r common.txt`)
+# 3. Convert each line to PEP 508 format in the list below
+# 4. Run `uv lock` to verify resolution succeeds
 version = "1.0.0.dev0"
 requires-dist = [
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
-  "torchvision==0.25.0",
-  "ray[cgraph]>=2.48.0",
-  "transformers>=4.56.0",
-  "flashinfer-python==0.6.4",
-  "llguidance>=1.3.0,<1.4.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
-  "xgrammar==0.1.29; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
-  "compressed-tensors==0.13.0",
+  # --- requirements/common.txt ---
+  "regex",
+  "cachetools",
+  "psutil",
+  "sentencepiece",
   "numpy",
   "requests>=2.26.0",
   "tqdm",
-  "psutil",
-  "sentencepiece",
+  "blake3",
+  "py-cpuinfo",
+  "transformers>=4.56.0",
   "tokenizers>=0.21.1",
+  "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*",
   "fastapi[standard]>=0.115.0",
   "aiohttp>=3.13.3",
   "openai>=1.99.1",
   "pydantic>=2.12.0",
+  "prometheus_client>=0.18.0",
   "pillow",
+  "prometheus-fastapi-instrumentator>=7.0.0",
   "tiktoken>=0.6.0",
+  "lm-format-enforcer==0.11.3",
+  "llguidance>=1.3.0,<1.4.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
   "outlines_core==0.2.11",
+  "diskcache==5.6.3",
+  "lark==1.2.2",
+  "xgrammar==0.1.29; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
+  "typing_extensions>=4.10",
+  "filelock>=3.16.1",
   "partial-json-parser",
   "pyzmq>=25.0.0",
   "msgspec",
   "gguf>=0.17.0",
+  "mistral_common[image]>=1.9.1",
   "opencv-python-headless>=4.13.0",
-  "einops",
-  "setuptools>=77.0.3,<81.0.0; python_version > '3.11'",
   "pyyaml",
-  "numba==0.61.2",
-  "protobuf>=5.29.6",
-  "prometheus_client>=0.18.0",
+  "six>=1.16.0; python_version > '3.11'",
+  "setuptools>=77.0.3,<81.0.0; python_version > '3.11'",
+  "einops",
+  "compressed-tensors==0.13.0",
+  "depyf==0.20.0",
+  "cloudpickle",
+  "watchfiles",
+  "python-json-logger",
+  "ninja",
   "pybase64",
+  "cbor2",
+  "ijson",
+  "setproctitle",
+  "openai-harmony>=0.0.3",
+  "anthropic>=0.71.0",
+  "model-hosting-container-standards>=0.1.13,<1.0.0",
+  "mcp",
   "grpcio",
+  "grpcio-reflection",
+  "opentelemetry-sdk>=1.27.0",
+  "opentelemetry-api>=1.27.0",
+  "opentelemetry-exporter-otlp>=1.27.0",
+  "opentelemetry-semantic-conventions-ai>=0.4.1",
+  # --- requirements/cuda.txt ---
+  "numba==0.61.2",
+  "ray[cgraph]>=2.48.0",
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+  "torchvision==0.25.0",
+  "flashinfer-python==0.6.4",
 ]
 
 [[tool.uv.dependency-metadata]]

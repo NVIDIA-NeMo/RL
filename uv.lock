@@ -164,7 +164,7 @@ requires-dist = ["torch==2.9.1", "torchaudio==2.9.1", "torchvision", "transforme
 [[manifest.dependency-metadata]]
 name = "vllm"
 version = "1.0.0.dev0"
-requires-dist = ["torch==2.10.0", "torchaudio==2.10.0", "torchvision==0.25.0", "ray[cgraph]>=2.48.0", "transformers>=4.56.0", "flashinfer-python==0.6.4", "llguidance>=1.3.0,<1.4.0 ; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", "xgrammar==0.1.29 ; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", "compressed-tensors==0.13.0", "numpy", "requests>=2.26.0", "tqdm", "psutil", "sentencepiece", "tokenizers>=0.21.1", "fastapi[standard]>=0.115.0", "aiohttp>=3.13.3", "openai>=1.99.1", "pydantic>=2.12.0", "pillow", "tiktoken>=0.6.0", "outlines-core==0.2.11", "partial-json-parser", "pyzmq>=25.0.0", "msgspec", "gguf>=0.17.0", "opencv-python-headless>=4.13.0", "einops", "setuptools>=77.0.3,<81.0.0 ; python_full_version >= '3.12'", "pyyaml", "numba==0.61.2", "protobuf>=5.29.6", "prometheus-client>=0.18.0", "pybase64", "grpcio"]
+requires-dist = ["regex", "cachetools", "psutil", "sentencepiece", "numpy", "requests>=2.26.0", "tqdm", "blake3", "py-cpuinfo", "transformers>=4.56.0", "tokenizers>=0.21.1", "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*", "fastapi[standard]>=0.115.0", "aiohttp>=3.13.3", "openai>=1.99.1", "pydantic>=2.12.0", "prometheus-client>=0.18.0", "pillow", "prometheus-fastapi-instrumentator>=7.0.0", "tiktoken>=0.6.0", "lm-format-enforcer==0.11.3", "llguidance>=1.3.0,<1.4.0 ; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", "outlines-core==0.2.11", "diskcache==5.6.3", "lark==1.2.2", "xgrammar==0.1.29 ; platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", "typing-extensions>=4.10", "filelock>=3.16.1", "partial-json-parser", "pyzmq>=25.0.0", "msgspec", "gguf>=0.17.0", "mistral-common[image]>=1.9.1", "opencv-python-headless>=4.13.0", "pyyaml", "six>=1.16.0 ; python_full_version >= '3.12'", "setuptools>=77.0.3,<81.0.0 ; python_full_version >= '3.12'", "einops", "compressed-tensors==0.13.0", "depyf==0.20.0", "cloudpickle", "watchfiles", "python-json-logger", "ninja", "pybase64", "cbor2", "ijson", "setproctitle", "openai-harmony>=0.0.3", "anthropic>=0.71.0", "model-hosting-container-standards>=0.1.13,<1.0.0", "mcp", "grpcio", "grpcio-reflection", "opentelemetry-sdk>=1.27.0", "opentelemetry-api>=1.27.0", "opentelemetry-exporter-otlp>=1.27.0", "opentelemetry-semantic-conventions-ai>=0.4.1", "numba==0.61.2", "ray[cgraph]>=2.48.0", "torch==2.10.0", "torchaudio==2.10.0", "torchvision==0.25.0", "flashinfer-python==0.6.4"]
 
 [[package]]
 name = "absl-py"
@@ -413,6 +413,25 @@ wheels = [
 ]
 
 [[package]]
+name = "anthropic"
+version = "0.84.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "docstring-parser" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/04/ea/0869d6df9ef83dcf393aeefc12dd81677d091c6ffc86f783e51cf44062f2/anthropic-0.84.0.tar.gz", hash = "sha256:72f5f90e5aebe62dca316cb013629cfa24996b0f5a4593b8c3d712bc03c43c37", size = 539457, upload-time = "2026-02-25T05:22:38.54Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/ca/218fa25002a332c0aa149ba18ffc0543175998b1f65de63f6d106689a345/anthropic-0.84.0-py3-none-any.whl", hash = "sha256:861c4c50f91ca45f942e091d83b60530ad6d4f98733bfe648065364da05d29e7", size = 455156, upload-time = "2026-02-25T05:22:40.468Z" },
+]
+
+[[package]]
 name = "antlr4-python3-runtime"
 version = "4.9.3"
 source = { registry = "https://pypi.org/simple" }
@@ -462,6 +481,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/63/40/f03da1264ae8f7cfdbf9146542e5e7e8100a4c66ab48e791df9a03d3f6c0/asgiref-3.11.1.tar.gz", hash = "sha256:5f184dc43b7e763efe848065441eac62229c9f7b0475f41f80e207a114eda4ce", size = 38550, upload-time = "2026-02-03T13:30:14.33Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/0a/a72d10ed65068e115044937873362e6e32fab1b7dce0046aeb224682c989/asgiref-3.11.1-py3-none-any.whl", hash = "sha256:e8667a091e69529631969fd45dc268fa79b99c92c5fcdda727757e52146ec133", size = 24345, upload-time = "2026-02-03T13:30:13.039Z" },
+]
+
+[[package]]
+name = "astor"
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/21/75b771132fee241dfe601d39ade629548a9626d1d39f333fde31bc46febe/astor-0.8.1.tar.gz", hash = "sha256:6a6effda93f4e1ce9f618779b2dd1d9d84f1e32812c23a29b3fff6fd7f63fa5e", size = 35090, upload-time = "2019-12-10T01:50:35.51Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c3/88/97eef84f48fa04fbd6750e62dcceafba6c63c81b7ac1420856c8dcc0a3f9/astor-0.8.1-py2.py3-none-any.whl", hash = "sha256:070a54e890cefb5b3739d19f30f5a5ec840ffc9c50ffa7d23cc9fc1a38ebbfc5", size = 27488, upload-time = "2019-12-10T01:50:33.628Z" },
 ]
 
 [[package]]
@@ -688,6 +716,74 @@ wheels = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.0.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/aa/abcd75e9600987a0bc6cfe9b6b2ff3f0e2cb08c170addc6e76035b5c4cb3/blake3-1.0.8.tar.gz", hash = "sha256:513cc7f0f5a7c035812604c2c852a0c1468311345573de647e310aca4ab165ba", size = 117308, upload-time = "2025-10-14T06:47:48.83Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/a0/b7b6dff04012cfd6e665c09ee446f749bd8ea161b00f730fe1bdecd0f033/blake3-1.0.8-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:d8da4233984d51471bd4e4366feda1d90d781e712e0a504ea54b1f2b3577557b", size = 347983, upload-time = "2025-10-14T06:45:47.214Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/a2/264091cac31d7ae913f1f296abc20b8da578b958ffb86100a7ce80e8bf5c/blake3-1.0.8-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1257be19f2d381c868a34cc822fc7f12f817ddc49681b6d1a2790bfbda1a9865", size = 325415, upload-time = "2025-10-14T06:45:48.482Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/7d/85a4c0782f613de23d114a7a78fcce270f75b193b3ff3493a0de24ba104a/blake3-1.0.8-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:269f255b110840e52b6ce9db02217e39660ebad3e34ddd5bca8b8d378a77e4e1", size = 371296, upload-time = "2025-10-14T06:45:49.674Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/20/488475254976ed93fab57c67aa80d3b40df77f7d9db6528c9274bff53e08/blake3-1.0.8-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:66ca28a673025c40db3eba21a9cac52f559f83637efa675b3f6bd8683f0415f3", size = 374516, upload-time = "2025-10-14T06:45:51.23Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/21/2a1c47fedb77fb396512677ec6d46caf42ac6e9a897db77edd0a2a46f7bb/blake3-1.0.8-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:bcb04966537777af56c1f399b35525aa70a1225816e121ff95071c33c0f7abca", size = 447911, upload-time = "2025-10-14T06:45:52.637Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/7d/db0626df16029713e7e61b67314c4835e85c296d82bd907c21c6ea271da2/blake3-1.0.8-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:e5b5da177d62cc4b7edf0cea08fe4dec960c9ac27f916131efa890a01f747b93", size = 505420, upload-time = "2025-10-14T06:45:54.445Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/55/6e737850c2d58a6d9de8a76dad2ae0f75b852a23eb4ecb07a0b165e6e436/blake3-1.0.8-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:38209b10482c97e151681ea3e91cc7141f56adbbf4820a7d701a923124b41e6a", size = 394189, upload-time = "2025-10-14T06:45:55.719Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/94/eafaa5cdddadc0c9c603a6a6d8339433475e1a9f60c8bb9c2eed2d8736b6/blake3-1.0.8-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:504d1399b7fb91dfe5c25722d2807990493185faa1917456455480c36867adb5", size = 388001, upload-time = "2025-10-14T06:45:57.067Z" },
+    { url = "https://files.pythonhosted.org/packages/17/81/735fa00d13de7f68b25e1b9cb36ff08c6f165e688d85d8ec2cbfcdedccc5/blake3-1.0.8-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:c84af132aa09abeadf9a0118c8fb26f4528f3f42c10ef8be0fcf31c478774ec4", size = 550302, upload-time = "2025-10-14T06:45:58.657Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/c6/d1fe8bdea4a6088bd54b5a58bc40aed89a4e784cd796af7722a06f74bae7/blake3-1.0.8-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:a25db3d36b55f5ed6a86470155cc749fc9c5b91c949b8d14f48658f9d960d9ec", size = 554211, upload-time = "2025-10-14T06:46:00.269Z" },
+    { url = "https://files.pythonhosted.org/packages/55/d1/ca74aa450cbe10e396e061f26f7a043891ffa1485537d6b30d3757e20995/blake3-1.0.8-cp312-cp312-win32.whl", hash = "sha256:e0fee93d5adcd44378b008c147e84f181f23715307a64f7b3db432394bbfce8b", size = 228343, upload-time = "2025-10-14T06:46:01.533Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/42/bbd02647169e3fbed27558555653ac2578c6f17ccacf7d1956c58ef1d214/blake3-1.0.8-cp312-cp312-win_amd64.whl", hash = "sha256:6a6eafc29e4f478d365a87d2f25782a521870c8514bb43734ac85ae9be71caf7", size = 215704, upload-time = "2025-10-14T06:46:02.79Z" },
+    { url = "https://files.pythonhosted.org/packages/55/b8/11de9528c257f7f1633f957ccaff253b706838d22c5d2908e4735798ec01/blake3-1.0.8-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:46dc20976bd6c235959ef0246ec73420d1063c3da2839a9c87ca395cf1fd7943", size = 347771, upload-time = "2025-10-14T06:46:04.248Z" },
+    { url = "https://files.pythonhosted.org/packages/50/26/f7668be55c909678b001ecacff11ad7016cd9b4e9c7cc87b5971d638c5a9/blake3-1.0.8-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:d17eb6382634b3a5bc0c0e0454d5265b0becaeeadb6801ed25150b39a999d0cc", size = 325431, upload-time = "2025-10-14T06:46:06.136Z" },
+    { url = "https://files.pythonhosted.org/packages/77/57/e8a85fa261894bf7ce7af928ff3408aab60287ab8d58b55d13a3f700b619/blake3-1.0.8-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:19fc6f2b7edab8acff6895fc6e38c19bd79f4c089e21153020c75dfc7397d52d", size = 370994, upload-time = "2025-10-14T06:46:07.398Z" },
+    { url = "https://files.pythonhosted.org/packages/62/cd/765b76bb48b8b294fea94c9008b0d82b4cfa0fa2f3c6008d840d01a597e4/blake3-1.0.8-cp313-cp313-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:4f54cff7f15d91dc78a63a2dd02a3dccdc932946f271e2adb4130e0b4cf608ba", size = 374372, upload-time = "2025-10-14T06:46:08.698Z" },
+    { url = "https://files.pythonhosted.org/packages/36/7a/32084eadbb28592bb07298f0de316d2da586c62f31500a6b1339a7e7b29b/blake3-1.0.8-cp313-cp313-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:e7e12a777f6b798eb8d06f875d6e108e3008bd658d274d8c676dcf98e0f10537", size = 447627, upload-time = "2025-10-14T06:46:10.002Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/f4/3788a1d86e17425eea147e28d7195d7053565fc279236a9fd278c2ec495e/blake3-1.0.8-cp313-cp313-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:ddfc59b0176fb31168f08d5dd536e69b1f4f13b5a0f4b0c3be1003efd47f9308", size = 507536, upload-time = "2025-10-14T06:46:11.614Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/01/4639cba48513b94192681b4da472cdec843d3001c5344d7051ee5eaef606/blake3-1.0.8-cp313-cp313-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:a2336d5b2a801a7256da21150348f41610a6c21dae885a3acb1ebbd7333d88d8", size = 394105, upload-time = "2025-10-14T06:46:12.808Z" },
+    { url = "https://files.pythonhosted.org/packages/21/ae/6e55c19c8460fada86cd1306a390a09b0c5a2e2e424f9317d2edacea439f/blake3-1.0.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e4072196547484c95a5a09adbb952e9bb501949f03f9e2a85e7249ef85faaba8", size = 386928, upload-time = "2025-10-14T06:46:16.284Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/6c/05b7a5a907df1be53a8f19e7828986fc6b608a44119641ef9c0804fbef15/blake3-1.0.8-cp313-cp313-musllinux_1_1_aarch64.whl", hash = "sha256:0eab3318ec02f8e16fe549244791ace2ada2c259332f0c77ab22cf94dfff7130", size = 550003, upload-time = "2025-10-14T06:46:17.791Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/03/f0ea4adfedc1717623be6460b3710fcb725ca38082c14274369803f727e1/blake3-1.0.8-cp313-cp313-musllinux_1_1_x86_64.whl", hash = "sha256:a33b9a1fb6d1d559a8e0d04b041e99419a6bb771311c774f6ff57ed7119c70ed", size = 553857, upload-time = "2025-10-14T06:46:19.088Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/6f/e5410d2e2a30c8aba8389ffc1c0061356916bf5ecd0a210344e7b69b62ab/blake3-1.0.8-cp313-cp313-win32.whl", hash = "sha256:e171b169cb7ea618e362a4dddb7a4d4c173bbc08b9ba41ea3086dd1265530d4f", size = 228315, upload-time = "2025-10-14T06:46:20.391Z" },
+    { url = "https://files.pythonhosted.org/packages/79/ef/d9c297956dfecd893f29f59e7b22445aba5b47b7f6815d9ba5dcd73fcae6/blake3-1.0.8-cp313-cp313-win_amd64.whl", hash = "sha256:3168c457255b5d2a2fc356ba696996fcaff5d38284f968210d54376312107662", size = 215477, upload-time = "2025-10-14T06:46:21.542Z" },
+    { url = "https://files.pythonhosted.org/packages/20/ba/eaa7723d66dd8ab762a3e85e139bb9c46167b751df6e950ad287adb8fb61/blake3-1.0.8-cp313-cp313t-macosx_10_12_x86_64.whl", hash = "sha256:b4d672c24dc15ec617d212a338a4ca14b449829b6072d09c96c63b6e6b621aed", size = 347289, upload-time = "2025-10-14T06:46:22.772Z" },
+    { url = "https://files.pythonhosted.org/packages/47/b3/6957f6ee27f0d5b8c4efdfda68a1298926a88c099f4dd89c711049d16526/blake3-1.0.8-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:1af0e5a29aa56d4fba904452ae784740997440afd477a15e583c38338e641f41", size = 324444, upload-time = "2025-10-14T06:46:24.729Z" },
+    { url = "https://files.pythonhosted.org/packages/13/da/722cebca11238f3b24d3cefd2361c9c9ea47cfa0ad9288eeb4d1e0b7cf93/blake3-1.0.8-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ef153c5860d5bf1cc71aece69b28097d2a392913eb323d6b52555c875d0439fc", size = 370441, upload-time = "2025-10-14T06:46:26.29Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/d5/2f7440c8e41c0af995bad3a159e042af0f4ed1994710af5b4766ca918f65/blake3-1.0.8-cp313-cp313t-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:e8ae3689f0c7bfa6ce6ae45cab110e4c3442125c4c23b28f1f097856de26e4d1", size = 374312, upload-time = "2025-10-14T06:46:27.451Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/6c/fb6a7812e60ce3e110bcbbb11f167caf3e975c589572c41e1271f35f2c41/blake3-1.0.8-cp313-cp313t-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:3fb83532f7456ddeb68dae1b36e1f7c52f9cb72852ac01159bbcb1a12b0f8be0", size = 447007, upload-time = "2025-10-14T06:46:29.056Z" },
+    { url = "https://files.pythonhosted.org/packages/13/3b/c99b43fae5047276ea9d944077c190fc1e5f22f57528b9794e21f7adedc6/blake3-1.0.8-cp313-cp313t-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:6ae7754c7d96e92a70a52e07c732d594cf9924d780f49fffd3a1e9235e0f5ba7", size = 507323, upload-time = "2025-10-14T06:46:30.661Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/bb/ba90eddd592f8c074a0694cb0a744b6bd76bfe67a14c2b490c8bdfca3119/blake3-1.0.8-cp313-cp313t-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:4bacaae75e98dee3b7da6c5ee3b81ee21a3352dd2477d6f1d1dbfd38cdbf158a", size = 393449, upload-time = "2025-10-14T06:46:31.805Z" },
+    { url = "https://files.pythonhosted.org/packages/25/ed/58a2acd0b9e14459cdaef4344db414d4a36e329b9720921b442a454dd443/blake3-1.0.8-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9456c829601d72852d8ba0af8dae0610f7def1d59f5942efde1e2ef93e8a8b57", size = 386844, upload-time = "2025-10-14T06:46:33.195Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/04/fed09845b18d90862100c8e48308261e2f663aab25d3c71a6a0bdda6618b/blake3-1.0.8-cp313-cp313t-musllinux_1_1_aarch64.whl", hash = "sha256:497ef8096ec4ac1ffba9a66152cee3992337cebf8ea434331d8fd9ce5423d227", size = 549550, upload-time = "2025-10-14T06:46:35.23Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/65/1859fddfabc1cc72548c2269d988819aad96d854e25eae00531517925901/blake3-1.0.8-cp313-cp313t-musllinux_1_1_x86_64.whl", hash = "sha256:511133bab85ff60ed143424ce484d08c60894ff7323f685d7a6095f43f0c85c3", size = 553805, upload-time = "2025-10-14T06:46:36.532Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/c7/2969352017f62378e388bb07bb2191bc9a953f818dc1cd6b9dd5c24916e1/blake3-1.0.8-cp313-cp313t-win32.whl", hash = "sha256:9c9fbdacfdeb68f7ca53bb5a7a5a593ec996eaf21155ad5b08d35e6f97e60877", size = 228068, upload-time = "2025-10-14T06:46:37.826Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/fc/923e25ac9cadfff1cd20038bcc0854d0f98061eb6bc78e42c43615f5982d/blake3-1.0.8-cp313-cp313t-win_amd64.whl", hash = "sha256:3cec94ed5676821cf371e9c9d25a41b4f3ebdb5724719b31b2749653b7cc1dfa", size = 215369, upload-time = "2025-10-14T06:46:39.054Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/2a/9f13ea01b03b1b4751a1cc2b6c1ef4b782e19433a59cf35b59cafb2a2696/blake3-1.0.8-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:2c33dac2c6112bc23f961a7ca305c7e34702c8177040eb98d0389d13a347b9e1", size = 347016, upload-time = "2025-10-14T06:46:40.318Z" },
+    { url = "https://files.pythonhosted.org/packages/06/8e/8458c4285fbc5de76414f243e4e0fcab795d71a8b75324e14959aee699da/blake3-1.0.8-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:c445eff665d21c3b3b44f864f849a2225b1164c08654beb23224a02f087b7ff1", size = 324496, upload-time = "2025-10-14T06:46:42.355Z" },
+    { url = "https://files.pythonhosted.org/packages/49/fa/b913eb9cc4af708c03e01e6b88a8bb3a74833ba4ae4b16b87e2829198e06/blake3-1.0.8-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a47939f04b89c5c6ff1e51e883e5efab1ea1bf01a02f4d208d216dddd63d0dd8", size = 370654, upload-time = "2025-10-14T06:46:43.907Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/4f/245e0800c33b99c8f2b570d9a7199b51803694913ee4897f339648502933/blake3-1.0.8-cp314-cp314-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:73e0b4fa25f6e3078526a592fb38fca85ef204fd02eced6731e1cdd9396552d4", size = 374693, upload-time = "2025-10-14T06:46:45.186Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/a6/8cb182c8e482071dbdfcc6ec0048271fd48bcb78782d346119ff54993700/blake3-1.0.8-cp314-cp314-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:4b0543c57eb9d6dac9d4bced63e9f7f7b546886ac04cec8da3c3d9c8f30cbbb7", size = 447673, upload-time = "2025-10-14T06:46:46.358Z" },
+    { url = "https://files.pythonhosted.org/packages/06/b7/1cbbb5574d2a9436d1b15e7eb5b9d82e178adcaca71a97b0fddaca4bfe3a/blake3-1.0.8-cp314-cp314-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:ed972ebd553c0c25363459e9fc71a38c045d8419e365b59acd8cd791eff13981", size = 507233, upload-time = "2025-10-14T06:46:48.109Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/45/b55825d90af353b3e26c653bab278da9d6563afcf66736677f9397e465be/blake3-1.0.8-cp314-cp314-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:3bafdec95dfffa3f6571e529644744e280337df15ddd9728f224ba70c5779b23", size = 393852, upload-time = "2025-10-14T06:46:49.511Z" },
+    { url = "https://files.pythonhosted.org/packages/34/73/9058a1a457dd20491d1b37de53d6876eff125e1520d9b2dd7d0acbc88de2/blake3-1.0.8-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2d78f06f3fb838b34c330e2987090376145cbe5944d8608a0c4779c779618f7b", size = 386442, upload-time = "2025-10-14T06:46:51.205Z" },
+    { url = "https://files.pythonhosted.org/packages/30/6d/561d537ffc17985e276e08bf4513f1c106f1fdbef571e782604dc4e44070/blake3-1.0.8-cp314-cp314-musllinux_1_1_aarch64.whl", hash = "sha256:dd03ff08d1b6e4fdda1cd03826f971ae8966ef6f683a8c68aa27fb21904b5aa9", size = 549929, upload-time = "2025-10-14T06:46:52.494Z" },
+    { url = "https://files.pythonhosted.org/packages/03/2f/dbe20d2c57f1a67c63be4ba310bcebc707b945c902a0bde075d2a8f5cd5c/blake3-1.0.8-cp314-cp314-musllinux_1_1_x86_64.whl", hash = "sha256:4e02a3c499e35bf51fc15b2738aca1a76410804c877bcd914752cac4f71f052a", size = 553750, upload-time = "2025-10-14T06:46:54.194Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/da/c6cb712663c869b2814870c2798e57289c4268c5ac5fb12d467fce244860/blake3-1.0.8-cp314-cp314-win32.whl", hash = "sha256:a585357d5d8774aad9ffc12435de457f9e35cde55e0dc8bc43ab590a6929e59f", size = 228404, upload-time = "2025-10-14T06:46:56.807Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/b6/c7dcd8bc3094bba1c4274e432f9e77a7df703532ca000eaa550bd066b870/blake3-1.0.8-cp314-cp314-win_amd64.whl", hash = "sha256:9ab5998e2abd9754819753bc2f1cf3edf82d95402bff46aeef45ed392a5468bf", size = 215460, upload-time = "2025-10-14T06:46:58.15Z" },
+    { url = "https://files.pythonhosted.org/packages/75/3c/6c8afd856c353176836daa5cc33a7989e8f54569e9d53eb1c53fc8f80c34/blake3-1.0.8-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:e2df12f295f95a804338bd300e8fad4a6f54fd49bd4d9c5893855a230b5188a8", size = 347482, upload-time = "2025-10-14T06:47:00.189Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/35/92cd5501ce8e1f5cabdc0c3ac62d69fdb13ff0b60b62abbb2b6d0a53a790/blake3-1.0.8-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:63379be58438878eeb76ebe4f0efbeaabf42b79f2cff23b6126b7991588ced67", size = 324376, upload-time = "2025-10-14T06:47:01.413Z" },
+    { url = "https://files.pythonhosted.org/packages/11/33/503b37220a3e2e31917ef13722efd00055af51c5e88ae30974c733d7ece6/blake3-1.0.8-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:88d527c247f9609dc1d45a08fd243e39f0d5300d54c57e048de24d4fa9240ebb", size = 370220, upload-time = "2025-10-14T06:47:02.573Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/df/fe817843adf59516c04d44387bd643b422a3b0400ea95c6ede6a49920737/blake3-1.0.8-cp314-cp314t-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:506a47897a11ebe8f3cdeb52f1365d6a2f83959e98ccb0c830f8f73277d4d358", size = 373454, upload-time = "2025-10-14T06:47:03.784Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/4d/90a2a623575373dfc9b683f1bad1bf017feafa5a6d65d94fb09543050740/blake3-1.0.8-cp314-cp314t-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:e5122a61b3b004bbbd979bdf83a3aaab432da3e2a842d7ddf1c273f2503b4884", size = 447102, upload-time = "2025-10-14T06:47:04.958Z" },
+    { url = "https://files.pythonhosted.org/packages/93/ff/4e8ce314f60115c4c657b1fdbe9225b991da4f5bcc5d1c1f1d151e2f39d6/blake3-1.0.8-cp314-cp314t-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:0171e85d56dec1219abdae5f49a0ed12cb3f86a454c29160a64fd8a8166bba37", size = 506791, upload-time = "2025-10-14T06:47:06.82Z" },
+    { url = "https://files.pythonhosted.org/packages/44/88/2963a1f18aab52bdcf35379b2b48c34bbc462320c37e76960636b8602c36/blake3-1.0.8-cp314-cp314t-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:003f61e8c41dd9931edddf1cc6a1bb680fb2ac0ad15493ef4a1df9adc59ce9df", size = 393717, upload-time = "2025-10-14T06:47:09.085Z" },
+    { url = "https://files.pythonhosted.org/packages/45/d1/a848ed8e8d4e236b9b16381768c9ae99d92890c24886bb4505aa9c3d2033/blake3-1.0.8-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d2c3151955efb09ba58cd3e1263521e15e9e3866a40d6bd3556d86fc968e8f95", size = 386150, upload-time = "2025-10-14T06:47:10.363Z" },
+    { url = "https://files.pythonhosted.org/packages/96/09/e3eb5d60f97c01de23d9f434e6e1fc117efb466eaa1f6ddbbbcb62580d6e/blake3-1.0.8-cp314-cp314t-musllinux_1_1_aarch64.whl", hash = "sha256:5eb25bca3cee2e0dd746a214784fb36be6a43640c01c55b6b4e26196e72d076c", size = 549120, upload-time = "2025-10-14T06:47:11.713Z" },
+    { url = "https://files.pythonhosted.org/packages/14/ad/3d9661c710febb8957dd685fdb3e5a861aa0ac918eda3031365ce45789e2/blake3-1.0.8-cp314-cp314t-musllinux_1_1_x86_64.whl", hash = "sha256:ab4e1dea4fa857944944db78e8f20d99ee2e16b2dea5a14f514fb0607753ac83", size = 553264, upload-time = "2025-10-14T06:47:13.317Z" },
+    { url = "https://files.pythonhosted.org/packages/11/55/e332a5b49edf377d0690e95951cca21a00c568f6e37315f9749efee52617/blake3-1.0.8-cp314-cp314t-win32.whl", hash = "sha256:67f1bc11bf59464ef092488c707b13dd4e872db36e25c453dfb6e0c7498df9f1", size = 228116, upload-time = "2025-10-14T06:47:14.516Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/5c/dbd00727a3dd165d7e0e8af40e630cd7e45d77b525a3218afaff8a87358e/blake3-1.0.8-cp314-cp314t-win_amd64.whl", hash = "sha256:421b99cdf1ff2d1bf703bc56c454f4b286fce68454dd8711abbcb5a0df90c19a", size = 215133, upload-time = "2025-10-14T06:47:16.069Z" },
+]
+
+[[package]]
 name = "blinker"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -813,6 +909,36 @@ dependencies = [
     { name = "packaging" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+
+[[package]]
+name = "cbor2"
+version = "5.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/8e/8b4fdde28e42ffcd741a37f4ffa9fb59cd4fe01625b544dfcfd9ccb54f01/cbor2-5.8.0.tar.gz", hash = "sha256:b19c35fcae9688ac01ef75bad5db27300c2537eb4ee00ed07e05d8456a0d4931", size = 107825, upload-time = "2025-12-30T18:44:22.455Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/4f/3a16e3e8fd7e5fd86751a4f1aad218a8d19a96e75ec3989c3e95a8fe1d8f/cbor2-5.8.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4b3f91fa699a5ce22470e973601c62dd9d55dc3ca20ee446516ac075fcab27c9", size = 70270, upload-time = "2025-12-30T18:43:46.005Z" },
+    { url = "https://files.pythonhosted.org/packages/38/81/0d0cf0796fe8081492a61c45278f03def21a929535a492dd97c8438f5dbe/cbor2-5.8.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:518c118a5e00001854adb51f3164e647aa99b6a9877d2a733a28cb5c0a4d6857", size = 286242, upload-time = "2025-12-30T18:43:47.026Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/a9/fdab6c10190cfb8d639e01f2b168f2406fc847a2a6bc00e7de78c3381d0a/cbor2-5.8.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cff2a1999e49cd51c23d1b6786a012127fd8f722c5946e82bd7ab3eb307443f3", size = 285412, upload-time = "2025-12-30T18:43:48.563Z" },
+    { url = "https://files.pythonhosted.org/packages/31/59/746a8e630996217a3afd523f583fcf7e3d16640d63f9a03f0f4e4f74b5b1/cbor2-5.8.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:4c4492160212374973cdc14e46f0565f2462721ef922b40f7ea11e7d613dfb2a", size = 278041, upload-time = "2025-12-30T18:43:49.92Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/a3/f3bbeb6dedd45c6e0cddd627ea790dea295eaf82c83f0e2159b733365ebd/cbor2-5.8.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:546c7c7c4c6bcdc54a59242e0e82cea8f332b17b4465ae628718fef1fce401ca", size = 278185, upload-time = "2025-12-30T18:43:51.192Z" },
+    { url = "https://files.pythonhosted.org/packages/67/e5/9013d6b857ceb6cdb2851ffb5a887f53f2bab934a528c9d6fa73d9989d84/cbor2-5.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:074f0fa7535dd7fdee247c2c99f679d94f3aa058ccb1ccf4126cc72d6d89cbae", size = 69817, upload-time = "2025-12-30T18:43:52.352Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/ab/7aa94ba3d44ecbc3a97bdb2fb6a8298063fe2e0b611e539a6fe41e36da20/cbor2-5.8.0-cp312-cp312-win_arm64.whl", hash = "sha256:f95fed480b2a0d843f294d2a1ef4cc0f6a83c7922927f9f558e1f5a8dc54b7ca", size = 64923, upload-time = "2025-12-30T18:43:53.719Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/0d/5a3f20bafaefeb2c1903d961416f051c0950f0d09e7297a3aa6941596b29/cbor2-5.8.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6d8d104480845e2f28c6165b4c961bbe58d08cb5638f368375cfcae051c28015", size = 70332, upload-time = "2025-12-30T18:43:54.694Z" },
+    { url = "https://files.pythonhosted.org/packages/57/66/177a3f089e69db69c987453ab4934086408c3338551e4984734597be9f80/cbor2-5.8.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:43efee947e5ab67d406d6e0dc61b5dee9d2f5e89ae176f90677a3741a20ca2e7", size = 285985, upload-time = "2025-12-30T18:43:55.733Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/8e/9e17b8e4ed80a2ce97e2dfa5915c169dbb31599409ddb830f514b57f96cc/cbor2-5.8.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:be7ae582f50be539e09c134966d0fd63723fc4789b8dff1f6c2e3f24ae3eaf32", size = 285173, upload-time = "2025-12-30T18:43:57.321Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/33/9f92e107d78f88ac22723ac15d0259d220ba98c1d855e51796317f4c4114/cbor2-5.8.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:50f5c709561a71ea7970b4cd2bf9eda4eccacc0aac212577080fdfe64183e7f5", size = 278395, upload-time = "2025-12-30T18:43:58.497Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/3f/46b80050a4a35ce5cf7903693864a9fdea7213567dc8faa6e25cb375c182/cbor2-5.8.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:a6790ecc73aa93e76d2d9076fc42bf91a9e69f2295e5fa702e776dbe986465bd", size = 278330, upload-time = "2025-12-30T18:43:59.656Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/d2/d41f8c04c783a4d204e364be2d38043d4f732a3bed6f4c732e321cf34c7b/cbor2-5.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:c114af8099fa65a19a514db87ce7a06e942d8fea2730afd49be39f8e16e7f5e0", size = 69841, upload-time = "2025-12-30T18:44:01.159Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/8c/0397a82f6e67665009951453c83058e4c77ba54b9a9017ede56d6870306c/cbor2-5.8.0-cp313-cp313-win_arm64.whl", hash = "sha256:ab3ba00494ad8669a459b12a558448d309c271fa4f89b116ad496ee35db38fea", size = 64982, upload-time = "2025-12-30T18:44:02.138Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/0c/0654233d7543ac8a50f4785f172430ddc97538ba418eb305d6e529d1a120/cbor2-5.8.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:ad72381477133046ce217617d839ea4e9454f8b77d9a6351b229e214102daeb7", size = 70710, upload-time = "2025-12-30T18:44:03.209Z" },
+    { url = "https://files.pythonhosted.org/packages/84/62/4671d24e557d7f5a74a01b422c538925140c0495e57decde7e566f91d029/cbor2-5.8.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6da25190fad3434ce99876b11d4ca6b8828df6ca232cf7344cd14ae1166fb718", size = 285005, upload-time = "2025-12-30T18:44:05.109Z" },
+    { url = "https://files.pythonhosted.org/packages/87/85/0c67d763a08e848c9a80d7e4723ba497cce676f41bc7ca1828ae90a0a872/cbor2-5.8.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c13919e3a24c5a6d286551fa288848a4cedc3e507c58a722ccd134e461217d99", size = 282435, upload-time = "2025-12-30T18:44:06.465Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/01/0650972b4dbfbebcfbe37cbba7fc3cd9019a8da6397ab3446e07175e342b/cbor2-5.8.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:f8c40d32e5972047a777f9bf730870828f3cf1c43b3eb96fd0429c57a1d3b9e6", size = 277493, upload-time = "2025-12-30T18:44:07.609Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/6c/7704a4f32adc7f10f3b41ec067f500a4458f7606397af5e4cf2d368fd288/cbor2-5.8.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:7627894bc0b3d5d0807f31e3107e11b996205470c4429dc2bb4ef8bfe7f64e1e", size = 276085, upload-time = "2025-12-30T18:44:09.021Z" },
+    { url = "https://files.pythonhosted.org/packages/88/6d/e43452347630efe8133f5304127539100d937c138c0996d27ec63963ec2c/cbor2-5.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:b51c5e59becae746ca4de2bbaa8a2f5c64a68fec05cea62941b1a84a8335f7d1", size = 71657, upload-time = "2025-12-30T18:44:10.162Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/66/9a780ef34ab10a0437666232e885378cdd5f60197b1b5e61a62499e5a10a/cbor2-5.8.0-cp314-cp314-win_arm64.whl", hash = "sha256:53b630f4db4b9f477ad84077283dd17ecf9894738aa17ef4938c369958e02a71", size = 67171, upload-time = "2025-12-30T18:44:11.619Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/4f/101071f880b4da05771128c0b89f41e334cff044dee05fb013c8f4be661c/cbor2-5.8.0-py3-none-any.whl", hash = "sha256:3727d80f539567b03a7aa11890e57798c67092c38df9e6c23abb059e0f65069c", size = 24374, upload-time = "2025-12-30T18:44:21.476Z" },
 ]
 
 [[package]]
@@ -1525,6 +1651,19 @@ wheels = [
 ]
 
 [[package]]
+name = "depyf"
+version = "0.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astor" },
+    { name = "dill" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/35/83fb0178212279aa0af031031905804c6de5618435d229f41ed21bb9ad2c/depyf-0.20.0.tar.gz", hash = "sha256:fb7683bd72c44f67b56029df2c47721e9a02ffa4d7b19095f1c54c4ebf797a98", size = 6168761, upload-time = "2025-10-13T12:33:38.589Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/65/4df6936130b56e1429114e663e7c1576cf845f3aef1b2dd200c0a5d19dba/depyf-0.20.0-py3-none-any.whl", hash = "sha256:d31effad4261cebecb58955d832e448ace88f432328f95f82fd99c30fd9308d4", size = 39381, upload-time = "2025-10-13T12:33:33.647Z" },
+]
+
+[[package]]
 name = "devtools"
 version = "0.12.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1622,6 +1761,15 @@ name = "docopt"
 version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/55/8f8cab2afd404cf578136ef2cc5dfb50baa1761b68c9da1fb1e4eed343c9/docopt-0.6.2.tar.gz", hash = "sha256:49b3a825280bd66b3aa83585ef59c4a8c82f2c8a522dbe754a8bc8d08c85c491", size = 25901, upload-time = "2014-06-16T11:18:57.406Z" }
+
+[[package]]
+name = "docstring-parser"
+version = "0.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b2/9d/c3b43da9515bd270df0f80548d9944e389870713cc1fe2b8fb35fe2bcefd/docstring_parser-0.17.0.tar.gz", hash = "sha256:583de4a309722b3315439bb31d64ba3eebada841f2e2cee23b99df001434c912", size = 27442, upload-time = "2025-07-21T07:35:01.868Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl", hash = "sha256:cf2569abd23dce8099b300f9b4fa8191e9582dda731fd533daf54c4551658708", size = 36896, upload-time = "2025-07-21T07:35:00.684Z" },
+]
 
 [[package]]
 name = "docutils"
@@ -2301,6 +2449,19 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-reflection"
+version = "1.78.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/06/337546aae558675f79cae2a8c1ce0c9b1952cbc5c28b01878f68d040f5bb/grpcio_reflection-1.78.0.tar.gz", hash = "sha256:e6e60c0b85dbcdf963b4d4d150c0f1d238ba891d805b575c52c0365d07fc0c40", size = 19098, upload-time = "2026-02-06T10:01:52.225Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/6d/4d095d27ccd049865ecdafc467754e9e47ad0f677a30dda969c3590f6582/grpcio_reflection-1.78.0-py3-none-any.whl", hash = "sha256:06fcfde9e6888cdd12e9dd1cf6dc7c440c2e9acf420f696ccbe008672ed05b60", size = 22800, upload-time = "2026-02-06T10:01:33.822Z" },
+]
+
+[[package]]
 name = "gunicorn"
 version = "23.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2438,6 +2599,15 @@ wheels = [
 ]
 
 [[package]]
+name = "httpx-sse"
+version = "0.4.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/4c/751061ffa58615a32c31b2d82e8482be8dd4a89154f003147acee90f2be9/httpx_sse-0.4.3.tar.gz", hash = "sha256:9b1ed0127459a66014aec3c56bebd93da3c1bc8bb6618c8082039a44889a755d", size = 15943, upload-time = "2025-10-10T21:48:22.271Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/fd/6668e5aec43ab844de6fc74927e155a3b37bf40d7c3790e49fc0406b6578/httpx_sse-0.4.3-py3-none-any.whl", hash = "sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc", size = 8960, upload-time = "2025-10-10T21:48:21.158Z" },
+]
+
+[[package]]
 name = "huggingface-hub"
 version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2512,6 +2682,69 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f1/70/7703c29685631f5a7590aa73f1f1d3fa9a380e654b86af429e0934a32f7d/idna-3.10.tar.gz", hash = "sha256:12f65c9b470abda6dc35cf8e63cc574b1c52b11df2c86030af0ac09b01b13ea9", size = 190490, upload-time = "2024-09-15T18:07:39.745Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl", hash = "sha256:946d195a0d259cbba61165e88e65941f16e9b36ea6ddb97f00452bae8b1287d3", size = 70442, upload-time = "2024-09-15T18:07:37.964Z" },
+]
+
+[[package]]
+name = "ijson"
+version = "3.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f4/57/60d1a6a512f2f0508d0bc8b4f1cc5616fd3196619b66bd6a01f9155a1292/ijson-3.5.0.tar.gz", hash = "sha256:94688760720e3f5212731b3cb8d30267f9a045fb38fb3870254e7b9504246f31", size = 68658, upload-time = "2026-02-24T03:58:30.974Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/17/9c63c7688025f3a8c47ea717b8306649c8c7244e49e20a2be4e3515dc75c/ijson-3.5.0-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:1ebefbe149a6106cc848a3eaf536af51a9b5ccc9082de801389f152dba6ab755", size = 88536, upload-time = "2026-02-24T03:57:06.809Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/dd/e15c2400244c117b06585452ebc63ae254f5a6964f712306afd1422daae0/ijson-3.5.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:19e30d9f00f82e64de689c0b8651b9cfed879c184b139d7e1ea5030cec401c21", size = 60499, upload-time = "2026-02-24T03:57:09.155Z" },
+    { url = "https://files.pythonhosted.org/packages/77/a9/bf4fe3538a0c965f16b406f180a06105b875da83f0743e36246be64ef550/ijson-3.5.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:a04a33ee78a6f27b9b8528c1ca3c207b1df3b8b867a4cf2fcc4109986f35c227", size = 60330, upload-time = "2026-02-24T03:57:10.574Z" },
+    { url = "https://files.pythonhosted.org/packages/31/76/6f91bdb019dd978fce1bc5ea1cd620cfc096d258126c91db2c03a20a7f34/ijson-3.5.0-cp312-cp312-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:7d48dc2984af02eb3c56edfb3f13b3f62f2f3e4fe36f058c8cfc75d93adf4fed", size = 138977, upload-time = "2026-02-24T03:57:11.932Z" },
+    { url = "https://files.pythonhosted.org/packages/11/be/bbc983059e48a54b0121ee60042979faed7674490bbe7b2c41560db3f436/ijson-3.5.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f1e73a44844d9adbca9cf2c4132cd875933e83f3d4b23881fcaf82be83644c7d", size = 149785, upload-time = "2026-02-24T03:57:13.255Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/81/2fee58f9024a3449aee83edfa7167fb5ccd7e1af2557300e28531bb68e16/ijson-3.5.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7389a56b8562a19948bdf1d7bae3a2edc8c7f86fb59834dcb1c4c722818e645a", size = 149729, upload-time = "2026-02-24T03:57:14.191Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/56/f1706761fcc096c9d414b3dcd000b1e6e5c24364c21cfba429837f98ee8d/ijson-3.5.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:3176f23f8ebec83f374ed0c3b4e5a0c4db7ede54c005864efebbed46da123608", size = 150697, upload-time = "2026-02-24T03:57:15.855Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/6e/ee0d9c875a0193b632b3e9ccd1b22a50685fb510256ad57ba483b6529f77/ijson-3.5.0-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:6babd88e508630c6ef86c9bebaaf13bb2fb8ec1d8f8868773a03c20253f599bc", size = 142873, upload-time = "2026-02-24T03:57:16.831Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/bf/f9d4399d0e6e3fd615035290a71e97c843f17f329b43638c0a01cf112d73/ijson-3.5.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:dc1b3836b174b6db2fa8319f1926fb5445abd195dc963368092103f8579cb8ed", size = 151583, upload-time = "2026-02-24T03:57:17.757Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/71/a7254a065933c0e2ffd3586f46187d84830d3d7b6f41cfa5901820a4f87d/ijson-3.5.0-cp312-cp312-win32.whl", hash = "sha256:6673de9395fb9893c1c79a43becd8c8fbee0a250be6ea324bfd1487bb5e9ee4c", size = 53079, upload-time = "2026-02-24T03:57:18.703Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/7b/2edca79b359fc9f95d774616867a03ecccdf333797baf5b3eea79733918c/ijson-3.5.0-cp312-cp312-win_amd64.whl", hash = "sha256:f4f7fabd653459dcb004175235f310435959b1bb5dfa8878578391c6cc9ad944", size = 55500, upload-time = "2026-02-24T03:57:20.428Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/71/d67e764a712c3590627480643a3b51efcc3afa4ef3cb54ee4c989073c97e/ijson-3.5.0-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:e9cedc10e40dd6023c351ed8bfc7dcfce58204f15c321c3c1546b9c7b12562a4", size = 88544, upload-time = "2026-02-24T03:57:21.293Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/39/f1c299371686153fa3cf5c0736b96247a87a1bee1b7145e6d21f359c505a/ijson-3.5.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:3647649f782ee06c97490b43680371186651f3f69bebe64c6083ee7615d185e5", size = 60495, upload-time = "2026-02-24T03:57:22.501Z" },
+    { url = "https://files.pythonhosted.org/packages/16/94/b1438e204d75e01541bebe3e668fe3e68612d210e9931ae1611062dd0a56/ijson-3.5.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:90e74be1dce05fce73451c62d1118671f78f47c9f6be3991c82b91063bf01fc9", size = 60325, upload-time = "2026-02-24T03:57:23.332Z" },
+    { url = "https://files.pythonhosted.org/packages/30/e2/4aa9c116fa86cc8b0f574f3c3a47409edc1cd4face05d0e589a5a176b05d/ijson-3.5.0-cp313-cp313-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:78e9ad73e7be2dd80627504bd5cbf512348c55ce2c06e362ed7683b5220e8568", size = 138774, upload-time = "2026-02-24T03:57:24.683Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/d2/738b88752a70c3be1505faa4dcd7110668c2712e582a6a36488ed1e295d4/ijson-3.5.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9577449313cc94be89a4fe4b3e716c65f09cc19636d5a6b2861c4e80dddebd58", size = 149820, upload-time = "2026-02-24T03:57:26.062Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/df/0b3ab9f393ca8f72ea03bc896ba9fdc987e90ae08cdb51c32a4ee0c14d5e/ijson-3.5.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3e4c1178fb50aff5f5701a30a5152ead82a14e189ce0f6102fa1b5f10b2f54ff", size = 149747, upload-time = "2026-02-24T03:57:27.308Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/a3/b0037119f75131b78cb00acc2657b1a9d0435475f1f2c5f8f5a170b66b9c/ijson-3.5.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:0eb402ab026ffb37a918d75af2b7260fe6cfbce13232cc83728a714dd30bd81d", size = 151027, upload-time = "2026-02-24T03:57:28.522Z" },
+    { url = "https://files.pythonhosted.org/packages/22/a0/cb344de1862bf09d8f769c9d25c944078c87dd59a1b496feec5ad96309a4/ijson-3.5.0-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:5b08ee08355f9f729612a8eb9bf69cc14f9310c3b2a487c6f1c3c65d85216ec4", size = 142996, upload-time = "2026-02-24T03:57:29.774Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/32/a8ffd67182e02ea61f70f62daf43ded4fa8a830a2520a851d2782460aba8/ijson-3.5.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:bda62b6d48442903e7bf56152108afb7f0f1293c2b9bef2f2c369defea76ab18", size = 152068, upload-time = "2026-02-24T03:57:30.969Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/d1/3578df8e75d446aab0ae92e27f641341f586b85e1988536adebc65300cb4/ijson-3.5.0-cp313-cp313-win32.whl", hash = "sha256:8d073d9b13574cfa11083cc7267c238b7a6ed563c2661e79192da4a25f09c82c", size = 53065, upload-time = "2026-02-24T03:57:31.93Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/a2/f7cdaf5896710da3e69e982e44f015a83d168aa0f3a89b6f074b5426779d/ijson-3.5.0-cp313-cp313-win_amd64.whl", hash = "sha256:2419f9e32e0968a876b04d8f26aeac042abd16f582810b576936bbc4c6015069", size = 55499, upload-time = "2026-02-24T03:57:32.773Z" },
+    { url = "https://files.pythonhosted.org/packages/42/65/13e2492d17e19a2084523e18716dc2809159f2287fd2700c735f311e76c4/ijson-3.5.0-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:4d4b0cd676b8c842f7648c1a783448fac5cd3b98289abd83711b3e275e143524", size = 93019, upload-time = "2026-02-24T03:57:33.976Z" },
+    { url = "https://files.pythonhosted.org/packages/33/92/483fc97ece0c3f1cecabf48f6a7a36e89d19369eec462faaeaa34c788992/ijson-3.5.0-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:252dec3680a48bb82d475e36b4ae1b3a9d7eb690b951bb98a76c5fe519e30188", size = 62714, upload-time = "2026-02-24T03:57:34.819Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/88/793fe020a0fe9d9eed4c285cf4a5cfdb0a935708b3bde0d72f35c794b513/ijson-3.5.0-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:aa1b5dca97d323931fde2501172337384c958914d81a9dac7f00f0d4bfc76bc7", size = 62460, upload-time = "2026-02-24T03:57:35.874Z" },
+    { url = "https://files.pythonhosted.org/packages/51/69/f1a2690aa8d4df1f4e262b385e65a933ffdc250b091531bac9a449c19e16/ijson-3.5.0-cp313-cp313t-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:7a5ec7fd86d606094bba6f6f8f87494897102fa4584ef653f3005c51a784c320", size = 199273, upload-time = "2026-02-24T03:57:37.07Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/a2/f1346d5299e79b988ab472dc773d5381ec2d57c23cb2f1af3ede4a810e62/ijson-3.5.0-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:009f41443e1521847701c6d87fa3923c0b1961be3c7e7de90947c8cb92ea7c44", size = 216884, upload-time = "2026-02-24T03:57:38.346Z" },
+    { url = "https://files.pythonhosted.org/packages/28/3c/8b637e869be87799e6c2c3c275a30a546f086b1aed77e2b7f11512168c5a/ijson-3.5.0-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e4c3651d1f9fe2839a93fdf8fd1d5ca3a54975349894249f3b1b572bcc4bd577", size = 207306, upload-time = "2026-02-24T03:57:39.718Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/7c/18b1c1df6951ca056782d7580ec40cea4ff9a27a0947d92640d1cc8c4ae3/ijson-3.5.0-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:945b7abcfcfeae2cde17d8d900870f03536494245dda7ad4f8d056faa303256c", size = 211364, upload-time = "2026-02-24T03:57:40.953Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/55/e795812e82851574a9dba8a53fde045378f531ef14110c6fb55dbd23b443/ijson-3.5.0-cp313-cp313t-musllinux_1_2_i686.whl", hash = "sha256:0574b0a841ff97495c13e9d7260fbf3d85358b061f540c52a123db9dbbaa2ed6", size = 200608, upload-time = "2026-02-24T03:57:42.272Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/cd/013c85b4749b57a4cb4c2670014d1b32b8db4ab1a7be92ea7aeb5d7fe7b5/ijson-3.5.0-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:f969ffb2b89c5cdf686652d7fb66252bc72126fa54d416317411497276056a18", size = 205127, upload-time = "2026-02-24T03:57:43.286Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/7c/faf643733e3ab677f180018f6a855c4ef70b7c46540987424c563c959e42/ijson-3.5.0-cp313-cp313t-win32.whl", hash = "sha256:59d3f9f46deed1332ad669518b8099920512a78bda64c1f021fcd2aff2b36693", size = 55282, upload-time = "2026-02-24T03:57:44.353Z" },
+    { url = "https://files.pythonhosted.org/packages/69/22/94ddb47c24b491377aca06cd8fc9202cad6ab50619842457d2beefde21ea/ijson-3.5.0-cp313-cp313t-win_amd64.whl", hash = "sha256:5c2839fa233746d8aad3b8cd2354e441613f5df66d721d59da4a09394bd1db2b", size = 58016, upload-time = "2026-02-24T03:57:45.237Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/93/0868efe753dc1df80cc405cf0c1f2527a6991643607c741bff8dcb899b3b/ijson-3.5.0-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:25a5a6b2045c90bb83061df27cfa43572afa43ba9408611d7bfe237c20a731a9", size = 89094, upload-time = "2026-02-24T03:57:46.115Z" },
+    { url = "https://files.pythonhosted.org/packages/24/94/fd5a832a0df52ef5e4e740f14ac8640725d61034a1b0c561e8b5fb424706/ijson-3.5.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:8976c54c0b864bc82b951bae06567566ac77ef63b90a773a69cd73aab47f4f4f", size = 60715, upload-time = "2026-02-24T03:57:47.552Z" },
+    { url = "https://files.pythonhosted.org/packages/70/79/1b9a90af5732491f9eec751ee211b86b11011e1158c555c06576d52c3919/ijson-3.5.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:859eb2038f7f1b0664df4241957694cc35e6295992d71c98659b22c69b3cbc10", size = 60638, upload-time = "2026-02-24T03:57:48.428Z" },
+    { url = "https://files.pythonhosted.org/packages/23/6f/2c551ea980fe56f68710a8d5389cfbd015fc45aaafd17c3c52c346db6aa1/ijson-3.5.0-cp314-cp314-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:c911aa02991c7c0d3639b6619b93a93210ff1e7f58bf7225d613abea10adc78e", size = 140667, upload-time = "2026-02-24T03:57:49.314Z" },
+    { url = "https://files.pythonhosted.org/packages/25/0e/27b887879ba6a5bc29766e3c5af4942638c952220fd63e1e442674f7883a/ijson-3.5.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:903cbdc350173605220edc19796fbea9b2203c8b3951fb7335abfa8ed37afda8", size = 149850, upload-time = "2026-02-24T03:57:50.329Z" },
+    { url = "https://files.pythonhosted.org/packages/da/1e/23e10e1bc04bf31193b21e2960dce14b17dbd5d0c62204e8401c59d62c08/ijson-3.5.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a4549d96ded5b8efa71639b2160235415f6bdb8c83367615e2dbabcb72755c33", size = 149206, upload-time = "2026-02-24T03:57:51.261Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/90/e552f6495063b235cf7fa2c592f6597c057077195e517b842a0374fd470c/ijson-3.5.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:6b2dcf6349e6042d83f3f8c39ce84823cf7577eba25bac5aae5e39bbbbbe9c1c", size = 150438, upload-time = "2026-02-24T03:57:52.198Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/18/45bf8f297c41b42a1c231d261141097babd953d2c28a07be57ae4c3a1a02/ijson-3.5.0-cp314-cp314-musllinux_1_2_i686.whl", hash = "sha256:e44af39e6f8a17e5627dcd89715d8279bf3474153ff99aae031a936e5c5572e5", size = 144369, upload-time = "2026-02-24T03:57:53.22Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/3a/deb9772bb2c0cead7ad64f00c3598eec9072bdf511818e70e2c512eeabbe/ijson-3.5.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:9260332304b7e7828db56d43f08fc970a3ab741bf84ff10189361ea1b60c395b", size = 151352, upload-time = "2026-02-24T03:57:54.375Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/51/67f4d80cd58ad7eab0cd1af5fe28b961886338956b2f88c0979e21914346/ijson-3.5.0-cp314-cp314-win32.whl", hash = "sha256:63bc8121bb422f6969ced270173a3fa692c29d4ae30c860a2309941abd81012a", size = 53610, upload-time = "2026-02-24T03:57:55.655Z" },
+    { url = "https://files.pythonhosted.org/packages/70/d3/263672ea22983ba3940f1534316dbc9200952c1c2a2332d7a664e4eaa7ae/ijson-3.5.0-cp314-cp314-win_amd64.whl", hash = "sha256:01b6dad72b7b7df225ef970d334556dfad46c696a2c6767fb5d9ed8889728bca", size = 56301, upload-time = "2026-02-24T03:57:56.584Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/d9/86f7fac35e0835faa188085ae0579e813493d5261ce056484015ad533445/ijson-3.5.0-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:2ea4b676ec98e374c1df400a47929859e4fa1239274339024df4716e802aa7e4", size = 93069, upload-time = "2026-02-24T03:57:57.849Z" },
+    { url = "https://files.pythonhosted.org/packages/33/d2/e7366ed9c6e60228d35baf4404bac01a126e7775ea8ce57f560125ed190a/ijson-3.5.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:014586eec043e23c80be9a923c56c3a0920a0f1f7d17478ce7bc20ba443968ef", size = 62767, upload-time = "2026-02-24T03:57:58.758Z" },
+    { url = "https://files.pythonhosted.org/packages/35/8b/3e703e8cc4b3ada79f13b28070b51d9550c578f76d1968657905857b2ddd/ijson-3.5.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d5b8b886b0248652d437f66e7c5ac318bbdcb2c7137a7e5327a68ca00b286f5f", size = 62467, upload-time = "2026-02-24T03:58:00.261Z" },
+    { url = "https://files.pythonhosted.org/packages/21/42/0c91af32c1ee8a957fdac2e051b5780756d05fd34e4b60d94a08d51bac1d/ijson-3.5.0-cp314-cp314t-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:498fd46ae2349297e43acf97cdc421e711dbd7198418677259393d2acdc62d78", size = 200447, upload-time = "2026-02-24T03:58:01.591Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/80/796ea0e391b7e2d45c5b1b451734bba03f81c2984cf955ea5eaa6c4920ad/ijson-3.5.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:22a51b4f9b81f12793731cf226266d1de2112c3c04ba4a04117ad4e466897e05", size = 217820, upload-time = "2026-02-24T03:58:02.598Z" },
+    { url = "https://files.pythonhosted.org/packages/38/14/52b6613fdda4078c62eb5b4fe3efc724ddc55a4ad524c93de51830107aa3/ijson-3.5.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9636c710dc4ac4a281baa266a64f323b4cc165cec26836af702c44328b59a515", size = 208310, upload-time = "2026-02-24T03:58:04.759Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/ad/8b3105a78774fd4a65e534a21d975ef3a77e189489fe3029ebcaeba5e243/ijson-3.5.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:f7168a39e8211107666d71b25693fd1b2bac0b33735ef744114c403c6cac21e1", size = 211843, upload-time = "2026-02-24T03:58:05.836Z" },
+    { url = "https://files.pythonhosted.org/packages/36/ab/a2739f6072d6e1160581bc3ed32da614c8cced023dcd519d9c5fa66e0425/ijson-3.5.0-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:8696454245415bc617ab03b0dc3ae4c86987df5dc6a90bad378fe72c5409d89e", size = 200906, upload-time = "2026-02-24T03:58:07.788Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/5e/e06c2de3c3d4a9cfb655c1ad08a68fb72838d271072cdd3196576ac4431a/ijson-3.5.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:c21bfb61f71f191565885bf1bc29e0a186292d866b4880637b833848360bdc1b", size = 205495, upload-time = "2026-02-24T03:58:09.163Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/11/778201eb2e202ddd76b36b0fb29bf3d8e3c167389d8aa883c62524e49f47/ijson-3.5.0-cp314-cp314t-win32.whl", hash = "sha256:a2619460d6795b70d0155e5bf016200ac8a63ab5397aa33588bb02b6c21759e6", size = 56280, upload-time = "2026-02-24T03:58:10.116Z" },
+    { url = "https://files.pythonhosted.org/packages/23/28/96711503245339084c8086b892c47415895eba49782d6cc52d9f4ee50301/ijson-3.5.0-cp314-cp314t-win_amd64.whl", hash = "sha256:4f24b78d4ef028d17eb57ad1b16c0aed4a17bdd9badbf232dc5d9305b7e13854", size = 58965, upload-time = "2026-02-24T03:58:11.278Z" },
 ]
 
 [[package]]
@@ -2861,6 +3094,21 @@ wheels = [
 ]
 
 [[package]]
+name = "lm-format-enforcer"
+version = "0.11.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "interegular" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/d5/41cd417ba7dfdbbcfe46cebf81fb3dfd7c591b89897560ad05bb410a465d/lm_format_enforcer-0.11.3.tar.gz", hash = "sha256:e68081c108719cce284a9bcc889709b26ffb085a1945b5eba3a12cfa96d528da", size = 40258, upload-time = "2025-08-24T19:37:47.527Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/ef/11292bb0b85cf4c93447cab5a29f64576ed14d3ab4280e35ddd23486594a/lm_format_enforcer-0.11.3-py3-none-any.whl", hash = "sha256:cf586350875def1ae7a8fba84fcbbfc8371424b6c9d05c1fcba70aa233fbf06f", size = 45418, upload-time = "2025-08-24T19:37:46.325Z" },
+]
+
+[[package]]
 name = "loguru"
 version = "0.7.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3064,6 +3312,31 @@ wheels = [
 ]
 
 [[package]]
+name = "mcp"
+version = "1.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "jsonschema" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "python-multipart" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "sse-starlette" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+    { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fc/6d/62e76bbb8144d6ed86e202b5edd8a4cb631e7c8130f3f4893c3f90262b10/mcp-1.26.0.tar.gz", hash = "sha256:db6e2ef491eecc1a0d93711a76f28dec2e05999f93afd48795da1c1137142c66", size = 608005, upload-time = "2026-01-24T19:40:32.468Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/d9/eaa1f80170d2b7c5ba23f3b59f766f3a0bb41155fbc32a69adfa1adaaef9/mcp-1.26.0-py3-none-any.whl", hash = "sha256:904a21c33c25aa98ddbeb47273033c435e595bbacfdb177f4bd87f6dceebe1ca", size = 233615, upload-time = "2026-01-24T19:40:30.652Z" },
+]
+
+[[package]]
 name = "mdit-py-plugins"
 version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3258,6 +3531,30 @@ wheels = [
 ]
 
 [[package]]
+name = "mistral-common"
+version = "1.9.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "pillow" },
+    { name = "pydantic" },
+    { name = "pydantic-extra-types", extra = ["pycountry"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "requests" },
+    { name = "tiktoken" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/db/ce/685b8127a326478e05501cb4c9ca23d1cd9f37e16c465a1e832c75aea709/mistral_common-1.9.1.tar.gz", hash = "sha256:550583d70a395c3586cfb748ffab53bd1d7c3409507f0efc0118bff30ffb26e9", size = 6338922, upload-time = "2026-02-12T10:53:41.639Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/72/a38bb1fd9fd4d4ef990341c9dd1a7c8061f1951e10efa6d50c0a3f04eced/mistral_common-1.9.1-py3-none-any.whl", hash = "sha256:9e2b2520b6f67bac2e2bb06fcf985b7a1277b01938da2b7cda8cf0fdbfa92e91", size = 6518623, upload-time = "2026-02-12T10:53:39.457Z" },
+]
+
+[package.optional-dependencies]
+image = [
+    { name = "opencv-python-headless" },
+]
+
+[[package]]
 name = "ml-dtypes"
 version = "0.5.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3332,8 +3629,10 @@ dependencies = [
     { name = "gitpython" },
     { name = "importlib-metadata" },
     { name = "opentelemetry-api" },
-    { name = "opentelemetry-proto" },
-    { name = "opentelemetry-sdk" },
+    { name = "opentelemetry-proto", version = "1.38.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "packaging" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -3357,8 +3656,10 @@ dependencies = [
     { name = "cachetools" },
     { name = "databricks-sdk" },
     { name = "opentelemetry-api" },
-    { name = "opentelemetry-proto" },
-    { name = "opentelemetry-sdk" },
+    { name = "opentelemetry-proto", version = "1.38.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "packaging" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -3412,6 +3713,24 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/71/879284c71dfb12ded986a6532a4ab7df5c2794385ccf2766c1b40aee74cb/mlx_metal-0.28.0-py3-none-macosx_13_0_arm64.whl", hash = "sha256:ce08d40f1fad4f0b3bc87bfff5d603c7fe7dd141c082ba9ce9328b41e8f8d46b", size = 33840007, upload-time = "2025-08-07T07:53:07.437Z" },
     { url = "https://files.pythonhosted.org/packages/06/90/44a261ccb9f6052c93c9da4faa4fc6d4f914938c51ecbbb68c546ab521b9/mlx_metal-0.28.0-py3-none-macosx_14_0_arm64.whl", hash = "sha256:424142ab843e2ac0b14edb58cf88d96723823c565291f46ddeeaa072abcc991e", size = 33196759, upload-time = "2025-08-07T07:52:59.436Z" },
     { url = "https://files.pythonhosted.org/packages/72/59/8e4dee2893a56fc68a27eec7ec7ed9559c7ea01099313a9b8196373bf3cf/mlx_metal-0.28.0-py3-none-macosx_15_0_arm64.whl", hash = "sha256:214ece3781d44f57eb9686561594b28915ec5568df4a5a73da59c66880b204ed", size = 33167706, upload-time = "2025-08-07T07:53:03.852Z" },
+]
+
+[[package]]
+name = "model-hosting-container-standards"
+version = "0.1.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "jmespath" },
+    { name = "pydantic" },
+    { name = "setuptools" },
+    { name = "starlette" },
+    { name = "supervisor" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d7/b7/a6a31b4dfd30d14b1019dc358f09c9d88ca38e555ba7c976e7d3e6b593fe/model_hosting_container_standards-0.1.13.tar.gz", hash = "sha256:27a1333410dde2719286a300a2803e24fdde407baa91894eb845c0f268aa194d", size = 79116, upload-time = "2026-01-09T21:45:20.683Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/37/6dc61971ba31450bbed460b5f40543f0915e352680534e3bcaf57116d8d7/model_hosting_container_standards-0.1.13-py3-none-any.whl", hash = "sha256:be307d4a988cc660df4e6bd8bdedb7917844bac940e332f9fd001cb385d7994c", size = 105738, upload-time = "2026-01-09T21:45:18.959Z" },
 ]
 
 [[package]]
@@ -4844,13 +5163,114 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-exporter-otlp"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/30/9c/3ab1db90f32da200dba332658f2bbe602369e3d19f6aba394031a42635be/opentelemetry_exporter_otlp-1.39.1.tar.gz", hash = "sha256:7cf7470e9fd0060c8a38a23e4f695ac686c06a48ad97f8d4867bc9b420180b9c", size = 6147, upload-time = "2025-12-11T13:32:40.309Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/6c/bdc82a066e6fb1dcf9e8cc8d4e026358fe0f8690700cc6369a6bf9bd17a7/opentelemetry_exporter_otlp-1.39.1-py3-none-any.whl", hash = "sha256:68ae69775291f04f000eb4b698ff16ff685fdebe5cb52871bc4e87938a7b00fe", size = 7019, upload-time = "2025-12-11T13:32:19.387Z" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-otlp-proto-common"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/9d/22d241b66f7bbde88a3bfa6847a351d2c46b84de23e71222c6aae25c7050/opentelemetry_exporter_otlp_proto_common-1.39.1.tar.gz", hash = "sha256:763370d4737a59741c89a67b50f9e39271639ee4afc999dadfe768541c027464", size = 20409, upload-time = "2025-12-11T13:32:40.885Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/02/ffc3e143d89a27ac21fd557365b98bd0653b98de8a101151d5805b5d4c33/opentelemetry_exporter_otlp_proto_common-1.39.1-py3-none-any.whl", hash = "sha256:08f8a5862d64cc3435105686d0216c1365dc5701f86844a8cd56597d0c764fde", size = 18366, upload-time = "2025-12-11T13:32:20.2Z" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-otlp-proto-grpc"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/48/b329fed2c610c2c32c9366d9dc597202c9d1e58e631c137ba15248d8850f/opentelemetry_exporter_otlp_proto_grpc-1.39.1.tar.gz", hash = "sha256:772eb1c9287485d625e4dbe9c879898e5253fea111d9181140f51291b5fec3ad", size = 24650, upload-time = "2025-12-11T13:32:41.429Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/a3/cc9b66575bd6597b98b886a2067eea2693408d2d5f39dad9ab7fc264f5f3/opentelemetry_exporter_otlp_proto_grpc-1.39.1-py3-none-any.whl", hash = "sha256:fa1c136a05c7e9b4c09f739469cbdb927ea20b34088ab1d959a849b5cc589c18", size = 19766, upload-time = "2025-12-11T13:32:21.027Z" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-otlp-proto-http"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/04/2a08fa9c0214ae38880df01e8bfae12b067ec0793446578575e5080d6545/opentelemetry_exporter_otlp_proto_http-1.39.1.tar.gz", hash = "sha256:31bdab9745c709ce90a49a0624c2bd445d31a28ba34275951a6a362d16a0b9cb", size = 17288, upload-time = "2025-12-11T13:32:42.029Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/95/f1/b27d3e2e003cd9a3592c43d099d2ed8d0a947c15281bf8463a256db0b46c/opentelemetry_exporter_otlp_proto_http-1.39.1-py3-none-any.whl", hash = "sha256:d9f5207183dd752a412c4cd564ca8875ececba13be6e9c6c370ffb752fd59985", size = 19641, upload-time = "2025-12-11T13:32:22.248Z" },
+]
+
+[[package]]
 name = "opentelemetry-exporter-prometheus"
 version = "0.54b1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+]
 dependencies = [
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-sdk" },
-    { name = "prometheus-client" },
+    { name = "opentelemetry-api", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "prometheus-client", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/da/ef/563c6413dbf042f1b738c4e23f7ff5f80fd0ae5ba64037433a5eeb0a1f79/opentelemetry_exporter_prometheus-0.54b1.tar.gz", hash = "sha256:6a28fde40ac8693bd653b84ba9deff75721fd05edf4e4313939327ea336ad3a9", size = 14948, upload-time = "2025-05-16T18:52:46.152Z" }
 wheels = [
@@ -4858,11 +5278,43 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-exporter-prometheus"
+version = "0.60b1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version < '3.13' and sys_platform == 'darwin'",
+]
+dependencies = [
+    { name = "opentelemetry-api", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "prometheus-client", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/14/39/7dafa6fff210737267bed35a8855b6ac7399b9e582b8cf1f25f842517012/opentelemetry_exporter_prometheus-0.60b1.tar.gz", hash = "sha256:a4011b46906323f71724649d301b4dc188aaa068852e814f4df38cc76eac616b", size = 14976, upload-time = "2025-12-11T13:32:42.944Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9b/0d/4be6bf5477a3eb3d917d2f17d3c0b6720cd6cb97898444a61d43cc983f5c/opentelemetry_exporter_prometheus-0.60b1-py3-none-any.whl", hash = "sha256:49f59178de4f4590e3cef0b8b95cf6e071aae70e1f060566df5546fad773b8fd", size = 13019, upload-time = "2025-12-11T13:32:23.974Z" },
+]
+
+[[package]]
 name = "opentelemetry-proto"
 version = "1.38.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version < '3.13' and sys_platform == 'darwin'",
+]
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/51/14/f0c4f0f6371b9cb7f9fa9ee8918bfd59ac7040c7791f1e6da32a1839780d/opentelemetry_proto-1.38.0.tar.gz", hash = "sha256:88b161e89d9d372ce723da289b7da74c3a8354a8e5359992be813942969ed468", size = 46152, upload-time = "2025-10-16T08:36:01.612Z" }
 wheels = [
@@ -4870,13 +5322,109 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-proto"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+]
+dependencies = [
+    { name = "protobuf", marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/49/1d/f25d76d8260c156c40c97c9ed4511ec0f9ce353f8108ca6e7561f82a06b2/opentelemetry_proto-1.39.1.tar.gz", hash = "sha256:6c8e05144fc0d3ed4d22c2289c6b126e03bcd0e6a7da0f16cedd2e1c2772e2c8", size = 46152, upload-time = "2025-12-11T13:32:48.681Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/95/b40c96a7b5203005a0b03d8ce8cd212ff23f1793d5ba289c87a097571b18/opentelemetry_proto-1.39.1-py3-none-any.whl", hash = "sha256:22cdc78efd3b3765d09e68bfbd010d4fc254c9818afd0b6b423387d9dee46007", size = 72535, upload-time = "2025-12-11T13:32:33.866Z" },
+]
+
+[[package]]
 name = "opentelemetry-sdk"
 version = "1.33.1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+]
 dependencies = [
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-semantic-conventions" },
-    { name = "typing-extensions" },
+    { name = "opentelemetry-api", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-semantic-conventions", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "typing-extensions", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/67/12/909b98a7d9b110cce4b28d49b2e311797cffdce180371f35eba13a72dd00/opentelemetry_sdk-1.33.1.tar.gz", hash = "sha256:85b9fcf7c3d23506fbc9692fd210b8b025a1920535feec50bd54ce203d57a531", size = 161885, upload-time = "2025-05-16T18:52:52.832Z" }
 wheels = [
@@ -4884,16 +5432,116 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-sdk"
+version = "1.39.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version < '3.13' and sys_platform == 'darwin'",
+]
+dependencies = [
+    { name = "opentelemetry-api", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-semantic-conventions", version = "0.60b1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "typing-extensions", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/eb/fb/c76080c9ba07e1e8235d24cdcc4d125ef7aa3edf23eb4e497c2e50889adc/opentelemetry_sdk-1.39.1.tar.gz", hash = "sha256:cf4d4563caf7bff906c9f7967e2be22d0d6b349b908be0d90fb21c8e9c995cc6", size = 171460, upload-time = "2025-12-11T13:32:49.369Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/98/e91cf858f203d86f4eccdf763dcf01cf03f1dae80c3750f7e635bfa206b6/opentelemetry_sdk-1.39.1-py3-none-any.whl", hash = "sha256:4d5482c478513ecb0a5d938dcc61394e647066e0cc2676bee9f3af3f3f45f01c", size = 132565, upload-time = "2025-12-11T13:32:35.069Z" },
+]
+
+[[package]]
 name = "opentelemetry-semantic-conventions"
 version = "0.54b1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
+]
 dependencies = [
-    { name = "deprecated" },
-    { name = "opentelemetry-api" },
+    { name = "deprecated", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-api", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5b/2c/d7990fc1ffc82889d466e7cd680788ace44a26789809924813b164344393/opentelemetry_semantic_conventions-0.54b1.tar.gz", hash = "sha256:d1cecedae15d19bdaafca1e56b29a66aa286f50b5d08f036a145c7f3e9ef9cee", size = 118642, upload-time = "2025-05-16T18:52:53.962Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0a/80/08b1698c52ff76d96ba440bf15edc2f4bc0a279868778928e947c1004bdd/opentelemetry_semantic_conventions-0.54b1-py3-none-any.whl", hash = "sha256:29dab644a7e435b58d3a3918b58c333c92686236b30f7891d5e51f02933ca60d", size = 194938, upload-time = "2025-05-16T18:52:38.796Z" },
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.60b1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version < '3.13' and sys_platform == 'darwin'",
+]
+dependencies = [
+    { name = "opentelemetry-api", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "typing-extensions", marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/df/553f93ed38bf22f4b999d9be9c185adb558982214f33eae539d3b5cd0858/opentelemetry_semantic_conventions-0.60b1.tar.gz", hash = "sha256:87c228b5a0669b748c76d76df6c364c369c28f1c465e50f661e39737e84bc953", size = 137935, upload-time = "2025-12-11T13:32:50.487Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/5e/5958555e09635d09b75de3c4f8b9cae7335ca545d77392ffe7331534c402/opentelemetry_semantic_conventions-0.60b1-py3-none-any.whl", hash = "sha256:9fa8c8b0c110da289809292b0591220d3a7b53c1526a23021e977d68597893fb", size = 219982, upload-time = "2025-12-11T13:32:36.955Z" },
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions-ai"
+version = "0.4.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "opentelemetry-semantic-conventions", version = "0.60b1", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/75/455c15f8360b475dd31101a87eab316420388486f7941bf019cbf4e63d5b/opentelemetry_semantic_conventions_ai-0.4.15.tar.gz", hash = "sha256:12de172d1e11d21c6e82bbf578c7e8a713589a7fda76af9ed785632564a28b81", size = 18595, upload-time = "2026-03-02T15:36:50.254Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/12/49/819fb212386f77cfd93f81bd916d674f0e735f87c8ac2262ed14e3b852c2/opentelemetry_semantic_conventions_ai-0.4.15-py3-none-any.whl", hash = "sha256:011461f1fba30f27035c49ab3b8344367adc72da0a6c8d3c7428303c6779edc9", size = 5999, upload-time = "2026-03-02T15:36:51.44Z" },
 ]
 
 [[package]]
@@ -5249,6 +5897,19 @@ wheels = [
 ]
 
 [[package]]
+name = "prometheus-fastapi-instrumentator"
+version = "7.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "prometheus-client" },
+    { name = "starlette" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/69/6d/24d53033cf93826aa7857699a4450c1c67e5b9c710e925b1ed2b320c04df/prometheus_fastapi_instrumentator-7.1.0.tar.gz", hash = "sha256:be7cd61eeea4e5912aeccb4261c6631b3f227d8924542d79eaf5af3f439cbe5e", size = 20220, upload-time = "2025-03-19T19:35:05.351Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/72/0824c18f3bc75810f55dacc2dd933f6ec829771180245ae3cc976195dec0/prometheus_fastapi_instrumentator-7.1.0-py3-none-any.whl", hash = "sha256:978130f3c0bb7b8ebcc90d35516a6fe13e02d2eb358c8f83887cdef7020c31e9", size = 19296, upload-time = "2025-03-19T19:35:04.323Z" },
+]
+
+[[package]]
 name = "propcache"
 version = "0.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -5354,6 +6015,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b2/4f/11cfa283228b5f259bcfc913f731f7c6f68748d26711594e14cf2cb5e39a/pulp-3.2.2.tar.gz", hash = "sha256:389a6ff1dc34ec4b093f34f7a9fa3553743ff0ea99b2a423e9f0dd16940f63d2", size = 16299367, upload-time = "2025-07-29T11:42:04.109Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/15/8d/a6a9d58c929a869f7f1b99b3d37b3f14ef63e2826eef581416338d686c3f/pulp-3.2.2-py3-none-any.whl", hash = "sha256:d3ca5ff11a28b3e7b2508a992d7e51f3533471d89305f0560b5fe3b6cc821043", size = 16385354, upload-time = "2025-07-29T11:42:01.829Z" },
+]
+
+[[package]]
+name = "py-cpuinfo"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/a8/d832f7293ebb21690860d2e01d8115e5ff6f2ae8bbdc953f0eb0fa4bd2c7/py-cpuinfo-9.0.0.tar.gz", hash = "sha256:3cdbbf3fac90dc6f118bfd64384f309edeadd902d7c8fb17f02ffa1fc3f49690", size = 104716, upload-time = "2022-10-25T20:38:06.303Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/a9/023730ba63db1e494a271cb018dcd361bd2c917ba7004c3e49d5daf795a2/py_cpuinfo-9.0.0-py3-none-any.whl", hash = "sha256:859625bc251f64e21f077d099d4162689c762b5d6a4c3c97553d56241c9674d5", size = 22335, upload-time = "2022-10-25T20:38:27.636Z" },
 ]
 
 [[package]]
@@ -5681,6 +6351,38 @@ wheels = [
 ]
 
 [[package]]
+name = "pydantic-extra-types"
+version = "2.11.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fd/35/2fee58b1316a73e025728583d3b1447218a97e621933fc776fb8c0f2ebdd/pydantic_extra_types-2.11.0.tar.gz", hash = "sha256:4e9991959d045b75feb775683437a97991d02c138e00b59176571db9ce634f0e", size = 157226, upload-time = "2025-12-31T16:18:27.944Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/17/fabd56da47096d240dd45ba627bead0333b0cf0ee8ada9bec579287dadf3/pydantic_extra_types-2.11.0-py3-none-any.whl", hash = "sha256:84b864d250a0fc62535b7ec591e36f2c5b4d1325fa0017eb8cda9aeb63b374a6", size = 74296, upload-time = "2025-12-31T16:18:26.38Z" },
+]
+
+[package.optional-dependencies]
+pycountry = [
+    { name = "pycountry" },
+]
+
+[[package]]
+name = "pydantic-settings"
+version = "2.13.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/6d/fffca34caecc4a3f97bda81b2098da5e8ab7efc9a66e819074a11955d87e/pydantic_settings-2.13.1.tar.gz", hash = "sha256:b4c11847b15237fb0171e1462bf540e294affb9b86db4d9aa5c01730bdbe4025", size = 223826, upload-time = "2026-02-19T13:45:08.055Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/4b/ccc026168948fec4f7555b9164c724cf4125eac006e176541483d2c959be/pydantic_settings-2.13.1-py3-none-any.whl", hash = "sha256:d56fd801823dbeae7f0975e1f8c8e25c258eb75d278ea7abb5d9cebb01b56237", size = 58929, upload-time = "2026-02-19T13:45:06.034Z" },
+]
+
+[[package]]
 name = "pydata-sphinx-theme"
 version = "0.16.1"
 source = { registry = "https://pypi.org/simple" }
@@ -5728,6 +6430,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b0/77/a5b8c569bf593b0140bde72ea885a803b82086995367bf2037de0159d924/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887", size = 4968631, upload-time = "2025-06-21T13:39:12.283Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b", size = 1225217, upload-time = "2025-06-21T13:39:07.939Z" },
+]
+
+[[package]]
+name = "pyjwt"
+version = "2.11.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/5a/b46fa56bf322901eee5b0454a34343cdbdae202cd421775a8ee4e42fd519/pyjwt-2.11.0.tar.gz", hash = "sha256:35f95c1f0fbe5d5ba6e43f00271c275f7a1a4db1dab27bf708073b75318ea623", size = 98019, upload-time = "2026-01-30T19:59:55.694Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6f/01/c26ce75ba460d5cd503da9e13b21a33804d38c2165dec7b716d06b13010c/pyjwt-2.11.0-py3-none-any.whl", hash = "sha256:94a6bde30eb5c8e04fee991062b534071fd1439ef58d2adc9ccb823e7bcd0469", size = 28224, upload-time = "2026-01-30T19:59:54.539Z" },
+]
+
+[package.optional-dependencies]
+crypto = [
+    { name = "cryptography" },
 ]
 
 [[package]]
@@ -5866,6 +6582,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f6/b0/4bc07ccd3572a2f9df7e6782f52b0c6c90dcbb803ac4a167702d7d0dfe1e/python_dotenv-1.1.1.tar.gz", hash = "sha256:a8a6399716257f45be6a007360200409fce5cda2661e3dec71d23dc15f6189ab", size = 41978, upload-time = "2025-06-24T04:21:07.341Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5f/ed/539768cf28c661b5b068d66d96a2f155c4971a5d55684a514c1a0e0dec2f/python_dotenv-1.1.1-py3-none-any.whl", hash = "sha256:31f23644fe2602f88ff55e1f5c79ba497e01224ee7737937930c448e4d0e24dc", size = 20556, upload-time = "2025-06-24T04:21:06.073Z" },
+]
+
+[[package]]
+name = "python-json-logger"
+version = "4.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/bf/eca6a3d43db1dae7070f70e160ab20b807627ba953663ba07928cdd3dc58/python_json_logger-4.0.0.tar.gz", hash = "sha256:f58e68eb46e1faed27e0f574a55a0455eecd7b8a5b88b85a784519ba3cff047f", size = 17683, upload-time = "2025-10-06T04:15:18.984Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/e5/fecf13f06e5e5f67e8837d777d1bc43fac0ed2b77a676804df5c34744727/python_json_logger-4.0.0-py3-none-any.whl", hash = "sha256:af09c9daf6a813aa4cc7180395f50f2a9e5fa056034c9953aec92e381c5ba1e2", size = 15548, upload-time = "2025-10-06T04:15:17.553Z" },
 ]
 
 [[package]]
@@ -6036,9 +6761,12 @@ default = [
     { name = "colorful" },
     { name = "grpcio" },
     { name = "opencensus" },
-    { name = "opentelemetry-exporter-prometheus" },
-    { name = "opentelemetry-proto" },
-    { name = "opentelemetry-sdk" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.60b1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-proto", version = "1.38.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-proto", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore') or (extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "prometheus-client" },
     { name = "py-spy" },
     { name = "pydantic" },
@@ -6569,6 +7297,64 @@ wheels = [
 ]
 
 [[package]]
+name = "setproctitle"
+version = "1.3.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/48/49393a96a2eef1ab418b17475fb92b8fcfad83d099e678751b05472e69de/setproctitle-1.3.7.tar.gz", hash = "sha256:bc2bc917691c1537d5b9bca1468437176809c7e11e5694ca79a9ca12345dcb9e", size = 27002, upload-time = "2025-09-05T12:51:25.278Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fb/f0/2dc88e842077719d7384d86cc47403e5102810492b33680e7dadcee64cd8/setproctitle-1.3.7-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:2dc99aec591ab6126e636b11035a70991bc1ab7a261da428491a40b84376654e", size = 18049, upload-time = "2025-09-05T12:49:36.241Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/b4/50940504466689cda65680c9e9a1e518e5750c10490639fa687489ac7013/setproctitle-1.3.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:cdd8aa571b7aa39840fdbea620e308a19691ff595c3a10231e9ee830339dd798", size = 13079, upload-time = "2025-09-05T12:49:38.088Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/99/71630546b9395b095f4082be41165d1078204d1696c2d9baade3de3202d0/setproctitle-1.3.7-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2906b6c7959cdb75f46159bf0acd8cc9906cf1361c9e1ded0d065fe8f9039629", size = 32932, upload-time = "2025-09-05T12:49:39.271Z" },
+    { url = "https://files.pythonhosted.org/packages/50/22/cee06af4ffcfb0e8aba047bd44f5262e644199ae7527ae2c1f672b86495c/setproctitle-1.3.7-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6915964a6dda07920a1159321dcd6d94fc7fc526f815ca08a8063aeca3c204f1", size = 33736, upload-time = "2025-09-05T12:49:40.565Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/00/a5949a8bb06ef5e7df214fc393bb2fb6aedf0479b17214e57750dfdd0f24/setproctitle-1.3.7-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:cff72899861c765bd4021d1ff1c68d60edc129711a2fdba77f9cb69ef726a8b6", size = 35605, upload-time = "2025-09-05T12:49:42.362Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/3a/50caca532a9343828e3bf5778c7a84d6c737a249b1796d50dd680290594d/setproctitle-1.3.7-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:b7cb05bd446687ff816a3aaaf831047fc4c364feff7ada94a66024f1367b448c", size = 33143, upload-time = "2025-09-05T12:49:43.515Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/14/b843a251296ce55e2e17c017d6b9f11ce0d3d070e9265de4ecad948b913d/setproctitle-1.3.7-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:3a57b9a00de8cae7e2a1f7b9f0c2ac7b69372159e16a7708aa2f38f9e5cc987a", size = 34434, upload-time = "2025-09-05T12:49:45.31Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/b7/06145c238c0a6d2c4bc881f8be230bb9f36d2bf51aff7bddcb796d5eed67/setproctitle-1.3.7-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:d8828b356114f6b308b04afe398ed93803d7fca4a955dd3abe84430e28d33739", size = 32795, upload-time = "2025-09-05T12:49:46.419Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/dc/ef76a81fac9bf27b84ed23df19c1f67391a753eed6e3c2254ebcb5133f56/setproctitle-1.3.7-cp312-cp312-win32.whl", hash = "sha256:b0304f905efc845829ac2bc791ddebb976db2885f6171f4a3de678d7ee3f7c9f", size = 12552, upload-time = "2025-09-05T12:49:47.635Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/5b/a9fe517912cd6e28cf43a212b80cb679ff179a91b623138a99796d7d18a0/setproctitle-1.3.7-cp312-cp312-win_amd64.whl", hash = "sha256:9888ceb4faea3116cf02a920ff00bfbc8cc899743e4b4ac914b03625bdc3c300", size = 13247, upload-time = "2025-09-05T12:49:49.16Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/2f/fcedcade3b307a391b6e17c774c6261a7166aed641aee00ed2aad96c63ce/setproctitle-1.3.7-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:c3736b2a423146b5e62230502e47e08e68282ff3b69bcfe08a322bee73407922", size = 18047, upload-time = "2025-09-05T12:49:50.271Z" },
+    { url = "https://files.pythonhosted.org/packages/23/ae/afc141ca9631350d0a80b8f287aac79a76f26b6af28fd8bf92dae70dc2c5/setproctitle-1.3.7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:3384e682b158d569e85a51cfbde2afd1ab57ecf93ea6651fe198d0ba451196ee", size = 13073, upload-time = "2025-09-05T12:49:51.46Z" },
+    { url = "https://files.pythonhosted.org/packages/87/ed/0a4f00315bc02510395b95eec3d4aa77c07192ee79f0baae77ea7b9603d8/setproctitle-1.3.7-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:0564a936ea687cd24dffcea35903e2a20962aa6ac20e61dd3a207652401492dd", size = 33284, upload-time = "2025-09-05T12:49:52.741Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/e4/adf3c4c0a2173cb7920dc9df710bcc67e9bcdbf377e243b7a962dc31a51a/setproctitle-1.3.7-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a5d1cb3f81531f0eb40e13246b679a1bdb58762b170303463cb06ecc296f26d0", size = 34104, upload-time = "2025-09-05T12:49:54.416Z" },
+    { url = "https://files.pythonhosted.org/packages/52/4f/6daf66394152756664257180439d37047aa9a1cfaa5e4f5ed35e93d1dc06/setproctitle-1.3.7-cp313-cp313-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:a7d159e7345f343b44330cbba9194169b8590cb13dae940da47aa36a72aa9929", size = 35982, upload-time = "2025-09-05T12:49:56.295Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/62/f2c0595403cf915db031f346b0e3b2c0096050e90e0be658a64f44f4278a/setproctitle-1.3.7-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:0b5074649797fd07c72ca1f6bff0406f4a42e1194faac03ecaab765ce605866f", size = 33150, upload-time = "2025-09-05T12:49:58.025Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/29/10dd41cde849fb2f9b626c846b7ea30c99c81a18a5037a45cc4ba33c19a7/setproctitle-1.3.7-cp313-cp313-musllinux_1_2_ppc64le.whl", hash = "sha256:61e96febced3f61b766115381d97a21a6265a0f29188a791f6df7ed777aef698", size = 34463, upload-time = "2025-09-05T12:49:59.424Z" },
+    { url = "https://files.pythonhosted.org/packages/71/3c/cedd8eccfaf15fb73a2c20525b68c9477518917c9437737fa0fda91e378f/setproctitle-1.3.7-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:047138279f9463f06b858e579cc79580fbf7a04554d24e6bddf8fe5dddbe3d4c", size = 32848, upload-time = "2025-09-05T12:50:01.107Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/3e/0a0e27d1c9926fecccfd1f91796c244416c70bf6bca448d988638faea81d/setproctitle-1.3.7-cp313-cp313-win32.whl", hash = "sha256:7f47accafac7fe6535ba8ba9efd59df9d84a6214565108d0ebb1199119c9cbbd", size = 12544, upload-time = "2025-09-05T12:50:15.81Z" },
+    { url = "https://files.pythonhosted.org/packages/36/1b/6bf4cb7acbbd5c846ede1c3f4d6b4ee52744d402e43546826da065ff2ab7/setproctitle-1.3.7-cp313-cp313-win_amd64.whl", hash = "sha256:fe5ca35aeec6dc50cabab9bf2d12fbc9067eede7ff4fe92b8f5b99d92e21263f", size = 13235, upload-time = "2025-09-05T12:50:16.89Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/a4/d588d3497d4714750e3eaf269e9e8985449203d82b16b933c39bd3fc52a1/setproctitle-1.3.7-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:10e92915c4b3086b1586933a36faf4f92f903c5554f3c34102d18c7d3f5378e9", size = 18058, upload-time = "2025-09-05T12:50:02.501Z" },
+    { url = "https://files.pythonhosted.org/packages/05/77/7637f7682322a7244e07c373881c7e982567e2cb1dd2f31bd31481e45500/setproctitle-1.3.7-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:de879e9c2eab637f34b1a14c4da1e030c12658cdc69ee1b3e5be81b380163ce5", size = 13072, upload-time = "2025-09-05T12:50:03.601Z" },
+    { url = "https://files.pythonhosted.org/packages/52/09/f366eca0973cfbac1470068d1313fa3fe3de4a594683385204ec7f1c4101/setproctitle-1.3.7-cp313-cp313t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:c18246d88e227a5b16248687514f95642505000442165f4b7db354d39d0e4c29", size = 34490, upload-time = "2025-09-05T12:50:04.948Z" },
+    { url = "https://files.pythonhosted.org/packages/71/36/611fc2ed149fdea17c3677e1d0df30d8186eef9562acc248682b91312706/setproctitle-1.3.7-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7081f193dab22df2c36f9fc6d113f3793f83c27891af8fe30c64d89d9a37e152", size = 35267, upload-time = "2025-09-05T12:50:06.015Z" },
+    { url = "https://files.pythonhosted.org/packages/88/a4/64e77d0671446bd5a5554387b69e1efd915274686844bea733714c828813/setproctitle-1.3.7-cp313-cp313t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:9cc9b901ce129350637426a89cfd650066a4adc6899e47822e2478a74023ff7c", size = 37376, upload-time = "2025-09-05T12:50:07.484Z" },
+    { url = "https://files.pythonhosted.org/packages/89/bc/ad9c664fe524fb4a4b2d3663661a5c63453ce851736171e454fa2cdec35c/setproctitle-1.3.7-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:80e177eff2d1ec172188d0d7fd9694f8e43d3aab76a6f5f929bee7bf7894e98b", size = 33963, upload-time = "2025-09-05T12:50:09.056Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/01/a36de7caf2d90c4c28678da1466b47495cbbad43badb4e982d8db8167ed4/setproctitle-1.3.7-cp313-cp313t-musllinux_1_2_ppc64le.whl", hash = "sha256:23e520776c445478a67ee71b2a3c1ffdafbe1f9f677239e03d7e2cc635954e18", size = 35550, upload-time = "2025-09-05T12:50:10.791Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/68/17e8aea0ed5ebc17fbf03ed2562bfab277c280e3625850c38d92a7b5fcd9/setproctitle-1.3.7-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:5fa1953126a3b9bd47049d58c51b9dac72e78ed120459bd3aceb1bacee72357c", size = 33727, upload-time = "2025-09-05T12:50:12.032Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/33/90a3bf43fe3a2242b4618aa799c672270250b5780667898f30663fd94993/setproctitle-1.3.7-cp313-cp313t-win32.whl", hash = "sha256:4a5e212bf438a4dbeece763f4962ad472c6008ff6702e230b4f16a037e2f6f29", size = 12549, upload-time = "2025-09-05T12:50:13.074Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/0e/50d1f07f3032e1f23d814ad6462bc0a138f369967c72494286b8a5228e40/setproctitle-1.3.7-cp313-cp313t-win_amd64.whl", hash = "sha256:cf2727b733e90b4f874bac53e3092aa0413fe1ea6d4f153f01207e6ce65034d9", size = 13243, upload-time = "2025-09-05T12:50:14.146Z" },
+    { url = "https://files.pythonhosted.org/packages/89/c7/43ac3a98414f91d1b86a276bc2f799ad0b4b010e08497a95750d5bc42803/setproctitle-1.3.7-cp314-cp314-macosx_10_13_universal2.whl", hash = "sha256:80c36c6a87ff72eabf621d0c79b66f3bdd0ecc79e873c1e9f0651ee8bf215c63", size = 18052, upload-time = "2025-09-05T12:50:17.928Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/2c/dc258600a25e1a1f04948073826bebc55e18dbd99dc65a576277a82146fa/setproctitle-1.3.7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:b53602371a52b91c80aaf578b5ada29d311d12b8a69c0c17fbc35b76a1fd4f2e", size = 13071, upload-time = "2025-09-05T12:50:19.061Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/26/8e3bb082992f19823d831f3d62a89409deb6092e72fc6940962983ffc94f/setproctitle-1.3.7-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:fcb966a6c57cf07cc9448321a08f3be6b11b7635be502669bc1d8745115d7e7f", size = 33180, upload-time = "2025-09-05T12:50:20.395Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/af/ae692a20276d1159dd0cf77b0bcf92cbb954b965655eb4a69672099bb214/setproctitle-1.3.7-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:46178672599b940368d769474fe13ecef1b587d58bb438ea72b9987f74c56ea5", size = 34043, upload-time = "2025-09-05T12:50:22.454Z" },
+    { url = "https://files.pythonhosted.org/packages/34/b2/6a092076324dd4dac1a6d38482bedebbff5cf34ef29f58585ec76e47bc9d/setproctitle-1.3.7-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:7f9e9e3ff135cbcc3edd2f4cf29b139f4aca040d931573102742db70ff428c17", size = 35892, upload-time = "2025-09-05T12:50:23.937Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/1a/8836b9f28cee32859ac36c3df85aa03e1ff4598d23ea17ca2e96b5845a8f/setproctitle-1.3.7-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:14c7eba8d90c93b0e79c01f0bd92a37b61983c27d6d7d5a3b5defd599113d60e", size = 32898, upload-time = "2025-09-05T12:50:25.617Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/22/8fabdc24baf42defb599714799d8445fe3ae987ec425a26ec8e80ea38f8e/setproctitle-1.3.7-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:9e64e98077fb30b6cf98073d6c439cd91deb8ebbf8fc62d9dbf52bd38b0c6ac0", size = 34308, upload-time = "2025-09-05T12:50:26.827Z" },
+    { url = "https://files.pythonhosted.org/packages/15/1b/b9bee9de6c8cdcb3b3a6cb0b3e773afdb86bbbc1665a3bfa424a4294fda2/setproctitle-1.3.7-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:b91387cc0f02a00ac95dcd93f066242d3cca10ff9e6153de7ee07069c6f0f7c8", size = 32536, upload-time = "2025-09-05T12:50:28.5Z" },
+    { url = "https://files.pythonhosted.org/packages/37/0c/75e5f2685a5e3eda0b39a8b158d6d8895d6daf3ba86dec9e3ba021510272/setproctitle-1.3.7-cp314-cp314-win32.whl", hash = "sha256:52b054a61c99d1b72fba58b7f5486e04b20fefc6961cd76722b424c187f362ed", size = 12731, upload-time = "2025-09-05T12:50:43.955Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/ae/acddbce90d1361e1786e1fb421bc25baeb0c22ef244ee5d0176511769ec8/setproctitle-1.3.7-cp314-cp314-win_amd64.whl", hash = "sha256:5818e4080ac04da1851b3ec71e8a0f64e3748bf9849045180566d8b736702416", size = 13464, upload-time = "2025-09-05T12:50:45.057Z" },
+    { url = "https://files.pythonhosted.org/packages/01/6d/20886c8ff2e6d85e3cabadab6aab9bb90acaf1a5cfcb04d633f8d61b2626/setproctitle-1.3.7-cp314-cp314t-macosx_10_13_universal2.whl", hash = "sha256:6fc87caf9e323ac426910306c3e5d3205cd9f8dcac06d233fcafe9337f0928a3", size = 18062, upload-time = "2025-09-05T12:50:29.78Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/60/26dfc5f198715f1343b95c2f7a1c16ae9ffa45bd89ffd45a60ed258d24ea/setproctitle-1.3.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:6134c63853d87a4897ba7d5cc0e16abfa687f6c66fc09f262bb70d67718f2309", size = 13075, upload-time = "2025-09-05T12:50:31.604Z" },
+    { url = "https://files.pythonhosted.org/packages/21/9c/980b01f50d51345dd513047e3ba9e96468134b9181319093e61db1c47188/setproctitle-1.3.7-cp314-cp314t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:1403d2abfd32790b6369916e2313dffbe87d6b11dca5bbd898981bcde48e7a2b", size = 34744, upload-time = "2025-09-05T12:50:32.777Z" },
+    { url = "https://files.pythonhosted.org/packages/86/b4/82cd0c86e6d1c4538e1a7eb908c7517721513b801dff4ba3f98ef816a240/setproctitle-1.3.7-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e7c5bfe4228ea22373e3025965d1a4116097e555ee3436044f5c954a5e63ac45", size = 35589, upload-time = "2025-09-05T12:50:34.13Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/4f/9f6b2a7417fd45673037554021c888b31247f7594ff4bd2239918c5cd6d0/setproctitle-1.3.7-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:585edf25e54e21a94ccb0fe81ad32b9196b69ebc4fc25f81da81fb8a50cca9e4", size = 37698, upload-time = "2025-09-05T12:50:35.524Z" },
+    { url = "https://files.pythonhosted.org/packages/20/92/927b7d4744aac214d149c892cb5fa6dc6f49cfa040cb2b0a844acd63dcaf/setproctitle-1.3.7-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:96c38cdeef9036eb2724c2210e8d0b93224e709af68c435d46a4733a3675fee1", size = 34201, upload-time = "2025-09-05T12:50:36.697Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/0c/fd4901db5ba4b9d9013e62f61d9c18d52290497f956745cd3e91b0d80f90/setproctitle-1.3.7-cp314-cp314t-musllinux_1_2_ppc64le.whl", hash = "sha256:45e3ef48350abb49cf937d0a8ba15e42cee1e5ae13ca41a77c66d1abc27a5070", size = 35801, upload-time = "2025-09-05T12:50:38.314Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/e3/54b496ac724e60e61cc3447f02690105901ca6d90da0377dffe49ff99fc7/setproctitle-1.3.7-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:1fae595d032b30dab4d659bece20debd202229fce12b55abab978b7f30783d73", size = 33958, upload-time = "2025-09-05T12:50:39.841Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/a8/c84bb045ebf8c6fdc7f7532319e86f8380d14bbd3084e6348df56bdfe6fd/setproctitle-1.3.7-cp314-cp314t-win32.whl", hash = "sha256:02432f26f5d1329ab22279ff863c83589894977063f59e6c4b4845804a08f8c2", size = 12745, upload-time = "2025-09-05T12:50:41.377Z" },
+    { url = "https://files.pythonhosted.org/packages/08/b6/3a5a4f9952972791a9114ac01dfc123f0df79903577a3e0a7a404a695586/setproctitle-1.3.7-cp314-cp314t-win_amd64.whl", hash = "sha256:cbc388e3d86da1f766d8fc2e12682e446064c01cea9f88a88647cfe7c011de6a", size = 13469, upload-time = "2025-09-05T12:50:42.67Z" },
+]
+
+[[package]]
 name = "setuptools"
 version = "80.10.2"
 source = { registry = "https://pypi.org/simple" }
@@ -6985,6 +7771,19 @@ wheels = [
 ]
 
 [[package]]
+name = "sse-starlette"
+version = "3.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "starlette" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/9f/c3695c2d2d4ef70072c3a06992850498b01c6bc9be531950813716b426fa/sse_starlette-3.3.2.tar.gz", hash = "sha256:678fca55a1945c734d8472a6cad186a55ab02840b4f6786f5ee8770970579dcd", size = 32326, upload-time = "2026-02-28T11:24:34.36Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/61/28/8cb142d3fe80c4a2d8af54ca0b003f47ce0ba920974e7990fa6e016402d1/sse_starlette-3.3.2-py3-none-any.whl", hash = "sha256:5c3ea3dad425c601236726af2f27689b74494643f57017cafcb6f8c9acfbb862", size = 14270, upload-time = "2026-02-28T11:24:32.984Z" },
+]
+
+[[package]]
 name = "starlette"
 version = "0.50.0"
 source = { registry = "https://pypi.org/simple" }
@@ -6995,6 +7794,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ba/b8/73a0e6a6e079a9d9cfa64113d771e421640b6f679a52eeb9b32f72d871a1/starlette-0.50.0.tar.gz", hash = "sha256:a2a17b22203254bcbc2e1f926d2d55f3f9497f769416b3190768befe598fa3ca", size = 2646985, upload-time = "2025-11-01T15:25:27.516Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/52/1064f510b141bd54025f9b55105e26d1fa970b9be67ad766380a3c9b74b0/starlette-0.50.0-py3-none-any.whl", hash = "sha256:9e5391843ec9b6e472eed1365a78c8098cfceb7a74bfd4d6b1c0c0095efb3bca", size = 74033, upload-time = "2025-11-01T15:25:25.461Z" },
+]
+
+[[package]]
+name = "supervisor"
+version = "4.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/b5/37e7a3706de436a8a2d75334711dad1afb4ddffab09f25e31d89e467542f/supervisor-4.3.0.tar.gz", hash = "sha256:4a2bf149adf42997e1bb44b70c43b613275ec9852c3edacca86a9166b27e945e", size = 468912, upload-time = "2025-08-23T18:25:02.418Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/65/5e726c372da8a5e35022a94388b12252710aad0c2351699c3d76ae8dba78/supervisor-4.3.0-py2.py3-none-any.whl", hash = "sha256:0bcb763fddafba410f35cbde226aa7f8514b9fb82eb05a0c85f6588d1c13f8db", size = 320736, upload-time = "2025-08-23T18:25:00.767Z" },
 ]
 
 [[package]]
@@ -7856,32 +8664,59 @@ version = "1.0.0.dev0"
 source = { git = "https://github.com/terrykong/vllm.git?rev=d35c05dbfec153a875258b8a1d563bd8b08aceb3#d35c05dbfec153a875258b8a1d563bd8b08aceb3" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "anthropic" },
+    { name = "blake3" },
+    { name = "cachetools" },
+    { name = "cbor2" },
+    { name = "cloudpickle" },
     { name = "compressed-tensors" },
+    { name = "depyf" },
+    { name = "diskcache" },
     { name = "einops" },
     { name = "fastapi", extra = ["standard"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "filelock" },
     { name = "flashinfer-python" },
     { name = "gguf" },
     { name = "grpcio" },
+    { name = "grpcio-reflection" },
+    { name = "ijson" },
+    { name = "lark" },
     { name = "llguidance" },
+    { name = "lm-format-enforcer" },
+    { name = "mcp" },
+    { name = "mistral-common", extra = ["image"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "model-hosting-container-standards" },
     { name = "msgspec" },
+    { name = "ninja" },
     { name = "numba" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
     { name = "openai" },
+    { name = "openai-harmony" },
     { name = "opencv-python-headless" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-sdk", version = "1.39.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "opentelemetry-semantic-conventions-ai" },
     { name = "outlines-core", version = "0.2.11", source = { registry = "https://pypi.org/simple" } },
     { name = "partial-json-parser" },
     { name = "pillow" },
     { name = "prometheus-client" },
+    { name = "prometheus-fastapi-instrumentator" },
     { name = "protobuf" },
     { name = "psutil" },
+    { name = "py-cpuinfo" },
     { name = "pybase64" },
     { name = "pydantic" },
+    { name = "python-json-logger" },
     { name = "pyyaml" },
     { name = "pyzmq" },
     { name = "ray", extra = ["cgraph"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "regex" },
     { name = "requests" },
     { name = "sentencepiece" },
+    { name = "setproctitle" },
     { name = "setuptools" },
+    { name = "six" },
     { name = "tiktoken" },
     { name = "tokenizers" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -7891,6 +8726,8 @@ dependencies = [
     { name = "torchvision", version = "0.25.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "typing-extensions" },
+    { name = "watchfiles" },
     { name = "xgrammar", version = "0.1.29", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
 ]
 
