@@ -1111,9 +1111,8 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
         task_to_env: Optional environment map. If a "nemo_gym" key is present,
-            its notify_weights_updated() method is called after the weight sync so
-            that custom routing policies (e.g. DynamoKvRoutingPolicy) can reset
-            their KV-cache state.
+            its notify_kv_cache_invalidated() method is called after the weight
+            sync so that custom routing policies can reset their KV-cache state.
     """
     if colocated_inference:
         policy.offload_before_refit()
@@ -1193,7 +1192,7 @@ def refit_policy_generation(
 
         nemo_gym_actor = (task_to_env or {}).get("nemo_gym")
         if nemo_gym_actor is not None:
-            ray.get(nemo_gym_actor.notify_weights_updated.remote())
+            ray.get(nemo_gym_actor.notify_kv_cache_invalidated.remote())
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -2874,11 +2873,13 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
+                        # Don't pass task_to_env here; in the async path the
+                        # nemo_gym KV-cache-invalidated notification is sent by
+                        # resume_after_refit() when it actually clears the cache.
                         refit_policy_generation(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            task_to_env=task_to_env,
                         )
                         POLICY_GENERATION_STALE = False
 
