@@ -76,3 +76,15 @@ export HF_HOME="/shared/nfs/huggingface"
 - **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem).
 - **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
 - **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.
+
+### Force Reimport ###
+
+By default, NeMo RL skips the HF → Megatron conversion if a converted checkpoint already exists at the target path. If you need to force a fresh conversion (e.g., after updating megatron-bridge or changing `hf_config_overrides`), set the following option in your config:
+
+```yaml
+policy:
+  megatron_cfg:
+    force_reimport_model: True  # Default: False
+```
+
+This is equivalent to deleting the converted checkpoint directory and rerunning — the old checkpoint will be overwritten with a freshly converted one.
