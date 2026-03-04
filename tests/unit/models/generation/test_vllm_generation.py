@@ -889,7 +889,7 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.skip(reason="Skipping on gb200 for now")
+@pytest.mark.skip(reason="Skipping for gb200 for now")
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
