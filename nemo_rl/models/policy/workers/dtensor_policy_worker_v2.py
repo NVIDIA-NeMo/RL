@@ -428,7 +428,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    sampling_params=self.sampling_params,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -436,6 +435,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
@@ -571,11 +571,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        sampling_params=self.sampling_params,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -640,11 +640,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        sampling_params=self.sampling_params,
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,
                         allow_flash_attn_args=False,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -730,11 +730,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        sampling_params=self.sampling_params,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 

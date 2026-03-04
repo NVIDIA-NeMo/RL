@@ -53,6 +53,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -1213,8 +1214,16 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     lp, (0, padding_needed), mode="constant", value=0.0
                 )
             all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        token_logprobs = torch.cat(all_log_probs_padded, dim=0)
 
+        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            token_logprobs = mask_out_neg_inf_logprobs(
+                token_logprobs, mask, "prev_logprobs"
+            )
+
+        return_data["logprobs"] = token_logprobs.cpu()
         return return_data
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)

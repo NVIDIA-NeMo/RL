@@ -258,13 +258,13 @@ def prepare_data_for_cp(
 
 def forward_with_post_processing_fn(
     model: nn.Module,
-    sampling_params: TrainingSamplingParams,
     post_processing_fn: PostProcessingFunction,
     processed_mb: ProcessedMicrobatch,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
@@ -278,13 +278,13 @@ def forward_with_post_processing_fn(
 
     Args:
         model: The model to run forward pass on
-        sampling_params: Sampling parameters
         post_processing_fn: Post-processing function to apply to the logits
         processed_mb: Pre-fetched ProcessedMicrobatch containing data and processed inputs
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
 
     Returns:
@@ -360,7 +360,6 @@ def forward_with_post_processing_fn(
 
 def automodel_forward_backward(
     model: nn.Module,
-    sampling_params: TrainingSamplingParams,
     data_iterator: Iterator[ProcessedMicrobatch],
     post_processing_fn: PostProcessingFunction,
     forward_only: bool = False,
@@ -368,6 +367,7 @@ def automodel_forward_backward(
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
     dp_size: int = 1,
     cp_size: int = 1,
@@ -386,7 +386,6 @@ def automodel_forward_backward(
 
     Args:
         model: The model to train
-        sampling_params: Sampling parameters
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         num_microbatches: Number of microbatches to process
         post_processing_fn: Post-processing function to apply to the logits
@@ -395,6 +394,7 @@ def automodel_forward_backward(
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
         dp_size: Data parallel size
         cp_size: Context parallel size
@@ -431,13 +431,13 @@ def automodel_forward_backward(
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
-                sampling_params=sampling_params,
                 post_processing_fn=post_processing_fn,
                 processed_mb=processed_mb,
                 is_reward_model=is_reward_model,
                 allow_flash_attn_args=allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
+                sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
             )
 
