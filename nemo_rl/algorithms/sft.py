@@ -44,6 +44,12 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class SFTSaveState(TypedDict):
+    """State dictionary for SFT training checkpoint persistence.
+
+    Tracks training progress across epochs and steps, including token-level
+    statistics needed for accurate loss computation upon resumption.
+    """
+
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
@@ -53,6 +59,11 @@ class SFTSaveState(TypedDict):
 
 
 def _default_sft_save_state() -> SFTSaveState:
+    """Create a default SFT save state with all counters initialized to zero.
+
+    Returns:
+        SFTSaveState: A fresh save state dictionary for starting training from scratch.
+    """
     return {
         "epoch": 0,
         "step": 0,
@@ -63,6 +74,11 @@ def _default_sft_save_state() -> SFTSaveState:
 
 
 class SFTConfig(TypedDict):
+    """Configuration for SFT training hyperparameters.
+
+    Controls training duration, validation schedule, and reproducibility settings.
+    """
+
     max_num_steps: int
     max_num_epochs: int
     val_period: int
@@ -77,6 +93,12 @@ class SFTConfig(TypedDict):
 
 
 class MasterConfig(TypedDict):
+    """Top-level configuration combining all sub-configs for SFT training.
+
+    Aggregates policy, data, SFT algorithm, logging, cluster, and checkpointing
+    configurations into a single typed dictionary.
+    """
+
     policy: PolicyConfig
     data: DataConfig
     sft: SFTConfig
@@ -362,6 +384,23 @@ def sft_train(
     checkpointer,
     sft_save_state: SFTSaveState,
 ) -> None:
+    """Execute the main SFT training loop with validation and checkpointing.
+
+    Runs supervised fine-tuning over the training dataset for the configured number
+    of epochs/steps, periodically running validation and saving checkpoints. Supports
+    resumption from a previous checkpoint via ``sft_save_state``.
+
+    Args:
+        policy: The policy model to train.
+        train_dataloader: DataLoader providing training batches.
+        val_dataloader: Optional DataLoader for validation batches.
+        tokenizer: Tokenizer used for encoding/decoding.
+        loss_fn: Loss function (e.g., NLLLoss) for computing training loss.
+        master_config: Full training configuration dictionary.
+        logger: Logger instance for metrics tracking.
+        checkpointer: CheckpointManager for saving/loading checkpoints.
+        sft_save_state: Training state for resumption, or None to start fresh.
+    """
     # Run basic sft training
     timer = Timer()
     timeout = TimeoutChecker(
