@@ -918,7 +918,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
         device_name = torch.cuda.get_device_name(0)
         if "GB200" in device_name:
-            pytest.skip(f"Skipping FP8 test on GB200 ({device_name}) until fixed.")
+            pytest.skip("Skipping FP8 test on GB200 until fixed.")
 
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
@@ -990,7 +990,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
             )
         device_name = torch.cuda.get_device_name(0)
         if "GB200" in device_name:
-            pytest.skip(f"Skipping FP8 test on GB200 ({device_name}) until fixed.")
+            pytest.skip("Skipping FP8 test on GB200 until fixed.")
 
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
@@ -1633,9 +1633,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 
         device_name = torch.cuda.get_device_name(0)
         if "GB200" in device_name:
-            pytest.skip(
-                f"Skipping FP8 test on GB200 ({device_name}) until fixed."
-            )
+            pytest.skip("Skipping FP8 test on GB200 until fixed.")
 
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -2053,7 +2051,7 @@ def test_vllm_generation_with_megatron_training(
 
         device_name = torch.cuda.get_device_name(0)
         if "GB200" in device_name:
-            pytest.skip(f"Skipping FP8 test on GB200 ({device_name}) until fixed.")
+            pytest.skip("Skipping FP8 test on GB200 until fixed.")
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
@@ -2227,7 +2225,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
         device_name = torch.cuda.get_device_name(0)
         if "GB200" in device_name:
-            pytest.skip(f"Skipping FP8 test on GB200 ({device_name}) until fixed.")
+            pytest.skip("Skipping FP8 test on GB200 until fixed.")
 
     model_name = "moonshotai/Moonlight-16B-A3B-Instruct"
     expert_parallel_size = 8
