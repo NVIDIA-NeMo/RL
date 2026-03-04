@@ -182,6 +182,38 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
+def mask_out_neg_inf_logprobs(
+    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+) -> torch.Tensor:
+    """Mask out negative infinity log probabilities.
+
+    Handling sampling mask mismatch:
+    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
+    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+
+    Args:
+        logprobs: Log probabilities.
+        mask: Mask.
+
+    Returns:
+        Masked log probabilities.
+    """
+    is_neginf = torch.isinf(logprobs)
+    neginf_count = (is_neginf & mask.bool()).sum().item()
+    if neginf_count > 0:
+        print(
+            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
+            "(policy top-k/top-p mismatch). Masking out these positions."
+        )
+
+    mask = mask * (~is_neginf).float()
+    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+
+    return logprobs
+
+
 def set_seed(seed: int) -> None:
     """Sets the seed for python, numpy, and pytorch."""
     random.seed(seed)

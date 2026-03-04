@@ -21,43 +21,12 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
-
-
-def _mask_out_neg_inf_logprobs(
-    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
-    """Mask out negative infinity log probabilities.
-
-    Handling sampling mask mismatch:
-    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
-    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
-    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
-    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
-
-    Args:
-        logprobs: Log probabilities.
-        mask: Mask.
-
-    Returns:
-        Masked log probabilities.
-    """
-    is_neginf = torch.isinf(logprobs)
-    neginf_count = (is_neginf & mask.bool()).sum().item()
-    if neginf_count > 0:
-        print(
-            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
-            "(policy top-k/top-p mismatch). Masking out these positions."
-        )
-
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
-
-    return logprobs
 
 
 def prepare_loss_input(
@@ -104,13 +73,9 @@ def prepare_loss_input(
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
             # mask out negative infinity logprobs
+            # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = _mask_out_neg_inf_logprobs(
-                logprobs, mask[:, 1:], "curr_logprobs"
-            )
-            data["prev_logprobs"] = _mask_out_neg_inf_logprobs(
-                data["prev_logprobs"], mask, "prev_logprobs"
-            )
+            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
