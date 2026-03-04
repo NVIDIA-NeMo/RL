@@ -29,6 +29,7 @@ from transformers import (
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
+import re
 
 def get_gdpo_reward_component_keys(batch) -> list:
     """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
