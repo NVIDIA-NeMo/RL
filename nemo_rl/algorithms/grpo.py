@@ -1046,7 +1046,10 @@ def _create_advantage_estimator(master_config: MasterConfig):
     """
     grpo_config = master_config["grpo"]
     loss_config = master_config["loss_fn"]
+
     # Provide backward-compatible defaults when adv_estimator is not in config.
+    # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
+    # which older configs still use.
     adv_estimator_config = grpo_config.get(
         "adv_estimator",
         {
@@ -1061,6 +1064,10 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
     adv_estimator_name = adv_estimator_config["name"]
     if adv_estimator_name == "gdpo":
+        assert not _should_use_async_rollouts(master_config), (
+            "GDPO is not supported for async rollouts, "
+            "please set policy.generation.vllm_cfg.async_engine to false in your config."
+        )
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
     elif adv_estimator_name == "grpo":
@@ -1372,9 +1379,8 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
-    # Create advantage estimator
+    # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
-
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -1596,8 +1602,8 @@ def grpo_train(
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...,", flush=True)
-                # GDPO
                 with timer.time("reward_calculation"):
+                    # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
                     # Store input_ids in batch so that after dynamic_sampling it stays aligned with
                     # the (possibly filtered) batch: select_indices / from_batches / slice all
@@ -1787,8 +1793,6 @@ def grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
-
-                    
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         repeated_batch=repeated_batch,
@@ -2445,7 +2449,7 @@ def async_grpo_train(
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
-    # Create advantage estimator
+    # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
     assert not colocated_inference, (
