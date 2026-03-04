@@ -1002,9 +1002,9 @@ class DistillationLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        teacher_logits: Optional[torch.Tensor] = None,
-        mb_offset: Optional[int] = None,
-        mb_size: Optional[int] = None,
+        teacher_logits: Optional = None,
+        mb_idx: Optional[int] = None,
+        mbs: Optional[int] = None,
         teacher_topk_indices_ipc: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
@@ -1045,17 +1045,12 @@ class DistillationLossFn(LossFunction):
                 vocab_start_index = 0
                 vocab_end_index = V_local
 
-            # Slice the microbatch from the pre-reconstructed IPC tensors using
-            # the actual cumulative batch offset (not mb_idx * mbs, which breaks
-            # with dynamic batching where microbatch sizes vary).
-            # Also truncate seq dim to match student's actual length.
-            student_seq_len = local_student_logits.shape[1]
             with torch.no_grad():
-                mb_start = mb_offset
-                mb_end = mb_offset + mb_size
-                teacher_topk_logprobs = teacher_logits[mb_start:mb_end, :student_seq_len, :].clone().detach()
+                mb_start = mb_idx * mbs
+                mb_end = mb_start + mbs
+                teacher_topk_logprobs = teacher_logits[mb_start:mb_end, :, :].clone().detach()
                 teacher_topk_logprobs = teacher_topk_logprobs.to(device=local_student_logits.device)
-                topk_indices = teacher_topk_indices_ipc[mb_start:mb_end, :student_seq_len, :].clone().detach()
+                topk_indices = teacher_topk_indices_ipc[mb_start:mb_end, :, :].clone().detach()
                 topk_indices = topk_indices.to(device=local_student_logits.device)
 
             # Gather student log probs at teacher's top-k global indices
@@ -1225,8 +1220,11 @@ class DistillationLossFn(LossFunction):
                     student_topk_logits, dim=-1
                 )
 
-            teacher_topk_logprobs = teacher_topk_logits.to(
+            teacher_topk_logits = teacher_topk_logits.to(
                 student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+            )
+            teacher_topk_logprobs = torch.nn.functional.log_softmax(
+                teacher_topk_logits, dim=-1
             )
 
             # Single point of next-token alignment after TP/CP processing

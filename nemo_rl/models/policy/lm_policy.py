@@ -577,12 +577,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "topk_logits": topk_logits,
         }
 
-        # For the teacher path, disable ALL output deduplication so we get
-        # IPC handles from every single worker (DP * TP * CP). Each worker's
-        # IPC buffer is GPU-local and can only be read by the colocated
-        # student worker at the same rank.
         if is_teacher:
-            output_replicated = []
+            output_replicated = [
+                "context_parallel",
+                "pipeline_parallel",
+            ]
         else:
             output_replicated = [
                 "context_parallel",
@@ -604,19 +603,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         results = self.worker_group.get_all_worker_results(futures)
 
-        # Teacher path: build a dict keyed by worker rank so each student
-        # worker can look up its corresponding teacher IPC handle.
-        # Each worker result is {rank_int: ipc_handle, 'actual_shape': ..., ...}.
         if is_teacher:
-            merged = {}
-            for r in results:
-                merged.update(r)
-            return merged
+            return results
 
-        # Aggregate the results
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
+            "kl_loss": sum(results[0]['all_mb_metrics']['kl_loss']) if 'kl_loss' in results[0]['all_mb_metrics'] else 0.0,
+            "nll_loss": sum(results[0]['all_mb_metrics']['nll_loss']) if 'nll_loss' in results[0]['all_mb_metrics'] else 0.0,
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
