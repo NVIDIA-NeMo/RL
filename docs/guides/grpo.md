@@ -8,20 +8,7 @@ To get started quickly, use the script [examples/run_grpo.py](../../examples/run
 
 ### Prerequisites
 
-Before launching a GRPO run, ensure your environment has the required extras installed. The extras you need depend on your chosen inference backend:
-
-```bash
-# For vLLM inference backend (recommended):
-uv sync --extra automodel --extra vllm
-
-# For SGLang inference backend:
-uv sync --extra sglang
-```
-
-> [!NOTE]
-> If you are running inside a pre-built Docker container, these extras are already installed. If you encounter import errors (e.g., `No module named 'nemo_automodel'` or `No module named 'vllm'`), re-run the appropriate `uv sync` command above.
-
-Set the required environment variables:
+Set the required environment variables before launching:
 
 ```bash
 # Required: HuggingFace and Weights & Biases
@@ -31,10 +18,14 @@ export WANDB_API_KEY=your_wandb_key
 
 # Recommended: Disable DeepGEMM if not available on your GPU (e.g., H20)
 export VLLM_USE_DEEP_GEMM=0
-
-# Recommended: Ensure CUDA libraries are discoverable by Ray workers
-export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 ```
+
+> [!NOTE]
+> If you are running outside of a pre-built Docker container (bare-metal), you may need to prefetch the Ray worker virtual environments before launching:
+> ```bash
+> uv run nemo_rl/utils/prefetch_venvs.py                # all workers
+> uv run nemo_rl/utils/prefetch_venvs.py vllm policy     # selective
+> ```
 
 ### Launch
 
@@ -52,11 +43,10 @@ If you encounter issues during the first run, try the following:
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| `No module named 'nemo_automodel'` | Missing `automodel` extra | `uv sync --extra automodel` |
-| `No module named 'vllm'` or `No module named 'vllm.logger'` | Missing or incomplete `vllm` extra | `uv sync --extra vllm` |
-| `cannot import name 'OmegaConf'` | Virtual environment not synced | `uv venv && uv sync --extra automodel --extra vllm` |
+| `No module named 'nemo_automodel'` or `No module named 'vllm'` | Worker venvs not built | `uv run nemo_rl/utils/prefetch_venvs.py` |
+| `cannot import name 'OmegaConf'` | Driver virtual environment not synced | `uv venv && uv sync` |
 | `No module named 'ray._private.node'` | Corrupted Ray installation | `uv pip install "ray[default]==2.49.2" --force-reinstall` |
-| `libcudnn.so.9: cannot open shared object` | cuDNN not visible to Ray workers | Set `LD_LIBRARY_PATH` (see Prerequisites) or `export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION` |
+| `libcudnn.so.9: cannot open shared object` | cuDNN not visible to Ray workers (bare-metal) | See [cuDNN note](../about/installation.md#cudnn-for-megatron-backend) or `export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION` |
 | `DeepGEMM backend is not available` | DeepGEMM not compiled for your GPU | `export VLLM_USE_DEEP_GEMM=0` |
 
 For Ray worker virtual environment issues, clearing and rebuilding may help:
@@ -64,6 +54,7 @@ For Ray worker virtual environment issues, clearing and rebuilding may help:
 ```bash
 ray stop
 rm -rf /opt/ray_venvs/*
+uv run nemo_rl/utils/prefetch_venvs.py
 ```
 
 In this guide, we'll walk through how we handle:
