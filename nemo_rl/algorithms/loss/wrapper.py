@@ -108,23 +108,38 @@ class SequencePackingLossWrapper:
                 1, logit_start, logit_length
             )
 
-            # prepare data for loss function
-            loss_input = self.prepare_fn(
-                logits=next_token_logits_slice,
-                data=unpadded_seq_data,
-                loss_fn=self.loss_fn,
-                vocab_parallel_rank=self.vocab_parallel_rank,
-                vocab_parallel_group=self.vocab_parallel_group,
-                context_parallel_group=self.context_parallel_group,
-            )
+            if (
+                hasattr(self.loss_fn, "use_linear_ce_fusion")
+                and self.loss_fn.use_linear_ce_fusion
+            ):
+                # Linear CE fusion path: model.forward already returns next-token logprobs.
+                loss, metrics = self.loss_fn(
+                    next_token_logits_slice,
+                    unpadded_seq_data,
+                    global_valid_seqs,
+                    global_valid_toks,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
+            else:
+                # prepare data for loss function
+                loss_input = self.prepare_fn(
+                    logits=next_token_logits_slice,
+                    data=unpadded_seq_data,
+                    loss_fn=self.loss_fn,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
 
-            # call loss function
-            loss, metrics = self.loss_fn(
-                data=unpadded_seq_data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+                # call loss function
+                loss, metrics = self.loss_fn(
+                    data=unpadded_seq_data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
 
             # aggregate loss and metrics
             loss_accum += loss
@@ -183,82 +198,3 @@ def wrap_loss_fn_with_input_preparation(
     )
 
     return loss, loss_metrics
-
-
-class SequencePackingNLLLinearCEFusionLossWrapper:
-    def __init__(
-        self,
-        loss_fn: LossFunction,
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
-    ):
-        self.loss_fn = loss_fn
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = cu_seqlens_q_padded
-
-    def __call__(
-        self,
-        token_logprobs: Tensor,
-        data: BatchedDataDict[Any],
-        global_valid_seqs: Tensor | None,
-        global_valid_toks: Tensor | None,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> tuple[Tensor, dict[str, Any]]:
-        """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
-        unpadded_cu_seqlens = self.cu_seqlens_q
-        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if self.cu_seqlens_q_padded is not None:
-            padded_cu_seqlens = self.cu_seqlens_q_padded
-            padded_seq_lengths = (
-                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
-            )
-        else:
-            padded_cu_seqlens = unpadded_cu_seqlens
-            padded_seq_lengths = unpadded_seq_lengths
-        seq_starts = padded_cu_seqlens[:-1]
-        seq_ends = padded_cu_seqlens[1:]
-
-        loss_accum = 0
-        metrics_accum = {}
-        for seq_idx in range(len(seq_starts)):
-            seq_start = seq_starts[seq_idx].item()
-            seq_end = seq_ends[seq_idx].item()
-
-            # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
-            seq_data = data.slice(seq_idx, seq_idx + 1)
-            unpadded_seq_data = {}
-            for k, v in seq_data.items():
-                if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:
-                    unpadded_seq_data[k] = v[:, : unpadded_seq_lengths[seq_idx]]
-                else:
-                    unpadded_seq_data[k] = v
-
-            # get next_token_logits
-            cp_size = (
-                1
-                if context_parallel_group is None
-                else torch.distributed.get_world_size(context_parallel_group)
-            )
-            logit_slice_idxs = slice(
-                seq_start // cp_size,
-                (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
-            )
-            token_logprobs_slice = token_logprobs[:, logit_slice_idxs]
-            loss, metrics = self.loss_fn(
-                token_logprobs_slice,
-                unpadded_seq_data,
-                global_valid_seqs,
-                global_valid_toks,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-            )
-            loss_accum += loss
-            for k, v in metrics.items():
-                if k not in metrics_accum:
-                    metrics_accum[k] = 0
-                metrics_accum[k] += v
-
-        return loss_accum, metrics_accum

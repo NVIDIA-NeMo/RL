@@ -31,7 +31,6 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss import (
     SequencePackingLossWrapper,
-    SequencePackingNLLLinearCEFusionLossWrapper,
     prepare_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
@@ -317,22 +316,15 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            if self.cfg["megatron_cfg"]["use_linear_ce_fusion_loss"]:
-                loss_fn_wrapped = SequencePackingNLLLinearCEFusionLossWrapper(
-                    loss_fn=self.loss_fn,
-                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                )
-            else:
-                loss_fn_wrapped = SequencePackingLossWrapper(
-                    loss_fn=self.loss_fn,
-                    prepare_fn=prepare_loss_input,
-                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                )
+            loss_fn_wrapped = SequencePackingLossWrapper(
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_loss_input,
+                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+            )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
