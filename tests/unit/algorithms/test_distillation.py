@@ -25,7 +25,7 @@ from nemo_rl.algorithms.distillation import (
     distillation_train,
     validate,
 )
-from nemo_rl.algorithms.loss_functions import DistillationLossFn
+from nemo_rl.algorithms.loss import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 

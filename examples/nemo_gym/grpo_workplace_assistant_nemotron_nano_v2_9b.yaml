@@ -37,6 +37,13 @@ grpo:
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: null
 
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false # Set to true to enable in-flight weight updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+
 loss_fn:
   reference_policy_kl_penalty: 0
   reference_policy_kl_type: "k3"
@@ -245,6 +252,10 @@ data:
   max_input_seq_length: null  # nemogym dataset doesn't use this parameter
   shuffle: true
   num_workers: 0
+
+  # use multiple dataloader for train
+  # see https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details.
+  use_multiple_dataloader: false
 
   # Using the prepared train and validation datasets (downloaded from HuggingFace and split 90/10)
   # Train: 1129 samples, Validation: 126 samples

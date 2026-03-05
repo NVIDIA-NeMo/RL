@@ -76,7 +76,16 @@ def import_model_from_hf_name(
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
     model_provider.finalize()
-    model_provider.initialize_model_parallel(seed=0)
+
+    from megatron.core import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        model_provider.initialize_model_parallel(seed=0)
+    else:
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(0)
+
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
     # The above parallelism settings are used to load the model in a distributed manner.

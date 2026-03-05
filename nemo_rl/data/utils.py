@@ -37,9 +37,12 @@ def setup_response_data(
     env_configs: Optional[dict[str, Any]] = None,
     is_vlm: bool = False,
 ) -> Union[
-    tuple[AllTaskProcessedDataset, Optional[AllTaskProcessedDataset]],
     tuple[
-        AllTaskProcessedDataset,
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[AllTaskProcessedDataset],
+    ],
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
         Optional[AllTaskProcessedDataset],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
@@ -69,7 +72,9 @@ def setup_response_data(
         "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
     )
 
-    # setup environments if needed
+    # ==========================
+    # Setup Environments
+    # ==========================
     has_envs = env_configs is not None
     if has_envs:
         print("\n▶ Setting up envs...")
@@ -81,9 +86,12 @@ def setup_response_data(
                 env_name=registered_env_name, env_config=env_configs[env_name]
             )
 
+    # ==========================
+    # Setup Train Dataset
+    # ==========================
     print("\n▶ Setting up data...")
-    # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     task_to_env = {}
     data_list = []
 
@@ -96,24 +104,53 @@ def setup_response_data(
             update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg)
         data_list.append(data)
+        print(
+            f"  - Loaded training dataset {data.task_name} with {len(data.dataset)} samples."
+        )
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
         task_data_processors[task_name] = (data.task_spec, data.processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[task_name] = data.preprocessor
         if has_envs:
             task_to_env[task_name] = envs[cfg["env_name"]]
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
-    dataset = AllTaskProcessedDataset(
-        merged_data,
-        tokenizer,
-        None,
-        task_data_processors,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
+    # merge datasets
+    if (
+        "use_multiple_dataloader" in data_config
+        and data_config["use_multiple_dataloader"]
+    ):
+        # merge datasets into a dictionary of task name to dataset
+        dataset = {
+            data.task_name: AllTaskProcessedDataset(
+                data.dataset,
+                tokenizer,
+                None,
+                task_data_processors,
+                task_data_preprocessors=task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for data in data_list
+        }
+    else:
+        # merge datasets into a single dataset
+        merged_data = concatenate_datasets([data.dataset for data in data_list])
+        dataset = AllTaskProcessedDataset(
+            merged_data,
+            tokenizer,
+            None,
+            task_data_processors,
+            task_data_preprocessors=task_data_preprocessors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+    sample_count = sum(len(data.dataset) for data in data_list)
+    print(f"  ✓ Training dataset loaded with {sample_count} samples.")
 
-    # setup validation dataset
+    # ==========================
+    # Setup Validation Dataset
+    # ==========================
     val_task_data_processors = {}
+    val_task_data_preprocessors = {}
     val_task_to_env = {}
     val_data_list = []
 
@@ -121,9 +158,16 @@ def setup_response_data(
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
             val_data_list.append(data.val_dataset)
+            print(
+                f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
+            )
             # bind task_name to task_data_processors and task_to_env
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[
+                    task_name
+                ]
             if has_envs:
                 val_task_to_env[task_name] = task_to_env[task_name]
 
@@ -138,15 +182,21 @@ def setup_response_data(
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
+            print(
+                f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
+            )
             # bind task_name to task_data_processors and task_to_env
             task_name = val_data.task_name
             val_task_data_processors[task_name] = (
                 val_data.task_spec,
                 val_data.processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[task_name] = val_data.preprocessor
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
+    # merge datasets
     val_dataset = None
     if len(val_data_list) > 0:
         merged_val_data = concatenate_datasets(val_data_list)
@@ -155,6 +205,7 @@ def setup_response_data(
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
@@ -166,7 +217,9 @@ def setup_response_data(
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
-def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_preference_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig
+) -> tuple[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]:
     """Setup preference data.
 
     This function is used to setup the preference data for the training and validation datasets.
@@ -189,12 +242,16 @@ def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         update_single_dataset_config(data_config["train"], data_config["default"])
     data = load_preference_dataset(data_config["train"])
     task_data_processors = {data.task_name: (data.task_spec, preference_preprocessor)}
+    task_data_preprocessors = {}
+    if hasattr(data, "preprocessor") and data.preprocessor is not None:
+        task_data_preprocessors[data.task_name] = data.preprocessor
 
     dataset = AllTaskProcessedDataset(
         data.dataset,
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
@@ -202,6 +259,7 @@ def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     # setup validation dataset
     # TODO @yukih: unify the code when support multiple datasets for preference dataset
     val_dataset = {}
+    val_task_data_preprocessors = {}
     if "val_data_paths" in data_config and data_config["val_data_paths"]:
         assert isinstance(data_config["val_data_paths"], dict), (
             f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
@@ -217,12 +275,17 @@ def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             val_task_data_processors = {
                 val_data.task_name: (val_data.task_spec, preference_preprocessor)
             }
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors = {
+                    val_data.task_name: val_data.preprocessor
+                }
 
             val_dataset[val_dataset_name] = AllTaskProcessedDataset(
                 val_data.dataset,
                 tokenizer,
                 None,
                 val_task_data_processors,
+                task_data_preprocessors=val_task_data_preprocessors,
                 max_seq_length=data_config["max_input_seq_length"],
             )
             print(
@@ -238,12 +301,15 @@ def setup_preference_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         val_task_data_processors = {
             val_data.task_name: (val_data.task_spec, preference_preprocessor)
         }
+        if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+            val_task_data_preprocessors = {val_data.task_name: val_data.preprocessor}
 
         val_dataset["default"] = AllTaskProcessedDataset(
             val_data.dataset,
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(
