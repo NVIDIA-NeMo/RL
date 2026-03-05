@@ -1040,7 +1040,7 @@ def run_async_nemo_gym_rollout(
         "Top k is not supported in the generation config in NeMo-Gym path!"
     )
 
-    timer = Timer()
+    timer = Timer(context={"worker": "rollout"})
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
