@@ -232,55 +232,6 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
-        def _patch_vllm_vit_flash_attn_backend():
-            """Patch vLLM vision attention backend selection logic.
-
-            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
-            vllm.attention.layer to avoid overriding the backend when it
-            is already set to XFORMERS. This avoids flash attention related
-            errors when the ViT head dimension is not a multiple of 32.
-
-            Related issues:
-            - https://github.com/vllm-project/vllm/issues/27562
-            - https://github.com/vllm-project/vllm/issues/26989
-
-            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
-            """
-            file_to_patch = _get_vllm_file("attention/layer.py")
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            new_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            # Only patch if the file still has the old snippet and
-            # hasn't been patched already.
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
         def _patch_vllm_speculative_decoding_post_step():
             """Patch vLLM speculative decoding post_step call.
 
@@ -319,9 +270,6 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
-
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
 
         _patch_vllm_speculative_decoding_post_step()
 
