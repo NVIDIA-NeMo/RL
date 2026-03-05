@@ -1,0 +1,29 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-fsdp2
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  sequence_packing:
+    enabled: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-30BA3B-2n8g-fsdp2
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

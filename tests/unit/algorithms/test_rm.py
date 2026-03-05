@@ -18,7 +18,7 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.loss_functions import PreferenceLoss
+from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.algorithms.rm import _default_rm_save_state, rm_train
 
 
@@ -75,7 +75,7 @@ def mock_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLossFn()
     logger = MagicMock()
     checkpointer = MagicMock()
 

@@ -22,6 +22,13 @@ grpo:
     overlong_buffer_length: 512
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
+  # Advantage Estimator Configuration
+  # Options: "grpo" (default) or "reinforce_plus_plus"
+  adv_estimator:
+    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -31,6 +38,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+  seq_logprob_error_threshold: null
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -152,6 +160,12 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
 
   # dynamic_batching improves performance by ensuring logprob and training microbatches
   # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
@@ -234,6 +248,9 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   shuffle: true
   num_workers: 1
+
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
 
   # dataset
   train:

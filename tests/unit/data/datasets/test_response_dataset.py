@@ -110,6 +110,37 @@ def test_response_dataset(input_key, output_key, is_save_to_disk, file_ext, toke
     assert combined_message == " Question: Hello Answer: Hi there!"
 
 
+def test_response_dataset_gsm8k_with_subset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "ResponseDataset",
+        "data_path": "openai/gsm8k",
+        "input_key": "question",
+        "output_key": "answer",
+        "subset": "main",
+        "split": "train",
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the input and output keys
+    assert dataset.input_key == "question"
+    assert dataset.output_key == "answer"
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][:20] == "Natalia sold clips t"
+    assert first_example["messages"][1]["role"] == "assistant"
+    assert first_example["messages"][1]["content"][:20] == "Natalia sold 48/2 = "
+
+
 def test_helpsteer3_dataset():
     # load the dataset
     data_config = {"dataset_name": "HelpSteer3"}
@@ -303,3 +334,26 @@ def test_vlm_dataset(dataset_name, format_func):
         assert first_example["messages"][1]["content"] == "3"
     elif dataset_name == "refcoco":
         assert first_example["messages"][1]["content"] == "[243, 469, 558, 746]"
+
+
+def test_dailyomni_dataset():
+    # load the dataset
+    dataset = load_response_dataset({"dataset_name": "daily-omni"})
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    assert hasattr(dataset, "preprocessor") and dataset.preprocessor is not None
+    first_example = dataset.preprocessor(first_example)
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][0]["type"] == "video"
+    assert first_example["messages"][0]["content"][1]["type"] == "text"
+    assert first_example["messages"][1]["role"] == "assistant"
+
+    assert first_example["messages"][1]["content"] == "B"

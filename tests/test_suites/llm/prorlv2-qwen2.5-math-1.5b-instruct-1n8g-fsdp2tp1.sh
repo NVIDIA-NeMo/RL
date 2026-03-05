@@ -3,21 +3,20 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=4
-GPUS_PER_NODE=4
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=1
+STEPS_PER_RUN=450
+MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_dpo.py \
+uv run examples/run_grpo_math.py \
     --config $CONFIG_PATH \
-    dpo.max_num_steps=$MAX_STEPS \
+    grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -35,14 +34,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 3.6' \
-        'data["train/loss"]["20"] < 3.4' \
-        'data["train/preference_loss"]["1"] > 0.69314' \
-        'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["20"] < 0.6' \
-        'mean(data["timing/train/total_step_time"], -10, -1) < 7.8'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["450"] < 1.1'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
-

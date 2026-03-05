@@ -17,7 +17,7 @@ What it does:
  1) Sets up a RayVirtualCluster
  2) Initializes VllmGeneration
  3) Initializes LM Policy
- 4) Trains on a tiny synthetic batch (global batch size = 2) with NLLLoss
+ 4) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
  5) Refits the generation engine with the latest policy weights
  6) Optionally repeats the train→refit cycle in a short loop
 
@@ -34,16 +34,18 @@ from omegaconf import OmegaConf
 from template_project.data_utils import create_batch_from
 
 from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.config import load_config, parse_hydra_overrides
-
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def main(config: MasterConfig) -> None:
@@ -93,8 +95,8 @@ def main(config: MasterConfig) -> None:
     state_dict_info = policy.prepare_refit_info()
     policy_generation.prepare_refit_info(state_dict_info or {})
 
-    # 4) Create tiny numeric batch and train with NLLLoss
-    print("\n▶ Creating tiny numeric batch and training with NLLLoss...")
+    # 4) Create tiny numeric batch and train with NLLLossFn
+    print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
     train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
         "train_global_batch_size"
     ]
@@ -114,7 +116,7 @@ def main(config: MasterConfig) -> None:
         "What is the capital of the Nepal?",
     ]
     data = create_batch_from(tokenizer, sentences=train_sentences)
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn()
 
     # Optionally repeat the train→refit cycle
     num_iters = int(os.environ.get("SINGLE_UPDATE_ITERS", "10"))
@@ -178,6 +180,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 if __name__ == "__main__":
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:

@@ -20,6 +20,7 @@ class ResponseDatasetConfig(TypedDict):
     data_path: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]
+    subset: NotRequired[str | None]
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
@@ -38,13 +39,14 @@ class PreferenceDatasetConfig(TypedDict):
     prompt_key: NotRequired[str]
     chosen_key: NotRequired[str]
     rejected_key: NotRequired[str]
+    subset: NotRequired[str | None]
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
 
 class DataConfig(TypedDict):
-    max_input_seq_length: int
+    max_input_seq_length: int | None
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
     add_generation_prompt: NotRequired[bool]
@@ -55,6 +57,11 @@ class DataConfig(TypedDict):
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # multiple dataloader configs
+    # currently only supported for GRPO
+    use_multiple_dataloader: NotRequired[bool]
+    num_prompts_per_dataloader: NotRequired[int]
+    custom_dataloader: NotRequired[str]
     # dataset configs
     train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
     validation: NotRequired[

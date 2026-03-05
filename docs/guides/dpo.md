@@ -32,8 +32,14 @@ uv run examples/run_dpo.py \
 
 ## Datasets
 
-Each DPO dataset class is expected to have the following attributes:
-1. `dataset`: The formatted dataset, which should be formatted like
+DPO datasets in NeMo RL are encapsulated using classes. Each DPO data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. An example implementation can be found in [preference_datasets/tulu3.py](../../nemo_rl/data/datasets/preference_datasets/tulu3.py).
+
+**Note:** The `task_name` field is required in each formatted example.
+
 ```json
 {
   "context": [], // list of dicts - The prompt message (including previous turns, if any)
@@ -46,10 +52,10 @@ Each DPO dataset class is expected to have the following attributes:
       "rank": 1, // int — The rank of the completion (lower rank is preferred)
       "completion": [] // list of dicts — The completion message(s)
     }
-  ]
+  ],
+  "task_name": "task_name" // identifier for the task
 }
 ```
-2. `task_name`: The unique task identifier for this dataset. This should specify the name you choose for this dataset.
 
 DPO training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```json
@@ -87,7 +93,8 @@ DPO training supports only two completions (where the lowest rank is preferred a
                 }
             ]
         }
-    ]
+    ],
+    "task_name": "task_name"
 }
 ```
 
@@ -102,6 +109,7 @@ data:
   train:
     # this dataset will override prompt_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
   validation:
     # this dataset will use the default values for other vars except data_path
@@ -146,6 +154,7 @@ data:
     # this dataset will override prompt_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     prompt_key: context
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
   validation:
     # this dataset will use the default values for other vars except data_path

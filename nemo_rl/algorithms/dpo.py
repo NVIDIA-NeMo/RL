@@ -23,7 +23,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.loss_functions import DPOLossFn
+from nemo_rl.algorithms.loss import DPOLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
@@ -385,6 +385,7 @@ def validate_one_dataset(
 
         val_metrics = defaultdict(list)
         num_valid_batches = 0
+        policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
