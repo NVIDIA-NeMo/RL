@@ -1,7 +1,9 @@
-# Self‑Distillation Algorithm Configuration
+# Best-of-N Self-Distillation Configuration
+# Samples N rollouts per prompt; uses a correct rollout as teacher COT.
+# Falls back to offline trace (deepseek_reasoning + ground_truth_solution) when all N fail.
 distillation:
   num_prompts_per_step: 2
-  num_generations_per_prompt: 1
+  num_generations_per_prompt: 4   # N for best-of-N selection
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 10
@@ -26,7 +28,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/self-distillation-${policy.model_name}"
+  checkpoint_dir: "checkpoints/self-distillation-bon-${policy.model_name}"
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
@@ -39,10 +41,10 @@ policy: &POLICY_BASE
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${..model_name}
-    chat_template_kwargs: null # for now dont use thinking template because the <think> tags messes with teacher prompt format 
-  train_global_batch_size: 2
+    chat_template_kwargs: null # for now dont use thinking template because the <think> tags messes with teacher prompt format
+  train_global_batch_size: 8   # num_prompts_per_step * num_generations_per_prompt
   train_micro_batch_size: 1
-  generation_batch_size: 2
+  generation_batch_size: 8
   logprob_batch_size: 1
   max_total_sequence_length: 16384
   precision: "bfloat16"
@@ -64,8 +66,6 @@ policy: &POLICY_BASE
       dim: 64
       alpha: 128
       match_all_linear: true
-      # target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-      # exclude_modules: []
       dropout: 0.0
       dropout_position: "post"
       lora_A_init: "xavier"
@@ -203,7 +203,7 @@ policy: &POLICY_BASE
         gpus_per_node: null
         num_nodes: null
 
-# No separate teacher block for self‑distillation
+# No separate teacher block for self-distillation
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -216,7 +216,6 @@ data:
   validation:
     dataset_name: AIME2024
     repeat: 8
-    # repeat: 1
     # split: "train"  # or "validation" if you have one
   default:
     prompt_file: "examples/prompts/cot.txt"
@@ -228,7 +227,7 @@ env:
     num_workers: 8
 
 logger:
-  log_dir: "logs/self-distillation"
+  log_dir: "logs/self-distillation-best-of-n"
   num_val_samples_to_print: 5
   wandb_enabled: true
   tensorboard_enabled: true
@@ -237,15 +236,15 @@ logger:
   monitor_gpus: true
   wandb:
     project: "nemo-distillation"
-    name: "self-distillation-${data.train.dataset_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    name: "self-distillation-bon-${data.train.dataset_name}-${policy.model_name}-${loss_fn.kl_type}-N${distillation.num_generations_per_prompt}"
   swanlab:
     project: "nemo-distillation"
-    name: "self-distillation-${data.train.dataset_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    name: "self-distillation-bon-${data.train.dataset_name}-${policy.model_name}-${loss_fn.kl_type}-N${distillation.num_generations_per_prompt}"
   tensorboard:
-    log_dir: "tb_logs-self-distillation-${data.train.dataset_name}"
+    log_dir: "tb_logs-self-distillation-bon-${data.train.dataset_name}"
   mlflow:
     experiment_name: "distillation-dev"
-    run_name: "self-distillation-math-cl-logger"
+    run_name: "self-distillation-bon-math-cl-logger"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

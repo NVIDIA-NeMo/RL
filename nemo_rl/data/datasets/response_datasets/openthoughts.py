@@ -46,6 +46,10 @@ class OpenThoughtsDataset(RawDataset):
         ground_truth_solution = data.get("Answer")
         deepseek_reasoning = data.get("COT_Reason")
 
+        # inject teacher prompt creation here 
+
+        
+
         assistant_answer = ground_truth_solution or ""
 
         return {
