@@ -38,6 +38,8 @@ from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
 
+pytestmark = pytest.mark.mcore
+
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
     "ratio_clip_max": 0.2,
