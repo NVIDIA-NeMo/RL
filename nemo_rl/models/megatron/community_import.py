@@ -105,7 +105,16 @@ def import_model_from_hf_name(
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
-    model_provider.initialize_model_parallel(seed=0)
+
+    from megatron.core import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        model_provider.initialize_model_parallel(seed=0)
+    else:
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+        model_parallel_cuda_manual_seed(0)
+
     megatron_model = model_provider.provide_distributed_model(
         wrap_with_ddp=False,
         post_wrap_hook=model_post_wrap_hook,

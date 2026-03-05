@@ -24,7 +24,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
