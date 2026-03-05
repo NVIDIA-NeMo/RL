@@ -83,13 +83,6 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
-            if self.ep_size != self.tp_size:
-                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
-                assert not self.cfg["vllm_cfg"]["async_engine"], (
-                    "vLLM async_engine has some issues when using DP inside vLLM. "
-                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
-                )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
@@ -181,10 +174,21 @@ class VllmGeneration(GenerationInterface):
                 "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
                 "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
             )
-        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.ep_size > self.tp_size:
-            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
+        # Use Ray-level DP (multiple independent workers) instead of vLLM internal DP
+        # when async_engine=true with DP>1 and EP>1, to avoid NCCL collective deadlocks.
+        self.use_ray_level_dp = (
+            self.dp_size > 1
+            and self.ep_size > 1
+            and self.cfg["vllm_cfg"]["async_engine"]
+        )
+
+        if self.use_ray_level_dp:
+            print(
+                f"INFO: Using Ray-level DP with {self.dp_size} independent workers (async engine with DP={self.dp_size}, EP={self.ep_size})"
+            )
+            self.vllm_dp_size = 1
+
+        env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
