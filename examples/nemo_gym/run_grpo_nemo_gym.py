@@ -43,6 +43,8 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
     setup_nemo_gym_config,
 )
 from nemo_rl.environments.utils import create_env
@@ -207,10 +209,17 @@ The validation set you pass in will directly be used for validation with no addi
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
+    nemo_gym_dict = config["env"]["nemo_gym"]
+    uv_cache_dir = get_nemo_gym_uv_cache_dir()
+    if uv_cache_dir is not None:
+        nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+    uv_venv_dir = get_nemo_gym_venv_dir()
+    if uv_venv_dir is not None:
+        nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
     nemo_gym_config = NemoGymConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["nemo_gym"],
+        initial_global_config_dict=nemo_gym_dict,
     )
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up

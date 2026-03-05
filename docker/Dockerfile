@@ -15,11 +15,22 @@
 # Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+#
+# Custom setup (override the default apptainer install):
+#   docker buildx build --build-context custom-setup=my-setup-dir/ --build-arg CUSTOM_SETUP_FNAME=my_script.sh -f docker/Dockerfile ...
+#
+# To skip custom setup entirely:
+#   docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# Default custom-setup stage: installs apptainer.
+# Override with: --build-context custom-setup=<your-dir>
+FROM scratch AS custom-setup
+COPY docker/install_apptainer.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -83,7 +94,7 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-
+ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 
 FROM base AS hermetic
 
@@ -105,6 +116,9 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+# Config paths (relative to repo root) whose NeMo Gym venvs should be prefetched.
+# Override to prefetch venvs for different configs, or set to empty to skip.
+ARG NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml examples/nemo_gym/grpo_nanov3.yaml"
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -112,23 +126,22 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
-# First copy only the dependency files
-COPY --from=nemo-rl pyproject.toml uv.lock ./
-# Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
-COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
-COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
-COPY --from=nemo-rl --link research/ ./research/
-COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
+# Copy in source from build context (defaults to cloned repo, can be overridden)
+COPY --from=nemo-rl . /opt/nemo-rl
+# Unshallow the repo to get the full history (in the case it was from the scratch layer).
+# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
+# so do a quick check before trying to unshallow.
+RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
+# The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
+    UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
+    UV_LINK_MODE=hardlink bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -136,17 +149,44 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
-uv sync --link-mode symlink --locked --no-install-project
+# The venv uses hardlinks to avoid bloating the layer size
+UV_LINK_MODE=hardlink uv sync --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra mcore --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra automodel --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --all-groups --no-install-project
+
+# Prefetch NeMo Gym internal venvs (for gym servers like code_gen, math, etc.)
+if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    # Infer the index from RL's pyproject.toml. This ensures all venv creation that needs torch will use the RL prescribed version for consistency since RL dictates the container CUDA version.
+    UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
+    UV_LINK_MODE=hardlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+fi
+
+# Remove /tmp/ray because the previous script starts up a local ray cluster which creates a session
+# that we can just clean up.
+rm -rf /tmp/ray
+
+NEGATIVE_FILTERS=""
+if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
+fi
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+fi
+if [[ -n "$NEGATIVE_FILTERS" ]]; then
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+else
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py
+fi
+
+# Prune unreachable cache entries
+uv cache prune
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -156,13 +196,23 @@ EOF
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
+# Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
+# To skip: --build-arg CUSTOM_SETUP_FNAME=
+ARG CUSTOM_SETUP_FNAME=install_apptainer.sh
+RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup <<"EOF" bash -exu
+if [[ -z "${CUSTOM_SETUP_FNAME}" ]]; then
+    echo "CUSTOM_SETUP_FNAME is empty, skipping custom setup"
+    exit 0
+fi
+cp /tmp/custom-setup/${CUSTOM_SETUP_FNAME} /opt/${CUSTOM_SETUP_FNAME}
+bash -x /opt/${CUSTOM_SETUP_FNAME}
+EOF
+
 WORKDIR /opt/nemo-rl
 
 FROM hermetic AS release
 
 # Re-declare build args for this stage
-ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -173,30 +223,6 @@ ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
-
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-
-# Copy in source from build context (defaults to cloned repo, can be overridden)
-# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
-# Unshallow the repo to get the full history (in the case it was from the scratch layer).
-# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
-# so do a quick check before trying to unshallow.
-RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
-NEGATIVE_FILTERS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
-fi
-if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
-else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
-EOF
 
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
