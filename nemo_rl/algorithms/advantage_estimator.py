@@ -37,20 +37,26 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
-    def compute_advantage(self, repeated_batch, mask, **kwargs):
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        repeated_batch,
+        mask,
+        **kwargs,
+    ):
         """Compute GRPO advantages.
 
         Args:
-            repeated_batch: Batch containing _input_ids_for_baseline and total_reward.
+            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            repeated_batch: Batch (unused; for interface consistency).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
-                  Used only for expanding advantages to token-level shape.
             **kwargs: Additional arguments (unused).
 
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        prompt_ids = repeated_batch["_input_ids_for_baseline"]
-        rewards = repeated_batch["total_reward"]
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
@@ -80,13 +86,21 @@ class GDPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
-    def compute_advantage(self, repeated_batch, mask, **kwargs):
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        repeated_batch,
+        mask,
+        **kwargs,
+    ):
         """Compute GDPO advantages.
 
         Args:
+            prompt_ids: Unused; for interface consistency.
+            rewards: Unused; for interface consistency.
             repeated_batch: Batch containing _input_ids_for_baseline and reward1, reward2, ... keys.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
-                  Used only for expanding advantages to token-level shape.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -153,23 +167,30 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.kl_coef = loss_config["reference_policy_kl_penalty"]
         self.kl_type = loss_config["reference_policy_kl_type"]
 
-    def compute_advantage(self, repeated_batch, mask, logprobs_policy=None, logprobs_reference=None, **kwargs):
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        repeated_batch,
+        mask,
+        logprobs_policy=None,
+        logprobs_reference=None,
+        **kwargs,
+    ):
         """Compute Reinforce++ advantages with optional KL penalty.
 
         Args:
-            repeated_batch: Batch containing _input_ids_for_baseline and total_reward.
+            prompt_ids: Tensor identifying which prompt each sample belongs to (for baseline).
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            repeated_batch: Unused; for interface consistency.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
-                  Used for: (1) expanding advantages to token-level shape, (2) global normalization
-                  that only considers valid tokens.
-            logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
-            logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
+            logprobs_policy: Policy log probabilities, required if use_kl_in_reward.
+            logprobs_reference: Reference policy log probabilities, required if use_kl_in_reward.
             **kwargs: Additional arguments (unused).
 
         Returns:
             Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
         """
-        prompt_ids = repeated_batch["_input_ids_for_baseline"]
-        rewards = repeated_batch["total_reward"]
         # minus baseline
         if self.minus_baseline:
             mean, _ = calculate_baseline_and_std_per_prompt(

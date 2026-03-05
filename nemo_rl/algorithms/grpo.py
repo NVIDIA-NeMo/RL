@@ -1795,6 +1795,8 @@ def grpo_train(
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
                         repeated_batch=repeated_batch,
                         mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],
@@ -2827,6 +2829,8 @@ def async_grpo_train(
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=rewards,
                         repeated_batch=repeated_batch,
                         mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],

@@ -328,8 +328,14 @@ def calculate_rewards(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
     # Stack rewards: each element may be scalar (single-reward env) or 1d (multi-reward env).
-    # torch.stack preserves shape: scalars -> (N,), shape (K,) -> (N, K).
-    rewards = torch.stack([all_rewards[i] for i in sorted_indices])
+    # Envs may return Python floats or tensors; ensure tensors for torch.stack.
+    # Handle empty batch (torch.stack requires non-empty list).
+    if not sorted_indices:
+        rewards = torch.tensor([], dtype=torch.float32)
+    else:
+        rewards = torch.stack(
+            [torch.as_tensor(all_rewards[i]) for i in sorted_indices]
+        )
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
@@ -476,7 +482,7 @@ def run_multi_turn_rollout(
                 number_of_rewards = 1
                 # multi_rewards left None: GRPO uses total_reward only; reward1 unused
         # Accumulate rewards: env may return shape (N,) or (N, K)
-        if env_output.rewards.ndim >= 2:
+        if number_of_rewards > 1:
             multi_rewards[active_indices] += env_output.rewards
             total_rewards[active_indices] += env_output.rewards.sum(dim=1)
         else:
