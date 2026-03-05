@@ -68,7 +68,6 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
-    apply_torch_aten_alias_tensor_patch,
     apply_transformer_engine_patch,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -214,8 +213,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         """Initialize the DTensorPolicyWorkerV2."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
 
         # Store configuration
         self.cfg = config
