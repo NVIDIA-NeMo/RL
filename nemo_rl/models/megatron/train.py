@@ -31,6 +31,7 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss import (
     SequencePackingLossWrapper,
+    SpecDecLossWrapper,
     prepare_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
@@ -44,6 +45,7 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.specdec.hidden_capture import get_capture_context
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -132,6 +134,8 @@ def forward_with_post_processing_fn(
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    specdec_model: Optional[torch.nn.Module] = None,
+    specdec_config: Optional[dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -166,16 +170,26 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
-    output_tensor = model_forward(
-        model=model,
-        data_dict=data_dict,
-        cfg=cfg,
-        input_ids_cp_sharded=input_ids_cp_sharded,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        packed_seq_params=packed_seq_params,
-        defer_fp32_logits=defer_fp32_logits,
-        straggler_timer=straggler_timer,
+    capture_context, capture = get_capture_context(model, specdec_config)
+    with capture_context:
+        output_tensor = model_forward(
+            model=model,
+            data_dict=data_dict,
+            cfg=cfg,
+            input_ids_cp_sharded=input_ids_cp_sharded,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+            defer_fp32_logits=defer_fp32_logits,
+            straggler_timer=straggler_timer,
+        )
+
+    captured_states = capture.get_captured_states() if capture is not None else None
+    captured_aux_hidden_states = (
+        captured_states.hidden_states if captured_states is not None else None
+    )
+    captured_input_embeds = (
+        captured_states.inputs_embeds if captured_states is not None else None
     )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -193,6 +207,10 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            captured_aux_hidden_states=captured_aux_hidden_states,
+            captured_input_embeds=captured_input_embeds,
+            specdec_model=specdec_model,
+            specdec_config=specdec_config,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -226,6 +244,8 @@ def megatron_forward_backward(
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    specdec_model: Optional[torch.nn.Module] = None,
+    specdec_config: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -258,6 +278,8 @@ def megatron_forward_backward(
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
         straggler_timer=straggler_timer,
+        specdec_model=specdec_model,
+        specdec_config=specdec_config,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -291,6 +313,10 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        captured_aux_hidden_states: Optional[torch.Tensor] = None,
+        captured_input_embeds: Optional[torch.Tensor] = None,
+        specdec_model: Optional[torch.nn.Module] = None,
+        specdec_config: Optional[dict[str, Any]] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -324,6 +350,35 @@ class LossPostProcessor:
                 wrap_loss_fn_with_input_preparation,
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input,
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+            )
+
+        if (
+            specdec_model is not None
+            and specdec_config is not None
+            and specdec_config.get("enabled", False)
+            and captured_aux_hidden_states is not None
+            and captured_input_embeds is not None
+        ):
+            loss_fn_wrapped = SpecDecLossWrapper(
+                loss_fn=loss_fn_wrapped,
+                specdec_model=specdec_model,
+                captured_aux_hidden_states=captured_aux_hidden_states,
+                captured_input_embeds=captured_input_embeds,
+                loss_weight=float(specdec_config.get("loss_weight", 1.0)),
+                kl_topk=int(specdec_config.get("kl_topk", 128)),
+                cu_seqlens_q=(
+                    packed_seq_params.cu_seqlens_q
+                    if pack_sequences and packed_seq_params is not None
+                    else None
+                ),
+                cu_seqlens_q_padded=(
+                    packed_seq_params.cu_seqlens_q_padded
+                    if pack_sequences and packed_seq_params is not None
+                    else None
+                ),
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
