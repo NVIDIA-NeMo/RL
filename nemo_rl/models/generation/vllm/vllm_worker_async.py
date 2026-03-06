@@ -18,6 +18,7 @@ import gc
 import threading
 import time
 import uuid
+import warnings
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -153,10 +154,27 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
-        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
+        # Workaround: convert compilation_config dict to CompilationConfig object
+        # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
         if llm_kwargs.get("compilation_config", None):
+            compilation_config = dict(llm_kwargs["compilation_config"])
+            # use_inductor was removed in vLLM v0.12+ (https://github.com/vllm-project/vllm/pull/29323)
+            # and replaced by the `backend` field: use_inductor=True -> backend="" (inductor),
+            # use_inductor=False -> backend="eager".
+            if "use_inductor" in compilation_config:
+                use_inductor = compilation_config.pop("use_inductor")
+                if "backend" not in compilation_config:
+                    compilation_config["backend"] = "" if use_inductor else "eager"
+                warnings.warn(
+                    "compilation_config.use_inductor is deprecated in vLLM v0.12+. "
+                    "Use compilation_config.backend instead: "
+                    "use_inductor=True -> backend='inductor', "
+                    "use_inductor=False -> backend='eager'.",
+                    DeprecationWarning,
+                    stacklevel=1,
+                )
             llm_kwargs["compilation_config"] = CompilationConfig(
-                **llm_kwargs["compilation_config"]
+                **compilation_config
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
