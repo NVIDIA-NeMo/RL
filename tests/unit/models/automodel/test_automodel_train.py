@@ -96,7 +96,7 @@ def base_cfg():
     return {
         "dtensor_cfg": {"sequence_parallel": False},
         "sequence_packing": {"train_mb_tokens": 256},
-        "generation": {"temperature": 1.0},
+        "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
 
 
