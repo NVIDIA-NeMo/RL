@@ -32,7 +32,7 @@ setup_cluster_config() {
     if [[ -z "${CONTAINER:-}" ]]; then
         if [[ "$GPUS_PER_NODE" -eq 8 ]]; then
             # H100 cluster
-            CONTAINER="/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_super/users/sna/fused_attn_debug/RL/nemo_rl_nightly.sqsh"
+            CONTAINER="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly.sqsh"
             CLUSTER_TYPE="H100"
         else
             # GB200 cluster (4 GPUs per node)

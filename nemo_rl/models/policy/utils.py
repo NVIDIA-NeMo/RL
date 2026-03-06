@@ -270,6 +270,23 @@ def configure_dynamo_cache() -> None:
     torch._inductor.config.autotune_local_cache = False
 
 
+def _get_pip_cudnn_lib_path() -> str | None:
+    """Return the lib/ directory of the pip-installed nvidia-cudnn-cu12 package, if present."""
+    try:
+        import importlib
+
+        spec = importlib.util.find_spec("nvidia.cudnn")
+        if spec and spec.submodule_search_locations:
+            import pathlib
+
+            lib_dir = pathlib.Path(list(spec.submodule_search_locations)[0]) / "lib"
+            if lib_dir.is_dir():
+                return str(lib_dir)
+    except Exception:
+        pass
+    return None
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
@@ -279,6 +296,9 @@ def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]
     Propagates CUDNN_HOME and LD_LIBRARY_PATH from the driver so that transformer_engine
     in Ray workers loads the same cuDNN as the head (avoids undefined symbol errors with
     libcudnn_graph.so.9 when TE and system cuDNN versions differ).
+
+    When nvidia-cudnn-cu12 is installed via pip, its lib/ path is prepended to
+    LD_LIBRARY_PATH so the pip version takes precedence over the container's system cuDNN.
     """
     runtime_env: dict[str, Any] = {
         **get_nsight_config_if_pattern_matches(policy_worker_name),
@@ -288,6 +308,13 @@ def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]
         val = os.environ.get(key)
         if val:
             env_vars[key] = val
+
+    pip_cudnn = _get_pip_cudnn_lib_path()
+    if pip_cudnn:
+        ld_path = env_vars.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
+        if pip_cudnn not in ld_path:
+            env_vars["LD_LIBRARY_PATH"] = f"{pip_cudnn}:{ld_path}" if ld_path else pip_cudnn
+
     if env_vars:
         runtime_env["env_vars"] = env_vars
     return runtime_env
