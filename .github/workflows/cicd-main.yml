@@ -126,7 +126,7 @@ jobs:
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
   org-member-pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@fd82c6b23b5987d226f00d0719560f6e91210021
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.78.0
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -237,7 +237,7 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
     needs: [pre-flight, org-member-pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@44284233576b11eb867ae55ac41fb291debc414d
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
     with:
       build-ref: ${{ github.sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
