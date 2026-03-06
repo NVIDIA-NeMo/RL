@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
@@ -647,6 +647,127 @@ def _create_megatron_config(
     )
 
 
+def get_specdec_model(
+    model: list[MegatronModule],
+    specdec_config: dict[str, Any],
+    ddp_config: DistributedDataParallelConfig,
+    use_torch_fsdp2: bool = False,
+    overlap_param_gather_with_optimizer_step: bool = False,
+    data_parallel_random_init: bool = True,
+    mixed_precision_wrapper: Callable | None = Float16Module,
+    pg_collection: ProcessGroupCollection = None,
+) -> MegatronModule | None:
+    """Build and wrap an Eagle draft model for online specdec training."""
+    if not specdec_config.get("enabled", False):
+        return None
+
+    from pathlib import Path
+
+    from megatron.bridge.models.model_provider import _ddp_wrap
+    from megatron.core import tensor_parallel
+    from megatron.core.parallel_state import is_pipeline_last_stage
+    from megatron.core.utils import get_model_config
+    from transformers import AutoConfig
+
+    from nemo_rl.models.specdec.llama_eagle3 import (
+        Eagle3ForCausalLM,
+        create_config_from_hf,
+        load_hf_weights_to_eagle,
+    )
+
+    if not is_pipeline_last_stage():
+        return None
+
+    draft_model_path = specdec_config.get("draft_model_path")
+    draft_state_dict = None
+
+    if draft_model_path:
+        hf_config = AutoConfig.from_pretrained(draft_model_path)
+        eagle_config = create_config_from_hf(
+            hf_config,
+            tensor_model_parallel_size=model[0].config.tensor_model_parallel_size,
+            context_parallel_size=model[0].config.context_parallel_size,
+            sequence_parallel=model[0].config.sequence_parallel,
+        )
+
+        local_path = Path(draft_model_path)
+        if (local_path / "model.safetensors").exists():
+            from safetensors.torch import load_file as load_safetensors
+
+            draft_state_dict = load_safetensors(str(local_path / "model.safetensors"))
+        elif (local_path / "pytorch_model.bin").exists():
+            draft_state_dict = torch.load(
+                str(local_path / "pytorch_model.bin"),
+                map_location="cpu",
+                weights_only=True,
+            )
+        else:
+            from huggingface_hub import hf_hub_download
+
+            try:
+                from safetensors.torch import load_file as load_safetensors
+
+                draft_checkpoint_path = hf_hub_download(
+                    draft_model_path, "model.safetensors"
+                )
+                draft_state_dict = load_safetensors(draft_checkpoint_path)
+            except Exception:
+                draft_checkpoint_path = hf_hub_download(
+                    draft_model_path, "pytorch_model.bin"
+                )
+                draft_state_dict = torch.load(
+                    draft_checkpoint_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+    else:
+        eagle_config = model[0].config
+
+    draft_model = Eagle3ForCausalLM.from_config(
+        config=eagle_config,
+        num_layers=int(specdec_config.get("num_layers", 1)),
+    )
+
+    if draft_state_dict is not None:
+        missing_keys, unexpected_keys = load_hf_weights_to_eagle(
+            draft_model,
+            draft_state_dict,
+            eagle_config,
+        )
+        if missing_keys:
+            print(f"[specdec] Missing keys after draft load: {missing_keys}")
+        if unexpected_keys:
+            print(f"[specdec] Unexpected keys after draft load: {unexpected_keys}")
+
+    for parameter in draft_model.parameters():
+        tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
+            parameter
+        )
+
+    draft_model_config = get_model_config(draft_model)
+    if (
+        not use_torch_fsdp2
+        and not draft_model_config.use_cpu_initialization
+        and not getattr(draft_model_config, "init_model_with_meta_device", False)
+    ):
+        draft_model.cuda(torch.cuda.current_device())
+
+    if (
+        draft_model_config.fp16 or draft_model_config.bf16
+    ) and mixed_precision_wrapper is not None:
+        draft_model = mixed_precision_wrapper(draft_model_config, draft_model)
+
+    wrapped_draft_model = _ddp_wrap(
+        [draft_model],
+        data_parallel_random_init,
+        ddp_config,
+        overlap_param_gather_with_optimizer_step,
+        use_torch_fsdp2=use_torch_fsdp2,
+        pg_collection=pg_collection,
+    )
+    return wrapped_draft_model[0]
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -784,11 +905,26 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
     )
+
+    specdec_model = get_specdec_model(
+        model=model,
+        specdec_config=policy_cfg.get("specdec", {}),
+        ddp_config=megatron_cfg.ddp,
+        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
+    )
+
+    models_for_optimizer = model + (
+        [specdec_model] if specdec_model is not None else []
+    )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
-            model=model,
+            model=models_for_optimizer,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
         )
     else:
@@ -818,9 +954,17 @@ def setup_model_and_optimizer(
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
+        if (
+            specdec_model is not None
+            and megatron_cfg.checkpoint.load is not None
+            and checkpoint_exists(megatron_cfg.checkpoint.load)
+        ):
+            models_for_load = model + [specdec_model]
+        else:
+            models_for_load = model
         load_checkpoint(
             state,
-            model,
+            models_for_load,
             optimizer,
             scheduler,
             checkpointing_context=checkpointing_context,
@@ -846,6 +990,7 @@ def setup_model_and_optimizer(
         scheduler,
         checkpointing_context,
         param_sync_func,
+        specdec_model=specdec_model,
     )
 
 
