@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import glob
 import importlib
 import os
 import time
@@ -450,6 +451,23 @@ class RayWorkerGroup:
         else:
             py_executable = actor_python_env
 
+        # Detect pip-installed cuDNN in the worker venv so workers load 9.19+
+        # instead of the container's system cuDNN 9.10.x
+        _worker_cudnn_lib = None
+        venv_root = os.path.dirname(os.path.dirname(py_executable))
+        _candidates = glob.glob(
+            os.path.join(venv_root, "lib", "python*", "site-packages", "nvidia", "cudnn", "lib")
+        )
+        if _candidates and os.path.isdir(_candidates[0]):
+            _worker_cudnn_lib = _candidates[0]
+            so9 = os.path.join(_worker_cudnn_lib, "libcudnn.so.9")
+            so_unversioned = os.path.join(_worker_cudnn_lib, "libcudnn.so")
+            if os.path.exists(so9) and not os.path.exists(so_unversioned):
+                try:
+                    os.symlink("libcudnn.so.9", so_unversioned)
+                except OSError:
+                    pass
+
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
         global_rank = 0
@@ -533,6 +551,13 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+
+                if _worker_cudnn_lib:
+                    ld_path = runtime_env["env_vars"].get("LD_LIBRARY_PATH", "")
+                    if _worker_cudnn_lib not in ld_path:
+                        runtime_env["env_vars"]["LD_LIBRARY_PATH"] = (
+                            f"{_worker_cudnn_lib}:{ld_path}" if ld_path else _worker_cudnn_lib
+                        )
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
