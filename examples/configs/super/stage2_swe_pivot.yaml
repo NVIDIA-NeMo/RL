@@ -290,7 +290,7 @@ env:
     port_range_high: 20000
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
 
 logger:
   log_dir: "logs"
