@@ -118,6 +118,7 @@ mcore = [
   "flash-attn==2.8.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
+modelopt = ["nvidia-modelopt"]
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
@@ -188,6 +189,7 @@ causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
+nvidia-modelopt = { path = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/mxin/qwq-32b/sources/modelopt_nemo_rl/TensorRT-Model-Optimizer", editable = true }
 
 [tool.uv.workspace]
 members = [
@@ -252,7 +254,12 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
+  # megatron-bridge bumped to transformers>=5.0.0, but nemo-rl and nemo-automodel need 4.x
+  "transformers==4.57.1",
+  # torchvision needs to match torch 2.9.0
+  "torchvision==0.24.0",
 ]
+
 # CVE fixes
 constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484

@@ -194,10 +194,7 @@ def get_train_context(
         yield
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
-class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
+class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -1127,3 +1124,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+    pass
