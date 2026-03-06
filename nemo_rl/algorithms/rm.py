@@ -318,7 +318,7 @@ def validate_one_dataset(
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
-    timer = Timer()
+    timer = Timer(context={"worker": "rm_validator"})
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
@@ -435,7 +435,7 @@ def rm_train(
     rm_save_state,
 ):
     # Run basic rm training
-    timer = Timer()
+    timer = Timer(context={"worker": "rm_driver"})
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
         fit_last_save_time=True,
