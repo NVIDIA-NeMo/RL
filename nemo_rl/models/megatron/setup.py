@@ -931,7 +931,8 @@ def setup_reference_model_state(
     # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
     # so they only need to be loaded here if use_peft is False
     should_load_checkpoint = (
-        not use_peft and ref_checkpoint_config.pretrained_checkpoint is not None
+        not use_peft 
+        and ref_checkpoint_config.pretrained_checkpoint is not None
         and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
     )
 
