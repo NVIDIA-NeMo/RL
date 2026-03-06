@@ -31,6 +31,7 @@ from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
+    _maybe_set_force_hf,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -2013,3 +2014,93 @@ class TestGetTokenizer:
             mock_hf.from_pretrained.assert_not_called()
 
         mock_nemo_auto_tokenizer.from_pretrained.assert_called_once()
+
+
+class TestMaybeSetForceHf:
+    """Tests for _maybe_set_force_hf adapter compatibility check."""
+
+    def _make_config(self, arch):
+        """Create a mock model config with the given architecture."""
+        config = Mock()
+        config.architectures = [arch]
+        return config
+
+    def test_force_hf_true_skips_check(self):
+        """When force_hf=True, no check is needed."""
+        kwargs = {"force_hf": True}
+        config = self._make_config("Qwen2ForCausalLM")
+        _maybe_set_force_hf(kwargs, config)
+        assert kwargs["force_hf"] is True
+
+    def test_unknown_arch_skips_check(self):
+        """When arch is not in the registry, no adapter is involved."""
+        kwargs = {}
+        config = self._make_config("SomeUnknownModelForCausalLM")
+        _maybe_set_force_hf(kwargs, config)
+        assert "force_hf" not in kwargs
+
+    def test_no_architectures_skips_check(self):
+        """When model config has no architectures, skip check."""
+        kwargs = {}
+        config = Mock()
+        config.architectures = None
+        _maybe_set_force_hf(kwargs, config)
+        assert "force_hf" not in kwargs
+
+    def test_qwen2_auto_sets_force_hf(self):
+        """Qwen2's CombinedProjectionStateDictAdapter lacks convert_single_tensor_to_hf,
+        so force_hf should be auto-set when not explicitly configured."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
+            pytest.skip("Qwen2ForCausalLM not in registry")
+
+        kwargs = {}
+        config = self._make_config("Qwen2ForCausalLM")
+        _maybe_set_force_hf(kwargs, config)
+        assert kwargs.get("force_hf") is True
+
+    def test_llama_auto_sets_force_hf(self):
+        """Llama also uses CombinedProjectionStateDictAdapter."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        if "LlamaForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
+            pytest.skip("LlamaForCausalLM not in registry")
+
+        kwargs = {}
+        config = self._make_config("LlamaForCausalLM")
+        _maybe_set_force_hf(kwargs, config)
+        assert kwargs.get("force_hf") is True
+
+    def test_qwen2_explicit_false_raises(self):
+        """When force_hf is explicitly False and adapter is incompatible, raise."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
+            pytest.skip("Qwen2ForCausalLM not in registry")
+
+        kwargs = {"force_hf": False}
+        config = self._make_config("Qwen2ForCausalLM")
+        with pytest.raises(RuntimeError, match="force_hf=False"):
+            _maybe_set_force_hf(kwargs, config)
+
+    def test_compatible_adapter_no_change(self):
+        """Models with adapters that implement convert_single_tensor_to_hf should
+        not have force_hf auto-set."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        # Find a model whose adapter has convert_single_tensor_to_hf
+        # (e.g. Qwen3Moe, NemotronH, DeepseekV3)
+        compatible_archs = ["Qwen3MoeForCausalLM", "NemotronHForCausalLM", "DeepseekV3ForCausalLM"]
+        arch = None
+        for a in compatible_archs:
+            if a in ModelRegistry.model_arch_name_to_cls:
+                arch = a
+                break
+        if arch is None:
+            pytest.skip("No compatible model arch found in registry")
+
+        kwargs = {}
+        config = self._make_config(arch)
+        _maybe_set_force_hf(kwargs, config)
+        assert "force_hf" not in kwargs
