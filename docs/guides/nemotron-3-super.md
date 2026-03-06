@@ -126,6 +126,17 @@ bash super_launch.sh
 ```
 
 ### Stage 2 - SWE 2 (64 nodes)
+#### Download Apptainer images for SWE stage
+
+```bash
+uv run --with datasets examples/nemo_gym/download_swe_images.py --sif-dir /path/to/sif --concurrency 16
+
+# Update container formatter in examples/configs/super/stage2_swe2.yaml
+container_formatter:
+  - "/path/to/sif/r2egym_{instance_id}.sif"
+  - "/path/to/sif/swegym_sweb.eval.x86_64.{instance_id}.sif"
+  - "/path/to/sif/swebench_sweb.eval.x86_64.{instance_id}.sif"
+```
 ```bash
 EXP_NAME=stage2.2-swe2 \
 CONFIG_PATH=examples/configs/super/stage2_swe2.yaml \
