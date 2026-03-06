@@ -552,6 +552,23 @@ def setup_model_and_optimizer(
 
     print(model)
 
+    # Validate that the model's state_dict_adapter supports per-tensor HF conversion,
+    # which is required for LoRA weight syncing. Custom model implementations that use
+    # CombinedProjectionStateDictAdapter (e.g. Qwen2, Llama) may not implement this yet.
+    # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
+    adapter = getattr(model, "state_dict_adapter", None)
+    if adapter is not None and getattr(
+        getattr(adapter, "convert_single_tensor_to_hf", None), "__isabstractmethod__", False
+    ):
+        raise RuntimeError(
+            f"The custom model implementation for {model_config.architectures[0]} has a "
+            f"state_dict_adapter ({type(adapter).__name__}) that does not implement "
+            f"'convert_single_tensor_to_hf', which is required for weight syncing. "
+            f"Please set `policy.dtensor_cfg.automodel_kwargs.force_hf=true` to use the "
+            f"HuggingFace model implementation instead. "
+            f"See https://github.com/NVIDIA-NeMo/RL/issues/2072 for details."
+        )
+
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
