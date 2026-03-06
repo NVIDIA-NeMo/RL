@@ -97,9 +97,9 @@ class GDPOAdvantageEstimator:
         """Compute GDPO advantages.
 
         Args:
-            prompt_ids: Unused; for interface consistency.
+            prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
-            repeated_batch: Batch containing _input_ids_for_baseline and reward1, reward2, ... keys.
+            repeated_batch: Batch containing reward1, reward2, ... keys.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -113,20 +113,17 @@ class GDPOAdvantageEstimator:
                 f"This batch has {len(reward_component_keys)} component(s). "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
-        current_input_ids = repeated_batch["_input_ids_for_baseline"]
-        valid = torch.ones_like(
-            repeated_batch[reward_component_keys[0]]
-        )
+        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
-        assert current_input_ids.shape[0] == valid.shape[0], (
-            "_input_ids_for_baseline must match reward batch size after dynamic_sampling; "
-            f"got {current_input_ids.shape[0]} vs {valid.shape[0]}"
+        assert prompt_ids.shape[0] == valid.shape[0], (
+            "prompt_ids must match reward batch size; "
+            f"got {prompt_ids.shape[0]} vs {valid.shape[0]}"
         )
         advantage_parts = []
         for key in reward_component_keys:
             r = repeated_batch[key]
             base, std_k = calculate_baseline_and_std_per_prompt(
-                current_input_ids,
+                prompt_ids,
                 r,
                 valid,
                 leave_one_out_baseline=leave_one_out,
