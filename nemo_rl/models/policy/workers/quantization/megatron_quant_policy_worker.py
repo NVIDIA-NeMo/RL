@@ -255,11 +255,34 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 module.enable()
 
     @contextmanager
+    def _hide_extra_state(self):
+        """Patch model.state_dict() to exclude _extra_state keys.
+
+        ModelOpt appends quantization calibration data (amax/scale) to TE's
+        serialized extra state, making it larger than the non-quantized
+        reference model's copy. These are calibration metadata, not learned
+        weights, and can also be resized by TE during forward passes.
+        Filtering them out lets the base class swap/restore skip them cleanly.
+        """
+        original_state_dict = self.model.state_dict
+
+        def filtered_state_dict(*args, **kwargs):
+            sd = original_state_dict(*args, **kwargs)
+            return {k: v for k, v in sd.items() if not k.endswith("._extra_state")}
+
+        try:
+            self.model.state_dict = filtered_state_dict
+            yield
+        finally:
+            self.model.state_dict = original_state_dict
+
+    @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model."""
         with (
             self.disable_quantization(),
             self.without_model_config(),
+            self._hide_extra_state(),
             super().use_reference_model(),
         ):
             yield

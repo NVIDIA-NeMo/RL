@@ -254,9 +254,11 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
+  # megatron-bridge bumped to transformers>=5.0.0, but nemo-rl and nemo-automodel need 4.x
+  "transformers==4.57.1",
+  # torchvision needs to match torch 2.9.0
+  "torchvision==0.24.0",
 ]
-# "onnx<1.19.0",
-#   "onnxscript<=0.2.7",
 
 # CVE fixes
 constraint-dependencies = [
