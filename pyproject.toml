@@ -252,9 +252,8 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
-  # TE 2.12.0 requires cuDNN 9.18+; without this, torch resolves to 9.10 which causes
-  # ABI mismatch (undefined symbol) when LD_LIBRARY_PATH has the 9.18 tarball cuDNN
-  "nvidia-cudnn-cu12>=9.18.0",
+  # pip-installed cuDNN: override torch's nvidia-cudnn-cu12==9.10.2.21 pin (ref: PR #1962)
+  "nvidia-cudnn-cu12==9.19.0.56",
 ]
 # CVE fixes
 constraint-dependencies = [
