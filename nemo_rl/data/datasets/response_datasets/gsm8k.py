@@ -33,7 +33,8 @@ class GSM8KDataset(RawDataset):
         extract_answer: Whether to extract the answer from the dataset, default is True
     """
 
-    def __init__(self,
+    def __init__(
+        self,
         split: str = "train",
         extract_answer: bool = True,
         system_prompt_file: str | None = None,
