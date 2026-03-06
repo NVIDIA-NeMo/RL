@@ -13,7 +13,6 @@
 # limitations under the License.
 import gc
 import os
-import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -29,8 +28,8 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
-    GRPOAdvantageEstimator,
     GDPOAdvantageEstimator,
+    GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss import (
@@ -45,10 +44,10 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
-    get_gdpo_reward_component_keys
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -971,9 +970,9 @@ def scale_rewards(
         # Clamp and scale
         def _scale(reward_tensor: torch.Tensor) -> torch.Tensor:
             r = torch.clamp(reward_tensor, min=source_min, max=source_max)
-            return target_min + (r - source_min) / (
-                source_max - source_min
-            ) * (target_max - target_min)
+            return target_min + (r - source_min) / (source_max - source_min) * (
+                target_max - target_min
+            )
 
         scaled_rewards = _scale(rewards)
         repeated_batch["total_reward"] = scaled_rewards

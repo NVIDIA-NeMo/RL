@@ -333,9 +333,7 @@ def calculate_rewards(
     if not sorted_indices:
         rewards = torch.tensor([], dtype=torch.float32)
     else:
-        rewards = torch.stack(
-            [torch.as_tensor(all_rewards[i]) for i in sorted_indices]
-        )
+        rewards = torch.stack([torch.as_tensor(all_rewards[i]) for i in sorted_indices])
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
@@ -480,15 +478,16 @@ def run_multi_turn_rollout(
                 )
             else:
                 number_of_rewards = 1
-                # multi_rewards left None: GRPO uses total_reward only; reward1 unused
+                # multi_rewards left None: GRPO uses total_reward only; multi_rewards unused
+
         # Accumulate rewards: env may return shape (N,) or (N, K)
         if number_of_rewards > 1:
+            # this assert is to infer the type of multi_rewards for pyrefly
+            assert multi_rewards is not None
             multi_rewards[active_indices] += env_output.rewards
             total_rewards[active_indices] += env_output.rewards.sum(dim=1)
         else:
             total_rewards[active_indices] += env_output.rewards
-
-        
 
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
@@ -700,7 +699,9 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
-    reward_acc_list: list[float] = []  # per-component rewards, length set on first multi-reward
+    reward_acc_list: list[
+        float
+    ] = []  # per-component rewards, length set on first multi-reward
     multi_reward_seen = False
     turn_count = 0
     token_count = 0

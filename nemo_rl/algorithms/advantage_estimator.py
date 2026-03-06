@@ -25,7 +25,12 @@ Reference papers:
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl, get_gdpo_reward_component_keys
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    calculate_kl,
+    get_gdpo_reward_component_keys,
+)
+
 
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
@@ -130,7 +135,6 @@ class GDPOAdvantageEstimator:
             )
             adv_k = (r - base).unsqueeze(-1)
             if self.normalize_rewards:
-
                 epsilon = 1e-6
                 non_zero_std_mask = std_k > 0
                 adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
@@ -138,7 +142,7 @@ class GDPOAdvantageEstimator:
                 )
 
             advantage_parts.append(adv_k)
-            
+
         advantages = sum(advantage_parts)
         # Normalize combined advantage to zero mean and unit std
         adv_std = advantages.std()

@@ -398,24 +398,26 @@ def math_gdpo_data_processor(
     message_list = []
     # system prompt
     if task_data_spec.system_prompt:
-        message_list.append({
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        })
+        message_list.append(
+            {
+                "role": "system",
+                "content": task_data_spec.system_prompt,
+            }
+        )
     # user prompt
     if task_data_spec.prompt:
         problem = task_data_spec.prompt.format(problem)
     message_list.append({"role": "user", "content": problem})
 
-    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
+    message: str = tokenizer.apply_chat_template(  # type: ignore
         message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    token_ids = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
 
     message_log: LLMMessageLogType = [
         {"role": "user", "content": message, "token_ids": token_ids}

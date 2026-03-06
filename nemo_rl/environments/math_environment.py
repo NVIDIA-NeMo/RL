@@ -251,7 +251,7 @@ class HFMultiRewardVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+    ) -> Union[list[list[float]], tuple[list[list[float]], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -263,6 +263,7 @@ class HFMultiRewardVerifyWorker:
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
+
         def extract_xml_answer(text: str) -> str:
             answer = text.split("<answer>")[-1]
             answer = answer.split("</answer>")[0]
@@ -280,10 +281,13 @@ class HFMultiRewardVerifyWorker:
             """Reward function that checks if the completion has a specific format."""
             rewards = []
             for response in completions:
-                
                 pattern = r"^<think>.*?</think>\n<answer>.*?</answer>$"
 
-                if re.search(pattern, response, re.DOTALL) and response.count("<answer>") == 1 and response.count("</answer>") == 1:
+                if (
+                    re.search(pattern, response, re.DOTALL)
+                    and response.count("<answer>") == 1
+                    and response.count("</answer>") == 1
+                ):
                     rewards.append(1.0)
                 else:
                     rewards.append(0.0)
@@ -295,12 +299,11 @@ class HFMultiRewardVerifyWorker:
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
-
             try:
                 # with _mute_output():
                 math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
                 if math_verify_impl == "hf_math_verify":
-                    cor_reward = correctness_reward_func([response],[ground_truth])
+                    cor_reward = correctness_reward_func([response], [ground_truth])
                     int_reward = int_reward_func([response])
                     format_reward = format_reward_func([response])
                     extracted_answer = extract_xml_answer(response)
@@ -339,9 +342,8 @@ class HFMultiRewardVerifyWorker:
         if return_extracted_answer:
             return results, extracted_answers
         else:
-            return results
             # return results --> [[0,1,0], [0,2,0], .........]
-
+            return results
 
 
 class MathEnvironmentMetadata(TypedDict):
@@ -507,7 +509,6 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         return batch, metrics
 
 
-
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
     def __init__(self, cfg: MathEnvConfig):
@@ -586,10 +587,10 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         ]
 
         worker_results = ray.get(futures)
-        
+
         # Flatten the results and extract both scores and answers
         number_of_rewards = 3
-        results = [[]for i in range(number_of_rewards)]
+        results = [[] for i in range(number_of_rewards)]
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
@@ -608,11 +609,11 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
                 if result
                 else "Environment: incorrect",
             }
-            for result in results[0] ## index 0 always store corretness reward
+            for result in results[0]  ## index 0 always store corretness reward
         ]
 
         # create a tensor of rewards and done flags
-        rewards = torch.tensor(results).T.cpu() ## Shape Batch_size, Number_rewards
+        rewards = torch.tensor(results).T.cpu()  ## Shape Batch_size, Number_rewards
         ## hard fixed this done to
         done = torch.ones(rewards.shape[0]).cpu()
         next_stop_strings = [None] * len(message_log_batch)
