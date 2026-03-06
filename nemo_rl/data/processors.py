@@ -472,6 +472,8 @@ def vlm_hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif datum_dict["task_name"] == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "avqa":
+        pass  # AVQA data is already formatted by AVQADataset.format_data
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -484,17 +486,12 @@ def vlm_hf_data_processor(
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
     images = []
+    audios = []
     if isinstance(problem, list):
         for content in problem:
-            # for image, video, just append it
+            # for image, video, audio, just append it
             # for text, format the prompt to the problem
-            if content["type"] != "text":
-                user_message["content"].append(content)
-                if content["type"] == "image":
-                    images.append(content["image"])
-                else:
-                    raise ValueError(f"Unsupported content type: {content['type']}")
-            elif content["type"] == "text":
+            if content["type"] == "text":
                 user_message["content"].append(
                     {
                         "type": "text",
@@ -503,6 +500,15 @@ def vlm_hf_data_processor(
                         else content["text"],
                     }
                 )
+            elif content["type"] == "image":
+                user_message["content"].append(content)
+                images.append(content["image"])
+            elif content["type"] == "audio":
+                user_message["content"].append(content)
+                # Store as (audio_array, sample_rate) tuple for vLLM
+                audios.append((content["audio"], 16000))
+            else:
+                raise ValueError(f"Unsupported content type: {content['type']}")
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
@@ -561,6 +567,7 @@ def vlm_hf_data_processor(
         vllm_kwargs = {
             "vllm_content": None,
             "vllm_images": [],
+            "vllm_audios": [],
         }
 
         # make smaller and mask out
@@ -573,11 +580,11 @@ def vlm_hf_data_processor(
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
     else:
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
-        # add images for vllm serving
+        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
         vllm_kwargs = {
             "vllm_content": string_formatted_dialog,
             "vllm_images": images,
+            "vllm_audios": audios,
         }
 
     output: DatumSpec = {
