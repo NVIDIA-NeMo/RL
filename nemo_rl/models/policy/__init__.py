@@ -68,7 +68,11 @@ class AutomodelKwargs(TypedDict):
     use_liger_kernel: NotRequired[bool]
     # Backend configuration for MoE models
     backend: NotRequired[AutomodelBackendConfig]
-    # Whether to force use of the HuggingFace implementation for MoE models
+    # Force the HuggingFace model implementation instead of the custom one.
+    # Set to true if the custom model's state_dict_adapter doesn't implement
+    # convert_single_tensor_to_hf (required for weight syncing). This is
+    # auto-detected and set at runtime if not explicitly configured.
+    # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     force_hf: NotRequired[bool]
 
 
