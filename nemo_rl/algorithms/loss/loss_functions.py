@@ -204,6 +204,9 @@ class ClippedPGLossFn(LossFunction):
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            curr_logprobs_unfiltered = data.get(
+                "curr_logprobs_unfiltered", curr_logprobs
+            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -273,6 +276,14 @@ class ClippedPGLossFn(LossFunction):
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
+            # When top-k/top-p filtering is enabled, we need special handling for KL:
+            # - reference_policy_logprobs is computed **without** filtering (see use_reference_model)
+            # - curr_logprobs/prev_logprobs are computed **with** filtering (for actor loss compatibility)
+            # - For KL, we need curr_logprobs **without** filtering to be consistent with ref logprobs
+            # - For importance weights, we also use unfiltered curr_logprobs_for_kl since we're
+            #   reweighting samples from π_gen_filtered to π_curr_unfiltered
+
+            # On-policy KL approximation
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
@@ -283,17 +294,21 @@ class ClippedPGLossFn(LossFunction):
                 )
             else:
                 kl_importance_weights = torch.ones_like(curr_logprobs)
+
+            # Compute KL loss
             kl = (
                 kl_importance_weights
                 * self.reference_policy_kl_penalty
                 * calculate_kl(
-                    logprobs=curr_logprobs,
+                    logprobs=curr_logprobs_unfiltered,
                     logprobs_reference=reference_policy_logprobs,
                     kl_type=self.reference_policy_kl_type,
                     input_clamp_value=self.kl_input_clamp_value,
                     output_clamp_value=self.kl_output_clamp_value,
                 )
             )
+
+            # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
                     kl, mask, global_normalization_factor=global_valid_toks

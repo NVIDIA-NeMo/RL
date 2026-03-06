@@ -92,7 +92,7 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    loss_input = prepare_loss_input(next_token_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
     loss, metrics_dict = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -118,7 +118,7 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    loss_input = prepare_loss_input(next_token_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
     loss, metrics_dict = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -154,7 +154,7 @@ def test_dpo_loss():
         }
     )
 
-    loss_input = prepare_loss_input(next_token_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -177,7 +177,7 @@ def test_dpo_loss():
         }
     )
 
-    loss_input = prepare_loss_input(next_token_logits, data, loss_fn_with_sft)
+    loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn_with_sft)
     loss_sft, _ = loss_fn_with_sft(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -269,7 +269,7 @@ def test_dpo_loss_varying_sequence_lengths():
     )
 
     # Compute no averaging loss
-    loss_input = prepare_loss_input(next_token_logits, data, dpo_loss_fn_no_avg)
+    loss_input, data = prepare_loss_input(next_token_logits, data, dpo_loss_fn_no_avg)
     _, metrics = dpo_loss_fn_no_avg(
         data=data,
         global_valid_seqs=torch.sum(sample_mask),
@@ -278,7 +278,7 @@ def test_dpo_loss_varying_sequence_lengths():
     )
 
     # Compute averaging loss
-    loss_input = prepare_loss_input(next_token_logits, data, dpo_loss_fn_avg)
+    loss_input, data = prepare_loss_input(next_token_logits, data, dpo_loss_fn_avg)
     _, metrics_avg = dpo_loss_fn_avg(
         data=data,
         global_valid_seqs=torch.sum(sample_mask),
@@ -334,7 +334,9 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute NLL loss
     nll_loss_fn = NLLLossFn()
-    loss_input = prepare_loss_input(next_token_logits[::2], sft_data, nll_loss_fn)
+    loss_input, sft_data = prepare_loss_input(
+        next_token_logits[::2], sft_data, nll_loss_fn
+    )
     nll_loss, _ = nll_loss_fn(
         data=sft_data,
         global_valid_seqs=None,
@@ -354,7 +356,7 @@ def test_dpo_sft_matches_nll_loss():
             "sft_average_log_probs": False,
         }
     )
-    loss_input = prepare_loss_input(next_token_logits, dpo_data, dpo_loss_fn)
+    loss_input, dpo_data = prepare_loss_input(next_token_logits, dpo_data, dpo_loss_fn)
     dpo_loss, _ = dpo_loss_fn(
         data=dpo_data,
         global_valid_seqs=torch.sum(dpo_data["sample_mask"]),
@@ -518,7 +520,7 @@ def test_clipped_pg_loss_ppo_clipping():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -566,7 +568,7 @@ def test_clipped_pg_loss_reinforce_mode():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -612,7 +614,7 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, metrics = loss_fn(
         data=data,
@@ -723,7 +725,7 @@ def test_clipped_pg_loss_kl_penalty():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -764,7 +766,7 @@ def test_clipped_pg_loss_masking():
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["reference_policy_kl_penalty"] = 0.1
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     # --- Test 1: Token Mask ---
     # Default mask: [[0, 1, 1, 1], [0, 1, 1, 1]] -> 3 tokens per sample
@@ -825,7 +827,7 @@ def test_clipped_pg_loss_masking():
     data_only_b0 = BatchedDataDict(data_only_b0_dict)
 
     logits_only_b0 = dummy_logits[0:1]
-    loss_input = prepare_loss_input(logits_only_b0, data_only_b0, loss_fn)
+    loss_input, data_only_b0 = prepare_loss_input(logits_only_b0, data_only_b0, loss_fn)
     loss_only_b0, _ = loss_fn(
         data=data_only_b0,
         global_valid_seqs=torch.sum(data_only_b0["sample_mask"]),
@@ -851,7 +853,7 @@ def test_clipped_pg_loss_zero_mask():
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["reference_policy_kl_penalty"] = 0.1
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     # Set token mask to all zeros
     data["token_mask"] = torch.zeros_like(data["token_mask"])
@@ -1002,7 +1004,7 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1135,7 +1137,7 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1183,7 +1185,7 @@ def test_clipped_pg_loss_icepop_importance_sampling():
     dummy_logits = _create_exact_logits(
         prev_lp, data["input_ids"], batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
     actual_loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1227,7 +1229,7 @@ def test_clipped_pg_loss_seq_mask_tis():
     dummy_logits = _create_exact_logits(
         prev_lp, data["input_ids"], batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
     actual_loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1359,7 +1361,7 @@ def test_clipped_pg_loss_dual_clip():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1409,7 +1411,7 @@ def test_clipped_pg_loss_entropy():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, data["input_ids"], batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     _, metrics = loss_fn(
         data=data,
@@ -1494,7 +1496,7 @@ def test_clipped_pg_loss_gspo():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1593,7 +1595,7 @@ def test_clipped_pg_loss_gspo_batch_size_2():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1695,7 +1697,7 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
     actual_loss, _ = loss_fn(
         data=data,
@@ -1758,7 +1760,7 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
         }
     )
 
-    loss_input = prepare_loss_input(student_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
     loss, metrics = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1803,7 +1805,7 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
         }
     )
 
-    loss_input = prepare_loss_input(student_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1843,7 +1845,7 @@ def test_distillation_loss_invalid_k_zero():
 
     # This should raise a ValueError for k=0
     with pytest.raises(ValueError, match="topk must be positive"):
-        _ = prepare_loss_input(student_logits, data, loss_fn)
+        prepare_loss_input(student_logits, data, loss_fn)
 
 
 def test_distillation_loss_gradient_flow():
@@ -1861,7 +1863,7 @@ def test_distillation_loss_gradient_flow():
         }
     )
 
-    loss_input = prepare_loss_input(student_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1895,7 +1897,7 @@ def test_distillation_loss_edge_cases():
 
     # Test with all-zero logits
     zero_logits = torch.zeros_like(student_logits)
-    loss_input = prepare_loss_input(zero_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(zero_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1909,7 +1911,7 @@ def test_distillation_loss_edge_cases():
 
     # Test with very large logits
     large_logits = torch.ones_like(student_logits) * 100.0
-    loss_input = prepare_loss_input(large_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(large_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1923,7 +1925,7 @@ def test_distillation_loss_edge_cases():
 
     # Test with very small logits
     small_logits = torch.ones_like(student_logits) * -100.0
-    loss_input = prepare_loss_input(small_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(small_logits, data, loss_fn)
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
@@ -1973,7 +1975,7 @@ def test_distillation_loss_fn_call():
         }
     )
 
-    loss_input = prepare_loss_input(student_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
     loss, metrics = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),

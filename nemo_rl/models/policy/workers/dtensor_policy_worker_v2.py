@@ -39,6 +39,7 @@ from transformers import (
     AutoTokenizer,
 )
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
@@ -67,9 +68,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import (
-    get_runtime_env_for_policy_worker,
-)
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_torch_aten_alias_tensor_patch,
@@ -320,6 +319,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
@@ -367,6 +367,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             cp_size=self.cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
         )
 
         # Create train context factory
@@ -427,7 +428,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    cfg=self.cfg,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -435,6 +435,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
@@ -541,6 +542,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
         )
 
         with torch.no_grad():
@@ -569,11 +571,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -638,11 +640,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,
                         allow_flash_attn_args=False,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -728,11 +730,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -779,30 +781,48 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
-            try:
-                # Save train model state_dict
-                curr_state_dict = get_cpu_state_dict(
-                    self.model.state_dict().items(), pin_memory=True
+            # Save train model state_dict
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
                 )
+            else:
+                self.sampling_params = None
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(self.reference_model_state_dict[k])
+            # - self.model is the original reference_model, now on CUDA
+            # - curr_state_dict is the train model, now on CPU
+            yield
 
-                # - self.model is the original reference_model, now on CUDA
-                # - curr_state_dict is the train model, now on CPU
-                yield
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-            finally:
-                # Restore train model state_dict
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(curr_state_dict[k])
+            # Restore train model state_dict
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""

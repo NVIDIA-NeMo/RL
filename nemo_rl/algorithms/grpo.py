@@ -1736,6 +1736,8 @@ def grpo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
                             **extra_multimodal_data,
                         }
                     )
@@ -1767,6 +1769,7 @@ def grpo_train(
                             "seq_logprob_error_threshold"
                         ],
                     )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
