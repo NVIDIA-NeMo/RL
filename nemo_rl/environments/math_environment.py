@@ -235,6 +235,8 @@ class HFMultiRewardVerifyWorker:
     def __init__(self) -> None:
         logging.getLogger("math_multi_reward_verify").setLevel(logging.CRITICAL)
 
+        self.number_of_rewards = 3
+
         # Use Latex and plain math extraction from predictions
         # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
         self.verify_func = math_metric(
@@ -294,19 +296,16 @@ class HFMultiRewardVerifyWorker:
 
             return rewards
 
-        number_of_rewards = 3
-        results = [[] for i in range(number_of_rewards)]
+        results = [[] for _ in range(self.number_of_rewards)]
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
-                # with _mute_output():
                 math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
                 if math_verify_impl == "hf_math_verify":
                     cor_reward = correctness_reward_func([response], [ground_truth])
                     int_reward = int_reward_func([response])
                     format_reward = format_reward_func([response])
-                    extracted_answer = extract_xml_answer(response)
                 else:
                     raise ValueError(
                         f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify'"
@@ -317,18 +316,8 @@ class HFMultiRewardVerifyWorker:
                 results[2].extend(format_reward)
 
                 if return_extracted_answer:
-                    # Make sure the extracted answer is not None and is a list of two elements
-                    assert extracted_answer is not None
-                    assert len(extracted_answer) == 2
-                    extracted_gold, extracted_prediction = extracted_answer
-                    # Get the extracted answer with the same logic as in the HFVerifyWorker
-                    for pred in extracted_prediction:
-                        if any(grader.verify(gold, pred) for gold in extracted_gold):
-                            extracted_answers.append(pred)
-                            break
-                    else:
-                        # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
+                    extracted_answer = extract_xml_answer(response)
+                    extracted_answers.append(extracted_answer)
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
@@ -351,22 +340,19 @@ class MathEnvironmentMetadata(TypedDict):
     extracted_answer: str | None
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
+# Use a base class to share some functions to avoid code duplication.
+class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
+    WORKER_CLASS_DICT: dict[str, type[ray.remote]]
+
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        # TODO: split out this environment since it's doing more than just math
         verifier_type = cfg.get("verifier_type", "math")
         assert isinstance(verifier_type, str), (
             f"{verifier_type=} must be a string but was {type(verifier_type)}"
         )
 
-        worker_cls = {
-            "math": HFVerifyWorker,
-            "english_multichoice": EnglishMultichoiceVerifyWorker,
-            "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
-        }[verifier_type]
+        worker_cls = self.WORKER_CLASS_DICT[verifier_type]
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
@@ -378,6 +364,56 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         # shutdown all workers
         for worker in self.workers:
             ray.kill(worker)
+
+    def global_post_process_and_metrics(
+        self, batch: BatchedDataDict[Any]
+    ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
+        """Computes metrics for this environment given a global rollout batch.
+
+        Every rank will run this function, so you're free to use distributed
+        calculations if you'd prefer for heavy metrics.
+        """
+        # for multi-reward environment, index 0 always store corretness reward
+        rewards = (
+            batch["rewards"] if batch["rewards"].ndim == 1 else batch["rewards"][:, 0]
+        )
+
+        # set a reward of 0 for any incorrectly ended sequences
+        rewards = rewards * batch["is_end"]
+        if (rewards == 1).float().sum() > 0:
+            correct_solution_generation_lengths = (
+                (batch["generation_lengths"] - batch["prompt_lengths"])[rewards == 1]
+                .float()
+                .mean()
+                .item()
+            )
+        else:
+            correct_solution_generation_lengths = 0
+
+        metrics = {
+            # "table": table, TODO @sahilj WIP
+            "accuracy": rewards.mean().item(),
+            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
+                batch["text"], rewards
+            ),
+            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
+            "num_problems_in_batch": batch["is_end"].shape[0],
+            "generation_lengths": batch["generation_lengths"].float().mean().item(),
+            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
+            "correct_solution_generation_lengths": correct_solution_generation_lengths,
+        }
+
+        return batch, metrics
+
+
+@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+class MathEnvironment(BaseMathEnvironment):
+    # TODO: split out this environment since it's doing more than just math
+    WORKER_CLASS_DICT = {
+        "math": HFVerifyWorker,
+        "english_multichoice": EnglishMultichoiceVerifyWorker,
+        "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
+    }
 
     def step(
         self,
@@ -439,12 +475,11 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         )
 
         for worker_result in worker_results:
+            worker_scores = worker_result
             if return_extracted_answer:
                 worker_scores, worker_answers = worker_result
-                results.extend(worker_scores)
                 extracted_answers.extend(worker_answers)
-            else:
-                results.extend(worker_result)
+            results.extend(worker_scores)
 
         observations = [
             {
@@ -470,70 +505,12 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
             answers=extracted_answers,
         )
 
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict[Any]
-    ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        """Computes metrics for this environment given a global rollout batch.
-
-        Every rank will run this function, so you're free to use distributed
-        calculations if you'd prefer for heavy metrics.
-        """
-        batch["rewards"] = (
-            batch["rewards"] * batch["is_end"]
-        )  # set a reward of 0 for any incorrectly ended sequences
-        if (batch["rewards"] == 1).float().sum() > 0:
-            correct_solution_generation_lengths = (
-                (batch["generation_lengths"] - batch["prompt_lengths"])[
-                    batch["rewards"] == 1
-                ]
-                .float()
-                .mean()
-                .item()
-            )
-        else:
-            correct_solution_generation_lengths = 0
-
-        metrics = {
-            # "table": table, TODO @sahilj WIP
-            "accuracy": batch["rewards"].mean().item(),
-            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
-                batch["text"], batch["rewards"]
-            ),
-            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
-            "num_problems_in_batch": batch["is_end"].shape[0],
-            "generation_lengths": batch["generation_lengths"].float().mean().item(),
-            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
-            "correct_solution_generation_lengths": correct_solution_generation_lengths,
-        }
-
-        return batch, metrics
-
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
-    def __init__(self, cfg: MathEnvConfig):
-        self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
-        # TODO: split out this environment since it's doing more than just math
-        verifier_type = cfg.get("verifier_type", "math")
-        assert isinstance(verifier_type, str), (
-            f"{verifier_type=} must be a string but was {type(verifier_type)}"
-        )
-
-        worker_cls = {
-            "math": HFMultiRewardVerifyWorker,
-        }[verifier_type]
-        self.workers = [
-            worker_cls.options(  # type: ignore # (decorated with @ray.remote)
-                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
-            ).remote()
-            for _ in range(self.num_workers)
-        ]
-
-    def shutdown(self) -> None:
-        # shutdown all workers
-        for worker in self.workers:
-            ray.kill(worker)
+class MathMultiRewardEnvironment(BaseMathEnvironment):
+    WORKER_CLASS_DICT = {
+        "math": HFMultiRewardVerifyWorker,
+    }
 
     def step(
         self,
@@ -589,18 +566,19 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         worker_results = ray.get(futures)
 
         # Flatten the results and extract both scores and answers
-        number_of_rewards = 3
-        results = [[] for i in range(number_of_rewards)]
+        number_of_rewards = len(worker_results[0])
+        results = [[] for _ in range(number_of_rewards)]
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
 
         for worker_result in worker_results:
+            worker_scores = worker_result
             if return_extracted_answer:
-                raise NotImplementedError("Skip return_extracted_answer handling")
-            else:
-                for i in range(number_of_rewards):
-                    results[i].extend(worker_result[i])
+                worker_scores, worker_answers = worker_result
+                extracted_answers.extend(worker_answers)
+            for i in range(number_of_rewards):
+                results[i].extend(worker_scores[i])
 
         observations = [
             {
@@ -626,41 +604,3 @@ class MathMultiRewardEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
             terminateds=done,
             answers=extracted_answers,
         )
-
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict[Any]
-    ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        """Computes metrics for this environment given a global rollout batch.
-
-        Every rank will run this function, so you're free to use distributed
-        calculations if you'd prefer for heavy metrics.
-        """
-        batch["rewards"] = (
-            batch["rewards"] * batch["is_end"]
-        )  # set a reward of 0 for any incorrectly ended sequences
-        if (batch["rewards"] == 1).float().sum() > 0:
-            correct_solution_generation_lengths = (
-                (batch["generation_lengths"] - batch["prompt_lengths"])[
-                    batch["rewards"] == 1
-                ]
-                .float()
-                .mean()
-                .item()
-            )
-        else:
-            correct_solution_generation_lengths = 0
-
-        metrics = {
-            # "table": table, TODO @sahilj WIP
-            "accuracy": batch["rewards"].mean().item(),
-            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
-                batch["text"], batch["rewards"]
-            ),
-            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
-            "num_problems_in_batch": batch["is_end"].shape[0],
-            "generation_lengths": batch["generation_lengths"].float().mean().item(),
-            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
-            "correct_solution_generation_lengths": correct_solution_generation_lengths,
-        }
-
-        return batch, metrics
