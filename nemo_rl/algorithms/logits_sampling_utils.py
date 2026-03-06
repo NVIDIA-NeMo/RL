@@ -46,7 +46,7 @@ class TrainingSamplingParams:
 
 def _need_top_k_filtering(top_k: int | None) -> bool:
     """Check if top-k filtering is needed."""
-    return top_k is not None and top_k != -1
+    return top_k is not None and top_k > 0
 
 
 def _need_top_p_filtering(top_p: float | None) -> bool:
