@@ -129,6 +129,11 @@ jobs:
           fi
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Get merge commit sha
         shell: bash -x -e -u -o pipefail {0}
         id: sha
