@@ -268,10 +268,137 @@ class BaseVllmGenerationWorker:
                 f.write(content)
             logger.info("Successfully patched vllm speculative decoding post_step.")
 
+        def _patch_vllm_hermes_tool_parser_thread_safety():
+            """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
+
+            The HuggingFace tokenizer's Rust backend does not support concurrent
+            access. When multiple async requests call _preprocess_chat concurrently,
+            each one constructs a new Hermes2ProToolParser which calls
+            tokenizer.encode() and tokenizer.decode() in __init__, causing
+            "RuntimeError: Already borrowed".
+
+            A lock alone is insufficient because the tool parser's encode() can
+            race with render_chat_async() in another concurrent request — two
+            different codepaths sharing the same tokenizer instance.
+
+            This patch caches the encode/decode results so only the first
+            instantiation (protected by a lock) touches the tokenizer. All
+            subsequent instantiations read from cache without any tokenizer
+            access.
+
+            Related:
+            - https://github.com/vllm-project/vllm/pull/30264
+            - https://github.com/huggingface/tokenizers/issues/537
+            - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
+            """
+            file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "_tokenizer_cache" in content:
+                logger.info("Hermes tool parser thread-safety patch already applied.")
+                return
+
+            old_import = (
+                "import json\n"
+                "from collections.abc import Sequence"
+            )
+            new_import = (
+                "import json\n"
+                "import threading\n"
+                "from collections.abc import Sequence"
+            )
+
+            old_class_line = "class Hermes2ProToolParser(ToolParser):"
+            new_class_line = (
+                "class Hermes2ProToolParser(ToolParser):\n"
+                "    _tokenizer_lock = threading.Lock()\n"
+                "    _tokenizer_cache = {}"
+            )
+
+            old_init_snippet = (
+                "        self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_start_token, add_special_tokens=False\n"
+                "        )\n"
+                "        self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_end_token, add_special_tokens=False\n"
+                "        )\n"
+                "\n"
+                "        self.tool_call_start_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_start_token_ids\n"
+                "        ]\n"
+                "\n"
+                "        self.tool_call_end_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_end_token_ids\n"
+                "        ]"
+            )
+
+            new_init_snippet = (
+                "        _tid = id(self.model_tokenizer)\n"
+                "        if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "            _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "            self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "            self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "            self.tool_call_start_token_array = _cached['start_array']\n"
+                "            self.tool_call_end_token_array = _cached['end_array']\n"
+                "        else:\n"
+                "            with Hermes2ProToolParser._tokenizer_lock:\n"
+                "                if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "                    _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "                    self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "                    self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "                    self.tool_call_start_token_array = _cached['start_array']\n"
+                "                    self.tool_call_end_token_array = _cached['end_array']\n"
+                "                else:\n"
+                "                    self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "                        self.tool_call_start_token, add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "                        self.tool_call_end_token, add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_start_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_start_token_ids\n"
+                "                    ]\n"
+                "                    self.tool_call_end_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_end_token_ids\n"
+                "                    ]\n"
+                "                    Hermes2ProToolParser._tokenizer_cache[_tid] = {\n"
+                "                        'start_ids': self.tool_call_start_token_ids,\n"
+                "                        'end_ids': self.tool_call_end_token_ids,\n"
+                "                        'start_array': self.tool_call_start_token_array,\n"
+                "                        'end_array': self.tool_call_end_token_array,\n"
+                "                    }"
+            )
+
+            if old_init_snippet not in content:
+                logger.warning(
+                    "Could not apply hermes tool parser thread-safety patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_import, new_import, 1)
+            content = content.replace(old_class_line, new_class_line, 1)
+            content = content.replace(old_init_snippet, new_init_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched hermes tool parser for thread-safety.")
+
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
         _patch_vllm_speculative_decoding_post_step()
+
+        _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
             import vllm
