@@ -196,6 +196,7 @@ def mask_out_neg_inf_logprobs(
     Args:
         logprobs: Log probabilities.
         mask: Mask.
+        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
         Masked log probabilities.

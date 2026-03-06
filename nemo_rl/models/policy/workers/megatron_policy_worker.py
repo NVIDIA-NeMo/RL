@@ -540,60 +540,56 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            try:
-                # Save original references
-                model_state_dict = {}
-                for name, item in self.model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device="cpu", non_blocking=True, copy=True
-                        )
-                    model_state_dict[name] = item
+            # Save original references
+            model_state_dict = {}
+            for name, item in self.model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                model_state_dict[name] = item
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    if isinstance(v, torch.Tensor):
-                        v.copy_(self.reference_state_dict[k])
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                if isinstance(v, torch.Tensor):
+                    v.copy_(self.reference_state_dict[k])
 
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-                # The reference policy has different weights, so its top-k/top-p set is
-                # inherently different from the current policy. Using filtered logprobs
-                # would cause -inf mismatches that cannot be resolved by masking.
-                # Note: We keep temperature scaling since it was applied to prev_logprobs.
-                saved_sampling_params = self.sampling_params
-                if saved_sampling_params is not None:
-                    self.sampling_params = TrainingSamplingParams(
-                        top_k=None,
-                        top_p=1.0,
-                        temperature=saved_sampling_params.temperature,
-                    )
-                else:
-                    self.sampling_params = None
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
+                )
+            else:
+                self.sampling_params = None
 
-                # - self.model is the original reference_model, now on CUDA
-                # - self.reference_model is the original model, now on CPU
-                yield
+            # - self.model is the original reference_model, now on CUDA
+            # - self.reference_model is the original model, now on CPU
+            yield
 
-            finally:
-                # Restore sampling_params
-                self.sampling_params = saved_sampling_params
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-                # Restore original references and device placement
-                for k, v in self.model.state_dict().items():
-                    if isinstance(v, torch.Tensor):
-                        v.copy_(model_state_dict[k])
+            # Restore original references and device placement
+            for k, v in self.model.state_dict().items():
+                if isinstance(v, torch.Tensor):
+                    v.copy_(model_state_dict[k])
 
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-                ## re-enable overlap param gather after weight swap
-                if self.should_disable_forward_pre_hook:
-                    self.enable_forward_pre_hook()
+            ## re-enable overlap param gather after weight swap
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(

@@ -19,6 +19,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import partial
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
@@ -801,11 +802,15 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
 
+                        # Wrap prepare_loss_input with sampling_params
+                        prepare_loss_input_wrapped = partial(
+                            prepare_loss_input, sampling_params=self.sampling_params
+                        )
                         # Wrap loss function for sequence packing if needed
                         if self.enable_seq_packing:
                             loss_fn_ = SequencePackingLossWrapper(
                                 loss_fn=loss_fn,
-                                prepare_fn=prepare_loss_input,
+                                prepare_fn=prepare_loss_input_wrapped,
                                 cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
                                 cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
                             )
@@ -816,7 +821,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 global_valid_toks,
                             )
                         else:
-                            loss_input, mb = prepare_loss_input(logits, mb, loss_fn)
+                            loss_input, mb = prepare_loss_input_wrapped(
+                                logits, mb, loss_fn
+                            )
                             loss, loss_metrics = loss_fn(
                                 data=mb,
                                 global_valid_seqs=global_valid_seqs,
@@ -1662,44 +1669,42 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
-            try:
-                # Save train model state_dict
-                curr_state_dict = get_cpu_state_dict(
-                    self.model.state_dict().items(), pin_memory=True
+            # Save train model state_dict
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,  # Disable top-k
+                    top_p=1.0,  # Disable top-p
+                    temperature=saved_sampling_params.temperature,  # Keep temperature
                 )
+            else:
+                self.sampling_params = None
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(self.reference_model_state_dict[k])
+            # - self.model is the original reference_model, now on CUDA
+            # - curr_state_dict is the train model, now on CPU
+            yield
 
-                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-                # The reference policy has different weights, so its top-k/top-p set is
-                # inherently different from the current policy. Using filtered logprobs
-                # would cause -inf mismatches that cannot be resolved by masking.
-                # Note: We keep temperature scaling since it was applied to prev_logprobs.
-                saved_sampling_params = self.sampling_params
-                if saved_sampling_params is not None:
-                    self.sampling_params = TrainingSamplingParams(
-                        top_k=None,  # Disable top-k
-                        top_p=1.0,  # Disable top-p
-                        temperature=saved_sampling_params.temperature,  # Keep temperature
-                    )
-                else:
-                    self.sampling_params = None
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-                # - self.model is the original reference_model, now on CUDA
-                # - curr_state_dict is the train model, now on CPU
-                yield
-
-            finally:
-                # Restore sampling_params
-                self.sampling_params = saved_sampling_params
-
-                # Restore train model state_dict
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(curr_state_dict[k])
+            # Restore train model state_dict
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
