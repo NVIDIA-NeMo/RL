@@ -553,7 +553,9 @@ class RayWorkerGroup:
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
 
                 if _worker_cudnn_lib:
-                    ld_path = runtime_env["env_vars"].get("LD_LIBRARY_PATH", "")
+                    ld_path = runtime_env["env_vars"].get(
+                        "LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", "")
+                    )
                     if _worker_cudnn_lib not in ld_path:
                         runtime_env["env_vars"]["LD_LIBRARY_PATH"] = (
                             f"{_worker_cudnn_lib}:{ld_path}" if ld_path else _worker_cudnn_lib
