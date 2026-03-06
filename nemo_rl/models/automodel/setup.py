@@ -558,7 +558,9 @@ def setup_model_and_optimizer(
     # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     adapter = getattr(model, "state_dict_adapter", None)
     if adapter is not None and getattr(
-        getattr(adapter, "convert_single_tensor_to_hf", None), "__isabstractmethod__", False
+        getattr(adapter, "convert_single_tensor_to_hf", None),
+        "__isabstractmethod__",
+        False,
     ):
         raise RuntimeError(
             f"The custom model implementation for {model_config.architectures[0]} has a "
@@ -595,6 +597,20 @@ def setup_model_and_optimizer(
 
         if embed_tokens_weight is not None:
             model.lm_head.weight = embed_tokens_weight
+
+    # Freeze visual encoder when not doing VLM training.
+    # Without this, the optimizer creates state entries for visual params that never
+    # receive gradients, causing a key mismatch when resuming from checkpoint.
+    # Note: visual encoder is nested under model.model (e.g. model.model.visual for
+    # Qwen3_5MoeForConditionalGeneration), not directly on model.
+    visual_module = getattr(getattr(model, "model", None), "visual", None) or getattr(
+        model, "visual", None
+    )
+    if not is_vlm and visual_module is not None:
+        for param in visual_module.parameters():
+            param.requires_grad_(False)
+        if rank == 0:
+            print("Froze visual encoder parameters for text-only training")
 
     # CPU offload if needed
     if cpu_offload:
