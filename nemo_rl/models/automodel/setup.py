@@ -14,6 +14,8 @@
 
 """Setup utilities for automodel-based training in NeMo RL."""
 
+import importlib
+import inspect
 import os
 from functools import partial
 from typing import Any, Optional, Union
@@ -51,6 +53,76 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
+    """Validate and maybe auto-set force_hf based on adapter compatibility.
+
+    Custom model implementations (e.g. Qwen2, Llama) use state_dict_adapters to
+    convert between native and HF weight formats. NeMo RL's weight syncing requires
+    the adapter to implement `convert_single_tensor_to_hf`. Some adapters (like
+    CombinedProjectionStateDictAdapter) don't implement this yet.
+
+    This function checks the adapter BEFORE model loading to avoid wasting time:
+    - force_hf=True: no check needed, HF model won't have an adapter.
+    - force_hf not set + adapter incompatible: auto-set force_hf=True with a warning.
+    - force_hf=False + adapter incompatible: raise an error telling the user to set
+      force_hf=True or file an issue to NeMo-Automodel.
+
+    See: https://github.com/NVIDIA-NeMo/RL/issues/2072
+    """
+    # If force_hf is already True, no check needed — HF model won't use an adapter.
+    if automodel_kwargs.get("force_hf") is True:
+        return
+
+    # If the architecture doesn't have a custom model implementation,
+    # HF model will be used regardless — no adapter involved.
+    architectures = getattr(model_config, "architectures", None) or []
+    if not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls:
+        return
+
+    arch = architectures[0]
+    model_cls = ModelRegistry.model_arch_name_to_cls[arch]
+
+    # Check the adapter class from the model's sibling state_dict_adapter module.
+    # Each custom model (e.g. nemo_automodel.components.models.qwen2.model) has
+    # a corresponding state_dict_adapter.py in the same package.
+    adapter_ok = True
+    try:
+        package_path = model_cls.__module__.rsplit(".", 1)[0]
+        adapter_module = importlib.import_module(f"{package_path}.state_dict_adapter")
+        for name, obj in inspect.getmembers(adapter_module, inspect.isclass):
+            if name.endswith("StateDictAdapter"):
+                method = getattr(obj, "convert_single_tensor_to_hf", None)
+                if method is None or getattr(method, "__isabstractmethod__", False):
+                    adapter_ok = False
+                break
+    except (ImportError, AttributeError):
+        # Can't find or import the adapter module. This means the model either
+        # doesn't use an adapter or has a non-standard layout — skip the check.
+        return
+
+    if adapter_ok:
+        return
+
+    force_hf_explicitly_false = "force_hf" in automodel_kwargs and automodel_kwargs["force_hf"] is False
+    if force_hf_explicitly_false:
+        raise RuntimeError(
+            f"force_hf=False but the custom model for {arch} uses an adapter that "
+            f"does not implement 'convert_single_tensor_to_hf', which is required "
+            f"for weight syncing. Please set "
+            f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` or file an issue "
+            f"at https://github.com/NVIDIA-NeMo/Automodel to add support."
+        )
+
+    # force_hf not set — auto-enable it.
+    print(
+        f"WARNING: Custom model for {arch} uses an adapter that does not implement "
+        f"'convert_single_tensor_to_hf' (required for weight syncing). "
+        f"Auto-setting force_hf=True. To silence this warning, explicitly set "
+        f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` in your config."
+    )
+    automodel_kwargs["force_hf"] = True
 
 
 def get_tokenizer(
@@ -532,6 +604,10 @@ def setup_model_and_optimizer(
     if is_reward_model and model_config.num_labels == 1:
         from_pretrained_kwargs["num_labels"] = 1
 
+    # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
+    # HF conversion (required for weight syncing).
+    _maybe_set_force_hf(automodel_kwargs, model_config)
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -551,23 +627,6 @@ def setup_model_and_optimizer(
     )
 
     print(model)
-
-    # Validate that the model's state_dict_adapter supports per-tensor HF conversion,
-    # which is required for LoRA weight syncing. Custom model implementations that use
-    # CombinedProjectionStateDictAdapter (e.g. Qwen2, Llama) may not implement this yet.
-    # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
-    adapter = getattr(model, "state_dict_adapter", None)
-    if adapter is not None and getattr(
-        getattr(adapter, "convert_single_tensor_to_hf", None), "__isabstractmethod__", False
-    ):
-        raise RuntimeError(
-            f"The custom model implementation for {model_config.architectures[0]} has a "
-            f"state_dict_adapter ({type(adapter).__name__}) that does not implement "
-            f"'convert_single_tensor_to_hf', which is required for weight syncing. "
-            f"Please set `policy.dtensor_cfg.automodel_kwargs.force_hf=true` to use the "
-            f"HuggingFace model implementation instead. "
-            f"See https://github.com/NVIDIA-NeMo/RL/issues/2072 for details."
-        )
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
