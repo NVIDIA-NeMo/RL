@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
+    GDPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss import (
@@ -46,6 +48,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
+    get_gdpo_reward_component_keys
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -121,9 +124,9 @@ class AsyncGRPOConfig(TypedDict):
 
 
 class AdvEstimatorConfig(TypedDict):
-    """Configuration for advantage estimator (GRPO or Reinforce++)."""
+    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
 
-    name: str  # "grpo" or "reinforce_plus_plus"
+    name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
     normalize_rewards: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
@@ -966,11 +969,16 @@ def scale_rewards(
             )
 
         # Clamp and scale
-        rewards = torch.clamp(rewards, min=source_min, max=source_max)
-        scaled_rewards = target_min + (rewards - source_min) / (
-            source_max - source_min
-        ) * (target_max - target_min)
+        def _scale(reward_tensor: torch.Tensor) -> torch.Tensor:
+            r = torch.clamp(reward_tensor, min=source_min, max=source_max)
+            return target_min + (r - source_min) / (
+                source_max - source_min
+            ) * (target_max - target_min)
+
+        scaled_rewards = _scale(rewards)
         repeated_batch["total_reward"] = scaled_rewards
+        for key in get_gdpo_reward_component_keys(repeated_batch):
+            repeated_batch[key] = _scale(repeated_batch[key])
 
     return repeated_batch
 
@@ -1031,7 +1039,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPOAdvantageEstimator or ReinforcePlusPlusAdvantageEstimator).
+        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -1055,7 +1063,14 @@ def _create_advantage_estimator(master_config: MasterConfig):
     )
 
     adv_estimator_name = adv_estimator_config["name"]
-    if adv_estimator_name == "grpo":
+    if adv_estimator_name == "gdpo":
+        assert not _should_use_async_rollouts(master_config), (
+            "GDPO is not supported for async rollouts, "
+            "please set policy.generation.vllm_cfg.async_engine to false in your config."
+        )
+        adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using GDPO advantage estimator (multi-reward)")
+    elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "reinforce_plus_plus":
@@ -1590,6 +1605,10 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    # Store input_ids in batch so that after dynamic_sampling it stays aligned with
+                    # the (possibly filtered) batch: select_indices / from_batches / slice all
+                    # apply to this key, so per-reward baselines use the same prompts as reward components.
+                    repeated_batch["_input_ids_for_baseline"] = input_ids
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
@@ -1644,10 +1663,10 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+
                     gen_step_metrics = {}
                     if hasattr(policy_generation, "get_step_metrics"):
                         gen_step_metrics = policy_generation.get_step_metrics()
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
@@ -1778,6 +1797,7 @@ def grpo_train(
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
+                        repeated_batch=repeated_batch,
                         mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
@@ -2724,6 +2744,8 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
+                    # All estimators read _input_ids_for_baseline from repeated_batch
+                    repeated_batch["_input_ids_for_baseline"] = prompt_ids_for_adv
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -2809,6 +2831,7 @@ def async_grpo_train(
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
+                        repeated_batch=repeated_batch,
                         mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),

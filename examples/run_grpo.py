@@ -139,6 +139,13 @@ def main() -> None:
                 "use_multiple_dataloader is not supported with async GRPO"
             )
 
+        # Async GDPO is not supported
+        if config["grpo"]["adv_estimator"]["name"] == "gdpo":
+            raise NotImplementedError(
+                "GDPO is not supported for async training, "
+                "please set grpo.async_grpo.enabled to false in your config."
+            )
+
         from nemo_rl.algorithms.grpo import async_grpo_train
 
         print("🚀 Running async GRPO training")
