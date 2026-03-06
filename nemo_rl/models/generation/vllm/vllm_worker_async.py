@@ -596,7 +596,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from logging import getLogger as _getLogger
 
-        _getLogger("vllm.entrypoints.openai.protocol").addFilter(CleanLoggingFilter())
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(CleanLoggingFilter())
 
         # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
         # This is expected during multi-turn rollouts; we log a clean one-line
