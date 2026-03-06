@@ -91,7 +91,7 @@ loss_fn:
   use_kl_in_reward: false
 
 policy:
-  model_name: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/checkpoints/nano-v3-sft-64gbs-nickel-capybara-5e-5-constant-wd-0-load-bal-1e-4-lcx3-pretool-base-temp1-iter-0013600-hf"
+  model_name: "/path/to/checkpoint"
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null

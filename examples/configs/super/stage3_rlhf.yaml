@@ -331,7 +331,7 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:8000/v1
           api_key: dummy_key
-          model: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/models/qwen235b_principle_comparison_genrm_step1230"
+          model: "/path/to/genrm_model"
           uses_reasoning_parser: True
           return_token_id_information: False
           spinup_server: True

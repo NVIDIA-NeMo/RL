@@ -1,42 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =============================================================================
-# Generic launcher for super-v3 multi-stage training (stage1 / stage2 / stage3)
-#
-# All inputs are env variables. Required vars are validated at startup.
-#
-# Required:
-#   EXP_NAME          Unique experiment name (checkpoint_dir, log_dir, wandb name)
-#   TRAIN_PATH        Path to the training data jsonl
-#   VAL_PATH          Path to the validation data jsonl
-#   CONFIG_PATH       Path to the YAML config
-#   MODEL_PATH        Path to the policy model (policy.model_name)
-#   CONTAINER         Sqsh container path for the training job
-#   SANDBOX_CONTAINER Sqsh container path for the sandbox
-#   PERSISTENT_CACHE  Root for compile/cache dirs
-#   SLURM_PARTITION   Slurm partition
-#   SLURM_ACCOUNT     Slurm account
-#
-# Optional (with defaults):
-#   WANDB_PROJ        Wandb project                     (default: super-v3-posttraining)
-#   SLURM_TIME_LIMIT  Slurm wall-clock time             (default: 4:0:0)
-#   DRY_RUN           Set to "true" to print without submitting
-#
-# Example:
-#   EXP_NAME=my-stage1-exp \
-#   CONFIG_PATH=examples/configs/grpo_superv3_stage1_21node.yaml \
-#   MODEL_PATH=/scratch/.../model/hf \
-#   TRAIN_PATH=/scratch/.../train.jsonl \
-#   VAL_PATH=/scratch/.../val.jsonl \
-#   CONTAINER=/scratch/.../superv3-prebaked.sqsh \
-#   SANDBOX_CONTAINER=/lustre/.../nemo-skills-sandbox-latest.sqsh \
-#   PERSISTENT_CACHE=/scratch/.../persistent_cache \
-#   SLURM_PARTITION=batch \
-#   SLURM_ACCOUNT=coreai_dlalgo_nemorl \
-#   bash launch.sh
-# =============================================================================
-
 # ---- Required vars ----
 : "${EXP_NAME:?EXP_NAME is required}"
 : "${TRAIN_PATH:?TRAIN_PATH is required}"
@@ -53,6 +17,8 @@ set -euo pipefail
 WANDB_PROJ="${WANDB_PROJ:-super-v3-posttraining}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 DRY_RUN="${DRY_RUN:-false}"
+# Optional: extra host:container mount pairs (e.g. "/scratch:/scratch,/lustre:/lustre") for your cluster.
+EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 
 # ---- Derived paths ----
 CODE_DIR=$PWD
@@ -160,7 +126,9 @@ export COMMAND="date ; \
     data.validation.data_path=${VAL_PATH}"
 
 export CONTAINER
-export MOUNTS="/scratch:/scratch,/lustre:/lustre,${SNAPSHOT_DIR}:${SNAPSHOT_DIR},${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm,${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
+# Core mounts (code, 3rdparty); set EXTRA_MOUNTS for cluster filesystems (e.g. /scratch:/scratch,/lustre:/lustre).
+BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR},${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm,${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
+export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
 # ---- Read num_nodes from the config's cluster.num_nodes field ----
 NUM_NODES=$(awk '/^cluster:/{found=1} found && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")
