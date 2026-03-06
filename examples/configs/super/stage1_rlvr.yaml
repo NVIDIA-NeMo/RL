@@ -338,7 +338,7 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:8001/v1
           api_key: dummy_key
-          model: /scratch/fsw/portfolios/llmservice/users/makeshn/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B
+          model: "nvidia/Nemotron-Content-Safety-Reasoning-4B"
           return_token_id_information: false
           uses_reasoning_parser: false
           spinup_server: true
@@ -367,7 +367,7 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:10000/v1
           api_key: dummy_key
-          model: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8"
+          model: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
           return_token_id_information: False
           uses_reasoning_parser: False
           spinup_server: True
@@ -443,7 +443,7 @@ env:
           entrypoint: app.py
           base_url: http://127.0.0.1:8000/v1
           api_key: dummy_key
-          model: "/scratch/fsw/portfolios/llmservice/users/jiaqiz/models/qwen235b_principle_comparison_genrm_step1230"
+          model: "nvidia/Qwen3-Nemotron-235B-A22B-GenRM-2603"
           uses_reasoning_parser: True
           return_token_id_information: False
           spinup_server: True
