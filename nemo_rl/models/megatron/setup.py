@@ -947,8 +947,6 @@ def setup_reference_model_state(
             checkpointing_context=ref_ckpt_context,
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
-    else:
-        print("Reference model not loaded")
 
     reference_state_dict = {}
 
@@ -964,6 +962,8 @@ def setup_reference_model_state(
                 cpu_item = item
             reference_state_dict[name] = cpu_item
         print("Reference model loaded")
+    else:
+        print("Reference model not loaded")
 
     return reference_state_dict
 
