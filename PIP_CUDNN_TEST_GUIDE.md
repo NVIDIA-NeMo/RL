@@ -137,6 +137,39 @@ NVTE_DEBUG=1 CUDNN_INSTALL=0 NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_
   2>&1 | tee ~/gpt-oss-120b_pip_cudnn919_8node.log
 ```
 
+### GPT-OSS 120B Quick Smoke Test (8 nodes, reduced generation)
+
+FusedAttention kernel이 정상 호출되는지만 빠르게 확인할 때 사용.
+Generation sample 수를 줄여 generation 시간을 단축.
+
+```bash
+# After attaching (bash JOBID-attach.sh), run:
+export PIP_CUDNN_LIB=$(uv run python3 -c "import nvidia.cudnn, pathlib; print(pathlib.Path(list(nvidia.cudnn.__path__)[0]) / 'lib')")
+export LD_LIBRARY_PATH="${PIP_CUDNN_LIB}:${LD_LIBRARY_PATH}"
+ln -sf libcudnn.so.9 ${PIP_CUDNN_LIB}/libcudnn.so
+
+NVTE_DEBUG=1 CUDNN_INSTALL=0 NRL_FORCE_REBUILD_VENVS=true uv run ./examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-gptoss-120b-8n8g-megatron.yaml \
+  cluster.num_nodes=8 \
+  cluster.gpus_per_node=8 \
+  policy.generation.vllm_cfg.tensor_parallel_size=8 \
+  policy.megatron_cfg.tensor_model_parallel_size=4 \
+  policy.megatron_cfg.expert_model_parallel_size=8 \
+  policy.megatron_cfg.pipeline_model_parallel_size=2 \
+  policy.megatron_cfg.moe_permute_fusion=true \
+  policy.sequence_packing.enabled=true \
+  grpo.num_prompts_per_step=16 \
+  grpo.num_generations_per_prompt=8 \
+  grpo.max_num_steps=2 \
+  checkpointing.enabled=false \
+  logger.wandb_enabled=True \
+  logger.wandb.project=sync-grpo-h100-gptoss120b-exp \
+  logger.wandb.name=GPTOSS120B_pip_cudnn919_8node_smoke \
+  2>&1 | tee ~/gpt-oss-120b_pip_cudnn919_smoke.log
+```
+
+Reduced from defaults: `num_prompts_per_step` 64→16, `num_generations_per_prompt` 32→8, `max_num_steps` →2.
+
 ### Key env vars
 
 | Variable | Value | Purpose |
