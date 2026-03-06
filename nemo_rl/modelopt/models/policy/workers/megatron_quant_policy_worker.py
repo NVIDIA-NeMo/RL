@@ -30,15 +30,15 @@ from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuanti
 
 import nemo_rl.models.megatron.setup as megatron_setup
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
+from nemo_rl.modelopt.models.policy.workers.utils import (
+    get_tokenizer,
+    quantization_layer_spec,
+    quantize_model,
+)
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
-)
-from nemo_rl.models.policy.workers.quantization.utils import (
-    get_tokenizer,
-    quantization_layer_spec,
-    quantize_model,
 )
 
 
