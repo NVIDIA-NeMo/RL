@@ -1,0 +1,19 @@
+defaults: ./grpo-nemotron-super-20n8g-gym.yaml
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4
+env:
+  nemo_gym:
+    nl2bash_judge_model:
+      responses_api_models:
+        vllm_model:
+          router_dp_size: 1
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 36
