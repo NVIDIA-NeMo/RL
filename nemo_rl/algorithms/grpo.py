@@ -1605,10 +1605,6 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
-                    # Store input_ids in batch so that after dynamic_sampling it stays aligned with
-                    # the (possibly filtered) batch: select_indices / from_batches / slice all
-                    # apply to this key, so per-reward baselines use the same prompts as reward components.
-                    repeated_batch["_input_ids_for_baseline"] = input_ids
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
@@ -2747,8 +2743,6 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
-                    # All estimators read _input_ids_for_baseline from repeated_batch
-                    repeated_batch["_input_ids_for_baseline"] = prompt_ids_for_adv
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
