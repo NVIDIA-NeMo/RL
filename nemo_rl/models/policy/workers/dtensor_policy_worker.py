@@ -182,9 +182,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.is_generation_colocated = generation_cfg["colocated"]["enabled"]
             # set sampling params
             self.sampling_params = TrainingSamplingParams(
-                top_k=generation_cfg.get("top_k", None),
-                top_p=generation_cfg.get("top_p", 1.0),
-                temperature=generation_cfg.get("temperature", 1.0),
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
             )
 
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
