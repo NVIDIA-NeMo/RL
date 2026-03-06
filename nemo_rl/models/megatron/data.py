@@ -560,8 +560,11 @@ def _get_pack_sequence_parameters_for_megatron(
     if tp_size > 1 and sp:
         minimum_pad_factor *= tp_size
     assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
-        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}). "
-        "Please set policy.make_sequence_length_divisible_by to a multiple of the minimum_pad_factor."
+        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
+        f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+        f"    - If CP is enabled, the minimum pad factor is `cp_size * 2`.\n"
+        f"    - If TP+SP is enabled, the minimum pad factor is `tp_size`.\n"
+        f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
     )
 
     # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.

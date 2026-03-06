@@ -287,13 +287,13 @@ class ClippedPGLossFn(LossFunction):
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
-                    curr_logprobs_unfiltered - generation_logprobs
+                    curr_logprobs - generation_logprobs
                 ).detach()
                 kl_importance_weights = torch.nan_to_num(
                     kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
+                kl_importance_weights = torch.ones_like(curr_logprobs)
 
             # Compute KL loss
             kl = (
