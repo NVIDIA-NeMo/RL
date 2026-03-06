@@ -182,7 +182,7 @@ policy:
       lr_decay_style: "constant"
       lr_decay_iters: null
       lr_warmup_iters: 10
-      lr_warmup_init: 1.0e-7
+      lr_warmup_init: 3e-7
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
