@@ -455,6 +455,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 tool_parser=None,
                 add_special_tokens=False,
             ):
+                if _chat_template_kwargs_override:
+                    chat_template_kwargs = {**(chat_template_kwargs or {}), **_chat_template_kwargs_override}
+
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
                     if message.get("tool_calls"):
@@ -608,6 +611,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if reasoning_parser_plugin:
             from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
             ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
+        # Extract chat_template_kwargs before passing to OpenAIServingChat (not a vllm init param).
+        # These are injected per-request in _preprocess_chat instead.
+        _chat_template_kwargs_override = serving_chat_kwargs.pop("chat_template_kwargs", None)
 
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 

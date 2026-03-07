@@ -1,0 +1,28 @@
+defaults: "stage2_swe_pivot.yaml"
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/super_v3_prod_stage2_swe_pivot_8node"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 512
+  max_total_sequence_length: 32768
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    context_parallel_size: 4
+
+cluster:
+  num_nodes: 8
