@@ -24,7 +24,7 @@ done
 ```
 
 ## Prepare the code
-Note that we currently require using the `super-v3` branch to train Nemotron 3 Super.
+Training Nemotron 3 Super currently requires the `super-v3` branch.
 ```bash
 # Checkout NeMo RL
 git clone -b super-v3 https://github.com/NVIDIA-NeMo/RL.git
@@ -42,7 +42,7 @@ RL training for Nemotron 3 Super consists of 3 main stages:
 2. SWE RL
 3. RLHF with length penalty to reduce verbosity
 
-The RLVR stage consists of 3 sub-stages that use different data blends. The SWE RL stage consists of 2 sub-stages. This means there are 6 total stages in the full RL pipeline.
+The RLVR stage consists of 3 sub-stages with different data blends and the SWE RL stage consists of 2 sub-stages, for 6 total stages.
 
 ### Build sandbox container
 
@@ -65,16 +65,15 @@ enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
 Each stage of training uses the `super_launch.sh` script to launch the training job. In the instructions below, be sure to correctly set the following variables:
 
 * `$DATA_DIR`: Path to the **final** `data` directory produced in [Download and prepare the data](#download-and-prepare-the-data).
-* `$SANDBOX_CONTAINER`: The location of the sandbox container in the [Build sandbox container](#build-sandbox-container) section.
-* `$PERSISTENT_CACHE_DIR`: The location to a folder that will be used to store caches for vllm and flashinfer.
+* `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
+* `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
-* Optional: `$EXTRA_MOUNTS` — comma-separated host:container mount pairs for your cluster (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). Omit if not needed.
-* Optional: `$SIF_DIR` — path to the directory containing SWE-bench `.sif` images (only needed for Stage 2.2).
+* Optional: `$EXTRA_MOUNTS` — additional comma-separated `host:container` mount pairs for your cluster. The launch script automatically mounts `MODEL_PATH`, data directories, `PERSISTENT_CACHE`, and `SIF_DIR` into the container, but you may still need this for other paths (e.g. `EXTRA_MOUNTS=/scratch:/scratch`).
 
-In all the recipes, the `MODEL_PATH` also needs to be correctly set. The starting checkpoint for RL (Stage 1.1) is the SFT finetuned checkpoint. Each subsequent stage in the RL pipeline takes as an input checkpoint the output of the previous stage.
+`MODEL_PATH` is the input checkpoint for each stage. Stage 1.1 starts from the SFT checkpoint; every subsequent stage takes the output of the previous one.
 
-The number of nodes required for each stage is specified in the `cluster.num_nodes` config in the corresponding config file. This corresponds to the number of B200 nodes (8 GPUs each) required for training and may need to be adjusted when using different GPUs.
+Node counts listed below (from `cluster.num_nodes` in each config) assume B200 nodes with 8 GPUs each and may need adjustment for other GPU types.
 
 ### Stage 1 - RLVR
 
@@ -87,7 +86,7 @@ TRAIN_PATH=$DATA_DIR/rlvr1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr1/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -102,7 +101,7 @@ TRAIN_PATH=$DATA_DIR/rlvr2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr2/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -117,7 +116,7 @@ TRAIN_PATH=$DATA_DIR/rlvr3/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr3/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -134,7 +133,7 @@ TRAIN_PATH=$DATA_DIR/swe1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe1/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -142,7 +141,7 @@ bash super_launch.sh
 
 #### Stage 2 - SWE 2 (64 nodes)
 
-For this stage of RL training, we first need to download the Apptainer images that are used for the Gym environments.
+This stage requires Apptainer images for the SWE Gym environments.
 
 First, install [Apptainer](https://apptainer.org/docs/admin/main/installation.html) if it is not already available:
 
@@ -158,7 +157,7 @@ Then run the download script, which pulls Docker images from the R2E-Gym, SWE-Gy
 ./examples/nemo_gym/download_swe_images.py --sif-dir /path/to/sif --concurrency 16
 ```
 
-Then launch with `SIF_DIR` pointing at the directory containing the downloaded `.sif` files:
+Then launch the training run with `SIF_DIR` pointing at the directory containing the downloaded `.sif` files:
 
 ```bash
 EXP_NAME=stage2.2-swe2 \
@@ -168,7 +167,7 @@ TRAIN_PATH=$DATA_DIR/swe2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe2/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 SIF_DIR=/path/to/sif \
@@ -184,7 +183,7 @@ TRAIN_PATH=$DATA_DIR/rlhf/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlhf/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
-PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
+PERSISTENT_CACHE=$PERSISTENT_CACHE \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh

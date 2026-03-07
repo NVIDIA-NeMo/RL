@@ -132,9 +132,17 @@ if [[ -n "$SIF_DIR" ]]; then
 fi
 
 export CONTAINER
-# Core mounts (code, 3rdparty); set EXTRA_MOUNTS for cluster filesystems (e.g. /scratch:/scratch,/lustre:/lustre).
+
+# ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR},${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm,${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
-export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
+
+AUTO_MOUNTS=""
+for p in "$MODEL_PATH" "$(dirname "$TRAIN_PATH")" "$(dirname "$VAL_PATH")" "$PERSISTENT_CACHE" ${SIF_DIR:+"$SIF_DIR"}; do
+    [[ -z "$p" ]] && continue
+    AUTO_MOUNTS="${AUTO_MOUNTS:+${AUTO_MOUNTS},}${p}:${p}"
+done
+
+export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${AUTO_MOUNTS:+${AUTO_MOUNTS},}${BASE_MOUNTS}"
 
 # ---- Read num_nodes from the config's cluster.num_nodes field ----
 NUM_NODES=$(awk '/^cluster:/{found=1} found && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")
