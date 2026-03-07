@@ -178,9 +178,6 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     # Infer the index from RL's pyproject.toml. This ensures all venv creation that needs torch will use the RL prescribed version for consistency since RL dictates the container CUDA version.
     UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
     UV_LINK_MODE=hardlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
-
-    # Uninstall gradio to address GHSA-jmh7-g254-2cq9 since it is optional
-    /opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym/bin/pip uninstall gradio
 fi
 
 # Remove /tmp/ray because the previous script starts up a local ray cluster which creates a session
