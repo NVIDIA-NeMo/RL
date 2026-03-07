@@ -124,7 +124,7 @@ bash super_launch.sh
 
 ### Stage 2 - SWE
 
-#### Stage 2 - SWE 1 (64 nodes)
+#### Stage 2.1 - SWE 1 (64 nodes)
 ```bash
 EXP_NAME=stage2.1-swe1 \
 CONFIG_PATH=examples/configs/super/stage2_swe1.yaml \
@@ -139,7 +139,7 @@ SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
 ```
 
-#### Stage 2 - SWE 2 (64 nodes)
+#### Stage 2.2 - SWE 2 (64 nodes)
 
 This stage requires Apptainer images for the SWE Gym environments.
 
