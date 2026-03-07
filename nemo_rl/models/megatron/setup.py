@@ -928,15 +928,13 @@ def setup_reference_model_state(
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
+    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+    # so they only need to be loaded here if use_peft is False
     should_load_checkpoint = (
-        ref_checkpoint_config.pretrained_checkpoint is not None
+        not use_peft
+        and ref_checkpoint_config.pretrained_checkpoint is not None
         and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
     )
-
-    if should_load_checkpoint and use_peft:
-        # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
-        # This is switched off here in order to load these states from the checkpoint
-        ref_megatron_cfg.checkpoint.finetune = False
 
     print("Loading the Reference Model")
 
@@ -949,8 +947,6 @@ def setup_reference_model_state(
             checkpointing_context=ref_ckpt_context,
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
-    else:
-        print("Reference model not loaded")
 
     reference_state_dict = {}
 
@@ -966,6 +962,8 @@ def setup_reference_model_state(
                 cpu_item = item
             reference_state_dict[name] = cpu_item
         print("Reference model loaded")
+    else:
+        print("Reference model not loaded")
 
     return reference_state_dict
 
