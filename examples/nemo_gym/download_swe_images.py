@@ -1,3 +1,45 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "datasets>=2.19.0",
+# ]
+# ///
+
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Downloads SWE-bench evaluation containers as Apptainer .sif files for use
+with the OpenHands SWE agent in NeMo RL training.
+
+Images are pulled from three HuggingFace datasets:
+  - R2E-Gym/R2E-Gym-Subset
+  - SWE-Gym/SWE-Gym
+  - princeton-nlp/SWE-bench_Verified
+
+Each image is saved as <prefix>_<image_tag>.sif under the output directory.
+Pass SIF_DIR=/path/to/sif when launching super_launch.sh for Stage 2.2
+and the container_formatter paths will be set automatically.
+
+Usage:
+    chmod +x examples/nemo_gym/download_swe_images.py
+    ./examples/nemo_gym/download_swe_images.py --sif-dir /path/to/sif [--concurrency 16]
+"""
+
+from __future__ import annotations
+
 import argparse
 import asyncio
 import os
@@ -5,6 +47,35 @@ import shutil
 import tempfile
 
 from datasets import load_dataset
+
+
+IMAGE_SOURCES = [
+    {
+        "name": "R2E-Gym",
+        "dataset": "R2E-Gym/R2E-Gym-Subset",
+        "split": "train",
+        "prefix": "r2egym",
+        "images": lambda ds: [row["docker_image"] for row in ds],
+    },
+    {
+        "name": "SWE-Gym",
+        "dataset": "SWE-Gym/SWE-Gym",
+        "split": "train",
+        "prefix": "swegym",
+        "images": lambda ds: [
+            f"xingyaoww/sweb.eval.x86_64.{row['instance_id'].replace('__', '_s_')}" for row in ds
+        ],
+    },
+    {
+        "name": "SWE-Bench Verified",
+        "dataset": "princeton-nlp/SWE-bench_Verified",
+        "split": "test",
+        "prefix": "swebench",
+        "images": lambda ds: [
+            f"swebench/sweb.eval.x86_64.{row['instance_id'].replace('__', '_1776_')}" for row in ds
+        ],
+    },
+]
 
 
 async def pull_image(
@@ -25,8 +96,8 @@ async def pull_image(
         temp_dir = tempfile.mkdtemp(prefix="apptainer_tmp_")
         try:
             proc = await asyncio.create_subprocess_exec(
-                "singularity",
-                "pull",
+                "apptainer",
+                "build",
                 local_image_path,
                 f"docker://{image_name}",
                 env={**os.environ, "APPTAINER_CACHEDIR": cache_dir, "APPTAINER_TMPDIR": temp_dir},
@@ -42,83 +113,43 @@ async def pull_image(
             shutil.rmtree(cache_dir, ignore_errors=True)
 
 
-async def install_apptainer():
-    """
-    Install Apptainer on the system.
-    """
-    cmd = (
-        "apt-get update"
-        " && apt-get install -y git build-essential gcc wget"
-        " && wget -O /tmp/apptainer_1.3.1_amd64.deb"
-        " https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb"
-        " && apt install -y /tmp/apptainer_1.3.1_amd64.deb"
-    )
-    proc = await asyncio.create_subprocess_exec("bash", "-c", cmd)
-    await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"install_apptainer failed (rc={proc.returncode})")
-
-
-async def main(sif_dir: str, concurrency: int):
+async def main(sif_dir: str, concurrency: int) -> None:
+    os.makedirs(sif_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(concurrency)
 
-    # Install apptainer
-    await install_apptainer()
-
-    # Pull images
-    image_sources = [
-        {
-            "name": "R2E-Gym",
-            "dataset": "R2E-Gym/R2E-Gym-Subset",
-            "split": "train",
-            "prefix": "r2egym",
-            "images": lambda ds: [row["docker_image"] for row in ds],
-        },
-        {
-            "name": "SWE-Gym",
-            "dataset": "SWE-Gym/SWE-Gym",
-            "split": "train",
-            "prefix": "swegym",
-            "images": lambda ds: [
-                f"xingyaoww/sweb.eval.x86_64.{row['instance_id'].replace('__', '_s_')}" for row in ds
-            ],
-        },
-        {
-            "name": "SWE-Bench Verified",
-            "dataset": "princeton-nlp/SWE-bench_Verified",
-            "split": "test",
-            "prefix": "swebench",
-            "images": lambda ds: [
-                f"swebench/sweb.eval.x86_64.{row['instance_id'].replace('__', '_1776_')}" for row in ds
-            ],
-        },
-    ]
-
-    for source in image_sources:
+    for source in IMAGE_SOURCES:
+        print(f"\n=== {source['name']} ({source['dataset']}) ===", flush=True)
         ds = load_dataset(source["dataset"], "default", split=source["split"])
         image_names = source["images"](ds)
         tasks = [pull_image(semaphore, name, sif_dir, source["prefix"]) for name in image_names]
         await asyncio.gather(*tasks)
-        print(f"Pulled {len(image_names)} images for {source['name']}")
+        print(f"Done: {len(image_names)} images for {source['name']}", flush=True)
 
 
 if __name__ == "__main__":
-    """
-    uv run --with datasets pull_super_images.py --sif-dir /path/to/sif --concurrency 16
+    if shutil.which("apptainer") is None:
+        print(
+            "Error: 'apptainer' not found on PATH.\n"
+            "Install Apptainer (https://apptainer.org/docs/admin/main/installation.html) "
+            "before running this script.",
+            file=__import__("sys").stderr,
+        )
+        raise SystemExit(1)
 
-    # add paths to config in Nemo-RL
-    container_formatter:
-    - "/path/to/sif/r2egym_{instance_id}.sif"
-    - "/path/to/sif/swegym_sweb.eval.x86_64.{instance_id}.sif"
-    - "/path/to/sif/swebench_sweb.eval.x86_64.{instance_id}.sif"
-    """
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sif-dir", type=str, required=True)
-    parser.add_argument("--concurrency", type=int, default=16)
+    parser = argparse.ArgumentParser(
+        description="Download SWE-bench evaluation containers as Apptainer .sif files."
+    )
+    parser.add_argument(
+        "--sif-dir",
+        type=str,
+        required=True,
+        help="Directory to save .sif files",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=16,
+        help="Number of parallel image pulls (default: 16)",
+    )
     args = parser.parse_args()
-
-    sif_dir = args.sif_dir
-    concurrency = args.concurrency
-
-    asyncio.run(main(sif_dir, concurrency))
+    asyncio.run(main(args.sif_dir, args.concurrency))

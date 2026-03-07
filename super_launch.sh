@@ -19,6 +19,8 @@ SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 DRY_RUN="${DRY_RUN:-false}"
 # Optional: extra host:container mount pairs (e.g. "/scratch:/scratch,/lustre:/lustre") for your cluster.
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
+# Optional: path to directory containing .sif images for SWE-bench (Stage 2.2).
+SIF_DIR="${SIF_DIR:-}"
 
 # ---- Derived paths ----
 CODE_DIR=$PWD
@@ -124,6 +126,10 @@ export COMMAND="date ; \
     logger.wandb.project=${WANDB_PROJ} \
     data.train.data_path=${TRAIN_PATH} \
     data.validation.data_path=${VAL_PATH}"
+
+if [[ -n "$SIF_DIR" ]]; then
+    COMMAND="$COMMAND sif_dir=${SIF_DIR}"
+fi
 
 export CONTAINER
 # Core mounts (code, 3rdparty); set EXTRA_MOUNTS for cluster filesystems (e.g. /scratch:/scratch,/lustre:/lustre).

@@ -282,6 +282,7 @@ data:
     system_prompt_file: null
     processor: "nemo_gym_data_processor"
 
+sif_dir: "/path/to/sif"
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
@@ -301,11 +302,9 @@ env:
           run_with_mixed_prompts: true
           dataset_path: "/path/to/train.jsonl"
           container_formatter:
-          - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
-          - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swe-bench/sweap.{instance_id}.sif"
-          - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swe-bench/namanjain12_{instance_id}.sif"
-          - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swe-bench/sweap.{instance_id}.sif"
-          - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
+          - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
+          - "${sif_dir}/r2egym_{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:

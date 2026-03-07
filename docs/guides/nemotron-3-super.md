@@ -46,7 +46,19 @@ The RLVR stage consists of 3 sub-stages that use different data blends. The SWE 
 
 ### Build sandbox container
 
-TODO
+Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during training rely on a sandbox container for code execution, including [NeMo-Skills tools](https://github.com/NVIDIA-NeMo/Gym/tree/main/resources_servers/ns_tools) (stateful Python execution with math verification) and [Lean4 formal proof verification](https://github.com/NVIDIA-NeMo/Gym/tree/main/resources_servers/math_formal_lean). To build the sandbox container, use the [NeMo-Skills Dockerfile](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox):
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Skills.git
+cd Skills
+docker build -t nemo-skills-sandbox:latest -f dockerfiles/Dockerfile.sandbox .
+```
+
+For SLURM clusters using [enroot](https://github.com/NVIDIA/enroot), convert the image to a `.sqsh` file:
+
+```bash
+enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
+```
 
 ### Launch script
 
@@ -58,6 +70,7 @@ Each stage of training uses the `super_launch.sh` script to launch the training 
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
 * Optional: `$EXTRA_MOUNTS` — comma-separated host:container mount pairs for your cluster (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). Omit if not needed.
+* Optional: `$SIF_DIR` — path to the directory containing SWE-bench `.sif` images (only needed for Stage 2.2).
 
 In all the recipes, the `MODEL_PATH` also needs to be correctly set. The starting checkpoint for RL (Stage 1.1) is the SFT finetuned checkpoint. Each subsequent stage in the RL pipeline takes as an input checkpoint the output of the previous stage.
 
@@ -110,7 +123,9 @@ SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
 ```
 
-### Stage 2 - SWE 1 (64 nodes)
+### Stage 2 - SWE
+
+#### Stage 2 - SWE 1 (64 nodes)
 ```bash
 EXP_NAME=stage2.1-swe1 \
 CONFIG_PATH=examples/configs/super/stage2_swe1.yaml \
@@ -125,18 +140,26 @@ SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
 ```
 
-### Stage 2 - SWE 2 (64 nodes)
-#### Download Apptainer images for SWE stage
+#### Stage 2 - SWE 2 (64 nodes)
+
+For this stage of RL training, we first need to download the Apptainer images that are used for the Gym environments.
+
+First, install [Apptainer](https://apptainer.org/docs/admin/main/installation.html) if it is not already available:
 
 ```bash
-uv run --with datasets examples/nemo_gym/download_swe_images.py --sif-dir /path/to/sif --concurrency 16
-
-# Update container formatter in examples/configs/super/stage2_swe2.yaml
-container_formatter:
-  - "/path/to/sif/r2egym_{instance_id}.sif"
-  - "/path/to/sif/swegym_sweb.eval.x86_64.{instance_id}.sif"
-  - "/path/to/sif/swebench_sweb.eval.x86_64.{instance_id}.sif"
+# Ubuntu/Debian
+wget https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb
+sudo apt install -y ./apptainer_1.3.1_amd64.deb
 ```
+
+Then run the download script, which pulls Docker images from the R2E-Gym, SWE-Gym, and SWE-Bench Verified datasets on HuggingFace and converts them to `.sif` files:
+
+```bash
+./examples/nemo_gym/download_swe_images.py --sif-dir /path/to/sif --concurrency 16
+```
+
+Then launch with `SIF_DIR` pointing at the directory containing the downloaded `.sif` files:
+
 ```bash
 EXP_NAME=stage2.2-swe2 \
 CONFIG_PATH=examples/configs/super/stage2_swe2.yaml \
@@ -148,6 +171,7 @@ SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE_DIR \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SIF_DIR=/path/to/sif \
 bash super_launch.sh
 ```
 
