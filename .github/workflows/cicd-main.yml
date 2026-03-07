@@ -55,6 +55,7 @@ jobs:
     outputs:
       test_level: ${{ steps.evaluate.outputs.test_level }}
       image_tag: ${{ steps.evaluate.outputs.image_tag }}
+      test_sha: ${{ steps.sha.outputs.main }}
     steps:
       - name: Get changed files
         id: changed-files
@@ -128,6 +129,27 @@ jobs:
           fi
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA=${{ github.event.merge_group.head_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
   pr-branch-up-to-date-check:
     name: Check if PR branch is up to date
     needs: [pre-flight]
@@ -188,7 +210,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -230,7 +252,7 @@ jobs:
     needs: [pre-flight]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
     with:
-      build-ref: ${{ github.sha }}
+      build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
@@ -263,6 +285,7 @@ jobs:
           script: ${{ matrix.script }}
           is_doc_test: "true"
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-unit-tests:
     strategy:
@@ -286,6 +309,8 @@ jobs:
           (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
         ) && !cancelled()
       }}
+
+
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     steps:
@@ -302,6 +327,7 @@ jobs:
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-functional-tests:
     strategy:
@@ -326,6 +352,7 @@ jobs:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-fast-functional-tests:
     strategy:
@@ -351,6 +378,7 @@ jobs:
           script: ${{ matrix.script }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   CI_QA_Gate:
     name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
@@ -389,6 +417,8 @@ jobs:
                 )
               )
             }}
+
+
           CI_SKIP: ${{ github.event.label.name == 'Skip CICD' }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |

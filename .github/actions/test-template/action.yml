@@ -62,6 +62,10 @@ inputs:
     description: "Override container image tag. If set, infers FAST=1 and prefetches venvs + regenerates fingerprint at startup."
     required: false
     default: ""
+  test-commit-sha:
+    description: "Commit SHA to use for test"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -161,8 +165,9 @@ runs:
       env:
         DIR: ${{ github.run_id }}
       with:
-        submodules: 'recursive'
+        submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
+        ref: ${{ inputs.test-commit-sha }}
 
     - name: Run tests
       id: test
