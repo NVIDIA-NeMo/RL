@@ -53,6 +53,7 @@ jobs:
       head_ref: ${{ steps.base-head-ref.outputs.head_ref }}
       head_sha: ${{ steps.base-head-ref.outputs.head_sha }}
       head_label: ${{ steps.base-head-ref.outputs.head_label }}
+      has_skip_cicd: ${{ steps.base-head-ref.outputs.has_skip_cicd }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -68,25 +69,33 @@ jobs:
         id: base-head-ref
         env:
           IS_PULL_REQUEST_REF: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
         run: |
-          if [[ "$IS_PULL_REQUEST_REF" == "true" ]]; then
-            base_ref="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
-            base_sha="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.sha }}"
-            head_ref="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.ref }}"
-            head_sha="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.sha }}"
-            head_label="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.label }}"
+          if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
+            base_ref=$(echo "$PR_INFO_JSON" | jq -r '.base.ref')
+            base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
+            head_ref=$(echo "$PR_INFO_JSON" | jq -r '.head.ref')
+            head_sha=$(echo "$PR_INFO_JSON" | jq -r '.head.sha')
+            head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
+            ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
+            has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
           else
             base_ref="HEAD~1"
             base_sha=$(git rev-parse HEAD~1)
             head_ref="HEAD"
             head_sha="${{ github.sha }}"
             head_label="${{ github.ref_name }}"
+            ci_label=""
+            has_skip_cicd="false"
           fi
+          [[ "$has_skip_cicd" != "true" ]] && has_skip_cicd="false"
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "head_label=$head_label" >> "$GITHUB_OUTPUT"
+          echo "ci_label=$ci_label" >> "$GITHUB_OUTPUT"
+          echo "has_skip_cicd=$has_skip_cicd" >> "$GITHUB_OUTPUT"
 
       - name: Get changed files
         id: changed-files
@@ -109,7 +118,7 @@ jobs:
           CHANGED_DOCS: ${{ steps.changed-files.outputs.doc_all_changed_files }}
           CHANGED_SRC: ${{ steps.changed-files.outputs.src_all_changed_files }}
           IS_PULLREQUEST: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-          LABEL: ${{ github.event.label.name }}
+          LABEL: ${{ steps.base-head-ref.outputs.ci_label }}
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
           # Some output that's helpful for debugging
@@ -444,7 +453,7 @@ jobs:
                 )
               )
             }}
-          CI_SKIP: ${{ github.event.label.name == 'Skip CICD' }}
+          CI_SKIP: ${{ needs.pre-flight.outputs.has_cicd_skip_label }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
