@@ -6,6 +6,29 @@ This guide details the Group Relative Policy Optimization (GRPO) implementation 
 
 To get started quickly, use the script [examples/run_grpo.py](../../examples/run_grpo.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
+### Prerequisites
+
+Set the required environment variables before launching:
+
+```bash
+# Required: HuggingFace and Weights & Biases
+export HF_HOME=/path/to/huggingface/cache
+export WANDB_API_KEY=your_wandb_key
+# For Llama models, also run: huggingface-cli login
+
+# Recommended: Disable DeepGEMM if not available on your GPU (e.g., H20)
+export VLLM_USE_DEEP_GEMM=0
+```
+
+> [!NOTE]
+> If you are running outside of a pre-built Docker container (bare-metal), you may need to prefetch the Ray worker virtual environments before launching:
+> ```bash
+> uv run nemo_rl/utils/prefetch_venvs.py                # all workers
+> uv run nemo_rl/utils/prefetch_venvs.py vllm policy     # selective
+> ```
+
+### Launch
+
 We recommend launching the job using `uv`:
 
 ```bash
@@ -14,7 +37,25 @@ uv run examples/run_grpo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+### Troubleshooting Common Setup Issues
+
+If you encounter issues during the first run, try the following:
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| `No module named 'nemo_automodel'` or `No module named 'vllm'` | Worker venvs not built | `uv run nemo_rl/utils/prefetch_venvs.py` |
+| `cannot import name 'OmegaConf'` | Driver virtual environment not synced | `uv venv && uv sync` |
+| `No module named 'ray._private.node'` | Corrupted Ray installation | `uv pip install "ray[default]==2.49.2" --force-reinstall` |
+| `libcudnn.so.9: cannot open shared object` | cuDNN not visible to Ray workers (bare-metal) | See [cuDNN note](../about/installation.md#cudnn-for-megatron-backend) or `export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION` |
+| `DeepGEMM backend is not available` | DeepGEMM not compiled for your GPU | `export VLLM_USE_DEEP_GEMM=0` |
+
+For Ray worker virtual environment issues, clearing and rebuilding may help:
+
+```bash
+ray stop
+rm -rf /opt/ray_venvs/*
+uv run nemo_rl/utils/prefetch_venvs.py
+```
 
 In this guide, we'll walk through how we handle:
 
