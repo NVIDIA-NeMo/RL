@@ -955,3 +955,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             table.add_row(row)
 
         print(table)
+
+    def copy_weights_from(self, source_policy: "Policy") -> None:
+        """Copy weights from source policy to this policy.
+
+        Used for initializing EMA teacher from student weights.
+
+        Args:
+            source_policy: The policy to copy weights from
+        """
+        # Get state dict from source policy
+        source_state_futures = source_policy.worker_group.run_all_workers_single_data(
+            "get_model_state_dict"
+        )
+        source_states = ray.get(source_state_futures)
+
+        # Load state dict into this policy - send each worker's state dict to corresponding worker
+        target_futures = []
+        for worker_idx, state_dict in enumerate(source_states):
+            future = self.worker_group.workers[worker_idx].load_model_state_dict.remote(
+                state_dict=state_dict
+            )
+            target_futures.append(future)
+        ray.get(target_futures)
+
+    def update_from_ema(
+        self, student_policy: "Policy", update_info: dict[str, Any]
+    ) -> None:
+        """Update this policy's parameters using EMA from student policy.
+
+        Formula: self.params = ema_decay * self.params + (1 - ema_decay) * student.params
+
+        Args:
+            student_policy: The student policy whose parameters will be used for EMA update
+            update_info: Dictionary containing 'ema_decay' parameter
+        """
+        ema_decay = update_info["ema_decay"]
+
+        # Get student state dict
+        student_state_futures = student_policy.worker_group.run_all_workers_single_data(
+            "get_model_state_dict"
+        )
+        student_states = ray.get(student_state_futures)
+
+        # Update teacher parameters with EMA - send each worker's state dict to corresponding worker
+        teacher_futures = []
+        for worker_idx, student_state_dict in enumerate(student_states):
+            future = self.worker_group.workers[worker_idx].update_model_with_ema.remote(
+                student_state_dict=student_state_dict,
+                ema_decay=ema_decay
+            )
+            teacher_futures.append(future)
+        ray.get(teacher_futures)

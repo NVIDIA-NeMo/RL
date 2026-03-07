@@ -1,0 +1,12 @@
+No chat template provided, using tokenizer's default
+
+▶ Setting up envs...
+
+▶ Setting up data...
+TaskDataSpec(task_name='OpenThoughts', prompt_file='examples/prompts/cot.txt', system_prompt_file=None) <function openthoughts_processor at 0x7f07471a6fc0>
+[<nemo_rl.data.datasets.response_datasets.openthoughts.OpenThoughtsDataset object at 0x7f09d8ad54c0>]
+  ✓ Training dataset loaded with 113957 samples.
+  ✓ Validation dataset loaded with 480 samples.
+<nemo_rl.data.datasets.processed_dataset.AllTaskProcessedDataset object at 0x7f09d8a27e30> {'OpenThoughts': Actor(MathEnvironment, 3fd910af58d7ee0f7e346f9601000000)}
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mself-distillation-OpenThoughts-Qwen/Qwen3-4B-Instruct-2507-mixed-1024[0m at: [34m[0m

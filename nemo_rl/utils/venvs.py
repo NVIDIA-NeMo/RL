@@ -76,6 +76,8 @@ def create_local_venv(
 
     logger.info(f"Creating new venv at {venv_path}")
 
+    print(f"Creating new venv at {venv_path}")
+
     # Create the virtual environment
     uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
