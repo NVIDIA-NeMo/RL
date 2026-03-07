@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import threading
 import warnings
 from pathlib import Path
+from queue import Empty, Queue
 from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -81,6 +83,99 @@ class MasterConfig(TypedDict):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+
+# =======================================================
+# Data Prefetch Pipeline
+# =======================================================
+class DataPrefetcher:
+    """Prefetches and preprocesses data batches in a background thread.
+
+    While the GPU is training on step N, the CPU prepares data for step N+1
+    in a background thread. This hides the CPU data processing latency
+    (tokenization, padding, collation) behind GPU compute time.
+
+    The prefetcher wraps the dataloader and yields preprocessed
+    ``BatchedDataDict`` objects ready for ``policy.train()``.
+    """
+
+    def __init__(
+        self,
+        dataloader: StatefulDataLoader,
+        tokenizer,
+        master_config: "MasterConfig",
+        maxsize: int = 2,
+    ):
+        self.dataloader = dataloader
+        self.tokenizer = tokenizer
+        self.master_config = master_config
+        self.queue: Queue = Queue(maxsize=maxsize)
+        self.thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def _preprocess_batch(self, batch) -> BatchedDataDict:
+        """Preprocess a raw collated batch into a BatchedDataDict."""
+        add_loss_mask_to_message_log(
+            batch["message_log"],
+            roles_to_train_on=["assistant"],
+        )
+        cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+            batch["message_log"],
+            pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=self.master_config["policy"][
+                "make_sequence_length_divisible_by"
+            ],
+        )
+        train_data: BatchedDataDict = BatchedDataDict(
+            {
+                "input_ids": cat_and_padded["token_ids"],
+                "input_lengths": input_lengths,
+                "token_mask": cat_and_padded["token_loss_mask"],
+                "sample_mask": batch["loss_multiplier"],
+            }
+        )
+        train_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+        return train_data
+
+    def _worker(self):
+        """Background thread: iterate dataloader, preprocess, enqueue."""
+        try:
+            for batch in self.dataloader:
+                if self._stop_event.is_set():
+                    break
+                train_data = self._preprocess_batch(batch)
+                self.queue.put(train_data)
+                if self._stop_event.is_set():
+                    break
+        except Exception as e:
+            self.queue.put(e)
+        finally:
+            self.queue.put(None)  # sentinel
+
+    def start(self):
+        """Start the background prefetch thread."""
+        self._stop_event.clear()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Signal the background thread to stop and drain the queue."""
+        self._stop_event.set()
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Empty:
+                break
+
+    def __iter__(self):
+        """Yield preprocessed ``BatchedDataDict`` objects."""
+        while True:
+            item = self.queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
 
 # =======================================================
@@ -407,6 +502,11 @@ def sft_train(
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
+    # Whether to use background data prefetching.
+    # When enabled, the next batch is preprocessed on CPU while the current
+    # batch is being trained on GPU, hiding data processing latency.
+    use_data_prefetch = sft_config.get("use_data_prefetch", False)
+
     policy.prepare_for_training()
 
     while (
@@ -415,7 +515,19 @@ def sft_train(
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
-        for batch in train_dataloader:
+        # Choose between prefetched or inline data processing
+        if use_data_prefetch:
+            prefetcher = DataPrefetcher(
+                train_dataloader, tokenizer, master_config, maxsize=2
+            )
+            prefetcher.start()
+            print("  🚀 Data prefetch pipeline started")
+            batch_iter = prefetcher
+        else:
+            prefetcher = None
+            batch_iter = train_dataloader
+
+        for batch_or_data in batch_iter:
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
             )
@@ -423,34 +535,43 @@ def sft_train(
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
-                # Prepare batch and generate responses
-                print("▶ Preparing batch...")
-                with timer.time("data_processing"):
-                    ## add loss mask based on role to every message
-                    add_loss_mask_to_message_log(
-                        batch["message_log"],
-                        roles_to_train_on=["assistant"],
-                    )
+                if use_data_prefetch:
+                    # Data already preprocessed by the prefetcher
+                    train_data = batch_or_data
+                else:
+                    # Inline data processing (original behavior)
+                    batch = batch_or_data
+                    print("▶ Preparing batch...")
+                    with timer.time("data_processing"):
+                        ## add loss mask based on role to every message
+                        add_loss_mask_to_message_log(
+                            batch["message_log"],
+                            roles_to_train_on=["assistant"],
+                        )
 
-                    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                        batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
+                        cat_and_padded, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                batch["message_log"],
+                                pad_value_dict={
+                                    "token_ids": tokenizer.pad_token_id
+                                },
+                                make_sequence_length_divisible_by=master_config[
+                                    "policy"
+                                ]["make_sequence_length_divisible_by"],
+                            )
+                        )
 
-                    train_data: BatchedDataDict = BatchedDataDict(
-                        {
-                            "input_ids": cat_and_padded["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": cat_and_padded["token_loss_mask"],
-                            "sample_mask": batch["loss_multiplier"],
-                        }
-                    )
-                    train_data.update(
-                        cat_and_padded.get_multimodal_dict(as_tensors=False)
-                    )
+                        train_data: BatchedDataDict = BatchedDataDict(
+                            {
+                                "input_ids": cat_and_padded["token_ids"],
+                                "input_lengths": input_lengths,
+                                "token_mask": cat_and_padded["token_loss_mask"],
+                                "sample_mask": batch["loss_multiplier"],
+                            }
+                        )
+                        train_data.update(
+                            cat_and_padded.get_multimodal_dict(as_tensors=False)
+                        )
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
@@ -631,13 +752,19 @@ def sft_train(
 
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
+                if prefetcher is not None:
+                    prefetcher.stop()
                 return
             if total_steps >= master_config["sft"]["max_num_steps"]:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                if prefetcher is not None:
+                    prefetcher.stop()
                 return
 
+        if prefetcher is not None:
+            prefetcher.stop()
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
