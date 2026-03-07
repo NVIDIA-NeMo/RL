@@ -189,10 +189,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BASE_SHA: ${{ pre-flight.outputs.base_sha }}
-          HEAD_SHA: ${{ pre-flight.outputs.head_sha }}
-          BASE_REF: ${{ pre-flight.outputs.base_ref }}
-          HEAD_LABEL: ${{ pre-flight.outputs.head_label }}
+          BASE_SHA: ${{ needs.pre-flight.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.pre-flight.outputs.head_sha }}
+          BASE_REF: ${{ needs.pre-flight.outputs.base_ref }}
+          HEAD_LABEL: ${{ needs.pre-flight.outputs.head_label }}
         run: |
           echo "Repository: $REPO"
           echo "Base branch: $BASE_REF (SHA: $BASE_SHA)"
