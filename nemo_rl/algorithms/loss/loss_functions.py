@@ -561,6 +561,9 @@ class NLLLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 
+    def __init__(self, use_linear_ce_fusion: bool = False):
+        self.use_linear_ce_fusion = use_linear_ce_fusion
+
     def __call__(
         self,
         next_token_logprobs: Tensor,
@@ -569,12 +572,19 @@ class NLLLossFn(LossFunction):
         global_valid_toks: Tensor,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
+        **_: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
+        if self.use_linear_ce_fusion:
+            # Linear CE fusion returns precomputed next-token logprobs from model.forward.
+            next_token_logprobs = next_token_logprobs.to(torch.float32)
+            next_token_logprobs = next_token_logprobs[
+                :, : data["input_ids"].shape[1] - 1
+            ]
 
         if dpo_loss:
             ## shape: [batch_size]

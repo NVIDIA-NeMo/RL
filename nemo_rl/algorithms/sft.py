@@ -21,7 +21,8 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss import NLLLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -96,7 +97,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    NLLLossFn,
+    LossFunction,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -208,7 +209,10 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn()
+    loss_fn = NLLLossFn(
+        use_linear_ce_fusion=policy_config["megatron_cfg"].get("enabled", False)
+        and policy_config["megatron_cfg"].get("use_linear_ce_fusion_loss", False)
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

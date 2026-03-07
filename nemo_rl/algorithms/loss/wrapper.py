@@ -101,30 +101,55 @@ class SequencePackingLossWrapper:
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
-            logit_start = seq_start // cp_size
-            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
-            logit_length = logit_end - logit_start
-            next_token_logits_slice = next_token_logits.narrow(
-                1, logit_start, logit_length
-            )
 
-            # prepare data for loss function
-            loss_input = self.prepare_fn(
-                logits=next_token_logits_slice,
-                data=unpadded_seq_data,
-                loss_fn=self.loss_fn,
-                vocab_parallel_rank=self.vocab_parallel_rank,
-                vocab_parallel_group=self.vocab_parallel_group,
-                context_parallel_group=self.context_parallel_group,
-            )
+            if (
+                hasattr(self.loss_fn, "use_linear_ce_fusion")
+                and self.loss_fn.use_linear_ce_fusion
+            ):
+                # Linear CE fusion returns precomputed token logprobs where shape
+                # can be shorter by 1 token than padded sequence metadata.
+                # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
+                logit_start = seq_start // cp_size
+                logit_end = min(
+                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    next_token_logits.shape[1],
+                )
+                logit_slice_idxs = slice(logit_start, logit_end)
+                next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
+                # Linear CE fusion path: model.forward already returns next-token logprobs.
+                loss, metrics = self.loss_fn(
+                    next_token_logits_slice,
+                    unpadded_seq_data,
+                    global_valid_seqs,
+                    global_valid_toks,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
+            else:
+                logit_start = seq_start // cp_size
+                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_length = logit_end - logit_start
+                next_token_logits_slice = next_token_logits.narrow(
+                    1, logit_start, logit_length
+                )
+                # prepare data for loss function
+                loss_input = self.prepare_fn(
+                    logits=next_token_logits_slice,
+                    data=unpadded_seq_data,
+                    loss_fn=self.loss_fn,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
 
-            # call loss function
-            loss, metrics = self.loss_fn(
-                data=unpadded_seq_data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+                # call loss function
+                loss, metrics = self.loss_fn(
+                    data=unpadded_seq_data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
 
             # aggregate loss and metrics
             loss_accum += loss

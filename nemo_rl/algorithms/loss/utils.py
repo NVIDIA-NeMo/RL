@@ -51,14 +51,19 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
-        logprobs = get_next_token_logprobs_from_logits(
-            input_ids=data["input_ids"],
-            next_token_logits=logits,
-            seq_index=data.get("seq_index", None),
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
-        )
+        # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
+        # Keep normal path unchanged for standard logits (3D tensor).
+        if logits.ndim == 2:
+            logprobs = logits
+        else:
+            logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
 
         loss_input = {"next_token_logprobs": logprobs}
 
