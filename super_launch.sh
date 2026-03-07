@@ -17,13 +17,13 @@ set -euo pipefail
 WANDB_PROJ="${WANDB_PROJ:-super-v3-posttraining}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 DRY_RUN="${DRY_RUN:-false}"
-# Optional: extra host:container mount pairs (e.g. "/scratch:/scratch,/lustre:/lustre") for your cluster.
+# Comma-separated host:container mount pairs for shared filesystems (e.g. "/scratch:/scratch,/lustre:/lustre").
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 # Optional: path to directory containing .sif images for SWE-bench (Stage 2.2).
 SIF_DIR="${SIF_DIR:-}"
 
 # ---- Derived paths ----
-CODE_DIR=$PWD
+CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
 CHECKPOINT_DIR="results/${EXP_NAME}"
 LOG_DIR="logs/${EXP_NAME}"
@@ -55,7 +55,7 @@ mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}"
 export OMP_NUM_THREADS=16
 
 # ---- Code snapshot ----
-SNAPSHOT_DIR=$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")
+SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
 
 if [ -d "${CODE_DIR}/3rdparty/vllm" ] && [ ! -e "${SNAPSHOT_DIR}/3rdparty/vllm" ]; then
     echo "Symlinking 3rdparty/vllm to snapshot..."
@@ -134,15 +134,12 @@ fi
 export CONTAINER
 
 # ---- Container mounts ----
-BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR},${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm,${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
+BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
+BASE_MOUNTS+=",${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+BASE_MOUNTS+=",${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
+BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
 
-AUTO_MOUNTS=""
-for p in "$MODEL_PATH" "$(dirname "$TRAIN_PATH")" "$(dirname "$VAL_PATH")" "$PERSISTENT_CACHE" ${SIF_DIR:+"$SIF_DIR"}; do
-    [[ -z "$p" ]] && continue
-    AUTO_MOUNTS="${AUTO_MOUNTS:+${AUTO_MOUNTS},}${p}:${p}"
-done
-
-export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${AUTO_MOUNTS:+${AUTO_MOUNTS},}${BASE_MOUNTS}"
+export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
 # ---- Read num_nodes from the config's cluster.num_nodes field ----
 NUM_NODES=$(awk '/^cluster:/{found=1} found && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")

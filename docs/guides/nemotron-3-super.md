@@ -62,14 +62,14 @@ enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
 
 ### Launch script
 
-Each stage of training uses the `super_launch.sh` script to launch the training job. In the instructions below, be sure to correctly set the following variables:
+Each stage is launched with `super_launch.sh`. Set the following variables before running:
 
 * `$DATA_DIR`: Path to the **final** `data` directory produced in [Download and prepare the data](#download-and-prepare-the-data).
 * `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
+* `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
-* Optional: `$EXTRA_MOUNTS` — additional comma-separated `host:container` mount pairs for your cluster. The launch script automatically mounts `MODEL_PATH`, data directories, `PERSISTENT_CACHE`, and `SIF_DIR` into the container, but you may still need this for other paths (e.g. `EXTRA_MOUNTS=/scratch:/scratch`).
 
 `MODEL_PATH` is the input checkpoint for each stage. Stage 1.1 starts from the SFT checkpoint; every subsequent stage takes the output of the previous one.
 
@@ -87,6 +87,7 @@ VAL_PATH=$DATA_DIR/rlvr1/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -102,6 +103,7 @@ VAL_PATH=$DATA_DIR/rlvr2/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -117,6 +119,7 @@ VAL_PATH=$DATA_DIR/rlvr3/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -134,6 +137,7 @@ VAL_PATH=$DATA_DIR/swe1/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
@@ -168,6 +172,7 @@ VAL_PATH=$DATA_DIR/swe2/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 SIF_DIR=/path/to/sif \
@@ -184,6 +189,7 @@ VAL_PATH=$DATA_DIR/rlhf/val-split.jsonl \
 CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
+EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
