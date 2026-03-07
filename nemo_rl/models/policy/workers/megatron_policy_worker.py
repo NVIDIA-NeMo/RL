@@ -1234,6 +1234,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if not is_training:
                 self.model.eval()
 
+            # Always free CUDA cache and synchronize before checkpoint save.
+            # With empty_unused_memory_level=0, the CUDA allocator holds large cached
+            # memory blocks. Synchronize ensures all async CUDA ops complete before
+            # the checkpoint writer serializes tensors.
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             save_checkpoint(
