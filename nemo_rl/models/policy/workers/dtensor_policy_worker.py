@@ -76,7 +76,6 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -158,9 +157,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
-
         """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor

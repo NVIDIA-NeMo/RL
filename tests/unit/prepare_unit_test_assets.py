@@ -56,6 +56,16 @@ def build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
     )
 
     shutil.rmtree(model_path, ignore_errors=True)
+
+    # Fix _tied_weights_keys format for transformers v5 compatibility.
+    # Older trust_remote_code models may set _tied_weights_keys as a list,
+    # but transformers v5's save_pretrained expects a dict.
+    for module in model.modules():
+        if hasattr(module, "_tied_weights_keys") and isinstance(
+            module._tied_weights_keys, list
+        ):
+            module._tied_weights_keys = {}
+
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
     print(f"✓ Built tiny Nemotron-H asset at: {model_path}")
