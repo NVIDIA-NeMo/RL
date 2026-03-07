@@ -164,7 +164,14 @@ UV_LINK_MODE=hardlink uv sync --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
+# Symlink the venv's newer aiohttp package to the ray runtime env directory
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find /opt/nemo_rl_venv/ -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+ln -s /opt/nemo_rl_venv/lib/python3.12/site-packages/aiohttp \
+      /opt/nemo_rl_venv/lib/python3.12/site-packages/ray/_private/runtime_env/agent/thirdparty_files/aiohttp
+
+ln -s /opt/nemo_rl_venv/lib/python3.12/site-packages/aiohttp-*.dist-info \
+      /opt/nemo_rl_venv/lib/python3.12/site-packages/ray/_private/runtime_env/agent/thirdparty_files/
 
 # Prefetch NeMo Gym internal venvs (for gym servers like code_gen, math, etc.)
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
