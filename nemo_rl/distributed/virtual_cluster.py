@@ -112,16 +112,45 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     cvd_tag = f"{cvd_tag_prefix}{cvd.replace(',', '_')}"
 
     # Try to attach to an existing cluster
+    # When using Ray Client (ray://), do not pass runtime_env or _temp_dir: server-side init
+    # rejects "resources" when connecting to an existing cluster.
+    ray_address = os.environ.get("RAY_ADDRESS", "")
+    use_ray_client = ray_address.strip().lower().startswith("ray://")
     try:
-        ray.init(
-            address="auto",
-            log_to_driver=True,
-            include_dashboard=False,
-            runtime_env=runtime_env,
-            _temp_dir=os.path.abspath(log_dir) if log_dir else None,
-        )
+        if use_ray_client:
+            # Connect directly to the Ray client address (e.g. ray://host:10001).
+            # address="auto" searches for a *local* Ray instance and fails when
+            # only a remote cluster exists, causing the fallback at line ~179 to
+            # call ray.init(resources=...) which Ray client rejects.
+            ray.init(
+                address=ray_address,
+                log_to_driver=True,
+                include_dashboard=False,
+            )
+        else:
+            # Use explicit RAY_ADDRESS (e.g. "host:port" GCS address) when set,
+            # otherwise fall back to "auto" (scans local /tmp/ray/ session files).
+            # Ray 2.54+ removed node_ip_address.json so "auto" can fail when the
+            # session file layout changed; an explicit address bypasses this.
+            connect_address = ray_address if ray_address else "auto"
+            ray.init(
+                address=connect_address,
+                log_to_driver=True,
+                include_dashboard=False,
+                runtime_env=runtime_env,
+                _temp_dir=os.path.abspath(log_dir) if log_dir else None,
+            )
 
         cluster_res = ray.cluster_resources()
+
+        # When using Ray client (ray://), we are always connecting to a remote
+        # SLURM-managed cluster.  Skip the nrl_tag reuse heuristic — it only
+        # applies to self-started local clusters and will incorrectly trigger a
+        # ray.shutdown() + local-cluster start when stale nrl_tag_* resources
+        # are present in the remote cluster.
+        if use_ray_client:
+            logger.info(f"Connected to existing Ray cluster via Ray client: {cluster_res}")
+            return
 
         # Check reusability for NeMo-RL managed local clusters
         if any(k.startswith(cvd_tag_prefix) for k in cluster_res):
@@ -153,6 +182,17 @@ def init_ray(log_dir: Optional[str] = None) -> None:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
             return
 
+    except RuntimeError as e:
+        if "Version mismatch" in str(e) and ray.is_initialized():
+            # Ray connected but check_version_info raised. This happens when the cluster
+            # was started with a different Ray binary version (e.g. GCS 2.54 vs Python 2.49).
+            # The connection IS established; just suppress the check and continue.
+            logger.warning(f"Ray version mismatch (treating as warning): {e}")
+            cluster_res = ray.cluster_resources()
+            logger.info(f"Connected to existing Ray cluster (version mismatch suppressed): {cluster_res}")
+            return
+        logger.debug(f"Ray init RuntimeError: {e}")
+        ray.shutdown()
     except ConnectionError:
         logger.debug("No existing Ray cluster found, will start a new one.")
         # If ConnectionError, proceed to start a new local cluster without further action here.

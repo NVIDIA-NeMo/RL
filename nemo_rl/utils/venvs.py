@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import glob
 import logging
 import os
 import shlex
@@ -108,6 +109,67 @@ def create_local_venv(
     return python_path
 
 
+_EXPECTED_CUDNN_VERSION = "9.19.0.56"
+
+
+def _fix_cudnn_in_venv(venv_path: Path) -> None:
+    """Ensure the worker venv has the correct nvidia-cudnn-cu12 version and symlinks.
+
+    1. Checks if the installed nvidia-cudnn-cu12 matches _EXPECTED_CUDNN_VERSION.
+       If not, force-installs the correct version via pip.
+    2. Ensures libcudnn.so is a symlink to libcudnn.so.9 (works around packaging bug
+       where the unversioned .so reports a wrong version).
+    """
+    python = venv_path / "bin" / "python"
+    if not python.exists():
+        return
+
+    # Step 1: Check and fix installed cuDNN version
+    try:
+        result = subprocess.run(
+            [str(python), "-c",
+             "from importlib.metadata import version; print(version('nvidia-cudnn-cu12'))"],
+            capture_output=True, text=True, timeout=30,
+        )
+        installed = result.stdout.strip()
+    except Exception:
+        installed = ""
+
+    if installed != _EXPECTED_CUDNN_VERSION:
+        logger.info(
+            f"cuDNN version mismatch in {venv_path}: "
+            f"installed={installed!r}, expected={_EXPECTED_CUDNN_VERSION}. "
+            f"Force-installing correct version."
+        )
+        try:
+            subprocess.run(
+                [str(python), "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                 f"nvidia-cudnn-cu12=={_EXPECTED_CUDNN_VERSION}"],
+                check=True, timeout=300,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to install nvidia-cudnn-cu12=={_EXPECTED_CUDNN_VERSION}: {e}")
+
+    # Step 2: Fix libcudnn.so symlink
+    candidates = glob.glob(
+        str(venv_path / "lib" / "python*" / "site-packages" / "nvidia" / "cudnn" / "lib")
+    )
+    for lib_dir in candidates:
+        so9 = os.path.join(lib_dir, "libcudnn.so.9")
+        so = os.path.join(lib_dir, "libcudnn.so")
+        if not os.path.exists(so9):
+            continue
+        if os.path.islink(so) and os.readlink(so) == "libcudnn.so.9":
+            continue
+        try:
+            if os.path.exists(so):
+                os.remove(so)
+            os.symlink("libcudnn.so.9", so)
+            logger.info(f"Fixed cuDNN symlink: {so} -> libcudnn.so.9")
+        except OSError as e:
+            logger.warning(f"Could not fix cuDNN symlink at {so}: {e}")
+
+
 # Ray-based helper to create a virtual environment on each Ray node
 @ray.remote(num_cpus=1)  # pragma: no cover
 def _env_builder(
@@ -124,6 +186,7 @@ def _env_builder(
     # Skip early return if force_rebuild is True
     if not force_rebuild and python_path.exists():
         logger.info(f"Using existing venv at {venv_path}")
+        _fix_cudnn_in_venv(venv_path)
         return str(python_path)
 
     # Sleep to stagger node startup
@@ -138,6 +201,7 @@ def _env_builder(
         python_path = venv_path / "bin" / "python"
         while not python_path.exists():
             time.sleep(1)
+        _fix_cudnn_in_venv(venv_path)
         return str(python_path)
 
     # Create the venv directory if needed
@@ -147,7 +211,9 @@ def _env_builder(
     started_file.touch()
     try:
         # Create the virtual environment on this node
-        return create_local_venv(py_executable, venv_name, force_rebuild=force_rebuild)
+        result = create_local_venv(py_executable, venv_name, force_rebuild=force_rebuild)
+        _fix_cudnn_in_venv(venv_path)
+        return result
     finally:
         # Clean up the started file
         if started_file.exists():

@@ -50,6 +50,16 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 
+# Auto-rename SLURM job based on run script name for easy identification in squeue.
+# Extracts the part between "run_" and ".sh" (e.g. "run_120b_8n_tp8.sh" -> "120b_8n_tp8").
+# Only renames if the job was submitted with the generic default name "JOB_NAME".
+if [[ -n "${COMMAND:-}" ]]; then
+  _job_label=$(echo "$COMMAND" | grep -oP "run_\K\S+(?=\.sh)" 2>/dev/null || true)
+  if [[ -n "$_job_label" ]]; then
+    scontrol update JobId="$SLURM_JOB_ID" Name="$_job_label" 2>/dev/null || true
+  fi
+fi
+
 # ===== Optional cuDNN setup (inside container) =====
 # Motivation:
 # - Some fused-attention / TE kernels require a newer cuDNN than what your container ships with.
@@ -139,6 +149,9 @@ fi
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
+
+# Note: Ray temp dir is left at default (/tmp/ray). Using a shared path (e.g. LOG_DIR/ray_tmp) would
+# exceed the 107-byte AF_UNIX socket path limit and cause "validate_socket_filename failed".
 
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
@@ -590,21 +603,19 @@ get_container_pid() {
 }
 
 extract_worker_units() {
-  # Get the container PID for ray-head
-  head_container_pid=$(get_container_pid "$head_node" "ray-head")
-  if [[ -z "$head_container_pid" ]]; then
-    echo 0
-    return
+  # Count connected nodes by checking if each node log shows "Ray runtime started".
+  # Avoids calling `ray status` (which fails on version mismatch between host Ray and
+  # the cluster's GCS binary).
+  local count=0
+  if grep -q "Ray runtime started" "$LOG_DIR/ray-head.log" 2>/dev/null; then
+    count=$((count + GPUS_PER_NODE))
   fi
-
-  # Execute ray status inside the container using enroot exec
-  status_output=$(srun --overlap --nodes=1 --ntasks=1 -w "$head_node" enroot exec "$head_container_pid" ray status 2>/dev/null || true)
-  if echo "$status_output" | grep -q "worker_units"; then
-    worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
-    echo $worker_units
-  else
-    echo 0
-  fi
+  for ((i=1; i<${#nodes_array[@]}; i++)); do
+    if grep -q "Ray runtime started" "$LOG_DIR/ray-worker-$i.log" 2>/dev/null; then
+      count=$((count + GPUS_PER_NODE))
+    fi
+  done
+  echo $count
 }
 
 # Poll to make sure that all Ray worker nodes have connected to the head.
@@ -658,9 +669,9 @@ if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
   HEAD_PID=\$(get_container_pid "$head_node" "ray-head")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && export RAY_ADDRESS=\"ray://$head_node_ip:${RAY_CLIENT_SERVER_PORT}\" && \${CUDNN_SETUP}\$COMMAND"
   else
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}exec bash"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && export RAY_ADDRESS=\"ray://$head_node_ip:${RAY_CLIENT_SERVER_PORT}\" && \${CUDNN_SETUP}exec bash"
   fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
@@ -672,9 +683,9 @@ else
   node="\${nodes_array[\$WORKER_NUM]}"
   WORKER_PID=\$(get_container_pid "\$node" "ray-worker-\$WORKER_NUM")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}\$COMMAND"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && export RAY_ADDRESS=\"ray://$head_node_ip:${RAY_CLIENT_SERVER_PORT}\" && \${CUDNN_SETUP}\$COMMAND"
   else
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \${CUDNN_SETUP}exec bash"
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && export RAY_ADDRESS=\"ray://$head_node_ip:${RAY_CLIENT_SERVER_PORT}\" && \${CUDNN_SETUP}exec bash"
   fi
 fi
 EOF

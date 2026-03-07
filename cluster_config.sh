@@ -28,11 +28,11 @@ setup_cluster_config() {
         GPUS_PER_NODE=$(detect_gpus_per_node "$partition")
     fi
     
-    # Set container path based on GPU count
+    # Set container path based on GPU count (override by setting CONTAINER before sourcing)
     if [[ -z "${CONTAINER:-}" ]]; then
         if [[ "$GPUS_PER_NODE" -eq 8 ]]; then
-            # H100 cluster
-            CONTAINER="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly.sqsh"
+            # H100 cluster: terry's latest tk-vllm-v5 image (override with CONTAINER=... if needed)
+            CONTAINER="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/gitlab-master.nvidia.com/terryk/images/nemo-rl:tk-vllm-v5-c19f6d84f.squashfs"
             CLUSTER_TYPE="H100"
         else
             # GB200 cluster (4 GPUs per node)

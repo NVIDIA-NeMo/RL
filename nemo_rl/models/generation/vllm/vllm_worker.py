@@ -252,7 +252,11 @@ class BaseVllmGenerationWorker:
 
             This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
             """
-            file_to_patch = _get_vllm_file("attention/layer.py")
+            # vllm 0.11.2+ includes this fix upstream; attention/layer.py may not exist.
+            try:
+                file_to_patch = _get_vllm_file("attention/layer.py")
+            except RuntimeError:
+                return
             with open(file_to_patch, "r") as f:
                 content = f.read()
 
