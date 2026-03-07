@@ -59,32 +59,28 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Checkout (for resolving SHAs when not on a PR)
-        if: ${{ !startsWith(github.ref, 'refs/heads/pull-request/') }}
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Determine base and head references
         id: base-head-ref
         env:
           IS_PULL_REQUEST_REF: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-          PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
-          GITHUB_HEAD_SHA: ${{ github.sha }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
-            base_ref=$(echo "$PR_INFO_JSON" | jq -r '.base.ref')
-            base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
-            head_ref=$(echo "$PR_INFO_JSON" | jq -r '.head.ref')
-            head_sha=$(echo "$PR_INFO_JSON" | jq -r '.head.sha')
-            head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
+          if [[ "$IS_PULL_REQUEST_REF" == "true" ]]; then
+            base_ref="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
+            base_sha="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.sha }}"
+            head_ref="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.ref }}"
+            head_sha="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.sha }}"
+            head_label="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.label }}"
           else
             base_ref="HEAD~1"
             base_sha=$(git rev-parse HEAD~1)
             head_ref="HEAD"
-            head_sha="${GITHUB_HEAD_SHA:-$(git rev-parse HEAD)}"
-            head_label="${REF_NAME:-}"
+            head_sha="${{ github.sha }}"
+            head_label="${{ github.ref_name }}"
           fi
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
