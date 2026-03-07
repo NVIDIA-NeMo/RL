@@ -22,7 +22,7 @@ dependencies = [
   "torch==2.9.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
-  "ray[default]==2.49.2",
+  "ray[default]==2.54.0",
   "transformers==4.57.1",
   "wandb>=0.25.0",
   "numpy",

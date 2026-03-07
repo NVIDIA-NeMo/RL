@@ -560,6 +560,16 @@ class RayWorkerGroup:
                         runtime_env["env_vars"]["LD_LIBRARY_PATH"] = (
                             f"{_worker_cudnn_lib}:{ld_path}" if ld_path else _worker_cudnn_lib
                         )
+                else:
+                    # No pip cuDNN found in worker venv (e.g. NEMO_RL_PY_EXECUTABLES_SYSTEM=1).
+                    # Propagate the driver's LD_LIBRARY_PATH so pip cuDNN on /lustre reaches actors.
+                    _driver_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+                    if _driver_ld_path:
+                        existing = runtime_env["env_vars"].get("LD_LIBRARY_PATH", "")
+                        if _driver_ld_path not in existing:
+                            runtime_env["env_vars"]["LD_LIBRARY_PATH"] = (
+                                f"{_driver_ld_path}:{existing}" if existing else _driver_ld_path
+                            )
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
