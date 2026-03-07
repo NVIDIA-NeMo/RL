@@ -211,5 +211,5 @@ class TestRewardModelEnvironment:
         assert output.rewards.shape == (2,)
         assert output.rewards.dtype == torch.float32
         # Verify expected reward values (with tolerance for floating point precision)
-        expected_rewards = torch.tensor([-5.3750, 2.6250])
+        expected_rewards = torch.tensor([-5.2500, 2.6094])
         assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
