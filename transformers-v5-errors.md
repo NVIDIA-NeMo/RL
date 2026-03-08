@@ -118,6 +118,12 @@ cd tests && uv run --no-sync pytest unit/models/generation/test_vllm_generation.
 **Affected tests:**
 - `test_vllm_generation.py::test_vllm_http_server`
 
+**Root cause:** vLLM 0.17's chat completion response dropped the `reasoning_content` field from the message object. The expected response hardcoded `"reasoning_content": None` but the actual response doesn't include it. The `_standardize` function already stripped `reasoning` but not `reasoning_content`.
+
+**Fix:** Updated `_standardize` to pop both `reasoning` and `reasoning_content` from the message, since these are version-dependent fields.
+
+**Status:** FIXED
+
 ## Err 3. Ray ActorAlreadyExistsError (megatron actor cleanup issue)
 
 **Description:** When running multiple megatron-parametrized test variants in sequence, the Ray actor `lm_policy-0-0` from the first test isn't cleaned up before the second starts, causing `ActorAlreadyExistsError`. This is a test isolation issue that surfaces in the mcore pass.
@@ -238,7 +244,7 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 ### Fix progress
 - [x] Err 1: vLLM FP8 QKVParallelLinear missing `input_scale` — FIXED (4/6 pass; 2 non-colocated have pre-existing logprob tolerance issue)
-- [ ] Err 2: vLLM HTTP server response format mismatch (1 test)
+- [x] Err 2: vLLM HTTP server response format mismatch — FIXED
 - [ ] Err 3: Ray ActorAlreadyExistsError — megatron actor cleanup (17 tests)
 - [ ] Err 4: SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED (8 tests)
 - [ ] Err 5: SDPA attention mask expand error TP=2 SP=True (2 tests)
