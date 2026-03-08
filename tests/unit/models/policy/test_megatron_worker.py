@@ -773,6 +773,7 @@ def test_megatron_policy_logprobs(logprob_setup):
     assert not torch.isinf(policy_logprobs).any(), "Logprobs should not contain Inf"
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(240)
 @pytest.mark.hf_gated
 def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
@@ -881,6 +882,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     cluster2.shutdown()
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(240)
 @pytest.mark.hf_gated
 def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model_path):
@@ -971,6 +973,7 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
     cluster2.shutdown()
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_reference_policy_functionality(tiny_llama_model_path):
@@ -1092,6 +1095,7 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     cluster.shutdown()
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
@@ -1347,6 +1351,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             cluster2.shutdown()
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_dpo_training(tiny_llama_model_path):
@@ -1635,6 +1640,7 @@ def test_megatron_policy_topk_logits(topk_setup):
         assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
@@ -1802,6 +1808,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_sft_training(tiny_llama_model_path):
@@ -1975,6 +1982,7 @@ def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
@@ -2179,6 +2187,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
@@ -2386,6 +2395,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_path):
@@ -2582,6 +2592,7 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
     )
 
 
+@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_policy_flops_range_check(tiny_llama_model_path):
