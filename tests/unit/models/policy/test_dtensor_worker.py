@@ -898,7 +898,7 @@ class TestTwoGPUCluster:
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
     @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=[pytest.mark.automodel, pytest.mark.skip(reason="transformers-v5: TP tied model fails with automodel v2")]), False]
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
     )
     def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         self, use_v2, two_gpu_cluster, tiny_llama_tied_model_path
