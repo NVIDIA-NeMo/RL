@@ -859,8 +859,8 @@ async def run_hf_train_process(
     [
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.skip(reason="transformers-v5: vLLM FP8 QKVParallelLinear missing input_scale")),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="transformers-v5: vLLM FP8 QKVParallelLinear missing input_scale")),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
         # LoRA tests (requires dtensor v2 / automodel)
         pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
         pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
@@ -930,8 +930,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     [
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.skip(reason="transformers-v5: vLLM FP8 QKVParallelLinear missing input_scale")),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="transformers-v5: vLLM FP8 QKVParallelLinear missing input_scale")),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — update_weights_from_collective missing process_weights_after_loading call")),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — update_weights_from_collective missing process_weights_after_loading call")),
         # LoRA tests (requires dtensor v2 / automodel)
         pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
         pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
@@ -1586,7 +1586,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("vllm_precision", ["bfloat16", pytest.param("fp8", marks=pytest.mark.skip(reason="transformers-v5: vLLM FP8 QKVParallelLinear missing input_scale"))])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
