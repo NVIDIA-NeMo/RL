@@ -1,7 +1,7 @@
 # FusedAttention Validation Report — GPT-OSS 20B / 120B
 
-**Last updated**: 2026-03-07 16:00 PST — 9867000 (20B WandB): vLLM 16/16 OK, model loading. 9867001 (120B 8n TP=8 PP=2 EP=4): vLLM 64/64 OK, model loading. Both initializing.
-**Author**: Claude Code (automated testing)
+**Last updated**: 2026-03-07 16:15 PST — 9867000 (20B, ~22 min): Megatron NCCL distributed init in progress (last log 15:58:48, log silent = normal during collective barrier). 9867001 (120B 8n TP=8, ~22 min): Megatron 16/64 workers done (25%, ~1.28 workers/s) — NO OOM, NO errors. First GRPO step expected shortly after 64/64 completes.
+**Author**: Seonjin Na
 
 ---
 
