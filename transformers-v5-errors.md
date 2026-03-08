@@ -154,6 +154,12 @@ cd tests && uv run --extra mcore pytest unit/models/generation/test_vllm_generat
 - `test_megatron_worker.py::test_megatron_sft_training`
 - `test_megatron_worker.py::test_megatron_context_parallel_logprob_agreement`
 - `test_megatron_worker.py::test_megatron_context_parallel_training_agreement`
+
+**Root cause:** `RayWorkerGroup.shutdown(cleanup_method="shutdown")` calls the worker's `shutdown()` method via RPC but does NOT call `ray.kill()` on the actors when graceful cleanup succeeds. The named actors (e.g., `lm_policy-0-0`) remain registered in Ray's actor registry. When the next test creates actors with the same name, it fails with `ActorAlreadyExistsError`.
+
+**Fix:** Changed `worker_groups.py` `shutdown()` to always kill actors after graceful cleanup, not just on failure. The graceful cleanup is for giving workers time to release resources, but after that, actors must be killed to release their name registrations. Changed the conditional `if force or cleanup_method is None:` to always execute the kill block.
+
+**Status:** FIXED — all 16 skip markers removed (5 in test_vllm_generation.py, 11 in test_megatron_worker.py). Verified megatron tests pass in sequence.
 - `test_megatron_worker.py::test_megatron_gradient_norm_consistency_across_parallelism`
 - `test_megatron_worker.py::test_megatron_policy_flops_range_check`
 
@@ -245,7 +251,7 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 ### Fix progress
 - [x] Err 1: vLLM FP8 QKVParallelLinear missing `input_scale` — FIXED (4/6 pass; 2 non-colocated have pre-existing logprob tolerance issue)
 - [x] Err 2: vLLM HTTP server response format mismatch — FIXED
-- [ ] Err 3: Ray ActorAlreadyExistsError — megatron actor cleanup (17 tests)
+- [x] Err 3: Ray ActorAlreadyExistsError — FIXED (always kill actors after graceful shutdown in worker_groups.py)
 - [ ] Err 4: SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED (8 tests)
 - [ ] Err 5: SDPA attention mask expand error TP=2 SP=True (2 tests)
 - [ ] Err 6: DTensor redistribute assertion gemma3 TP=2 (1 test)
