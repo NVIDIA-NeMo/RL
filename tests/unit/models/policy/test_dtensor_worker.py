@@ -586,8 +586,8 @@ class TestTwoGPUCluster:
             ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
             # nemotron5_h doesn't support cp
             # TP2, SP=True
-            pytest.param(("tiny_llama_model_path", 2, 1, True, False, False), marks=pytest.mark.skip(reason="transformers-v5: TP=2 SP=True llama hits SDPA mask expand error")),
-            pytest.param(("tiny_qwen2_model_path", 2, 1, True, False, False), marks=pytest.mark.skip(reason="TP=2 SP=True qwen2 hits mask expand error with transformers v5 (hemil)")),
+            ("tiny_llama_model_path", 2, 1, True, False, False),
+            ("tiny_qwen2_model_path", 2, 1, True, False, False),
         ]
     )
     def training_setup(self, request, two_gpu_cluster):
