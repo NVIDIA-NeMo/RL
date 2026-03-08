@@ -1108,24 +1108,23 @@ logger.wandb.name='${WANDB_NAME}'"
         echo "[INFO] 120B 16-node: T_TP=8, T_PP=2, T_EP=8, vLLM TP=8 — VALIDATED config"
         echo "  - Nodes: ${NUM_NODES} (128 GPUs)"
         echo "  - Training: EP=${T_EP}, TP=${T_TP}, PP=${T_PP}"
-        echo "  - Generation: TP=${G_TP}, gpu_memory_utilization=0.47, NRL_REFIT_BUFFER_MEMORY_RATIO=0.35"
+        echo "  - Generation: TP=${G_TP}, gpu_memory_utilization=0.47, NRL_REFIT_BUFFER_MEMORY_RATIO=0.40"
         echo "  - Megatron TP=vLLM TP=8 → 1:1 weight copy at prepare_refit_info (no Bug 11)"
         echo "  - 16-node fixes Bug 13: ~27 GiB/GPU model vs ~54 GiB on 8-node"
         echo "  - moe_permute_fusion: true, sequence_packing: true, alltoall dispatcher"
 
         # Bug 14/15/16 analysis and fixes:
-        # Bug 14: half-buffer = free_at_alloc × RATIO / 2 must be ≥ 3.96 GiB (gate_up_proj aligned size)
-        #   → RATIO ≥ 2×3.96/F = 0.263 (Step 1: F≈66GiB → always OK; Step 2: F≈15.66GiB without fix)
-        # Bug 15: Step 2 OOM at gather_from_ep_ranks (observed on 9870244/9870652/9870789/9871124).
-        #   free_at_ep_gather = F×(1-RATIO) - V_wakeup = 30.15×(1-RATIO) - 14.38 ≥ 3.96
-        # Bug 16 (root cause of Step 2 Bug 14 RETURNS at 9871487): After Step 1 backward, PyTorch
-        #   allocator caches ~50GiB as reserved-but-freed pages. NVML sees only 15.66GiB free.
-        #   FIX APPLIED: torch.cuda.empty_cache() in base_policy_worker.get_free_memory_bytes()
-        #   → NVML sees free≈51.55GiB → half=9.02GiB>3.96✓ AND free_ep=19.13GiB>3.96✓
-        # With Bug 16 fix: empty_cache releases all ~50GiB → F≈51.55GiB at every step
-        #   RATIO=0.35: half=51.55×0.35/2=9.02GiB>>3.96✓; free_ep=51.55×0.65-14.38=19.13GiB>>3.96✓
+        # Bug 14: half-buffer = free_before_wake × RATIO / 2 must be ≥ 3.96 GiB (gate_up_proj aligned size)
+        #   Bug 16 TRUE FIX (grpo.py commit e8178d99): get_free_memory_bytes() called BEFORE
+        #   prepare_for_generation(tags=["weights"]) so it measures free while vLLM is still sleeping.
+        #   - free_before_wake ≈ 51 GiB (Megatron=14 + vLLM_sleep=14.63 + non-PyTorch=~11 GiB used)
+        #   - After vLLM wakes: worst rank (rank 25, PP stage 0) free_after_wake = 23.65 GiB
+        #   - Need 2 × half ≤ free_after_wake: 2 × (51 × RATIO / 2) ≤ 23.65 → RATIO ≤ 0.464
+        #   - Use RATIO=0.40: half = 51×0.40/2 = 10.2 GiB >> 3.96 ✓, total=20.4 GiB ≤ 23.65 ✓ (3.25 GiB headroom)
+        # Bug 15: torch.cat OOM at gpt_oss_bridge.py:183 (FIXED via PYTHONPATH + Lustre edit)
+        #   - ep_size==num_experts: merged_hf_weights = value (avoid redundant 3.96GiB copy)
         # gpu_memory_utilization=0.47: (0.43 too low → KV=-0.77GiB; 0.50 gives free_ep<0)
-        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && export NRL_REFIT_BUFFER_MEMORY_RATIO=0.35 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=false uv run ./examples/run_grpo.py \
+        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && export NRL_REFIT_BUFFER_MEMORY_RATIO=0.40 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=false uv run ./examples/run_grpo.py \
 --config ${CONFIG_FILE} \
 cluster.num_nodes=${NUM_NODES} \
 cluster.gpus_per_node=${GPUS_PER_NODE} \
