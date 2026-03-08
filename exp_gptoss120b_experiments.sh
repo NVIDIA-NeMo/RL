@@ -42,7 +42,10 @@ WANDB_PROJECT="sync-grpo-${CLUSTER_TYPE,,}-gptoss120b-exp"
 # ray.sub pip-installs nvidia-cudnn-cu12==9.19.0.56 into /opt/nemo_rl_venv on ALL compute nodes.
 # PYTHONPATH fix: prepend SLURM_SUBMIT_DIR so the Lustre nemo_rl (with _worker_cudnn_lib)
 # is imported before container's /opt/nemo_rl_venv version. PYTHONPATH takes precedence.
-CUDNN_SETUP="export PYTHONPATH=\${SLURM_SUBMIT_DIR}:\${PYTHONPATH:-} && export LD_LIBRARY_PATH=/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:\${LD_LIBRARY_PATH:-} && export HF_HUB_OFFLINE=1 && export TRANSFORMERS_OFFLINE=1 && export HF_DATASETS_OFFLINE=1 && export NCCL_CUMEM_ENABLE=0 && export PYTORCH_ALLOC_CONF=expandable_segments:True && "
+# Also prepend Megatron-Bridge src so workers load our gpt_oss_bridge.py fix (Bug 15 torch.cat)
+# from Lustre instead of container's /opt/nemo-rl/3rdparty/... baked-in version.
+# megatron/ is a namespace pkg (no __init__.py) → both bridge src and container megatron.core coexist.
+CUDNN_SETUP="export PYTHONPATH=\${SLURM_SUBMIT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:\${SLURM_SUBMIT_DIR}:\${PYTHONPATH:-} && export LD_LIBRARY_PATH=/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:\${LD_LIBRARY_PATH:-} && export HF_HUB_OFFLINE=1 && export TRANSFORMERS_OFFLINE=1 && export HF_DATASETS_OFFLINE=1 && export NCCL_CUMEM_ENABLE=0 && export PYTORCH_ALLOC_CONF=expandable_segments:True && "
 
 # Organize logs
 export BASE_LOG_DIR="${SCRIPT_DIR}/exp_logs/gpt-oss-120b"
@@ -1110,17 +1113,17 @@ logger.wandb.name='${WANDB_NAME}'"
         echo "  - 16-node fixes Bug 13: ~27 GiB/GPU model vs ~54 GiB on 8-node"
         echo "  - moe_permute_fusion: true, sequence_packing: true, alltoall dispatcher"
 
-        # Bug 14 fix: NRL_REFIT_BUFFER_MEMORY_RATIO must give half-buffer ≥ gate_up_proj_size (3.96 GiB)
-        # gate_up_proj aligned = 4246732800 bytes = 3.96 GiB per EP rank.
-        # half_buffer = free_at_alloc × RATIO / 2; must be ≥ 3.96 GiB → RATIO ≥ 2×3.96/F = 0.263
-        #
-        # Bug 15 fix: Step 2 refit OOM at gather_from_ep_ranks (observed on 9870244/9870652/9870789/9871124).
-        # Model (from 9871124 observed data, F_step2≈30.15GiB, V_wakeup=14.38GiB):
+        # Bug 14/15/16 analysis and fixes:
+        # Bug 14: half-buffer = free_at_alloc × RATIO / 2 must be ≥ 3.96 GiB (gate_up_proj aligned size)
+        #   → RATIO ≥ 2×3.96/F = 0.263 (Step 1: F≈66GiB → always OK; Step 2: F≈15.66GiB without fix)
+        # Bug 15: Step 2 OOM at gather_from_ep_ranks (observed on 9870244/9870652/9870789/9871124).
         #   free_at_ep_gather = F×(1-RATIO) - V_wakeup = 30.15×(1-RATIO) - 14.38 ≥ 3.96
-        #   → RATIO ≤ (30.15-14.38-3.96)/30.15 = 11.81/30.15 = 0.392 ... but observed 0.40 failed
-        #   → empirical bound: RATIO ≤ 0.374 (3.71GiB free at RATIO=0.40, 0.25GiB short)
-        # Valid RATIO range: [0.263, 0.374].
-        # RATIO=0.35: half=30.15×0.35/2=5.28GiB>3.96✓; free_ep=30.15×0.65-14.38=5.22GiB>3.96✓ (1.26GiB margin)
+        # Bug 16 (root cause of Step 2 Bug 14 RETURNS at 9871487): After Step 1 backward, PyTorch
+        #   allocator caches ~50GiB as reserved-but-freed pages. NVML sees only 15.66GiB free.
+        #   FIX APPLIED: torch.cuda.empty_cache() in base_policy_worker.get_free_memory_bytes()
+        #   → NVML sees free≈51.55GiB → half=9.02GiB>3.96✓ AND free_ep=19.13GiB>3.96✓
+        # With Bug 16 fix: empty_cache releases all ~50GiB → F≈51.55GiB at every step
+        #   RATIO=0.35: half=51.55×0.35/2=9.02GiB>>3.96✓; free_ep=51.55×0.65-14.38=19.13GiB>>3.96✓
         # gpu_memory_utilization=0.47: (0.43 too low → KV=-0.77GiB; 0.50 gives free_ep<0)
         COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && export NRL_REFIT_BUFFER_MEMORY_RATIO=0.35 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=false uv run ./examples/run_grpo.py \
 --config ${CONFIG_FILE} \

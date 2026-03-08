@@ -90,9 +90,17 @@ class AbstractPolicyWorker:
             self.zmq_socket.bind(self.get_zmq_address())
 
     def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
+        """Get the available free memory.
+
+        Calls torch.cuda.empty_cache() first to release PyTorch's cached
+        (reserved-but-freed) allocations back to CUDA so that NVML reports
+        accurate free VRAM (Bug 16 fix: after training backward, ~50 GiB may
+        be held in the allocator cache, causing the refit buffer to be
+        undersized at Step 2+).
+        """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
+        torch.cuda.empty_cache()
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
