@@ -1,6 +1,6 @@
 # FusedAttention Validation Report — GPT-OSS 20B / 120B
 
-**Last updated**: 2026-03-07 16:22 PST — 🎉 9867000 (20B WandB): **STEP 1 STARTED** — `▶ Generating responses (batch 128)`, 34/32 prompts in flight, vLLM active. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs ❌ 9867001 (120B 8n TP=8): **FAILED Bug 13** — DDP grad buffer OOM: 54.22 GiB model + 26.71 GiB grad = 80.93 GiB > 79.11 GiB. 8-node 120B NOT viable. 16-node only. WandB run created: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/67awljv2
+**Last updated**: 2026-03-07 17:53 PST — 🎉🎉🎉 **9867000 (20B WandB, 2:17 runtime): Steps 1–10 FULLY VALIDATED ✅, Step 11/20 generating** — cuDNN 9.19.0, FusedAttention sub-backend 1 is_training=True all 10 steps. Step 10: Loss=0.0159, Reward=0.4375, 625.9s/step. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | ⚠️ **9867278 (120B 16n, 1:31 runtime): Step 1/5 training backward STARTED ✅** — `▶ Training policy...` appeared (line 2611). PARTIAL: 88/128 ranks cuDNN 9.19.0 → FusedAttention sub-backend 1 + is_training=True ✅; 5 nodes (10.65.10.11, 10.65.18.151, 10.65.3.205, 10.65.2.221, 10.65.8.69) cuDNN 9.10.1 → UnfusedDotProductAttention ❌ (~40/128 ranks). pip cuDNN mechanism confirmed working — failure is node-level pip install issue. No OOM/NCCL. | ❌ 9867001 (120B 8n): FAILED Bug 13
 **Author**: Seonjin Na
 
 ---
@@ -272,8 +272,16 @@ COMMAND='bash run_SCRIPT.sh' sbatch --nodes=N --account=coreai_dlalgo_nemorl \
 
 | Job | Model | Config | Job ID | Status | Purpose | Result |
 |-----|-------|--------|--------|--------|---------|--------|
-| S | GPT-OSS 20B | 2n8g, TP=2 EP=8, alltoall, moe_permute_fusion=true, seq_pack=true, **WandB=true, max_num_steps=20** | **9867000** | **RUNNING ~27 min** — Step 1 started: `▶ Generating responses (batch 128)`, 34/32 prompts in flight, vLLM active at ~130 tok/s. WandB live: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | 20B 20-step WandB run | **IN PROGRESS** — Generation active, FusedAttention expected during logprob pass. |
+| S | GPT-OSS 20B | 2n8g, TP=2 EP=8, alltoall, moe_permute_fusion=true, seq_pack=true, **WandB=true, max_num_steps=20** | **9867000** | **RUNNING ~2:17** — Steps 1–10 COMPLETE (Step 11 generating at 17:52 PST). FusedAttention sub-backend 1 + `is_training=True` confirmed ALL 10 training backward passes cluster-wide. Step 10: Loss=0.0159, Reward=0.4375, 625.9s/step. cuDNN 9.19.0, qkv_layout=thd_thd_thd. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | 20B 20-step WandB run | **🎉🎉🎉 10/20 STEPS FULLY VALIDATED — FusedAttention sub-backend 1 active in logprob AND training backward, is_training=True, across 10 consecutive steps. Continuing to step 20.** |
 | T | GPT-OSS 120B | **8n8g**, TP=8 **PP=2** EP=4, alltoall, moe_permute_fusion=true, seq_pack=true, **Bug 12 fix: PP=2** | **9867001** | **FAILED ~26 min** — ❌ **Bug 13 (NEW)**: `torch.OutOfMemoryError` at `param_and_grad_buffer.py:806` (`_ParamAndGradBuffer.__init__` → `self.grad_data = torch.zeros(`). GPU 0: 54.22 GiB PyTorch alloc + 26.71 GiB grad buffer = **80.93 GiB > 79.11 GiB**. Root cause: GPT-OSS 120B expert params do NOT split evenly across PP stages — PP=2 saves only 0.51 GiB vs PP=1 (54.22 vs 54.73 GiB). WandB run created: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/67awljv2 | Bug 12 fix validation on 8n: PP=2 | **❌ ELIMINATED** — PP=2 on 8n is also OOM (Bug 13). GPT-OSS expert params don't split across PP stages. **8-node 120B is NOT viable on H100 80GB.** 16 nodes required. |
+
+### Round 20 — 120B 16-node clean rerun (2026-03-07 ~16:19 UTC)
+
+**Rationale**: 8-node 120B definitively eliminated (Bug 13). Re-running 120B on 16 nodes (previously validated in R18-Q job 9866422) to get a clean WandB-logged run confirming FusedAttention sub-backend 1 on 120B training backward, in parallel with the ongoing 20B job.
+
+| Job | Model | Config | Job ID | Status | Purpose | Result |
+|-----|-------|--------|--------|--------|---------|--------|
+| U | GPT-OSS 120B | **16n8g**, TP=8 PP=2 EP=8 (128 GPUs), alltoall, moe_permute_fusion=true, seq_pack=true, Megatron TP=vLLM TP=8 | **9867278** | **RUNNING ~1:31** — `▶ Training policy...` confirmed (line 2611, 17:52 PST). **PARTIAL VALIDATION**: 88/128 ranks: cuDNN 9.19.0 → FusedAttention sub-backend 1 + `is_training=True` ✅ (rank=28/27/3/58 confirmed, rank=3 repeated 580x across cluster). 5 nodes have system cuDNN 9.10.1 — pip install failed on these nodes: 10.65.10.11(rank51/55), 10.65.18.151(rank65), 10.65.3.205(ranks104-109), 10.65.2.221(ranks114-115), 10.65.8.69(rank95) → UnfusedDotProductAttention ❌ (~40/128 ranks). No OOM/NCCL. Step 1/5 training backward in progress. | 120B clean validation run, 16 nodes | ⚠️ PARTIAL VALIDATED — pip cuDNN mechanism confirmed working on 88/128 ranks. 5-node pip install failure is infrastructure issue (not a code bug). FusedAttention sub-backend 1 + is_training=True confirmed on all properly-installed ranks. Submit new job excluding bad nodes for full clean validation. |
 
 ## Previous Round 11 Status (RL-pip-cudnn-test branch)
 
