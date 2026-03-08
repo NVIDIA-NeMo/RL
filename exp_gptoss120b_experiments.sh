@@ -1105,24 +1105,24 @@ logger.wandb.name='${WANDB_NAME}'"
         echo "[INFO] 120B 16-node: T_TP=8, T_PP=2, T_EP=8, vLLM TP=8 — VALIDATED config"
         echo "  - Nodes: ${NUM_NODES} (128 GPUs)"
         echo "  - Training: EP=${T_EP}, TP=${T_TP}, PP=${T_PP}"
-        echo "  - Generation: TP=${G_TP}, gpu_memory_utilization=0.47, NRL_REFIT_BUFFER_MEMORY_RATIO=0.40"
+        echo "  - Generation: TP=${G_TP}, gpu_memory_utilization=0.47, NRL_REFIT_BUFFER_MEMORY_RATIO=0.35"
         echo "  - Megatron TP=vLLM TP=8 → 1:1 weight copy at prepare_refit_info (no Bug 11)"
         echo "  - 16-node fixes Bug 13: ~27 GiB/GPU model vs ~54 GiB on 8-node"
         echo "  - moe_permute_fusion: true, sequence_packing: true, alltoall dispatcher"
 
         # Bug 14 fix: NRL_REFIT_BUFFER_MEMORY_RATIO must give half-buffer ≥ gate_up_proj_size (3.96 GiB)
         # gate_up_proj aligned = 4246732800 bytes = 3.96 GiB per EP rank.
-        # Default ratio=0.3: half = 27.86*0.3/2 = 4.18 GiB > 3.96 GiB ✓ (just barely)
-        # Actually default ratio=0.3: half = free(~25GiB)*0.3/2 = 3.75 GiB < 3.96 GiB → AssertionError!
-        # Bug 15 fix: Step 2 refit OOM at gather_from_ep_ranks (need 3.96 GiB for torch.cat).
-        # Memory forensics (from jobs 9870652, 9870789 with RATIO=0.5):
-        #   vLLM sleeping: ~25 GiB | Megatron model+NCCL: ~26.26 GiB → free_at_alloc ≈ 27.86 GiB
-        #   buffers(RATIO=0.5) = 27.86*0.5 = 13.93 GiB → free_for_cat = 16.06-13.93 = 2.13 GiB < 3.96 GiB ✗
-        # Fix: RATIO=0.40 → buffers = 27.86*0.40 = 11.14 GiB
-        #   half = 5.57 GiB > 3.96 GiB ✓ (Bug 14 OK)
-        #   free_for_cat = 16.06-11.14 = 4.92 GiB > 3.96 GiB ✓ (Bug 15 fixed, 0.96 GiB margin)
-        # gpu_memory_utilization=0.47: (0.43 too low → KV=-0.77GiB; 0.5 → buffers too large)
-        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && export NRL_REFIT_BUFFER_MEMORY_RATIO=0.40 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=false uv run ./examples/run_grpo.py \
+        # half_buffer = free_at_alloc × RATIO / 2; must be ≥ 3.96 GiB → RATIO ≥ 2×3.96/F = 0.263
+        #
+        # Bug 15 fix: Step 2 refit OOM at gather_from_ep_ranks (observed on 9870244/9870652/9870789/9871124).
+        # Model (from 9871124 observed data, F_step2≈30.15GiB, V_wakeup=14.38GiB):
+        #   free_at_ep_gather = F×(1-RATIO) - V_wakeup = 30.15×(1-RATIO) - 14.38 ≥ 3.96
+        #   → RATIO ≤ (30.15-14.38-3.96)/30.15 = 11.81/30.15 = 0.392 ... but observed 0.40 failed
+        #   → empirical bound: RATIO ≤ 0.374 (3.71GiB free at RATIO=0.40, 0.25GiB short)
+        # Valid RATIO range: [0.263, 0.374].
+        # RATIO=0.35: half=30.15×0.35/2=5.28GiB>3.96✓; free_ep=30.15×0.65-14.38=5.22GiB>3.96✓ (1.26GiB margin)
+        # gpu_memory_utilization=0.47: (0.43 too low → KV=-0.77GiB; 0.50 gives free_ep<0)
+        COMMAND="export NVTE_DEBUG=1 && export NVTE_DEBUG_LEVEL=2 && export NRL_REFIT_BUFFER_MEMORY_RATIO=0.35 && ${CUDNN_SETUP}NRL_FORCE_REBUILD_VENVS=false uv run ./examples/run_grpo.py \
 --config ${CONFIG_FILE} \
 cluster.num_nodes=${NUM_NODES} \
 cluster.gpus_per_node=${GPUS_PER_NODE} \
