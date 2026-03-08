@@ -542,6 +542,10 @@ def vlm_hf_data_processor(
     if "token_type_ids" in message:
         user_message["token_type_ids"] = message["token_type_ids"][0]
 
+    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
+    if "mm_token_type_ids" in message:
+        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
+
     ### append to user message
     message_log.append(user_message)
 
