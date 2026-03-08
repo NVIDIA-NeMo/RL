@@ -1,6 +1,6 @@
 # FusedAttention Validation Report — GPT-OSS 20B / 120B
 
-**Last updated**: 2026-03-07 16:15 PST — 9867000 (20B, ~22 min): Megatron NCCL distributed init in progress (last log 15:58:48, log silent = normal during collective barrier). 9867001 (120B 8n TP=8, ~22 min): Megatron 16/64 workers done (25%, ~1.28 workers/s) — NO OOM, NO errors. First GRPO step expected shortly after 64/64 completes.
+**Last updated**: 2026-03-07 16:22 PST — 🎉 9867000 (20B WandB): **STEP 1 STARTED** — `▶ Generating responses (batch 128)`, 34/32 prompts in flight, vLLM active. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs ❌ 9867001 (120B 8n TP=8): **FAILED Bug 13** — DDP grad buffer OOM: 54.22 GiB model + 26.71 GiB grad = 80.93 GiB > 79.11 GiB. 8-node 120B NOT viable. 16-node only. WandB run created: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/67awljv2
 **Author**: Seonjin Na
 
 ---
@@ -112,7 +112,15 @@ grpo.num_prompts_per_step=16
 grpo.num_generations_per_prompt=8
 ```
 
-**Option B — 8 nodes (IN PROGRESS, job 9867001)**
+**Option B — 8 nodes (FAILED — Bug 13, job 9867001)**
+
+❌ **NOT VIABLE.** 8-node 120B hits OOM at DDP gradient buffer allocation (Bug 13).
+Use 16-node Option A instead.
+
+Root cause: GPT-OSS 120B expert params are not evenly split by PP stages (MoE experts
+concentrate memory independently of pipeline depth). Result: PP=2 saves only 0.51 GiB
+vs PP=1 (54.22 vs 54.73 GiB), and the DDP grad buffer requires another 26.71 GiB →
+54.22 + 26.71 = 80.93 GiB > 79.11 GiB GPU capacity.
 
 Smaller footprint option. EP=4 (vs EP=8 on 16n) because TP=8 × PP=2 × EP=4 = 64 GPUs.
 Batch reduced to 64 (8 prompts × 8 gen) to halve KV cache during generation.
@@ -145,6 +153,7 @@ COMMAND='bash run_120b_8n_tp8.sh' sbatch --nodes=8 --account=coreai_dlalgo_nemor
 | Bug 10 | vLLM sleep mode holds ~59 GiB CUDA IPC handles as non-PyTorch memory on colocated 2-node 120B | Use 8+ nodes so GPU memory is not shared across vLLM+Megatron on same GPUs |
 | Bug 11 | OOM at `prepare_refit_info()` when Megatron TP < vLLM TP — forces all_gather of weights | Match Megatron TP = vLLM TP (both = 8) for 1:1 weight copy |
 | Bug 12 | PP=1 on 8 nodes with TP=8: 54.73 GiB + 26.71 GiB = 81.44 GiB > 79.11 GiB GPU | Use PP=2 |
+| Bug 13 | PP=2 on 8 nodes with TP=8: DDP grad buffer alloc `param_and_grad_buffer.py:806` — 54.22 GiB model + 26.71 GiB grad = 80.93 GiB > 79.11 GiB. GPT-OSS expert params do not split evenly across PP stages — PP=2 saves only 0.51 GiB vs PP=1. | Use 16 nodes (Option A). 8-node 120B is NOT viable on H100 80GB. |
 
 ---
 
@@ -254,6 +263,17 @@ COMMAND='bash run_SCRIPT.sh' sbatch --nodes=N --account=coreai_dlalgo_nemorl \
 - `run_120b_final.sh` ✓
 - `run_20b_nopermfuse.sh` ✓
 - `run_20b_te_rng.sh` ✓
+
+### Round 19 — 20B WandB + 120B Bug 13 diagnosis (2026-03-07 ~15:39 UTC)
+
+**Rationale**: Two parallel jobs:
+- **Job S (20B WandB)**: Re-run 20B with `logger.wandb_enabled=True` and `max_num_steps=20` to log full 20-step run to WandB for external visibility.
+- **Job T (120B 8n PP=2)**: Re-test 8n 120B with PP=2 (Bug 12 fix from R18-R) to check if PP=2 resolves the OOM at `MegatronPolicyWorker.__init__()`.
+
+| Job | Model | Config | Job ID | Status | Purpose | Result |
+|-----|-------|--------|--------|--------|---------|--------|
+| S | GPT-OSS 20B | 2n8g, TP=2 EP=8, alltoall, moe_permute_fusion=true, seq_pack=true, **WandB=true, max_num_steps=20** | **9867000** | **RUNNING ~27 min** — Step 1 started: `▶ Generating responses (batch 128)`, 34/32 prompts in flight, vLLM active at ~130 tok/s. WandB live: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | 20B 20-step WandB run | **IN PROGRESS** — Generation active, FusedAttention expected during logprob pass. |
+| T | GPT-OSS 120B | **8n8g**, TP=8 **PP=2** EP=4, alltoall, moe_permute_fusion=true, seq_pack=true, **Bug 12 fix: PP=2** | **9867001** | **FAILED ~26 min** — ❌ **Bug 13 (NEW)**: `torch.OutOfMemoryError` at `param_and_grad_buffer.py:806` (`_ParamAndGradBuffer.__init__` → `self.grad_data = torch.zeros(`). GPU 0: 54.22 GiB PyTorch alloc + 26.71 GiB grad buffer = **80.93 GiB > 79.11 GiB**. Root cause: GPT-OSS 120B expert params do NOT split evenly across PP stages — PP=2 saves only 0.51 GiB vs PP=1 (54.22 vs 54.73 GiB). WandB run created: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/67awljv2 | Bug 12 fix validation on 8n: PP=2 | **❌ ELIMINATED** — PP=2 on 8n is also OOM (Bug 13). GPT-OSS expert params don't split across PP stages. **8-node 120B is NOT viable on H100 80GB.** 16 nodes required. |
 
 ## Previous Round 11 Status (RL-pip-cudnn-test branch)
 
