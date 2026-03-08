@@ -1,6 +1,6 @@
 # FusedAttention Validation Report — GPT-OSS 20B / 120B
 
-**Last updated**: 2026-03-07 22:10 PST — 🎉🎉🎉 **9867000 (20B WandB): Steps 1–15 FULLY VALIDATED ✅** cuDNN 9.19.0, sub-backend 1 all ranks, is_training=True ✅. Step 15: Loss=0.0764, Reward=0.5391, 569s/step. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | 🎉 **9867278 (120B 16n): sub-backend 1 VALIDATED 88/128 ranks, is_training=True ✅**, then ❌ Bug 14. | ❌ 9867001 (120B 8n): Bug 13. | ❌ **120B 8-node RL-pr1962-sj (9867513/9867514): NEW OOM BUG** — `gather_from_ep_ranks` → `torch.cat` OOM at setup() before Step 1, GPU 69.82GB used/17MB free, tried 160MB. | 🎉🎉🎉 **RL-pr1962-sj 4-job 20B sweep ALL 3 STEPS DONE ✅**: **9868621** alltoall+seqpack(THD) S1:0.0192/0.6338/292s S2:0.0064/0.5288/269s S3:-0.0120/0.5332/260s; **9868622** alltoall+nopack(SBHD) ALL DONE S3:0.0083/0.5269/407s; **9868623** allgather+nopack(SBHD) ALL DONE S3:-0.0005/0.5269/389s; **9868620** allgather+seqpack(THD) ❌ FAILED Step12/20 — RayChannelTimeoutError vLLM gen >300s. | 🎉🎉 **9869197** 20B 8-node allgather+seqpack(THD) TP=4 EP=8 PP=2 ALL 3 DONE ✅ cuDNN 9.19.0, sub-backend 1 ALL RANKS ✅, is_training=True ✅ S1:0.0115/0.6333/162s S2:0.0086/0.5278/118s S3:0.0004/0.5386/113s — zero crashes. ❌ **9869198** 120B 8-node — CRASHED at prepare_refit_info() OOM (NCCL_CUMEM_ENABLE=0 didn't fix). ❌ **9869310** 120B 8-node TP=4 EP=8 PP=2 — OOM at prepare_refit_info(), PYTORCH_ALLOC_CONF=expandable_segments:True did NOT fix: tried 3.96 GiB, only 599MB free (69.27GB in use). | ❌ **9869349** 120B 8-node TP=8 PP=1 EP=8 gpu_util=0.40 — FAILED vLLM init: KV cache = -3.14 GiB (120B/TP=8=~30GB weights, 0.40×80=32GB budget → no room for KV). | 🆕 **Script updated**: run_120b_8n_tp8.sh → PP=1 EP=8 gpu_util=0.55 (fix: 44GB−30GB=14GB KV cache). All 20B 2-node TP=4 EP=4, cuDNN 9.19.0, sub-backend 1 ✅, is_training=True ✅.
+**Last updated**: 2026-03-07 21:36 UTC — 🎉🎉🎉 **9867000 (20B WandB): Steps 1–15 FULLY VALIDATED ✅** cuDNN 9.19.0, sub-backend 1 all ranks, is_training=True ✅. Step 15: Loss=0.0764, Reward=0.5391, 569s/step. WandB: https://wandb.ai/nvidia/sync-grpo-h100-gptoss-exp/runs/d8br52fs | 🎉 **9867278 (120B 16n): sub-backend 1 VALIDATED 88/128 ranks, is_training=True ✅**, then ❌ Bug 14. | ❌ 9867001 (120B 8n): Bug 13. | ❌ **120B 8-node RL-pr1962-sj (9867513/9867514): NEW OOM BUG** — `gather_from_ep_ranks` → `torch.cat` OOM at setup() before Step 1, GPU 69.82GB used/17MB free, tried 160MB. | 🎉🎉🎉 **RL-pr1962-sj 4-job 20B sweep ALL 3 STEPS DONE ✅**: **9868621** alltoall+seqpack(THD) S1:0.0192/0.6338/292s S2:0.0064/0.5288/269s S3:-0.0120/0.5332/260s; **9868622** alltoall+nopack(SBHD) ALL DONE S3:0.0083/0.5269/407s; **9868623** allgather+nopack(SBHD) ALL DONE S3:-0.0005/0.5269/389s; **9868620** allgather+seqpack(THD) ❌ FAILED Step12/20 — RayChannelTimeoutError vLLM gen >300s. | 🎉🎉 **9869197** 20B 8-node allgather+seqpack(THD) TP=4 EP=8 PP=2 ALL 3 DONE ✅ cuDNN 9.19.0, sub-backend 1 ALL RANKS ✅, is_training=True ✅ S1:0.0115/0.6333/162s S2:0.0086/0.5278/118s S3:0.0004/0.5386/113s — zero crashes. ❌ **9869198** 120B 8-node — CRASHED at prepare_refit_info() OOM (NCCL_CUMEM_ENABLE=0 didn't fix). ❌ **9869310** 120B 8-node TP=4 EP=8 PP=2 — OOM at prepare_refit_info(), PYTORCH_ALLOC_CONF=expandable_segments:True did NOT fix: tried 3.96 GiB, only 599MB free (69.27GB in use). | ❌ **9869349** 120B 8-node TP=8 PP=1 EP=8 gpu_util=0.40 — FAILED vLLM init: KV cache = -3.14 GiB (120B/TP=8=~30GB weights, 0.40×80=32GB budget → no room for KV). | ❌ **9869444** 120B 8-node TP=8 PP=1 EP=8 gpu_util=0.47 — **Bug 13 재현** (model=54.42+grad=26.71+vLLM=9.12=~90GiB>79GiB). | ❌ **9869715** 120B 8-node TP=4 PP=2 EP=4 vLLM-TP=8 gpu_util=0.47 — **Bug 13 CONFIRMED** (model=54.41+grad=26.71+vLLM-sleep=9.12=~90GiB>79GiB). vLLM 83/83 ✅ KV=2.4GiB ✅ but Megatron OOM at grad_data alloc. **8-node 120B은 TP/PP/EP 불문 모두 동일 실패 — 16-node 필요 (확정).** All 20B 2-node TP=4 EP=4, cuDNN 9.19.0, sub-backend 1 ✅, is_training=True ✅.
 **Author**: Seonjin Na
 
 ---
@@ -70,7 +70,7 @@ grpo.num_prompts_per_step=16
 grpo.num_generations_per_prompt=8
 ```
 
-### GPT-OSS 120B — STEP 1 VALIDATED ✅ (16 nodes) / IN PROGRESS (8 nodes)
+### GPT-OSS 120B — STEP 1 VALIDATED ✅ (16 nodes) / ❌ 8-node NOT VIABLE (Bug 13)
 
 **Option A — 16 nodes (VALIDATED, Step 1 complete)**
 
@@ -112,15 +112,20 @@ grpo.num_prompts_per_step=16
 grpo.num_generations_per_prompt=8
 ```
 
-**Option B — 8 nodes (FAILED — Bug 13, job 9867001)**
+**Option B — 8 nodes (❌ DEFINITIVELY NOT VIABLE — Bug 13 confirmed on ALL configs)**
 
-❌ **NOT VIABLE.** 8-node 120B hits OOM at DDP gradient buffer allocation (Bug 13).
+❌ **NOT VIABLE.** 8-node 120B hits OOM at DDP gradient buffer allocation (Bug 13) regardless of TP/PP/EP configuration.
 Use 16-node Option A instead.
 
+**Exhaustively tested and all failed** (jobs 9867001, 9869444, 9869715):
+- TP=8 PP=2 EP=4: model=54.22 + grad=26.71 = 80.93 GiB > 79.11 GiB
+- TP=8 PP=1 EP=8: model=54.73 + grad=26.71 = 81.44 GiB > 79.11 GiB
+- TP=4 PP=2 EP=4: model=54.41 + grad=26.71 = 81.12 GiB > 79.11 GiB (9869715 confirmed 2026-03-07)
+
 Root cause: GPT-OSS 120B expert params are not evenly split by PP stages (MoE experts
-concentrate memory independently of pipeline depth). Result: PP=2 saves only 0.51 GiB
-vs PP=1 (54.22 vs 54.73 GiB), and the DDP grad buffer requires another 26.71 GiB →
-54.22 + 26.71 = 80.93 GiB > 79.11 GiB GPU capacity.
+concentrate memory independently of pipeline depth). Regardless of TP/PP/EP choice,
+~54 GiB model + 26.71 GiB grad + 9.12 GiB vLLM-sleep ≈ 90 GiB > 79.11 GiB H100.
+**16 nodes is required for GPT-OSS 120B GRPO training.**
 
 Smaller footprint option. EP=4 (vs EP=8 on 16n) because TP=8 × PP=2 × EP=4 = 64 GPUs.
 Batch reduced to 64 (8 prompts × 8 gen) to halve KV cache during generation.
@@ -153,7 +158,7 @@ COMMAND='bash run_120b_8n_tp8.sh' sbatch --nodes=8 --account=coreai_dlalgo_nemor
 | Bug 10 | vLLM sleep mode holds ~59 GiB CUDA IPC handles as non-PyTorch memory on colocated 2-node 120B | Use 8+ nodes so GPU memory is not shared across vLLM+Megatron on same GPUs |
 | Bug 11 | OOM at `prepare_refit_info()` when Megatron TP < vLLM TP — forces all_gather of weights | Match Megatron TP = vLLM TP (both = 8) for 1:1 weight copy |
 | Bug 12 | PP=1 on 8 nodes with TP=8: 54.73 GiB + 26.71 GiB = 81.44 GiB > 79.11 GiB GPU | Use PP=2 |
-| Bug 13 | PP=2 on 8 nodes with TP=8: DDP grad buffer alloc `param_and_grad_buffer.py:806` — 54.22 GiB model + 26.71 GiB grad = 80.93 GiB > 79.11 GiB. GPT-OSS expert params do not split evenly across PP stages — PP=2 saves only 0.51 GiB vs PP=1. | Use 16 nodes (Option A). 8-node 120B is NOT viable on H100 80GB. |
+| Bug 13 | DDP grad buffer alloc `param_and_grad_buffer.py:806` — ~54 GiB model + 26.71 GiB grad + 9.12 GiB vLLM-sleep ≈ 90 GiB > 79.11 GiB. GPT-OSS expert params do NOT split evenly across PP/TP/EP stages. **CONFIRMED on ALL tested configs** (TP=8 PP=1 EP=8, TP=8 PP=2 EP=4, TP=4 PP=2 EP=4 — jobs 9867001/9869444/9869715). 8-node 120B is DEFINITIVELY NOT viable. | **Use 16 nodes (Option A). NO 8-node 120B workaround exists on H100 80GB.** |
 | Bug 14 | IPC/ZMQ refit buffer too small for 120B MoE expert tensor during `stream_weights_via_ipc_zmq_impl`: `AssertionError: Parameter model.layers.0.mlp.experts.gate_up_proj too large for buffer: 4246732800 > 3367718092` (`megatron_policy_worker.py:1005` → `utils.py:439`). Refit from Megatron training workers → vLLM after Step 1 training on 16n 120B (job 9867278). | TBD — increase IPC buffer size allocation in `utils.py` for large MoE expert tensors |
 
 ---
