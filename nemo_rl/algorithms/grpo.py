@@ -1112,6 +1112,18 @@ def refit_policy_generation(
     """
     if colocated_inference:
         policy.offload_before_refit()
+        # Measure free memory BEFORE waking vLLM: prepare_for_generation re-allocates ~30 GiB
+        # of model weights onto GPU, which would undersize the refit buffer at Step 2+.
+        # (Bug 16 fix: moved from inside timer_context to here, before vLLM wake-up.)
+        if _refit_buffer_size_gb is not None:
+            buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+        else:
+            # Empirically sets ratio as 30% to maximize efficiency.
+            # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+            memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+            buffer_size_bytes = int(
+                policy.get_free_memory_bytes() * float(memory_ratio)
+            )
         policy_generation.prepare_for_generation(tags=["weights"])
 
     # Create a context manager that does nothing when timer is None
@@ -1124,16 +1136,6 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
 
             if isinstance(policy_generation, SGLangGeneration):
                 sglang_url_to_gpu_uuids = (
