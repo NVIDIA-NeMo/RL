@@ -212,6 +212,14 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - `test_dtensor_worker.py::test_dtensor_worker_training[training_setup21-False]` (TP=2 SP=True llama)
 - `test_dtensor_worker.py::test_dtensor_worker_training[training_setup22-False]` (TP=2 SP=True qwen2, already skipped by Hemil)
 
+**Root cause:** With sequence parallelism (SP=True), hidden states are sharded along the sequence dimension after the embedding layer. In transformers v5, SDPA attention (the new default) tries to expand the 2D attention mask to match the full sequence length, causing a shape mismatch with the sharded query tensor. In v4, the default was "eager" attention which had the same issue but it was masked by the test not running before.
+
+The actual bug: `attention_mask = torch.ones((batch_size, seq_len), ...)` creates a full-size mask, but with SP the query is only `seq_len / tp_size` long. The mask expansion in both SDPA and eager attention fails because the mask doesn't match the local query shape.
+
+**Fix:** When sequence parallelism is enabled, pass `attention_mask=None` to the model forward. The model uses its built-in causal mask internally, which correctly handles the sharded sequence dimension. Changed in `dtensor_policy_worker.py` forward pass.
+
+**Status:** FIXED — both TP=2 SP=True tests (llama and qwen2) pass.
+
 ## Err 6. DTensor redistribute assertion error for gemma3 TP=2
 
 **Description:** When running DTensor policy worker v2 with gemma3 model and TP=2, the DTensor redistribute operation fails with an assertion error about `src_shard_order` and `dst_shard_order` being None. This is a PyTorch DTensor compatibility issue with gemma3's architecture under tensor parallelism.
@@ -259,7 +267,7 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - [x] Err 2: vLLM HTTP server response format mismatch — FIXED
 - [x] Err 3: Ray ActorAlreadyExistsError — FIXED (always kill actors after graceful shutdown in worker_groups.py)
 - [x] Err 4: SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED — FIXED (disable_piecewise_cuda_graph in test config)
-- [ ] Err 5: SDPA attention mask expand error TP=2 SP=True (2 tests)
+- [x] Err 5: SDPA attention mask expand error TP=2 SP=True — FIXED (pass attention_mask=None when SP enabled)
 - [ ] Err 6: DTensor redistribute assertion gemma3 TP=2 (1 test)
 - [ ] Err 7: TP tied model fails with automodel v2 (1 test)
 

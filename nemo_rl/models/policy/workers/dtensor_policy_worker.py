@@ -675,11 +675,19 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
+                            # When sequence parallelism is enabled, hidden states are
+                            # sharded along the sequence dimension after the embedding layer.
+                            # Passing a full-size attention mask causes a shape mismatch in
+                            # both SDPA and eager attention. Pass None instead — the model
+                            # will use its built-in causal mask.
+                            if self.cfg["dtensor_cfg"]["sequence_parallel"]:
+                                attention_mask = None
+                            else:
+                                attention_mask = torch.ones(
+                                    (batch_size, seq_len),
+                                    dtype=torch.bool,
+                                    device=input_ids.device,
+                                )
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
