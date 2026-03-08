@@ -232,42 +232,6 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
-        def _patch_vllm_speculative_decoding_post_step():
-            """Patch vLLM speculative decoding post_step call.
-
-            Related PR:
-            - https://github.com/vllm-project/vllm/pull/30319
-
-            This patch fixes the InprocessClient.get_output method to properly
-            call post_step with the model_executed flag from step_fn.
-            """
-            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, _ = self.engine_core.step_fn()\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            new_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, model_executed = self.engine_core.step_fn()\n"
-                "        self.engine_core.post_step(model_executed=model_executed)\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-            logger.info("Successfully patched vllm speculative decoding post_step.")
-
         def _patch_vllm_hermes_tool_parser_thread_safety():
             """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
 
@@ -395,8 +359,6 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
-
-        _patch_vllm_speculative_decoding_post_step()
 
         _patch_vllm_hermes_tool_parser_thread_safety()
 

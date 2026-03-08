@@ -78,7 +78,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm",
+  "vllm==0.17.0",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
 ]
@@ -123,8 +123,6 @@ build = [
   "pybind11",
   # Build requirement for flash-attn
   "psutil",
-  # Build requirement for vllm (VCS install uses setuptools-scm for versioning)
-  "setuptools-scm>=8.0",
 ]
 docs = [
   "sphinx",
@@ -176,8 +174,6 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
-# From terrykong/vllm branch v5-upgrade-from-30566 (based on vllm-project/vllm#30566)
-vllm = { git = "https://github.com/terrykong/vllm.git", rev = "d35c05dbfec153a875258b8a1d563bd8b08aceb3" }
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
 sglang = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "python" }
 sgl-kernel = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "sgl-kernel" }
@@ -206,16 +202,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-# These vllm env vars are only necessary while vllm is a VCS (git) install. Without
-# VLLM_PRECOMPILED_WHEEL_COMMIT, vllm's setup.py cannot determine the base commit on main
-# (since we're building from a fork) and falls back to the "nightly" wheel which is a moving
-# target and may not have wheels for all architectures at any given time.
-# VLLM_PRECOMPILED_WHEEL_COMMIT is the latest upstream main commit on the vllm fork's branch —
-# vllm's setup.py uses it to fetch
-# the correct arch-specific wheel from wheels.vllm.ai (supports both x86_64 and aarch64).
-# This commit must also be set in the Dockerfile ENV for runtime ray worker venv rebuilds.
-# TODO(https://github.com/NVIDIA-NeMo/RL/issues/2065): Remove once vllm releases with transformers v5.
-extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" }, vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "b66a74649e40022c6b1180b98fbb1b6e4b4af74a" } }
+extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -226,7 +213,6 @@ no-build-isolation-package = [
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sgl-kernel",
-  "vllm",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -266,6 +252,9 @@ override-dependencies = [
   "nvidia-cutlass-dsl>=4.2.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
+  # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
+  # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
+  "transformers>=5.0.0",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -327,7 +316,6 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 sgl-kernel = [{ requirement = "torch", match-runtime = true }]
-vllm = [{ requirement = "torch", match-runtime = true }, "setuptools-scm>=8.0"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -369,92 +357,6 @@ name = "sgl-kernel"
 # This version has to match the version in the commit/rev/tag used
 version = "0.3.21"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
-
-[[tool.uv.dependency-metadata]]
-# TODO(https://github.com/NVIDIA-NeMo/RL/issues/2065): Remove once vllm releases with transformers v5.
-name = "vllm"
-# VCS install from terrykong/vllm@v5-upgrade-from-30566
-# Version is dynamic (setuptools-scm), use a placeholder.
-#
-# Since vllm declares dependencies dynamically via requirements/*.txt (not static
-# pyproject.toml metadata), uv cannot extract them without a full build. We provide
-# them here so uv can resolve without building.
-#
-# HOW TO UPDATE: This list must mirror requirements/cuda.txt (which includes
-# requirements/common.txt) from the vllm commit pinned in [tool.uv.sources].
-# 1. Open https://github.com/terrykong/vllm/tree/<COMMIT>/requirements
-# 2. Concatenate common.txt + cuda.txt (cuda includes common via `-r common.txt`)
-# 3. Convert each line to PEP 508 format in the list below
-# 4. Run `uv lock` to verify resolution succeeds
-version = "1.0.0.dev0"
-requires-dist = [
-  # --- requirements/common.txt ---
-  "regex",
-  "cachetools",
-  "psutil",
-  "sentencepiece",
-  "numpy",
-  "requests>=2.26.0",
-  "tqdm",
-  "blake3",
-  "py-cpuinfo",
-  "transformers>=4.56.0",
-  "tokenizers>=0.21.1",
-  "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*",
-  "fastapi[standard]>=0.115.0",
-  "aiohttp>=3.13.3",
-  "openai>=1.99.1",
-  "pydantic>=2.12.0",
-  "prometheus_client>=0.18.0",
-  "pillow",
-  "prometheus-fastapi-instrumentator>=7.0.0",
-  "tiktoken>=0.6.0",
-  "lm-format-enforcer==0.11.3",
-  "llguidance>=1.3.0,<1.4.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
-  "outlines_core==0.2.11",
-  "diskcache==5.6.3",
-  "lark==1.2.2",
-  "xgrammar==0.1.29; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 's390x' or platform_machine == 'ppc64le'",
-  "typing_extensions>=4.10",
-  "filelock>=3.16.1",
-  "partial-json-parser",
-  "pyzmq>=25.0.0",
-  "msgspec",
-  "gguf>=0.17.0",
-  "mistral_common[image]>=1.9.1",
-  "opencv-python-headless>=4.13.0",
-  "pyyaml",
-  "six>=1.16.0; python_version > '3.11'",
-  "setuptools>=77.0.3,<81.0.0; python_version > '3.11'",
-  "einops",
-  "compressed-tensors==0.13.0",
-  "depyf==0.20.0",
-  "cloudpickle",
-  "watchfiles",
-  "python-json-logger",
-  "ninja",
-  "pybase64",
-  "cbor2",
-  "ijson",
-  "setproctitle",
-  "openai-harmony>=0.0.3",
-  "anthropic>=0.71.0",
-  "model-hosting-container-standards>=0.1.13,<1.0.0",
-  "mcp",
-  "grpcio",
-  "grpcio-reflection",
-  "opentelemetry-sdk>=1.27.0",
-  "opentelemetry-api>=1.27.0",
-  "opentelemetry-exporter-otlp>=1.27.0",
-  "opentelemetry-semantic-conventions-ai>=0.4.1",
-  # --- requirements/cuda.txt ---
-  "numba==0.61.2",
-  "ray[cgraph]>=2.48.0",
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
-  "torchvision==0.25.0",
-  "flashinfer-python==0.6.4",
-]
 
 [[tool.uv.dependency-metadata]]
 name = "sglang"
@@ -573,6 +475,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
+#addopts = "--testmon --durations=100 -s -rA -x"
 addopts = "--durations=100 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
