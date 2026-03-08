@@ -197,6 +197,11 @@ else
     UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py
 fi
 
+# Address CVE GHSA-7rgv-gqhr-fxg3 by forcing xgrammar 0.1.32 in custom vllm and gym venvs
+# It is not possible to use uv overrides with how we install these venvs
+/opt/nemo-rl/3rdparty/vllm/.venv/bin/pip install xgrammar==0.1.32
+/opt/gym_venvs/responses_api_models/vllm_model/.venv/bin/pip install xgrammar==0.1.32
+
 # Prune unreachable cache entries
 uv cache clean
 EOF
