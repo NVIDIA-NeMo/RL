@@ -449,7 +449,7 @@ All upstream references are now inline with each error section above.
 
 Testing all L1 functional tests (`tests/functional/L1_Functional_Tests_GPU.sh`) against transformers 5.3.
 
-**Summary: 31/35 PASS, 4/35 FAIL**
+**Summary: 33/35 PASS, 2/35 FAIL**
 
 | # | Test | Status | Notes |
 |---|------|--------|-------|
@@ -469,8 +469,8 @@ Testing all L1 functional tests (`tests/functional/L1_Functional_Tests_GPU.sh`) 
 | 14 | `grpo_automodel_lora_non_colocated.sh` | PASS |  |
 | 15 | `grpo_megatron.sh` | PASS |  |
 | 16 | `grpo_megatron_generation.sh` | PASS |  |
-| 17 | `grpo_megatron_lora.sh` | **FAIL** | Missing LoRA adapter `_extra_state` keys in checkpoint (Func Err 2) |
-| 18 | `grpo_megatron_lora_async.sh` | **FAIL** | Same as #17 — LoRA adapter checkpoint key mismatch (Func Err 2) |
+| 17 | `grpo_megatron_lora.sh` | PASS |  |
+| 18 | `grpo_megatron_lora_async.sh` | PASS |  |
 | 19 | `grpo_multiple_dataloaders.sh` | PASS |  |
 | 20 | `grpo_multiturn.sh` | PASS |  |
 | 21 | `grpo_non_colocated.sh` | PASS |  |
@@ -487,7 +487,7 @@ Testing all L1 functional tests (`tests/functional/L1_Functional_Tests_GPU.sh`) 
 | 32 | `test_automodel_extra_installed_correctly.sh` | PASS |  |
 | 33 | `test_converters.sh` | PASS |  |
 | 34 | `test_mcore_extra_installed_correctly.sh` | PASS |  |
-| 35 | `vlm_grpo.sh` | **FAIL** | Metric check failure: `train/token_mult_prob_error` exceeds threshold (Func Err 3) |
+| 35 | `vlm_grpo.sh` | **FAIL** | Metric check failure: `train/token_mult_prob_error` exceeds threshold (Func Err 2) |
 
 ---
 
@@ -518,32 +518,7 @@ cd tests/functional && bash distillation/distillation.sh
 
 ---
 
-## Func Err 2. Missing LoRA adapter `_extra_state` keys in Megatron checkpoint
-
-**Tests:** `grpo_megatron_lora.sh`, `grpo_megatron_lora_async.sh`
-**Error:** `RuntimeError: Missing key in checkpoint state_dict: decoder.layers.self_attention.linear_proj.adapter.linear_in._extra_state/shard_0_24`
-**Location:** `torch/distributed/checkpoint/default_planner.py:475` in `create_default_local_load_plan`
-
-**Stack trace (abbreviated):**
-```
-MegatronPolicyWorker pid=631794
-  megatron/core/dist_checkpointing/strategies/torch.py:799 load
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
-  torch/distributed/checkpoint/state_dict_loader.py:283 _load_state_dict
-    central_plan = distW.reduce_scatter("plan", local_step, global_step)
-  torch/distributed/checkpoint/default_planner.py:475 create_default_local_load_plan
-    raise RuntimeError(f"Missing key in checkpoint state_dict: {fqn}.")
-RuntimeError: Missing key in checkpoint state_dict: decoder.layers.self_attention.linear_proj.adapter.linear_in._extra_state/shard_0_24.
-```
-
-**Reproduction:**
-```bash
-cd tests/functional && bash grpo_megatron_lora/grpo_megatron_lora.sh
-```
-
----
-
-## Func Err 3. VLM GRPO `token_mult_prob_error` regression
+## Func Err 2. VLM GRPO `token_mult_prob_error` regression
 
 **Test:** `vlm_grpo.sh`
 **Error:** `train/token_mult_prob_error` exceeds threshold — numerical accuracy regression, not a crash.
@@ -551,13 +526,13 @@ cd tests/functional && bash grpo_megatron_lora/grpo_megatron_lora.sh
 The test checks (from `vlm_grpo.sh`):
 ```python
 max(data["train/token_mult_prob_error"]) < 1.05
-mean(data["train/token_mult_prob_error"]) < 1.05
+median(data["train/token_mult_prob_error"]) < 1.05
 ```
 
 Actual values:
 ```
-max  = 1.115  (threshold: < 1.05)  — FAIL
-mean = 1.094  (threshold: < 1.05)  — FAIL
+max    = 1.108  (threshold: < 1.05)  — FAIL
+median = 1.094  (threshold: < 1.05)  — FAIL
 ```
 
 This metric measures the multiplicative probability error between the policy and reference model token probabilities. Values >1.05 indicate the policy's token probabilities are diverging more than expected from the reference after training.
