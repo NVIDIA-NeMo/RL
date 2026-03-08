@@ -443,3 +443,127 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 All upstream references are now inline with each error section above.
 
+---
+
+# Phase 3: Functional Tests with Transformers 5.3
+
+Testing all L1 functional tests (`tests/functional/L1_Functional_Tests_GPU.sh`) against transformers 5.3.
+
+**Summary: 31/35 PASS, 4/35 FAIL**
+
+| # | Test | Status | Notes |
+|---|------|--------|-------|
+| 1 | `grpo_frozen_env.sh` | PASS |  |
+| 2 | `test_frozen_env.sh` | PASS |  |
+| 3 | `distillation.sh` | **FAIL** | DTensor SDPA `AssertionError: inputs need to be redistributed` (Func Err 1) |
+| 4 | `distillation_megatron.sh` | PASS |  |
+| 5 | `dpo.sh` | PASS |  |
+| 6 | `dpo_automodel_lora.sh` | PASS |  |
+| 7 | `dpo_megatron.sh` | PASS |  |
+| 8 | `eval.sh` | PASS |  |
+| 9 | `eval_async.sh` | PASS |  |
+| 10 | `grpo.sh` | PASS |  |
+| 11 | `grpo_async_gym.sh` | PASS |  |
+| 12 | `grpo_automodel_lora.sh` | PASS |  |
+| 13 | `grpo_automodel_lora_async.sh` | PASS |  |
+| 14 | `grpo_automodel_lora_non_colocated.sh` | PASS |  |
+| 15 | `grpo_megatron.sh` | PASS |  |
+| 16 | `grpo_megatron_generation.sh` | PASS |  |
+| 17 | `grpo_megatron_lora.sh` | **FAIL** | Missing LoRA adapter `_extra_state` keys in checkpoint (Func Err 2) |
+| 18 | `grpo_megatron_lora_async.sh` | **FAIL** | Same as #17 — LoRA adapter checkpoint key mismatch (Func Err 2) |
+| 19 | `grpo_multiple_dataloaders.sh` | PASS |  |
+| 20 | `grpo_multiturn.sh` | PASS |  |
+| 21 | `grpo_non_colocated.sh` | PASS |  |
+| 22 | `grpo_rm_env.sh` | PASS |  |
+| 23 | `grpo_sglang.sh` | PASS |  |
+| 24 | `prorlv2.sh` | PASS |  |
+| 25 | `rm.sh` | PASS |  |
+| 26 | `sft.sh` | PASS |  |
+| 27 | `sft_automodel_lora.sh` | PASS |  |
+| 28 | `sft_avlm.sh` | PASS |  |
+| 29 | `sft_megatron.sh` | PASS |  |
+| 30 | `sft_megatron_lora.sh` | PASS |  |
+| 31 | `sft_resume_diamond.sh` | PASS |  |
+| 32 | `test_automodel_extra_installed_correctly.sh` | PASS |  |
+| 33 | `test_converters.sh` | PASS |  |
+| 34 | `test_mcore_extra_installed_correctly.sh` | PASS |  |
+| 35 | `vlm_grpo.sh` | **FAIL** | Metric check failure: `train/token_mult_prob_error` exceeds threshold (Func Err 3) |
+
+---
+
+## Func Err 1. DTensor SDPA redistribute assertion in distillation
+
+**Test:** `distillation.sh`
+**Error:** `AssertionError: inputs need to be redistributed`
+**Location:** `torch/distributed/tensor/experimental/_context_parallel/_attention.py:904` in `_sdpa_handler`
+
+**Stack trace (abbreviated):**
+```
+ray::DTensorPolicyWorkerV2.train() (pid=422978)
+  transformers/models/qwen3/modeling_qwen3.py:280 forward
+    attn_output, attn_weights = attention_interface(...)
+  transformers/integrations/sdpa_attention.py:92 sdpa_attention_forward
+    attn_output = torch.nn.functional.scaled_dot_product_attention(...)
+  torch/distributed/tensor/experimental/_context_parallel/_attention.py:966 inner_fn
+    outputs = target_fn(*args, **kwargs)
+  torch/distributed/tensor/experimental/_context_parallel/_attention.py:904 _sdpa_handler
+    assert not output_sharding.needs_redistribute, "inputs need to be redistributed"
+AssertionError: inputs need to be redistributed
+```
+
+**Reproduction:**
+```bash
+cd tests/functional && bash distillation/distillation.sh
+```
+
+---
+
+## Func Err 2. Missing LoRA adapter `_extra_state` keys in Megatron checkpoint
+
+**Tests:** `grpo_megatron_lora.sh`, `grpo_megatron_lora_async.sh`
+**Error:** `RuntimeError: Missing key in checkpoint state_dict: decoder.layers.self_attention.linear_proj.adapter.linear_in._extra_state/shard_0_24`
+**Location:** `torch/distributed/checkpoint/default_planner.py:475` in `create_default_local_load_plan`
+
+**Stack trace (abbreviated):**
+```
+MegatronPolicyWorker pid=631794
+  megatron/core/dist_checkpointing/strategies/torch.py:799 load
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+  torch/distributed/checkpoint/state_dict_loader.py:283 _load_state_dict
+    central_plan = distW.reduce_scatter("plan", local_step, global_step)
+  torch/distributed/checkpoint/default_planner.py:475 create_default_local_load_plan
+    raise RuntimeError(f"Missing key in checkpoint state_dict: {fqn}.")
+RuntimeError: Missing key in checkpoint state_dict: decoder.layers.self_attention.linear_proj.adapter.linear_in._extra_state/shard_0_24.
+```
+
+**Reproduction:**
+```bash
+cd tests/functional && bash grpo_megatron_lora/grpo_megatron_lora.sh
+```
+
+---
+
+## Func Err 3. VLM GRPO `token_mult_prob_error` regression
+
+**Test:** `vlm_grpo.sh`
+**Error:** `train/token_mult_prob_error` exceeds threshold — numerical accuracy regression, not a crash.
+
+The test checks (from `vlm_grpo.sh`):
+```python
+max(data["train/token_mult_prob_error"]) < 1.05
+mean(data["train/token_mult_prob_error"]) < 1.05
+```
+
+Actual values:
+```
+max  = 1.115  (threshold: < 1.05)  — FAIL
+mean = 1.094  (threshold: < 1.05)  — FAIL
+```
+
+This metric measures the multiplicative probability error between the policy and reference model token probabilities. Values >1.05 indicate the policy's token probabilities are diverging more than expected from the reference after training.
+
+**Reproduction:**
+```bash
+cd tests/functional && bash vlm_grpo.sh
+```
+
