@@ -719,6 +719,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -798,6 +801,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -966,6 +972,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "dtensor_cfg": {"enabled": False},
             "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "sglang",
                 "colocated": {
                     "enabled": colocated_inference,
@@ -1338,6 +1347,9 @@ def mock_grpo_components():
             "max_total_sequence_length": 2048,
             "make_sequence_length_divisible_by": 1,
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {"enabled": True},
                 "vllm_cfg": {"async_engine": True},  # Support async mode
@@ -1902,6 +1914,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},
@@ -1995,6 +2010,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},

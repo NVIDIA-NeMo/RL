@@ -376,7 +376,7 @@ class TestForwardWithPostProcessingFn:
 
         cfg = {
             "sequence_packing": {"enabled": False},
-            "generation": {"temperature": 0.7},
+            "generation": {"temperature": 0.7, "top_p": 1.0, "top_k": None},
         }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
         sampling_params = TrainingSamplingParams(
@@ -420,7 +420,7 @@ class TestForwardWithPostProcessingFn:
 
         cfg = {
             "sequence_packing": {"enabled": False},
-            "generation": {"temperature": 0.5},
+            "generation": {"temperature": 0.5, "top_p": 1.0, "top_k": None},
         }
         post_processor = LogprobsPostProcessor(cfg=cfg)
         sampling_params = TrainingSamplingParams(
@@ -465,7 +465,7 @@ class TestForwardWithPostProcessingFn:
         cfg = {
             "sequence_packing": {"enabled": False},
             "megatron_cfg": {"context_parallel_size": 1},
-            "generation": {"temperature": 1.5},
+            "generation": {"temperature": 1.5, "top_p": 1.0, "top_k": None},
         }
         post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
         sampling_params = TrainingSamplingParams(

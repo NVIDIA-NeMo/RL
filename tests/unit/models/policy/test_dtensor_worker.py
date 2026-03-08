@@ -54,9 +54,9 @@ def create_test_config(
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
-            "max_new_tokens": 16,  # Small number of tokens for testing
             "top_p": 1.0,
             "top_k": None,
+            "max_new_tokens": 16,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
             "colocated": {

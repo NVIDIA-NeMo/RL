@@ -763,6 +763,9 @@ class TestValidateAndSetConfig:
 
         config = {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {"enabled": True},
             },
             "precision": "bfloat16",
