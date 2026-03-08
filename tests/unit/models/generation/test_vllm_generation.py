@@ -1909,7 +1909,7 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize(
-    "policy_type", ["dtensor", pytest.param("megatron", marks=[pytest.mark.mcore, pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")])]
+    "policy_type", ["dtensor", pytest.param("megatron", marks=[pytest.mark.mcore])]
 )
 async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
@@ -2020,7 +2020,6 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 
 @pytest.mark.mcore
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
@@ -2198,7 +2197,6 @@ def test_vllm_generation_with_megatron_training(
 
 
 @pytest.mark.mcore
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training_moe_model(
@@ -2367,7 +2365,6 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
 
 @pytest.mark.mcore
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(180)
 def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     """Test that vLLM streaming weight update with Megatron can save memory."""
@@ -2457,7 +2454,6 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
 
 @pytest.mark.mcore
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 @pytest.mark.timeout(120)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
@@ -2550,7 +2546,6 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
 
 
 @pytest.mark.mcore
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
 def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
     megatron_policy = None
     vllm_generation = None
