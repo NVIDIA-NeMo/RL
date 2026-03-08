@@ -71,12 +71,15 @@ cd tests && uv run --extra sglang pytest unit/path/test.py::test_name --hf-gated
 
 ---
 
-## Err 1. vLLM FP8 QKVParallelLinear missing `input_scale`
+## Err 1. vLLM FP8 QKVParallelLinear missing `input_scale` — FIXED
 
 **Description:** When loading a model with FP8 precision via vLLM, `QKVParallelLinear` object has no attribute `input_scale`. This is a vLLM/FP8 quantization compatibility issue triggered by the transformers v5 model weight format changes.
 
-**Error:**
+**Stack trace:**
 ```
+File "vllm/model_executor/layers/quantization/fp8.py", in apply()
+    if layer.input_scale is not None:
+       ^^^^^^^^^^^^^^^^^
 AttributeError: 'QKVParallelLinear' object has no attribute 'input_scale'. Did you mean: 'input_size'?
 torch._dynamo.exc.ObservedAttributeError: 'QKVParallelLinear' object has no attribute 'input_scale'
 ```
@@ -96,18 +99,34 @@ cd tests && uv run --no-sync pytest unit/models/generation/test_vllm_generation.
 
 **Root cause:** Our patched `process_weights_after_loading` in `nemo_rl/models/generation/vllm/quantization/fp8.py` didn't set `layer.input_scale = None` for the block_quant dynamic activation path. vLLM's original does this (line 440 of vLLM's fp8.py), and the `apply()` forward pass accesses `layer.input_scale` at lines 461 and 519 when `block_quant=True`.
 
-**Fix:** Added `if not hasattr(layer, "input_scale"): layer.input_scale = None` after `maybe_post_process_fp8_weight_block(layer)` in our patched function.
+**Fix:** In `nemo_rl/models/generation/vllm/quantization/fp8.py`, added `input_scale = None` after `maybe_post_process_fp8_weight_block(layer)`:
+```python
+# in process_weights_after_loading():
+maybe_post_process_fp8_weight_block(layer)
+
+# vLLM's apply() forward pass accesses layer.input_scale when block_quant=True.
+# The original process_weights_after_loading sets input_scale = None for dynamic activation
+# with block quantization. We must do the same to avoid AttributeError.
+if not hasattr(layer, "input_scale"):
+    layer.input_scale = None
+```
 
 **Status:** FIXED — colocated FP8 tests pass (4/4). Non-colocated FP8 tests (2 tests) still fail with a separate logprob tolerance issue (avg_prob_mult_error=1.1293 > threshold 1.08, deterministic). This is a pre-existing bug: `update_weights_from_collective` in `vllm_backend.py` does NOT call `process_weights_after_loading` after loading (unlike the IPC/colocated path which does). The `weight_update_and_prefix_cache_reset` FP8 tests (2 tests) still need verification.
 
-## Err 2. vLLM HTTP server response format mismatch
+**Upstream references:**
+- [vllm#11537](https://github.com/vllm-project/vllm/issues/11537) — exact same `'QKVParallelLinear' object has no attribute 'input_scale'` error
+- [vllm#5915](https://github.com/vllm-project/vllm/issues/5915) — root cause: fused/merged linear modules don't propagate FP8 scales correctly
+- [verl#540](https://github.com/volcengine/verl/issues/540) — verl hit the same `'Parameter' object has no attribute 'weight_loader'` variant
+
+## Err 2. vLLM HTTP server response format mismatch — FIXED
 
 **Description:** The `test_vllm_http_server` test compares expected vs actual HTTP response JSON from the vLLM OpenAI-compatible server. The response format has changed (likely new/different fields in the chat completion response) causing assertion mismatch.
 
-**Error:**
+**Stack trace:**
 ```
 AssertionError: assert _standardize(expected_result) == _standardize(actual_result)
-Differing items in choices[0] — truncated diff, likely a new field or changed structure in chat completion response.
+# Diff: expected has "reasoning_content": None in choices[0].message,
+# but actual response from vLLM 0.17 omits this field entirely.
 ```
 
 **Reproduction:**
@@ -120,17 +139,29 @@ cd tests && uv run --no-sync pytest unit/models/generation/test_vllm_generation.
 
 **Root cause:** vLLM 0.17's chat completion response dropped the `reasoning_content` field from the message object. The expected response hardcoded `"reasoning_content": None` but the actual response doesn't include it. The `_standardize` function already stripped `reasoning` but not `reasoning_content`.
 
-**Fix:** Updated `_standardize` to pop both `reasoning` and `reasoning_content` from the message, since these are version-dependent fields.
+**Fix:** In `tests/unit/models/generation/test_vllm_generation.py`, updated `_standardize` to strip both version-dependent fields:
+```python
+# Remove version-dependent fields that vLLM may or may not include
+message = d["choices"][0]["message"]
+for key in ("reasoning", "reasoning_content"):
+    message.pop(key, None)
+```
 
 **Status:** FIXED
 
-## Err 3. Ray ActorAlreadyExistsError (megatron actor cleanup issue)
+**Upstream references:**
+- [vllm#27755](https://github.com/vllm-project/vllm/issues/27755) — RFC: `reasoning_content` → `reasoning` field rename in vLLM API responses
+
+## Err 3. Ray ActorAlreadyExistsError (megatron actor cleanup issue) — FIXED
 
 **Description:** When running multiple megatron-parametrized test variants in sequence, the Ray actor `lm_policy-0-0` from the first test isn't cleaned up before the second starts, causing `ActorAlreadyExistsError`. This is a test isolation issue that surfaces in the mcore pass.
 
-**Error:**
+**Stack trace:**
 ```
 ray.exceptions.ActorAlreadyExistsError: The name lm_policy-0-0 (namespace=None) is already taken.
+# Happens when a second test tries to create a Policy with the same actor name
+# after the first test's Policy.shutdown() completed gracefully but did NOT
+# ray.kill() the actors.
 ```
 
 **Reproduction:**
@@ -157,19 +188,39 @@ cd tests && uv run --extra mcore pytest unit/models/generation/test_vllm_generat
 
 **Root cause:** `RayWorkerGroup.shutdown(cleanup_method="shutdown")` calls the worker's `shutdown()` method via RPC but does NOT call `ray.kill()` on the actors when graceful cleanup succeeds. The named actors (e.g., `lm_policy-0-0`) remain registered in Ray's actor registry. When the next test creates actors with the same name, it fails with `ActorAlreadyExistsError`.
 
-**Fix:** Changed `worker_groups.py` `shutdown()` to always kill actors after graceful cleanup, not just on failure. The graceful cleanup is for giving workers time to release resources, but after that, actors must be killed to release their name registrations. Changed the conditional `if force or cleanup_method is None:` to always execute the kill block.
+**Fix:** In `nemo_rl/distributed/worker_groups.py`, changed `RayWorkerGroup.shutdown()` to always kill actors after graceful cleanup:
+```python
+# Before (buggy): only killed on failure or force
+if force or cleanup_method is None:
+    # kill actors ...
+
+# After (fixed): always kill to release named actor registrations
+# Even after successful graceful cleanup, actors remain alive in Ray's registry
+# which prevents creating new actors with the same name.
+if True:
+    # kill actors ...
+```
 
 **Status:** FIXED — all 16 skip markers removed (5 in test_vllm_generation.py, 11 in test_megatron_worker.py). Verified megatron tests pass in sequence.
 - `test_megatron_worker.py::test_megatron_gradient_norm_consistency_across_parallelism`
 - `test_megatron_worker.py::test_megatron_policy_flops_range_check`
 
-## Err 4. SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED
+**Upstream references:**
+- [ray#7591](https://github.com/ray-project/ray/issues/7591) — named actors found after `ray.kill()`; name not released
+- [ray#20611](https://github.com/ray-project/ray/issues/20611) — race condition: actor name reserved but `get_actor` fails
+- Standard pattern across verl/prime-rl: always `ray.kill()` named actors explicitly during cleanup
+
+## Err 4. SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED — FIXED
 
 **Description:** SGLang server process crashes during startup when building piecewise CUDA graphs. The error is `CUBLAS_STATUS_EXECUTION_FAILED` in cublasGemmEx. This may be caused by GPU memory/state contamination from prior tests or SGLang incompatibility with the new transformers model loading.
 
-**Error:**
+**Stack trace:**
 ```
+File "sglang/srt/layers/attention/triton_ops/decode_attention.py", in _decode_softmax()
 RuntimeError: CUDA error: CUBLAS_STATUS_EXECUTION_FAILED when calling cublasGemmEx(...)
+# Happens during PiecewiseCudaGraphRunner.capture() in the SGLang server subprocess
+# launched via multiprocessing.Process(target=launch_server) from a Ray worker actor.
+
 RuntimeError: [SGLang Server] Rank 0 Server process terminated unexpectedly.
 ```
 
@@ -190,17 +241,40 @@ cd tests && uv run --extra sglang pytest unit/models/generation/test_sglang_gene
 
 **Root cause:** CUDA graph capture (`cublasGemmEx`) fails inside a Ray worker actor's forked subprocess. SGLang starts a server via `multiprocessing.Process(target=launch_server)` which uses `fork` on Linux. The CUBLAS error occurs during piecewise CUDA graph capture in the child process. SGLang works fine when run directly (not inside Ray). This is NOT a transformers v5 regression — it's an SGLang + CUDA graph + Ray fork issue.
 
-**Fix:** Added `"disable_piecewise_cuda_graph": True` to the `basic_sglang_test_config["sglang_cfg"]` in the test config. CUDA graphs are a performance optimization not needed for correctness testing.
+**Fix:** In `tests/unit/models/generation/test_sglang_generation.py`, added `disable_piecewise_cuda_graph` to the test config:
+```python
+basic_sglang_test_config: SGLangConfig = {
+    "sglang_cfg": {
+        ...
+        "mem_fraction_static": 0.7,
+        "disable_piecewise_cuda_graph": True,  # <-- added: CUDA graphs fail in Ray fork
+    },
+    ...
+}
+```
+CUDA graphs are a performance optimization not needed for correctness testing.
 
 **Status:** FIXED — all 7 skip markers removed, `disable_piecewise_cuda_graph: True` added to test config.
 
-## Err 5. SDPA attention mask expand error with TP=2 SP=True
+**Upstream references:**
+- [sglang#12796](https://github.com/sgl-project/sglang/issues/12796) — piecewise CUDA graph CUBLAS failures in SGLang v0.5.5+
+- [sglang#4584](https://github.com/sgl-project/sglang/issues/4584) — `CUBLAS_STATUS_INTERNAL_ERROR` when calling `cublasGemmEx()`
+- [sglang#18130](https://github.com/sgl-project/sglang/issues/18130) — TODO list for making piecewise CUDA graph the default (tracking remaining compat issues)
+- [verl#1656](https://github.com/volcengine/verl/issues/1656) — verl feature request to expose `disable_cuda_graph` for SGLang rollout engine
+
+## Err 5. SDPA attention mask expand error with TP=2 SP=True — FIXED
 
 **Description:** When using tensor parallelism (TP=2) with sequence parallelism (SP=True), transformers v5's SDPA attention implementation tries to expand the attention mask to a size that doesn't match the sequence-parallel-split tensor dimensions. The mask has shape `[1, 1, 64, 128]` but SDPA tries to expand it to `[1, 1, 128, 128]`.
 
-**Error:**
+**Stack trace:**
 ```
-RuntimeError: The expanded size of the tensor (128) must match the existing size (64) at non-singleton dimension 2.  Target sizes: [1, 1, 128, 128].  Tensor sizes: [1, 1, 64, 128]
+File "transformers/models/llama/modeling_llama.py", in LlamaSdpaAttention.forward()
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states, key_states, value_states, attn_mask=causal_mask, ...)
+    # causal_mask has shape [1, 1, 64, 128] (64 = seq_len/tp_size due to SP)
+    # but SDPA tries to expand it to [1, 1, 128, 128] to match full key length
+RuntimeError: The expanded size of the tensor (128) must match the existing size (64)
+  at non-singleton dimension 2.  Target sizes: [1, 1, 128, 128].  Tensor sizes: [1, 1, 64, 128]
 ```
 
 **Reproduction:**
@@ -216,19 +290,60 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 The actual bug: `attention_mask = torch.ones((batch_size, seq_len), ...)` creates a full-size mask, but with SP the query is only `seq_len / tp_size` long. The mask expansion in both SDPA and eager attention fails because the mask doesn't match the local query shape.
 
-**Fix:** When sequence parallelism is enabled, pass `attention_mask=None` to the model forward. The model uses its built-in causal mask internally, which correctly handles the sharded sequence dimension. Changed in `dtensor_policy_worker.py` forward pass.
+**Fix:** In `nemo_rl/models/policy/workers/dtensor_policy_worker.py`, pass `attention_mask=None` when SP is enabled:
+```python
+# When sequence parallelism is enabled, hidden states are sharded along
+# the sequence dimension after the embedding layer. Passing a full-size
+# attention mask causes a shape mismatch in both SDPA and eager attention.
+# Pass None instead — the model will use its built-in causal mask.
+if self.cfg["dtensor_cfg"]["sequence_parallel"]:
+    attention_mask = None
+else:
+    attention_mask = torch.ones(
+        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device,
+    )
+```
 
 **Status:** FIXED — both TP=2 SP=True tests (llama and qwen2) pass.
 
-## Err 6. DTensor redistribute assertion error for gemma3 TP=2
+**Upstream references:**
+- [HF#30461](https://github.com/huggingface/transformers/issues/30461) — SDPA mask causes 10-30% training slowdown; `attention_mask=None` enables flash attention fast path via `is_causal=True`
+- [HF#29668](https://github.com/huggingface/transformers/issues/29668) — "We don't need attention_mask in SDPA implementation?"
+- [HF#38803](https://github.com/huggingface/transformers/issues/38803) — DTensor issues with TP: `expand`/`unfold` not compatible with DTensor sharding
+- [verl#312](https://github.com/volcengine/verl/issues/312) — verl SP optimization compat with newer transformers
+- [prime-rl model.py](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/src/prime_rl/trainer/model.py) — prime-rl never passes `attention_mask` at all
+- [torchtitan](https://github.com/pytorch/torchtitan) — explicitly requires `None` or causal mask for context/sequence parallelism
 
-**Description:** When running DTensor policy worker v2 with gemma3 model and TP=2, the DTensor redistribute operation fails with an assertion error about `src_shard_order` and `dst_shard_order` being None. This is a PyTorch DTensor compatibility issue with gemma3's architecture under tensor parallelism.
+## Err 6. DTensor redistribute assertion error for gemma3 TP=2 — FIXED
 
-**Error:**
+**Description:** When running DTensor policy worker v2 with gemma3 model and TP=2, the DTensor redistribute operation fails with an assertion error about `src_shard_order` and `dst_shard_order` being None.
+
+**Root cause:** Transformers v5 added `initialize_weights()` / `smart_apply()` which calls `_init_weights()` on every module. Gemma3's `_init_weights` calls `super()._init_weights(module)` which does `init.zeros_(module.weight[module.padding_idx])` for embedding layers. When the embedding weight is a DTensor (sharded via TP), this integer indexing triggers a redistribute that fails because the shard order metadata is missing.
+
+**Stack trace:**
 ```
-assert src_shard_order is not None and dst_shard_order is not None
+File "nemo_automodel/components/checkpoint/checkpointing.py", in load_base_model()
+    model.initialize_weights()
+File "transformers/modeling_utils.py", in initialize_weights()
+    self.smart_apply(self._initialize_weights)
+File "transformers/modeling_utils.py", in _init_weights()
+    init.zeros_(module.weight[module.padding_idx])
+    # module.weight is a DTensor (sharded via TP), indexing with padding_idx
+    # triggers a redistribute operation
+File "torch/distributed/tensor/_redistribute.py", in _gen_transform_infos_non_cached()
+    assert src_shard_order is not None and dst_shard_order is not None
 AssertionError
 ```
+
+**Fix:** In `nemo_automodel/components/checkpoint/checkpointing.py`, added `Gemma3ForCausalLM` to the skip list (the multimodal `Gemma3ForConditionalGeneration` was already there):
+```python
+# Before:
+skip_initialize_weights = model_class in ["Gemma3ForConditionalGeneration"] or is_nemotron_v2
+
+# After:
+skip_initialize_weights = model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2
+```
+Skipping `initialize_weights` is safe because the weights are loaded from the pretrained checkpoint immediately after.
 
 **Reproduction:**
 ```bash
@@ -238,9 +353,49 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 **Affected tests:**
 - `test_dtensor_worker_v2.py::test_dtensor_worker_v1_v2_model_config_equivalence[tiny_gemma3_model_path-2-1-False-False-False]`
 
-## Err 7. TP tied model fails with automodel v2
+**Upstream references:**
+- [HF#38358](https://github.com/huggingface/transformers/issues/38358) — "Invalid attribute access in `PreTrainedModel.initialize_weights`" (the upstream bug)
+- [HF#39186](https://github.com/huggingface/transformers/issues/39186) — FSDP `RuntimeError: 'weight' must be 2-D` with gemma-3-12b embedding
+- [PyTorch#124019](https://github.com/pytorch/pytorch/issues/124019) — `[FSDP+TP] RuntimeError: 'weight' must be 2-D` with embeddings
+- [verl#1013](https://github.com/volcengine/verl/issues/1013) — Gemma3 support in verl's FSDP backend; verl uses custom `dtensor_weight_loader` registry to bypass HF init entirely
 
-**Description:** DTensor TP=2 with a tied llama model and custom parallel plan fails in the automodel v2 code path. Error trace was truncated; needs investigation.
+## Err 7. TP tied model fails with automodel v2 — FIXED
+
+**Description:** DTensor TP=2 with a tied llama model and custom parallel plan fails in the automodel v2 code path during `model.to(device)` after FSDP parallelization.
+
+**Root cause:** After FSDP sharding + checkpoint loading, calling `model.to(device)` triggers `nn.Module._apply()` → FSDP's `reset_sharded_param()`. For tied parameters (lm_head and embed_tokens sharing the same weight), `reset_sharded_param` tries to copy the full unsharded size (128256) into the local shard (64128), causing a RuntimeError.
+
+**Stack trace:**
+```
+File "nemo_automodel/_transformers/infrastructure.py", in apply_model_infrastructure()
+    model.to(device)
+File "transformers/modeling_utils.py", in to()
+    return super().to(*args, **kwargs)
+File "torch/nn/modules/module.py", in to()
+    return self._apply(convert)
+File "torch/distributed/fsdp/_fully_shard/_fully_shard.py", in _apply()
+    fsdp_param.reset_sharded_param()
+File "torch/distributed/fsdp/_fully_shard/_fsdp_param.py", in reset_sharded_param()
+    padded_local_tensor.narrow(dim=shard_dim, start=0, length=length).copy_(
+    # length=128256 (full unsharded vocab), but local shard is only 64128 (= 128256/2)
+RuntimeError: start (0) + length (128256) exceeds dimension size (64128).
+```
+
+**Fix:** In `nemo_automodel/_transformers/infrastructure.py`, skip `model.to(device)` when checkpoint loading already placed params on device:
+```python
+# Before:
+if autopipeline is None:
+    print_trainable_parameters(model)
+    model.to(device)  # crashes with tied params + FSDP
+
+# After:
+if autopipeline is None:
+    print_trainable_parameters(model)
+    # Skip if checkpoint was loaded (params are already on device) to avoid triggering
+    # FSDP's reset_sharded_param which fails on tied parameters after parallelization.
+    if not should_load_checkpoint:
+        model.to(device)
+```
 
 **Reproduction:**
 ```bash
@@ -249,6 +404,13 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 **Affected tests:**
 - `test_dtensor_worker.py::test_dtensor_tp_and_tied_model_with_custom_parallel_plan[True]`
+
+**Upstream references:**
+- [accelerate#3870](https://github.com/huggingface/accelerate/issues/3870) — FSDP2 fails with `KeyError: 'lm_head.weight'` due to tied weights
+- [HF#23868](https://github.com/huggingface/transformers/issues/23868) — "Avoid saving tied weights with sharded checkpoints" (FSDP breaks tied weight identity)
+- [PyTorch#125738](https://github.com/pytorch/pytorch/issues/125738) — FSDP2 `_sharded_param_data` out of sync after external `.to()` calls
+- [PyTorch FSDP2 docs](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) — `fully_shard` handles device placement; `.to()` after is redundant
+- [torchtitan](https://github.com/pytorch/torchtitan) — PyTorch's reference FSDP2 training framework never calls `model.to()` after `fully_shard()`
 
 ---
 
@@ -268,12 +430,12 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - [x] Err 3: Ray ActorAlreadyExistsError — FIXED (always kill actors after graceful shutdown in worker_groups.py)
 - [x] Err 4: SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED — FIXED (disable_piecewise_cuda_graph in test config)
 - [x] Err 5: SDPA attention mask expand error TP=2 SP=True — FIXED (pass attention_mask=None when SP enabled)
-- [ ] Err 6: DTensor redistribute assertion gemma3 TP=2 (1 test)
-- [ ] Err 7: TP tied model fails with automodel v2 (1 test)
+- [x] Err 6: DTensor redistribute assertion gemma3 TP=2 — FIXED (add Gemma3ForCausalLM to skip_initialize_weights)
+- [x] Err 7: TP tied model fails with automodel v2 — FIXED (skip model.to(device) after checkpoint loading)
 
 ---
 
 ## Resources about transformers v5 upgrade
 
-(Add links, issues, PRs, and notes here as they come in)
+All upstream references are now inline with each error section above.
 
