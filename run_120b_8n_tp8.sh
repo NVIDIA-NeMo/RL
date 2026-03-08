@@ -1,17 +1,18 @@
 #!/bin/bash
-# GPT-OSS 120B 8-node TP=8 run: pip cuDNN 9.19 + alltoall + moe_permute_fusion + sequence_packing
-# 8n8g: TP=8, PP=2, EP=4 (64 GPUs total)
+# GPT-OSS 120B 8-node TP=8 PP=1 run: pip cuDNN 9.19 + alltoall + moe_permute_fusion + sequence_packing
+# 8n8g: TP=8, PP=1, EP=8 (64 GPUs total) — PP=1 for better performance (no PP bubble overhead)
 #
 # Memory calc (H100 80GB per GPU):
-#   vLLM  (TP=8, util=0.5): 40GB alloc = ~30GB model + ~10GB KV cache → 64 seq OK
-#   Megatron training (TP=8, PP=2, EP=4):
-#     - PP=1/TP=8 needed 54.73GB → PP=2 halves to ~27GB model base
-#     - EP=4 (vs 16n EP=8) doubles expert params per GPU → ~35GB estimate
-#     - Activations (activation_checkpointing=true): ~5-8GB → total ~42GB → fits H100 80GB ✓
-#   Note: EP=4 is the only valid EP with TP=8 PP=2 on 8 nodes (8x2x4=64; 8x2x8=128>64)
+#   vLLM  (TP=8, util=0.55): 44GB alloc = ~30GB model + ~14GB KV cache → OK
+#   Megatron training (TP=8, PP=1, EP=8):
+#     - PP=1/TP=8 estimated ~54.73GB (model + optimizer states + activations w/ act_ckpt)
+#     - EP=8 (vs EP=4): halves expert params per GPU → lower memory than EP=4
+#     - Total ~55-59GB → fits H100 80GB ✓
+#   Note: TP=8×PP=1×EP=8 = 64 GPUs ✓ (8 nodes × 8 GPUs)
 #
 # Key fix: Megatron TP=8 == vLLM TP=8 → 1:1 weight copy at prepare_refit_info → no Bug 11 OOM
-# Batch reduced: 8 prompts x 8 generations = 64 (vs 128) to halve KV cache during generation
+# Previous attempt (9869349) used gpu_util=0.40 → KV cache -3.14 GiB → FIXED: use 0.55
+# Batch: 16 prompts x 8 generations = 128
 set -e
 
 PIP_CUDNN_LIB=$(uv run python3 -c "import nvidia.cudnn, pathlib; print(pathlib.Path(list(nvidia.cudnn.__path__)[0]) / 'lib')")
@@ -48,9 +49,9 @@ v = cudnn.cudnnGetVersion()
 print(f'[cuDNN] libcudnn.so.9 version: {v // 10000}.{(v % 10000) // 100}.{v % 100}')
 "
 
-LOGFILE="gpt-oss-120b_8n_tp8_$(date +%Y%m%d_%H%M%S).log"
-RUN_NAME="gptoss-120b-8n-tp8-ep4-$(date +%Y%m%d_%H%M%S)"
-echo "[INFO] Starting GPT-OSS 120B 8n TP=8 PP=2 EP=4 run, logging to ${LOGFILE}"
+LOGFILE="gpt-oss-120b_8n_tp8pp1_$(date +%Y%m%d_%H%M%S).log"
+RUN_NAME="gptoss-120b-8n-tp8pp1-ep8-$(date +%Y%m%d_%H%M%S)"
+echo "[INFO] Starting GPT-OSS 120B 8n TP=8 PP=1 EP=8 run, logging to ${LOGFILE}"
 
 NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 CUDNN_INSTALL=0 NRL_FORCE_REBUILD_VENVS=false NRL_IGNORE_VERSION_MISMATCH=1 VLLM_USE_DEEP_GEMM=0 \
 uv run --no-sync ./examples/run_grpo.py \
@@ -58,21 +59,23 @@ uv run --no-sync ./examples/run_grpo.py \
   cluster.num_nodes=8 \
   cluster.gpus_per_node=8 \
   policy.generation.vllm_cfg.tensor_parallel_size=8 \
+  policy.generation.vllm_cfg.pipeline_parallel_size=1 \
+  policy.generation.vllm_cfg.gpu_memory_utilization=0.55 \
   policy.megatron_cfg.tensor_model_parallel_size=8 \
-  policy.megatron_cfg.pipeline_model_parallel_size=2 \
-  policy.megatron_cfg.expert_model_parallel_size=4 \
+  policy.megatron_cfg.pipeline_model_parallel_size=1 \
+  policy.megatron_cfg.expert_model_parallel_size=8 \
   policy.megatron_cfg.moe_token_dispatcher_type=alltoall \
   policy.megatron_cfg.moe_permute_fusion=true \
-  policy.train_global_batch_size=64 \
-  grpo.num_prompts_per_step=8 \
+  policy.train_global_batch_size=128 \
+  grpo.num_prompts_per_step=16 \
   grpo.num_generations_per_prompt=8 \
-  grpo.max_num_steps=20 \
+  grpo.max_num_steps=3 \
   grpo.val_period=1000 \
   checkpointing.enabled=false \
   logger.wandb_enabled=True \
-  logger.wandb.project=sync-grpo-h100-gptoss-exp \
+  logger.wandb.project=sync-grpo-h100-gptoss120b-exp \
   +logger.wandb.entity=nvidia \
   "logger.wandb.name=${RUN_NAME}" \
   2>&1 | tee "${LOGFILE}"
 
-echo "[INFO] 120B 8n TP=8 run complete. Log: ${LOGFILE}"
+echo "[INFO] 120B 8n TP=8 PP=1 EP=8 run complete. Log: ${LOGFILE}"
