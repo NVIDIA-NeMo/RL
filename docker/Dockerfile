@@ -155,15 +155,6 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-# Ensure ray workers that rebuild vllm in isolated venvs use the precompiled wheel
-# instead of compiling from source. These are only necessary while vllm is a VCS
-# (git) install in pyproject.toml. The commit should match the value set in
-# pyproject.toml's [tool.uv] extra-build-variables for vllm.
-# We use WHEEL_COMMIT (not WHEEL_LOCATION) so that vllm's setup.py auto-selects
-# the correct arch-specific wheel from wheels.vllm.ai (supports both x86_64 and aarch64).
-# TODO(https://github.com/NVIDIA-NeMo/RL/issues/2065): Remove once vllm releases with transformers v5.
-ENV VLLM_USE_PRECOMPILED=1
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=b66a74649e40022c6b1180b98fbb1b6e4b4af74a
 
 WORKDIR /opt/nemo-rl
 
