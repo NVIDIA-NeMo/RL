@@ -359,6 +359,8 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - [PyTorch#124019](https://github.com/pytorch/pytorch/issues/124019) — `[FSDP+TP] RuntimeError: 'weight' must be 2-D` with embeddings
 - [verl#1013](https://github.com/volcengine/verl/issues/1013) — Gemma3 support in verl's FSDP backend; verl uses custom `dtensor_weight_loader` registry to bypass HF init entirely
 
+**Automodel PR:** [NVIDIA-NeMo/Automodel#1488](https://github.com/NVIDIA-NeMo/Automodel/pull/1488)
+
 ## Err 7. TP tied model fails with automodel v2 — FIXED
 
 **Description:** DTensor TP=2 with a tied llama model and custom parallel plan fails in the automodel v2 code path during `model.to(device)` after FSDP parallelization.
@@ -411,6 +413,8 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - [PyTorch#125738](https://github.com/pytorch/pytorch/issues/125738) — FSDP2 `_sharded_param_data` out of sync after external `.to()` calls
 - [PyTorch FSDP2 docs](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) — `fully_shard` handles device placement; `.to()` after is redundant
 - [torchtitan](https://github.com/pytorch/torchtitan) — PyTorch's reference FSDP2 training framework never calls `model.to()` after `fully_shard()`
+
+**Automodel PR:** [NVIDIA-NeMo/Automodel#1489](https://github.com/NVIDIA-NeMo/Automodel/pull/1489)
 
 ---
 
