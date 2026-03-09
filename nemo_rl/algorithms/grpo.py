@@ -1065,7 +1065,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
     if adv_estimator_name == "gdpo":
         assert not _should_use_async_rollouts(master_config), (
             "GDPO is not supported for async rollouts, "
-            "please set policy.generation.vllm_cfg.async_engine to false in your config."
+            "please set policy.generation.vllm_cfg.async_engine to false in your config. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2061 for more details."
         )
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
