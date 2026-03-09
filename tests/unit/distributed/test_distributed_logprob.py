@@ -133,9 +133,7 @@ def _run_logprob_forward_and_backward(rank, world_size, tp_size, chunk_size):
     distributed_loss.backward()
     distributed_grad = vocab_parallel_logits.grad
 
-    torch.testing.assert_close(
-        distributed_grad, baseline_grad, rtol=1e-4, atol=1e-4
-    )
+    torch.testing.assert_close(distributed_grad, baseline_grad, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(
         distributed_log_probs, baseline_log_probs, rtol=1e-4, atol=1e-4
     )
@@ -179,14 +177,23 @@ def _run_edge_cases(rank, world_size, tp_size):
 
     # Large logits — should not produce NaN or Inf
     torch.manual_seed(42)
-    large_logits = torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
-    vocab_parallel_logits = large_logits[:, :, vocab_start_index:vocab_end_index].clone()
+    large_logits = (
+        torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
+    )
+    vocab_parallel_logits = large_logits[
+        :, :, vocab_start_index:vocab_end_index
+    ].clone()
 
     torch.manual_seed(43)
     target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
 
     log_probs = DistributedLogprob.apply(
-        vocab_parallel_logits, target, vocab_start_index, vocab_end_index, tp_group, True
+        vocab_parallel_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        True,
     )
 
     assert not torch.isnan(log_probs).any(), "Log probs contain NaN"
@@ -196,11 +203,18 @@ def _run_edge_cases(rank, world_size, tp_size):
     zero_target = torch.zeros(batch_size, seq_len, dtype=torch.long, device="cuda")
 
     log_probs_zero = DistributedLogprob.apply(
-        vocab_parallel_logits, zero_target, vocab_start_index, vocab_end_index, tp_group, True
+        vocab_parallel_logits,
+        zero_target,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        True,
     )
 
     torch.manual_seed(42)
-    baseline_large_logits = torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
+    baseline_large_logits = (
+        torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
+    )
     baseline_log_probs = _torch_baseline_logprob(baseline_large_logits, zero_target)
 
     torch.testing.assert_close(log_probs_zero, baseline_log_probs, rtol=1e-4, atol=1e-4)
@@ -267,14 +281,10 @@ def _run_chunked_gather_logprob(rank, world_size, tp_size, chunk_size, inference
     # Baseline: single-GPU log_softmax + gather
     baseline_logits = full_logits.clone().detach().requires_grad_(not inference_only)
     baseline_log_probs = torch.nn.functional.log_softmax(baseline_logits, dim=-1)
-    baseline_selected = torch.gather(
-        baseline_log_probs, dim=-1, index=global_indices
-    )
+    baseline_selected = torch.gather(baseline_log_probs, dim=-1, index=global_indices)
 
     if not inference_only:
-        torch.gather(
-            baseline_log_probs, dim=-1, index=global_indices
-        ).sum().backward()
+        torch.gather(baseline_log_probs, dim=-1, index=global_indices).sum().backward()
         baseline_grad = baseline_logits.grad[:, :, vocab_start_index:vocab_end_index]
 
     # Distributed path
