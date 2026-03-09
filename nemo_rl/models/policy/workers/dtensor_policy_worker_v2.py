@@ -166,7 +166,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
-        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
+        self.offload_optimizer_for_logprob = self.cfg.get("offload_optimizer_for_logprob", False)
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         try:
@@ -174,7 +174,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         except KeyError:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        self.enable_seq_packing = self.cfg.get("sequence_packing", {}).get("enabled", False)
         if self.enable_seq_packing:
             assert not self.is_vlm, (
                 "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
@@ -672,7 +672,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
                 # so its safe to not check for the case where the last data slice is smaller than mbs
                 dummy_iterator = iter([])
-                if self.cfg["dynamic_batching"]["enabled"]:
+                if self.cfg.get("dynamic_batching", {}).get("enabled", False):
                     mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
                 elif self.enable_seq_packing:
@@ -1173,7 +1173,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1458,7 +1458,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1600,7 +1600,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
                 # dynamic batching support (no CP/packed)
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()

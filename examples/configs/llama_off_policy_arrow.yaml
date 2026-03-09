@@ -3,8 +3,8 @@
 distillation:
   num_prompts_per_step: 768
   num_generations_per_prompt: 1
-  max_num_steps: 1000
-  max_num_epochs: 10
+  max_num_steps: 3000
+  max_num_epochs: 20
   val_period: 0 # Handled in eval block instead
   val_at_start: false
   max_val_samples: 128
@@ -15,11 +15,11 @@ distillation:
 
 loss_fn:
   kl_type: "forward"
-  zero_outside_topk: false
+  zero_outside_topk: true
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B"
+  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B-3000steps"
   metric_name: "train:loss"
   higher_is_better: false
   keep_top_k: 3
@@ -36,6 +36,17 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
   precision: "bfloat16"
+
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
   max_grad_norm: 1.0
 
   optimizer:
@@ -56,7 +67,7 @@ policy:
         total_iters: 50
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: 950
+        T_max: 2950
         eta_min: 0.0
     - milestones: [50]
 
@@ -94,6 +105,47 @@ teacher:
     name: "meta-llama/Llama-3.1-8B"
     chat_template: null
   precision: "bfloat16"
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
+  max_grad_norm: 1.0
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: false
+      fused: false
+
+  generation: null
 
 data:
   dataset_name: "arrow_text"
@@ -125,12 +177,17 @@ logger:
   log_dir: "logs/off-policy-distillation-arrow-llama-topk8192-16node"
   num_val_samples_to_print: 5
   wandb_enabled: true
+  swanlab_enabled: false
+  mlflow_enabled: false
   tensorboard_enabled: false
   monitor_gpus: true
   wandb:
     project: "nemo-off-policy-distillation-eval"
-    name: "distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-16node"
+    name: "distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-16node-3000steps"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
+  num_nodes: 16
