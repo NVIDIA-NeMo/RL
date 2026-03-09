@@ -327,13 +327,13 @@ def calculate_rewards(
     sorted_indices = sorted(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
+
     # Stack rewards: each element may be scalar (single-reward env) or 1d (multi-reward env).
-    # Envs may return Python floats or tensors; ensure tensors for torch.stack.
-    # Handle empty batch (torch.stack requires non-empty list).
-    if not sorted_indices:
-        rewards = torch.tensor([], dtype=torch.float32)
+    if len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
+        rewards = torch.stack([all_rewards[i] for i in sorted_indices])
     else:
-        rewards = torch.stack([torch.as_tensor(all_rewards[i]) for i in sorted_indices])
+        rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
+
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]

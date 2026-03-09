@@ -42,21 +42,14 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
-    def compute_advantage(
-        self,
-        prompt_ids,
-        rewards,
-        repeated_batch,
-        mask,
-        **kwargs,
-    ):
+    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
 
         Args:
             prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
-            repeated_batch: Batch (unused; for interface consistency).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+                  Used only for expanding advantages to token-level shape.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -95,8 +88,8 @@ class GDPOAdvantageEstimator:
         self,
         prompt_ids,
         rewards,
-        repeated_batch,
         mask,
+        repeated_batch,
         **kwargs,
     ):
         """Compute GDPO advantages.
@@ -172,7 +165,6 @@ class ReinforcePlusPlusAdvantageEstimator:
         self,
         prompt_ids,
         rewards,
-        repeated_batch,
         mask,
         logprobs_policy=None,
         logprobs_reference=None,
@@ -181,12 +173,13 @@ class ReinforcePlusPlusAdvantageEstimator:
         """Compute Reinforce++ advantages with optional KL penalty.
 
         Args:
-            prompt_ids: Tensor identifying which prompt each sample belongs to (for baseline).
+            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
-            repeated_batch: Unused; for interface consistency.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
-            logprobs_policy: Policy log probabilities, required if use_kl_in_reward.
-            logprobs_reference: Reference policy log probabilities, required if use_kl_in_reward.
+                  Used for: (1) expanding advantages to token-level shape, (2) global normalization
+                  that only considers valid tokens.
+            logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
+            logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             **kwargs: Additional arguments (unused).
 
         Returns:
