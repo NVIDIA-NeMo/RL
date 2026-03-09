@@ -28,6 +28,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/..)
+set -x
 
 # Function to extract config from a script
 extract_config() {
