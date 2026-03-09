@@ -427,19 +427,18 @@ def _parallelize_nm5_h(
         "mixer.down_proj": RowwiseParallel(),
     }
 
-    layers: torch.nn.ModuleList = model.backbone.layers
+    # Native transformers NemotronH uses model.model.layers, custom uses model.backbone.layers
+    inner_model = model.backbone if hasattr(model, "backbone") else model.model
+    layers: torch.nn.ModuleList = inner_model.layers
     parallelize_module(model, tp_mesh, model_tp_plan)
 
-    for layer in model.backbone.layers:
+    for layer in inner_model.layers:
         if layer.block_type == "mlp":
             parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
     if activation_checkpointing:
         for i in range(len(layers)):
-            if layers[i].block_type == "mlp":
-                layers[i] = checkpoint_wrapper(layers[i])
-
-            if layers[i].block_type == "mamba":
+            if layers[i].block_type in ("mlp", "mamba"):
                 layers[i] = checkpoint_wrapper(layers[i])
 
     mp_policy = MixedPrecisionPolicy(
