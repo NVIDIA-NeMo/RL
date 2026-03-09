@@ -1,6 +1,30 @@
 # Nemotron 3 Super
 
+**Technical Report:** [NVIDIA Nemotron-3-Super Technical Report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf)
+
 This guide explains how to post-train the Nemotron 3 Super model using NeMo RL.
+
+## Container
+
+All training stages use the pre-built NeMo RL container:
+
+```
+nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super
+```
+
+**Note:** This container is built for **x86_64 (amd64)** only. To build the container yourself (e.g. for ARM), use the [`docker/Dockerfile`](../../docker/Dockerfile):
+
+```bash
+docker buildx build --target release \
+    --build-arg MAX_JOBS=4 \
+    --build-arg BUILD_CUSTOM_VLLM=1 \
+    --build-arg SKIP_SGLANG_BUILD=1 \
+    --build-arg BUILD_CUSTOM_VLLM_URL=https://github.com/CentML/vllm.git \
+    --build-arg BUILD_CUSTOM_VLLM_REF=nemotron-h-rl-2-mtp-fix-2 \
+    --build-arg BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl \
+    --build-context nemo-rl=. -f docker/Dockerfile \
+    --tag nemo-rl:v0.5.0.nemotron_3_super .
+```
 
 ## Download and prepare the data
 
@@ -26,12 +50,8 @@ done
 ## Prepare the code
 Training Nemotron 3 Super currently requires the `super-v3` branch.
 ```bash
-# Checkout NeMo RL
-git clone -b super-v3 https://github.com/NVIDIA-NeMo/RL.git
+git clone --recursive -b super-v3 https://github.com/NVIDIA-NeMo/RL.git
 cd RL
-
-# Initialize the submodules
-git submodule update --init --recursive
 ```
 
 ## Training the model
@@ -51,6 +71,7 @@ Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during train
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Skills.git
 cd Skills
+git checkout a5da59797890284af4df1c2a9c10990b33623a9d
 docker build -t nemo-skills-sandbox:latest -f dockerfiles/Dockerfile.sandbox .
 ```
 
@@ -68,6 +89,7 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 * `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
+* `$SIF_DIR`: *(Stage 2.2 only)* Path to the directory containing Apptainer `.sif` images for the SWE-bench environments. These are converted Docker images from R2E-Gym, SWE-Gym, and SWE-Bench Verified. See [Stage 2.2](#stage-22---swe-2-64-nodes) for download instructions.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
 
