@@ -439,6 +439,23 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 **Status:** 2/3 tests unskipped. 1 test (fp8-2 TP=2) remains skipped as pre-existing OOM.
 
+## Err 10. CP=2 DTensor SDPA redistribute assertion — NOT FIXED (Hemil handling)
+
+**Description:** Context parallelism (CP=2) with DTensor hits `AssertionError: inputs need to be redistributed` in the SDPA attention handler. This is the same root cause as Func Err 1 (distillation failure). Hemil is handling this fix.
+
+**Stack trace:**
+```
+torch/distributed/tensor/experimental/_context_parallel/_attention.py:904 _sdpa_handler
+    assert not output_sharding.needs_redistribute, "inputs need to be redistributed"
+AssertionError: inputs need to be redistributed
+```
+
+**Affected tests (10 tests, all CP=2 in test_dtensor_worker.py):**
+- `training_setup`: llama CP=2, qwen2 CP=2, qwen3 CP=2
+- `logprob_setup`: qwen2 CP=2 (2 variants), llama CP=2 (3 variants), qwen3 CP=2 (2 variants)
+
+**Status:** SKIPPED — Hemil is working on this. Skips already in place with reason "CP=2 hits DTensor redistribute assertion with transformers v5 (hemil)".
+
 ---
 
 ## Phase 2: Fix Plan
@@ -461,6 +478,7 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 - [x] Err 7: TP tied model fails with automodel v2 — FIXED (skip model.to(device) after checkpoint loading)
 - [x] Err 8: Nemotron-H test asset incompatible with native transformers — FIXED (convert config to native format, fix parallelize.py backbone→model.model)
 - [x] Err 9: FP8 timeout — FIXED (2/3 unskipped; bump timeout 300→420, fp8-2 TP=2 is pre-existing OOM)
+- [ ] Err 10: CP=2 DTensor SDPA redistribute assertion — NOT FIXED (Hemil handling)
 
 ---
 
