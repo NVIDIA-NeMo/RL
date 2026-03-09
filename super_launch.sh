@@ -31,7 +31,7 @@ LOG_DIR="logs/${EXP_NAME}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
-PREBAKED_VENVS="/opt/prebaked_gym/venvs"
+PREBAKED_VENVS="/opt/gym_venvs"
 
 echo "========================================"
 echo " Experiment : ${EXP_NAME}"
@@ -107,7 +107,7 @@ export COMMAND="date ; \
     VLLM_DEEP_GEMM_WARMUP=skip \
     FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_CACHE} \
     FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
-    NEMO_GYM_PREBAKED_VENVS_ROOT=${PREBAKED_VENVS} \
+    NEMO_GYM_VENV_DIR=${PREBAKED_VENVS} \
     NRL_VLLM_USE_V1=1 \
     NRL_IGNORE_VERSION_MISMATCH=1 \
     VLLM_ATTENTION_BACKEND=FLASH_ATTN \

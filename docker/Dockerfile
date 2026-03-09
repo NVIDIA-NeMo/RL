@@ -97,7 +97,7 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 # Config paths (relative to repo root) whose NeMo Gym venvs should be prefetched.
 # Override to prefetch venvs for different configs, or set to empty to skip.
-ARG NEMO_GYM_PREFETCH_CONFIGS="examples/configs/grpo_superv3.yaml"
+ARG NEMO_GYM_PREFETCH_CONFIGS="examples/configs/super/stage1_rlvr.yaml examples/configs/super/stage2_swe1.yaml examples/configs/super/stage2_swe2.yaml examples/configs/super/stage3_rlhf.yaml"
 
 
 FROM base AS hermetic
