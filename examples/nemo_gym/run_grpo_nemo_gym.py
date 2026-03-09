@@ -148,13 +148,25 @@ def main() -> None:
         )
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    is_vlm = config["policy"].get("is_vlm", False)
+    if is_vlm:
+        processor = get_tokenizer(config["policy"]["tokenizer"], get_processor=True)
+        tokenizer = processor.tokenizer
+    else:
+        processor = None
+        tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], tokenizer
     )
+
+    if is_vlm and "vllm_cfg" in config["policy"]["generation"]:
+        assert not config["policy"]["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
+            "VLMs require skip_tokenizer_init=False"
+        )
 
     # NeMo-Gym specific config setup.
     setup_nemo_gym_config(config, tokenizer)
@@ -202,7 +214,7 @@ The validation set you pass in will directly be used for validation with no addi
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(config, tokenizer, train_dataset, val_dataset, processor=processor)
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
