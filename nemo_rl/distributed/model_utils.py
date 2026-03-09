@@ -220,7 +220,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.empty_like(
+        grad_input: torch.Tensor = torch.zeros_like(
             vocab_parallel_logits, dtype=torch.float32
         )
 
@@ -334,7 +334,7 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.empty_like(
+        grad_input: torch.Tensor = torch.zeros_like(
             vocab_parallel_logits, dtype=torch.float32
         )
 
