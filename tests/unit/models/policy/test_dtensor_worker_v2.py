@@ -222,7 +222,7 @@ def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
         ("tiny_qwen2_model_path", 2, 1, False, False, False),
         ("tiny_llama_model_path", 2, 1, False, False, False),
         ("tiny_qwen3_model_path", 2, 1, False, False, False),
-        ("tiny_gemma3_model_path", 2, 1, False, False, False),
+        pytest.param("tiny_gemma3_model_path", 2, 1, False, False, False, marks=pytest.mark.skip(reason="transformers-v5: Err 6 — DTensor redistribute assertion for gemma3 TP=2 (fix in Automodel PR #1488)")),
         # TP=1, CP=2
         ("tiny_qwen2_model_path", 1, 2, False, False, False),
         ("tiny_llama_model_path", 1, 2, False, False, False),
