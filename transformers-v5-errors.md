@@ -417,34 +417,18 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 **Automodel PR:** [NVIDIA-NeMo/Automodel#1489](https://github.com/NVIDIA-NeMo/Automodel/pull/1489)
 
-## Err 8. Nemotron-H `from_config()` resolves `auto_map` — missing `modeling_nemotron_h.py`
+## Err 8. Nemotron-H test asset incompatible with native transformers — FIXED
 
-**Description:** Transformers v5 `AutoModelForCausalLM.from_config()` now resolves `auto_map` entries in config.json and tries to load the referenced dynamic module file. The `tiny_nemotron5_h_with_nemotron_tokenizer` test asset has `auto_map.AutoModelForCausalLM = "modeling_nemotron_h.NemotronHForCausalLM"` but the `modeling_nemotron_h.py` file is missing from the test asset directory.
+**Description:** The `tiny_nemotron5_h_with_nemotron_tokenizer` test asset originally referenced a custom `modeling_nemotron_h.py` via `auto_map` that was missing. After removing `auto_map` and converting to native transformers (using `layers_block_type` instead of `hybrid_override_pattern`), the model loads successfully but fails because `nemo_rl/models/dtensor/parallelize.py` hardcodes `model.backbone.layers` — the custom NemotronH model used `backbone` as the inner module, but the native transformers model uses `model.model.layers`.
 
-**Stack trace:**
-```
-ray::DTensorPolicyWorker.__init__() (pid=3460983)
-  File "dtensor_policy_worker.py", line 275, in __init__
-    self.model = model_class.from_config(...)
-  File "transformers/models/auto/auto_factory.py", line 226, in from_config
-    model_class = get_class_from_dynamic_module(class_ref, repo_id, **kwargs)
-  File "transformers/dynamic_module_utils.py", line 572, in get_class_from_dynamic_module
-    final_module = get_cached_module_file(...)
-  File "transformers/dynamic_module_utils.py", line 390, in get_cached_module_file
-    resolved_module_file = cached_file(...)
-OSError: .../tiny_nemotron5_h_with_nemotron_tokenizer does not appear to have a file named modeling_nemotron_h.py
-```
+**Fix:**
+1. Updated test asset `config.json`: removed `auto_map`, replaced `hybrid_override_pattern` with `layers_block_type: ["mamba", "attention", "mamba"]`
+2. Deleted unused `configuration_nemotron_h.py` custom config class
+3. Regenerated `model.safetensors` to match native architecture
+4. Fixed `nemo_rl/models/dtensor/parallelize.py` line 430: detect both custom (`model.backbone`) and native (`model.model`) inner model via `hasattr`
+5. Updated `tests/unit/prepare_unit_test_assets.py`: use native `NemotronHConfig` with `layers_block_type` instead of custom `trust_remote_code` model with `hybrid_override_pattern`
 
-**Reproduction:**
-```bash
-cd tests && uv run --no-sync pytest unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training[training_setup19-False] --hf-gated -x -s
-```
-
-**Affected tests:**
-- `test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training[training_setup19-False]` (nemotron5_h, no SP/CPU/act)
-- `test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training[training_setup20-False]` (nemotron5_h, CPU+act)
-
-**Status:** SKIPPED — needs `modeling_nemotron_h.py` added to the test asset, or the test asset config needs to reference a model class that ships with transformers.
+**Status:** FIXED — both nemotron training tests pass (training_setup19 and training_setup20). All 3 L0 suites pass.
 
 ## Err 9. FP8 + cpu_offload colocated test borderline timeout
 
@@ -482,6 +466,8 @@ cd tests && uv run --no-sync pytest unit/models/generation/test_vllm_generation.
 - [x] Err 5: SDPA attention mask expand error TP=2 SP=True — FIXED (pass attention_mask=None when SP enabled)
 - [x] Err 6: DTensor redistribute assertion gemma3 TP=2 — FIXED (add Gemma3ForCausalLM to skip_initialize_weights)
 - [x] Err 7: TP tied model fails with automodel v2 — FIXED (skip model.to(device) after checkpoint loading)
+- [x] Err 8: Nemotron-H test asset incompatible with native transformers — FIXED (convert config to native format, fix parallelize.py backbone→model.model)
+- [ ] Err 9: FP8 + cpu_offload colocated test borderline timeout — SKIPPED (likely pre-existing)
 
 ---
 
