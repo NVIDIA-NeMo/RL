@@ -20,6 +20,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
@@ -1815,6 +1816,51 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
     # Verify opposite signs
     assert result[0, 0] * result[1, 0] < 0
+
+
+# ============================================================================
+# Tests for ReinforcePlusPlusAdvantageEstimator class
+# ============================================================================
+
+
+def test_gdpo_advantage_estimator_multiple_rewards():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {
+        "reward1": torch.tensor([1.0, 1.0]),
+        "reward2": torch.tensor([1.0, -1.0]),
+        "reward3": torch.tensor([1.0, 0.0]),
+    }
+
+    result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+    assert result.shape == (2, 3)
+    assert torch.allclose(result[0, 0], torch.tensor(0.7071))
+    assert torch.allclose(result[1, 0], torch.tensor(-0.7071))
+
+
+def test_gdpo_advantage_estimator_single_reward():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+
+    with pytest.raises(ValueError):
+        estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
 # ============================================================================
