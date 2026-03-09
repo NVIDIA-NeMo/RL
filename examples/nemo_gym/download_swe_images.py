@@ -94,23 +94,25 @@ async def pull_image(
 
         cache_dir = tempfile.mkdtemp(prefix="apptainer_cache_")
         temp_dir = tempfile.mkdtemp(prefix="apptainer_tmp_")
+        tmp_sif = local_image_path + ".tmp"
         try:
             proc = await asyncio.create_subprocess_exec(
                 "apptainer",
                 "build",
-                local_image_path,
+                tmp_sif,
                 f"docker://{image_name}",
                 env={**os.environ, "APPTAINER_CACHEDIR": cache_dir, "APPTAINER_TMPDIR": temp_dir},
             )
             await proc.communicate()
             if proc.returncode != 0:
                 print(f"FAILED (rc={proc.returncode}): {image_name}", flush=True)
-                if os.path.exists(local_image_path):
-                    os.remove(local_image_path)
             else:
+                os.rename(tmp_sif, local_image_path)
                 print(f"Pulled: {image_name}", flush=True)
         finally:
             shutil.rmtree(cache_dir, ignore_errors=True)
+            if os.path.exists(tmp_sif):
+                os.remove(tmp_sif)
 
 
 async def main(sif_dir: str, concurrency: int) -> None:
