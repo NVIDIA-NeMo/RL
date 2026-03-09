@@ -280,20 +280,20 @@ class ClippedPGLossFn(LossFunction):
             # - reference_policy_logprobs is computed **without** filtering (see use_reference_model)
             # - curr_logprobs/prev_logprobs are computed **with** filtering (for actor loss compatibility)
             # - For KL, we need curr_logprobs **without** filtering to be consistent with ref logprobs
-            # - For importance weights, we also use unfiltered curr_logprobs_for_kl since we're
+            # - For importance weights, we also use unfiltered curr_logprobs_unfiltered since we're
             #   reweighting samples from π_gen_filtered to π_curr_unfiltered
 
             # On-policy KL approximation
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
-                    curr_logprobs - generation_logprobs
+                    curr_logprobs_unfiltered - generation_logprobs
                 ).detach()
                 kl_importance_weights = torch.nan_to_num(
                     kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs)
+                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
 
             # Compute KL loss
             kl = (

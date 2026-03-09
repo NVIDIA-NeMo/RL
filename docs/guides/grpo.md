@@ -338,6 +338,12 @@ We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vll
 
 The function, [grpo_train](../../nemo_rl/algorithms/grpo.py), contains the core GRPO training loop.
 
+### Generation Sampling Parameters (temperature, top-p, top-k)
+
+GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollout generation via vLLM; these settings are aligned with the training. For a detailed description of top-p and top-k filtering, see [Top-p and top-k filtering](#top-p-and-top-k-filtering) below.
+
+**Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
+
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
@@ -449,6 +455,18 @@ grpo:
 ```
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
+
+#### Top-p and top-k filtering
+
+The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.
+
+When top-p or top-k filtering is enabled, the following conventions apply:
+
+- **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
+- **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
+- **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+
+Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
