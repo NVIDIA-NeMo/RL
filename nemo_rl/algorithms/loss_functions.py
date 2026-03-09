@@ -23,12 +23,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
+    _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -983,13 +985,13 @@ class DistillationLossFn(LossFunction):
 
     def __init__(self, cfg: DistillationLossConfig):
         self.kl_type = cfg["kl_type"]
-        self.mixed_kl_weight = cfg["mixed_kl_weight"]
+        self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
-        assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
+        assert 0 <= self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
 
@@ -1095,6 +1097,55 @@ class DistillationLossFn(LossFunction):
             del teacher_probs_full, teacher_logprobs_full
             del student_topk_logprobs, student_topk_probs, student_rest_prob
             del student_logprobs_full, topk_indices
+
+            # Next-token alignment
+            per_token_kl = per_token_kl[:, :-1]
+
+        # ===== FULL-LOGPROB IPC PATH: teacher provides full vocab logprobs via IPC =====
+        elif teacher_logits is not None:
+            # Resolve TP-local student logits
+            if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                device_mesh = next_token_logits.device_mesh
+                tp_group = device_mesh.get_group("tp")
+                local_student_logits = next_token_logits.to_local()
+            else:
+                tp_group = None
+                local_student_logits = next_token_logits
+
+            with torch.no_grad():
+                mb_start_index = mb_idx * mbs
+                mb_end_index = mb_start_index + mbs
+                teacher_logprobs_local = teacher_logits[mb_start_index:mb_end_index, :, :].clone().detach()
+                teacher_logprobs_local = teacher_logprobs_local.to(device=local_student_logits.device)
+
+            if tp_group is not None:
+                # Differentiable distributed log-softmax for student logits.
+                # The normalization constants are computed under no_grad,
+                # but the final log-softmax is built with differentiable ops
+                # so autograd can back-propagate through the student model.
+                with torch.no_grad():
+                    logits_max = torch.amax(local_student_logits, dim=-1, keepdim=True)
+                    torch.distributed.all_reduce(
+                        logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                    )
+                shifted = local_student_logits - logits_max
+                local_sum_exp = shifted.exp().sum(-1, keepdim=True)
+                global_sum_exp = torch.distributed.nn.functional.all_reduce(
+                    local_sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
+                student_logprobs_local = shifted - global_sum_exp.log()
+                del shifted, local_sum_exp, global_sum_exp
+            else:
+                student_logprobs_local = torch.nn.functional.log_softmax(local_student_logits, dim=-1)
+
+            per_token_kl = teacher_logprobs_local.exp() * (teacher_logprobs_local - student_logprobs_local)
+            per_token_kl = per_token_kl.sum(-1)
+            del teacher_logprobs_local, student_logprobs_local, local_student_logits
+
+            if tp_group is not None:
+                per_token_kl = torch.distributed.nn.functional.all_reduce(
+                    per_token_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
 
             # Next-token alignment
             per_token_kl = per_token_kl[:, :-1]

@@ -441,9 +441,9 @@ def validate(
             flat_messages, input_lengths = batched_message_log_to_flat_message(
                 val_batch["message_log"],
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                make_sequence_length_divisible_by=master_config["policy"][
-                    "make_sequence_length_divisible_by"
-                ],
+                make_sequence_length_divisible_by=master_config["policy"].get(
+                    "make_sequence_length_divisible_by", 1
+                ),
             )
 
             val_data = BatchedDataDict[DistillationLossDataDict](
@@ -580,7 +580,7 @@ def off_policy_distillation_train(
     """
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config["checkpointing"].get("checkpoint_must_save_by", None),
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -675,9 +675,9 @@ def off_policy_distillation_train(
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
+                        make_sequence_length_divisible_by=master_config["policy"].get(
+                            "make_sequence_length_divisible_by", 1
+                        ),
                     )
 
                     # Create training data from flattened messages

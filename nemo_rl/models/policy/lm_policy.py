@@ -214,7 +214,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars=env_vars or {},
             )
 
-        if config["dynamic_batching"]["enabled"]:
+        if config.get("dynamic_batching", {}).get("enabled", False):
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
             )
@@ -227,7 +227,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
                 "max_tokens_per_microbatch": 0,  # Override this in each different call (presumably different sizes)
             }
-            assert not config["sequence_packing"]["enabled"], (
+            assert not config.get("sequence_packing", {}).get("enabled", False), (
                 "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
             )
         else:
@@ -242,7 +242,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.flops_tracker = None
             print(f"FLOPS tracker not supported for model {config['model_name']}: {e}")
 
-        if config["sequence_packing"]["enabled"]:
+        if config.get("sequence_packing", {}).get("enabled", False):
             self.use_sequence_packing = True
             sequence_length_pad_multiple = (
                 cp_size * 2 * tp_size if cp_size > 1 else tp_size
@@ -253,7 +253,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
-            assert not config["dynamic_batching"]["enabled"], (
+            assert not config.get("dynamic_batching", {}).get("enabled", False), (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
         else:
@@ -843,6 +843,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             kv_scales=kv_scales,
         )
         return futures
+
+    def get_model_config(self):
+        """Get the model configuration from workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "return_model_config"
+        )
+        results = ray.get(futures)
+        return results[0]
 
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
