@@ -852,7 +852,7 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(420)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
@@ -860,7 +860,7 @@ async def run_hf_train_process(
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
         (True, False, "fp8", False),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="transformers-v5: Err 9 — FP8+cpu_offload colocated test borderline timeout (303s > 300s limit)")),
+        (False, True, "fp8", False),
         # LoRA tests (requires dtensor v2 / automodel)
         pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
         pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
@@ -1584,8 +1584,15 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
 
 @pytest.mark.timeout(180)
-@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("vllm_precision", ["bfloat16", pytest.param("fp8", marks=pytest.mark.skip(reason="transformers-v5: Err 9 — FP8 weight update test timeout (>180s)"))])
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "vllm_precision"),
+    [
+        (1, "bfloat16"),
+        (2, "bfloat16"),
+        (1, "fp8"),
+        pytest.param(2, "fp8", marks=pytest.mark.skip(reason="pre-existing: FP8 TP=2 OOM — vLLM needs 55GiB but only 16GiB free after DTensor training")),
+    ],
+)
 def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
