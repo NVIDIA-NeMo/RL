@@ -27,7 +27,7 @@ grpo:
   max_val_samples: null
   val_batch_size: 256
   seed: 42
-  invalid_tool_call_strategy: "mask"
+  invalid_tool_call_strategy: ""
 
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
@@ -300,7 +300,7 @@ env:
           concurrency: 768
           swebench_agent_timeout: 3600
           run_with_mixed_prompts: true
-          dataset_path: "/path/to/train.jsonl"
+          dataset_path: ${data.train.data_path}
           container_formatter:
           - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
           - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
@@ -311,7 +311,7 @@ env:
           agent_max_turns: 200
           concurrency: 768
           swebench_agent_timeout: 3600
-          dataset_path: "/path/to/validation.jsonl"
+          dataset_path: ${data.validation.data_path}
           container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
     use_absolute_ip: true
 
