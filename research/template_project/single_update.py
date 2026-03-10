@@ -17,9 +17,10 @@ What it does:
  1) Sets up a RayVirtualCluster
  2) Initializes VllmGeneration
  3) Initializes LM Policy
- 4) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
+ 4) Executes custom methods on all workers
  5) Refits the generation engine with the latest policy weights
- 6) Optionally repeats the train→refit cycle in a short loop
+ 6) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
+ 7) Optionally repeats the train→refit cycle in a short loop
 
 Notes:
 - The configuration is defined entirely in this file, inspired by examples/configs/grpo_math_1B.yaml
@@ -92,7 +93,7 @@ def main(config: MasterConfig) -> None:
     )
     print("  ✓ Policy created")
 
-    # 4) Run methods on all workers
+    # 4) Executes custom methods on all workers
     # 4.1) Run a method on all workers in parallel with the same data
     print("\n▶ Running a method on all workers in parallel with the same data...")
     results = policy.run_all_workers_single_data("get_worker_rank")
@@ -109,7 +110,7 @@ def main(config: MasterConfig) -> None:
     state_dict_info = policy.prepare_refit_info()
     policy_generation.prepare_refit_info(state_dict_info or {})
 
-    # 5) Create tiny numeric batch and train with NLLLossFn
+    # Create tiny numeric batch and train with NLLLossFn
     print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
     train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
         "train_global_batch_size"
@@ -146,6 +147,7 @@ def main(config: MasterConfig) -> None:
             }
         )
 
+        # 5) Refits the generation engine with the latest policy weights
         print("  • Refit generation with latest policy weights...")
         refit_policy_generation(
             policy=policy,
@@ -167,6 +169,8 @@ def main(config: MasterConfig) -> None:
         )
         for i, out_text in enumerate(decoded):
             print(f"    - prompt: '{generation_prompts[i]}' -> '{out_text}'")
+
+        # 6) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
         policy.prepare_for_training()
         results = policy.train(data, loss_fn)
         loss_tensor = results["loss"]

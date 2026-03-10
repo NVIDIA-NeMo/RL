@@ -20,7 +20,7 @@ from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import DTensorPolicy
 
 
 class DTensorPolicyWorkerV2Extension(DTensorPolicyWorkerV2):
-    """Example worker extension that adds a custom method callable via run_all_workers_single_data."""
+    """Example worker extension that adds custom methods."""
 
     def get_worker_rank(self) -> dict[str, Any]:
         """Return per-worker rank. Used to demonstrate run_all_workers_single_data."""
