@@ -787,6 +787,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                   is different from the current policy, making filtered logprobs incompatible.
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
+        # If reference model was never initialized, yield without swapping
+        if not hasattr(self, "reference_model_state_dict") or self.reference_model_state_dict is None:
+            yield
+            return
+
         with torch.no_grad():
             # Save train model state_dict
             curr_state_dict = get_cpu_state_dict(
