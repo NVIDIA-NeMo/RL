@@ -18,7 +18,7 @@ checkpointing:
   metric_name: null # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: null
-  save_period: 120
+  save_period: 200
   checkpoint_must_save_by: null
 
 policy:
@@ -84,7 +84,7 @@ policy:
       NCCL_P2P_NET_CHUNKSIZE: "2097152"
       NCCL_DEBUG: "WARN"
       TORCHINDUCTOR_WORKER_START: "fork"
-    empty_unused_memory_level: 1
+    empty_unused_memory_level: 0
     activation_checkpointing: false
     tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1

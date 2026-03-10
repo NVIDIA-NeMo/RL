@@ -786,16 +786,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ## so we handle the scaling in nemo-rl.
         ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
         ## on the TP-sharded parameters.
-        model_cfg.calculate_per_token_loss = False
+        model_cfg.calculate_per_token_loss = True
         model_cfg.perform_initialization = True
-
-        # assert (
-        #     "aux_loss" not in model_cfg.moe_router_load_balancing_type
-        #     or model_cfg.moe_aux_loss_coeff == 0
-        # ), (
-        #     "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-        #     "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-        # )
 
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
@@ -1147,6 +1139,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
+                    # Set moe_grad_scale_func for MOE aux loss scaling.
+                    # With calculate_per_token_loss=True, the router pre-multiplies
+                    # aux_loss by num_local_tokens. Setting loss_scale = 1/global_valid_toks
+                    # makes the final MOE gradient correctly normalized:
+                    #   (1/G) * N_local * aux_grad -> after DDP SUM -> avg(aux_grad)
+                    moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                    self._set_moe_grad_scale_func(lambda: moe_scale)
+
                     # Forward pass.
                     forward_backward_func = get_forward_backward_func()
                     losses_reduced = forward_backward_func(
@@ -1171,6 +1171,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         forward_only=eval_mode,
                         do_not_average_loss=True,
                     )
+
+                    # Clear moe_grad_scale_func after the forward-backward pass
+                    self._set_moe_grad_scale_func(None)
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -1307,6 +1310,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "metrics_and_lr": _t_metrics_and_lr,
         }
         return metrics
+
+    def _get_model_config(self):
+        """Get the underlying model config (handle Float16Module wrapper)."""
+        model = self.model
+        if hasattr(model, "module") and hasattr(model.module, "config"):
+            return model.module.config
+        elif hasattr(model, "config"):
+            return model.config
+        return None
+
+    def _set_moe_grad_scale_func(self, func):
+        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.moe_grad_scale_func = func
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
