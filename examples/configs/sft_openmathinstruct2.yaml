@@ -39,6 +39,7 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  megatron_recipe: megatron.bridge.recipes.llama.llama31_8b_pretrain_config
   megatron_cfg:
     enabled: false
 
