@@ -340,7 +340,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         straggler_timer=self.mcore_state.straggler_timer,
-                        model_cfg=self.megatron_cfg.model, 
                     )
 
                 # Empty unused memory.
@@ -500,7 +499,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             straggler_timer=self.mcore_state.straggler_timer,
-            model_cfg=self.megatron_cfg.model, 
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
@@ -627,7 +625,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             straggler_timer=self.mcore_state.straggler_timer,
-            model_cfg=self.megatron_cfg.model, 
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
