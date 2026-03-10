@@ -139,6 +139,15 @@ class AbstractPolicyWorker:
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        # When reference model was never initialized (e.g.,
+        # skip_reference_policy_logprobs_calculation=true), return zeros
+        # matching the expected shape to avoid crashes downstream.
+        if not self._has_reference_model():
+            logprobs = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+            return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+            return_data["reference_logprobs"] = torch.zeros_like(logprobs["logprobs"]).cpu()
+            return return_data
+
         with self.use_reference_model():
             reference_logprobs = self.get_logprobs(
                 data=data, micro_batch_size=micro_batch_size
@@ -147,6 +156,15 @@ class AbstractPolicyWorker:
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
+
+    def _has_reference_model(self) -> bool:
+        """Check if a reference model has been initialized."""
+        # DTensor v2 uses reference_model_state_dict, others use reference_state_dict
+        for attr in ("reference_model_state_dict", "reference_state_dict"):
+            val = getattr(self, attr, None)
+            if val is not None:
+                return True
+        return False
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
