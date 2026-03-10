@@ -1583,16 +1583,9 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     vllm_generation.shutdown()
 
 
-@pytest.mark.timeout(180)
-@pytest.mark.parametrize(
-    ("tensor_parallel_size", "vllm_precision"),
-    [
-        (1, "bfloat16"),
-        (2, "bfloat16"),
-        (1, "fp8"),
-        pytest.param(2, "fp8", marks=pytest.mark.skip(reason="pre-existing: FP8 TP=2 OOM — vLLM needs 55GiB but only 16GiB free after DTensor training")),
-    ],
-)
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
