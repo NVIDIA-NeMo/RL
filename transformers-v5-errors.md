@@ -581,3 +581,241 @@ cd tests/functional && bash distillation/distillation.sh
 
 **Validated:** `token_mult_prob_error` max=1.042 (threshold <1.05) on transformers 5.3.0 after fix.
 
+---
+
+# Phase 4: Nightly Test Failures
+
+Results from `code_snapshots_v5_nightly/` run on 3/10/2026. 25 PASS, 3 METRIC FAIL, 22 UNK (crash/timeout).
+
+Errors are categorized below. Each nightly error is prefixed "N-Err" to distinguish from unit test errors above.
+
+---
+
+## N-Err 1. NemotronH `backbone` attribute missing (5 tests)
+
+**Error:**
+```
+AttributeError: 'NemotronHForCausalLM' object has no attribute 'backbone'. Did you mean: 'backend'?
+  parallelizer.py:236 → model.backbone.layers
+```
+
+**Affected tests:**
+- `grpo-nanov3-30BA3B-2n8g-fsdp2`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora`
+- `sft-nanov3-30BA3B-2n8g-fsdp2`
+- `sft-nanov3-30BA3B-2n8g-fsdp2-lora`
+- `grpo-nano-v2-12b-2n8g-fsdp2tp1` (slightly different: `'NemotronHConfig' object has no attribute 'n_routed_experts'`)
+
+**Observation:** Same root cause as Err 8 (unit tests). The `parallelize.py` fix (detect `model.backbone` vs `model.model`) was applied for the unit test tiny model, but the nightly tests use real NemotronH checkpoints that may still have `auto_map` or old config format. The nano-v2 variant also has a config attribute mismatch (`n_routed_experts`).
+
+---
+
+## N-Err 2. SGLang server crash (2 tests)
+
+**Error:**
+```
+RuntimeError: [SGLang Server] Rank 0 Server process terminated unexpectedly.
+```
+
+**Affected tests:**
+- `grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang`
+- `grpo-qwen3-0.6b-1n8g-sglang`
+
+**Observation:** SGLang server dies during generation or refitting. May be related to Err 4 (CUDA graph issue) but in nightly context. The unit test fix (`disable_piecewise_cuda_graph`) only applies to test configs, not nightly YAML configs.
+
+---
+
+## N-Err 3. CUDA OOM during training (3 tests)
+
+**Error:**
+```
+torch.OutOfMemoryError: CUDA out of memory.
+  # During log_softmax / get_next_token_logprobs_from_logits / prepare_loss_input
+```
+
+**Affected tests:**
+- `grpo-moonlight-16b-automodel-1n8g-ep8` (Step 4/30, needs 2.25 GiB, 1.82 GiB free)
+- `grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3` (Step 1/2, needs 4.64 GiB, 4.09 GiB free)
+- `grpo-qwen3-8b-base-1n8g-megatron-lora` (Step 1/20, OOM in `_compute_distributed_log_softmax`)
+
+**Observation:** Memory pressure from version bump (torch 2.10, TE 2.12, vLLM 0.17). These may have been borderline before and tipped over with slightly higher memory usage from new dependencies.
+
+---
+
+## N-Err 4. Moonlight Megatron APEX missing (1 test)
+
+**Error:**
+```
+RuntimeError: ColumnParallelLinear was called with gradient_accumulation_fusion set to True
+but the custom CUDA extension fused_weight_gradient_mlp_cuda module is not found.
+  megatron/core/tensor_parallel/layers.py:905
+```
+
+**Affected tests:**
+- `grpo-moonlight-16ba3b-4n8g-megatron`
+
+**Observation:** APEX CUDA extensions not compiled in this environment. Not a transformers v5 regression — likely environment/build issue.
+
+---
+
+## N-Err 5. Moonlight Megatron FP8 MoE vLLM incompatibility (1 test)
+
+**Error:**
+```
+AttributeError: 'Fp8MoEMethod' object has no attribute 'flashinfer_moe_backend'
+  vllm/quantization/fp8.py:549
+```
+
+**Affected tests:**
+- `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e`
+
+**Observation:** vLLM 0.17 FP8 MoE backend missing `flashinfer_moe_backend` attribute. Likely a vLLM version compatibility issue with flashinfer.
+
+---
+
+## N-Err 6. FP8 E2E reference model tensor size mismatch (1 test)
+
+**Error:**
+```
+RuntimeError: The size of tensor a (546) must match the size of tensor b (0)
+  megatron_policy_worker.py:547 → v.copy_(self.reference_state_dict[k])
+```
+
+**Affected tests:**
+- `grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e`
+
+**Observation:** Reference model state dict has empty tensors (size 0) instead of expected weights. May be an FP8 checkpoint conversion issue with the new stack.
+
+---
+
+## N-Err 7. Unknown parallel style `colwise_gather_output` (1 test)
+
+**Error:**
+```
+ValueError: Unknown parallel style: colwise_gather_output
+  parallelize.py:302 → translate_parallel_style()
+```
+
+**Affected tests:**
+- `dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long`
+
+**Observation:** Transformers v5 introduced new tensor parallel sharding patterns not handled by `translate_parallel_style()`. Needs a mapping for `colwise_gather_output`.
+
+---
+
+## N-Err 8. Distributed timeout during weight loading (1 test)
+
+**Error:**
+```
+torch.distributed.DistBackendError: wait timeout after 600000ms
+  # During _broadcast_state_dict() in set_model_state_dict()
+```
+
+**Affected tests:**
+- `dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload`
+
+**Observation:** 10-minute NCCL timeout during cross-node weight broadcast. May be a networking/infrastructure issue or NemotronH model too large for the timeout.
+
+---
+
+## N-Err 9. VLM multimodal cache assertion (1 test)
+
+**Error:**
+```
+AssertionError: Expected a cached item for mm_hash='f806c579...'
+  # vLLM multimodal cache lookup failed during validation
+```
+
+**Affected tests:**
+- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1` (crashed after step 20)
+
+**Observation:** vLLM multimodal cache eviction between generation and validation. May need larger cache or different eviction policy.
+
+---
+
+## N-Err 10. Megatron VLM passes unexpected `mm_token_type_ids` (1 test)
+
+**Error:**
+```
+TypeError: Qwen25VLModel.forward() got an unexpected keyword argument 'mm_token_type_ids'
+  megatron_policy_worker.py → model.forward()
+```
+
+**Affected tests:**
+- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1`
+
+**Observation:** The `mm_token_type_ids` field was added for DTensor/automodel VLM support (Func Err 2 fix), but Megatron's VLM forward doesn't accept it. Megatron path needs to filter out this key before calling model.forward().
+
+---
+
+## N-Err 11. Megatron LoRA config validation failure (1 test)
+
+**Error:**
+```
+megatron_cfg.validate() → model.finalize() failed
+```
+
+**Affected tests:**
+- `grpo-nanov3-30BA3B-2n8g-megatron-lora`
+
+**Observation:** Megatron config validation fails after checkpoint load. Likely related to NemotronH config changes in transformers v5.
+
+---
+
+## N-Err 12. SLURM time limit (2 tests)
+
+**Error:**
+```
+CANCELLED DUE TO TIME LIMIT
+```
+
+**Affected tests:**
+- `grpo-gspo-deepscaler-1.5b-8K` (completed steps, timed out in validation)
+- `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` (completed steps, timed out in validation)
+
+**Observation:** Training completed but validation/metric checking exceeded walltime. May need longer SLURM allocation or the new stack is slightly slower.
+
+---
+
+## N-Err 13. Missing script (1 test)
+
+**Error:**
+```
+Failed to spawn: 'examples/run_grpo_math.py' No such file or directory
+```
+
+**Affected tests:**
+- `prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1`
+
+**Observation:** Code snapshot missing the entry point script. Build/packaging issue.
+
+---
+
+## N-Err 14. Torch compile dynamic shape error (1 test)
+
+**Error:**
+```
+torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
+  Could not guard on data-dependent expression Max(2880, u3)*Min(2880, u3) >= 5242880
+```
+
+**Affected tests:**
+- `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel`
+
+**Observation:** Torch compiler (inductor) can't handle dynamic shapes in this model. Torch 2.10 regression or model-specific dynamic shape issue.
+
+---
+
+## METRIC FAIL (3 tests — completed training but metric checks failed)
+
+| Test | Failed metric | Value | Threshold |
+|------|--------------|-------|-----------|
+| `grpo-nano-v2-12b-1n8g-megatron` | `token_mult_prob_error` | NaN | < 1.05 |
+| `sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch` | `gpu.0.mem_gb` | 77.5 GB | < 75 GB |
+| `sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3` | `gpu.0.mem_gb` | 35.3 GB | < 35 GB |
+
+**Observations:**
+- nano-v2 megatron: NaN in `token_mult_prob_error` suggests logprob computation issue (related to N-Err 1?)
+- sft-llama dynamic batch: Memory ~2.5 GB over threshold — borderline, may need threshold bump or memory optimization
+- sft-qwen2.5-32b: Memory ~0.3 GB over threshold — very borderline, likely from torch 2.10 memory overhead
+
