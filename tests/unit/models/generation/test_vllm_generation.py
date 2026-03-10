@@ -930,6 +930,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     [
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
+        # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
+        # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
         (True, False, "fp8", False),
         (False, True, "fp8", False),
         # LoRA tests (requires dtensor v2 / automodel)
