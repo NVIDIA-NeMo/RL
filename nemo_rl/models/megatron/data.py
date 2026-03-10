@@ -534,7 +534,7 @@ def _pack_sequences_for_megatron(
 def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
     max_seq_len_in_batch: int,
-    model_cfg: Optional[ConfigContainer] = None,
+    model_cfg: Optional[Any] = None,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
