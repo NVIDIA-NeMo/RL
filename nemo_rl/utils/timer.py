@@ -11,12 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import datetime
+import logging
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Sequence, Union
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class Timer:
@@ -68,19 +73,41 @@ class Timer:
         "count": len,
     }
 
-    def __init__(self) -> None:
-        # Dictionary mapping labels to lists of elapsed times
-        # We store a list of times for each label rather than a single value
-        # to support multiple timing runs with the same label (e.g., in loops)
-        # This allows calculating reductions like mean, min, max, and std dev
+    def __init__(self, context: Optional[dict[str, object]] = None) -> None:
+        """Initialize the timer.
+
+        Args:
+            context: Arbitrary key-value pairs identifying this timer instance.
+                     Included in DEBUG log messages emitted on every
+                     start/stop/record/mark call.
+                     Typical keys: rank, worker, node, job_id.
+                     Example: {"rank": 3, "worker": "collector", "node": "gpu-05"}
+        """
         self._timers: dict[str, list[float]] = {}
         self._start_times: dict[str, float] = {}
+        self._markers: dict[str, list[tuple[float, Optional[dict]]]] = {}
+        self._context = context or {}
+        if "hostname" not in self._context:
+            import socket
+
+            self._context["hostname"] = socket.gethostname()
+
+    def _fmt(self, label: str, event: str) -> str:
+        """Build a log message string, prepending context prefix and appending UTC timestamp."""
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        if self._context:
+            prefix = " ".join(f"{k}={v}" for k, v in self._context.items())
+            return f"[{prefix}] {label} {event} ts={ts}"
+        return f"{label} {event} ts={ts}"
 
     def start(self, label: str) -> None:
         """Start timing for the given label."""
         if label in self._start_times:
             raise ValueError(f"Timer '{label}' is already running")
         self._start_times[label] = time.perf_counter()
+        logger.info(self._fmt(label, "start"))
 
     def stop(self, label: str) -> float:
         """Stop timing for the given label and return the elapsed time.
@@ -104,7 +131,64 @@ class Timer:
             self._timers[label] = []
         self._timers[label].append(elapsed)
         del self._start_times[label]
+        logger.info(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
         return elapsed
+
+    def record(self, label: str, elapsed: float) -> None:
+        """Append a pre-measured duration without start/stop.
+
+        Useful when the caller has already measured the elapsed time
+        (e.g., across a try/except boundary) and wants to record it directly.
+
+        Args:
+            label: The timing label to record under
+            elapsed: The elapsed time in seconds
+        """
+        if label not in self._timers:
+            self._timers[label] = []
+        self._timers[label].append(elapsed)
+        logger.info(self._fmt(label, f"record elapsed={elapsed:.4f}s"))
+
+    def mark(self, label: str, metadata: Optional[dict] = None) -> float:
+        """Record a point-in-time event at the current Unix epoch.
+
+        Unlike start/stop/record which measure durations, this captures
+        a standalone timestamp for events like failures, state transitions,
+        or any moment worth noting on a timeline.
+
+        Uses time.time() (not perf_counter) so timestamps are correlatable
+        across processes and Ray actors.
+
+        Args:
+            label: The event label (e.g., "vllm/worker_crashed")
+            metadata: Optional context dict (e.g., {"worker_id": 3, "error": "OOM"})
+
+        Returns:
+            The recorded timestamp (Unix epoch seconds).
+        """
+        ts = time.time()
+        if label not in self._markers:
+            self._markers[label] = []
+        self._markers[label].append((ts, metadata))
+        event = f"mark meta={metadata}" if metadata else "mark"
+        logger.info(self._fmt(label, event))
+        return ts
+
+    def get_markers(
+        self, label: Optional[str] = None
+    ) -> dict[str, list[tuple[float, Optional[dict]]]]:
+        """Get recorded markers, optionally filtered by label.
+
+        Args:
+            label: If provided, return markers for this label only.
+                   If None, return all markers.
+
+        Returns:
+            Dict mapping labels to lists of (timestamp, metadata) tuples.
+        """
+        if label is not None:
+            return {label: list(self._markers.get(label, []))}
+        return {k: list(v) for k, v in self._markers.items()}
 
     @contextmanager
     def time(self, label: str) -> Generator[None, None, None]:
@@ -233,19 +317,88 @@ class Timer:
         return results
 
     def reset(self, label: Optional[str] = None) -> None:
-        """Reset timings for the specified label or all labels.
+        """Reset timings and markers for the specified label or all labels.
 
         Args:
-            label: Optional label to reset. If None, resets all timers.
+            label: Optional label to reset. If None, resets all timers and markers.
         """
         if label:
             if label in self._timers:
                 del self._timers[label]
             if label in self._start_times:
                 del self._start_times[label]
+            if label in self._markers:
+                del self._markers[label]
         else:
             self._timers = {}
             self._start_times = {}
+            self._markers = {}
+
+
+class ThreadSafeTimer(Timer):
+    """Thread-safe extension of Timer for use in multi-threaded contexts.
+
+    Wraps all mutating and reading operations with a lock so that
+    concurrent threads can safely record timings to the same instance.
+    """
+
+    def __init__(self, context: Optional[dict[str, object]] = None) -> None:
+        super().__init__(context=context)
+        self._lock = threading.Lock()
+
+    def start(self, label: str) -> None:
+        with self._lock:
+            super().start(label)
+
+    def stop(self, label: str) -> float:
+        with self._lock:
+            return super().stop(label)
+
+    def record(self, label: str, elapsed: float) -> None:
+        with self._lock:
+            super().record(label, elapsed)
+
+    def mark(self, label: str, metadata: Optional[dict] = None) -> float:
+        with self._lock:
+            return super().mark(label, metadata)
+
+    def get_markers(
+        self, label: Optional[str] = None
+    ) -> dict[str, list[tuple[float, Optional[dict]]]]:
+        with self._lock:
+            return super().get_markers(label)
+
+    @contextmanager
+    def time(self, label: str) -> Generator[None, None, None]:
+        # start/stop are individually locked; no need to hold the lock
+        # across the yielded block (that would serialize all timed code).
+        self.start(label)
+        try:
+            yield
+        finally:
+            self.stop(label)
+
+    def get_elapsed(self, label: str) -> list[float]:
+        with self._lock:
+            return super().get_elapsed(label)
+
+    def get_latest_elapsed(self, label: str) -> float:
+        with self._lock:
+            return super().get_latest_elapsed(label)
+
+    def reduce(self, label: str, operation: str = "mean") -> float:
+        with self._lock:
+            return super().reduce(label, operation)
+
+    def get_timing_metrics(
+        self, reduction_op: Union[str, dict[str, str]] = "mean"
+    ) -> dict[str, float | list[float]]:
+        with self._lock:
+            return super().get_timing_metrics(reduction_op)
+
+    def reset(self, label: Optional[str] = None) -> None:
+        with self._lock:
+            super().reset(label)
 
 
 def convert_to_seconds(time_string: str) -> int:

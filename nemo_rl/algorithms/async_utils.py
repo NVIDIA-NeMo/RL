@@ -28,6 +28,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -291,6 +292,8 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
+        self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -403,7 +406,8 @@ class AsyncTrajectoryCollector:
                 # Check if refit is in progress and wait
                 if not self._refit_pause_cleared.is_set() and self.running:
                     print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
+                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                        self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
                 # Check if generation limits require pausing collection
@@ -428,7 +432,8 @@ class AsyncTrajectoryCollector:
                         self._generation_limit_cleared.clear()  # Clear the event to pause
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                    with self._efficiency_timer.time("idle/generation_limit_pause"):
+                        self._generation_limit_cleared.wait()
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -482,7 +487,8 @@ class AsyncTrajectoryCollector:
                     print(
                         "   Note: With vLLM V1 async engine, active threads can complete during weight update"
                     )
-                    self._refit_pause_cleared.wait()
+                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                        self._refit_pause_cleared.wait()
 
                     # After refit finishes if weight version has updated, reflect that in the new trajectories
                     generation_weight_version = self.current_weight_version
@@ -628,6 +634,13 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
+    def get_efficiency_metrics(self) -> dict[str, float]:
+        """Return accumulated efficiency metrics (sum of durations per category).
+
+        Called by the driver process each step to merge collector-side metrics.
+        """
+        return self._efficiency_timer.get_timing_metrics(reduction_op="sum")
+
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
@@ -641,6 +654,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
     ) -> None:
+        worker_start = time.perf_counter()
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -690,6 +704,7 @@ class AsyncTrajectoryCollector:
             # Use exponential backoff when buffer is full
             try:
                 backoff_delay = 0.01
+                backoff_start = None
                 while self.running:
                     status = ray.get(
                         self.replay_buffer.push_with_wait_signal.remote(
@@ -699,6 +714,11 @@ class AsyncTrajectoryCollector:
                         )
                     )
                     if status == "success":
+                        if backoff_start is not None:
+                            self._efficiency_timer.record(
+                                "idle/buffer_full_backoff",
+                                time.perf_counter() - backoff_start,
+                            )
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
                         )
@@ -715,6 +735,8 @@ class AsyncTrajectoryCollector:
                                     )
                         break
                     elif status == "full":
+                        if backoff_start is None:
+                            backoff_start = time.perf_counter()
                         # Exponential backoff up to 0.5 second
                         time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
@@ -722,11 +744,19 @@ class AsyncTrajectoryCollector:
                         # Unexpected status, wait briefly
                         time.sleep(0.01)
             except Exception as e:
+                if backoff_start is not None:
+                    self._efficiency_timer.record(
+                        "idle/buffer_full_backoff",
+                        time.perf_counter() - backoff_start,
+                    )
                 print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
                 import traceback
 
                 traceback.print_exc()
         except Exception as e:
+            self._efficiency_timer.record(
+                "wasted/failed_trajectory", time.perf_counter() - worker_start
+            )
             print(f"❌ Error in prompt group worker: {e}")
             import traceback
 

@@ -79,6 +79,7 @@ from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
 
 
 def dtensor_params_generator(
@@ -253,6 +254,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
         self.rank = torch.distributed.get_rank()
+        self.timer = Timer(context={"worker": "dtensor_policy_v2", "rank": self.rank})
         self.device_mesh = distributed_manager.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
@@ -333,6 +335,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -503,6 +506,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 dtype=self.dtype,
             )
 
+            self.timer.stop("train")
             return metrics
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
@@ -521,6 +525,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -596,6 +601,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
 
+        self.timer.stop("get_logprobs")
         return return_data
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
@@ -678,6 +684,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self.timer.start("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -773,6 +780,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
         ).cpu()
+        self.timer.stop("get_topk_logits")
         return ret
 
     @contextmanager
@@ -782,6 +790,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
         On exit: Restores original references and re-flips cuda/cpu
         """
+        self.timer.start("use_reference_model")
         with torch.no_grad():
             try:
                 # Save train model state_dict
@@ -803,6 +812,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
+                self.timer.stop("use_reference_model")
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -1010,17 +1020,20 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
+        self.timer.start("offload_before_refit")
         torch.randn(1).cuda()  # wake up torch allocator
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
+        self.timer.stop("offload_before_refit")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
+        self.timer.start("offload_after_refit")
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1032,6 +1045,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        self.timer.stop("offload_after_refit")
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():
@@ -1075,6 +1089,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        self.timer.start("save_checkpoint")
         self.checkpoint_manager.save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1087,6 +1102,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )
+        self.timer.stop("save_checkpoint")
 
     def load_checkpoint(
         self,

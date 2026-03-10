@@ -116,7 +116,7 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
     ) -> list[dict]:
-        timer = Timer()
+        timer = Timer(context={"worker": "nemo_gym"})
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
