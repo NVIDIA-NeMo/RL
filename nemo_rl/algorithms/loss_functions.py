@@ -1287,13 +1287,19 @@ class MseValueLossFn(LossFunction):
 
         if values.shape[-1] != 1:
             values = values[..., 0]
+        # print(
+        #     f"Loss @ Values: {values.shape}, Rewards: {data['rewards'].shape}",
+        #     flush=True,
+        # )
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
 
-        loss = torch.nn.functional.mse_loss(
-            values, data["rewards"].unsqueeze(-1), reduction="none"
-        )
+        rewards = torch.zeros_like(values)
+        for i, l in enumerate(data["input_lengths"]):
+            rewards[i, l - 1] = data["rewards"][i]
+
+        loss = torch.nn.functional.mse_loss(values, rewards, reduction="none")
 
         loss = self.scale * masked_mean(
             loss,

@@ -196,6 +196,7 @@ class GeneralizedAdvantageEstimator:
         mask,
         lengths,
         values,
+        reference_logprobs,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
@@ -207,6 +208,7 @@ class GeneralizedAdvantageEstimator:
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             lengths: Input lengths of shape [batch_size].
             values: Value predictions of shape [batch_size, seq_len]. Required for GAE.
+            reference_logprobs: Reference policy log probabilities of shape [batch_size, seq_len]. Required for GAE.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -230,6 +232,9 @@ class GeneralizedAdvantageEstimator:
             last_advantage = advantages[:, t]
 
         advantages = torch.masked_fill(
-            self._reward_whiten(advantages, mask), ~(mask.bool()), 0
+            # self._reward_whiten(advantages, mask),
+            advantages,
+            ~(mask.bool()),
+            0,
         )
         return advantages
