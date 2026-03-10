@@ -71,9 +71,9 @@ cd tests && uv run --extra sglang pytest unit/path/test.py::test_name --hf-gated
 - [x] Post-rebase re-test — ALL 3 PASS. New skips: Err 8 (nemotron-H auto_map), Err 9 (FP8 timeouts), Err 6 (gemma3 v2 TP=2), Err 3 flaky (CP agreement actor race), pre-existing (vLLM speculative decoding sentinel)
 - [x] Fix round 3 — unskipped vLLM speculative decoding sentinel, unskipped 3 CP agreement tests (unique name_prefix + topk threshold 0.95→0.94), unskipped gemma3 TP=2 (already fixed by Err 6)
 
-### Remaining skips (all pre-existing or Err 10)
+### Remaining skips (Err 10 only)
 - **Err 10 (Hemil):** 10 CP=2 DTensor SDPA redistribute tests in `test_dtensor_worker.py`
-- **Pre-existing (not transformers v5):** 2 non-colocated FP8 logprob tolerance, 1 SGLang non-colocated not implemented, 3 flaky dataset downloads, 4 complex mocking, 1 large model CI resources
+- **Not skipped, failing on main too:** 2 non-colocated FP8 logprob tolerance tests (left unskipped to match main)
 
 ---
 
@@ -117,7 +117,7 @@ if not hasattr(layer, "input_scale"):
     layer.input_scale = None
 ```
 
-**Status:** FIXED — colocated FP8 tests pass (4/4). Non-colocated FP8 tests (2 tests) still fail with a separate logprob tolerance issue (avg_prob_mult_error=1.1293 > threshold 1.08, deterministic). This is a pre-existing bug: `update_weights_from_collective` in `vllm_backend.py` does NOT call `process_weights_after_loading` after loading (unlike the IPC/colocated path which does). The `weight_update_and_prefix_cache_reset` FP8 tests (2 tests) still need verification.
+**Status:** FIXED — colocated FP8 tests pass (4/4). Non-colocated FP8 tests (2 tests) still fail with a separate logprob tolerance issue (avg_prob_mult_error=1.1293 > threshold 1.08, deterministic). **Not a regression** — confirmed failing on main as of 3/9/2026 with the same error (`assert tensor(1.1323) <= 1.08`). Tests are left unskipped to match main. Not something to fix in this PR.
 
 **Upstream references:**
 - [vllm#11537](https://github.com/vllm-project/vllm/issues/11537) — exact same `'QKVParallelLinear' object has no attribute 'input_scale'` error
