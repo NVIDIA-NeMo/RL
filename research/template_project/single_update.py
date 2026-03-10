@@ -88,14 +88,20 @@ def main(config: MasterConfig) -> None:
         config=policy_config,
         tokenizer=tokenizer,
         init_reference_model=False,
+        worker_extension_cls="research.template_project.worker_extension.DTensorPolicyWorkerV2Extension",
     )
     print("  ✓ Policy created")
+
+    # 4) Run a method on all workers in parallel with the same data
+    print("\n▶ Running a method on all workers in parallel with the same data...")
+    results = policy.run_all_workers_single_data("get_worker_info")
+    print(f"  ✓ Results: {results}")
 
     # Prepare refit info once before first refit
     state_dict_info = policy.prepare_refit_info()
     policy_generation.prepare_refit_info(state_dict_info or {})
 
-    # 4) Create tiny numeric batch and train with NLLLossFn
+    # 5) Create tiny numeric batch and train with NLLLossFn
     print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
     train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
         "train_global_batch_size"

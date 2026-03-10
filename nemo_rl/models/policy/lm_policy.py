@@ -70,6 +70,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
+        worker_extension_cls: Optional[str] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -130,6 +131,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+        # If a worker extension class is provided, use it instead of the default worker builder class
+        if worker_extension_cls is not None:
+            print(
+                f"Using worker extension class: {worker_extension_cls}, please make sure it is a subclass of {worker_builder_cls}."
+            )
+            worker_builder_cls = worker_extension_cls
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -274,6 +282,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+    def run_all_workers_single_data(self, method_name: str, **kwargs) -> Any:
+        """Run a method on all workers in parallel with the same data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_single_data(method_name, **kwargs)
+        results = ray.get(futures)
+        return results
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
