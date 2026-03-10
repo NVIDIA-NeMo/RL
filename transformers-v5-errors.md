@@ -600,11 +600,11 @@ AttributeError: 'NemotronHForCausalLM' object has no attribute 'backbone'. Did y
 ```
 
 **Affected tests:**
-- `grpo-nanov3-30BA3B-2n8g-fsdp2`
-- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora`
-- `sft-nanov3-30BA3B-2n8g-fsdp2`
-- `sft-nanov3-30BA3B-2n8g-fsdp2-lora`
-- `grpo-nano-v2-12b-2n8g-fsdp2tp1` (slightly different: `'NemotronHConfig' object has no attribute 'n_routed_experts'`)
+- `grpo-nanov3-30BA3B-2n8g-fsdp2` — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2/9905294-logs/ray-driver.log`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora` — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2-lora/9905297-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2/9905539-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2-lora` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2-lora/9905544-logs/ray-driver.log`
+- `grpo-nano-v2-12b-2n8g-fsdp2tp1` (slightly different: `'NemotronHConfig' object has no attribute 'n_routed_experts'`) — `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9905287-logs/ray-driver.log`
 
 **Observation:** Same root cause as Err 8 (unit tests). The `parallelize.py` fix (detect `model.backbone` vs `model.model`) was applied for the unit test tiny model, but the nightly tests use real NemotronH checkpoints that may still have `auto_map` or old config format. The nano-v2 variant also has a config attribute mismatch (`n_routed_experts`).
 
@@ -618,8 +618,8 @@ RuntimeError: [SGLang Server] Rank 0 Server process terminated unexpectedly.
 ```
 
 **Affected tests:**
-- `grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang`
-- `grpo-qwen3-0.6b-1n8g-sglang`
+- `grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang` — `code_snapshots_v5_nightly/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang/9905090-logs/ray-driver.log`
+- `grpo-qwen3-0.6b-1n8g-sglang` — `code_snapshots_v5_nightly/grpo-qwen3-0.6b-1n8g-sglang/9905088-logs/ray-driver.log`
 
 **Observation:** SGLang server dies during generation or refitting. May be related to Err 4 (CUDA graph issue) but in nightly context. The unit test fix (`disable_piecewise_cuda_graph`) only applies to test configs, not nightly YAML configs.
 
@@ -634,9 +634,9 @@ torch.OutOfMemoryError: CUDA out of memory.
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16b-automodel-1n8g-ep8` (Step 4/30, needs 2.25 GiB, 1.82 GiB free)
-- `grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3` (Step 1/2, needs 4.64 GiB, 4.09 GiB free)
-- `grpo-qwen3-8b-base-1n8g-megatron-lora` (Step 1/20, OOM in `_compute_distributed_log_softmax`)
+- `grpo-moonlight-16b-automodel-1n8g-ep8` (Step 4/30, needs 2.25 GiB, 1.82 GiB free) — `code_snapshots_v5_nightly/grpo-moonlight-16b-automodel-1n8g-ep8/9905095-logs/ray-driver.log`
+- `grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3` (Step 1/2, needs 4.64 GiB, 4.09 GiB free) — `code_snapshots_v5_nightly/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3/9905103-logs/ray-driver.log`
+- `grpo-qwen3-8b-base-1n8g-megatron-lora` (Step 1/20, OOM in `_compute_distributed_log_softmax`) — `code_snapshots_v5_nightly/grpo-qwen3-8b-base-1n8g-megatron-lora/9905475-logs/ray-driver.log`
 
 **Observation:** Memory pressure from version bump (torch 2.10, TE 2.12, vLLM 0.17). These may have been borderline before and tipped over with slightly higher memory usage from new dependencies.
 
@@ -652,7 +652,7 @@ but the custom CUDA extension fused_weight_gradient_mlp_cuda module is not found
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16ba3b-4n8g-megatron`
+- `grpo-moonlight-16ba3b-4n8g-megatron` — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron/9905106-logs/ray-driver.log`
 
 **Observation:** APEX CUDA extensions not compiled in this environment. Not a transformers v5 regression — likely environment/build issue.
 
@@ -667,7 +667,7 @@ AttributeError: 'Fp8MoEMethod' object has no attribute 'flashinfer_moe_backend'
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e`
+- `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e` — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e/9905250-logs/ray-driver.log`
 
 **Observation:** vLLM 0.17 FP8 MoE backend missing `flashinfer_moe_backend` attribute. Likely a vLLM version compatibility issue with flashinfer.
 
@@ -682,7 +682,7 @@ RuntimeError: The size of tensor a (546) must match the size of tensor b (0)
 ```
 
 **Affected tests:**
-- `grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e`
+- `grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e` — `code_snapshots_v5_nightly/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e/9905244-logs/ray-driver.log`
 
 **Observation:** Reference model state dict has empty tensors (size 0) instead of expected weights. May be an FP8 checkpoint conversion issue with the new stack.
 
@@ -697,7 +697,7 @@ ValueError: Unknown parallel style: colwise_gather_output
 ```
 
 **Affected tests:**
-- `dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long`
+- `dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long` — `code_snapshots_v5_nightly/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long/9905675-logs/ray-driver.log`
 
 **Observation:** Transformers v5 introduced new tensor parallel sharding patterns not handled by `translate_parallel_style()`. Needs a mapping for `colwise_gather_output`.
 
@@ -712,7 +712,7 @@ torch.distributed.DistBackendError: wait timeout after 600000ms
 ```
 
 **Affected tests:**
-- `dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload`
+- `dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload` — `code_snapshots_v5_nightly/dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload/9905573-logs/ray-driver.log`
 
 **Observation:** 10-minute NCCL timeout during cross-node weight broadcast. May be a networking/infrastructure issue or NemotronH model too large for the timeout.
 
@@ -727,7 +727,7 @@ AssertionError: Expected a cached item for mm_hash='f806c579...'
 ```
 
 **Affected tests:**
-- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1` (crashed after step 20)
+- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1` (crashed after step 20) — `code_snapshots_v5_nightly/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1/9905108-logs/ray-driver.log`
 
 **Observation:** vLLM multimodal cache eviction between generation and validation. May need larger cache or different eviction policy.
 
@@ -742,7 +742,7 @@ TypeError: Qwen25VLModel.forward() got an unexpected keyword argument 'mm_token_
 ```
 
 **Affected tests:**
-- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1`
+- `vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1` — `code_snapshots_v5_nightly/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1/9905194-logs/ray-driver.log`
 
 **Observation:** The `mm_token_type_ids` field was added for DTensor/automodel VLM support (Func Err 2 fix), but Megatron's VLM forward doesn't accept it. Megatron path needs to filter out this key before calling model.forward().
 
@@ -756,7 +756,7 @@ megatron_cfg.validate() → model.finalize() failed
 ```
 
 **Affected tests:**
-- `grpo-nanov3-30BA3B-2n8g-megatron-lora`
+- `grpo-nanov3-30BA3B-2n8g-megatron-lora` — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-megatron-lora/9905298-logs/ray-driver.log`
 
 **Observation:** Megatron config validation fails after checkpoint load. Likely related to NemotronH config changes in transformers v5.
 
@@ -770,8 +770,8 @@ CANCELLED DUE TO TIME LIMIT
 ```
 
 **Affected tests:**
-- `grpo-gspo-deepscaler-1.5b-8K` (completed steps, timed out in validation)
-- `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` (completed steps, timed out in validation)
+- `grpo-gspo-deepscaler-1.5b-8K` (completed steps, timed out in validation) — `code_snapshots_v5_nightly/grpo-gspo-deepscaler-1.5b-8K/9905235-logs/ray-driver.log`
+- `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` (completed steps, timed out in validation) — `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9905099-logs/ray-driver.log`
 
 **Observation:** Training completed but validation/metric checking exceeded walltime. May need longer SLURM allocation or the new stack is slightly slower.
 
@@ -785,7 +785,7 @@ Failed to spawn: 'examples/run_grpo_math.py' No such file or directory
 ```
 
 **Affected tests:**
-- `prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1`
+- `prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1` — `code_snapshots_v5_nightly/prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1/9905085-logs/ray-driver.log`
 
 **Observation:** Code snapshot missing the entry point script. Build/packaging issue.
 
@@ -800,7 +800,7 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 ```
 
 **Affected tests:**
-- `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel`
+- `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel` — `code_snapshots_v5_nightly/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel/9905534-logs/ray-driver.log`
 
 **Observation:** Torch compiler (inductor) can't handle dynamic shapes in this model. Torch 2.10 regression or model-specific dynamic shape issue.
 
@@ -808,11 +808,11 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 
 ## METRIC FAIL (3 tests — completed training but metric checks failed)
 
-| Test | Failed metric | Value | Threshold |
-|------|--------------|-------|-----------|
-| `grpo-nano-v2-12b-1n8g-megatron` | `token_mult_prob_error` | NaN | < 1.05 |
-| `sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch` | `gpu.0.mem_gb` | 77.5 GB | < 75 GB |
-| `sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3` | `gpu.0.mem_gb` | 35.3 GB | < 35 GB |
+| Test | Failed metric | Value | Threshold | Log |
+|------|--------------|-------|-----------|-----|
+| `grpo-nano-v2-12b-1n8g-megatron` | `token_mult_prob_error` | NaN | < 1.05 | `code_snapshots_v5_nightly/grpo-nano-v2-12b-1n8g-megatron/9905270-logs/ray-driver.log` |
+| `sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch` | `gpu.0.mem_gb` | 77.5 GB | < 75 GB | `code_snapshots_v5_nightly/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch/9905487-logs/ray-driver.log` |
+| `sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3` | `gpu.0.mem_gb` | 35.3 GB | < 35 GB | `code_snapshots_v5_nightly/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3/9905507-logs/ray-driver.log` |
 
 **Observations:**
 - nano-v2 megatron: NaN in `token_mult_prob_error` suggests logprob computation issue (related to N-Err 1?)
