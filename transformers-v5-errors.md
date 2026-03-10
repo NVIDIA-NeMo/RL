@@ -73,7 +73,7 @@ cd tests && uv run --extra sglang pytest unit/path/test.py::test_name --hf-gated
 
 ### Remaining skips (all pre-existing or Err 10)
 - **Err 10 (Hemil):** 10 CP=2 DTensor SDPA redistribute tests in `test_dtensor_worker.py`
-- **Pre-existing (not transformers v5):** 2 non-colocated FP8 logprob tolerance, 1 FP8 TP=2 OOM, 1 SGLang non-colocated not implemented, 3 flaky dataset downloads, 4 complex mocking, 1 large model CI resources
+- **Pre-existing (not transformers v5):** 2 non-colocated FP8 logprob tolerance, 1 SGLang non-colocated not implemented, 3 flaky dataset downloads, 4 complex mocking, 1 large model CI resources
 
 ---
 
@@ -437,14 +437,14 @@ cd tests && uv run --extra automodel pytest unit/models/policy/test_dtensor_work
 
 **Status:** FIXED — both nemotron training tests pass (training_setup19 and training_setup20). All 3 L0 suites pass.
 
-## Err 9. FP8 + cpu_offload colocated test borderline timeout — FIXED (partially)
+## Err 9. FP8 + cpu_offload colocated test borderline timeout — FIXED
 
 **Description:** Originally reported as borderline timeouts. After investigation:
 - `test_vllm_generation_with_hf_training_colocated[False-True-fp8-False]` — was timing out at 303s > 300s. **Fixed** by bumping timeout from 300→420s. Passes in ~64s with warm venvs.
 - `test_vllm_weight_update_and_prefix_cache_reset[fp8-1]` — **Fixed**, passes in ~44s with warm venvs.
-- `test_vllm_weight_update_and_prefix_cache_reset[fp8-2]` — **Pre-existing OOM**: FP8 TP=2 leaves only 16GiB free for vLLM which needs 55GiB. Not a transformers v5 issue.
+- `test_vllm_weight_update_and_prefix_cache_reset[fp8-2]` — originally diagnosed as OOM, but actually passes in ~60s when run in isolation. The failure only occurred when run after other GPU-heavy tests. Restored original parametrize style (separate decorators), bumped timeout 180→600s.
 
-**Status:** 2/3 tests unskipped. 1 test (fp8-2 TP=2) remains skipped as pre-existing OOM.
+**Status:** All 3 tests unskipped and passing.
 
 ## Err 10. CP=2 DTensor SDPA redistribute assertion — NOT FIXED (Hemil handling)
 
@@ -484,7 +484,7 @@ AssertionError: inputs need to be redistributed
 - [x] Err 6: DTensor redistribute assertion gemma3 TP=2 — FIXED (add Gemma3ForCausalLM to skip_initialize_weights; stale gemma3 TP=2 skip removed)
 - [x] Err 7: TP tied model fails with automodel v2 — FIXED (skip model.to(device) after checkpoint loading)
 - [x] Err 8: Nemotron-H test asset incompatible with native transformers — FIXED (convert config to native format, fix parallelize.py backbone→model.model)
-- [x] Err 9: FP8 timeout — FIXED (2/3 unskipped; bump timeout 300→420, fp8-2 TP=2 is pre-existing OOM)
+- [x] Err 9: FP8 timeout — FIXED (all 3 unskipped; fp8-2 TP=2 passes in isolation, timeout bumped 180→600s)
 - [ ] Err 10: CP=2 DTensor SDPA redistribute assertion — NOT FIXED (Hemil handling)
 
 ---
