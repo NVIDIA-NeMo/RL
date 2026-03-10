@@ -476,7 +476,7 @@ AssertionError: inputs need to be redistributed
 6. Summarize the root cause, fix, and any resources below
 
 ### Fix progress
-- [x] Err 1: vLLM FP8 QKVParallelLinear missing `input_scale` — FIXED (4/6 pass; 2 non-colocated have pre-existing logprob tolerance issue)
+- [x] Err 1: vLLM FP8 QKVParallelLinear missing `input_scale` — FIXED (all 6 unskipped; 2 non-colocated fail on main too, not a regression)
 - [x] Err 2: vLLM HTTP server response format mismatch — FIXED
 - [x] Err 3: Ray ActorAlreadyExistsError — FIXED (always kill actors after graceful shutdown + unique name_prefix for CP agreement tests + topk threshold 0.95→0.94 for torch 2.10/TE 2.12)
 - [x] Err 4: SGLang CUDA graph CUBLAS_STATUS_EXECUTION_FAILED — FIXED (disable_piecewise_cuda_graph in test config)
