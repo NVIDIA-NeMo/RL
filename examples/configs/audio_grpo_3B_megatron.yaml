@@ -1,9 +1,9 @@
 grpo:
   num_prompts_per_step: 8
-  num_generations_per_prompt: 4
+  num_generations_per_prompt: 8
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 500
+  max_num_steps: 200
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
@@ -54,10 +54,10 @@ loss_fn:
   force_on_policy_ratio: false
 checkpointing:
   enabled: true
-  checkpoint_dir: results/audio_grpo_3B_megatron
+  checkpoint_dir: results/audio_grpo_3B_megatron_rerun
   metric_name: val:accuracy
   higher_is_better: true
-  keep_top_k: 3
+  keep_top_k: 10
   save_period: 100
   checkpoint_must_save_by: null
 policy:
@@ -173,8 +173,8 @@ policy:
       lora_dtype: null
     optimizer:
       optimizer: adam
-      lr: 2.0e-07
-      min_lr: 2.0e-07
+      lr: 1.0e-6
+      min_lr: 1.0e-7
       weight_decay: 0.01
       bf16: true
       fp16: false
@@ -194,8 +194,8 @@ policy:
       weight_decay_incr_style: constant
       lr_decay_style: constant
       lr_decay_iters: 1000
-      lr_warmup_iters: 50
-      lr_warmup_init: 2.0e-08
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
@@ -246,10 +246,10 @@ logger:
   monitor_gpus: false
   wandb:
     project: grpo-dev
-    name: audio-grpo-3b-megatron
+    name: audio-grpo-3b-megatron-large-lr
   swanlab:
     project: grpo-dev
-    name: audio-grpo-3b-megatron
+    name: audio-grpo-3b-megatron-large-lr
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
