@@ -38,12 +38,12 @@ chmod +x data_with_placeholders/fill_placeholders.py
 ./data_with_placeholders/fill_placeholders.py --input-dir data_with_placeholders --output-dir data_filled
 
 
-# Create train/val splits for each data blend (last 1000 rows held out for validation)
+# Create train/val splits for each data blend (last 100 rows held out for validation)
 for f in data_filled/*.jsonl; do
   name=$(basename "$f" .jsonl)
   mkdir -p "data/$name"
-  head -n -1000 "$f" > "data/$name/train-split.jsonl"
-  tail -n 1000 "$f" > "data/$name/val-split.jsonl"
+  head -n -100 "$f" > "data/$name/train-split.jsonl"
+  tail -n 100 "$f" > "data/$name/val-split.jsonl"
 done
 ```
 
