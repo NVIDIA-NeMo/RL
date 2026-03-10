@@ -962,8 +962,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     [
         (True, False, "bfloat16", False),
         (False, True, "bfloat16", False),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — update_weights_from_collective missing process_weights_after_loading call")),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — update_weights_from_collective missing process_weights_after_loading call")),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — collective weight transfer produces higher FP8 quantization error than IPC path")),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.skip(reason="pre-existing: non-colocated FP8 logprob tolerance (1.13 > 1.08) — collective weight transfer produces higher FP8 quantization error than IPC path")),
         # LoRA tests (requires dtensor v2 / automodel)
         pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
         pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
