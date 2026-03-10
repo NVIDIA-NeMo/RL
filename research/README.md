@@ -27,7 +27,7 @@ A new research project needs to include at least:
     - You can refer to [run_grpo.py](examples/run_grpo.py) and [grpo.py](nemo_rl/algorithms/grpo.py) in the core repository, and [single_update.py](research/template_project/single_update.py) in the research template for examples.
 - Configuration
     - A runnable `config.yaml` that defines the experiment.
-    - You can refer to [configs/](research/template_project/configs) in the core repository and [examples/configs/](examples/configs) in the research template for examples.
+    - You can refer to [examples/configs/](examples/configs) in the core repository and [configs/](research/template_project/configs) in the research template for examples.
 - Documentation
     - A `README.md` that describes the project, how to run it, and how to reproduce results.
 - Functional test

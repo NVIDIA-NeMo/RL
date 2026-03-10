@@ -283,19 +283,41 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
-    def run_all_workers_single_data(self, method_name: str, **kwargs) -> Any:
+    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
 
         Mainly used for worker extension classes.
 
         Args:
             method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
             **kwargs: The keyword arguments to pass to the method.
 
         Returns:
             The results of the method run on all workers.
         """
-        futures = self.worker_group.run_all_workers_single_data(method_name, **kwargs)
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with different data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name, *args, **kwargs
+        )
         results = ray.get(futures)
         return results
 

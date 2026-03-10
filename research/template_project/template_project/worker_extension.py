@@ -22,11 +22,11 @@ from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import DTensorPolicy
 class DTensorPolicyWorkerV2Extension(DTensorPolicyWorkerV2):
     """Example worker extension that adds a custom method callable via run_all_workers_single_data."""
 
-    def get_worker_info(self) -> dict[str, Any]:
-        """Return per-worker info. Used to demonstrate run_all_workers_single_data."""
+    def get_worker_rank(self) -> dict[str, Any]:
+        """Return per-worker rank. Used to demonstrate run_all_workers_single_data."""
         rank = torch.distributed.get_rank()
-        device = getattr(self, "device", None)
-        return {
-            "rank": rank,
-            "device": str(device) if device is not None else "unknown",
-        }
+        return rank
+
+    def return_input(self, input: Any) -> Any:
+        """Return the input. Used to demonstrate run_all_workers_multiple_data."""
+        return input

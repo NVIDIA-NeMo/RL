@@ -92,10 +92,18 @@ def main(config: MasterConfig) -> None:
     )
     print("  ✓ Policy created")
 
-    # 4) Run a method on all workers in parallel with the same data
+    # 4) Run methods on all workers
+    # 4.1) Run a method on all workers in parallel with the same data
     print("\n▶ Running a method on all workers in parallel with the same data...")
-    results = policy.run_all_workers_single_data("get_worker_info")
-    print(f"  ✓ Results: {results}")
+    results = policy.run_all_workers_single_data("get_worker_rank")
+    print(f"  ✓ Results for get_worker_rank: {results}")
+
+    # 4.2) Run a method on all workers in parallel with different data
+    print("\n▶ Running a method on all workers in parallel with different data...")
+    worker_nums = config["cluster"]["gpus_per_node"] * config["cluster"]["num_nodes"]
+    input_list = [i for i in range(worker_nums)]
+    results = policy.run_all_workers_multiple_data("return_input", input=input_list)
+    print(f"  ✓ Results for return_input: {results}")
 
     # Prepare refit info once before first refit
     state_dict_info = policy.prepare_refit_info()
