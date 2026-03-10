@@ -13,11 +13,13 @@ This is a template project for research experiments with NeMo RL.
 
 The `single_update.py` script demonstrates a minimal train-and-generate loop:
 1. Sets up a Ray compute cluster
-2. Initializes vLLM generation and an LM policy
-3. Trains the policy on a small batch using NLL loss
-4. Refits the generation engine with the updated policy weights
-5. Generates outputs with the new policy
-6. Repeats the loop (10 iterations by default)
+2. Initializes the vLLM generation
+3. Initializes the LM policy with an extension worker class that supports custom functions
+4. Executes a custom function provided by the extension worker class
+5. Repeats the loop (10 iterations by default)
+    1. Trains the policy on a small batch using NLL loss
+    2. Refits the generation engine with the updated policy weights
+    3. Generates outputs with the new policy
 
 This shows the basic cycle of training a language model and using it for generation.
 
