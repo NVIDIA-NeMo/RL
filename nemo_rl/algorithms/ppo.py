@@ -78,11 +78,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import (
-    Logger,
-    LoggerConfig,
-    print_message_log_samples,
-)
+from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -1365,14 +1361,9 @@ def ppo_train(
                 values = value_model.get_values(train_data)
                 train_data["values"] = values["values"][..., 0]
 
-            with timer.time("compute_advantages"):
-                print("▶ Computing advantages...", flush=True)
-                train_data["advantages"] = adv_estimator.compute_advantage(
-                    prompt_ids=torch.arange(messages["token_ids"].shape[0]),
-                    rewards=train_data["rewards"],
-                    mask=train_data["token_mask"],
-                    values=train_data["values"],
-                    lengths=input_lengths,
+                print(
+                    f"  • Average batch reward: {train_data['rewards'].mean().numpy():.4f}\n"
+                    f"  • Average batch response length: {input_lengths.sum():.4f}"
                 )
 
             with timer.time("logprob_inference_prep"):
@@ -1385,23 +1376,37 @@ def ppo_train(
                     train_data, timer=timer
                 )["logprobs"]
 
+                train_data["reference_policy_logprobs"] = (
+                    policy.get_reference_policy_logprobs(train_data, timer=timer)[
+                        "reference_logprobs"
+                    ]
+                )
+
+            with timer.time("compute_advantages"):
+                print("▶ Computing advantages...", flush=True)
+                train_data["advantages"] = adv_estimator.compute_advantage(
+                    prompt_ids=torch.arange(messages["token_ids"].shape[0]),
+                    rewards=train_data["rewards"],
+                    mask=train_data["token_mask"],
+                    values=train_data["values"],
+                    lengths=input_lengths,
+                    reference_logprobs=train_data["reference_policy_logprobs"],
+                )
+
+                train_data["returns"] = train_data["advantages"] + train_data["values"]
+
+                # for i in range(train_data["advantages"].shape[0]):
+                #     if train_data["rewards"][i] != 0:
+                #         print(f"Advantages: {train_data['advantages'][i, :]}")
+                #         print(f"Values: {train_data['values'][i, :]}")
+                #         print(f"Masks: {train_data['token_mask'][i, :]}")
+                #         print(f"Rewards: {train_data['rewards'][i]}")
+                #         break
+
             for step in range(steps_per_epoch):
-                print(f"▶ Step {step + 1}/{steps_per_epoch}...", flush=True)
-                permutation = torch.randperm(train_data["advantages"].shape[0])
-                train_data_permuted = BatchedDataDict[ClippedPGLossDataDict](
-                    {
-                        "input_ids": train_data["input_ids"][permutation],
-                        "input_lengths": train_data["input_lengths"][permutation],
-                        "generation_logprobs": train_data["generation_logprobs"][
-                            permutation
-                        ],
-                        "values": train_data["values"][permutation],
-                        "rewards": train_data["rewards"][permutation],
-                        "sample_mask": train_data["sample_mask"][permutation],
-                        "token_mask": train_data["token_mask"][permutation],
-                        "advantages": train_data["advantages"][permutation],
-                        "prev_logprobs": train_data["prev_logprobs"][permutation],
-                    }
+                print(
+                    f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch}...",
+                    flush=True,
                 )
 
                 with timer.time("policy_training_prep"):
@@ -1410,7 +1415,7 @@ def ppo_train(
                 with timer.time("policy_training"):
                     print("▶ Training policy...", flush=True)
                     train_results = policy.train(
-                        train_data_permuted,
+                        train_data,
                         loss_fn,
                         timer=timer,
                     )
@@ -1423,17 +1428,19 @@ def ppo_train(
                 with timer.time("value_training"):
                     print("▶ Training value...", flush=True)
                     value_results = value_model.train(
-                        train_data_permuted,
+                        train_data,
                         value_loss_fn,
                         timer=timer,
                     )
                     value_model.finish_training()
 
-                print(f"▶ Step {step + 1}/{steps_per_epoch} training results:")
+                print(
+                    f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch} training results:"
+                )
                 print(f"    • Policy loss: {train_results['loss'].item():.4f}")
                 print(f"    • Value loss: {value_results['loss'].item():.4f}")
 
-            if (current_epoch + 1) % val_period == 0:
+            if (epoch + 1) % val_period == 0:
                 with timer.time("validation"):
                     print("▶ Validating...", flush=True)
 
@@ -1451,17 +1458,19 @@ def ppo_train(
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        step=0,
+                        step=epoch + 1,
                         master_config=master_config,
                         logger=logger,
                     )
                     policy_generation.finish_generation()
 
                     logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
+                        validation_timings,
+                        current_epoch + 1,
+                        prefix="timing/validation",
                     )
                     logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
+                        val_metrics, current_epoch + 1, prefix="validation"
                     )
 
 
