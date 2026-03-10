@@ -54,14 +54,14 @@ loss_fn:
   force_on_policy_ratio: false
 checkpointing:
   enabled: true
-  checkpoint_dir: results/audio_grpo_3B_megatron_rerun
+  checkpoint_dir: results/audio_grpo_3B_megatron
   metric_name: val:accuracy
   higher_is_better: true
   keep_top_k: 10
   save_period: 100
   checkpoint_must_save_by: null
 policy:
-  model_name: /workspace_yuekai/HF/Qwen2.5-Omni-3B
+  model_name: Qwen/Qwen2.5-Omni-3B
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 32
@@ -224,7 +224,7 @@ data:
     split: validation
   # default settings for all datasets
   default:
-    prompt_file: examples/prompts/avqa_cot.txt
+    prompt_file: null
     system_prompt_file: null
     processor: "vlm_hf_data_processor"
     env_name: "avqa"
