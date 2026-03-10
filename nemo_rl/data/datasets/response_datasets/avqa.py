@@ -81,7 +81,7 @@ class AVQADataset(RawDataset):
                 f"Invalid split: {split}. Please use one of {VALID_SPLITS}."
             )
 
-        self.dataset = load_dataset("/workspace_yuekai/HF/avqa-processed", split=split)
+        self.dataset = load_dataset("gijs/avqa-processed", split=split)
 
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)

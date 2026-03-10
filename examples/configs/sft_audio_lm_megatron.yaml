@@ -22,7 +22,7 @@ checkpointing:
   save_period: 500
 
 policy:
-  model_name: "/workspace_yuekai/HF/Qwen2-Audio-7B"
+  model_name: "Qwen/Qwen2-Audio-7B"
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 32
