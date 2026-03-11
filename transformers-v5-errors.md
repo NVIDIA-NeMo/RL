@@ -613,13 +613,15 @@ AttributeError: 'NemotronHForCausalLM' object has no attribute 'backbone'. Did y
 ```
 
 **Affected tests:**
-- `grpo-nanov3-30BA3B-2n8g-fsdp2` — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2/9905294-logs/ray-driver.log`
-- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora` — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2-lora/9905297-logs/ray-driver.log`
-- `sft-nanov3-30BA3B-2n8g-fsdp2` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2/9905539-logs/ray-driver.log`
-- `sft-nanov3-30BA3B-2n8g-fsdp2-lora` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2-lora/9905544-logs/ray-driver.log`
-- `grpo-nano-v2-12b-2n8g-fsdp2tp1` (slightly different: `'NemotronHConfig' object has no attribute 'n_routed_experts'`) — `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9905287-logs/ray-driver.log`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2` — METRIC PASS — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2/9922064-logs/ray-driver.log`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora` — METRIC PASS — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2-lora/9922069-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2` — METRIC PASS — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2/9922071-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2-lora` — METRIC PASS — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2-lora/9922075-logs/ray-driver.log`
+- `grpo-nano-v2-12b-2n8g-fsdp2tp1` — METRIC FAIL — `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9922079-logs/ray-driver.log`
 
-**Observation:** Same root cause as Err 8 (unit tests). The `parallelize.py` fix (detect `model.backbone` vs `model.model`) was applied for the unit test tiny model, but the nightly tests use real NemotronH checkpoints that may still have `auto_map` or old config format. The nano-v2 variant also has a config attribute mismatch (`n_routed_experts`).
+**Fix:** Added `dtensor_cfg.automodel_kwargs.force_hf: true` to all NemotronH fsdp2 recipe configs + added `NemotronHForCausalLM` to `skip_initialize_weights` in Automodel checkpointing.py.
+
+**Status:** 4/5 PASS. nano-v2-12b METRIC FAIL needs further investigation (different model variant).
 
 ---
 
@@ -631,10 +633,10 @@ RuntimeError: [SGLang Server] Rank 0 Server process terminated unexpectedly.
 ```
 
 **Affected tests:**
-- `grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang` — `code_snapshots_v5_nightly/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang/9905090-logs/ray-driver.log`
-- `grpo-qwen3-0.6b-1n8g-sglang` — `code_snapshots_v5_nightly/grpo-qwen3-0.6b-1n8g-sglang/9905088-logs/ray-driver.log`
+- `grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang` — running (Step 378/450) — `code_snapshots_v5_nightly/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang/9922111-logs/ray-driver.log`
+- `grpo-qwen3-0.6b-1n8g-sglang` — running (Step 345/500) — `code_snapshots_v5_nightly/grpo-qwen3-0.6b-1n8g-sglang/9922117-logs/ray-driver.log`
 
-**Observation:** SGLang server dies during generation or refitting. May be related to Err 4 (CUDA graph issue) but in nightly context. The unit test fix (`disable_piecewise_cuda_graph`) only applies to test configs, not nightly YAML configs.
+**Fix:** Added `disable_piecewise_cuda_graph: true` to both sglang YAML configs + bumped NUM_MINUTES (120→150 and 120→180). Rerunning.
 
 ---
 
@@ -665,9 +667,9 @@ but the custom CUDA extension fused_weight_gradient_mlp_cuda module is not found
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16ba3b-4n8g-megatron` — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron/9905106-logs/ray-driver.log`
+- `grpo-moonlight-16ba3b-4n8g-megatron` — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron/9922729-logs/ray-driver.log`
 
-**Observation:** APEX CUDA extensions not compiled in this environment. Not a transformers v5 regression — likely environment/build issue.
+**Observation:** Original error (APEX CUDA extensions missing) fixed by Megatron-Bridge PR #2739. New error on rerun is a transient network timeout downloading the tokenizer (`ValueError: Unable to instantiate HuggingFace AutoTokenizer for moonshotai/Moonlight-16B-A3B-Instruct. Exception: The read operation timed out`). Needs rerun.
 
 ---
 
@@ -725,9 +727,9 @@ torch.distributed.DistBackendError: wait timeout after 600000ms
 ```
 
 **Affected tests:**
-- `dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload` — `code_snapshots_v5_nightly/dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload/9905573-logs/ray-driver.log`
+- `dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload` — `code_snapshots_v5_nightly/dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload/9922260-logs/ray-driver.log`
 
-**Observation:** 10-minute NCCL timeout during cross-node weight broadcast. May be a networking/infrastructure issue or NemotronH model too large for the timeout.
+**Observation:** Original error was NCCL timeout (caused by N-Err 1 backbone crash on other ranks). After N-Err 1 fix (force_hf + _v2 + skip_initialize_weights), training completes all 15 steps but times out during metrics validation. Bumped NUM_MINUTES 30→45. Rerunning.
 
 ---
 
