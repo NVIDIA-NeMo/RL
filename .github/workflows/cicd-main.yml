@@ -32,7 +32,7 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only, Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
       image_tag:
         description: "Override container image tag (e.g. 'main'). Skips container build."
         required: false
@@ -163,9 +163,9 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast uses main, workflow_dispatch can override
+          # Determine image tag: Lfast and docs reuse the main container, workflow_dispatch can override
           IMAGE_TAG=""
-          if [[ "$TEST_LEVEL" == "Lfast" ]]; then
+          if [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
             IMAGE_TAG="main"
           fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.image_tag }}" ]]; then
@@ -308,7 +308,15 @@ jobs:
           - script: Docs_Tests
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
     needs: [pre-flight, build-container, org-member-pre-flight]
-    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    if: >-
+      ${{
+        (
+          always() &&
+          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.result == 'success' &&
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
+        ) && !cancelled()
+      }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     environment: nemo-ci
@@ -321,6 +329,7 @@ jobs:
           runner: ${{ runner.name }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
