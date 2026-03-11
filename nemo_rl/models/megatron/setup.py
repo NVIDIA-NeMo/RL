@@ -362,15 +362,16 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.tensor_model_parallel_size = config["megatron_cfg"][
         "tensor_model_parallel_size"
     ]
-    model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
-        "pipeline_model_parallel_size"
-    ]
-    model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
-        "num_layers_in_first_pipeline_stage"
-    ]
-    model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"][
-        "num_layers_in_last_pipeline_stage"
-    ]
+    if getattr(model_cfg, "pipeline_model_parallel_layout", None) is None:
+        model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
+            "pipeline_model_parallel_size"
+        ]
+        model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
+            "num_layers_in_first_pipeline_stage"
+        ]
+        model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"][
+            "num_layers_in_last_pipeline_stage"
+        ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
