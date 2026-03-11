@@ -1,0 +1,268 @@
+# ============================================================================
+# GRPO Training with Turing VIF Environment (Inverse IF data)
+# ============================================================================
+# Uses the turing_vif resource server to evaluate Inverse IF tasks.
+# All training hyperparameters, policy, Megatron, and vLLM settings are
+# identical to the original inverse_if experiment for fair comparison.
+#
+# Key difference: turing_vif uses all-or-nothing reward (1.0 only if ALL
+# llm_judge checks pass) vs the old inverse_if mean aggregation.
+#
+# Architecture (colocated):
+#   - Training nodes: 16 (Megatron with TP=4, CP=1, EP=8)
+#   - vLLM TP=2, gpu_memory_utilization=0.5
+#   - Judge nodes: 4 (Qwen3-235B-A22B FP8 with TP=8, 4 replicas)
+#   - Total: 20 nodes (16 policy + 4 judge)
+#
+# Usage:
+#   See launch_turing_vif_inverse_if_training.sh for launch instructions.
+# ============================================================================
+
+# Inherit from the base GRPO config
+defaults: ../../examples/configs/grpo_math_1B.yaml
+
+# ============================================================================
+# GRPO Hyperparameters - Matching reference script
+# ============================================================================
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_num_epochs: 1000
+  max_num_steps: 1000000
+  max_rollout_turns: 1
+  normalize_rewards: false
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+
+# ============================================================================
+# Loss Function - Aligned with reference
+# ============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+
+# ============================================================================
+# Policy Model Configuration
+# ============================================================================
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/users/mfathi/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+  precision: bfloat16
+  max_total_sequence_length: 8192
+  train_global_batch_size: 1024
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  logprob_chunk_size: null
+  max_grad_norm: 1.0
+
+  dtensor_cfg:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    converter_type: "LlamaForCausalLM"
+    
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    
+    activation_checkpointing: true
+    defer_fp32_logits: null
+    
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: "alltoall"
+    moe_enable_deepep: false
+    moe_aux_loss_coeff: 1e-4
+    moe_router_enable_expert_bias: true
+    
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: 0.9999e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 1
+      lr_warmup_init: 0.9999e-6
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  generation:
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      skip_tokenizer_init: false
+
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+
+# ============================================================================
+# Cluster Configuration
+# ============================================================================
+cluster:
+  num_nodes: 20
+  gpus_per_node: 8
+  cpus_per_node: 112
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl
+  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl
+  max_input_seq_length: ${policy.max_total_sequence_length}
+
+# ============================================================================
+# Environment Configuration (NeMo-Gym) — Turing VIF
+# ============================================================================
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    num_gpu_nodes: 4
+
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/turing_vif/configs/turing_vif.yaml
+
+    # Wire turing_vif to use the dedicated judge model via direct URL
+    turing_vif:
+      resources_servers:
+        turing_vif:
+          judge_base_url: http://127.0.0.1:8000/v1
+          judge_api_key: dummy_key
+          judge_model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
+
+    turing_vif_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+
+    # Dedicated Judge Model Server — spun up on num_gpu_nodes
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://127.0.0.1:8000/v1
+          api_key: dummy_key
+          model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
+          return_token_id_information: false
+          uses_reasoning_parser: false
+          spinup_server: true
+          router_dp_size: 4
+          server_args:
+            tensor_parallel_size: 8
+            gpu_memory_utilization: 0.9
+            max_model_len: 65536
+            enable_expert_parallel: true
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+
+# ============================================================================
+# Logger Configuration
+# ============================================================================
+logger:
+  log_dir: results/turing_vif_inverse_if_grpo
+  num_val_samples_to_print: 3
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: nemo-rl-turing-vif-inverse-if
+    name: null
+
+# ============================================================================
+# Checkpointing Configuration
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/turing_vif_inverse_if_grpo/checkpoints
+  save_period: 10
+  keep_top_k: 100
+  checkpoint_must_save_by: "00:03:30:00"
