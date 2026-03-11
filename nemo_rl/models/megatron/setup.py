@@ -467,6 +467,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
 
+    if model_cfg.gradient_accumulation_fusion:
+        try:
+            import fused_weight_gradient_mlp_cuda  # noqa: F401
+        except ImportError:
+            model_cfg.gradient_accumulation_fusion = False
+
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
@@ -754,6 +760,12 @@ def setup_model_and_optimizer(
         pre_wrap_hook.extend([composed_peft_hook])
 
     # Model, optimizer, and learning rate.
+    if megatron_cfg.model.gradient_accumulation_fusion:
+        try:
+            import fused_weight_gradient_mlp_cuda  # noqa: F401
+        except ImportError:
+            megatron_cfg.model.gradient_accumulation_fusion = False
+
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
     model = get_model(
