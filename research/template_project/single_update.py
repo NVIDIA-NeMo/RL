@@ -89,7 +89,7 @@ def main(config: MasterConfig) -> None:
         config=policy_config,
         tokenizer=tokenizer,
         init_reference_model=False,
-        worker_extension_cls="research.template_project.template_project.worker_extension.DTensorPolicyWorkerV2Extension",
+        worker_extension_cls="template_project.worker_extension.DTensorPolicyWorkerV2Extension",
     )
     print("  ✓ Policy created")
 
