@@ -1048,11 +1048,15 @@ class DistillationLossFn(LossFunction):
                 vocab_end_index = V_local
 
             with torch.no_grad():
-                mb_start = mb_idx * mbs
-                mb_end = mb_start + mbs
-                teacher_topk_logprobs = teacher_logits[mb_start:mb_end, :, :].clone().detach()
+                if mb_idx is not None and mbs is not None:
+                    mb_start = mb_idx * mbs
+                    mb_end = mb_start + mbs
+                    teacher_topk_logprobs = teacher_logits[mb_start:mb_end, :, :].clone().detach()
+                    topk_indices = teacher_topk_indices_ipc[mb_start:mb_end, :, :].clone().detach()
+                else:
+                    teacher_topk_logprobs = teacher_logits.clone().detach()
+                    topk_indices = teacher_topk_indices_ipc.clone().detach()
                 teacher_topk_logprobs = teacher_topk_logprobs.to(device=local_student_logits.device)
-                topk_indices = teacher_topk_indices_ipc[mb_start:mb_end, :, :].clone().detach()
                 topk_indices = topk_indices.to(device=local_student_logits.device)
 
             # Gather student log probs at teacher's top-k global indices
@@ -1113,9 +1117,12 @@ class DistillationLossFn(LossFunction):
                 local_student_logits = next_token_logits
 
             with torch.no_grad():
-                mb_start_index = mb_idx * mbs
-                mb_end_index = mb_start_index + mbs
-                teacher_logprobs_local = teacher_logits[mb_start_index:mb_end_index, :, :].clone().detach()
+                if mb_idx is not None and mbs is not None:
+                    mb_start_index = mb_idx * mbs
+                    mb_end_index = mb_start_index + mbs
+                    teacher_logprobs_local = teacher_logits[mb_start_index:mb_end_index, :, :].clone().detach()
+                else:
+                    teacher_logprobs_local = teacher_logits.clone().detach()
                 teacher_logprobs_local = teacher_logprobs_local.to(device=local_student_logits.device)
 
             if tp_group is not None:

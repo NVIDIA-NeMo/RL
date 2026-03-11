@@ -30,7 +30,11 @@ export HF_DATASETS_CACHE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ge
 # Run Off-Policy Distillation with IPC teacher logits + MATH/MMLU eval
 uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow_with_eval.py \
   --config /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/configs/llama_off_policy_arrow.yaml \
-  cluster.num_nodes=${NUM_ACTOR_NODES}
+  cluster.num_nodes=${NUM_ACTOR_NODES} \
+  checkpointing.checkpoint_dir=checkpoints/distillation-microbatch-ipc-tp4-test
+  # Previous checkpoint dirs:
+  # checkpoints/distillation-microbatch-ipc-test (tp=1 microbatch IPC test)
+  # checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B-10000steps (original chain)
 EOF
 
 export COMMAND

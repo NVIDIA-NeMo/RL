@@ -1,0 +1,11 @@
+Model,top_k,MATH (%),MATH (correct),MATH (total),MMLU (%),MMLU (correct),MMLU (total),wandb
+Llama-3.1-8B (teacher),--,12.56,628,5000,35.14,4935,14042,
+Llama-3.2-1B (pretrained baseline),--,5.64,282,5000,23.06,3238,14042,
+Distillation forward KL (50 steps),64,5.52,276,5000,23.25,3265,14042,https://wandb.ai/nvidia/nemo-off-policy-distillation-eval/runs/uc8nnmh1
+Distillation forward KL (1000 steps),64,5.84,292,5000,26.24,3684,14042,https://wandb.ai/nvidia/nemo-off-policy-distillation-eval/runs/uc8nnmh1
+Delta from baseline (top_k=64),,+0.20,+10,,+3.18,+446,,
+Distillation forward KL (50 steps),4096,5.27,27,512,26.56,136,512,https://wandb.ai/nvidia/nemo-off-policy-distillation-eval/runs/8a7dictz
+Distillation forward KL (1000 steps),4096,5.27,27,512,26.56,136,512,https://wandb.ai/nvidia/nemo-off-policy-distillation-eval/runs/8a7dictz
+SFT (50 steps),--,4.06,203,5000,16.79,2358,14042,https://wandb.ai/nvidia/nemo-sft-arrow-eval/runs/w5fiqlbw
+SFT (1000 steps),--,7.30,365,5000,22.13,3108,14042,https://wandb.ai/nvidia/nemo-sft-arrow-eval/runs/w5fiqlbw
+Delta from baseline (SFT),,+1.66,+83,,-0.93,-130,,
