@@ -69,9 +69,10 @@ CACHED_DEPENDENCIES = [
     "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
     "datasets",
     "fastapi~=0.50",
-    "flask[async]",
     "hypercorn",
-    "openai",
+    "quart",
+    "openai[aiohttp]",
+    "orjson",
 ]
 
 
