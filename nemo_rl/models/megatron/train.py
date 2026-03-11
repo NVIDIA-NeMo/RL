@@ -324,9 +324,7 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            fuse_loss = self.cfg.get("sequence_packing", {}).get(
-                "fuse_loss", False
-            )
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = prepare_packed_loss_input

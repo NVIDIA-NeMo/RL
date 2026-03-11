@@ -139,9 +139,7 @@ def _pack_input_ids(
     for i in range(batch_size):
         actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
         packed_start = int(cu_seqlens_q_padded[i].item())
-        packed[0, packed_start : packed_start + actual_len] = input_ids[
-            i, :actual_len
-        ]
+        packed[0, packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
     return packed
 
 
@@ -189,7 +187,9 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
-    packed_input_ids = _pack_input_ids(data["input_ids"], cu_seqlens_q, cu_seqlens_q_padded)
+    packed_input_ids = _pack_input_ids(
+        data["input_ids"], cu_seqlens_q, cu_seqlens_q_padded
+    )
     unpacked_seqlen = data["input_ids"].shape[1]
 
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
