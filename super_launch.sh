@@ -57,12 +57,6 @@ export OMP_NUM_THREADS=16
 # ---- Code snapshot ----
 SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
 
-if [ -d "${CODE_DIR}/3rdparty/vllm" ] && [ ! -e "${SNAPSHOT_DIR}/3rdparty/vllm" ]; then
-    echo "Symlinking 3rdparty/vllm to snapshot..."
-    mkdir -p "${SNAPSHOT_DIR}/3rdparty"
-    ln -s "${CODE_DIR}/3rdparty/vllm" "${SNAPSHOT_DIR}/3rdparty/vllm"
-fi
-
 cd "${SNAPSHOT_DIR}"
 
 export VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
@@ -116,7 +110,7 @@ export COMMAND="date ; \
     UV_HTTP_TIMEOUT=10 \
     VLLM_USE_PRECOMPILED=1 \
     VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION} \
-    uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+    python ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${CONFIG_PATH} \
     policy.model_name=${MODEL_PATH} \
     checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
@@ -135,7 +129,6 @@ export CONTAINER
 
 # ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
-BASE_MOUNTS+=",${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
