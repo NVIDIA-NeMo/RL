@@ -135,7 +135,7 @@ def create_megatron_test_config(
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
             "moe_enable_deepep": False,
-            "moe_token_dispatcher_type": "allgather",
+            "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training

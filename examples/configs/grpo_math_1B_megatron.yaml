@@ -96,7 +96,7 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     moe_permute_fusion: false
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
