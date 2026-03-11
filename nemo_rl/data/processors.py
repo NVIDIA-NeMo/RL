@@ -115,7 +115,7 @@ def helpsteer3_data_processor(
     extra_env_info = {"ground_truth": ground_truth}
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # Truncate if too long
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -169,7 +169,7 @@ def sft_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for message in message_log:
             message["token_ids"] = message["token_ids"][
@@ -361,7 +361,7 @@ def math_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for indiv_message in message_log:
             indiv_message["token_ids"] = indiv_message["token_ids"][
@@ -419,7 +419,7 @@ def math_hf_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
