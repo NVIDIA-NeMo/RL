@@ -472,15 +472,6 @@ wheels = [
 ]
 
 [[package]]
-name = "asgiref"
-version = "3.11.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/63/40/f03da1264ae8f7cfdbf9146542e5e7e8100a4c66ab48e791df9a03d3f6c0/asgiref-3.11.1.tar.gz", hash = "sha256:5f184dc43b7e763efe848065441eac62229c9f7b0475f41f80e207a114eda4ce", size = 38550, upload-time = "2026-02-03T13:30:14.33Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5c/0a/a72d10ed65068e115044937873362e6e32fab1b7dce0046aeb224682c989/asgiref-3.11.1-py3-none-any.whl", hash = "sha256:e8667a091e69529631969fd45dc268fa79b99c92c5fcdda727757e52146ec133", size = 24345, upload-time = "2026-02-03T13:30:13.039Z" },
-]
-
-[[package]]
 name = "astor"
 version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2062,11 +2053,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/f9/7f9263c5695f4bd0023734af91bedb2ff8209e8de6ead162f35d8dc762fd/flask-3.1.2-py3-none-any.whl", hash = "sha256:ca1d8112ec8a6158cc29ea4858963350011b5c846a414cdb7a954aa9e967d03c", size = 103308, upload-time = "2025-08-19T21:03:19.499Z" },
 ]
 
-[package.optional-dependencies]
-async = [
-    { name = "asgiref" },
-]
-
 [[package]]
 name = "flask-cors"
 version = "6.0.1"
@@ -2630,6 +2616,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
+]
+
+[[package]]
+name = "httpx-aiohttp"
+version = "0.1.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/2c/b894861cecf030fb45675ea24aa55b5722e97c602a163d872fca66c5a6d8/httpx_aiohttp-0.1.12.tar.gz", hash = "sha256:81feec51fd82c0ecfa0e9aaf1b1a6c2591260d5e2bcbeb7eb0277a78e610df2c", size = 275945, upload-time = "2025-12-12T10:12:15.283Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/8d/85c9701e9af72ca132a1783e2a54364a90c6da832304416a30fc11196ab2/httpx_aiohttp-0.1.12-py3-none-any.whl", hash = "sha256:5b0eac39a7f360fa7867a60bcb46bb1024eada9c01cbfecdb54dc1edb3fb7141", size = 6367, upload-time = "2025-12-12T10:12:14.018Z" },
 ]
 
 [[package]]
@@ -3543,7 +3542,6 @@ dependencies = [
     { name = "fastapi" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-python" },
-    { name = "flask", extra = ["async"] },
     { name = "hypercorn" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"] },
@@ -3555,9 +3553,11 @@ dependencies = [
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
     { name = "onnxscript" },
-    { name = "openai" },
+    { name = "openai", extra = ["aiohttp"] },
     { name = "opentelemetry-api" },
+    { name = "orjson" },
     { name = "packaging" },
+    { name = "quart" },
     { name = "tensorstore" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3576,7 +3576,6 @@ requires-dist = [
     { name = "fastapi", specifier = "~=0.50" },
     { name = "flash-linear-attention", specifier = "~=0.4.0" },
     { name = "flashinfer-python", specifier = "~=0.5.0" },
-    { name = "flask", extras = ["async"] },
     { name = "hypercorn" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
@@ -3587,9 +3586,11 @@ requires-dist = [
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
-    { name = "openai" },
+    { name = "openai", extras = ["aiohttp"] },
     { name = "opentelemetry-api", specifier = "~=1.33.1" },
+    { name = "orjson" },
     { name = "packaging", specifier = ">=24.2" },
+    { name = "quart" },
     { name = "tensorstore", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
@@ -5213,6 +5214,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/15/0e/331df43df633e6105ff9cf45e0ce57762bd126a45ac16b25a43f6738d8a2/openai-2.6.1-py3-none-any.whl", hash = "sha256:904e4b5254a8416746a2f05649594fa41b19d799843cd134dac86167e094edef", size = 1005551, upload-time = "2025-10-24T13:29:50.973Z" },
 ]
 
+[package.optional-dependencies]
+aiohttp = [
+    { name = "aiohttp" },
+    { name = "httpx-aiohttp" },
+]
+
 [[package]]
 name = "openai-harmony"
 version = "0.0.4"
@@ -6678,6 +6685,26 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/23/28/231c862500fec531080cc733e5766b46518edaefe0a068d46b276c380a25/quack_kernels-0.2.10.tar.gz", hash = "sha256:df86e981ea76542467ae2cd9ac606d587658e8d648a51c34dc0f2913a3e26bf6", size = 161102, upload-time = "2026-02-18T22:20:50.17Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/ac/8f70ddd397aff1d606d7aa6fbe857a2bc58a817965099cd97d91264175a8/quack_kernels-0.2.10-py3-none-any.whl", hash = "sha256:a5b604c5cf28d9e601aae00488b6b603bb4060ccab8409a4443e72a649226f74", size = 165298, upload-time = "2026-02-18T22:20:48.978Z" },
+]
+
+[[package]]
+name = "quart"
+version = "0.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiofiles" },
+    { name = "blinker" },
+    { name = "click" },
+    { name = "flask" },
+    { name = "hypercorn" },
+    { name = "itsdangerous" },
+    { name = "jinja2" },
+    { name = "markupsafe" },
+    { name = "werkzeug" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1d/9d/12e1143a5bd2ccc05c293a6f5ae1df8fd94a8fc1440ecc6c344b2b30ce13/quart-0.20.0.tar.gz", hash = "sha256:08793c206ff832483586f5ae47018c7e40bdd75d886fee3fabbdaa70c2cf505d", size = 63874, upload-time = "2024-12-23T13:53:05.664Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/e9/cc28f21f52913adf333f653b9e0a3bf9cb223f5083a26422968ba73edd8d/quart-0.20.0-py3-none-any.whl", hash = "sha256:003c08f551746710acb757de49d9b768986fd431517d0eb127380b656b98b8f1", size = 77960, upload-time = "2024-12-23T13:53:02.842Z" },
 ]
 
 [[package]]
