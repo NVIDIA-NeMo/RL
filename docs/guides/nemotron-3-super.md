@@ -30,7 +30,7 @@ docker buildx build --target release \
 
 ```bash
 # Download RL data blends (rlvr1, rlvr2, rlvr3, swe1, swe2, rlhf)
-uvx --from huggingface-hub hf download nvidia/Nemotron-3-Super-RL-Training-Blends --repo-type dataset --local-dir=data_with_placeholders
+uvx --from huggingface-hub hf download nvidia/Nemotron-RL-Super-Training-Blends --repo-type dataset --local-dir=data_with_placeholders
 
 
 # Fill in placeholders in data blends
