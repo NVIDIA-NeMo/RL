@@ -32,6 +32,9 @@ policy:
       max_running_requests: null
       mem_fraction_static: 0.7
       skip_server_warmup: true
+      # Piecewise CUDA graphs fail with CUBLAS_STATUS_EXECUTION_FAILED
+      # inside Ray worker forks. See unit test Err 4 for details.
+      disable_piecewise_cuda_graph: true
 
 data:
   max_input_seq_length: 512
