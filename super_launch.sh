@@ -135,7 +135,6 @@ export CONTAINER
 
 # ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
-BASE_MOUNTS+=",${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
 

@@ -149,6 +149,31 @@ bash super_launch.sh
 
 ### Stage 2 - SWE
 
+#### Rebuild the container for SWE
+
+The SWE stages require additional virtual environments that are not included in the base container. Rebuild the container to pre-fetch them:
+
+```bash
+docker buildx build \
+  -t your-registry/nemo-rl:v0.5.0.nemotron_3_super_swe \
+  --push \
+  -f- . <<'EOF'
+FROM nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super
+
+RUN <<'RUNEOF'
+set -euxo pipefail
+
+UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
+UV_LINK_MODE=hardlink uv run python examples/nemo_gym/prefetch_venvs.py \
+    examples/configs/super/stage2_swe1.yaml \
+    examples/configs/super/stage2_swe2.yaml
+
+RUNEOF
+EOF
+```
+
+Use the resulting image as `$SWE_CONTAINER` in the Stage 2 launch commands below.
+
 #### Stage 2.1 - SWE 1 (64 nodes)
 ```bash
 EXP_NAME=stage2.1-swe1 \
@@ -156,7 +181,7 @@ CONFIG_PATH=examples/configs/super/stage2_swe1.yaml \
 MODEL_PATH=/path/to/rlvr3_checkpoint \
 TRAIN_PATH=$DATA_DIR/swe1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe1/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=$SWE_CONTAINER \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -191,7 +216,7 @@ CONFIG_PATH=examples/configs/super/stage2_swe2.yaml \
 MODEL_PATH=/path/to/swe1_checkpoint \
 TRAIN_PATH=$DATA_DIR/swe2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe2/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=$SWE_CONTAINER \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
