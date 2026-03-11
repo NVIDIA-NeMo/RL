@@ -105,14 +105,17 @@ STRING_TO_DTYPE = {
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_distillation_worker")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
-    def __repr__(self) -> str:
-        """Customizes the actor's prefix in the Ray logs.
+class DTensorDistillationWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+    """DTensor worker that holds both student and teacher models for distillation.
 
-        This makes it easier to identify which worker is producing specific log messages.
-        """
+    The teacher model runs forward-only (no grad) and stores top-k logprobs in
+    GPU IPC buffers. The student model trains using those logprobs without any
+    data leaving the GPU (no Ray object store transfer).
+    """
+
+    def __repr__(self) -> str:
         if torch.distributed.is_initialized():
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
@@ -127,9 +130,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        teacher_config: Optional[PolicyConfig] = None,
         **kwargs: Any,
     ):
-        """Initialize the DTensorPolicyWorkerV2."""
+        """Initialize the DTensorDistillationWorker with student and (optionally) teacher models."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
@@ -166,7 +170,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
-        self.offload_optimizer_for_logprob = self.cfg.get("offload_optimizer_for_logprob", False)
+        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         try:
@@ -174,7 +178,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         except KeyError:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        self.enable_seq_packing = self.cfg.get("sequence_packing", {}).get("enabled", False)
+        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
         if self.enable_seq_packing:
             assert not self.is_vlm, (
                 "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
@@ -562,6 +566,67 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
             )
 
+        # ── Teacher model initialization (distillation-specific) ──
+        self.teacher_model = None
+        self.teacher_logits = None
+        self._teacher_topk_vals_buffer = None
+        self._teacher_topk_idx_buffer = None
+        self.teacher_cfg = teacher_config
+
+        if teacher_config is not None:
+            teacher_model_name = teacher_config["model_name"]
+            teacher_hf_overrides = teacher_config.get("hf_config_overrides", {}) or {}
+            teacher_model_config = AutoConfig.from_pretrained(
+                teacher_model_name,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                **teacher_hf_overrides,
+            )
+            teacher_model_class = resolve_model_class(teacher_model_config.model_type)
+
+            with init_empty_weights():
+                self.teacher_model = teacher_model_class.from_pretrained(
+                    teacher_model_name,
+                    attn_implementation=attn_impl,
+                    torch_dtype=str(teacher_model_config.torch_dtype),
+                    trust_remote_code=True,
+                    config=teacher_model_config,
+                    sdpa_method=sdpa_method,
+                )
+
+            self.teacher_model = manager.parallelize(self.teacher_model)
+
+            teacher_ckpt_manager = AutomodelCheckpointManager(
+                dp_mesh=self.dp_mesh,
+                tp_mesh=self.tp_mesh,
+                model_state_dict_keys=list(self.teacher_model.state_dict().keys()),
+                moe_mesh=self.moe_mesh,
+            )
+            teacher_ckpt_manager.init_checkpointer(
+                config_updates={
+                    "model_repo_id": teacher_model_name,
+                    "dequantize_base_checkpoint": teacher_config.get(
+                        "dequantize_base_checkpoint", False
+                    ),
+                    "is_peft": False,
+                },
+            )
+            teacher_ckpt_manager.set_model_state_dict_keys(
+                list(self.teacher_model.state_dict().keys())
+            )
+            teacher_ckpt_manager.load_base_model(
+                self.teacher_model,
+                model_name=teacher_model_name,
+                hf_cache_dir=teacher_hf_overrides.get("cache_dir", None),
+                dequantize_base_checkpoint=teacher_config.get(
+                    "dequantize_base_checkpoint", False
+                ),
+            )
+            self.teacher_model.eval()
+            for p in self.teacher_model.parameters():
+                p.requires_grad_(False)
+            print(f"[Rank {self.rank}] Teacher model ({teacher_model_name}) loaded and parallelized")
+
     def _apply_temperature_scaling(self, logits: torch.Tensor, skip: bool = False) -> torch.Tensor:
         if skip:
             return logits
@@ -582,7 +647,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return True
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
+    @wrap_with_nvtx_name("dtensor_distillation_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -590,11 +655,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        is_teacher: bool = False,
-        teacher_logits: Optional[Any] = None,
-        topk_logits: Optional[int] = None,
+        teacher_logits: Optional[dict] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the student policy, optionally using teacher logprobs from IPC buffers."""
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -617,17 +680,41 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
 
-        if is_teacher:
+        if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
-        elif eval_mode:
-            ctx = torch.no_grad()
             self.model.eval()
         else:
             ctx = nullcontext()
+            # Ensure model is in training mode
             self.model.train()
 
         with ctx:
+            # If teacher_forward() was called on this same worker, read teacher
+            # logprobs directly from the GPU IPC buffers (self.teacher_logits).
+            # No data round-trip through Ray — same process, same GPU.
+            ipc_source = teacher_logits if teacher_logits is not None else self.teacher_logits
+            if ipc_source is not None and isinstance(ipc_source, dict):
+                current_device_id = torch.cuda.current_device()
+                rank = torch.distributed.get_rank()
+                actual_shape = ipc_source.get('actual_shape')
+                is_topk = ipc_source.get('is_topk', False)
+
+                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                    ipc_source[rank], current_device_id
+                ).detach()
+                if actual_shape is not None:
+                    aB, aS, aK = actual_shape
+                    teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
+                data["teacher_topk_logits"] = teacher_logits_tensor
+
+                if is_topk and 'topk_indices_ipc' in ipc_source:
+                    teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
+                        ipc_source['topk_indices_ipc'], current_device_id
+                    ).detach()
+                    if actual_shape is not None:
+                        teacher_topk_indices_tensor = teacher_topk_indices_tensor[:aB, :aS, :aK].clone()
+                    data["teacher_topk_indices"] = teacher_topk_indices_tensor
+
             # Get data from batch and move to device
             data.to("cuda")
 
@@ -664,15 +751,14 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         "token_mask must be present in the data when using token-level loss"
                     )
 
-                if not is_teacher:
-                    self.optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 mb_losses = []
                 batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
                 # Calculate number of microbatches to process
                 # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
                 # so its safe to not check for the case where the last data slice is smaller than mbs
                 dummy_iterator = iter([])
-                if self.cfg.get("dynamic_batching", {}).get("enabled", False):
+                if self.cfg["dynamic_batching"]["enabled"]:
                     mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
                 elif self.enable_seq_packing:
@@ -707,14 +793,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     warnings.warn(
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
-
-                _teacher_mb_handles = []
-                _teacher_is_topk = False
-                if not is_teacher and teacher_logits is not None:
-                    rank = torch.distributed.get_rank()
-                    worker_result = teacher_logits[rank]
-                    _teacher_mb_handles = worker_result['microbatch_handles']
-                    _teacher_is_topk = worker_result.get('is_topk', False)
 
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
@@ -879,168 +957,69 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
 
-                        if is_teacher:
-                            with torch.no_grad():
-                                if isinstance(logits, DTensor):
-                                    mb_logits_local = logits.to_local()
-                                else:
-                                    mb_logits_local = logits
-                                del logits
-
-                                tp_group = self.tp_mesh.get_group()
-                                tp_rank = torch.distributed.get_rank(tp_group)
-                                V_local = int(mb_logits_local.shape[-1])
-                                vocab_start_index = tp_rank * V_local
-                                vocab_end_index = (tp_rank + 1) * V_local
-
-                                mb_logits_local = mb_logits_local.to(torch.float32)
-                                mb_log_prob = _compute_distributed_log_softmax(mb_logits_local, group=tp_group)
-                                del mb_logits_local
-
-                                if isinstance(mb_log_prob, DTensor):
-                                    mb_log_prob = mb_log_prob.to_local()
-
-                                if self.cfg.get('is_mdlm', False):
-                                    shared_seq_len = int(mb_log_prob.shape[1] / 2)
-                                    mb_log_prob = mb_log_prob[:, shared_seq_len:, :]
-
-                                if topk_logits is not None:
-                                    mb_topk_vals, mb_topk_idx = distributed_vocab_topk(
-                                        mb_log_prob,
-                                        k=topk_logits,
-                                        tp_group=tp_group,
-                                        vocab_start_index=vocab_start_index,
-                                        vocab_end_index=vocab_end_index,
-                                    )
-                                    del mb_log_prob
-
-                                    B_mb, S_mb, K_mb = mb_topk_vals.shape
-                                    buf_idx = len(_teacher_mb_handles)
-                                    self._ensure_teacher_mb_topk_buffer(
-                                        buf_idx, B_mb, K_mb,
-                                        mb_topk_vals.dtype, mb_topk_idx.dtype, mb_topk_vals.device,
-                                    )
-                                    self._teacher_mb_vals_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_vals)
-                                    self._teacher_mb_idx_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_idx)
-                                    del mb_topk_vals, mb_topk_idx
-
-                                    rank = torch.distributed.get_rank()
-                                    _teacher_mb_handles.append({
-                                        rank: self._teacher_mb_vals_ipcs[buf_idx],
-                                        'actual_shape': (B_mb, S_mb, K_mb),
-                                        'topk_indices_ipc': self._teacher_mb_idx_ipcs[buf_idx],
-                                    })
-                                else:
-                                    B_mb, S_mb, V_mb = mb_log_prob.shape
-                                    buf_idx = len(_teacher_mb_handles)
-                                    self._ensure_teacher_mb_logits_buffer(
-                                        buf_idx, B_mb, V_mb,
-                                        mb_log_prob.dtype, mb_log_prob.device,
-                                    )
-                                    self._teacher_mb_logits_buffers[buf_idx][:B_mb, :S_mb, :V_mb].copy_(mb_log_prob)
-                                    del mb_log_prob
-
-                                    rank = torch.distributed.get_rank()
-                                    _teacher_mb_handles.append({
-                                        rank: self._teacher_mb_logits_ipcs[buf_idx],
-                                        'actual_shape': (B_mb, S_mb, V_mb),
-                                    })
+                        if self.enable_seq_packing:
+                            loss_fn_ = SequencePackingLossWrapper(
+                                loss_fn=loss_fn,
+                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                            )
                         else:
-                            if self.enable_seq_packing:
-                                loss_fn_ = SequencePackingLossWrapper(
-                                    loss_fn=loss_fn,
-                                    cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
-                                    cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
-                                )
-                            else:
-                                loss_fn_ = loss_fn
+                            loss_fn_ = loss_fn
 
-                            # ── NaN debug: inspect logits on first microbatch of first 2 steps ──
-                            if mb_idx == 0 and gb_idx == 0 and self.rank == 0 and len(losses) < 2:
-                                _local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
-                                _lf = _local_logits.float()
-                                print(
-                                    f"  [NaN debug rank-0] logits shape={_local_logits.shape}, "
-                                    f"dtype={_local_logits.dtype}, "
-                                    f"min={_lf.min().item():.4f}, max={_lf.max().item():.4f}, "
-                                    f"has_nan={torch.isnan(_lf).any().item()}, "
-                                    f"has_inf={torch.isinf(_lf).any().item()}, "
-                                    f"global_valid_toks={global_valid_toks.item():.0f}, "
-                                    f"global_valid_seqs={global_valid_seqs.item():.0f}",
-                                    flush=True,
-                                )
-                                del _local_logits, _lf
+                        # ── NaN debug: inspect logits on first microbatch of first 2 steps ──
+                        if mb_idx == 0 and gb_idx == 0 and self.rank == 0 and len(losses) < 2:
+                            _local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+                            _lf = _local_logits.float()
+                            print(
+                                f"  [NaN debug rank-0] logits shape={_local_logits.shape}, "
+                                f"dtype={_local_logits.dtype}, "
+                                f"min={_lf.min().item():.4f}, max={_lf.max().item():.4f}, "
+                                f"has_nan={torch.isnan(_lf).any().item()}, "
+                                f"has_inf={torch.isinf(_lf).any().item()}, "
+                                f"global_valid_toks={global_valid_toks.item():.0f}, "
+                                f"global_valid_seqs={global_valid_seqs.item():.0f}",
+                                flush=True,
+                            )
+                            del _local_logits, _lf
 
-                            if _teacher_mb_handles and mb_idx < len(_teacher_mb_handles) and not self.enable_seq_packing:
-                                rank = torch.distributed.get_rank()
-                                current_device_id = torch.cuda.current_device()
-                                handle = _teacher_mb_handles[mb_idx]
-                                aB, aS, aK = handle['actual_shape']
+                        loss, loss_metrics = loss_fn_(
+                            logits,
+                            mb,
+                            global_valid_seqs,
+                            global_valid_toks,
+                        )
+                        del logits
 
-                                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
-                                    handle[rank], current_device_id
-                                ).detach()
-                                teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
+                        # skip the update for dummy batches
+                        if mb_idx < iterator_len:
+                            ## scale by the number of global batches so we get the correct
+                            ## value when summing metrics across all microbatches
+                            for k in loss_metrics.keys():
+                                loss_metrics[k] /= num_global_batches
+                            num_valid_samples = loss_metrics["num_valid_samples"]
+                            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        else:
+                            loss *= 0
 
-                                teacher_topk_indices_tensor = None
-                                if _teacher_is_topk and 'topk_indices_ipc' in handle:
-                                    teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
-                                        handle['topk_indices_ipc'], current_device_id
-                                    ).detach()
-                                    teacher_topk_indices_tensor = teacher_topk_indices_tensor[:aB, :aS, :aK].clone()
+                        # Backward pass
+                        if not eval_mode:
+                            ## NOTE: invalid samples should be multiplied
+                            ## by zero in the loss function to prevent them
+                            ## from affecting the gradient calculation
 
-                                loss, loss_metrics = loss_fn_(
-                                    logits,
-                                    mb,
-                                    global_valid_seqs,
-                                    global_valid_toks,
-                                    teacher_logits=teacher_logits_tensor,
-                                    teacher_topk_indices_ipc=teacher_topk_indices_tensor,
-                                )
-                                del teacher_logits_tensor
-                                if teacher_topk_indices_tensor is not None:
-                                    del teacher_topk_indices_tensor
-                            else:
-                                loss, loss_metrics = loss_fn_(
-                                    logits,
-                                    mb,
-                                    global_valid_seqs,
-                                    global_valid_toks,
-                                )
-                            del logits
+                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+                            # but we want to sum them so we cancel out the average here
+                            loss *= self.dp_size * self.cp_size
+                            loss.backward()
 
-                            # skip the update for dummy batches
-                            if mb_idx < iterator_len:
-                                ## scale by the number of global batches so we get the correct
-                                ## value when summing metrics across all microbatches
-                                for k in loss_metrics.keys():
-                                    loss_metrics[k] /= num_global_batches
-                                num_valid_samples = loss_metrics["num_valid_samples"]
-                                loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                                loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                                loss_metrics["global_valid_toks"] = global_valid_toks.item()
-                            else:
-                                loss *= 0
-
-                            # Backward pass
-                            if not eval_mode:
-                                loss *= self.dp_size * self.cp_size
-                                loss.backward()
-
-                    if not is_teacher:
-                        if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
-                            all_mb_metrics.append(loss_metrics)
-
-                if is_teacher:
-                    self.teacher_logits = {
-                        'microbatch_handles': _teacher_mb_handles,
-                        'is_topk': topk_logits is not None,
-                    }
-                    return self.teacher_logits
+                    if num_valid_samples > 0:
+                        mb_losses.append(loss.item())
+                        all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
-                if not is_teacher and not eval_mode:
+                if not eval_mode:
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -1064,13 +1043,15 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Update parameters
                     self.optimizer.step()
 
-                if not is_teacher:
-                    losses.append(torch.tensor(mb_losses).sum().item())
+                losses.append(torch.tensor(mb_losses).sum().item())
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
+            # increment scheduler after all batches in rollout are processed
             if not eval_mode:
                 self.scheduler.step()
+            # dynamic batch and sequence dims causes alot of fragmentation, so clear
+            # the memory allocator before moving on
             torch.cuda.empty_cache()
 
             # Compute global loss across all ranks
@@ -1135,7 +1116,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
+            if self.cfg["dynamic_batching"]["enabled"]:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1420,7 +1401,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
+            if self.cfg["dynamic_batching"]["enabled"]:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1562,7 +1543,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg.get("dynamic_batching", {}).get("enabled", False):
+            if self.cfg["dynamic_batching"]["enabled"]:
                 # dynamic batching support (no CP/packed)
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
@@ -1849,32 +1830,145 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         ).cpu()
         return ret
 
-    def _ensure_teacher_mb_topk_buffer(self, buf_idx, B, K, vals_dtype, idx_dtype, device):
-        """Lazily grow the per-microbatch IPC buffer pool for top-k teacher logits."""
-        if not hasattr(self, '_teacher_mb_vals_buffers'):
-            self._teacher_mb_vals_buffers = []
-            self._teacher_mb_vals_ipcs = []
-            self._teacher_mb_idx_buffers = []
-            self._teacher_mb_idx_ipcs = []
-        max_S = self.cfg.get("max_total_sequence_length", 1)
-        while len(self._teacher_mb_vals_buffers) <= buf_idx:
-            vals_buf = torch.empty((B, max_S, K), dtype=vals_dtype, device=device)
-            idx_buf = torch.empty((B, max_S, K), dtype=idx_dtype, device=device)
-            self._teacher_mb_vals_buffers.append(vals_buf)
-            self._teacher_mb_vals_ipcs.append(get_handle_from_tensor(vals_buf))
-            self._teacher_mb_idx_buffers.append(idx_buf)
-            self._teacher_mb_idx_ipcs.append(get_handle_from_tensor(idx_buf))
+    @wrap_with_nvtx_name("dtensor_distillation_worker/teacher_forward")
+    def teacher_forward(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict:
+        """Run teacher forward pass and store top-k logprobs in GPU IPC buffers.
 
-    def _ensure_teacher_mb_logits_buffer(self, buf_idx, B, V, dtype, device):
-        """Lazily grow the per-microbatch IPC buffer pool for full-vocab teacher logits."""
-        if not hasattr(self, '_teacher_mb_logits_buffers'):
-            self._teacher_mb_logits_buffers = []
-            self._teacher_mb_logits_ipcs = []
-        max_S = self.cfg.get("max_total_sequence_length", 1)
-        while len(self._teacher_mb_logits_buffers) <= buf_idx:
-            buf = torch.empty((B, max_S, V), dtype=dtype, device=device)
-            self._teacher_mb_logits_buffers.append(buf)
-            self._teacher_mb_logits_ipcs.append(get_handle_from_tensor(buf))
+        Returns a dict with IPC handles and shape metadata (no tensor data
+        goes through Ray). The student's train() method uses
+        rebuild_cuda_tensor_from_ipc to access the same GPU memory directly.
+        """
+        assert self.teacher_model is not None, "teacher_config must be provided to use teacher_forward"
+
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        sequence_dim = 1
+        self.teacher_model.eval()
+
+        with torch.no_grad():
+            data.to("cuda")
+
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+            else:
+                mb_iterator = data.make_microbatch_iterator(topk_batch_size)
+
+            all_vals = []
+            all_idx = []
+
+            for batch_idx, lp_batch in enumerate(mb_iterator):
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+                batch_size, seq_len = input_ids.shape
+
+                attention_mask = torch.zeros(
+                    (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                )
+                for i, length in enumerate(input_lengths):
+                    attention_mask[i, :length] = 1
+
+                position_ids = torch.arange(
+                    seq_len, device=input_ids.device
+                ).repeat(batch_size, 1)
+
+                attention_mask_all_ones = torch.ones(
+                    (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                )
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    outputs = self.teacher_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask_all_ones,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+
+                if not hasattr(outputs, "logits"):
+                    logits = self.teacher_model.lm_head(outputs.last_hidden_state)
+                else:
+                    logits = outputs.logits
+                del outputs
+
+                if isinstance(logits, DTensor):
+                    local_logits = logits.to_local()
+                    tp_group = self.tp_mesh.get_group()
+                    tp_rank = torch.distributed.get_rank(tp_group)
+                    V_local = int(local_logits.shape[-1])
+                    vocab_start_index = tp_rank * V_local
+                    vocab_end_index = (tp_rank + 1) * V_local
+
+                    local_logits = local_logits.to(torch.float32)
+                    local_log_probs = _compute_distributed_log_softmax(local_logits, group=tp_group)
+                    del logits, local_logits
+
+                    if isinstance(local_log_probs, DTensor):
+                        local_log_probs = local_log_probs.to_local()
+
+                    vals, idx = distributed_vocab_topk(
+                        local_log_probs,
+                        k=k,
+                        tp_group=tp_group,
+                        vocab_start_index=vocab_start_index,
+                        vocab_end_index=vocab_end_index,
+                    )
+                    del local_log_probs
+                else:
+                    full_logits = logits.to(torch.float32)
+                    vals, idx = torch.topk(full_logits, k=k, dim=-1)
+
+                all_vals.append(vals)
+                all_idx.append(idx)
+
+            # Concatenate all microbatch results
+            topk_logprobs = torch.cat(all_vals, dim=0) if len(all_vals) > 1 else all_vals[0]
+            topk_indices = torch.cat(all_idx, dim=0) if len(all_idx) > 1 else all_idx[0]
+
+            B, S, K = topk_logprobs.shape
+            target_dtype = topk_logprobs.dtype
+            target_device = topk_logprobs.device
+
+            if self._teacher_topk_vals_buffer is None:
+                max_S = self.cfg.get("max_total_sequence_length", S)
+                vals_buf_shape = (B, max_S, K)
+                self._teacher_topk_vals_buffer = torch.empty(
+                    vals_buf_shape, dtype=target_dtype, device=target_device
+                )
+                self._teacher_topk_vals_ipc = {
+                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_vals_buffer)
+                }
+                idx_buf_shape = (B, max_S, K)
+                self._teacher_topk_idx_buffer = torch.empty(
+                    idx_buf_shape, dtype=topk_indices.dtype, device=target_device
+                )
+                self._teacher_topk_idx_ipc = {
+                    torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_idx_buffer)
+                }
+                print(f" rank {torch.distributed.get_rank()} Allocated topk IPC buffers: "
+                      f"vals={vals_buf_shape} ({self._teacher_topk_vals_buffer.numel() * self._teacher_topk_vals_buffer.element_size() / 1e9:.4f} GB), "
+                      f"idx={idx_buf_shape} ({self._teacher_topk_idx_buffer.numel() * self._teacher_topk_idx_buffer.element_size() / 1e9:.4f} GB) "
+                      f"(actual data: [{B}, {S}, {K}])")
+
+            self._teacher_topk_vals_buffer[:B, :S, :K].copy_(topk_logprobs)
+            self._teacher_topk_idx_buffer[:B, :S, :K].copy_(topk_indices)
+            del topk_logprobs, topk_indices
+
+            rank = torch.distributed.get_rank()
+            self.teacher_logits = {
+                rank: self._teacher_topk_vals_ipc[rank],
+                'actual_shape': (B, S, K),
+                'topk_indices_ipc': self._teacher_topk_idx_ipc[rank],
+                'is_topk': True,
+            }
+            return self.teacher_logits
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

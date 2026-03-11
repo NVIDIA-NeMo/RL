@@ -3,7 +3,7 @@
 distillation:
   num_prompts_per_step: 768
   num_generations_per_prompt: 1
-  max_num_steps: 3000
+  max_num_steps: 10000
   max_num_epochs: 20
   val_period: 0 # Handled in eval block instead
   val_at_start: false
@@ -19,7 +19,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B-3000steps"
+  checkpoint_dir: "checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B-10000steps"
   metric_name: "train:loss"
   higher_is_better: false
   keep_top_k: 3
@@ -43,7 +43,7 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -67,7 +67,7 @@ policy:
         total_iters: 50
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: 2950
+        T_max: 9950
         eta_min: 0.0
     - milestones: [50]
 
@@ -83,7 +83,7 @@ policy:
       async_engine: false
       precision: "bfloat16"
       kv_cache_dtype: "auto"
-      tensor_parallel_size: 1
+      tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.6
@@ -118,7 +118,7 @@ teacher:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -149,7 +149,7 @@ teacher:
 
 data:
   dataset_name: "arrow_text"
-  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-0000[0-9]-of-02476.arrow"
+  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
   prompt_file: null
   max_input_seq_length: 4096
   shuffle: true
@@ -183,7 +183,7 @@ logger:
   monitor_gpus: true
   wandb:
     project: "nemo-off-policy-distillation-eval"
-    name: "distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-16node-3000steps"
+    name: "distill-arrow-llama1b-8b-bs768-lr5e5-cosine-topk8192-16node-10000steps"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
