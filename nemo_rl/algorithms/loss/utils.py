@@ -24,6 +24,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    from_parallel_logits_to_logprobs_packed_sequences,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
@@ -119,3 +120,88 @@ def prepare_loss_input(
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")
 
     return loss_input, data
+
+def _pack_input_ids(
+    input_ids: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+) -> torch.Tensor:
+    """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
+
+    Each sequence i is placed at cu_seqlens_q_padded[i] in the packed tensor,
+    with actual_len = cu_seqlens_q[i+1] - cu_seqlens_q[i] tokens copied.
+    """
+    batch_size = input_ids.shape[0]
+    total_packed_len = int(cu_seqlens_q_padded[-1].item())
+    packed = torch.zeros(
+        1, total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+    )
+    for i in range(batch_size):
+        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
+        packed_start = int(cu_seqlens_q_padded[i].item())
+        packed[0, packed_start : packed_start + actual_len] = input_ids[
+            i, :actual_len
+        ]
+    return packed
+
+
+def prepare_packed_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> dict[str, Any]:
+    """Prepare loss input from packed logits in a single fused pass.
+
+    Unlike prepare_loss_input which operates on a single (unpacked) sequence,
+    this function computes log probabilities from packed logits across all
+    sequences at once using from_parallel_logits_to_logprobs_packed_sequences.
+
+    Currently only supports LossInputType.LOGPROB.
+
+    Args:
+        logits: Packed logits from the model [1, T_packed // CP, V // TP].
+        data: Microbatch data (unpacked, [B, S]).
+        loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        vocab_parallel_rank: Vocab parallel rank.
+        vocab_parallel_group: Vocab parallel group.
+        context_parallel_group: Context parallel group.
+
+    Returns:
+        Loss input dict with key "next_token_logprobs".
+    """
+    if loss_fn.input_type != LossInputType.LOGPROB:
+        raise ValueError(
+            f"prepare_packed_loss_input only supports LossInputType.LOGPROB, "
+            f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
+            f"prepare_loss_input for other types."
+        )
+    assert vocab_parallel_group is not None, (
+        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    )
+    assert vocab_parallel_rank is not None, (
+        "vocab_parallel_rank must be provided with vocab_parallel_group."
+    )
+
+    packed_input_ids = _pack_input_ids(data["input_ids"], cu_seqlens_q, cu_seqlens_q_padded)
+    unpacked_seqlen = data["input_ids"].shape[1]
+
+    logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+        logits.to(torch.float32),
+        packed_input_ids,
+        cu_seqlens_q_padded,
+        unpacked_seqlen,
+        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+        group=vocab_parallel_group,
+        inference_only=False,
+        cp_group=context_parallel_group,
+    )
+
+    return {"next_token_logprobs": logprobs}

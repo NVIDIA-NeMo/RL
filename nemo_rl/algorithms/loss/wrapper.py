@@ -18,11 +18,8 @@ from typing import Any, Callable, Optional, TypeVar
 import torch
 import torch.distributed
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    from_parallel_logits_to_logprobs_packed_sequences,
-)
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -159,38 +156,29 @@ class SequencePackingFusionLossWrapper:
     """Fused sequence packing loss wrapper that processes all sequences in one forward pass.
 
     Unlike SequencePackingLossWrapper which iterates over sequences one at a time,
-    this wrapper computes log probabilities from packed logits in a single shot using
-    from_parallel_logits_to_logprobs_packed_sequences, then calls the loss function
-    with the pre-computed logprobs.
+    this wrapper calls prepare_fn once on the packed logits to compute log
+    probabilities in a single shot, then calls the loss function once with the
+    pre-computed result.
 
     This avoids per-sequence kernel launches and TP/CP communication overhead while
     producing numerically identical results.
 
-    Requirements:
-        - The wrapped loss_fn must have input_type == LossInputType.LOGPROB.
-        - vocab_parallel_group and vocab_parallel_rank must be provided (Megatron TP).
+    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
+    which currently only supports LossInputType.LOGPROB.
     """
 
     def __init__(
         self,
         loss_fn: LossFunction,
+        prepare_fn: Callable[..., Any],
         cu_seqlens_q: Tensor,
         cu_seqlens_q_padded: Optional[Tensor] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        assert loss_fn.input_type == LossInputType.LOGPROB, (
-            f"SequencePackingFusionLossWrapper only supports LossInputType.LOGPROB, "
-            f"got {loss_fn.input_type}. Use SequencePackingLossWrapper for other types."
-        )
-        assert vocab_parallel_group is not None, (
-            "SequencePackingFusionLossWrapper requires vocab_parallel_group (Megatron TP)."
-        )
-        assert vocab_parallel_rank is not None, (
-            "vocab_parallel_rank must be provided with vocab_parallel_group."
-        )
         self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
@@ -199,27 +187,6 @@ class SequencePackingFusionLossWrapper:
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
 
-    def _pack_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
-
-        Each sequence i is placed at cu_seqlens_q_padded[i] in the packed tensor,
-        with actual_len = cu_seqlens_q[i+1] - cu_seqlens_q[i] tokens copied.
-        """
-        batch_size = input_ids.shape[0]
-        total_packed_len = int(self.cu_seqlens_q_padded[-1].item())
-        packed = torch.zeros(
-            1, total_packed_len, dtype=input_ids.dtype, device=input_ids.device
-        )
-        for i in range(batch_size):
-            actual_len = int(
-                (self.cu_seqlens_q[i + 1] - self.cu_seqlens_q[i]).item()
-            )
-            packed_start = int(self.cu_seqlens_q_padded[i].item())
-            packed[0, packed_start : packed_start + actual_len] = input_ids[
-                i, :actual_len
-            ]
-        return packed
-
     def __call__(
         self,
         next_token_logits: Tensor,
@@ -227,34 +194,23 @@ class SequencePackingFusionLossWrapper:
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor | None,
     ) -> tuple[Tensor, dict[str, Any]]:
-        """Compute loss for all packed sequences in one forward pass.
-
-        1. Pack input_ids from [B, S] to [1, T_packed] to match packed logit layout.
-        2. Compute logprobs from packed logits via
-           from_parallel_logits_to_logprobs_packed_sequences -> [B, S-1].
-        3. Call the loss function with the pre-computed logprobs.
-        """
-        packed_input_ids = self._pack_input_ids(data["input_ids"])
-        unpacked_seqlen = data["input_ids"].shape[1]
-
-        logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-            next_token_logits.to(torch.float32),
-            packed_input_ids,
-            self.cu_seqlens_q_padded,
-            unpacked_seqlen,
-            vocab_start_index=self.vocab_parallel_rank * next_token_logits.shape[-1],
-            vocab_end_index=(self.vocab_parallel_rank + 1)
-            * next_token_logits.shape[-1],
-            group=self.vocab_parallel_group,
-            inference_only=False,
-            cp_group=self.context_parallel_group,
+        """Compute loss for all packed sequences in one forward pass."""
+        loss_input = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.loss_fn,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_q_padded=self.cu_seqlens_q_padded,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
         )
 
         return self.loss_fn(
             data=data,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            next_token_logprobs=logprobs,
+            **loss_input,
         )
 
 
