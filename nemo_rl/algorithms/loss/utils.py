@@ -139,9 +139,7 @@ def _pack_input_ids(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
     for i in range(batch_size):
-        actual_len = int(
-            (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-        ) // cp_size
+        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()) // cp_size
         packed_start = int(cu_seqlens_q_padded[i].item()) // cp_size
         packed[packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
     return packed.unsqueeze(0)
