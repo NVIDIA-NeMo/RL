@@ -24,6 +24,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
@@ -125,22 +126,25 @@ def _pack_input_ids(
     input_ids: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_q_padded: torch.Tensor,
+    cp_size: int = 1,
 ) -> torch.Tensor:
     """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
 
-    Each sequence i is placed at cu_seqlens_q_padded[i] in the packed tensor,
-    with actual_len = cu_seqlens_q[i+1] - cu_seqlens_q[i] tokens copied.
+    When cp_size > 1, input_ids is [B, S // cp_size] (already CP-sharded) and
+    offsets are divided by cp_size to produce [1, T_packed // cp_size].
     """
     batch_size = input_ids.shape[0]
-    total_packed_len = int(cu_seqlens_q_padded[-1].item())
+    total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
     packed = torch.zeros(
-        1, total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
     for i in range(batch_size):
-        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
-        packed_start = int(cu_seqlens_q_padded[i].item())
-        packed[0, packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
-    return packed
+        actual_len = int(
+            (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
+        ) // cp_size
+        packed_start = int(cu_seqlens_q_padded[i].item()) // cp_size
+        packed[packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
+    return packed.unsqueeze(0)
 
 
 def prepare_packed_loss_input(
@@ -187,14 +191,28 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
-    packed_input_ids = _pack_input_ids(
-        data["input_ids"], cu_seqlens_q, cu_seqlens_q_padded
+    input_ids = data["input_ids"]
+    unpacked_seqlen = input_ids.shape[1]
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
     )
-    unpacked_seqlen = data["input_ids"].shape[1]
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
+    )
+
+    rolled_ids = input_ids.roll(-1, dims=1)
+    rolled_ids = _get_tokens_on_this_cp_rank(rolled_ids, cp_rank, cp_size, seq_dim=1)
+    packed_rolled_targets = _pack_input_ids(
+        rolled_ids, cu_seqlens_q, cu_seqlens_q_padded, cp_size
+    )
 
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         logits.to(torch.float32),
-        packed_input_ids,
+        packed_rolled_targets,
         cu_seqlens_q_padded,
         unpacked_seqlen,
         vocab_start_index=vocab_parallel_rank * logits.shape[-1],
@@ -202,6 +220,7 @@ def prepare_packed_loss_input(
         group=vocab_parallel_group,
         inference_only=False,
         cp_group=context_parallel_group,
+        target_is_pre_rolled=True,
     )
 
     return {"next_token_logprobs": logprobs}
