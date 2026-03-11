@@ -589,6 +589,19 @@ Results from `code_snapshots_v5_nightly/` run on 3/10/2026. 25 PASS, 3 METRIC FA
 
 Errors are categorized below. Each nightly error is prefixed "N-Err" to distinguish from unit test errors above.
 
+### Reproducing nightly test failures
+
+After applying a fix, rerun with `FROM_SCRATCH=true` to delete old snapshots (resyncs code) and rerun:
+```bash
+FROM_SCRATCH=true bash run-nightly.sh tests/test_suites/llm/script1.sh tests/test_suites/llm/script2.sh
+```
+This will show which snapshots will be deleted and prompt for confirmation before proceeding.
+
+**Check results:**
+```bash
+summarize_code_snapshot.sh code_snapshots_v5_nightly/
+```
+
 ---
 
 ## N-Err 1. NemotronH `backbone` attribute missing (5 tests)
