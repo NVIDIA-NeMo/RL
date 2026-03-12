@@ -35,7 +35,7 @@ A new research project needs to include at least:
 
 The following are optional:
 - Unit tests and test suites (adding these is encouraged).
-- Dependency specifications (required if the project’s dependencies differ from the core `nemo_rl` package).
+- Dependency specifications (required if the project’s "driver" dependencies differ from the core `nemo_rl` package).
 
 ## Expectations for Research Project Authors
 
