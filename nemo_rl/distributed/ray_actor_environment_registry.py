@@ -54,8 +54,8 @@ def get_actor_python_env(actor_class_fqn: str) -> str:
         return ACTOR_ENVIRONMENT_REGISTRY[actor_class_fqn]
     else:
         raise ValueError(
-            f"No actor environment registered for {actor_class_fqn}"
-            f"You're attempting to create an actor ({actor_class_fqn})"
+            f"No actor environment registered for {actor_class_fqn}. "
+            f"You're attempting to create an actor ({actor_class_fqn}) "
             "without specifying a python environment for it. Please either"
             "specify a python environment in the registry "
             "(nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY) "

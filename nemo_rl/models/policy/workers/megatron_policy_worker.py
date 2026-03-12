@@ -99,10 +99,9 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
-class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -1541,3 +1540,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
+    pass

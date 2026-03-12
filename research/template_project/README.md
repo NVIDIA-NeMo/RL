@@ -13,11 +13,13 @@ This is a template project for research experiments with NeMo RL.
 
 The `single_update.py` script demonstrates a minimal train-and-generate loop:
 1. Sets up a Ray compute cluster
-2. Initializes vLLM generation and an LM policy
-3. Trains the policy on a small batch using NLL loss
-4. Refits the generation engine with the updated policy weights
-5. Generates outputs with the new policy
-6. Repeats the loop (10 iterations by default)
+2. Initializes the vLLM generation
+3. Initializes the LM policy with an extension worker class that supports custom functions
+4. Executes custom functions provided by the extension worker class
+5. Repeats the loop (10 iterations by default)
+    1. Trains the policy on a small batch using NLL loss
+    2. Refits the generation engine with the updated policy weights
+    3. Generates outputs with the new policy
 
 This shows the basic cycle of training a language model and using it for generation.
 
@@ -27,6 +29,22 @@ To run the `single_update.py` script:
 
 ```bash
 uv run single_update.py
+```
+
+## Extension Worker Class
+
+To add custom behavior to the policy worker, you can use an extension worker class that subclasses the default worker implementation. See the example in `template_project/worker_extension.py`.
+
+After defining your extension class, you need to register it in the actor environment registry so that the runtime can resolve the correct Python environment for the worker. See the example in `single_update.py`.
+
+```python
+from nemo_rl.distributed.ray_actor_environment_registry import ACTOR_ENVIRONMENT_REGISTRY
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+# register the worker extension class to the actor environment registry
+ACTOR_ENVIRONMENT_REGISTRY[
+    "template_project.worker_extension.DTensorPolicyWorkerV2Extension"
+] = PY_EXECUTABLES.AUTOMODEL
 ```
 
 ## Testing
