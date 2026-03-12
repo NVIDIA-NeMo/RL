@@ -4,7 +4,7 @@ source $SCRIPT_DIR/common.env
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
 # allow user to pass an existing HF checkpoint path based on instruction in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md
-export MODEL_NAME=${NRL_DEEPSEEK_V3_HF_CKPT:-"unsloth/DeepSeek-V3-0324-BF16"}
+export MODEL_NAME=${NRL_DEEPSEEK_V3_BF16_CKPT:-"unsloth/DeepSeek-V3-0324-BF16"}
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
