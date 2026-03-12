@@ -55,7 +55,10 @@ IMAGE_SOURCES = [
         "dataset": "R2E-Gym/R2E-Gym-Subset",
         "split": "train",
         "prefix": "r2egym",
-        "images": lambda ds: [row["docker_image"] for row in ds],
+        "images": lambda ds: [
+            (row["docker_image"], row["docker_image"].split("/")[-1].replace(":", "_"))
+            for row in ds
+        ],
     },
     {
         "name": "SWE-Gym",
@@ -63,7 +66,11 @@ IMAGE_SOURCES = [
         "split": "train",
         "prefix": "swegym",
         "images": lambda ds: [
-            f"xingyaoww/sweb.eval.x86_64.{row['instance_id'].replace('__', '_s_')}" for row in ds
+            (
+                f"xingyaoww/sweb.eval.x86_64.{row['instance_id'].replace('__', '_s_')}",
+                f"sweb.eval.x86_64.{row['instance_id'].replace('__', '_s_')}",
+            )
+            for row in ds
         ],
     },
     {
@@ -72,7 +79,11 @@ IMAGE_SOURCES = [
         "split": "test",
         "prefix": "swebench",
         "images": lambda ds: [
-            f"swebench/sweb.eval.x86_64.{row['instance_id'].replace('__', '_1776_')}" for row in ds
+            (
+                f"swebench/sweb.eval.x86_64.{row['instance_id'].replace('__', '_1776_')}",
+                f"sweb.eval.x86_64.{row['instance_id'].replace('__', '_1776_')}",
+            )
+            for row in ds
         ],
     },
 ]
@@ -81,11 +92,12 @@ IMAGE_SOURCES = [
 async def pull_image(
     semaphore: asyncio.Semaphore,
     image_name: str,
+    sif_name: str,
     sif_dir: str,
     prefix: str,
 ):
     async with semaphore:
-        local_image_path = os.path.join(sif_dir, f"{prefix}_{image_name.split('/')[-1]}.sif")
+        local_image_path = os.path.join(sif_dir, f"{prefix}_{sif_name}.sif")
         if os.path.exists(local_image_path):
             print(f"Already exists: {local_image_path}", flush=True)
             return
@@ -122,10 +134,13 @@ async def main(sif_dir: str, concurrency: int) -> None:
     for source in IMAGE_SOURCES:
         print(f"\n=== {source['name']} ({source['dataset']}) ===", flush=True)
         ds = load_dataset(source["dataset"], "default", split=source["split"])
-        image_names = source["images"](ds)
-        tasks = [pull_image(semaphore, name, sif_dir, source["prefix"]) for name in image_names]
+        image_pairs = source["images"](ds)
+        tasks = [
+            pull_image(semaphore, img, sif_stem, sif_dir, source["prefix"])
+            for img, sif_stem in image_pairs
+        ]
         await asyncio.gather(*tasks)
-        print(f"Done: {len(image_names)} images for {source['name']}", flush=True)
+        print(f"Done: {len(image_pairs)} images for {source['name']}", flush=True)
 
 
 if __name__ == "__main__":
