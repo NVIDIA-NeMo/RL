@@ -38,7 +38,14 @@ from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
+from nemo_rl.distributed.virtual_cluster import (
+    PY_EXECUTABLES,
+    RayVirtualCluster,
+    init_ray,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
@@ -47,6 +54,11 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+
+# register the worker extension class to the actor environment registry
+ACTOR_ENVIRONMENT_REGISTRY[
+    "template_project.worker_extension.DTensorPolicyWorkerV2Extension"
+] = PY_EXECUTABLES.AUTOMODEL
 
 
 def main(config: MasterConfig) -> None:
