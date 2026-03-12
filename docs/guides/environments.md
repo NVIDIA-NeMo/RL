@@ -87,7 +87,7 @@ if multi_rewards is not None:
     for i in range(num_reward_components):
         current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
 ```
-
+For instance, when running `examples/configs/gdpo_math_1B.yaml`, `reward1` maps to `correctness_reward`, `reward2` to `int_reward`, and `reward3` to `format_reward`. More details can be found in `HFMultiRewardVerifyWorker`. Users can also implement their own environments that support multi-reward GDPO training by following this example.
 
 ## Code Environment
 
