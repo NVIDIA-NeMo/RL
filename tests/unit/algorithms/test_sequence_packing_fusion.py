@@ -26,6 +26,7 @@ import functools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
     SequencePackingFusionLossWrapper,
@@ -279,6 +280,101 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
     )
 
 
+def _run_compare_sequence_packing_wrappers_with_sampling(
+    rank, world_size, cp_size, tp_size
+):
+    """Compare fused vs unfused wrappers with sampling params enabled."""
+    _my_cp_rank, my_tp_rank, cp_group, tp_group = _setup_2d_process_groups(
+        rank, world_size, cp_size, tp_size
+    )
+    tc = _build_test_case(cp_size, tp_size, my_tp_rank, cp_group)
+    base_loss_fn = ClippedPGLossFn(tc["loss_cfg"])
+    data_dict = tc["data_dict"]
+
+    sampling_params = TrainingSamplingParams(top_k=8, top_p=0.9, temperature=1.0)
+    prepare_loss_input_wrapped = functools.partial(
+        prepare_loss_input, sampling_params=sampling_params
+    )
+    prepare_packed_loss_input_wrapped = functools.partial(
+        prepare_packed_loss_input, sampling_params=sampling_params
+    )
+
+    baseline_wrapper = SequencePackingLossWrapper(
+        loss_fn=base_loss_fn,
+        prepare_fn=prepare_loss_input_wrapped,
+        cu_seqlens_q=tc["cu_seqlens"],
+        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        vocab_parallel_rank=my_tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+    )
+
+    candidate_wrapper = SequencePackingFusionLossWrapper(
+        loss_fn=base_loss_fn,
+        prepare_fn=prepare_packed_loss_input_wrapped,
+        cu_seqlens_q=tc["cu_seqlens"],
+        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        vocab_parallel_rank=my_tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+    )
+
+    # Baseline run
+    baseline_logits, baseline_packed_logits = tc["make_logits_and_packed_logits"]()
+    baseline_loss, baseline_metrics = baseline_wrapper(
+        baseline_packed_logits,
+        data_dict,
+        tc["global_valid_seqs"],
+        tc["global_valid_toks"],
+    )
+    (baseline_loss / cp_size).backward()
+    baseline_grad = baseline_logits.grad.clone()
+
+    # Candidate run (fresh logits, identical values)
+    candidate_logits, candidate_packed_logits = tc["make_logits_and_packed_logits"]()
+    candidate_loss, candidate_metrics = candidate_wrapper(
+        candidate_packed_logits,
+        data_dict,
+        tc["global_valid_seqs"],
+        tc["global_valid_toks"],
+    )
+    (candidate_loss / cp_size).backward()
+    candidate_grad = candidate_logits.grad.clone()
+
+    # Sanity: gradients must be non-None and non-zero
+    assert baseline_grad.abs().sum() > 0, f"baseline grad is all zeros on rank {rank}"
+    assert candidate_grad.abs().sum() > 0, f"candidate grad is all zeros on rank {rank}"
+
+    # Forward: loss values must match
+    torch.testing.assert_close(
+        baseline_loss,
+        candidate_loss,
+        atol=1e-5,
+        rtol=1e-5,
+        msg=f"Loss mismatch with sampling params on rank {rank}",
+    )
+
+    # Metrics parity under sampling params
+    assert set(baseline_metrics.keys()) == set(candidate_metrics.keys())
+    for k in baseline_metrics:
+        torch.testing.assert_close(
+            torch.as_tensor(baseline_metrics[k], device="cuda"),
+            torch.as_tensor(candidate_metrics[k], device="cuda"),
+            atol=1e-5,
+            rtol=1e-5,
+            msg=f"Metric mismatch for key={k} on rank {rank}",
+        )
+
+    # Backward: gradients w.r.t. logits must match
+    torch.testing.assert_close(
+        baseline_grad,
+        candidate_grad,
+        atol=1e-5,
+        rtol=1e-5,
+        msg=f"Gradient mismatch with sampling params on rank {rank}",
+    )
+
+
 @pytest.mark.parametrize(
     "cp_tp",
     [
@@ -304,6 +400,31 @@ def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
 
     test_fn = functools.partial(
         _run_compare_sequence_packing_wrappers,
+        cp_size=cp_size,
+        tp_size=tp_size,
+    )
+    distributed_test_runner(test_fn, world_size=world_size)
+
+
+@pytest.mark.parametrize(
+    "cp_tp",
+    [
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+    ],
+    ids=lambda cp_tp: f"sampling_cp{cp_tp[0]}_tp{cp_tp[1]}",
+)
+def test_sequence_packing_fusion_vs_baseline_with_sampling_params(
+    distributed_test_runner, cp_tp
+):
+    """Compare fused vs unfused wrappers with top-k/top-p sampling params."""
+    cp_size, tp_size = cp_tp
+    world_size = cp_size * tp_size
+
+    test_fn = functools.partial(
+        _run_compare_sequence_packing_wrappers_with_sampling,
         cp_size=cp_size,
         tp_size=tp_size,
     )

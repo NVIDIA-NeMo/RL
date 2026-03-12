@@ -127,12 +127,26 @@ def _pack_input_ids(
     input_ids: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_q_padded: torch.Tensor,
+    cp_rank: int = 0,
     cp_size: int = 1,
+    roll_shift: int = 0,
 ) -> torch.Tensor:
-    """Pack input_ids from [B, S] to [1, T_packed] using sequence boundaries.
+    """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
 
-    When cp_size > 1, input_ids is [B, S // cp_size] (already CP-sharded) and
-    offsets are divided by cp_size to produce [1, T_packed // cp_size].
+    Each sequence is individually padded to its padded length (from
+    cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
+    length before being placed into the packed output.  This matches how
+    Megatron packs and CP-shards sequences in _pack_sequences_for_megatron.
+
+    Args:
+        input_ids: Unpacked input IDs [B, S].
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        cp_rank: Context parallelism rank.
+        cp_size: Context parallelism size.
+        roll_shift: If non-zero, roll each padded sequence by this amount
+            before CP-sharding.  Use -1 to build shifted targets for
+            next-token prediction.
     """
     batch_size = input_ids.shape[0]
     total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
@@ -140,9 +154,17 @@ def _pack_input_ids(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
     for i in range(batch_size):
-        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()) // cp_size
-        packed_start = int(cu_seqlens_q_padded[i].item()) // cp_size
-        packed[packed_start : packed_start + actual_len] = input_ids[i, :actual_len]
+        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
+        padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
+        packed_start = int(cu_seqlens_q_padded[i].item())
+        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq[:actual_len] = input_ids[i, :actual_len]
+        if roll_shift != 0:
+            seq = seq.roll(shifts=roll_shift, dims=0)
+        sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+            sharded
+        )
     return packed.unsqueeze(0)
 
 
@@ -155,6 +177,7 @@ def prepare_packed_loss_input(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -173,6 +196,7 @@ def prepare_packed_loss_input(
         vocab_parallel_rank: Vocab parallel rank.
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
+        sampling_params: Sampling parameters.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -203,10 +227,13 @@ def prepare_packed_loss_input(
         else torch.distributed.get_rank(context_parallel_group)
     )
 
-    rolled_ids = input_ids.roll(-1, dims=1)
-    rolled_ids = _get_tokens_on_this_cp_rank(rolled_ids, cp_rank, cp_size, seq_dim=1)
     packed_rolled_targets = _pack_input_ids(
-        rolled_ids, cu_seqlens_q, cu_seqlens_q_padded, cp_size
+        input_ids,
+        cu_seqlens_q,
+        cu_seqlens_q_padded,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        roll_shift=-1,
     )
 
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
@@ -219,7 +246,34 @@ def prepare_packed_loss_input(
         group=vocab_parallel_group,
         inference_only=False,
         cp_group=context_parallel_group,
+        sampling_params=sampling_params,
         target_is_pre_rolled=True,
     )
+
+    # Match prepare_loss_input behavior for top-k/top-p filtered training:
+    # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
+    if need_top_k_or_top_p_filtering(sampling_params):
+        mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+
+        if (
+            hasattr(loss_fn, "reference_policy_kl_penalty")
+            and loss_fn.reference_policy_kl_penalty != 0
+        ):
+            data["curr_logprobs_unfiltered"] = (
+                from_parallel_logits_to_logprobs_packed_sequences(
+                    logits.to(torch.float32),
+                    packed_rolled_targets,
+                    cu_seqlens_q_padded,
+                    unpacked_seqlen,
+                    vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                    vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                    group=vocab_parallel_group,
+                    inference_only=False,
+                    cp_group=context_parallel_group,
+                    sampling_params=None,
+                    target_is_pre_rolled=True,
+                )
+            )
 
     return {"next_token_logprobs": logprobs}, data

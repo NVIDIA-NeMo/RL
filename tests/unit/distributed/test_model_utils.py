@@ -348,22 +348,14 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     )
 
     # --- Path 2: target_is_pre_rolled=True ---
-    # Prepare pre-rolled targets per-sequence (matching the internal logic of
-    # the target_is_pre_rolled=False path): each packed sequence is rolled and
-    # CP-sharded independently from its own padded_seq_len.
-    pre_rolled_packed = torch.zeros(
-        total_padded // cp_size, dtype=input_ids.dtype, device="cuda"
+    packed_target_pre_rolled = _pack_input_ids(
+        input_ids,
+        cu_seqlens,
+        cu_seqlens_padded,
+        cp_rank=my_cp_rank_val,
+        cp_size=cp_size,
+        roll_shift=-1,
     )
-    for i in range(batch_size):
-        start = int(cu_seqlens_padded[i].item())
-        end = int(cu_seqlens_padded[i + 1].item())
-        seq_tokens = packed_target_raw[0, start:end]
-        rolled = seq_tokens.roll(shifts=-1, dims=0)
-        sharded = _get_tokens_on_this_cp_rank(
-            rolled, my_cp_rank_val, cp_size, seq_dim=0
-        )
-        pre_rolled_packed[start // cp_size : end // cp_size] = sharded
-    packed_target_pre_rolled = pre_rolled_packed.unsqueeze(0)
 
     logprobs_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
