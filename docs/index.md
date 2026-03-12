@@ -190,6 +190,7 @@ about/tips-and-tricks
 
 local-workstation.md
 cluster.md
+guides/ray-interactive.md
 
 ```
 
