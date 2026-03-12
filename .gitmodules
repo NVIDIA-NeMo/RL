@@ -15,6 +15,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = git@github.com:abubakaria56/Gym.git
-	branch = feature/nvidia-IF-bench-validators-integrations
+	url = git@github.com:NVIDIA-NeMo/Gym.git
+	branch = mfathi/turing_envs
 	shallow = true

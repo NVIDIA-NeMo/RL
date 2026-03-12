@@ -28,7 +28,16 @@ python3 experiments/turing_vif_multichallenge/data_preprocessing_multichallenge.
 # Verify: expect 1068 advanced + 1050 vanilla = 2118 total
 wc -l 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/multichallenge_*.jsonl
 
-# 4. Launch training
+# 4. Filter data to fit within max_total_sequence_length (8192 tokens)
+#    Uses the actual model tokenizer + chat template for accurate measurement.
+#    Samples exceeding the limit would cause vLLM to reject the request.
+uv run experiments/filter_data_by_length.py \
+    --tokenizer /lustre/fsw/portfolios/llmservice/users/mfathi/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+    --max-tokens 8192 \
+    --inputs 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/multichallenge_vanilla.jsonl \
+    --suffix _8k
+
+# 5. Launch training
 bash experiments/turing_vif_multichallenge/launch_turing_vif_multichallenge_training.sh
 ```
 
@@ -71,6 +80,36 @@ python3 experiments/turing_vif_multichallenge/data_preprocessing_multichallenge.
 The `--data-dir` should contain subdirectories named after each split (e.g., `advanced/`, `vanilla/`),
 each with `*.json` task files.
 
+### Length Filtering
+
+Some multichallenge samples have multi-turn conversation inputs that exceed `max_total_sequence_length`.
+vLLM rejects requests that exceed `max_model_len` with a 400 error, and the `simple_agent` raises
+on model errors, crashing the training run.
+
+Filter the data to keep only samples that fit within the token budget:
+
+```bash
+uv run experiments/filter_data_by_length.py \
+    --tokenizer /path/to/policy-model \
+    --max-tokens 8192 \
+    --inputs 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/multichallenge_vanilla.jsonl \
+    --suffix _8k
+```
+
+This produces `multichallenge_vanilla_8k.jsonl` alongside the original file. The script uses the
+actual model tokenizer with `apply_chat_template` for accurate token counting. With the default
+Nemotron-3-Nano-30B tokenizer at 8192 tokens, ~84% of vanilla samples are kept (165 filtered).
+
+To use a different token budget (e.g., 16384 for longer sequences):
+
+```bash
+uv run experiments/filter_data_by_length.py \
+    --tokenizer /path/to/policy-model \
+    --max-tokens 16384 \
+    --inputs .../multichallenge_vanilla.jsonl \
+    --suffix _16k
+```
+
 ## Configuration
 
 The launch script auto-detects the cluster (LAX vs DFW) and sets container/model paths accordingly.
@@ -80,8 +119,8 @@ Override any default via environment variables:
 |---|---|---|
 | `NUM_NODES` | 16 | Policy nodes (colocated training + vLLM inference) |
 | `POLICY_MODEL` | Nemotron-3-Nano-30B-A3B-BF16 | HF model path for the policy |
-| `TRAIN_DATA` | `multichallenge_vanilla.jsonl` | Training data JSONL |
-| `VAL_DATA` | `multichallenge_vanilla.jsonl` | Validation data JSONL |
+| `TRAIN_DATA` | `multichallenge_vanilla_8k.jsonl` | Training data JSONL (filtered to 8K tokens) |
+| `VAL_DATA` | `multichallenge_vanilla_8k.jsonl` | Validation data JSONL (filtered to 8K tokens) |
 | `CONTAINER_IMAGE` | auto-detected per cluster | Squashfs container image |
 | `SLURM_ACCOUNT` | `llmservice_modelalignment_ppo` | SLURM billing account |
 | `SLURM_PARTITION` | `batch` | SLURM partition |

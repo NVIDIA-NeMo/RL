@@ -1,0 +1,199 @@
+# ============================================================================
+# Dummy GRPO Training with Turing VIF Environment (1-node, small model)
+# ============================================================================
+# Lightweight version of the multichallenge experiment for fast iteration.
+# Uses Qwen2.5-1.5B for both policy and judge on a single node.
+#
+# Architecture:
+#   - 1 node (8 GPUs), DTensor TP=1, DP=8
+#   - Colocated vLLM for generation
+#   - Judge: Qwen2.5-1.5B (shared on the same node, TP=1)
+#
+# Usage:
+#   See launch_dummy_turing_vif_training.sh for launch instructions.
+# ============================================================================
+
+defaults: ../../examples/configs/grpo_math_1B.yaml
+
+# ============================================================================
+# GRPO Hyperparameters
+# ============================================================================
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_epochs: 1000
+  max_num_steps: 1000000
+  max_rollout_turns: 1
+  normalize_rewards: false
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: null
+  seed: 42
+
+# ============================================================================
+# Loss Function
+# ============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+
+# ============================================================================
+# Policy Model Configuration — Qwen2.5-1.5B with DTensor
+# ============================================================================
+policy:
+  model_name: Qwen/Qwen2.5-1.5B
+  tokenizer:
+    name: ${policy.model_name}
+  precision: bfloat16
+  max_total_sequence_length: 32768
+  train_global_batch_size: 32
+  train_micro_batch_size: 4
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  logprob_chunk_size: null
+  max_grad_norm: 1.0
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    lora_cfg:
+      enabled: false
+
+  megatron_cfg:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+
+  generation:
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      skip_tokenizer_init: false
+
+    vllm_kwargs: {}
+
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+
+# ============================================================================
+# Cluster Configuration — Single node
+# ============================================================================
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+  cpus_per_node: 112
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/multichallenge_vanilla.jsonl
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/multichallenge_vanilla.jsonl
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+
+# ============================================================================
+# Environment Configuration (NeMo-Gym) — Turing VIF
+# ============================================================================
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    num_gpu_nodes: 1
+
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/turing_vif/configs/turing_vif.yaml
+
+    turing_vif:
+      resources_servers:
+        turing_vif:
+          judge_server_name: judge_model
+          judge_base_url: null
+          judge_api_key: dummy_key
+          judge_model: Qwen/Qwen2.5-1.5B
+
+    turing_vif_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+
+    judge_model:
+      responses_api_models:
+        local_vllm_model:
+          entrypoint: app.py
+          model: Qwen/Qwen2.5-1.5B
+          return_token_id_information: false
+          uses_reasoning_parser: false
+          vllm_serve_kwargs:
+            tensor_parallel_size: 1
+            pipeline_parallel_size: 1
+            data_parallel_size: 1
+            gpu_memory_utilization: 0.85
+            max_model_len: 32768
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: "strict"
+
+# ============================================================================
+# Logger Configuration
+# ============================================================================
+logger:
+  log_dir: results/dummy_turing_vif
+  num_val_samples_to_print: 3
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: nemo-rl-dummy-turing-vif
+    name: null
+
+# ============================================================================
+# Checkpointing Configuration
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/dummy_turing_vif/checkpoints
+  save_period: 10
+  keep_top_k: 3
+  checkpoint_must_save_by: null

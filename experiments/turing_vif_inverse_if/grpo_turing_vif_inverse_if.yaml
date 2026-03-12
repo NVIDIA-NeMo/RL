@@ -25,7 +25,7 @@ defaults: ../../examples/configs/grpo_math_1B.yaml
 # GRPO Hyperparameters - Matching reference script
 # ============================================================================
 grpo:
-  num_prompts_per_step: 64
+  num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_num_epochs: 1000
   max_num_steps: 1000000
@@ -61,7 +61,7 @@ policy:
     name: ${policy.model_name}
   precision: bfloat16
   max_total_sequence_length: 8192
-  train_global_batch_size: 1024
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 4
   logprob_chunk_size: null
@@ -194,9 +194,17 @@ cluster:
 # Data Configuration
 # ============================================================================
 data:
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl
   max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
 
 # ============================================================================
 # Environment Configuration (NeMo-Gym) — Turing VIF
@@ -210,11 +218,11 @@ env:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/turing_vif/configs/turing_vif.yaml
 
-    # Wire turing_vif to use the dedicated judge model via direct URL
     turing_vif:
       resources_servers:
         turing_vif:
-          judge_base_url: http://127.0.0.1:8000/v1
+          judge_server_name: judge_model
+          judge_base_url: null
           judge_api_key: dummy_key
           judge_model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
 
@@ -223,26 +231,27 @@ env:
         simple_agent:
           max_steps: 1
 
-    # Dedicated Judge Model Server — spun up on num_gpu_nodes
     judge_model:
       responses_api_models:
-        vllm_model:
+        local_vllm_model:
           entrypoint: app.py
-          base_url: http://127.0.0.1:8000/v1
-          api_key: dummy_key
           model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
           return_token_id_information: false
           uses_reasoning_parser: false
-          spinup_server: true
-          router_dp_size: 4
-          server_args:
+          vllm_serve_kwargs:
             tensor_parallel_size: 8
+            pipeline_parallel_size: 1
+            data_parallel_size: 4
             gpu_memory_utilization: 0.9
-            max_model_len: 65536
+            max_model_len: 32768
+            max_num_seqs: 256
+            enforce_eager: true
             enable_expert_parallel: true
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 112
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: "strict"
 
 # ============================================================================
 # Logger Configuration

@@ -98,8 +98,8 @@ CONFIG_FILE="${CONFIG_FILE:-experiments/turing_vif_inverse_if/grpo_turing_vif_in
 POLICY_MODEL="${POLICY_MODEL:-/lustre/fsw/portfolios/llmservice/users/mfathi/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 
 # Data paths (defaults to preprocessed Inverse IF data)
-TRAIN_DATA="${TRAIN_DATA:-3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl}"
-VAL_DATA="${VAL_DATA:-3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if.jsonl}"
+TRAIN_DATA="${TRAIN_DATA:-3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl}"
+VAL_DATA="${VAL_DATA:-3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl}"
 
 # ============================================================================
 # LLM JUDGE CONFIGURATION
@@ -155,7 +155,9 @@ JUDGE_TP="${JUDGE_TP:-8}"                    # TP=8 for 235B (full node)
 JUDGE_ROUTER_DP_SIZE="${JUDGE_ROUTER_DP_SIZE:-4}"  # 4 replicas (matches reference: GENRM_ROUTER_DP_SIZE=4)
 JUDGE_NUM_NODES="${JUDGE_NUM_NODES:-4}"      # 4 nodes (32 GPUs) for 235B (matches reference: NUM_GENRM_NODES=4)
 JUDGE_GPU_UTIL="${JUDGE_GPU_UTIL:-0.9}"      # Higher util with FP8
-JUDGE_MAX_LEN="${JUDGE_MAX_LEN:-65536}"      # 64K context for long evaluations
+JUDGE_MAX_LEN="${JUDGE_MAX_LEN:-32768}"      # 32K context for evaluations
+JUDGE_MAX_NUM_SEQS="${JUDGE_MAX_NUM_SEQS:-256}"  # Limit concurrent seqs to avoid OOM during sampler warmup
+JUDGE_ENFORCE_EAGER="${JUDGE_ENFORCE_EAGER:-true}"  # Disable CUDA graphs to save ~3 GiB for forward pass activations
 JUDGE_ENABLE_EP="${JUDGE_ENABLE_EP:-true}"   # Expert parallelism for MoE
 JUDGE_MULTITHREAD_LOAD="${JUDGE_MULTITHREAD_LOAD:-true}"  # Fast model loading
 
@@ -266,34 +268,35 @@ if [ "$USE_SEPARATE_JUDGE" = "true" ]; then
     # Calculate total nodes (policy + judge)
     TOTAL_NODES=$((NUM_NODES + JUDGE_NUM_NODES))
     
-    # Base judge arguments
+    # Base judge arguments (local_vllm_model spins up its own vLLM instance)
     JUDGE_ARGS="++env.nemo_gym.num_gpu_nodes=${JUDGE_NUM_NODES} \\
-    ++env.nemo_gym.turing_vif.resources_servers.turing_vif.judge_base_url=http://127.0.0.1:8000/v1 \\
+    ++env.nemo_gym.turing_vif.resources_servers.turing_vif.judge_server_name=judge_model \\
     ++env.nemo_gym.turing_vif.resources_servers.turing_vif.judge_api_key=dummy_key \\
     ++env.nemo_gym.turing_vif.resources_servers.turing_vif.judge_model=${JUDGE_MODEL} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.entrypoint=app.py \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.base_url=http://127.0.0.1:8000/v1 \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.api_key=dummy_key \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.model=${JUDGE_MODEL} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.return_token_id_information=false \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.uses_reasoning_parser=false \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.spinup_server=true \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.router_dp_size=${JUDGE_ROUTER_DP_SIZE} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.tensor_parallel_size=${JUDGE_TP} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.gpu_memory_utilization=${JUDGE_GPU_UTIL} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.max_model_len=${JUDGE_MAX_LEN}"
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.entrypoint=app.py \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.model=${JUDGE_MODEL} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.return_token_id_information=false \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.uses_reasoning_parser=false \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.tensor_parallel_size=${JUDGE_TP} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.pipeline_parallel_size=1 \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.data_parallel_size=${JUDGE_ROUTER_DP_SIZE} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.gpu_memory_utilization=${JUDGE_GPU_UTIL} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.max_model_len=${JUDGE_MAX_LEN} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.max_num_seqs=${JUDGE_MAX_NUM_SEQS} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.enforce_eager=${JUDGE_ENFORCE_EAGER} \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_env_vars.VLLM_RAY_DP_PACK_STRATEGY=strict"
 
     # Add expert parallelism for large MoE models (e.g., Qwen3-235B)
     if [ "$JUDGE_ENABLE_EP" = "true" ]; then
         JUDGE_ARGS="${JUDGE_ARGS} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.enable_expert_parallel=true"
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.enable_expert_parallel=true"
     fi
 
     # Add multithread loading for faster startup with large models
     if [ "$JUDGE_MULTITHREAD_LOAD" = "true" ]; then
         JUDGE_ARGS="${JUDGE_ARGS} \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.model_loader_extra_config.enable_multithread_load=true \\
-    ++env.nemo_gym.judge_model.responses_api_models.vllm_model.server_args.model_loader_extra_config.num_threads=112"
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.model_loader_extra_config.enable_multithread_load=true \\
+    ++env.nemo_gym.judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.model_loader_extra_config.num_threads=112"
     fi
 else
     TOTAL_NODES=$NUM_NODES
@@ -342,8 +345,6 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
     --config ${CONFIG_FILE} \\
     ++cluster.num_nodes=${NUM_NODES} \\
     ++policy.model_name=${POLICY_MODEL} \\
-    ++data.train_jsonl_fpath=${TRAIN_DATA} \\
-    ++data.validation_jsonl_fpath=${VAL_DATA} \\
     ++logger.wandb.name=${EXP_NAME} \\
     ++logger.wandb.project=${WANDB_PROJECT} \\
     ++logger.log_dir=${LOG_BASE_DIR}/\${SLURM_JOB_ID}-logs \\
