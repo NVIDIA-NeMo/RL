@@ -53,6 +53,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -457,6 +458,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    # Optional explicit attention backend override for environments where
+    # TE auto backend probing is unstable.
+    attention_backend = config["megatron_cfg"].get("attention_backend")
+    if attention_backend is not None:
+        try:
+            model_cfg.attention_backend = AttnBackend[attention_backend]
+        except KeyError:
+            model_cfg.attention_backend = AttnBackend(attention_backend)
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
