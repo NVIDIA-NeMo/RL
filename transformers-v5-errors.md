@@ -924,3 +924,85 @@ METRIC FAIL: mean(data["timing/train_step"][-6, -1]) < 220 — actual: 229.97
 
 **Observation:** Training completed but step time (229.97s) exceeded threshold (220s). Slight throughput regression from version bump, or hardware variance. May need threshold bump.
 
+---
+
+# Phase 6: Performance Test Failures
+
+Results from `code_snapshots_v5_performance/`. 5 failures out of the performance suite.
+
+### Reproducing performance test failures
+
+```bash
+FROM_SCRATCH=true bash run-perf.sh tests/test_suites/llm/performance/script1.sh
+```
+
+---
+
+## P-Err 1. DeepSeek-V3 no attention backend (2 tests)
+
+**Error:**
+```
+ValueError: No dot product attention backend is available for the provided inputs
+```
+
+**Affected tests:**
+- `dapo-deepseek-v3-64n8g` — UNK [Step 1/10] — `code_snapshots_v5_performance/dapo-deepseek-v3-64n8g/9952524-logs/ray-driver.log`
+
+**Observation:** Same root cause as R-Err 2 and N-Err 4/5 — MLA asymmetric head dims not supported by FlashAttention v2, and FusedAttention (cuDNN) not available in this container. Zhiyu investigating.
+
+---
+
+## P-Err 2. DeepSeek-V3 FP8 token_mult_prob_error (1 test)
+
+**Error:**
+```
+METRIC FAIL: data["train/token_mult_prob_error"] < 1.1 — actual: 13.117
+```
+
+**Affected tests:**
+- `grpo-deepseek-v3-64n8g-fp8-async-1off` — UNK [Step 2/10] — `code_snapshots_v5_performance/grpo-deepseek-v3-64n8g-fp8-async-1off/9952632-logs/ray-driver.log`
+
+**Observation:** Training ran but logprob error is wildly off (13.1 vs 1.1 threshold). Likely related to MLA unfused attention path producing incorrect logprobs, same family as moonlight megatron metric failures.
+
+---
+
+## P-Err 3. Qwen3-235B token_mult_prob_error (1 test)
+
+**Error:**
+```
+METRIC FAIL: data["train/token_mult_prob_error"] < 1.1 — actual: 13.117
+```
+
+**Affected tests:**
+- `grpo-qwen3-235b-16n8g` — METRIC FAIL [Step 10/10] — `code_snapshots_v5_performance/grpo-qwen3-235b-16n8g/9952515-logs/ray-driver.log`
+
+**Observation:** Same metric value (13.117) as P-Err 2, suggesting a systematic issue with logprob computation at scale. May be related to MoE weight transfer or attention backend.
+
+---
+
+## P-Err 4. Qwen3-235B async checkpoint mount issue (1 test)
+
+**Error:**
+```
+FileNotFoundError: Pretrained run config not found at .../Qwen3-235B-A22B/iter_0000000/run_config.yaml
+```
+
+**Affected tests:**
+- `grpo-qwen3-235b-32n8g-async-1off` — UNK — `code_snapshots_v5_performance/grpo-qwen3-235b-32n8g-async-1off/9952604-logs/ray-driver.log`
+
+**Observation:** Rank 0 saved HF→mcore converted checkpoint to a directory not mounted on worker nodes. Distributed filesystem/mount issue during checkpoint conversion.
+
+---
+
+## P-Err 5. Qwen3-30BA3B SLURM time limit (1 test)
+
+**Error:**
+```
+CANCELLED DUE TO TIME LIMIT
+```
+
+**Affected tests:**
+- `grpo-qwen3-30ba3b-4n8g-40K` — UNK [Step 2/10] — `code_snapshots_v5_performance/grpo-qwen3-30ba3b-4n8g-40K/9952504-logs/ray-driver.log`
+
+**Observation:** Only completed 2/10 steps before 100min wall time. Needs longer allocation or the step time increased with the version bump.
+
