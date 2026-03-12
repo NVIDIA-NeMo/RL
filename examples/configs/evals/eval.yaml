@@ -45,6 +45,7 @@ data:
   prompt_file: null
   system_prompt_file: null
   dataset_name: "aime2024"
+  env_name: "math"
 
 env:
   math:
