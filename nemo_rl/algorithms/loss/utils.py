@@ -122,6 +122,7 @@ def prepare_loss_input(
 
     return loss_input, data
 
+
 def _pack_input_ids(
     input_ids: torch.Tensor,
     cu_seqlens_q: torch.Tensor,

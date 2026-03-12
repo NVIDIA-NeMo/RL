@@ -23,8 +23,6 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 
-from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
 
 @torch.no_grad()
 def _compute_distributed_log_softmax(
