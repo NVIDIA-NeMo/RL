@@ -821,7 +821,7 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 **Affected tests:**
 - `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel` — UNK (still crashing) — `code_snapshots_v5_nightly/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel/9936142-logs/ray-driver.log`
 
-**Observation:** Torch compiler (inductor) can't handle dynamic shapes in this model. Still failing on rerun with same error. Torch 2.10 regression or model-specific dynamic shape issue.
+**Root cause:** The `attn: flex` backend triggers `torch._dynamo` compilation internally. Flex attention with dynamic MoE shapes fails in torch 2.10's inductor backward pass compilation. Fix: switched to `attn: te` (transformer engine attention) which doesn't require torch.compile. Needs rerun.
 
 ---
 
@@ -839,7 +839,7 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 
 | Test | Error | Log |
 |------|-------|-----|
-| `sft-qwen2.5-math7b-2n8g-megatron` | `TypeError: 'NoneType' not iterable` in `param_and_grad_buffer.py:336` (mcore DDP `bucket.layerwise_param_flat_sizes` is None). This is a Megatron-LM bug from the mcore bump — not fixable from RL. | `code_snapshots_v5_nightly/sft-qwen2.5-math7b-2n8g-megatron/9936141-logs/ray-driver.log` |
+| `sft-qwen2.5-math7b-2n8g-megatron` | `TypeError: 'NoneType' not iterable` in `param_and_grad_buffer.py:336`. Root cause: `use_distributed_optimizer=false` + `overlap_param_gather=true` (from base sft.yaml) is incompatible in mcore. Fix: set `overlap_param_gather: false` in recipe. Needs rerun. | `code_snapshots_v5_nightly/sft-qwen2.5-math7b-2n8g-megatron/9936141-logs/ray-driver.log` |
 | `grpo-gemma3-1b-it-1n8g-fsdp2tp1` | METRIC FAIL [400/400] — median passes (1.007) but last-step spikes to 1.99. Dropped last-step check (same pattern as SGLang). Needs rerun. | `code_snapshots_v5_nightly/grpo-gemma3-1b-it-1n8g-fsdp2tp1/9934497-logs/ray-driver.log` |
 
 **Completed on rerun (now METRIC PASS — were previously failing or not tested):**
