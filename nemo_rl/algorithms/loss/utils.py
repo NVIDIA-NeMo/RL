@@ -154,7 +154,7 @@ def prepare_packed_loss_input(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
     Unlike prepare_loss_input which operates on a single (unpacked) sequence,
@@ -174,7 +174,7 @@ def prepare_packed_loss_input(
         context_parallel_group: Context parallel group.
 
     Returns:
-        Loss input dict with key "next_token_logprobs".
+        tuple(loss_input, maybe_updated_data)
     """
     if loss_fn.input_type != LossInputType.LOGPROB:
         raise ValueError(
@@ -221,4 +221,4 @@ def prepare_packed_loss_input(
         target_is_pre_rolled=True,
     )
 
-    return {"next_token_logprobs": logprobs}
+    return {"next_token_logprobs": logprobs}, data

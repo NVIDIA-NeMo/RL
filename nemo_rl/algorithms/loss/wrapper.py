@@ -195,7 +195,7 @@ class SequencePackingFusionLossWrapper:
         global_valid_toks: Tensor | None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Compute loss for all packed sequences in one forward pass."""
-        loss_input = self.prepare_fn(
+        loss_input, prepared_data = self.prepare_fn(
             logits=next_token_logits,
             data=data,
             loss_fn=self.loss_fn,
@@ -207,7 +207,7 @@ class SequencePackingFusionLossWrapper:
         )
 
         return self.loss_fn(
-            data=data,
+            data=prepared_data,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
             **loss_input,
