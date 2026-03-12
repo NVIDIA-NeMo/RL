@@ -45,7 +45,7 @@ def calculate_accuracy_linear(data: list[dict]):
             if linear_ranking is None:
                 mapped_prediction = -1
             else:
-                mapped_prediction = 0 if linear_ranking >= 0.5 else 1
+                mapped_prediction = 1 if linear_ranking >= 0.5 else 0
                             
             # Check if the prediction is correct
             if mapped_prediction == preference:

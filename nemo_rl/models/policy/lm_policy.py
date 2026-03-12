@@ -403,15 +403,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         for x in shards:
             if x["input_ids"].shape[0] < max_bsize:
                 x["input_ids"] = torch.cat([x["input_ids"], torch.zeros((max_bsize - x["input_ids"].shape[0], x["input_ids"].shape[-1]), device=x["input_ids"].device, dtype=x["input_ids"].dtype)], dim=0)
-                x["input_lengths"] = torch.cat([x["input_lengths"], torch.tensor([1], device=x["input_lengths"].device, dtype=x["input_lengths"].dtype)], dim=0)
+                x["input_lengths"] = torch.cat([x["input_lengths"], torch.tensor([1] * (max_bsize - x["input_lengths"].shape[0]), device=x["input_lengths"].device, dtype=x["input_lengths"].dtype)], dim=0)
                 num_inserts += 1
 
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_linear_predictions",
             data=shards,
             in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
         '''

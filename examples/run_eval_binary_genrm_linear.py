@@ -5,20 +5,22 @@ import json
 import os
 import pprint
 import ray
-import traceback
+#import traceback
 import yaml
+from contextlib import nullcontext
 from typing import Any, Optional, TypedDict
 
 import torch
-from datasets import Dataset
+#from datasets import Dataset
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig
+#from transformers import AutoConfig
 
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, eval_collate_fn
+from nemo_rl.data.collate_fn import eval_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import (
     JudgeBenchDataset,
     RMBenchDataset,
@@ -28,18 +30,17 @@ from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import (
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
-    GenerationOutputSpec,
 )
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster, init_ray
 from nemo_rl.experience.rollouts import generate_responses
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.timer import Timer
 from nemo_rl.models.generation import configure_generation_config
 
 from nemo_rl.environments.binary_genrm_environment import format_scoring_stage_prompt
@@ -515,6 +516,7 @@ def refit_policy_generation(
     policy_generation: GenerationInterface,
     colocated_inference: bool,
     _refit_buffer_size_gb: Optional[int] = None,
+    timer: Optional[Timer] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -524,48 +526,59 @@ def refit_policy_generation(
         _refit_buffer_size_gb: The size of the buffer to use for refitting.
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
+        timer: Optional Timer used to time the prepare/transfer/update phase
     """
     if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    # update weights
-    update_success = False
-    if colocated_inference:
-        # get model param keys, which is grouped by size
-        grouped_param_keys = policy.prepare_weights_for_ipc(
-            _refit_buffer_size_gb=_refit_buffer_size_gb
-        )
+    # Create a context manager that does nothing when timer is None
+    timer_context = (
+        timer.time("prepare_for_generation/transfer_and_update_weights")
+        if timer is not None
+        else nullcontext()
+    )
+    with timer_context:
+        # update weights
+        update_success = False
+        if colocated_inference:
+            # get model param keys, which is grouped by size
+            if _refit_buffer_size_gb is not None:
+                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+            else:
+                # Empirically sets ratio as 30% to maximize efficiency.
+                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+                buffer_size_bytes = int(
+                    policy.get_free_memory_bytes() * float(memory_ratio)
+                )
 
-        # do update
-        for keys in grouped_param_keys:
-            ipc_handles = policy.get_weights_ipc_handles(keys)
-            assert "bt_beta" not in keys, "bt_beta detected in IPC handles, should never happen"
-            update_success = policy_generation.update_weights(ipc_handles)
-            if not update_success:
-                break
-    else:
-        # prepare info for update weights
-        state_dict_info = policy.prepare_info_for_collective()
-        # update weights through nccl
-        futures_train = policy.broadcast_weights_for_collective()
-        futures_inference = policy_generation.update_weights_from_collective(
-            state_dict_info
-        )
-        # wait for all futures to complete
-        ray.get(futures_train)
-        results = ray.get(futures_inference)
-        update_success = all(result for result in results if result is not None)
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
+        else:
+            # update weights through nccl
+            futures_train = policy.broadcast_weights_for_collective()
+            futures_inference = policy_generation.update_weights_from_collective()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
 
-    # check if update is successful
-    if not update_success:
-        error_tag = "cuda-ipc" if colocated_inference else "nccl"
-        error_message = (
-            "❌ Error: Updating weights for the generation policy failed during refit.\n"
-            f"This often indicates an issue with {error_tag} or "
-            "a problem within the generation backend (e.g., vLLM worker).\n"
-        )
-        raise RuntimeError(error_message)
+        # check if update is successful
+        if not update_success:
+            error_tag = "cuda-ipc" if colocated_inference else "nccl"
+            error_message = (
+                "❌ Error: Updating weights for the generation policy failed during refit.\n"
+                f"This often indicates an issue with {error_tag} or "
+                "a problem within the generation backend (e.g., vLLM worker).\n"
+            )
+            raise RuntimeError(error_message)
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -656,6 +669,10 @@ def main():
         optimizer_path=None,
         init_optimizer=False,
     )
+    
+    # prepare refit info
+    state_dict_info = actor_policy.prepare_refit_info()
+    vllm_generation.prepare_refit_info(state_dict_info)
     
     refit_policy_generation(actor_policy, vllm_generation, True)
     

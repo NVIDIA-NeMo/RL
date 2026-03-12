@@ -1386,7 +1386,7 @@ class DTensorPolicyWorker:
                     as_tensors=True, device=input_ids.device
                 )
                 
-                print("*** get_linear_predictions_EOT_CHECK: ", [self.tokenizer.decode(input_ids[x, :input_lengths[x]].cpu().tolist()) for x in range(len(input_lengths))], flush=True)
+                print("*** get_linear_predictions_EOT_CHECK: ", [self.tokenizer.decode(input_ids[x, input_lengths[x] - 1]) for x in range(len(input_lengths))], flush=True)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
