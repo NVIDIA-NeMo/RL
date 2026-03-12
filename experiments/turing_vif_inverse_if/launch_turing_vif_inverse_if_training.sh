@@ -314,9 +314,9 @@ export RAY_DEDUP_LOGS=1
 export NRL_VLLM_USE_V1=1
 export NRL_IGNORE_VERSION_MISMATCH=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export NRL_FORCE_REBUILD_VENVS=false
+export NRL_FORCE_REBUILD_VENVS=true
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-export UV_HTTP_TIMEOUT=10
+export UV_HTTP_TIMEOUT=300
 export VLLM_USE_PRECOMPILED=1
 export VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
 
@@ -340,7 +340,7 @@ fi
 # Run GRPO training with NeMo-Gym (Turing VIF Inverse IF)
 uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
     --config ${CONFIG_FILE} \\
-    ++cluster.num_nodes=${TOTAL_NODES} \\
+    ++cluster.num_nodes=${NUM_NODES} \\
     ++policy.model_name=${POLICY_MODEL} \\
     ++data.train_jsonl_fpath=${TRAIN_DATA} \\
     ++data.validation_jsonl_fpath=${VAL_DATA} \\
@@ -348,6 +348,7 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
     ++logger.wandb.project=${WANDB_PROJECT} \\
     ++logger.log_dir=${LOG_BASE_DIR}/\${SLURM_JOB_ID}-logs \\
     ++checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \\
+    ++loss_fn.force_on_policy_ratio=true \\
     ${JUDGE_ARGS} \\
     \$@
 EOF
