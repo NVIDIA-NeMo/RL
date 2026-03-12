@@ -58,17 +58,6 @@ grpo:
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
 
-  use_best_at_k: false
-  best_at_k_k: 8
-  best_at_k_m: 1000
-
-  use_combined_training: false
-  combined_training_weight_mode: "auto"
-  combined_training_best_at_k_weight: 0.2
-  combined_training_pass_at_1_weight: 1.0
-
-  dynamic_sampling_oversample_ratio: 1.0
-
   seq_logprob_error_threshold: 2
 
 loss_fn:
@@ -141,12 +130,7 @@ policy:
     apply_rope_fusion: True
     bias_activation_fusion: False
     defer_fp32_logits: True
-    track_moe_metrics: True
     moe_per_layer_logging: True
-    do_not_average_loss: true
-    cp_normalize: true
-    calculate_per_token_loss: true
-    scale_loss_by_dp_cp_size: false
 
     mtp_loss_scaling_factor: 0.0
     mtp_use_repeated_layer: true
@@ -189,7 +173,6 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
-      average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
