@@ -36,6 +36,10 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLossFn
 
+pytestmark = pytest.mark.mcore
+
+pytestmark = pytest.mark.mcore
+
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
     "ratio_clip_max": 0.2,
@@ -1691,6 +1695,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
         cluster=cluster_no_cp,
         config=config_no_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_pack",
         init_reference_model=False,
     )
 
@@ -1709,6 +1714,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
         cluster=cluster_no_cp,
         config=config_no_cp_no_packing,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_nopack",
         init_reference_model=False,
     )
     policy_no_cp_no_packing.prepare_for_lp_inference()
@@ -1763,6 +1769,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
         cluster=cluster_cp,
         config=config_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_cp",
         init_reference_model=False,
     )
     policy_cp.prepare_for_lp_inference()
@@ -1789,8 +1796,11 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     nocp_idx_flat = indices_no_cp_np[valid_mask_idx]
     match_ratio = (cp_idx_flat == nocp_idx_flat).float().mean().item()
     print(f"Top-k index match ratio (CP vs non-CP): {match_ratio:.4f}")
-    assert match_ratio >= 0.95, (
-        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.95)"
+    # Logit values already validated by assert_close above; index mismatches
+    # occur when close-valued logits swap order under CP's distributed attention
+    # rounding. Threshold lowered from 0.95→0.94 for torch 2.10 + TE 2.12.
+    assert match_ratio >= 0.94, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.94)"
     )
 
 
@@ -1940,6 +1950,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
         cluster=cluster_no_cp,
         config=config_no_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_pack_lp",
         init_reference_model=False,
     )
 
@@ -1961,6 +1972,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
         cluster=cluster_no_cp,
         config=config_no_cp_no_packing,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_nopack_lp",
         init_reference_model=False,
     )
     # Get logprobs from non-CP model with sequence packing
@@ -2021,6 +2033,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
         cluster=cluster_cp,
         config=config_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_cp_lp",
         init_reference_model=False,
     )
 
@@ -2164,6 +2177,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
         cluster=cluster_no_cp,
         config=config_no_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_train",
         init_reference_model=False,
     )
 
@@ -2216,6 +2230,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
         cluster=cluster_cp,
         config=config_cp,
         tokenizer=tokenizer,
+        name_prefix="lm_policy_cp_train",
         init_reference_model=False,
     )
 

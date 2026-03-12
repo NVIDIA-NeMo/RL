@@ -76,13 +76,32 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def _attach_context_parallel_hooks(model: nn.Module) -> None:
+    """Attach forward pre-hooks to self_attn modules for context parallelism.
+
+    CP shards Q/K/V on the sequence dimension as DTensors, so explicit 4D
+    attention masks cause shape mismatches. This registers a hook on every
+    ``self_attn`` sub-module that strips ``attention_mask`` and sets
+    ``is_causal=True``, letting SDPA handle causal masking internally.
+    """
+
+    def _hook(_module, module_args, module_kwargs):
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            module.register_forward_pre_hook(_hook, with_kwargs=True, prepend=True)
 
 
 @contextmanager
@@ -158,9 +177,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
-
         """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
@@ -356,6 +372,13 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             ],
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
+
+        # Attach CP attention-mask hooks (strip mask, set is_causal=True).
+        # CP shards Q/K/V as DTensors on the sequence dimension, so explicit
+        # attention masks cause shape mismatches. These hooks ensure SDPA uses
+        # is_causal=True instead.
+        if self.cp_size > 1:
+            _attach_context_parallel_hooks(self.model)
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
         # This will broadcast the state dict from rank 0 to all other ranks
@@ -654,11 +677,22 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
+                            # When sequence parallelism is enabled, hidden states are
+                            # sharded along the sequence dimension after the embedding layer.
+                            # Passing a full-size attention mask causes a shape mismatch in
+                            # both SDPA and eager attention. Pass None instead — the model
+                            # will use its built-in causal mask.
+                            if (
+                                self.cfg["dtensor_cfg"]["sequence_parallel"]
+                                or self.cp_size > 1
+                            ):
+                                attention_mask = None
+                            else:
+                                attention_mask = torch.ones(
+                                    (batch_size, seq_len),
+                                    dtype=torch.bool,
+                                    device=input_ids.device,
+                                )
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
@@ -997,11 +1031,15 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # yet our attention mask above is not always all 1s
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
+                    if self.cp_size > 1:
+                        # CP doesn't support attention_mask — SDPA uses is_causal=True
+                        attention_mask = None
+                    else:
+                        attention_mask = torch.ones(
+                            (batch_size, seq_len),
+                            dtype=torch.bool,
+                            device=input_ids.device,
+                        )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:

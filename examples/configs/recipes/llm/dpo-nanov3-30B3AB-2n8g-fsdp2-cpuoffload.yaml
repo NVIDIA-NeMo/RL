@@ -9,7 +9,12 @@ policy:
   train_global_batch_size: 16
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
+  # TODO(automodel-issue): NemotronH needs force_hf=true with transformers v5
+  # to bypass custom backbone→model.model attribute mismatch in parallelizer.
   dtensor_cfg:
+    _v2: true
+    automodel_kwargs:
+      force_hf: true
     cpu_offload: true
 logger:
   wandb_enabled: true

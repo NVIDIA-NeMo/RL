@@ -516,6 +516,12 @@ def process_weights_after_loading(self, layer) -> None:
 
     maybe_post_process_fp8_weight_block(layer)
 
+    # vLLM's apply() forward pass accesses layer.input_scale when block_quant=True.
+    # The original process_weights_after_loading sets input_scale = None for dynamic activation
+    # with block quantization. We must do the same to avoid AttributeError.
+    if not hasattr(layer, "input_scale"):
+        layer.input_scale = None
+
 
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.

@@ -7,7 +7,7 @@ NUM_NODES=2
 STEPS_PER_RUN=15
 MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=45  # bumped from 30: ~55s/step + slow init with cpuoffload + metrics validation
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

@@ -76,6 +76,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
+        "mm_token_type_ids",  # specific to qwen2.5-vl (transformers>=5.3): tells model which tokens are text(0)/image(1)/video(2) for 3D RoPE position encoding
     ]
 
     def __init__(self, *args, **kwargs):
