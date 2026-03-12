@@ -12,7 +12,10 @@ policy:
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
-        attn: flex
+        # flex attention requires torch.compile which hits inductor
+        # GuardOnDataDependentSymNode with dynamic MoE shapes in torch 2.10.
+        # Use TE attention instead.
+        attn: te
         linear: te
         rms_norm: te
         enable_deepep: true
