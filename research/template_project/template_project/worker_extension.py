@@ -14,12 +14,19 @@
 
 from typing import Any
 
+import ray
 import torch
 
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import DTensorPolicyWorkerV2
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+    DTensorPolicyWorkerV2Impl,
+)
 
 
-class DTensorPolicyWorkerV2Extension(DTensorPolicyWorkerV2):
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2Extension(DTensorPolicyWorkerV2Impl):
     """Example worker extension that adds custom methods."""
 
     def get_worker_rank(self) -> dict[str, Any]:
