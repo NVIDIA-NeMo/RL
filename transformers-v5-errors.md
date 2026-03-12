@@ -856,3 +856,71 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 |------|----------|-----|
 | `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` | Step 483/500 | `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9936123-logs/ray-driver.log` |
 
+---
+
+# Phase 5: Release Test Failures
+
+Results from `code_snapshots_v5_release/`. 4 failures out of the release suite.
+
+### Reproducing release test failures
+
+```bash
+FROM_SCRATCH=true bash run-release.sh tests/test_suites/llm/script1.sh tests/test_suites/llm/script2.sh
+```
+
+---
+
+## R-Err 1. Distillation loss not converging (1 test)
+
+**Error:**
+```
+METRIC FAIL: data["train/loss"][-1] < 0.25 — actual: 0.3706
+```
+
+**Affected tests:**
+- `distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-long.v1` — METRIC FAIL [100/100] — `code_snapshots_v5_release/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-long.v1/9939510-logs/ray-driver.log`
+
+**Observation:** Training completed all 100 steps but loss (0.3706) didn't converge below threshold (0.25). May be a numerical regression from the version bump or need hyperparameter tuning.
+
+---
+
+## R-Err 2. DeepSeek-V3 no attention backend available (1 test)
+
+**Error:**
+```
+ValueError: No dot product attention backend is available for the provided inputs
+```
+
+**Affected tests:**
+- `grpo-dapomath17k-dsv3-megatron` — UNK [Step 1/10] — `code_snapshots_v5_release/grpo-dapomath17k-dsv3-megatron/9952432-logs/ray-driver.log`
+
+**Observation:** TE attention backend fails for DeepSeek-V3 MLA config. Same root cause as N-Err 4/5 moonlight attention issue — MLA asymmetric head dims not supported by FlashAttention v2 or FusedAttention in this container. Zhiyu investigating.
+
+---
+
+## R-Err 3. Gemma3 missing `pad_token_id` config attribute (1 test)
+
+**Error:**
+```
+AttributeError: 'Gemma3Config' object has no attribute 'pad_token_id'
+```
+
+**Affected tests:**
+- `grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long` — UNK — `code_snapshots_v5_release/grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long/9939370-logs/ray-driver.log`
+
+**Observation:** Transformers v5 changed Gemma3Config — `pad_token_id` moved or was removed. Needs a compatibility fix in the code that accesses it.
+
+---
+
+## R-Err 4. Qwen3-30BA3B Megatron step time regression (1 test)
+
+**Error:**
+```
+METRIC FAIL: mean(data["timing/train_step"][-6, -1]) < 220 — actual: 229.97
+```
+
+**Affected tests:**
+- `grpo-qwen3-30ba3b-8n8g-megatron` — METRIC FAIL [30/30] — `code_snapshots_v5_release/grpo-qwen3-30ba3b-8n8g-megatron/9939372-logs/ray-driver.log`
+
+**Observation:** Training completed but step time (229.97s) exceeded threshold (220s). Slight throughput regression from version bump, or hardware variance. May need threshold bump.
+
