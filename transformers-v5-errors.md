@@ -686,7 +686,9 @@ AttributeError: 'Fp8MoEMethod' object has no attribute 'flashinfer_moe_backend'
 **Affected tests:**
 - `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e` — UNK (still crashing) — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e/9936131-logs/ray-driver.log`
 
-**Observation:** vLLM 0.17 FP8 MoE backend missing `flashinfer_moe_backend` attribute. Still failing after Bridge bump — this is a vLLM-side issue.
+**Root cause:** Our patched `process_weights_after_loading_moe` in `nemo_rl/models/generation/vllm/quantization/fp8.py` referenced the old vLLM API (`self.flashinfer_moe_backend`, `self.allow_deep_gemm`). vLLM 0.17 refactored this to `self.fp8_backend` + `convert_to_fp8_moe_kernel_format()` + `make_fp8_moe_kernel()`.
+
+**Fix:** Updated `process_weights_after_loading_moe` to use the new API while preserving `.copy_()` pattern for weight_loader. Needs rerun to verify.
 
 ---
 
