@@ -10,7 +10,7 @@ while getopts "n:" opt; do
   esac
 done
 
-EXP_NAME=OffPolicy-Distillation-Llama
+EXP_NAME=OffPolicy-Distillation-Llama-ipc-test
 
 read -r -d '' COMMAND <<EOF
 export WANDB_API_KEY=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
@@ -31,8 +31,13 @@ export HF_DATASETS_CACHE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ge
 uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow_with_eval.py \
   --config /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/configs/llama_off_policy_arrow.yaml \
   cluster.num_nodes=${NUM_ACTOR_NODES} \
-  checkpointing.checkpoint_dir=checkpoints/distillation-microbatch-ipc-tp4-test
+  checkpointing.checkpoint_dir=checkpoints/ipc-topk64-test \
+  distillation.topk_logits_k=64 \
+  distillation.use_ipc=true \
+  distillation.max_num_steps=10 \
+  eval.val_period=0
   # Previous checkpoint dirs:
+  # checkpoints/distillation-microbatch-ipc-tp4-test (tp=4 microbatch IPC test)
   # checkpoints/distillation-microbatch-ipc-test (tp=1 microbatch IPC test)
   # checkpoints/distillation-forward-kl-cosine-topk8192-16node-Llama-3.2-1B-10000steps (original chain)
 EOF

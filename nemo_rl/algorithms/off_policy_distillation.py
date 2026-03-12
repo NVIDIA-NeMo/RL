@@ -468,36 +468,54 @@ def validate(
                 )
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
-            # Get teacher top-k logits via IPC (use student batch sizes for alignment)
+            # Get teacher top-k logits
+            use_ipc = master_config["distillation"].get("use_ipc", True)
+            topk_k = master_config["distillation"]["topk_logits_k"]
+
             teacher_policy.prepare_for_lp_inference()
-            teacher_logits = teacher_policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                is_teacher=True,
-                topk_logits=master_config["distillation"]["topk_logits_k"],
-                gbs=val_data.size,
-                mbs=master_config["distillation"].get(
-                    "val_micro_batch_size",
-                    master_config["distillation"].get(
-                        "val_global_batch_size",
-                        master_config["distillation"]["num_prompts_per_step"],
+            if use_ipc:
+                teacher_logits = teacher_policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    is_teacher=True,
+                    topk_logits=topk_k,
+                    gbs=val_data.size,
+                    mbs=master_config["distillation"].get(
+                        "val_micro_batch_size",
+                        master_config["distillation"].get(
+                            "val_global_batch_size",
+                            master_config["distillation"]["num_prompts_per_step"],
+                        ),
                     ),
-                ),
-            )
+                )
+            else:
+                teacher_topk = teacher_policy.get_topk_logits(val_data, k=topk_k)
+                val_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                val_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                del teacher_topk
             teacher_policy.offload_after_refit()
 
             # Compute student validation loss (eval mode, no gradient updates)
             student_policy.prepare_for_training()
-            val_results = student_policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                gbs=val_data.size,
-                mbs=val_mbs,
-                teacher_logits=teacher_logits,
-            )
-            del teacher_logits
+            if use_ipc:
+                val_results = student_policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                    teacher_logits=teacher_logits,
+                )
+                del teacher_logits
+            else:
+                val_results = student_policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                )
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
@@ -695,23 +713,34 @@ def off_policy_distillation_train(
                     )
                     train_data.to("cpu")
 
-                # ==== Teacher Logprob Inference (IPC) ====
+                # ==== Teacher Logprob Inference ====
+                use_ipc = master_config["distillation"].get("use_ipc", True)
+                topk_k = master_config["distillation"]["topk_logits_k"]
+
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     student_policy.offload_after_refit()
                     teacher_policy.prepare_for_lp_inference()
 
-                print("▶ Computing teacher logprobs (IPC)...", flush=True)
-                with timer.time("teacher_logprob_inference"):
-                    teacher_logits = teacher_policy.train(
-                        train_data,
-                        loss_fn,
-                        eval_mode=True,
-                        is_teacher=True,
-                        topk_logits=master_config["distillation"]["topk_logits_k"],
-                        gbs=master_config["policy"]["train_global_batch_size"],
-                        mbs=master_config["policy"]["train_micro_batch_size"],
-                    )
+                if use_ipc:
+                    print("▶ Computing teacher logprobs (IPC)...", flush=True)
+                    with timer.time("teacher_logprob_inference"):
+                        teacher_logits = teacher_policy.train(
+                            train_data,
+                            loss_fn,
+                            eval_mode=True,
+                            is_teacher=True,
+                            topk_logits=topk_k,
+                            gbs=master_config["policy"]["train_global_batch_size"],
+                            mbs=master_config["policy"]["train_micro_batch_size"],
+                        )
+                else:
+                    print("▶ Computing teacher logprobs (non-IPC, data dict)...", flush=True)
+                    with timer.time("teacher_logprob_inference"):
+                        teacher_topk = teacher_policy.get_topk_logits(train_data, k=topk_k)
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                        del teacher_topk
 
                 # ==== Student Training ====
                 print("▶ Preparing for training...", flush=True)
@@ -721,10 +750,13 @@ def off_policy_distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(
-                        train_data, loss_fn, teacher_logits=teacher_logits
-                    )
-                    del teacher_logits
+                    if use_ipc:
+                        train_results = student_policy.train(
+                            train_data, loss_fn, teacher_logits=teacher_logits
+                        )
+                        del teacher_logits
+                    else:
+                        train_results = student_policy.train(train_data, loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
