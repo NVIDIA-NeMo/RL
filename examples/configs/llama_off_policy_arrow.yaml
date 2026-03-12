@@ -10,6 +10,7 @@ distillation:
   max_val_samples: 128
   val_batch_size: 64
   topk_logits_k: 8192
+  use_ipc: true
   loss_on_all_tokens: true
   seed: 42
 
@@ -107,6 +108,7 @@ teacher:
   precision: "bfloat16"
   train_global_batch_size: 768
   train_micro_batch_size: 1
+  logprob_batch_size: 1
   max_total_sequence_length: 4096
   max_grad_norm: 1.0
   logprob_chunk_size: null

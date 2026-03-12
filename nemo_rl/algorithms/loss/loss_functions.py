@@ -1281,46 +1281,33 @@ class DistillationLossFn(LossFunction):
             teacher_topk_logits = teacher_topk_logits.to(
                 student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
             )
-            teacher_topk_logprobs = torch.nn.functional.log_softmax(
-                teacher_topk_logits, dim=-1
-            )
+
+            # Use the teacher's top-k values as log-probabilities directly
+            # (get_topk_logits returns log-probs when using DTensor/TP).
+            # Build (k+1)-dim distributions with a "rest" bucket to match
+            # the IPC path and preserve the true probability mass outside top-k.
+            teacher_topk_logprobs = teacher_topk_logits
 
             # Single point of next-token alignment after TP/CP processing
             teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
             student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-            if self.zero_outside_topk and self.kl_type != "forward":
-                H_all = H_all[:, :-1]
 
-            student_probs = student_topk_logprobs.exp()
-            teacher_probs = teacher_topk_logprobs.exp()
+            if self.kl_type == "reverse":
+                teacher_topk_logprobs, student_topk_logprobs = student_topk_logprobs, teacher_topk_logprobs
 
-            loss_correction_term = torch.zeros_like(student_probs[..., 0])
-            if self.zero_outside_topk and self.kl_type != "forward":
-                H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
-                P_rest = 1 - (student_probs.sum(-1))
-                loss_correction_term = H_rest - self.log_infinitesimal * P_rest
-                if self.kl_type == "mixed":
-                    loss_correction_term = loss_correction_term * (
-                        1.0 - self.mixed_kl_weight
-                    )
+            teacher_topk_probs = teacher_topk_logprobs.exp()
+            teacher_rest_prob = (1.0 - teacher_topk_probs.sum(dim=-1, keepdim=True)).clamp(min=1e-10)
+            teacher_probs_full = torch.cat([teacher_topk_probs, teacher_rest_prob], dim=-1)
+            teacher_logprobs_full = torch.cat([teacher_topk_logprobs, teacher_rest_prob.log()], dim=-1)
 
-            if self.kl_type == "forward":
-                per_token_kl = teacher_probs * (
-                    teacher_topk_logprobs - student_topk_logprobs
-                )
-            elif self.kl_type == "reverse":
-                per_token_kl = student_probs * (
-                    student_topk_logprobs - teacher_topk_logprobs
-                )
-            else:
-                kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
-                kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-                per_token_kl = (
-                    self.mixed_kl_weight * kl_forward
-                    + (1.0 - self.mixed_kl_weight) * kl_reverse
-                )
+            student_topk_probs = student_topk_logprobs.exp()
+            student_rest_prob = (1.0 - student_topk_probs.sum(dim=-1, keepdim=True)).clamp(min=1e-10)
+            student_logprobs_full = torch.cat([student_topk_logprobs, student_rest_prob.log()], dim=-1)
 
-            per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term
+            per_token_kl = (teacher_probs_full * (teacher_logprobs_full - student_logprobs_full)).sum(dim=-1)
+
+            del teacher_topk_probs, teacher_rest_prob, teacher_probs_full, teacher_logprobs_full
+            del student_topk_probs, student_rest_prob, student_logprobs_full
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
