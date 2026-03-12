@@ -34,8 +34,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
+    SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
+    prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -322,9 +324,19 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            loss_fn_wrapped = SequencePackingLossWrapper(
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if fuse_loss:
+                wrapper_cls = SequencePackingFusionLossWrapper
+                prepare_fn = partial(
+                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                )
+            else:
+                wrapper_cls = SequencePackingLossWrapper
+                prepare_fn = prepare_loss_input_wrapped
+
+            loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
-                prepare_fn=prepare_loss_input_wrapped,
+                prepare_fn=prepare_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
