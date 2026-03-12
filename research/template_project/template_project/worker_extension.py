@@ -23,6 +23,8 @@ from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
 )
 
 
+# this worker extension class needs to be registered to the actor environment registry in your main process
+# see the example in `single_update.py`
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover

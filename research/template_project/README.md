@@ -31,6 +31,22 @@ To run the `single_update.py` script:
 uv run single_update.py
 ```
 
+## Extension Worker Class
+
+To add custom behavior to the policy worker, you can use an extension worker class that subclasses the default worker implementation. See the example in `template_project/worker_extension.py`.
+
+After defining your extension class, you need to register it in the actor environment registry so that the runtime can resolve the correct Python environment for the worker. See the example in `single_update.py`.
+
+```python
+from nemo_rl.distributed.ray_actor_environment_registry import ACTOR_ENVIRONMENT_REGISTRY
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+# register the worker extension class to the actor environment registry
+ACTOR_ENVIRONMENT_REGISTRY[
+    "template_project.worker_extension.DTensorPolicyWorkerV2Extension"
+] = PY_EXECUTABLES.AUTOMODEL
+```
+
 ## Testing
 
 This project includes a comprehensive test suite following NeMo RL's testing patterns.
