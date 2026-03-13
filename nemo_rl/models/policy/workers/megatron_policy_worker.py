@@ -749,7 +749,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
             )
 
-        model_cfg = self.megatron_cfg.model
         mcore_generation_config = cast(
             MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
         )
