@@ -1524,11 +1524,8 @@ def grpo_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
-                        # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
+                        # Always keep per-agent full_result Tables in rollout_metrics
+                        # so judge verdicts and validation details are visible in wandb.
 
                     # Use async rollouts if vLLM async engine is enabled
                     elif _should_use_async_rollouts(master_config):

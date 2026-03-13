@@ -55,9 +55,9 @@ policy:
   tokenizer:
     name: ${policy.model_name}
   precision: bfloat16
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 20480
   train_global_batch_size: 32
-  train_micro_batch_size: 4
+  train_micro_batch_size: 1
   logprob_batch_size: ${policy.train_micro_batch_size}
   logprob_chunk_size: null
   max_grad_norm: 1.0
@@ -149,6 +149,7 @@ env:
     turing_vif:
       resources_servers:
         turing_vif:
+          aggregation_mode: mean  # all | any | mean | min | max
           judge_server_name: judge_model
           judge_base_url: null
           judge_api_key: dummy_key
