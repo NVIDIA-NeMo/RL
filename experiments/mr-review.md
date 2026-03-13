@@ -58,11 +58,23 @@ else:
 
 **Backwards compatibility:** Fully backwards-compatible. The default is `all`, which reproduces the original hard-coded behavior exactly. The base `turing_vif.yaml` config now declares the field explicitly. Experiment YAMLs can override it per-experiment (e.g., `aggregation_mode: mean` for multichallenge and inverse_if).
 
-### 4. `resources_servers/turing_vif/configs/turing_vif.yaml` — Base Config Update
+### 4. `resources_servers/turing_vif/app.py` — Thinking Trace Stripping
+
+**Problem:** The `verify()` method extracted the response text by blindly taking `body.response.output[-1]`, which could be a `type: "reasoning"` output item instead of the actual assistant message. Inline `<think>`/`<thinking>` blocks were also passed through verbatim to both fast validators and the LLM judge. This meant word counts, keyword checks, and judge evaluations could be contaminated by the model's chain-of-thought.
+
+**Fix:** Added two module-level helpers:
+- `_extract_text_from_response()`: iterates output items in reverse to find the last `type="message"` / `role="assistant"` item (skipping `type="reasoning"` items entirely), then regex-strips `<think>`/`<thinking>` blocks.
+- `_strip_thinking_traces()`: strips thinking tags from any string. Applied to judge responses in `_validate_custom_llm_judge_async`, `_validate_llm_instruction_async`, and `_get_dynamic_definition_async` before JSON parsing.
+
+This mirrors the MultiChallenge server's approach, handling all three thinking representations: `type="reasoning"` output items, inline `<think>`/`<thinking>` tags, and `role="thinking"` messages.
+
+**Backwards compatibility:** Fully backwards-compatible. For non-thinking models, the output list typically has a single `type="message"` item and no thinking tags, so behavior is unchanged.
+
+### 5. `resources_servers/turing_vif/configs/turing_vif.yaml` — Base Config Update
 
 Added `aggregation_mode: all` to the base server config so the field is explicit and discoverable.
 
-### 5. `resources_servers/turing_vif/README.md` — Documentation Update
+### 6. `resources_servers/turing_vif/README.md` — Documentation Update
 
 Updated to document the new `aggregation_mode` config field with a table of available modes and an example experiment YAML override.
 
