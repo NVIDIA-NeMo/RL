@@ -17,14 +17,16 @@ import pytest
 import ray
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
+    ChunkedDistributedLogprobWithSampling,
     DistributedLogprob,
+    DistributedLogprobWithSampling,
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
-    from_parallel_hidden_states_to_logprobs,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
@@ -960,225 +962,296 @@ def test_distributed_logprob_all_tests(
 
 
 @ray.remote(num_gpus=1)
-class HiddenStatesToLogprobsTestActor:
-    def __init__(self, tp_size, chunk_size):
+class SamplingParamsTestActor:
+    def __init__(self, tp_size, sharding):
         self.tp_size = tp_size
-        self.chunk_size = chunk_size
+        self.sharding = sharding
         self.env_vars = dict(os.environ)
         torch.distributed.init_process_group(backend="nccl")
         self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
 
-    def test_forward_and_backward_against_baseline(self):
-        rank = int(os.environ["RANK"])
+    def test_top_k_top_p_filtering_forward_backward(self, top_k, top_p):
+        """Test top-k and top-p filtering logic including backward pass."""
+        batch_size = 2
+        seq_len = 4
+        vocab_size = 100
 
-        batch_size = 3
-        seq_len = 8
-        hidden_size = 16
-        full_vocab_size = 64
-
-        # Keep tensor-parallel partitions evenly divisible for clean baseline slicing.
-        local_seq = seq_len // self.tp_size
-        vocab_part_size = full_vocab_size // self.tp_size
-        vocab_start_index = rank * vocab_part_size
-        vocab_end_index = (rank + 1) * vocab_part_size
-
-        torch.manual_seed(1337)
-        full_hidden_states = torch.randn(
-            seq_len, batch_size, hidden_size, device="cuda", requires_grad=True
+        torch.manual_seed(42)
+        logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", requires_grad=True
         )
-        full_weight = torch.randn(
-            full_vocab_size, hidden_size, device="cuda", requires_grad=True
-        )
-        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
 
-        local_hidden_states = (
-            full_hidden_states[rank * local_seq : (rank + 1) * local_seq]
-            .detach()
+        filtered_logits, keep_mask = apply_top_k_top_p(logits, top_k=top_k, top_p=top_p)
+
+        # Test 1: Verify top-k filtering
+        if top_k is not None:
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    topk_vals, topk_indices = torch.topk(logits[b, s], k=top_k)
+                    topk_mask = torch.zeros(
+                        vocab_size, dtype=torch.bool, device=logits.device
+                    )
+                    topk_mask[topk_indices] = True
+                    assert torch.all(torch.isinf(filtered_logits[b, s][~topk_mask])), (
+                        "Values outside top-k should be -inf"
+                    )
+                    if top_p == 1.0:
+                        assert not torch.any(
+                            torch.isinf(filtered_logits[b, s][topk_mask])
+                        ), "Top-k values should not be -inf when top_p=1.0"
+                    non_inf_count = (~torch.isinf(filtered_logits[b, s])).sum().item()
+                    assert non_inf_count <= top_k, (
+                        f"Non-inf count {non_inf_count} exceeds top_k {top_k}"
+                    )
+
+        # Test 2: Verify top-p filtering
+        if top_p < 1.0:
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    if top_k is not None:
+                        topk_vals, topk_indices = torch.topk(logits[b, s], k=top_k)
+                        temp_logits = torch.full_like(logits[b, s], float("-inf"))
+                        temp_logits[topk_indices] = topk_vals
+                    else:
+                        temp_logits = logits[b, s]
+                    probs = torch.nn.functional.softmax(temp_logits, dim=-1)
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumsum_probs = torch.cumsum(sorted_probs, dim=0)
+                    cutoff_idx = torch.where(cumsum_probs > top_p)[0]
+                    if len(cutoff_idx) > 0:
+                        cutoff_idx = cutoff_idx[0].item() + 1
+                    else:
+                        cutoff_idx = len(sorted_probs)
+                    kept_indices = sorted_indices[:cutoff_idx]
+                    for idx in kept_indices:
+                        if not torch.isinf(filtered_logits[b, s, idx]):
+                            continue
+                        raise AssertionError(f"Index {idx} in top-p should not be -inf")
+
+        # Test 3: No filtering case
+        if top_k is None and top_p >= 1.0:
+            torch.testing.assert_close(
+                filtered_logits, logits.detach(), rtol=1e-5, atol=1e-5
+            )
+
+        # Test 4: Valid probabilities
+        probs = torch.nn.functional.softmax(filtered_logits, dim=-1)
+        assert torch.all(probs >= 0) and torch.all(probs <= 1), "Invalid probabilities"
+        assert torch.allclose(
+            probs.sum(dim=-1), torch.ones(batch_size, seq_len, device="cuda"), atol=1e-5
+        ), "Probabilities don't sum to 1"
+
+        # Test 5: Verify keep_mask alignment with filtered logits
+        if keep_mask is not None:
+            non_inf_mask = ~torch.isinf(filtered_logits.detach())
+            assert torch.equal(keep_mask, non_inf_mask), (
+                f"keep_mask doesn't match non-inf positions in filtered_logits! "
+                f"Mismatch count: {(keep_mask != non_inf_mask).sum().item()} out of {keep_mask.numel()}"
+            )
+
+        # Test 6: Backward pass
+        torch.manual_seed(44)
+        output_grad = torch.randn_like(filtered_logits)
+        non_inf_mask = ~torch.isinf(filtered_logits.detach())
+        expected_grad = output_grad * non_inf_mask.float()
+        filtered_logits.backward(output_grad)
+        actual_grad = logits.grad
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
+
+        return {"success": True, "error": None, "top_k": top_k, "top_p": top_p}
+
+    def test_distributed_logprob_with_sampling(self, top_k, top_p, chunk_size):
+        """Test DistributedLogprobWithSampling and ChunkedDistributedLogprobWithSampling."""
+        tp_group = self.tp_group
+        tp_rank = torch.distributed.get_rank(tp_group)
+
+        batch_size = 4
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(42)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        vocab_parallel_logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
             .clone()
             .requires_grad_(True)
         )
-        local_weight = (
-            full_weight[vocab_start_index:vocab_end_index]
-            .detach()
-            .clone()
-            .requires_grad_(True)
-        )
 
-        # Baseline: compute full-vocab token logprobs on a single rank representation.
-        rolled_target = target.roll(shifts=-1, dims=-1)
-        baseline_logits = torch.matmul(full_hidden_states, full_weight.T).transpose(
-            0, 1
-        )  # [B, S, V]
-        baseline_log_probs = torch.nn.functional.log_softmax(
-            baseline_logits.float(), dim=-1
-        )
-        baseline_token_logprobs = torch.gather(
-            baseline_log_probs, dim=-1, index=rolled_target.unsqueeze(-1)
-        ).squeeze(-1)[:, :-1]
+        torch.manual_seed(43)
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-        # Distributed implementation under test.
-        token_logprobs = from_parallel_hidden_states_to_logprobs(
-            local_hidden_states,
-            local_weight,
-            local_weight,
-            runtime_gather_output=False,
-            target=target,
-            vocab_start_index=vocab_start_index,
-            vocab_end_index=vocab_end_index,
-            tp_group=self.tp_group,
-            inference_only=False,
-            chunk_size=self.chunk_size,
+        # === Expected computation using full logits ===
+        expected_logits_filtered, _ = apply_top_k_top_p(
+            full_logits.clone(), top_k=top_k, top_p=top_p
         )
+        expected_log_probs = torch.nn.functional.log_softmax(
+            expected_logits_filtered, dim=-1
+        )
+        expected_target_logprobs = torch.gather(
+            expected_log_probs, -1, target.unsqueeze(-1)
+        ).squeeze(-1)
 
+        # === Actual computation using distributed function ===
+        if chunk_size is None:
+            actual_logprobs = DistributedLogprobWithSampling.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                top_k,
+                top_p,
+                False,
+            )
+        else:
+            actual_logprobs = ChunkedDistributedLogprobWithSampling.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                top_k,
+                top_p,
+                chunk_size,
+                False,
+            )
+
+        # === Forward pass validation ===
         torch.testing.assert_close(
-            token_logprobs, baseline_token_logprobs, rtol=1e-4, atol=1e-4
+            actual_logprobs, expected_target_logprobs, rtol=1e-4, atol=1e-4
         )
 
-        # Backward comparison for hidden-state grads and local weight grads.
-        baseline_loss = baseline_token_logprobs.sum()
-        baseline_loss.backward()
-        expected_hidden_grad = full_hidden_states.grad[
-            rank * local_seq : (rank + 1) * local_seq
-        ]
-        expected_weight_grad = full_weight.grad[vocab_start_index:vocab_end_index]
+        # === Backward pass validation ===
+        torch.manual_seed(44)
+        output_grad = torch.randn_like(actual_logprobs)
 
-        dist_loss = token_logprobs.sum()
-        dist_loss.backward()
-        actual_hidden_grad = local_hidden_states.grad
-        actual_weight_grad = local_weight.grad
+        expected_logits_filtered_grad = full_logits.clone().requires_grad_(True)
+        expected_logits_filtered_after_filter, _ = apply_top_k_top_p(
+            expected_logits_filtered_grad, top_k=top_k, top_p=top_p
+        )
+        expected_log_probs_grad = torch.nn.functional.log_softmax(
+            expected_logits_filtered_after_filter, dim=-1
+        )
+        expected_target_logprobs_grad = torch.gather(
+            expected_log_probs_grad, -1, target.unsqueeze(-1)
+        ).squeeze(-1)
+        expected_target_logprobs_grad.backward(output_grad)
+        expected_grad = expected_logits_filtered_grad.grad[
+            :, :, vocab_start_index:vocab_end_index
+        ].clone()
 
-        torch.testing.assert_close(
-            actual_hidden_grad, expected_hidden_grad, rtol=1e-4, atol=1e-4
-        )
-        torch.testing.assert_close(
-            actual_weight_grad, expected_weight_grad, rtol=1e-4, atol=1e-4
-        )
+        actual_logprobs.backward(output_grad)
+        actual_grad = vocab_parallel_logits.grad.clone()
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-4)
 
         return {
-            "forward_max_diff": torch.max(
-                torch.abs(token_logprobs - baseline_token_logprobs)
-            ).item(),
-            "hidden_grad_max_diff": torch.max(
-                torch.abs(actual_hidden_grad - expected_hidden_grad)
-            ).item(),
-            "weight_grad_max_diff": torch.max(
-                torch.abs(actual_weight_grad - expected_weight_grad)
-            ).item(),
+            "success": True,
+            "error": None,
+            "top_k": top_k,
+            "top_p": top_p,
+            "chunk_size": chunk_size,
         }
 
-    def test_inference_only_forward(self):
-        rank = int(os.environ["RANK"])
 
-        batch_size = 2
-        seq_len = 6
-        hidden_size = 8
-        full_vocab_size = 32
-        local_seq = seq_len // self.tp_size
-        vocab_part_size = full_vocab_size // self.tp_size
-        vocab_start_index = rank * vocab_part_size
-        vocab_end_index = (rank + 1) * vocab_part_size
-
-        torch.manual_seed(2026)
-        full_hidden_states = torch.randn(
-            seq_len, batch_size, hidden_size, device="cuda"
-        )
-        full_weight = torch.randn(full_vocab_size, hidden_size, device="cuda")
-        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
-
-        local_hidden_states = full_hidden_states[
-            rank * local_seq : (rank + 1) * local_seq
-        ].clone()
-        local_weight = full_weight[vocab_start_index:vocab_end_index].clone()
-
-        token_logprobs = from_parallel_hidden_states_to_logprobs(
-            local_hidden_states,
-            local_weight,
-            local_weight,
-            runtime_gather_output=False,
-            target=target,
-            vocab_start_index=vocab_start_index,
-            vocab_end_index=vocab_end_index,
-            tp_group=self.tp_group,
-            inference_only=True,
-            chunk_size=self.chunk_size,
-        )
-
-        assert token_logprobs.shape == (batch_size, seq_len - 1)
-        assert not torch.isnan(token_logprobs).any()
-        assert not torch.isinf(token_logprobs).any()
-        return {"ok": True}
-
-
-HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN = (
-    f"{HiddenStatesToLogprobsTestActor.__module__}.HiddenStatesToLogprobsTestActor"
+SAMPLING_PARAMS_TEST_ACTOR_FQN = (
+    f"{SamplingParamsTestActor.__module__}.SamplingParamsTestActor"
 )
 
 
 @pytest.fixture
-def register_hidden_states_to_logprobs_test_actor():
+def register_sampling_params_test_actor():
+    """Register the SamplingParamsTestActor for use in tests."""
     original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
-        HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN
+        SAMPLING_PARAMS_TEST_ACTOR_FQN
     )
-    ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN] = (
-        PY_EXECUTABLES.SYSTEM
-    )
-
-    yield HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN
-
-    if HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+    ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN] = PY_EXECUTABLES.SYSTEM
+    yield SAMPLING_PARAMS_TEST_ACTOR_FQN
+    if SAMPLING_PARAMS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
         if original_registry_value is None:
-            del ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN]
+            del ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN]
         else:
-            ACTOR_ENVIRONMENT_REGISTRY[HIDDEN_STATES_TO_LOGPROBS_TEST_ACTOR_FQN] = (
+            ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN] = (
                 original_registry_value
             )
 
 
-@pytest.mark.parametrize("tp_size,chunk_size", [(1, 4), (2, 4)])
-def test_chunked_hidden_states_to_logprobs_all_tests(
-    register_hidden_states_to_logprobs_test_actor, tp_size, chunk_size
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [
+        (None, 1.0),  # No filtering
+        (10, 1.0),  # Only top-k
+        (None, 0.9),  # Only top-p
+        (10, 0.9),  # Both top-k and top-p
+    ],
+)
+def test_sampling_params_top_k_top_p(
+    register_sampling_params_test_actor, tp_size, top_k, top_p
 ):
+    """Test top-k and top-p filtering logic."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
         pytest.skip(
             f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
         )
-
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
-
     try:
-        actor_fqn = register_hidden_states_to_logprobs_test_actor
+        actor_fqn = register_sampling_params_test_actor
         sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
-        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size)
-
+        builder = RayWorkerBuilder(actor_fqn, tp_size, sharding)
         worker_group = RayWorkerGroup(
             cluster=cluster,
             remote_worker_builder=builder,
             workers_per_node=None,
             sharding_annotations=sharding,
         )
-
         futures = worker_group.run_all_workers_single_data(
-            "test_forward_and_backward_against_baseline"
+            "test_top_k_top_p_filtering_forward_backward", top_k=top_k, top_p=top_p
         )
         results = ray.get(futures)
         for i, result in enumerate(results):
-            assert result["forward_max_diff"] < 1e-4, (
-                f"Worker {i} forward diff too large: {result['forward_max_diff']}"
-            )
-            assert result["hidden_grad_max_diff"] < 1e-4, (
-                f"Worker {i} hidden grad diff too large: {result['hidden_grad_max_diff']}"
-            )
-            assert result["weight_grad_max_diff"] < 1e-4, (
-                f"Worker {i} weight grad diff too large: {result['weight_grad_max_diff']}"
-            )
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
 
-        futures = worker_group.run_all_workers_single_data(
-            "test_inference_only_forward"
+
+@pytest.mark.parametrize("tp_size", [2])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [
+        (10, 1.0),  # Only top-k
+        (None, 0.9),  # Only top-p
+        (10, 0.9),  # Both top-k and top-p
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [None, 4])
+def test_sampling_params_distributed_logprob(
+    register_sampling_params_test_actor, tp_size, top_k, top_p, chunk_size
+):
+    """Test DistributedLogprobWithSampling and ChunkedDistributedLogprobWithSampling."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
         )
-        inference_results = ray.get(futures)
-        for i, result in enumerate(inference_results):
-            assert result["ok"], f"Worker {i} inference-only forward failed"
-
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        actor_fqn = register_sampling_params_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, sharding)
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        futures = worker_group.run_all_workers_single_data(
+            "test_distributed_logprob_with_sampling",
+            top_k=top_k,
+            top_p=top_p,
+            chunk_size=chunk_size,
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()

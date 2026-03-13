@@ -69,6 +69,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
@@ -197,12 +198,20 @@ def validate_and_set_config(
     hf_model_name,
     pretrained_path,
     weights_path,
-    tokenizer,
 ):
-    # Handle generation colocation
+    # Handle generation configuration
     is_generation_colocated = None
+    sampling_params = None
     if "generation" in config and config["generation"] is not None:
-        is_generation_colocated = config["generation"]["colocated"]["enabled"]
+        generation_cfg = config["generation"]
+        # set generation colocated
+        is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg["top_k"],
+            top_p=generation_cfg["top_p"],
+            temperature=generation_cfg["temperature"],
+        )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -245,6 +254,7 @@ def validate_and_set_config(
         optimizer_cpu_offload,
         offload_optimizer_for_logprob,
         is_generation_colocated,
+        sampling_params,
         final_padded_vocab_size,
     )
 
@@ -946,15 +956,13 @@ def setup_reference_model_state(
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
+    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+    # so they only need to be loaded here if use_peft is False
     should_load_checkpoint = (
-        ref_checkpoint_config.pretrained_checkpoint is not None
+        not use_peft
+        and ref_checkpoint_config.pretrained_checkpoint is not None
         and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
     )
-
-    if should_load_checkpoint and use_peft:
-        # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
-        # This is switched off here in order to load these states from the checkpoint
-        ref_megatron_cfg.checkpoint.finetune = False
 
     print("Loading the Reference Model")
 
@@ -967,8 +975,6 @@ def setup_reference_model_state(
             checkpointing_context=ref_ckpt_context,
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
-    else:
-        print("Reference model not loaded")
 
     reference_state_dict = {}
 
@@ -984,6 +990,8 @@ def setup_reference_model_state(
                 cpu_item = item
             reference_state_dict[name] = cpu_item
         print("Reference model loaded")
+    else:
+        print("Reference model not loaded")
 
     return reference_state_dict
 

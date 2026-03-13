@@ -95,7 +95,6 @@ class SequencePackingLossWrapper:
                 else:
                     unpadded_seq_data[k] = v
 
-            # get next_token_logits
             cp_size = (
                 1
                 if self.context_parallel_group is None
@@ -116,16 +115,6 @@ class SequencePackingLossWrapper:
                 )
                 logit_slice_idxs = slice(logit_start, logit_end)
                 next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
-                # Linear CE fusion path: model.forward already returns next-token logprobs.
-                loss, metrics = self.loss_fn(
-                    next_token_logits_slice,
-                    unpadded_seq_data,
-                    global_valid_seqs,
-                    global_valid_toks,
-                    vocab_parallel_rank=self.vocab_parallel_rank,
-                    vocab_parallel_group=self.vocab_parallel_group,
-                    context_parallel_group=self.context_parallel_group,
-                )
             else:
                 logit_start = seq_start // cp_size
                 logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
@@ -133,23 +122,20 @@ class SequencePackingLossWrapper:
                 next_token_logits_slice = next_token_logits.narrow(
                     1, logit_start, logit_length
                 )
-                # prepare data for loss function
-                loss_input = self.prepare_fn(
-                    logits=next_token_logits_slice,
-                    data=unpadded_seq_data,
-                    loss_fn=self.loss_fn,
-                    vocab_parallel_rank=self.vocab_parallel_rank,
-                    vocab_parallel_group=self.vocab_parallel_group,
-                    context_parallel_group=self.context_parallel_group,
-                )
-
-                # call loss function
-                loss, metrics = self.loss_fn(
-                    data=unpadded_seq_data,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    **loss_input,
-                )
+            loss_input, unpadded_seq_data = self.prepare_fn(
+                logits=next_token_logits_slice,
+                data=unpadded_seq_data,
+                loss_fn=self.loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+            loss, metrics = self.loss_fn(
+                data=unpadded_seq_data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **loss_input,
+            )
 
             # aggregate loss and metrics
             loss_accum += loss
@@ -190,7 +176,7 @@ def wrap_loss_fn_with_input_preparation(
 ) -> tuple[Tensor, dict[str, Any]]:
     """Wraps a loss function to handle input preparation for megatron policy worker."""
     # prepare loss input
-    loss_input = prepare_fn(
+    loss_input, data = prepare_fn(
         logits=next_token_logits,
         data=data,
         loss_fn=loss_fn,

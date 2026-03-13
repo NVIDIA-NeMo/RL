@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -29,6 +30,12 @@ from transformers import (
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
+
+
+def get_gdpo_reward_component_keys(batch) -> list:
+    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
+    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
+    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
 
 
 def calculate_kl(
@@ -180,6 +187,39 @@ def masked_mean(
         else global_normalization_factor
     )
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
+
+
+def mask_out_neg_inf_logprobs(
+    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+) -> torch.Tensor:
+    """Mask out negative infinity log probabilities.
+
+    Handling sampling mask mismatch:
+    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
+    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+
+    Args:
+        logprobs: Log probabilities.
+        mask: Mask.
+        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+
+    Returns:
+        Masked log probabilities.
+    """
+    is_neginf = torch.isinf(logprobs)
+    neginf_count = (is_neginf & mask.bool()).sum().item()
+    if neginf_count > 0:
+        print(
+            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
+            "(policy top-k/top-p mismatch). Masking out these positions."
+        )
+
+    mask = mask * (~is_neginf).float()
+    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+
+    return logprobs
 
 
 def set_seed(seed: int) -> None:
