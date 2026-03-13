@@ -42,6 +42,30 @@ else:
 
 **Backwards compatibility:** No behavioral change. The modules are imported at the same point in the execution flow — just deferred from module load time to first use.
 
+### 3. `resources_servers/turing_vif/app.py` — Configurable Reward Aggregation
+
+**Problem:** The reward signal was hard-coded to all-or-nothing (AND): `reward = float(all(is_following_list))`. This is the strictest aggregation — the model only receives reward 1.0 when every single check passes, and 0.0 otherwise. For tasks with many constraints, this produces a very sparse reward signal that can hinder RL training.
+
+**Fix:** Added an `AggregationMode` enum and a configurable `aggregation_mode` field to `TuringVIFResourcesServerConfig`. The `verify()` method now converts the per-check boolean results into float scores and delegates to `_aggregate_scores()`, which supports five modes:
+
+| Mode | Behavior | Output |
+|------|----------|--------|
+| `all` (default) | All checks must pass (AND) | 0.0 or 1.0 |
+| `any` | At least one passes (OR) | 0.0 or 1.0 |
+| `mean` | Average of binary scores | [0.0, 1.0] |
+| `min` | Minimum score | 0.0 or 1.0 |
+| `max` | Maximum score | 0.0 or 1.0 |
+
+**Backwards compatibility:** Fully backwards-compatible. The default is `all`, which reproduces the original hard-coded behavior exactly. The base `turing_vif.yaml` config now declares the field explicitly. Experiment YAMLs can override it per-experiment (e.g., `aggregation_mode: mean` for multichallenge and inverse_if).
+
+### 4. `resources_servers/turing_vif/configs/turing_vif.yaml` — Base Config Update
+
+Added `aggregation_mode: all` to the base server config so the field is explicit and discoverable.
+
+### 5. `resources_servers/turing_vif/README.md` — Documentation Update
+
+Updated to document the new `aggregation_mode` config field with a table of available modes and an example experiment YAML override.
+
 ## Experiment Configs (NeMo-RL side, not in Gym)
 
 The following changes were made in the NeMo-RL experiment configs to work with the corrected Gym code:
@@ -51,3 +75,4 @@ The following changes were made in the NeMo-RL experiment configs to work with t
 - Used proper `local_vllm_model` config fields: `vllm_serve_kwargs` and `vllm_serve_env_vars`
 - Switched dataset loading from inherited `OpenMathInstruct-2` to `NemoGymDataset` with `nemo_gym_data_processor`
 - Fixed `cluster.num_nodes` to use policy-only node count (judge nodes managed separately by NeMo-Gym)
+- Set `aggregation_mode: mean` in both `grpo_turing_vif_multichallenge.yaml` and `grpo_turing_vif_inverse_if.yaml` for denser reward signal during RL training

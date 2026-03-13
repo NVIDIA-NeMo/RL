@@ -5,8 +5,8 @@
 # All training hyperparameters, policy, Megatron, and vLLM settings are
 # identical to the original multichallenge experiment for fair comparison.
 #
-# Key difference: turing_vif uses all-or-nothing reward (1.0 only if ALL
-# llm_judge checks pass) vs the old multichallenge mean aggregation.
+# Reward aggregation: mean (average of binary per-check scores).
+# Options: all (AND), any (OR), mean, min, max.
 #
 # Architecture (colocated):
 #   - Training nodes: 16 (Megatron with TP=4, CP=1, EP=8)
@@ -221,6 +221,7 @@ env:
     turing_vif:
       resources_servers:
         turing_vif:
+          aggregation_mode: mean  # all | any | mean | min | max
           judge_server_name: judge_model
           judge_base_url: null
           judge_api_key: dummy_key
