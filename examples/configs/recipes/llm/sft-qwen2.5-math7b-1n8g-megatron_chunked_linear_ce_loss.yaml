@@ -11,6 +11,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    use_linear_ce_fusion_loss: true
     linear_ce_fusion_chunk_size: 128
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
@@ -31,8 +32,6 @@ policy:
       lr_warmup_iters: 10
       lr_warmup_init: 1.0e-11
       lr_decay_iters: 32
-  sequence_packing:
-    enabled: true
   make_sequence_length_divisible_by: 8
 data:
   add_generation_prompt: true

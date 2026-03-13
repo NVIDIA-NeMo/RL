@@ -587,7 +587,6 @@ class NLLLossFn(LossFunction):
         global_valid_toks: Tensor,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
-        **_: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
