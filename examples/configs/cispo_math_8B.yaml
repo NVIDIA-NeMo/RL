@@ -1,5 +1,4 @@
 # CISPO Algorithm Configuration
-# This algoritm implements the CISPO algorithm from MiniMax-M1 paper: https://arxiv.org/abs/2506.13585
 defaults: "grpo_math_1B.yaml"
 
   # ============================================================================
@@ -14,9 +13,12 @@ defaults: "grpo_math_1B.yaml"
 loss_fn:
   use_cispo: true
   reference_policy_kl_penalty: 0.0
-  ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
-
+  ratio_clip_min: 1.0 # set to very high
+  ratio_clip_max: 0.8 #tune as per experiments
+  token_level_loss: true
+  force_on_policy_ratio: false
+  ratio_clip_c: null
+  
 checkpointing:
   checkpoint_dir: "results/cispo"
 
