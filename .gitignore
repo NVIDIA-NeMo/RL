@@ -17,6 +17,9 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+*.so
+**/libcudnn*.so*
+**/libcudnn*.a
 
 # Test
 coverage.json
