@@ -271,8 +271,7 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
-      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
-      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
+      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
