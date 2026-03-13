@@ -18,7 +18,12 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
@@ -37,7 +42,10 @@ class NemoGym(EnvironmentInterface):
         self.cfg = cfg
 
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        self.head_server_port = _get_free_port_local(
+            port_range_low=self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW),
+            port_range_high=self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH),
+        )
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
