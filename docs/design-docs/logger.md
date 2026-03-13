@@ -151,6 +151,30 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ![Validation Pretty Logging Example](../assets/val-log.png)
 
+## Validation Table Logging (WandB)
+
+When WandB is enabled, validation input/output samples can be logged as WandB tables for manual inspection in the WandB UI. This is controlled by the `num_val_samples_to_log` configuration parameter.
+
+```python
+logger:
+  wandb_enabled: true
+  wandb:
+    project: "my-project"
+    name: "my-run"
+  num_val_samples_to_log: 16  # 0 to disable
+```
+
+When `num_val_samples_to_log` is greater than 0, the logger uploads a table at each validation step with columns **input**, **output**, and **reward**. Samples are chosen to include a mix of high- and low-reward examples for easier quality inspection. The tables appear in WandB as `val/generations` and `val/generations_step_{step}`.
+
+This is useful for:
+
+1. Inspecting model generations directly in the WandB run without opening logs or artifacts.
+2. Comparing prompts, responses, and rewards across validation steps.
+3. Sharing or reviewing specific samples with collaborators via the WandB UI.
+
+> [!NOTE]
+> This feature only has effect when `wandb_enabled` is true. If WandB is disabled or `num_val_samples_to_log` is 0, no validation tables are logged.
+
 ## GPU Metric Logging
 
 NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.
