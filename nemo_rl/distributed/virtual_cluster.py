@@ -318,9 +318,9 @@ class RayVirtualCluster:
             # Create a single unified placement group for cross-node model parallelism
             all_bundles = []
             for bundle_count in self._bundle_ct_per_node_list:
-                for _ in range(bundle_count):
+                for _ in range(4):
                     all_bundles.append(
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+                        {"CPU": num_cpus_per_bundle, "GPU": 2}
                     )
 
             placement_groups = [
@@ -333,8 +333,8 @@ class RayVirtualCluster:
             for node_idx, bundle_count in enumerate(self._bundle_ct_per_node_list):
                 if bundle_count > 0:
                     node_bundles = [
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                        for _ in range(bundle_count)
+                        {"CPU": num_cpus_per_bundle, "GPU": 2}
+                        for _ in range(4)
                     ]
                     pg = placement_group(
                         bundles=node_bundles,

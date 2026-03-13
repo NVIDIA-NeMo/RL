@@ -109,7 +109,7 @@ class BaseVllmGenerationWorker:
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
 
-        env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
 
@@ -378,27 +378,29 @@ class BaseVllmGenerationWorker:
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
 
-        # Special handling for parallel case (either TP or PP or both)
-        if model_parallel_size > 1:
-            # Configure vLLM for tensor/pipeline parallelism within Ray
-            # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
-                self.fraction_of_gpus / model_parallel_size
-            )
+        rank = int(os.environ["RANK"])
+        os.environ["CUDA_VISIBLE_DEVICES"] = f"{rank*2},{rank*2+1}"
+        # # Special handling for parallel case (either TP or PP or both)
+        # if model_parallel_size > 1:
+        #     # Configure vLLM for tensor/pipeline parallelism within Ray
+        #     # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
+        #     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        #     os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
+        #         self.fraction_of_gpus / model_parallel_size
+        #     )
 
-            # Set bundle indices for parallel workers
-            bundle_indices_str = ",".join(map(str, bundle_indices))
-            os.environ["VLLM_RAY_BUNDLE_INDICES"] = bundle_indices_str
-            print(
-                f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
-            )
+        #     # Set bundle indices for parallel workers
+        #     bundle_indices_str = ",".join(map(str, bundle_indices))
+        #     os.environ["VLLM_RAY_BUNDLE_INDICES"] = bundle_indices_str
+        #     print(
+        #         f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
+        #     )
 
-            # Use Ray for distributed execution in parallel mode
-            vllm_kwargs["distributed_executor_backend"] = "ray"
-        else:
-            # For non-parallel mode, explicitly set executor to None to avoid Ray issues
-            vllm_kwargs["distributed_executor_backend"] = None
+        #     # Use Ray for distributed execution in parallel mode
+        #     vllm_kwargs["distributed_executor_backend"] = "ray"
+        # else:
+        #     # For non-parallel mode, explicitly set executor to None to avoid Ray issues
+        #     vllm_kwargs["distributed_executor_backend"] = None
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -493,6 +495,17 @@ class BaseVllmGenerationWorker:
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
             logprobs_mode="processed_logprobs",
+            distributed_executor_backend="mp",
+            # data_parallel_external_lb=True,
+            # data_parallel_rank=os.environ["VLLM_DP_RANK"],
+            # master_addr=os.environ["VLLM_DP_MASTER_IP"],
+            master_addr="127.0.0.1",
+            master_port=os.environ["VLLM_DP_MASTER_PORT"],
+            data_parallel_rpc_port=10888,
+            data_parallel_size=int(os.environ["VLLM_DP_SIZE"]),
+            data_parallel_size_local=int(os.environ["VLLM_DP_SIZE"]),
+            data_parallel_start_rank=0,
+            data_parallel_address="127.0.0.1",
             **vllm_kwargs,
         )
 

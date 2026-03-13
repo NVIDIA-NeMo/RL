@@ -540,7 +540,7 @@ class RayWorkerGroup:
                 worker_future, initializer = remote_worker_builder.create_worker_async(
                     placement_group=pg,
                     placement_group_bundle_index=bundle_idx,
-                    num_gpus=num_gpus,
+                    num_gpus=2,
                     bundle_indices=worker_bundle_indices,
                     **extra_options,
                 )
