@@ -24,14 +24,29 @@ ckpts/
 coverage.json
 .coverage*
 test_assets/
+.nrl_remote_map.json
+.nrl_remote_state.json
+# Test biproducts
+tests/functional/*/
+
+# Gym
+/3rdparty/Gym-workspace/Gym/cache/uv/
+/3rdparty/Gym-workspace/Gym/res*/*/.venv/
+/3rdparty/Gym-workspace/Gym/res*/*/.venv/
+/3rdparty/Gym-workspace/Gym/.venv/
 
 # Cache
 uv_cache/
 hf_home/
 hf_datasets_cache/
 *logs/
-datasets/
+/datasets/
 wandb/
 checkpoints/
 results/
-code_snapshots/
+code_snapshots*/
+.cache/
+
+# Runtime env
+*runtime_env.yaml
+!default_runtime_env.yaml
