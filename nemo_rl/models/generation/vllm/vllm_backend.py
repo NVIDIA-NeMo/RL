@@ -173,14 +173,9 @@ class VllmInternalWorkerExtension:
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
-                # Load weights into the model
-                from nemo_rl.models.generation.vllm.quantization import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
+                # Load weights into the model (re-uses the shared helper that
+                # skips FP8 quantization when weights arrive pre-quantized).
+                self._load_model_weights(weights, self.model_runner)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -207,6 +202,25 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+    @staticmethod
+    def _load_model_weights(weights, model_runner):
+        """Load model weights, skipping FP8 quantization when pre-quantized.
+
+        If the incoming batch already contains ``_scale_inv`` entries (i.e.
+        weights were quantized on the training worker), we feed them straight
+        to ``model.load_weights`` and avoid a redundant quantization pass.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(model_runner.vllm_config):
+            pre_quantized = any(name.endswith("_scale_inv") for name, _ in weights)
+            if pre_quantized:
+                model_runner.model.load_weights(weights=weights)
+            else:
+                fp8.load_weights(weights, model_runner)
+        else:
+            model_runner.model.load_weights(weights=weights)
+
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
@@ -217,25 +231,7 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        def _load_model_weights(weights, model_runner):
-            """Load model weights.
-
-            Args:
-                weights: List[(name, tensor)]
-                model_runner: vLLM ModelRunner
-
-            Returns:
-                None
-            """
-            from nemo_rl.models.generation.vllm.quantization import fp8
-
-            if fp8.is_fp8_model(model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, model_runner)
-            else:
-                model_runner.model.load_weights(weights=weights)
-
-        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+        load_model_weight_func = lambda x: self._load_model_weights(x, self.model_runner)
 
         try:
             packed_broadcast_consumer(
