@@ -292,7 +292,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
