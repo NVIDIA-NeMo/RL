@@ -1743,6 +1743,9 @@ def from_parallel_hidden_states_to_logprobs(
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded hidden states."""
     target = target.roll(shifts=-1, dims=-1)
+    assert cp_group is None or torch.distributed.get_world_size(cp_group) == 1, (
+        "Context parallelism is not supported for linear CE fusion loss"
+    )
     logprobs: torch.Tensor = ChunkedDistributedHiddenStatesToLogprobs.apply(  # type: ignore
         tensor_parallel_hidden_states,
         target,

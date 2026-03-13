@@ -100,7 +100,7 @@ class SequencePackingLossWrapper:
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
-
+            # prepare data for loss function
             if (
                 hasattr(self.loss_fn, "use_linear_ce_fusion")
                 and self.loss_fn.use_linear_ce_fusion
@@ -130,6 +130,8 @@ class SequencePackingLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
+
+            # call loss function
             loss, metrics = self.loss_fn(
                 data=unpadded_seq_data,
                 global_valid_seqs=global_valid_seqs,
