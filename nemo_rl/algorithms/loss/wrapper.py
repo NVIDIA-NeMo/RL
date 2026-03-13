@@ -95,20 +95,33 @@ class SequencePackingLossWrapper:
                 else:
                     unpadded_seq_data[k] = v
 
-            # get next_token_logits
             cp_size = (
                 1
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
-            logit_start = seq_start // cp_size
-            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
-            logit_length = logit_end - logit_start
-            next_token_logits_slice = next_token_logits.narrow(
-                1, logit_start, logit_length
-            )
-
             # prepare data for loss function
+            if (
+                hasattr(self.loss_fn, "use_linear_ce_fusion")
+                and self.loss_fn.use_linear_ce_fusion
+            ):
+                # Linear CE fusion returns precomputed token logprobs where shape
+                # can be shorter by 1 token than padded sequence metadata.
+                # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
+                logit_start = seq_start // cp_size
+                logit_end = min(
+                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    next_token_logits.shape[1],
+                )
+                logit_slice_idxs = slice(logit_start, logit_end)
+                next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
+            else:
+                logit_start = seq_start // cp_size
+                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_length = logit_end - logit_start
+                next_token_logits_slice = next_token_logits.narrow(
+                    1, logit_start, logit_length
+                )
             loss_input, unpadded_seq_data = self.prepare_fn(
                 logits=next_token_logits_slice,
                 data=unpadded_seq_data,

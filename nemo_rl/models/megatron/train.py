@@ -67,19 +67,20 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        cfg: Policy configuration dictionary
         input_ids_cp_sharded: Context-parallel sharded input token IDs
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         straggler_timer: Straggler detector for profiling the forward pass
+        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -96,6 +97,11 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if use_linear_ce_fusion_loss:
+        additional_kwargs["labels"] = input_ids_cp_sharded
+        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+        # GPTModel.forward signatures do not accept it.
+        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -135,6 +141,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -178,6 +185,7 @@ def forward_with_post_processing_fn(
         packed_seq_params=packed_seq_params,
         defer_fp32_logits=defer_fp32_logits,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -231,6 +239,7 @@ def megatron_forward_backward(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -263,6 +272,7 @@ def megatron_forward_backward(
         global_valid_toks=global_valid_toks,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
