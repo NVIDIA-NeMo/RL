@@ -594,12 +594,6 @@ class NLLLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
-        if self.use_linear_ce_fusion:
-            # Linear CE fusion returns precomputed next-token logprobs from model.forward.
-            next_token_logprobs = next_token_logprobs.to(torch.float32)
-            next_token_logprobs = next_token_logprobs[
-                :, : data["input_ids"].shape[1] - 1
-            ]
 
         if dpo_loss:
             ## shape: [batch_size]

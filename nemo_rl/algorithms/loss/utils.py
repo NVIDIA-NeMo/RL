@@ -64,6 +64,8 @@ def prepare_loss_input(
         # Keep normal path unchanged for standard logits (3D tensor).
         if logits.ndim == 2:
             logprobs = logits
+            logprobs = logprobs.to(torch.float32)
+            logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
         else:
             logprobs = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
