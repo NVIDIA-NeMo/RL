@@ -44,3 +44,6 @@ class VllmSpecificArgs(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+
+    # quantization config
+    quant_cfg: NotRequired[str | None]

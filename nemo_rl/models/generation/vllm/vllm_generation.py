@@ -143,6 +143,12 @@ class VllmGeneration(GenerationInterface):
             worker_cls = (
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
+        try:
+            from nemo_rl.modelopt.resolve import resolve_generation_worker_cls
+
+            worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        except ImportError:
+            pass
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars

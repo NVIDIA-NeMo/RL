@@ -91,6 +91,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         if megatron_enable:
             worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            try:
+                from nemo_rl.modelopt.resolve import resolve_policy_worker_cls
+
+                worker_builder_cls_fqn = resolve_policy_worker_cls(
+                    worker_builder_cls_fqn, config
+                )
+            except ImportError:
+                pass
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -114,7 +122,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
                 worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                try:
+                    from nemo_rl.modelopt.resolve import resolve_policy_worker_cls
 
+                    worker_builder_cls_fqn = resolve_policy_worker_cls(
+                        worker_builder_cls_fqn, config
+                    )
+                except ImportError:
+                    pass
                 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                     warnings.warn(
                         "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
