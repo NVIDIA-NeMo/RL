@@ -454,7 +454,8 @@ requires-dist = [
   # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
   # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
-  "transformer-engine[pytorch,core_cu13]",
+  # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
+  "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
   "nvidia-resiliency-ext",
   "causal-conv1d",
