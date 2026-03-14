@@ -141,6 +141,9 @@ def mock_components():
             "make_sequence_length_divisible_by": 8,
             "max_total_sequence_length": 2048,
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {
                     "enabled": False,
                 },
@@ -420,6 +423,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -485,6 +491,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,
@@ -600,6 +609,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated

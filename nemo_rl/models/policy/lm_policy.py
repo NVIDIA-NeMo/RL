@@ -70,13 +70,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
+        worker_extension_cls_fqn: Optional[str] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        worker_builder_cls: str
+        worker_builder_cls_fqn: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
@@ -89,12 +90,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
         if megatron_enable:
-            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             try:
                 from nemo_rl.modelopt.resolve import resolve_policy_worker_cls
 
-                worker_builder_cls = resolve_policy_worker_cls(
-                    worker_builder_cls, config
+                worker_builder_cls_fqn = resolve_policy_worker_cls(
+                    worker_builder_cls_fqn, config
                 )
             except ImportError:
                 pass
@@ -120,12 +121,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
                 try:
                     from nemo_rl.modelopt.resolve import resolve_policy_worker_cls
 
-                    worker_builder_cls = resolve_policy_worker_cls(
-                        worker_builder_cls, config
+                    worker_builder_cls_fqn = resolve_policy_worker_cls(
+                        worker_builder_cls_fqn, config
                     )
                 except ImportError:
                     pass
@@ -139,12 +140,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+        # If a worker extension class is provided, use it instead of the default worker builder class
+        if worker_extension_cls_fqn is not None:
+            print(
+                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+            )
+            worker_builder_cls_fqn = worker_extension_cls_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -203,7 +211,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         pre_init_queue = RayQueue()
         worker_builder = RayWorkerBuilder(
-            worker_builder_cls,
+            worker_builder_cls_fqn,
             config,
             tokenizer=tokenizer,
             processor=processor,
@@ -289,6 +297,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with the same data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with different data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
