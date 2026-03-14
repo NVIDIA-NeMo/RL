@@ -908,7 +908,9 @@ AttributeError: 'Gemma3Config' object has no attribute 'pad_token_id'
 **Affected tests:**
 - `grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long` — UNK — `code_snapshots_v5_release/grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long/9939370-logs/ray-driver.log`
 
-**Observation:** Transformers v5 changed Gemma3Config — `pad_token_id` moved or was removed. Needs a compatibility fix in the code that accesses it.
+**Root cause:** Transformers v5 Gemma3Config doesn't have `pad_token_id` as a direct attribute (raises `AttributeError` instead of returning `None`). Code at `dtensor_policy_worker.py:300` and `automodel/setup.py:641` accessed it directly.
+
+**Fix:** Changed to `getattr(model.config, "pad_token_id", None)` in both locations. Needs rerun.
 
 ---
 
