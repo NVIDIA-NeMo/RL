@@ -274,7 +274,6 @@ def setup_model_config(
     weights_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Setup model configuration."""
-
     model_cfg = None
     megatron_recipe = config.get("megatron_recipe") or config.get(
         "megatron_cfg", {}
@@ -286,7 +285,7 @@ def setup_model_config(
         megatron_cfg = load_recipe(megatron_recipe)
         model_cfg = megatron_cfg.model
 
-    else: 
+    else:
         # Load pretrained run config
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"

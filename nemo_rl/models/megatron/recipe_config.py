@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Recipe-based configuration for NeMo-RL Megatron integration.
+"""Recipe-based configuration for NeMo-RL Megatron integration.
 
 This module provides a clean integration with Megatron-Bridge recipes,
 allowing NeMo-RL to use pre-configured training recipes as a base and
@@ -36,8 +35,7 @@ from megatron.bridge.training.config import ConfigContainer
 
 
 def load_recipe(recipe_path: str) -> ConfigContainer:
-    """
-    Dynamically import and call a Megatron-Bridge recipe function.
+    """Dynamically import and call a Megatron-Bridge recipe function.
 
     Args:
         recipe_path: Fully qualified Python import path to the recipe function.
