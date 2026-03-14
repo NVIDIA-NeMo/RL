@@ -16,17 +16,17 @@
 import ray
 
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    DTensorPolicyWorkerV2Impl,
+from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+    DTensorPolicyWorkerImpl,
 )
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
 )  # pragma: no cover
-class DTensorQuantPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
-    # TODO: Adding quantization support for DTensorQuantPolicyWorkerV2 when modelopt supports AutoModel
+class DTensorQuantPolicyWorker(DTensorPolicyWorkerImpl):
+    # TODO: Adding quantization support for DTensorQuantPolicyWorker when modelopt supports AutoModel
     def __init__(self, *args, **kwargs):
         raise NotImplementedError(
-            "Quantization support for DTensorQuantPolicyWorkerV2 is not implemented yet."
+            "Quantization support for DTensorQuantPolicyWorker is not implemented yet."
         )

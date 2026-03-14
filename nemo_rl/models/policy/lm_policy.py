@@ -141,6 +141,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
                 worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                try:
+                    from nemo_rl.modelopt.resolve import resolve_policy_worker_cls
+
+                    worker_builder_cls_fqn = resolve_policy_worker_cls(
+                        worker_builder_cls_fqn, config
+                    )
+                except ImportError:
+                    pass
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]

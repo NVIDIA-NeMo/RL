@@ -14,6 +14,7 @@
 
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
