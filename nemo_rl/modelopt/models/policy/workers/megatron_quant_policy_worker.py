@@ -302,6 +302,42 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for name, config in configs.items():
                 setattr(self.model.get_submodule(name), "config", config)
 
+    def get_quantizer_stats(self) -> dict:
+        """Return summary statistics for all enabled TensorQuantizers.
+
+        Useful for verifying that calibration ran and amax values are valid.
+        """
+        total = 0
+        enabled = 0
+        with_amax = 0
+        positive_amax = 0
+        for _, module in self.model.named_modules():
+            if isinstance(module, TensorQuantizer):
+                total += 1
+                if module.is_enabled:
+                    enabled += 1
+                    if hasattr(module, "amax") and module.amax is not None:
+                        with_amax += 1
+                        if (module.amax > 0).all():
+                            positive_amax += 1
+        return {
+            "total": total,
+            "enabled": enabled,
+            "with_amax": with_amax,
+            "positive_amax": positive_amax,
+        }
+
+    def generate(self, **kwargs):
+        """Quantized Megatron generation is not supported.
+
+        ModelOpt unconditionally patches flash_decode_and_prefill on quantized
+        attention modules, which breaks the Megatron generation path.
+        """
+        raise NotImplementedError(
+            "MegatronQuantPolicyWorker does not support generate(). "
+            "Use vLLM or SGLang as the generation backend instead."
+        )
+
     def save_checkpoint(self, *args, **kwargs):
         """Save the checkpoint."""
         with self.without_model_config():

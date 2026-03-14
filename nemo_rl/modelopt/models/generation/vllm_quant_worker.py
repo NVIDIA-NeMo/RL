@@ -29,7 +29,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
     def __init__(self, *args, **kwargs):
         kwargs["extra_env_vars"] = ["VLLM_QUANT_CFG"]
@@ -48,20 +48,40 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
 
         super()._create_engine(llm_kwargs)
 
-    def export_amax(self) -> dict[str, Any]:
-        """Export amax buffers for testing/debugging."""
+    def _collective_rpc_or_empty(self, method: str) -> dict[str, Any]:
+        """Best-effort RPC call; returns {} on any failure.
+
+        collective_rpc can propagate arbitrary exceptions from the internal
+        worker (RuntimeError, AttributeError, etc.), so broad except is
+        intentional here -- consistent with the base class pattern.
+        """
         if not hasattr(self, "llm"):
             return {}
         try:
-            results = self.llm.collective_rpc("export_amax", args=tuple())
+            results = self.llm.collective_rpc(method, args=tuple())
             return results[0] if results else {}
         except Exception:
             return {}
 
+    def export_amax(self) -> dict[str, Any]:
+        """Export amax buffers for testing/debugging."""
+        return self._collective_rpc_or_empty("export_amax")
+
+    def get_quantizer_stats(self) -> dict[str, Any]:
+        """Return quantizer statistics. Mirrors MegatronQuantPolicyWorker.get_quantizer_stats()."""
+        return self._collective_rpc_or_empty("get_quantizer_stats")
+
+    def get_weight_snapshot(self, name: str) -> Any:
+        """Return a CPU copy of a named parameter for before/after comparison."""
+        if not hasattr(self, "llm"):
+            return None
+        results = self.llm.collective_rpc("get_weight_snapshot", args=(name,))
+        return results[0] if results else None
+
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
-)
+)  # pragma: no cover
 class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
     def __init__(self, *args, **kwargs):
         kwargs["extra_env_vars"] = ["VLLM_QUANT_CFG"]
@@ -79,12 +99,30 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
 
         super()._create_engine(llm_kwargs)
 
-    def export_amax(self) -> dict[str, Any]:
-        """Export amax buffers for testing/debugging."""
+    async def _collective_rpc_or_empty(self, method: str) -> dict[str, Any]:
+        """Best-effort async RPC call; returns {} on any failure.
+
+        See sync counterpart for rationale on broad except.
+        """
         if not hasattr(self, "llm"):
             return {}
         try:
-            results = self.llm.collective_rpc("export_amax", args=tuple())
+            results = await self.llm.collective_rpc(method, args=tuple())
             return results[0] if results else {}
         except Exception:
             return {}
+
+    async def export_amax(self) -> dict[str, Any]:
+        """Export amax buffers for testing/debugging."""
+        return await self._collective_rpc_or_empty("export_amax")
+
+    async def get_quantizer_stats(self) -> dict[str, Any]:
+        """Return quantizer statistics. Mirrors MegatronQuantPolicyWorker.get_quantizer_stats()."""
+        return await self._collective_rpc_or_empty("get_quantizer_stats")
+
+    async def get_weight_snapshot(self, name: str) -> Any:
+        """Return a CPU copy of a named parameter for before/after comparison."""
+        if not hasattr(self, "llm"):
+            return None
+        results = await self.llm.collective_rpc("get_weight_snapshot", args=(name,))
+        return results[0] if results else None

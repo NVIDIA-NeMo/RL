@@ -36,7 +36,7 @@ MODELOPT_MCORE_EXECUTABLE = (
 
 MODELOPT_ACTOR_REGISTRY: dict[str, str] = {
     "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker": MODELOPT_VLLM_EXECUTABLE,
-    "nemo_rl.modelopt.models.generation.vllm_quant_worker_async.VllmQuantAsyncGenerationWorker": MODELOPT_VLLM_EXECUTABLE,
+    "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker": MODELOPT_VLLM_EXECUTABLE,
     "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2": MODELOPT_AUTOMODEL_EXECUTABLE,
     "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker": MODELOPT_MCORE_EXECUTABLE,
 }

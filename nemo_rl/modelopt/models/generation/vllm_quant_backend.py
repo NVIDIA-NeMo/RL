@@ -84,7 +84,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     and hasattr(module, "_is_active")
                     and module._is_active
                 ):
-                    print(f"enabling quantizer: {module}")
+                    # print(f"enabling quantizer: {module}")
                     module.enable()
             yield
         finally:
@@ -103,6 +103,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 )
             return super()._load_weights(weights)
 
+    def get_weight_snapshot(self, name: str) -> torch.Tensor:
+        """Return a CPU copy of a named parameter for before/after comparison."""
+        model = self.model_runner.model
+        for n, p in model.named_parameters():
+            if n == name:
+                return p.detach().cpu().clone()
+        raise KeyError(f"Parameter '{name}' not found in model")
+
     def export_amax(self) -> dict[str, torch.Tensor]:
         """Export amax buffers from the model for testing/debugging."""
         try:
@@ -114,3 +122,32 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             }
         except AttributeError:
             return {}
+
+    def get_quantizer_stats(self) -> dict:
+        """Return summary statistics for all TensorQuantizer modules.
+
+        Matches the interface of MegatronQuantPolicyWorker.get_quantizer_stats().
+        """
+        total = 0
+        enabled = 0
+        with_amax = 0
+        positive_amax = 0
+        try:
+            model = self.model_runner.model
+        except AttributeError:
+            return {"total": 0, "enabled": 0, "with_amax": 0, "positive_amax": 0}
+        for _, module in model.named_modules():
+            if isinstance(module, TensorQuantizer):
+                total += 1
+                if module.is_enabled:
+                    enabled += 1
+                    if hasattr(module, "amax") and module.amax is not None:
+                        with_amax += 1
+                        if (module.amax > 0).all():
+                            positive_amax += 1
+        return {
+            "total": total,
+            "enabled": enabled,
+            "with_amax": with_amax,
+            "positive_amax": positive_amax,
+        }

@@ -255,7 +255,8 @@ def quantize_model(
     if data == "random":
         calib_size = 1
         calib_dataloader = DataLoader(
-            _DictDataset({"input_ids": torch.randint(0, 100, (1, 5))}), batch_size=1
+            _DictDataset({"input_ids": torch.randint(0, 100, (1, 5), device=device)}),
+            batch_size=1,
         )
     else:
         calib_dataloader = get_dataset_dataloader(
