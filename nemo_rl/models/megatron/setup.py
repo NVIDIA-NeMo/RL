@@ -998,12 +998,11 @@ def setup_model_and_optimizer(
         pg_collection=pg_collection,
     )
 
-    models_for_optimizer = model
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
-            model=models_for_optimizer,
+            model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
         )
     else:
