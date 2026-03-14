@@ -297,7 +297,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 trust_remote_code=True,
             )
 
-        if self.model.config.pad_token_id is None:
+        # Some model configs (e.g. Gemma3 in transformers v5) don't have pad_token_id
+        # as a direct attribute. Use getattr to handle missing attribute gracefully.
+        if getattr(self.model.config, "pad_token_id", None) is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
