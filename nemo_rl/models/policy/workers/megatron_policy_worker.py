@@ -190,7 +190,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
-        self.specdec_model = model_and_optimizer_state.specdec_model
+        self.draft_model = model_and_optimizer_state.draft_model
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -199,14 +199,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Step 5: Setup reference model if needed
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
-            if self.specdec_model is not None:
-                self.specdec_model = self.move_model(self.specdec_model, "cpu")
             self.reference_state_dict = setup_reference_model_state(
                 config, self.megatron_cfg, pretrained_path
             )
             self.model = self.move_model(self.model, "cuda")
-            if self.specdec_model is not None:
-                self.specdec_model = self.move_model(self.specdec_model, "cuda")
 
         # Step 6: Finalize setup
         (
@@ -282,14 +278,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
-            if self.specdec_model is not None:
-                self.specdec_model.eval()
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
             self.model.train()
-            if self.specdec_model is not None:
-                self.specdec_model.train()
 
         with ctx:
             all_mb_metrics = []
@@ -332,44 +324,23 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
                     self.model.zero_grad_buffer()
-                    if self.specdec_model is not None:
-                        self.specdec_model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
-                    # Suppress draft-model gradient sync inside microbatch loops.
-                    use_manual_specdec_grad_sync = (
-                        self.specdec_model is not None
-                        and not eval_mode
-                        and hasattr(self.specdec_model, "no_sync")
-                        and hasattr(self.specdec_model, "start_grad_sync")
-                        and hasattr(self.specdec_model, "finish_grad_sync")
+                    losses_reduced = megatron_forward_backward(
+                        model=self.model,
+                        cfg=self.cfg,
+                        data_iterator=data_iterator,
+                        num_microbatches=num_microbatches,
+                        seq_length=padded_seq_length,
+                        mbs=micro_batch_size,
+                        post_processing_fn=loss_post_processor,
+                        forward_only=eval_mode,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        straggler_timer=self.mcore_state.straggler_timer,
+                        draft_model=self.draft_model,
                     )
-                    draft_no_sync_context = (
-                        self.specdec_model.no_sync()
-                        if use_manual_specdec_grad_sync
-                        else nullcontext()
-                    )
-                    with draft_no_sync_context:
-                        losses_reduced = megatron_forward_backward(
-                            model=self.model,
-                            cfg=self.cfg,
-                            data_iterator=data_iterator,
-                            num_microbatches=num_microbatches,
-                            seq_length=padded_seq_length,
-                            mbs=micro_batch_size,
-                            post_processing_fn=loss_post_processor,
-                            forward_only=eval_mode,
-                            defer_fp32_logits=self.defer_fp32_logits,
-                            global_valid_seqs=global_valid_seqs,
-                            global_valid_toks=global_valid_toks,
-                            straggler_timer=self.mcore_state.straggler_timer,
-                            specdec_model=self.specdec_model,
-                            specdec_config=self.cfg.get("specdec", {}),
-                        )
-
-                    if use_manual_specdec_grad_sync:
-                        self.specdec_model.start_grad_sync()
-                        self.specdec_model.finish_grad_sync()
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -574,6 +545,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Swap reference model state_dict to self.model
                 for k, v in self.model.state_dict().items():
                     if isinstance(v, torch.Tensor):
+                        if k not in self.reference_state_dict:
+                            if "draft_model." in k:
+                                continue
+                            raise KeyError(
+                                f"Missing reference-model tensor for key '{k}'."
+                            )
                         v.copy_(self.reference_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -923,9 +900,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-            [self.model]
-        )
+        self.refit_conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -983,19 +962,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         for name, tensor in base_iter:
             yield name, tensor
 
-        if self.specdec_model is not None:
-            from nemo_rl.models.specdec.llama_eagle3 import save_eagle_weights_to_hf
+        if self.draft_model is not None:
+            from nemo_rl.models.draft import export_eagle_weights_to_hf
 
-            raw_specdec_model = self.specdec_model
-            while hasattr(raw_specdec_model, "module"):
-                raw_specdec_model = raw_specdec_model.module
-
-            specdec_weights = save_eagle_weights_to_hf(
-                self.specdec_model,
-                raw_specdec_model.config,
+            draft_weights = export_eagle_weights_to_hf(
+                self.draft_model,
             )
-            for name, tensor in specdec_weights.items():
-                yield f"specdec.{name}", tensor
+            for name, tensor in draft_weights:
+                yield f"draft.{name}", tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -1068,20 +1042,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
-        if self.specdec_model is not None:
-            self.specdec_model = self.move_model(
-                self.specdec_model, "cuda", move_grads=False
-            )
-            self.specdec_model.eval()
 
         # offload grads to cpu
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
-        if self.specdec_model is not None:
-            self.specdec_model = self.move_model(
-                self.specdec_model, "cpu", move_params=False, move_grads=True
-            )
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1102,11 +1067,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
-        if self.specdec_model is not None:
-            self.specdec_model = self.move_model(
-                self.specdec_model, "cuda", move_grads=True, move_params=True
-            )
-            self.specdec_model.train()
 
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
@@ -1134,10 +1094,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
-        if self.specdec_model is not None:
-            self.specdec_model = self.move_model(
-                self.specdec_model, "cpu", move_params=False, move_grads=True
-            )
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
@@ -1164,9 +1120,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
-        if self.specdec_model is not None:
-            self.specdec_model = self.move_model(self.specdec_model, "cpu")
-            self.specdec_model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
@@ -1301,12 +1254,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
-            models_to_save = [self.model] + (
-                [self.specdec_model] if self.specdec_model is not None else []
-            )
             save_checkpoint(
                 state=self.mcore_state,
-                model=models_to_save,
+                model=[self.model],
                 optimizer=optimizer_to_save,
                 opt_param_scheduler=scheduler_to_save,
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,

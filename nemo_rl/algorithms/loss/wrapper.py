@@ -13,17 +13,19 @@
 # limitations under the License.
 
 import math
-from typing import Any, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import torch
 import torch.distributed
+from megatron.core.transformer.multi_token_prediction import roll_tensor
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    distributed_vocab_topk,
-    gather_logits_at_global_indices,
-)
+from nemo_rl.distributed.model_utils import DistributedCrossEntropy
+
+if TYPE_CHECKING:
+    from nemo_rl.models.draft.hidden_capture import CapturedStates
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -156,96 +158,67 @@ class SequencePackingLossWrapper:
         return loss_accum, metrics_accum
 
 
-class SpecDecLossWrapper:
-    """Combine policy loss with Eagle/specdec top-k forward-KL loss."""
+class DraftLossWrapper:
+    """Combine policy loss with draft soft cross-entropy loss."""
 
     def __init__(
         self,
         loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
-        specdec_model: torch.nn.Module,
-        captured_aux_hidden_states: torch.Tensor,
-        captured_input_embeds: torch.Tensor,
+        draft_model: torch.nn.Module,
+        lm_head_weight: torch.Tensor,
+        captured_states: "CapturedStates | None",
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[Any] = None,
         loss_weight: float = 1.0,
-        kl_topk: int = 128,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-        vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.loss_fn = loss_fn
-        self.specdec_model = specdec_model
-        self.captured_aux_hidden_states = captured_aux_hidden_states
-        self.captured_input_embeds = captured_input_embeds
+        self.draft_model = draft_model
+        self.lm_head_weight = lm_head_weight
+        self.captured_states = captured_states
+        self.attention_mask = attention_mask
+        self.packed_seq_params = packed_seq_params
         self.loss_weight = loss_weight
-        self.kl_topk = int(kl_topk)
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
         )
-        self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
-        if self.kl_topk <= 0:
-            raise ValueError(f"kl_topk must be positive, got {self.kl_topk}.")
 
-    def _compute_topk_forward_kl(
-        self,
-        teacher_logits: torch.Tensor,
-        student_logits: torch.Tensor,
-        vocab_parallel_rank: int | None,
-        vocab_parallel_group: torch.distributed.ProcessGroup | None,
-        context_parallel_group: torch.distributed.ProcessGroup | None,
-    ) -> torch.Tensor:
-        if vocab_parallel_group is None:
-            k_eff = min(self.kl_topk, int(teacher_logits.shape[-1]))
-            teacher_topk_logits, teacher_topk_indices = torch.topk(
-                teacher_logits,
-                k=k_eff,
-                dim=-1,
-            )
-            student_topk_logits = torch.gather(
-                student_logits,
-                dim=-1,
-                index=teacher_topk_indices,
-            )
-        else:
-            if vocab_parallel_rank is None:
-                raise ValueError(
-                    "vocab_parallel_rank is required when vocab_parallel_group is provided."
-                )
-            vocab_shard_size = int(teacher_logits.shape[-1])
-            vocab_start_index = vocab_parallel_rank * vocab_shard_size
-            vocab_end_index = (vocab_parallel_rank + 1) * vocab_shard_size
-
-            teacher_topk_logits, teacher_topk_indices = distributed_vocab_topk(
-                teacher_logits,
-                k=self.kl_topk,
-                tp_group=vocab_parallel_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
-            )
-            student_topk_logits = gather_logits_at_global_indices(
-                student_logits,
-                teacher_topk_indices,
-                tp_group=vocab_parallel_group,
-                cp_group=context_parallel_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
+        if lm_head_weight.requires_grad:
+            raise ValueError(
+                "DraftLossWrapper requires a detached LM head weight tensor."
             )
 
-        teacher_topk_log_probs = torch.nn.functional.log_softmax(
-            teacher_topk_logits, dim=-1
+    def _compute_draft_logits(self) -> torch.Tensor:
+        if (
+            self.captured_states is None
+            or self.captured_states.hidden_states is None
+            or self.captured_states.inputs_embeds is None
+        ):
+            raise ValueError(
+                "DraftLossWrapper requires captured hidden states and input embeddings."
+            )
+
+        shifted_input_embeds, _ = roll_tensor(
+            self.captured_states.inputs_embeds,
+            shifts=-1,
+            dims=0,
+            cp_group=self.context_parallel_group,
+            packed_seq_params=self.packed_seq_params,
         )
-        student_topk_log_probs = torch.nn.functional.log_softmax(
-            student_topk_logits, dim=-1
+        return self.draft_model(
+            hidden_states=self.captured_states.hidden_states,
+            input_embeds=shifted_input_embeds,
+            attention_mask=self.attention_mask,
+            lm_head_weight=self.lm_head_weight,
         )
-        teacher_topk_probs = teacher_topk_log_probs.exp()
-        return (
-            teacher_topk_probs * (teacher_topk_log_probs - student_topk_log_probs)
-        ).sum(dim=-1)
 
-    def _build_packed_kl_mask(
+    def _build_packed_mask(
         self,
         data: BatchedDataDict[Any],
         kl_seq_len: int,
@@ -278,15 +251,52 @@ class SpecDecLossWrapper:
                 seq_mask = seq_mask * data["sample_mask"][sequence_idx]
             packed_mask[0, padded_start : padded_start + unpadded_length] = seq_mask
 
-        kl_mask = packed_mask[:, 1:]
+        mask = packed_mask[:, 1:]
 
         # Remove sequence-boundary transitions in packed layout.
         for sequence_idx in range(1, num_sequences + 1):
             boundary = self.cu_seqlens_q_padded[sequence_idx].item() // cp_size
             if 0 < boundary <= kl_seq_len:
-                kl_mask[0, boundary - 1] = 0
+                mask[0, boundary - 1] = 0
 
-        return kl_mask
+        return mask
+
+    def _build_mask(
+        self,
+        data: BatchedDataDict[Any],
+        kl_seq_len: int,
+    ) -> torch.Tensor:
+        if self.cu_seqlens_q is not None:
+            return self._build_packed_mask(
+                data=data,
+                kl_seq_len=kl_seq_len,
+                context_parallel_group=self.context_parallel_group,
+            )
+
+        token_mask = roll_tensor(data["token_mask"], shifts=-1, dims=1)[0][
+            :, :kl_seq_len
+        ]
+        if "sample_mask" in data:
+            return token_mask * data["sample_mask"].unsqueeze(-1)
+        return token_mask
+
+    def _compute_per_token_draft_loss(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.vocab_parallel_group is not None:
+            # Soft cross entropy matches the forward-KL student gradient.
+            return DistributedCrossEntropy.apply(
+                student_logits,
+                teacher_logits,
+                self.vocab_parallel_group,
+                False,
+            )
+
+        teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
+        student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
+        return -(teacher_probs * student_log_probs).sum(dim=-1)
 
     def __call__(
         self,
@@ -297,17 +307,7 @@ class SpecDecLossWrapper:
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if global_valid_toks is None:
-            raise ValueError("global_valid_toks is required for SpecDecLossWrapper.")
-
-        vocab_parallel_rank = kwargs.get(
-            "vocab_parallel_rank", self.vocab_parallel_rank
-        )
-        vocab_parallel_group = kwargs.get(
-            "vocab_parallel_group", self.vocab_parallel_group
-        )
-        context_parallel_group = kwargs.get(
-            "context_parallel_group", self.context_parallel_group
-        )
+            raise ValueError("global_valid_toks is required for DraftLossWrapper.")
 
         policy_loss, metrics = self.loss_fn(
             next_token_logits,
@@ -316,61 +316,43 @@ class SpecDecLossWrapper:
             global_valid_toks,
             **kwargs,
         )
-
-        specdec_logits = self.specdec_model(
-            hidden_states=self.captured_aux_hidden_states,
-            input_embeds=self.captured_input_embeds,
-        )
+        draft_logits = self._compute_draft_logits()
 
         teacher_logits = next_token_logits.detach().to(torch.float32)
-        student_logits = specdec_logits.to(torch.float32)
+        student_logits = draft_logits.to(torch.float32)
 
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
+        # Align teacher logits with the draft model's next-token prediction target.
         teacher_logits, _ = roll_tensor(
             teacher_logits,
             shifts=-1,
             dims=1,
-            cp_group=context_parallel_group,
+            cp_group=self.context_parallel_group,
+            packed_seq_params=self.packed_seq_params,
         )
 
         kl_seq_len = teacher_logits.shape[1]
         student_logits = student_logits[:, :kl_seq_len, :]
-
-        if self.cu_seqlens_q is not None:
-            kl_mask = self._build_packed_kl_mask(
-                data=data,
-                kl_seq_len=kl_seq_len,
-                context_parallel_group=context_parallel_group,
-            )
-        else:
-            token_mask = data["token_mask"][:, 1:][:, :kl_seq_len]
-            if "sample_mask" in data:
-                kl_mask = token_mask * data["sample_mask"].unsqueeze(-1)
-            else:
-                kl_mask = token_mask
-
-        per_token_forward_kl = self._compute_topk_forward_kl(
-            teacher_logits=teacher_logits,
-            student_logits=student_logits,
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
-        )
+        mask = self._build_mask(data, kl_seq_len)
 
         effective_seq_len = min(
-            int(per_token_forward_kl.shape[1]),
-            int(kl_mask.shape[1]),
+            int(teacher_logits.shape[1]),
+            int(mask.shape[1]),
         )
-        per_token_forward_kl = per_token_forward_kl[:, :effective_seq_len]
-        kl_mask = kl_mask[:, :effective_seq_len]
+        teacher_logits = teacher_logits[:, :effective_seq_len, :]
+        student_logits = student_logits[:, :effective_seq_len, :]
+        mask = mask[:, :effective_seq_len]
 
-        specdec_loss = (per_token_forward_kl * kl_mask).sum() / global_valid_toks.to(
-            per_token_forward_kl.dtype
+        per_token_draft_loss = self._compute_per_token_draft_loss(
+            teacher_logits,
+            student_logits,
         )
-
-        combined_loss = policy_loss + self.loss_weight * specdec_loss
-        metrics["specdec_loss"] = float(specdec_loss.detach().item())
+        draft_loss = masked_mean(
+            per_token_draft_loss,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+        combined_loss = policy_loss + self.loss_weight * draft_loss
+        metrics["draft_loss"] = float(draft_loss.detach().item())
         return combined_loss, metrics
 
 

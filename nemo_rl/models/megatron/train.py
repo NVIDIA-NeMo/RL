@@ -30,8 +30,8 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss import (
+    DraftLossWrapper,
     SequencePackingLossWrapper,
-    SpecDecLossWrapper,
     prepare_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
@@ -43,9 +43,10 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
+from nemo_rl.models.draft.hidden_capture import CapturedStates, get_capture_context
+from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.specdec.hidden_capture import get_capture_context
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -125,6 +126,25 @@ def apply_temperature_scaling(
     return logits
 
 
+def _resolve_draft_runtime_inputs(
+    model: GPTModel,
+    draft_model: Optional[MegatronModule],
+    capture,
+) -> tuple[Optional[CapturedStates], Optional[torch.Tensor]]:
+    captured_states = capture.get_captured_states() if capture is not None else None
+    if draft_model is None:
+        return captured_states, None
+
+    from megatron.training.utils import unwrap_model
+
+    unwrapped_model = unwrap_model(model)
+    if getattr(unwrapped_model, "share_embeddings_and_output_weights"):
+        lm_head_weight = unwrapped_model.shared_embedding_or_output_weight()
+    else:
+        lm_head_weight = unwrapped_model.output_layer.weight
+    return captured_states, lm_head_weight.detach()
+
+
 def forward_with_post_processing_fn(
     data_iterator: Iterator[ProcessedMicrobatch],
     model: GPTModel,
@@ -134,8 +154,7 @@ def forward_with_post_processing_fn(
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
-    specdec_model: Optional[torch.nn.Module] = None,
-    specdec_config: Optional[dict[str, Any]] = None,
+    draft_model: Optional[MegatronModule] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -170,7 +189,11 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
-    capture_context, capture = get_capture_context(model, specdec_config)
+    draft_config = cfg.get("draft")
+    capture_context, capture = get_capture_context(
+        model,
+        draft_config,
+    )
     with capture_context:
         output_tensor = model_forward(
             model=model,
@@ -184,12 +207,10 @@ def forward_with_post_processing_fn(
             straggler_timer=straggler_timer,
         )
 
-    captured_states = capture.get_captured_states() if capture is not None else None
-    captured_aux_hidden_states = (
-        captured_states.hidden_states if captured_states is not None else None
-    )
-    captured_input_embeds = (
-        captured_states.inputs_embeds if captured_states is not None else None
+    captured_states, lm_head_weight = _resolve_draft_runtime_inputs(
+        model,
+        draft_model,
+        capture,
     )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -207,10 +228,9 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            captured_aux_hidden_states=captured_aux_hidden_states,
-            captured_input_embeds=captured_input_embeds,
-            specdec_model=specdec_model,
-            specdec_config=specdec_config,
+            captured_states=captured_states,
+            draft_model=draft_model,
+            lm_head_weight=lm_head_weight,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -244,8 +264,7 @@ def megatron_forward_backward(
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
-    specdec_model: Optional[torch.nn.Module] = None,
-    specdec_config: Optional[dict[str, Any]] = None,
+    draft_model: Optional[MegatronModule] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -278,8 +297,7 @@ def megatron_forward_backward(
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
         straggler_timer=straggler_timer,
-        specdec_model=specdec_model,
-        specdec_config=specdec_config,
+        draft_model=draft_model,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -313,10 +331,9 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
-        captured_aux_hidden_states: Optional[torch.Tensor] = None,
-        captured_input_embeds: Optional[torch.Tensor] = None,
-        specdec_model: Optional[torch.nn.Module] = None,
-        specdec_config: Optional[dict[str, Any]] = None,
+        captured_states: Optional[CapturedStates] = None,
+        draft_model: Optional[MegatronModule] = None,
+        lm_head_weight: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -355,20 +372,13 @@ class LossPostProcessor:
                 context_parallel_group=get_context_parallel_group(),
             )
 
-        if (
-            specdec_model is not None
-            and specdec_config is not None
-            and specdec_config.get("enabled", False)
-            and captured_aux_hidden_states is not None
-            and captured_input_embeds is not None
-        ):
-            loss_fn_wrapped = SpecDecLossWrapper(
+        if draft_model is not None:
+            loss_fn_wrapped = DraftLossWrapper(
                 loss_fn=loss_fn_wrapped,
-                specdec_model=specdec_model,
-                captured_aux_hidden_states=captured_aux_hidden_states,
-                captured_input_embeds=captured_input_embeds,
-                loss_weight=float(specdec_config.get("loss_weight", 1.0)),
-                kl_topk=int(specdec_config.get("kl_topk", 128)),
+                draft_model=draft_model,
+                lm_head_weight=lm_head_weight,
+                captured_states=captured_states,
+                loss_weight=float(self.cfg.get("draft", {}).get("loss_weight", 1.0)),
                 cu_seqlens_q=(
                     packed_seq_params.cu_seqlens_q
                     if pack_sequences and packed_seq_params is not None
@@ -379,7 +389,6 @@ class LossPostProcessor:
                     if pack_sequences and packed_seq_params is not None
                     else None
                 ),
-                vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
