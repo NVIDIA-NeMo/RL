@@ -57,13 +57,23 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
+    # hardcode math for now
+    env_name = "math"
+
+    if env_name == "math_multi_reward":
+        raise NotImplementedError(
+            "MathMultiRewardEnvironment is not supported for evaluation, "
+            "please set env_name to a different environment. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2088 for more details."
+        )
+
     env = MathEnvironment.options(
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.math_environment.MathEnvironment"
             )
         }
-    ).remote(env_configs["math"])
+    ).remote(env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,

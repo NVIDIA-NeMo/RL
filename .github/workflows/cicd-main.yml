@@ -32,7 +32,7 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only, Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
       image_tag:
         description: "Override container image tag (e.g. 'main'). Skips container build."
         required: false
@@ -54,6 +54,7 @@ jobs:
       head_sha: ${{ steps.base-head-ref.outputs.head_sha }}
       head_label: ${{ steps.base-head-ref.outputs.head_label }}
       has_skip_cicd: ${{ steps.base-head-ref.outputs.has_skip_cicd }}
+      test_sha: ${{ steps.base-head-ref.outputs.test_sha }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -76,6 +77,7 @@ jobs:
             base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
             head_ref=$(echo "$PR_INFO_JSON" | jq -r '.head.ref')
             head_sha=$(echo "$PR_INFO_JSON" | jq -r '.head.sha')
+            test_sha=$(echo "$PR_INFO_JSON" | jq -r '.merge_commit_sha')
             head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
             ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
             has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
@@ -84,6 +86,7 @@ jobs:
             base_sha=$(git rev-parse HEAD~1)
             head_ref="HEAD"
             head_sha="${{ github.sha }}"
+            test_sha="${{ github.sha }}"
             head_label="${{ github.ref_name }}"
             ci_label=""
             has_skip_cicd="false"
@@ -160,9 +163,9 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast uses main, workflow_dispatch can override
+          # Determine image tag: Lfast and docs reuse the main container, workflow_dispatch can override
           IMAGE_TAG=""
-          if [[ "$TEST_LEVEL" == "Lfast" ]]; then
+          if [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
             IMAGE_TAG="main"
           fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.image_tag }}" ]]; then
@@ -242,7 +245,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -284,7 +287,7 @@ jobs:
     needs: [pre-flight, org-member-pre-flight]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
     with:
-      build-ref: ${{ github.sha }}
+      build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
       runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
@@ -295,7 +298,7 @@ jobs:
         nemo-rl=${{ github.run_id }}/
       build-args: |
         MAX_JOBS=4
-        NEMO_RL_COMMIT=${{ github.sha }}
+        NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-doc-tests:
     strategy:
@@ -305,7 +308,15 @@ jobs:
           - script: Docs_Tests
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
     needs: [pre-flight, build-container, org-member-pre-flight]
-    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    if: >-
+      ${{
+        (
+          always() &&
+          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.result == 'success' &&
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
+        ) && !cancelled()
+      }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     environment: nemo-ci
@@ -318,9 +329,11 @@ jobs:
           runner: ${{ runner.name }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-unit-tests:
     strategy:
@@ -344,6 +357,8 @@ jobs:
           (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
         ) && !cancelled()
       }}
+
+
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     steps:
@@ -362,6 +377,7 @@ jobs:
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-functional-tests:
     strategy:
@@ -388,6 +404,7 @@ jobs:
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-fast-functional-tests:
     strategy:
@@ -396,8 +413,8 @@ jobs:
         include:
           - script: L1_Functional_Tests_GPU
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
-    needs: [pre-flight, build-container, org-member-pre-flight]
-    if: ${{ needs.pre-flight.outputs.test_level == 'Lfast' }}
+    needs: [pre-flight, org-member-pre-flight]
+    if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
     name: fast_${{ matrix.script }}
     environment: nemo-ci
@@ -415,6 +432,7 @@ jobs:
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   CI_QA_Gate:
     name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
@@ -453,6 +471,8 @@ jobs:
                 )
               )
             }}
+
+
           CI_SKIP: ${{ needs.pre-flight.outputs.has_cicd_skip_label }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |

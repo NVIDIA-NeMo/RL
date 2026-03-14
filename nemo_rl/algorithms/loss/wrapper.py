@@ -109,7 +109,7 @@ class SequencePackingLossWrapper:
             )
 
             # prepare data for loss function
-            loss_input = self.prepare_fn(
+            loss_input, unpadded_seq_data = self.prepare_fn(
                 logits=next_token_logits_slice,
                 data=unpadded_seq_data,
                 loss_fn=self.loss_fn,
@@ -165,7 +165,7 @@ def wrap_loss_fn_with_input_preparation(
 ) -> tuple[Tensor, dict[str, Any]]:
     """Wraps a loss function to handle input preparation for megatron policy worker."""
     # prepare loss input
-    loss_input = prepare_fn(
+    loss_input, data = prepare_fn(
         logits=next_token_logits,
         data=data,
         loss_fn=loss_fn,

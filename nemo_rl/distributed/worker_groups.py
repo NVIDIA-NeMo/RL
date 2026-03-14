@@ -652,7 +652,13 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
+        try:
+            method = getattr(worker, method_name)
+        except AttributeError as e:
+            print(
+                f"Supported methods: {list(worker._method_shells.keys())}", flush=True
+            )
+            raise e
         return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
@@ -737,7 +743,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
                 futures.append(
@@ -793,7 +806,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 futures.append(method.remote(*args, **kwargs))
 
         return futures
