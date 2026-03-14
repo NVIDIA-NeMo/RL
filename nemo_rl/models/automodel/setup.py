@@ -648,8 +648,9 @@ def setup_model_and_optimizer(
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
 
-    # Set pad token ID if needed
-    if model.config.pad_token_id is None:
+    # Set pad token ID if needed. Some model configs (e.g. Gemma3 in transformers v5)
+    # don't have pad_token_id as a direct attribute.
+    if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
     # Handle tied word embeddings (safety net after from_pretrained)
