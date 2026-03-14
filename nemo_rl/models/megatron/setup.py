@@ -23,6 +23,7 @@ from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
+    _load_checkpoint_from_path,
     checkpoint_exists,
     init_checkpointing_context,
     load_checkpoint,
@@ -56,6 +57,7 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.utils import unwrap_model
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
@@ -647,125 +649,190 @@ def _create_megatron_config(
     )
 
 
-def get_specdec_model(
-    model: list[MegatronModule],
-    specdec_config: dict[str, Any],
-    ddp_config: DistributedDataParallelConfig,
-    use_torch_fsdp2: bool = False,
-    overlap_param_gather_with_optimizer_step: bool = False,
-    data_parallel_random_init: bool = True,
-    mixed_precision_wrapper: Callable | None = Float16Module,
-    pg_collection: ProcessGroupCollection = None,
+def build_unwrapped_draft_model(
+    model_provider,
+    draft_config: dict[str, Any],
 ) -> MegatronModule | None:
-    """Build and wrap an Eagle draft model for online specdec training."""
-    if not specdec_config.get("enabled", False):
+    """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
+    if not draft_config.get("enabled", False):
         return None
 
-    from pathlib import Path
-
-    from megatron.bridge.models.model_provider import _ddp_wrap
-    from megatron.core import tensor_parallel
-    from megatron.core.parallel_state import is_pipeline_last_stage
-    from megatron.core.utils import get_model_config
     from transformers import AutoConfig
 
-    from nemo_rl.models.specdec.llama_eagle3 import (
-        Eagle3ForCausalLM,
-        create_config_from_hf,
+    from nemo_rl.models.draft import (
+        EagleModel,
+        get_eagle3_aux_hidden_state_layers,
         load_hf_weights_to_eagle,
     )
 
-    if not is_pipeline_last_stage():
-        return None
-
-    draft_model_path = specdec_config.get("draft_model_path")
-    draft_state_dict = None
-
-    if draft_model_path:
-        hf_config = AutoConfig.from_pretrained(draft_model_path)
-        eagle_config = create_config_from_hf(
-            hf_config,
-            tensor_model_parallel_size=model[0].config.tensor_model_parallel_size,
-            context_parallel_size=model[0].config.context_parallel_size,
-            sequence_parallel=model[0].config.sequence_parallel,
-        )
-
-        local_path = Path(draft_model_path)
-        if (local_path / "model.safetensors").exists():
-            from safetensors.torch import load_file as load_safetensors
-
-            draft_state_dict = load_safetensors(str(local_path / "model.safetensors"))
-        elif (local_path / "pytorch_model.bin").exists():
-            draft_state_dict = torch.load(
-                str(local_path / "pytorch_model.bin"),
-                map_location="cpu",
-                weights_only=True,
-            )
-        else:
-            from huggingface_hub import hf_hub_download
-
-            try:
-                from safetensors.torch import load_file as load_safetensors
-
-                draft_checkpoint_path = hf_hub_download(
-                    draft_model_path, "model.safetensors"
-                )
-                draft_state_dict = load_safetensors(draft_checkpoint_path)
-            except Exception:
-                draft_checkpoint_path = hf_hub_download(
-                    draft_model_path, "pytorch_model.bin"
-                )
-                draft_state_dict = torch.load(
-                    draft_checkpoint_path,
-                    map_location="cpu",
-                    weights_only=True,
-                )
-    else:
-        eagle_config = model[0].config
-
-    draft_model = Eagle3ForCausalLM.from_config(
-        config=eagle_config,
-        num_layers=int(specdec_config.get("num_layers", 1)),
+    model_name = draft_config.get("model_name")
+    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    config = TransformerConfig(
+        normalization="RMSNorm",
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
+        hidden_dropout=0.0,
+        attention_softmax_in_fp32=False,
+        tensor_model_parallel_size=model_provider.tensor_model_parallel_size,
+        pipeline_model_parallel_size=model_provider.pipeline_model_parallel_size,
+        expert_tensor_parallel_size=model_provider.expert_tensor_parallel_size,
+        sequence_parallel=model_provider.sequence_parallel,
+        use_cpu_initialization=model_provider.use_cpu_initialization,
+        fp16=model_provider.fp16,
+        bf16=model_provider.bf16,
+        params_dtype=model_provider.params_dtype,
+        pipeline_dtype=model_provider.pipeline_dtype,
+        num_layers=hf_config.get("num_hidden_layers", 1),
+        ffn_hidden_size=hf_config.get(
+            "intermediate_size", model_provider.ffn_hidden_size
+        ),
+        num_attention_heads=hf_config.get(
+            "num_attention_heads", model_provider.num_attention_heads
+        ),
+        kv_channels=hf_config.get("head_dim", model_provider.kv_channels),
+        num_query_groups=hf_config.get(
+            "num_key_value_heads", model_provider.num_query_groups
+        ),
+        init_method_std=model_provider.init_method_std,
+        layernorm_epsilon=hf_config.get(
+            "rms_norm_eps", model_provider.layernorm_epsilon
+        ),
+        add_bias_linear=hf_config.get("mlp_bias", model_provider.add_bias_linear),
+        attention_dropout=hf_config.get(
+            "attention_dropout", model_provider.attention_dropout
+        ),
     )
 
-    if draft_state_dict is not None:
+    config.transformer_layer_spec = None
+    config.hidden_size = hf_config.get("hidden_size", model_provider.hidden_size)
+    config.vocab_size = config.draft_vocab_size = hf_config.get(
+        "vocab_size", model_provider.vocab_size
+    )
+    config.seq_length = model_provider.seq_length
+    config.gradient_accumulation_fusion = False
+    config.position_embedding_type = hf_config.get(
+        "position_embedding_type", model_provider.position_embedding_type
+    )
+    config.rotary_percent = model_provider.rotary_percent
+    config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    config.rope_scaling = (
+        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+    )
+    config.rope_scaling_factor = (
+        hf_config.get("rope_scaling", {}).get("factor")
+        if hf_config
+        else model_provider.rope_scaling_factor
+    )
+
+    config.draft_vocab_size = hf_config.get("vocab_size", model_provider.vocab_size)
+    config.use_input_layernorm_in_first_layer = hf_config.get(
+        "use_input_layernorm_in_first_layer", True
+    )
+    config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
+    config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
+    config.eagle_aux_hidden_state_layer_ids = hf_config.get(
+        "eagle_aux_hidden_state_layer_ids", []
+    )
+    if (
+        config.use_aux_hidden_state
+        and len(config.eagle_aux_hidden_state_layer_ids) == 0
+    ):
+        config.eagle_aux_hidden_state_layer_ids = get_eagle3_aux_hidden_state_layers(
+            model_provider.num_layers
+        )
+
+    config.parallel_draft_step = 1
+    config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
+    config.has_lm_head = False
+
+    draft_model = EagleModel(config=config)
+    if model_name is not None:
         missing_keys, unexpected_keys = load_hf_weights_to_eagle(
-            draft_model,
-            draft_state_dict,
-            eagle_config,
+            draft_model, model_name
         )
         if missing_keys:
-            print(f"[specdec] Missing keys after draft load: {missing_keys}")
+            print(f"[draft] Missing keys after draft load: {missing_keys}")
         if unexpected_keys:
-            print(f"[specdec] Unexpected keys after draft load: {unexpected_keys}")
+            print(f"[draft] Unexpected keys after draft load: {unexpected_keys}")
 
-    for parameter in draft_model.parameters():
-        tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(
-            parameter
+    return draft_model
+
+
+def _find_draft_owner_chunk(model: list[MegatronModule]) -> MegatronModule | None:
+    for model_chunk in reversed(model):
+        if getattr(model_chunk, "post_process", False):
+            return model_chunk
+        language_model = getattr(model_chunk, "language_model", None)
+        if language_model is not None and getattr(
+            language_model, "post_process", False
+        ):
+            return model_chunk
+    return None
+
+
+def _get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | None:
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        draft_model = getattr(unwrapped_chunk, "draft_model", None)
+        if draft_model is not None:
+            return draft_model
+    return None
+
+
+def _create_draft_pre_wrap_hook(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    state: GlobalState,
+    *,
+    preload_policy_from_pretrained: bool,
+) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    draft_cfg = policy_cfg.get("draft", {}) or {}
+
+    def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        if not draft_cfg.get("enabled", False):
+            return model
+
+        # Base pretrained checkpoints do not contain draft weights, so load the
+        # policy weights before attaching the nested draft module.
+        if preload_policy_from_pretrained:
+            pretrained_checkpoint = megatron_cfg.checkpoint.pretrained_checkpoint
+            if pretrained_checkpoint is None or not checkpoint_exists(
+                pretrained_checkpoint
+            ):
+                raise ValueError(
+                    f"Invalid pretrained checkpoint directory found: {pretrained_checkpoint}"
+                )
+            megatron_cfg.checkpoint.finetune = True
+            _load_checkpoint_from_path(
+                load_dir=pretrained_checkpoint,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+            )
+
+        draft_owner = _find_draft_owner_chunk(model)
+        if draft_owner is None:
+            return model
+
+        if getattr(draft_owner, "draft_model", None) is not None:
+            raise RuntimeError(
+                "Policy model chunk already has an attached `draft_model`."
+            )
+
+        draft_model = build_unwrapped_draft_model(
+            megatron_cfg.model,
+            draft_config=draft_cfg,
         )
+        if draft_model is not None:
+            setattr(draft_owner, "draft_model", draft_model)
 
-    draft_model_config = get_model_config(draft_model)
-    if (
-        not use_torch_fsdp2
-        and not draft_model_config.use_cpu_initialization
-        and not getattr(draft_model_config, "init_model_with_meta_device", False)
-    ):
-        draft_model.cuda(torch.cuda.current_device())
+        return model
 
-    if (
-        draft_model_config.fp16 or draft_model_config.bf16
-    ) and mixed_precision_wrapper is not None:
-        draft_model = mixed_precision_wrapper(draft_model_config, draft_model)
-
-    wrapped_draft_model = _ddp_wrap(
-        [draft_model],
-        data_parallel_random_init,
-        ddp_config,
-        overlap_param_gather_with_optimizer_step,
-        use_torch_fsdp2=use_torch_fsdp2,
-        pg_collection=pg_collection,
-    )
-    return wrapped_draft_model[0]
+    return draft_pre_wrap_hook
 
 
 def setup_model_and_optimizer(
@@ -830,6 +897,22 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+    draft_cfg = policy_cfg.get("draft", {}) or {}
+    draft_enabled = bool(draft_cfg.get("enabled", False))
+    resume_checkpoint_exists = (
+        megatron_cfg.checkpoint.load is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.load)
+    )
+    pretrained_checkpoint_exists = (
+        megatron_cfg.checkpoint.pretrained_checkpoint is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+    )
+    preload_policy_from_pretrained_for_draft = (
+        draft_enabled
+        and not use_peft
+        and not resume_checkpoint_exists
+        and pretrained_checkpoint_exists
+    )
 
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
@@ -888,6 +971,15 @@ def setup_model_and_optimizer(
 
         pre_wrap_hook.extend([composed_peft_hook])
 
+    if draft_enabled:
+        draft_pre_wrap_hook = _create_draft_pre_wrap_hook(
+            policy_cfg,
+            megatron_cfg,
+            state,
+            preload_policy_from_pretrained=preload_policy_from_pretrained_for_draft,
+        )
+        pre_wrap_hook.extend([draft_pre_wrap_hook])
+
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
@@ -906,20 +998,7 @@ def setup_model_and_optimizer(
         pg_collection=pg_collection,
     )
 
-    specdec_model = get_specdec_model(
-        model=model,
-        specdec_config=policy_cfg.get("specdec", {}),
-        ddp_config=megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-        pg_collection=pg_collection,
-    )
-
-    models_for_optimizer = model + (
-        [specdec_model] if specdec_model is not None else []
-    )
+    models_for_optimizer = model
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
@@ -935,36 +1014,22 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     if megatron_cfg.peft is not None:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        )
+        should_load_checkpoint = resume_checkpoint_exists
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
             # This is switched off here in order to load these states from the checkpoint
             megatron_cfg.checkpoint.finetune = False
     else:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        ) or (
-            megatron_cfg.checkpoint.pretrained_checkpoint is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+        should_load_checkpoint = resume_checkpoint_exists or (
+            pretrained_checkpoint_exists
+            and not preload_policy_from_pretrained_for_draft
         )
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
-        if (
-            specdec_model is not None
-            and megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        ):
-            models_for_load = model + [specdec_model]
-        else:
-            models_for_load = model
         load_checkpoint(
             state,
-            models_for_load,
+            model,
             optimizer,
             scheduler,
             checkpointing_context=checkpointing_context,
@@ -972,6 +1037,8 @@ def setup_model_and_optimizer(
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
+
+    draft_model = _get_attached_draft_model(model)
 
     # Set the param sync function for the model
     param_sync_func = None
@@ -990,7 +1057,7 @@ def setup_model_and_optimizer(
         scheduler,
         checkpointing_context,
         param_sync_func,
-        specdec_model=specdec_model,
+        draft_model=draft_model,
     )
 
 

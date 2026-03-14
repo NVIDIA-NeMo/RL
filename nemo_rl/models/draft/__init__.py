@@ -12,24 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.models.specdec.hidden_capture import (
+from nemo_rl.models.draft.eagle import EagleModel
+from nemo_rl.models.draft.hidden_capture import (
     CapturedStates,
     HiddenStateCapture,
     get_capture_context,
+    get_eagle3_aux_hidden_state_layers,
 )
-from nemo_rl.models.specdec.llama_eagle3 import (
-    Eagle3ForCausalLM,
-    create_config_from_hf,
+from nemo_rl.models.draft.utils import (
+    export_eagle_weights_to_hf,
     load_hf_weights_to_eagle,
-    save_eagle_weights_to_hf,
 )
 
 __all__ = [
     "CapturedStates",
     "HiddenStateCapture",
     "get_capture_context",
-    "Eagle3ForCausalLM",
-    "create_config_from_hf",
+    "EagleModel",
     "load_hf_weights_to_eagle",
-    "save_eagle_weights_to_hf",
+    "export_eagle_weights_to_hf",
+    "get_eagle3_aux_hidden_state_layers",
 ]

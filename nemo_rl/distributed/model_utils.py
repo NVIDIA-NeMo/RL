@@ -152,6 +152,62 @@ class DistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class DistributedCrossEntropy(torch.autograd.Function):
+    """Compute soft-target cross entropy across TP-sharded vocab.
+
+    This returns H(p_target, q_student), which matches forward KL up to the
+    target entropy constant. Backward propagates only through student logits.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        if student_logits.shape != target_logits.shape:
+            raise ValueError(
+                "student_logits and target_logits must have the same shape, "
+                f"got {student_logits.shape} and {target_logits.shape}."
+            )
+
+        student_logits = student_logits.to(dtype=torch.float32)
+        target_logits = target_logits.to(dtype=torch.float32)
+
+        target_log_probs = _compute_distributed_log_softmax(target_logits, group=group)
+        student_log_probs = _compute_distributed_log_softmax(
+            student_logits, group=group
+        )
+        target_probs = target_log_probs.exp()
+
+        local_cross_entropy = -(target_probs * student_log_probs).sum(dim=-1)
+        torch.distributed.all_reduce(
+            local_cross_entropy,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+
+        if not inference_only:
+            student_probs = student_log_probs.exp()
+            ctx.save_for_backward(target_probs, student_probs)
+
+        return local_cross_entropy.contiguous()
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None]:
+        grad_output = grad_outputs[0]
+        target_probs, student_probs = ctx.saved_tensors
+
+        # d(H(p, q))/d(z_v) = q_v - p_v
+        grad_student = (student_probs - target_probs) * grad_output.unsqueeze(-1)
+        return grad_student, None, None, None
+
+
 class ChunkedDistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 

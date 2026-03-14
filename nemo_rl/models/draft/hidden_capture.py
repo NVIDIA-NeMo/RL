@@ -21,7 +21,19 @@ from typing import ContextManager, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
+from megatron.training.utils import unwrap_model
 from torch import Tensor, nn
+
+
+def get_eagle3_aux_hidden_state_layers(num_layers: int) -> tuple[int, ...]:
+    candidate_indices = (
+        1,
+        max(0, num_layers // 2 - 1),
+        max(1, num_layers - 4),
+    )
+    valid_indices = sorted(set(candidate_indices))
+    return tuple(valid_indices)
+
 
 _DTYPE_TO_CODE = {
     torch.float16: 0,
@@ -32,22 +44,12 @@ _DTYPE_TO_CODE = {
 _CODE_TO_DTYPE = {code: dtype for dtype, code in _DTYPE_TO_CODE.items()}
 
 
-def get_default_aux_layer_indices(num_layers: int) -> Tuple[int, ...]:
-    """Return default Eagle3 auxiliary-layer indices (0-indexed)."""
-    candidate_indices = (2, num_layers // 2, num_layers - 3)
-    valid_indices = sorted({idx for idx in candidate_indices if 0 <= idx < num_layers})
-    return tuple(valid_indices)
-
-
 @dataclass
 class CapturedStates:
     """Container for hidden states captured from the policy model."""
 
     hidden_states: Optional[Tensor] = None
     inputs_embeds: Optional[Tensor] = None
-
-    def is_complete(self) -> bool:
-        return self.hidden_states is not None and self.inputs_embeds is not None
 
 
 class HiddenStateCapture:
@@ -58,26 +60,14 @@ class HiddenStateCapture:
         model: nn.Module,
         aux_layer_indices: Optional[Tuple[int, ...]] = None,
     ):
-        self.model = self._unwrap_model(model)
+        self.model = unwrap_model(model)
         self.num_layers = self.model.config.num_layers
 
-        if aux_layer_indices is None:
-            self.aux_layer_indices = get_default_aux_layer_indices(self.num_layers)
-        else:
-            raw_indices = tuple(aux_layer_indices)
-            if not all(isinstance(idx, int) for idx in raw_indices):
-                raise ValueError(
-                    f"aux_layer_indices must be integers, got {raw_indices}."
-                )
-            invalid_indices = [
-                idx for idx in raw_indices if idx < 0 or idx >= self.num_layers
-            ]
-            if invalid_indices:
-                raise ValueError(
-                    "aux_layer_indices out of range for model with "
-                    f"{self.num_layers} layers: {invalid_indices}"
-                )
-            self.aux_layer_indices = tuple(sorted(set(raw_indices)))
+        self.aux_layer_indices = (
+            aux_layer_indices
+            if aux_layer_indices is not None
+            else get_eagle3_aux_hidden_state_layers(self.num_layers)
+        )
 
         self.pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -91,12 +81,6 @@ class HiddenStateCapture:
 
         self._captured: Dict[str, Tensor] = {}
         self._hooks: List[torch.utils.hooks.RemovableHandle] = []
-
-    @staticmethod
-    def _unwrap_model(model: nn.Module) -> nn.Module:
-        while hasattr(model, "module"):
-            model = model.module
-        return model
 
     def _compute_local_layer_mapping(self) -> None:
         for local_idx, layer in enumerate(self.model.decoder.layers):
@@ -133,13 +117,10 @@ class HiddenStateCapture:
                     break
         return owner_map
 
-    def _make_layer_pre_hook(self, global_idx: int):
-        def hook(_module, args, kwargs):
-            if args:
-                hidden_states = args[0]
-            elif "hidden_states" in kwargs:
-                hidden_states = kwargs["hidden_states"]
-            else:
+    def _make_layer_output_hook(self, global_idx: int):
+        def hook(_module, _args, output):
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            if hidden_states is None:
                 return
             self._captured[f"layer_{global_idx}"] = hidden_states.detach().clone()
 
@@ -164,9 +145,7 @@ class HiddenStateCapture:
             layer = self.model.decoder.layers[local_idx]
             global_idx = int(layer.layer_number) - 1
             self._hooks.append(
-                layer.register_forward_pre_hook(
-                    self._make_layer_pre_hook(global_idx), with_kwargs=True
-                )
+                layer.register_forward_hook(self._make_layer_output_hook(global_idx))
             )
 
     def clear_hooks(self) -> None:
@@ -330,17 +309,14 @@ class HiddenStateCapture:
 
 def get_capture_context(
     model: nn.Module,
-    specdec_config: Optional[Dict] = None,
+    draft_config: Optional[Dict] = None,
+    aux_layer_indices: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[ContextManager, Optional[HiddenStateCapture]]:
-    """Return a capture context and capture object when specdec is enabled."""
-    if not specdec_config or not specdec_config.get("enabled", False):
+    """Return a capture context and capture object when draft is enabled."""
+    if not isinstance(draft_config, dict) or not draft_config.get("enabled", False):
         return nullcontext(), None
-
-    aux_layer_indices = specdec_config.get("aux_layer_indices")
     capture = HiddenStateCapture(
         model=model,
-        aux_layer_indices=(
-            tuple(aux_layer_indices) if aux_layer_indices is not None else None
-        ),
+        aux_layer_indices=aux_layer_indices,
     )
     return capture.capture_context(), capture

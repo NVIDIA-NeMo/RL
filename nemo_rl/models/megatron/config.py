@@ -75,4 +75,4 @@ class ModelAndOptimizerState(NamedTuple):
     scheduler: OptimizerParamScheduler
     checkpointing_context: dict[str, Any]
     param_sync_func: Optional[Callable]
-    specdec_model: Optional[MegatronModule] = None
+    draft_model: Optional[MegatronModule] = None

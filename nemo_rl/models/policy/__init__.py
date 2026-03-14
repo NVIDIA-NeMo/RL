@@ -248,15 +248,14 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
 
 
-class SpecDecConfigDisabled(TypedDict):
+class DraftConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
-class SpecDecConfig(TypedDict):
+class DraftConfig(TypedDict):
     enabled: Literal[True]
-    draft_model_path: str
+    model_name: str
     loss_weight: NotRequired[float]
-    kl_topk: NotRequired[int]
     num_layers: NotRequired[int]
     aux_layer_indices: NotRequired[list[int]]
 
@@ -323,7 +322,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    specdec: NotRequired[SpecDecConfig | SpecDecConfigDisabled]
+    draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
