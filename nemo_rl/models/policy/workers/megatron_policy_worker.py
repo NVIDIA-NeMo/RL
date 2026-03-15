@@ -186,6 +186,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        print(
+            "mcore TransformerConfig:\n"
+            + json.dumps(
+                {
+                    f.name: str(getattr(self.model.config, f.name))
+                    for f in dataclasses.fields(self.model.config)
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
