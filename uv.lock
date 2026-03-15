@@ -4141,6 +4141,7 @@ requires-dist = [
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion'" },
+    { name = "kernels", marker = "extra == 'diffusion'" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "image", "sentencepiece"] },
@@ -4173,8 +4174,11 @@ requires-dist = [
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
+    { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'diffusion'", index = "https://pypi.org/simple" },
+    { name = "torchvision", marker = "sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "<=2.11.0" },
-    { name = "transformers", specifier = ">=5.0.0" },
+    { name = "transformers", specifier = ">=5.3.0" },
     { name = "wandb" },
 ]
 provides-extras = ["diffusion", "cuda", "cuda-source", "extra", "fa", "delta-databricks", "moe", "vlm", "all"]
