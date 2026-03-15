@@ -173,16 +173,15 @@ class DistributedCrossEntropy(torch.autograd.Function):
                 f"got {student_logits.shape} and {target_logits.shape}."
             )
 
-        student_logits = student_logits.to(dtype=torch.float32)
-        target_logits = target_logits.to(dtype=torch.float32)
-
-        target_log_probs = _compute_distributed_log_softmax(target_logits, group=group)
+        target_probs = _compute_distributed_log_softmax(target_logits, group=group)
+        target_probs.exp_().to(dtype=torch.float32)
         student_log_probs = _compute_distributed_log_softmax(
-            student_logits, group=group
+            student_logits.to(dtype=torch.float32), group=group
         )
-        target_probs = target_log_probs.exp()
-
-        local_cross_entropy = -(target_probs * student_log_probs).sum(dim=-1)
+        # Reuse the log-softmax buffers to avoid extra full-vocab allocations.
+        local_cross_entropy = torch.einsum(
+            "...v,...v->...", target_probs, student_log_probs
+        ).neg_()
         torch.distributed.all_reduce(
             local_cross_entropy,
             op=torch.distributed.ReduceOp.SUM,
@@ -190,7 +189,7 @@ class DistributedCrossEntropy(torch.autograd.Function):
         )
 
         if not inference_only:
-            student_probs = student_log_probs.exp()
+            student_probs = student_log_probs.exp_()
             ctx.save_for_backward(target_probs, student_probs)
 
         return local_cross_entropy.contiguous()

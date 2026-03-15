@@ -49,6 +49,7 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
@@ -652,6 +653,7 @@ def _create_megatron_config(
 def build_unwrapped_draft_model(
     model_provider,
     draft_config: dict[str, Any],
+    pg_collection: ProcessGroupCollection,
 ) -> MegatronModule | None:
     """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
     if not draft_config.get("enabled", False):
@@ -746,6 +748,18 @@ def build_unwrapped_draft_model(
     config.has_lm_head = False
 
     draft_model = EagleModel(config=config)
+    tp_group = getattr(pg_collection, "tp", None)
+    if tp_group is not None:
+        for module in draft_model.modules():
+            if hasattr(module, "pg_collection"):
+                module.pg_collection = pg_collection
+            if hasattr(module, "_pg_collection"):
+                module._pg_collection = pg_collection
+            if hasattr(module, "tp_group"):
+                module.tp_group = tp_group
+            if hasattr(module, "_tp_group"):
+                module._tp_group = tp_group
+
     if model_name is not None:
         missing_keys, unexpected_keys = load_hf_weights_to_eagle(
             draft_model, model_name
@@ -823,9 +837,11 @@ def _create_draft_pre_wrap_hook(
                 "Policy model chunk already has an attached `draft_model`."
             )
 
+        pg_collection = get_pg_collection(model)
         draft_model = build_unwrapped_draft_model(
             megatron_cfg.model,
             draft_config=draft_cfg,
+            pg_collection=pg_collection,
         )
         if draft_model is not None:
             setattr(draft_owner, "draft_model", draft_model)

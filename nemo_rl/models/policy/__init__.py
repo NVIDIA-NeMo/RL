@@ -256,6 +256,7 @@ class DraftConfig(TypedDict):
     enabled: Literal[True]
     model_name: str
     loss_weight: NotRequired[float]
+    topk: NotRequired[int | None]
     num_layers: NotRequired[int]
     aux_layer_indices: NotRequired[list[int]]
 
