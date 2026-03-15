@@ -127,6 +127,14 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
+# Ensure LOG_DIR is accessible inside the container by auto-mounting its filesystem root
+# (e.g. if SLURM_SUBMIT_DIR is /scratch/fsw/... but MOUNTS only has /lustre:/lustre)
+LOG_DIR_ROOT=$(echo "$LOG_DIR" | cut -d'/' -f1-2)  # e.g. /scratch or /lustre
+if [[ -n "$LOG_DIR_ROOT" ]] && [[ -d "$LOG_DIR_ROOT" ]] && ! echo "$MOUNTS" | grep -q "$LOG_DIR_ROOT"; then
+  MOUNTS="${MOUNTS:+$MOUNTS,}${LOG_DIR_ROOT}:${LOG_DIR_ROOT}"
+  echo "[INFO] Auto-added $LOG_DIR_ROOT to MOUNTS for container access"
+fi
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
