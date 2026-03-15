@@ -613,11 +613,11 @@ AttributeError: 'NemotronHForCausalLM' object has no attribute 'backbone'. Did y
 ```
 
 **Affected tests:**
-- `grpo-nanov3-30BA3B-2n8g-fsdp2` — was METRIC PASS, now OOM on rerun — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2/9936134-logs/ray-driver.log`
-- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora` — UNK: `aten.copy_.default mixed Tensor/DTensor` (initialize_weights still running?) — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2-lora/9936135-logs/ray-driver.log`
-- `sft-nanov3-30BA3B-2n8g-fsdp2` — OOM on rerun — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2/9936143-logs/ray-driver.log`
-- `sft-nanov3-30BA3B-2n8g-fsdp2-lora` — UNK: `aten.copy_.default mixed Tensor/DTensor` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2-lora/9936144-logs/ray-driver.log`
-- `grpo-nano-v2-12b-2n8g-fsdp2tp1` — METRIC FAIL — `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9934575-logs/ray-driver.log`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2` — was METRIC PASS, now OOM on rerun — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2/9992xxx-logs/ray-driver.log`
+- `grpo-nanov3-30BA3B-2n8g-fsdp2-lora` — UNK: `aten.copy_.default mixed Tensor/DTensor` (initialize_weights still running?) — `code_snapshots_v5_nightly/grpo-nanov3-30BA3B-2n8g-fsdp2-lora/9992xxx-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2` — OOM on rerun — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2/9992xxx-logs/ray-driver.log`
+- `sft-nanov3-30BA3B-2n8g-fsdp2-lora` — UNK: `aten.copy_.default mixed Tensor/DTensor` — `code_snapshots_v5_nightly/sft-nanov3-30BA3B-2n8g-fsdp2-lora/9992xxx-logs/ray-driver.log`
+- `grpo-nano-v2-12b-2n8g-fsdp2tp1` — METRIC FAIL — `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9992xxx-logs/ray-driver.log`
 
 **Fix:** Added `dtensor_cfg.automodel_kwargs.force_hf: true` to all NemotronH fsdp2 recipe configs + added `NemotronHForCausalLM` to `skip_initialize_weights` in Automodel checkpointing.py.
 
@@ -651,11 +651,11 @@ torch.OutOfMemoryError: CUDA out of memory.
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16b-automodel-1n8g-ep8` — OOM (Step 4/30, needs 2.25 GiB) — `code_snapshots_v5_nightly/grpo-moonlight-16b-automodel-1n8g-ep8/9936121-logs/ray-driver.log`
-- `grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3` — **METRIC PASS** — `code_snapshots_v5_nightly/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3/9934521-logs/ray-driver.log`
-- `grpo-qwen3-8b-base-1n8g-megatron-lora` — OOM (Step 1/20) — `code_snapshots_v5_nightly/grpo-qwen3-8b-base-1n8g-megatron-lora/9936137-logs/ray-driver.log`
+- `grpo-moonlight-16b-automodel-1n8g-ep8` — METRIC FAIL [30/30] — cuDNN fix resolved OOM but metric fails (gen_kl_error, grad_norm) — `code_snapshots_v5_nightly/grpo-moonlight-16b-automodel-1n8g-ep8/9992016-logs/ray-driver.log`
+- `grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3` — OOM regression on latest rerun — `code_snapshots_v5_nightly/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3/9992020-logs/ray-driver.log`
+- `grpo-qwen3-8b-base-1n8g-megatron-lora` — **METRIC PASS** — `code_snapshots_v5_nightly/grpo-qwen3-8b-base-1n8g-megatron-lora/9992072-logs/ray-driver.log`
 
-**Observation:** Memory pressure from version bump. qwen2.5-32b now passes. moonlight-16b and qwen3-8b-megatron-lora still OOM.
+**Observation:** cuDNN fix resolved OOM for moonlight-16b and qwen3-8b-megatron-lora. moonlight-16b now completes but METRIC FAIL. qwen3-8b-megatron-lora now PASS. qwen2.5-32b has OOM regression on latest rerun.
 
 ---
 
@@ -669,7 +669,7 @@ but the custom CUDA extension fused_weight_gradient_mlp_cuda module is not found
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16ba3b-4n8g-megatron` — METRIC FAIL — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron/9934523-logs/ray-driver.log`
+- `grpo-moonlight-16ba3b-4n8g-megatron` — METRIC FAIL — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron/9992021-logs/ray-driver.log`
 
 **Status:** Crash fixed by Megatron-Bridge PR #2739. Now METRIC FAIL [30/30] — completes all steps but `token_mult_prob_error` is wildly off (median=29296, last step=216619). Zhiyu is looking at it.
 
@@ -684,11 +684,11 @@ AttributeError: 'Fp8MoEMethod' object has no attribute 'flashinfer_moe_backend'
 ```
 
 **Affected tests:**
-- `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e` — UNK (still crashing) — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e/9936131-logs/ray-driver.log`
+- `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e` — METRIC FAIL [30/30] — cuDNN fix resolved crash and OOM, but token_mult_prob_error=26189 — `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e/9992046-logs/ray-driver.log`
 
 **Root cause:** Our patched `process_weights_after_loading_moe` in `nemo_rl/models/generation/vllm/quantization/fp8.py` referenced the old vLLM API (`self.flashinfer_moe_backend`, `self.allow_deep_gemm`). vLLM 0.17 refactored this to `self.fp8_backend` + `convert_to_fp8_moe_kernel_format()` + `make_fp8_moe_kernel()`.
 
-**Fix:** Updated `process_weights_after_loading_moe` to use the new API while preserving `.copy_()` pattern for weight_loader. Needs rerun to verify.
+**Fix:** Updated `process_weights_after_loading_moe` to use the new API while preserving `.copy_()` pattern for weight_loader. cuDNN fix resolved crash/OOM but metric still fails.
 
 ---
 
@@ -701,9 +701,9 @@ RuntimeError: The size of tensor a (546) must match the size of tensor b (0)
 ```
 
 **Affected tests:**
-- `grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e` — UNK (CUDA OOM + illegal memory access) — `code_snapshots_v5_nightly/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e/9936130-logs/ray-driver.log`
+- `grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e` — OOM (reaches Step 100/100 but crashes with OOM) — `code_snapshots_v5_nightly/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e/9992043-logs/ray-driver.log`
 
-**Observation:** On rerun, crashes at Step 3/100 with CUDA OOM then illegal memory access. Original empty tensor error may have been from stale checkpoint; new error is memory pressure.
+**Observation:** Now reaches Step 100/100 but crashes with OOM. Progress from previous runs: Step 3/100 OOM → now completes training steps but OOM at end.
 
 ---
 
@@ -789,10 +789,10 @@ CANCELLED DUE TO TIME LIMIT
 ```
 
 **Affected tests:**
-- `grpo-gspo-deepscaler-1.5b-8K` — METRIC PASS — `code_snapshots_v5_nightly/grpo-gspo-deepscaler-1.5b-8K/9934551-logs/ray-driver.log`
-- `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` — still running (Step 317/500) — `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9936123-logs/ray-driver.log`
+- `grpo-gspo-deepscaler-1.5b-8K` — SLURM timeout again (step time ~254s vs expected, perf regression) — `code_snapshots_v5_nightly/grpo-gspo-deepscaler-1.5b-8K/9992037-logs/ray-driver.log`
+- `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` — **METRIC PASS** — `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9992019-logs/ray-driver.log`
 
-**Status:** gspo-deepscaler FIXED (passed on rerun). megatron_generation still running, currently at Step 317/500.
+**Status:** megatron_generation now PASS. gspo-deepscaler regressed back to SLURM timeout (was PASS on previous rerun, now timing out again with step time ~254s — perf regression).
 
 ---
 
@@ -819,28 +819,27 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 ```
 
 **Affected tests:**
-- `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel` — UNK (still crashing) — `code_snapshots_v5_nightly/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel/9936142-logs/ray-driver.log`
+- `sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel` — UNK (attn:te fix wasn't sufficient) — `code_snapshots_v5_nightly/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel/9992117-logs/ray-driver.log`
 
-**Root cause:** The `attn: flex` backend triggers `torch._dynamo` compilation internally. Flex attention with dynamic MoE shapes fails in torch 2.10's inductor backward pass compilation. Fix: switched to `attn: te` (transformer engine attention) which doesn't require torch.compile. Needs rerun.
+**Root cause:** The `attn: flex` backend triggers `torch._dynamo` compilation internally. Flex attention with dynamic MoE shapes fails in torch 2.10's inductor backward pass compilation. Initial fix (switched to `attn: te`) wasn't sufficient — root cause is `@torch.compile` in MoE `experts.py`. New fix: set `TORCH_COMPILE_DISABLE=1`.
 
 ---
 
-## METRIC FAIL (updated as of 3/12/2026)
+## METRIC FAIL (updated as of 3/15/2026)
 
 | Test | Failed metric | Value | Threshold | Log |
 |------|--------------|-------|-----------|-----|
 | `grpo-nano-v2-12b-1n8g-megatron` | `token_mult_prob_error` | NaN→now PASS | | `code_snapshots_v5_nightly/grpo-nano-v2-12b-1n8g-megatron/9936133-logs/ray-driver.log` |
-| `grpo-nano-v2-12b-2n8g-fsdp2tp1` | `token_mult_prob_error` | still FAIL | < 1.05 | `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9934575-logs/ray-driver.log` |
-| `grpo-gemma3-1b-it-1n8g-fsdp2tp1` | ? | **NEW REGRESSION** | | `code_snapshots_v5_nightly/grpo-gemma3-1b-it-1n8g-fsdp2tp1/9934497-logs/ray-driver.log` |
+| `grpo-nano-v2-12b-2n8g-fsdp2tp1` | `reward` | still FAIL (reward too low 0.324 < 0.4 threshold) | < 0.4 | `code_snapshots_v5_nightly/grpo-nano-v2-12b-2n8g-fsdp2tp1/9992058-logs/ray-driver.log` |
 | `sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch` | `gpu.0.mem_gb` | now PASS | | `code_snapshots_v5_nightly/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch/9934642-logs/ray-driver.log` |
 | `sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3` | `gpu.0.mem_gb` | now PASS | | `code_snapshots_v5_nightly/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3/9934652-logs/ray-driver.log` |
+| `grpo-moonlight-16b-automodel-1n8g-ep8` | `gen_kl_error`, `grad_norm` | METRIC FAIL | | `code_snapshots_v5_nightly/grpo-moonlight-16b-automodel-1n8g-ep8/9992016-logs/ray-driver.log` |
+| `grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e` | `token_mult_prob_error` | 26189 | | `code_snapshots_v5_nightly/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e/9992046-logs/ray-driver.log` |
 
 **New errors found on rerun:**
 
 | Test | Error | Log |
 |------|-------|-----|
-| `sft-qwen2.5-math7b-2n8g-megatron` | `TypeError: 'NoneType' not iterable` in `param_and_grad_buffer.py:336`. Root cause: `use_distributed_optimizer=false` + `overlap_param_gather=true` (from base sft.yaml) is incompatible in mcore. Fix: set `overlap_param_gather: false` in recipe. Needs rerun. | `code_snapshots_v5_nightly/sft-qwen2.5-math7b-2n8g-megatron/9936141-logs/ray-driver.log` |
-| `grpo-gemma3-1b-it-1n8g-fsdp2tp1` | METRIC FAIL [400/400] — median passes (1.007) but last-step spikes to 1.99. Dropped last-step check (same pattern as SGLang). Needs rerun. | `code_snapshots_v5_nightly/grpo-gemma3-1b-it-1n8g-fsdp2tp1/9934497-logs/ray-driver.log` |
 
 **Completed on rerun (now METRIC PASS — were previously failing or not tested):**
 
@@ -849,12 +848,14 @@ torch._inductor.exc.InductorError: GuardOnDataDependentSymNode:
 | `grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3` | `code_snapshots_v5_nightly/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3/9936129-logs/ray-driver.log` |
 | `grpo-math-qwen3-30ba3b-megatron-tp4-32k` | `code_snapshots_v5_nightly/grpo-math-qwen3-30ba3b-megatron-tp4-32k/9936127-logs/ray-driver.log` |
 | `grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron` | `code_snapshots_v5_nightly/grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron/9936132-logs/ray-driver.log` |
+| `grpo-gemma3-1b-it-1n8g-fsdp2tp1` | now METRIC PASS |
+| `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` | `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9992019-logs/ray-driver.log` |
+| `sft-qwen2.5-math7b-2n8g-megatron` | now METRIC PASS |
+| `grpo-qwen3-8b-base-1n8g-megatron-lora` | `code_snapshots_v5_nightly/grpo-qwen3-8b-base-1n8g-megatron-lora/9992072-logs/ray-driver.log` |
 
 **Still running:**
 
-| Test | Progress | Log |
-|------|----------|-----|
-| `grpo-llama3.2-1b-instruct-1n8g-megatron_generation` | Step 483/500 | `code_snapshots_v5_nightly/grpo-llama3.2-1b-instruct-1n8g-megatron_generation/9936123-logs/ray-driver.log` |
+(none)
 
 ---
 
