@@ -1046,22 +1046,10 @@ class AsyncTrajectoryCollector:
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
             from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 
-            uses_nemo_gym = _should_use_nemo_gym(self.master_config)
-            rollout_backend = (
-                "nemo_gym_router" if uses_nemo_gym else "nemo_rl_async_rollout"
-            )
-            worker_start = time.time()
-            print(
-                f"[rollout-worker-debug] worker_pool={rollout_backend} "
-                f"prompt_idx={prompt_idx} target={target_weight_version} "
-                f"gen_weight={generation_weight_version} retry={retry_count} "
-                f"batch_size={repeated_batch.size} STARTING"
-            )
-
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
             # Check if we should use nemo_gym (similar to synchronous GRPO)
-            if uses_nemo_gym:
+            if _should_use_nemo_gym(self.master_config):
                 generation_config = self.master_config["policy"]["generation"]
                 env_cfg = self.master_config.get("env") or {}
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
@@ -1102,14 +1090,6 @@ class AsyncTrajectoryCollector:
                     max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
-
-            worker_elapsed = time.time() - worker_start
-            print(
-                f"[rollout-worker-debug] worker_pool={rollout_backend} "
-                f"prompt_idx={prompt_idx} target={target_weight_version} "
-                f"gen_weight={generation_weight_version} retry={retry_count} "
-                f"ROLLOUT DONE in {worker_elapsed:.1f}s"
-            )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
