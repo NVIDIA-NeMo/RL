@@ -231,6 +231,7 @@ def forward_with_post_processing_fn(
             captured_states=captured_states,
             draft_model=draft_model,
             lm_head_weight=lm_head_weight,
+            attention_mask=attention_mask,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -334,6 +335,7 @@ class LossPostProcessor:
         captured_states: Optional[CapturedStates] = None,
         draft_model: Optional[MegatronModule] = None,
         lm_head_weight: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -378,6 +380,7 @@ class LossPostProcessor:
                 draft_model=draft_model,
                 lm_head_weight=lm_head_weight,
                 captured_states=captured_states,
+                attention_mask=attention_mask,
                 loss_weight=float(self.cfg.get("draft", {}).get("loss_weight", 1.0)),
                 cu_seqlens_q=(
                     packed_seq_params.cu_seqlens_q

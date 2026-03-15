@@ -165,10 +165,13 @@ class _EagleModelLayout:
         return {layer.layer_index: layer for layer in self.layers}
 
 
-def _combine_weight_parts(
+def _combine_or_shard_weight_parts(
     *,
+    parameter_name: str,
     fused_weight: Tensor | None,
     component_weights: tuple[Tensor | None, ...],
+    target: Tensor | None,
+    tp_rank: int,
     incomplete_error: str,
 ) -> Tensor | None:
     if fused_weight is not None:
@@ -179,10 +182,51 @@ def _combine_weight_parts(
     if any(weight is None for weight in component_weights):
         raise RuntimeError(incomplete_error)
 
-    return torch.cat(
+    full_weight = torch.cat(
         [weight for weight in component_weights if weight is not None],
         dim=0,
-    )
+    ).contiguous()
+    if target is None:
+        return full_weight
+    if full_weight.shape == target.shape:
+        return full_weight.to(dtype=target.dtype)
+
+    full_dim = full_weight.shape[0]
+    local_dim = target.shape[0]
+    if local_dim <= 0 or full_dim % local_dim != 0:
+        raise RuntimeError(
+            f"[draft] Cannot infer TP sharding for '{parameter_name}': "
+            f"checkpoint={tuple(full_weight.shape)} model={tuple(target.shape)}"
+        )
+
+    inferred_tp = full_dim // local_dim
+    if tp_rank >= inferred_tp:
+        raise RuntimeError(
+            f"[draft] tp_rank={tp_rank} out of range for key '{parameter_name}' "
+            f"(inferred_tp={inferred_tp})"
+        )
+
+    # Fused Megatron weights expect each local TP shard to preserve component
+    # boundaries, e.g. [q_local, k_local, v_local] instead of chunk(full[q, k, v]).
+    local_weight_parts = []
+    for weight in component_weights:
+        assert weight is not None
+        if weight.shape[0] % inferred_tp != 0:
+            raise RuntimeError(
+                f"[draft] Cannot TP-shard fused component for '{parameter_name}': "
+                f"component={tuple(weight.shape)} inferred_tp={inferred_tp}"
+            )
+        local_weight_parts.append(
+            torch.chunk(weight, inferred_tp, dim=0)[tp_rank].contiguous()
+        )
+
+    local_weight = torch.cat(local_weight_parts, dim=0).contiguous()
+    if local_weight.shape != target.shape:
+        raise RuntimeError(
+            f"[draft] Invalid TP shard shape for '{parameter_name}': "
+            f"got={tuple(local_weight.shape)} expected={tuple(target.shape)}"
+        )
+    return local_weight.to(dtype=target.dtype)
 
 
 @dataclass
@@ -195,10 +239,19 @@ class _PendingLayerWeights:
     gate_weight: Tensor | None = None
     up_weight: Tensor | None = None
 
-    def apply_to(self, mapped_state: StateDict, layer: _EagleLayerLayout) -> None:
-        qkv_weight = _combine_weight_parts(
+    def apply_to(
+        self,
+        mapped_state: StateDict,
+        layer: _EagleLayerLayout,
+        model_state: Mapping[str, Tensor],
+        tp_rank: int,
+    ) -> None:
+        qkv_weight = _combine_or_shard_weight_parts(
+            parameter_name=layer.qkv_weight_key,
             fused_weight=self.qkv_weight,
             component_weights=(self.q_weight, self.k_weight, self.v_weight),
+            target=model_state.get(layer.qkv_weight_key),
+            tp_rank=tp_rank,
             incomplete_error=(
                 "[draft] Incomplete QKV tensors. Expected q_proj, k_proj, and v_proj."
             ),
@@ -206,9 +259,12 @@ class _PendingLayerWeights:
         if qkv_weight is not None:
             mapped_state[layer.qkv_weight_key] = qkv_weight
 
-        fc1_weight = _combine_weight_parts(
+        fc1_weight = _combine_or_shard_weight_parts(
+            parameter_name=layer.fc1_weight_key,
             fused_weight=self.fc1_weight,
             component_weights=(self.gate_weight, self.up_weight),
+            target=model_state.get(layer.fc1_weight_key),
+            tp_rank=tp_rank,
             incomplete_error=(
                 "[draft] Incomplete MLP tensors. Expected gate_proj and up_proj."
             ),
@@ -768,8 +824,14 @@ def _map_hf_state_to_eagle_state(
             pending_weights=pending_weights_by_layer[layer_index],
         )
 
+    tp_rank = _get_tp_rank()
     for layer in layout.layers:
-        pending_weights_by_layer[layer.layer_index].apply_to(mapped_state, layer)
+        pending_weights_by_layer[layer.layer_index].apply_to(
+            mapped_state,
+            layer,
+            model_state=model_state,
+            tp_rank=tp_rank,
+        )
 
     if not mapped_state:
         raise RuntimeError(
@@ -778,7 +840,6 @@ def _map_hf_state_to_eagle_state(
         )
 
     split_axis_by_parameter = _build_split_axis_by_parameter(layout)
-    tp_rank = _get_tp_rank()
     for parameter_name in list(mapped_state):
         mapped_state[parameter_name] = _shard_to_local_tp(
             parameter_name=parameter_name,

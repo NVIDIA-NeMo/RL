@@ -545,12 +545,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Swap reference model state_dict to self.model
                 for k, v in self.model.state_dict().items():
                     if isinstance(v, torch.Tensor):
-                        if k not in self.reference_state_dict:
-                            if "draft_model." in k:
-                                continue
-                            raise KeyError(
-                                f"Missing reference-model tensor for key '{k}'."
-                            )
+                        if "draft_model." in k:
+                            continue
                         v.copy_(self.reference_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:

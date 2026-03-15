@@ -17,6 +17,10 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import torch
 import torch.distributed
+from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.multi_token_prediction import roll_tensor
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -194,6 +198,46 @@ class DraftLossWrapper:
                 "DraftLossWrapper requires a detached LM head weight tensor."
             )
 
+    def _shift_draft_input_embeds(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        sequence_parallel_enabled = bool(
+            getattr(
+                getattr(self.draft_model, "config", None), "sequence_parallel", False
+            )
+        )
+        tp_group = getattr(getattr(self.draft_model, "lm_head", None), "tp_group", None)
+
+        if (
+            not sequence_parallel_enabled
+            or tp_group is None
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size(tp_group) <= 1
+        ):
+            return roll_tensor(
+                input_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=self.context_parallel_group,
+                packed_seq_params=self.packed_seq_params,
+            )[0]
+
+        # Captured embeddings inherit Megatron's sequence-parallel sharding, so roll on
+        # the gathered TP view before re-sharding for the draft model forward pass.
+        gathered_input_embeds = gather_from_sequence_parallel_region(
+            input_embeds,
+            group=tp_group,
+        )
+        shifted_input_embeds, _ = roll_tensor(
+            gathered_input_embeds,
+            shifts=-1,
+            dims=0,
+            cp_group=self.context_parallel_group,
+            packed_seq_params=self.packed_seq_params,
+        )
+        return scatter_to_sequence_parallel_region(
+            shifted_input_embeds.contiguous(),
+            group=tp_group,
+        )
+
     def _compute_draft_logits(self) -> torch.Tensor:
         if (
             self.captured_states is None
@@ -204,12 +248,8 @@ class DraftLossWrapper:
                 "DraftLossWrapper requires captured hidden states and input embeddings."
             )
 
-        shifted_input_embeds, _ = roll_tensor(
-            self.captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=self.context_parallel_group,
-            packed_seq_params=self.packed_seq_params,
+        shifted_input_embeds = self._shift_draft_input_embeds(
+            self.captured_states.inputs_embeds
         )
         return self.draft_model(
             hidden_states=self.captured_states.hidden_states,
@@ -317,34 +357,30 @@ class DraftLossWrapper:
             **kwargs,
         )
         draft_logits = self._compute_draft_logits()
-
-        teacher_logits = next_token_logits.detach().to(torch.float32)
-        student_logits = draft_logits.to(torch.float32)
-
         # Align teacher logits with the draft model's next-token prediction target.
-        teacher_logits, _ = roll_tensor(
-            teacher_logits,
+        next_token_logits, _ = roll_tensor(
+            next_token_logits.detach(),
             shifts=-1,
             dims=1,
             cp_group=self.context_parallel_group,
             packed_seq_params=self.packed_seq_params,
         )
 
-        kl_seq_len = teacher_logits.shape[1]
-        student_logits = student_logits[:, :kl_seq_len, :]
+        kl_seq_len = next_token_logits.shape[1]
+        draft_logits = draft_logits[:, :kl_seq_len, :]
         mask = self._build_mask(data, kl_seq_len)
 
         effective_seq_len = min(
-            int(teacher_logits.shape[1]),
+            int(next_token_logits.shape[1]),
             int(mask.shape[1]),
         )
-        teacher_logits = teacher_logits[:, :effective_seq_len, :]
-        student_logits = student_logits[:, :effective_seq_len, :]
+        next_token_logits = next_token_logits[:, :effective_seq_len, :]
+        draft_logits = draft_logits[:, :effective_seq_len, :]
         mask = mask[:, :effective_seq_len]
 
         per_token_draft_loss = self._compute_per_token_draft_loss(
-            teacher_logits,
-            student_logits,
+            next_token_logits,
+            draft_logits,
         )
         draft_loss = masked_mean(
             per_token_draft_loss,

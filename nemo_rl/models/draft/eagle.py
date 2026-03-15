@@ -31,6 +31,20 @@ def build_default_causal_attention_mask(seq_len: int, device: torch.device) -> T
     )
 
 
+def shift_attention_mask_for_next_token_inputs(attention_mask: Tensor) -> Tensor:
+    """Align a causal mask with left-shifted next-token draft inputs."""
+    if attention_mask.ndim != 4 or attention_mask.shape[-1] != attention_mask.shape[-2]:
+        raise ValueError(
+            "EagleModel.forward expects a square attention mask with shape [b, 1, s, s]."
+        )
+
+    shifted_attention_mask = attention_mask.clone()
+    shifted_attention_mask[:, :, :-1, :-1] = attention_mask[:, :, 1:, 1:]
+    shifted_attention_mask[:, :, -1, :] = True
+    shifted_attention_mask[:, :, :, -1] = True
+    return shifted_attention_mask.contiguous()
+
+
 class EagleModel(MegatronModule):
     def __init__(self, config: TransformerConfig):
         super().__init__(config=config)
@@ -83,11 +97,7 @@ class EagleModel(MegatronModule):
                 f"`bootstrap_hidden_states=False`, got {hidden_states.shape[-1]}."
             )
 
-        if attention_mask is None:
-            attention_mask = build_default_causal_attention_mask(
-                hidden_states.shape[0],
-                hidden_states.device,
-            )
+        attention_mask = shift_attention_mask_for_next_token_inputs(attention_mask)
 
         hidden_states, _ = self.eagle_module(
             embeddings=input_embeds,
