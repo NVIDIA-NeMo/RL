@@ -206,7 +206,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            optimizer_module_filter=["score."],
+            #optimizer_module_filter=["score."],
         )
 
         # Set instance attributes from model and optimizer state

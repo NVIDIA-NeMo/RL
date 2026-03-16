@@ -28,45 +28,33 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
-    GeneralizedAdvantageEstimator,
-    GRPOAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
-)
+    GeneralizedAdvantageEstimator, GRPOAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator)
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import (
-    ClippedPGLossConfig,
-    ClippedPGLossDataDict,
-    ClippedPGLossFn,
-    MseValueLossFn,
-)
-from nemo_rl.algorithms.reward_functions import (
-    RewardShapingConfig,
-    apply_reward_shaping,
-)
-from nemo_rl.algorithms.utils import (
-    calculate_baseline_and_std_per_prompt,
-    log_generation_metrics_to_wandb,
-    print_performance_metrics,
-    set_seed,
-)
+from nemo_rl.algorithms.loss_functions import (ClippedPGLossConfig,
+                                               ClippedPGLossDataDict,
+                                               ClippedPGLossFn, MseValueLossFn)
+from nemo_rl.algorithms.reward_functions import (RewardShapingConfig,
+                                                 apply_reward_shaping)
+from nemo_rl.algorithms.utils import (calculate_baseline_and_std_per_prompt,
+                                      log_generation_metrics_to_wandb,
+                                      print_performance_metrics, set_seed)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
-    batched_message_log_to_flat_message,
-    get_keys_from_message_log,
-)
+    batched_message_log_to_flat_message, get_keys_from_message_log)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.collectives import T
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.ray_actor_environment_registry import \
+    get_actor_python_env
+from nemo_rl.distributed.virtual_cluster import (ClusterConfig,
+                                                 RayVirtualCluster)
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.rollouts import (
-    run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
-    run_multi_turn_rollout,
-)
+from nemo_rl.experience.rollouts import (run_async_multi_turn_rollout,
+                                         run_async_nemo_gym_rollout,
+                                         run_multi_turn_rollout)
 from nemo_rl.models import value
 from nemo_rl.models.automodel import train
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -78,7 +66,8 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
+from nemo_rl.utils.logger import (Logger, LoggerConfig,
+                                  print_message_log_samples)
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -1363,7 +1352,7 @@ def ppo_train(
 
                 print(
                     f"  • Average batch reward: {train_data['rewards'].mean().numpy():.4f}\n"
-                    f"  • Average batch response length: {input_lengths.sum():.4f}"
+                    f"  • Average batch response length: {input_lengths.sum() / input_lengths.shape[0]:.4f}"
                 )
 
             with timer.time("logprob_inference_prep"):
@@ -1384,24 +1373,18 @@ def ppo_train(
 
             with timer.time("compute_advantages"):
                 print("▶ Computing advantages...", flush=True)
-                train_data["advantages"] = adv_estimator.compute_advantage(
+                advantages, returns = adv_estimator.compute_advantage(
                     prompt_ids=torch.arange(messages["token_ids"].shape[0]),
                     rewards=train_data["rewards"],
                     mask=train_data["token_mask"],
                     values=train_data["values"],
                     lengths=input_lengths,
                     reference_logprobs=train_data["reference_policy_logprobs"],
+                    logprobs=train_data["prev_logprobs"],
                 )
 
-                train_data["returns"] = train_data["advantages"] + train_data["values"]
-
-                # for i in range(train_data["advantages"].shape[0]):
-                #     if train_data["rewards"][i] != 0:
-                #         print(f"Advantages: {train_data['advantages'][i, :]}")
-                #         print(f"Values: {train_data['values'][i, :]}")
-                #         print(f"Masks: {train_data['token_mask'][i, :]}")
-                #         print(f"Rewards: {train_data['rewards'][i]}")
-                #         break
+                train_data["advantages"] = advantages
+                train_data["returns"] = returns
 
             for step in range(steps_per_epoch):
                 print(
@@ -1409,18 +1392,19 @@ def ppo_train(
                     flush=True,
                 )
 
-                with timer.time("policy_training_prep"):
-                    policy.prepare_for_training()
+                if epoch > 12:
+                    with timer.time("policy_training_prep"):
+                        policy.prepare_for_training()
 
-                with timer.time("policy_training"):
-                    print("▶ Training policy...", flush=True)
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
-                    policy.finish_training()
-                    POLICY_GENERATION_STALE = True
+                    with timer.time("policy_training"):
+                        print("▶ Training policy...", flush=True)
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        policy.finish_training()
+                        POLICY_GENERATION_STALE = True
 
                 with timer.time("value_training_prep"):
                     value_model.prepare_for_training()
@@ -1437,7 +1421,9 @@ def ppo_train(
                 print(
                     f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch} training results:"
                 )
-                print(f"    • Policy loss: {train_results['loss'].item():.4f}")
+
+                if epoch > 12:
+                    print(f"    • Policy loss: {train_results['loss'].item():.4f}")
                 print(f"    • Value loss: {value_results['loss'].item():.4f}")
 
             if (epoch + 1) % val_period == 0:

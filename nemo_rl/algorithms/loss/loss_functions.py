@@ -191,7 +191,7 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
         self.reference_policy_kl_type = cfg.reference_policy_kl_type
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
