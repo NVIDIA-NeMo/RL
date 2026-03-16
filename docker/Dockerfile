@@ -1,9 +1,20 @@
 # syntax=docker/dockerfile:1
 # Usage:
-# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
-# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
-# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
-# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
+#   Self-contained build (default: builds from main):
+#     docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
+#
+#   Self-contained build (specific git ref):
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+#
+#   Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+#
+#   Local NeMo RL source override:
+#     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
+#
+# Optional build args to skip vLLM or SGLang dependencies:
+#   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
+#   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -34,7 +45,7 @@ apt-get install -y --no-install-recommends \
 # Nsight
 apt install -y --no-install-recommends gnupg
 echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub
+apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
 apt update
 apt install -y nsight-systems-cli
 
@@ -44,6 +55,18 @@ apt install -y --only-upgrade gnupg
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
+
+# CMake (for sglang build)
+RUN GITHUB_ARTIFACTORY=github.com \
+    && CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
+        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
 ARG UV_VERSION=0.9.7
@@ -72,6 +95,16 @@ ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
+ARG BUILD_CUSTOM_VLLM_URL
+ARG BUILD_CUSTOM_VLLM_REF
+ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
+# Only use for custom flashinfer installs.
+ARG BUILD_CUSTOM_FLASHINFER
+ARG BUILD_CUSTOM_FLASHINFER_URL
+ARG BUILD_CUSTOM_FLASHINFER_REF
+# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
+ARG SKIP_VLLM_BUILD
+ARG SKIP_SGLANG_BUILD
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -84,14 +117,18 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh
+    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
+fi
+if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -101,7 +138,12 @@ fi
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
-uv sync --link-mode symlink --locked --extra vllm --no-install-project
+if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
+    uv sync --link-mode symlink --locked --extra vllm --no-install-project
+fi
+if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
+    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
@@ -118,6 +160,9 @@ WORKDIR /opt/nemo-rl
 
 FROM hermetic AS release
 
+# Re-declare build args for this stage
+ARG SKIP_VLLM_BUILD
+ARG SKIP_SGLANG_BUILD
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -138,7 +183,20 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+RUN <<"EOF" bash -exu
+NEGATIVE_FILTERS=""
+if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
+fi
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+fi
+if [[ -n "$NEGATIVE_FILTERS" ]]; then
+    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+else
+    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+fi
+EOF
 
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts

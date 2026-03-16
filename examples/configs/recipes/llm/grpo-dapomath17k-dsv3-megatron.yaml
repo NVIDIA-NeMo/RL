@@ -29,6 +29,8 @@ policy:
     sequence_parallel: true
     moe_permute_fusion: true
     apply_rope_fusion: false
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
     optimizer:
       lr: 5.0e-07
       min_lr: 5.0e-08
@@ -39,8 +41,12 @@ policy:
       async_engine: true
       tensor_parallel_size: 32
 data:
-  prompt_file: null
-  dataset_name: DAPOMath17K
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
 logger:
   monitor_gpus: false
   wandb:

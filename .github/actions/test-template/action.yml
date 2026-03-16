@@ -58,6 +58,21 @@ inputs:
     description: "Whether this is a pull request from a fork"
     required: false
     default: "false"
+  registry:
+    description: "Registry to use for test"
+    required: false
+  test_data_path:
+    description: "Test data path"
+    required: false
+    default: "/mnt/datadrive/TestData"
+  image-tag:
+    description: "Override container image tag. If set, infers FAST=1 and prefetches venvs + regenerates fingerprint at startup."
+    required: false
+    default: ""
+  test-commit-sha:
+    description: "Commit SHA to use for test"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -68,73 +83,12 @@ runs:
       run: |
         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
-    - name: Azure Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
+    - name: Install uuidgen
+      shell: bash -x -e -u -o pipefail {0}
+      if: ${{ contains(inputs.runner, 'gcp') }}
       run: |
-        az acr login --name nemoci
-
-    - name: Azure Fileshare
-      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' && inputs.is_doc_test == 'false' }}
-      shell: bash
-      id: azure-fileshare
-      run: |
-        sudo apt update
-        sudo apt install -y cifs-utils
-
-        RESOURCE_GROUP_NAME="azure-gpu-vm-runner_group"
-        STORAGE_ACCOUNT_NAME="nemocistorageaccount2"
-        FILE_SHARE_NAME="fileshare"
-
-        MNT_ROOT="/media"
-        MNT_PATH="$MNT_ROOT/$STORAGE_ACCOUNT_NAME/$FILE_SHARE_NAME"
-
-        echo "MNT_PATH=$MNT_PATH" | tee -a "$GITHUB_OUTPUT"
-
-        sudo mkdir -p $MNT_PATH
-
-        # Create a folder to store the credentials for this storage account and
-        # any other that you might set up.
-        CREDENTIAL_ROOT="/etc/smbcredentials"
-        sudo mkdir -p "/etc/smbcredentials"
-
-        # Get the storage account key for the indicated storage account.
-        # You must be logged in with az login and your user identity must have
-        # permissions to list the storage account keys for this command to work.
-        STORAGE_ACCOUNT_KEY=$(az storage account keys list \
-            --resource-group $RESOURCE_GROUP_NAME \
-            --account-name $STORAGE_ACCOUNT_NAME \
-            --query "[0].value" --output tsv | tr -d '"')
-
-        # Create the credential file for this individual storage account
-        SMB_CREDENTIAL_FILE="$CREDENTIAL_ROOT/$STORAGE_ACCOUNT_NAME.cred"
-        if [ ! -f $SMB_CREDENTIAL_FILE ]; then
-            echo "username=$STORAGE_ACCOUNT_NAME" | sudo tee $SMB_CREDENTIAL_FILE > /dev/null
-            echo "password=$STORAGE_ACCOUNT_KEY" | sudo tee -a $SMB_CREDENTIAL_FILE > /dev/null
-        else
-            echo "The credential file $SMB_CREDENTIAL_FILE already exists, and was not modified."
-        fi
-
-        # Change permissions on the credential file so only root can read or modify the password file.
-        sudo chmod 600 $SMB_CREDENTIAL_FILE
-
-        # This command assumes you have logged in with az login
-        HTTP_ENDPOINT=$(az storage account show --resource-group $RESOURCE_GROUP_NAME --name $STORAGE_ACCOUNT_NAME --query "primaryEndpoints.file" --output tsv | tr -d '"')
-        SMB_PATH=$(echo $HTTP_ENDPOINT | cut -c7-${#HTTP_ENDPOINT})$FILE_SHARE_NAME
-
-        STORAGE_ACCOUNT_KEY=$(az storage account keys list --resource-group $RESOURCE_GROUP_NAME --account-name $STORAGE_ACCOUNT_NAME --query "[0].value" --output tsv | tr -d '"')
-
-        sudo mount -t cifs $SMB_PATH $MNT_PATH -o credentials=$SMB_CREDENTIAL_FILE,serverino,nosharesock,actimeo=30,mfsymlinks
-
-        ls -al $MNT_PATH/TestData
+        apt-get update
+        apt-get install -y uuid-runtime
 
     - name: Docker system cleanup
       shell: bash
@@ -144,7 +98,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ github.run_id }}
+        docker pull ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}
 
     - name: Create UUID
       id: uuid
@@ -157,8 +111,9 @@ runs:
       env:
         DIR: ${{ github.run_id }}
       with:
-        submodules: 'recursive'
+        submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
+        ref: ${{ inputs.test-commit-sha }}
 
     - name: Run tests
       id: test
@@ -176,16 +131,24 @@ runs:
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
           ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
+          ${{ inputs.image-tag != '' && '--env FAST=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
           --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
-          --volume /mnt/datadrive/TestData/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \
-          --volume /mnt/datadrive/TestData/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
-          --volume /mnt/datadrive/TestData/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
-          --volume /mnt/datadrive/TestData/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -eux -o pipefail -c '\
+          --volume ${{ inputs.test_data_path }}/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \
+          --volume ${{ inputs.test_data_path }}/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
+          --volume ${{ inputs.test_data_path }}/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
+          --volume ${{ inputs.test_data_path }}/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
+          ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
+            # When reusing a pre-built container (FAST=1), prefetch venvs and regenerate the
+            # fingerprint once upfront instead of using NRL_FORCE_REBUILD_VENVS=true which
+            # rebuilds on every Ray remote call.
+            if [[ "${FAST:-0}" == "1" ]]; then
+              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+              python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+            fi
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
 

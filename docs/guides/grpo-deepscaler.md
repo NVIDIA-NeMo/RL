@@ -8,9 +8,9 @@ We follow the DeepScaleR recipe and train the model in three stages. In the firs
 To train the model using NeMo RL, use the `examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml` config file. This file closely matches the experiment settings in the original DeepScaleR recipe. We then train with `examples/configs/recipes/llm/grpo-deepscaler-1.5b-16K.yaml` and `examples/configs/recipes/llm/grpo-deepscaler-1.5b-24K.yaml` for the second and third stages, respectively.
 
 ```sh
-uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml
-uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-16K.yaml policy.model_name=/path/to/8K/checkpoint/hf
-uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-24K.yaml policy.model_name=/path/to/16K/checkpoint/hf
+uv run examples/run_grpo.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml
+uv run examples/run_grpo.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-16K.yaml policy.model_name=/path/to/8K/checkpoint/hf
+uv run examples/run_grpo.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-24K.yaml policy.model_name=/path/to/16K/checkpoint/hf
 ```
 
 At the end of each stage, you need to specify the Hugging Face checkpoint to continue training with. To get this checkpoint, we convert a model checkpoint to a Hugging Face checkpoint with the following command:

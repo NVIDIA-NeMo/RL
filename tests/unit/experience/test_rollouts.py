@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import gc
+import json
+import tempfile
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -22,8 +24,10 @@ import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -32,8 +36,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.environments.nemo_gym import nemo_gym_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
+    _calculate_single_metric,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -59,6 +63,42 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+class TestCalculateSingleMetric:
+    """Unit tests for _calculate_single_metric function."""
+
+    def test_single_value_returns_nan_for_stddev(self):
+        """Test that stddev returns nan when given a single value (GitHub issue #1411)."""
+        import math
+
+        result = _calculate_single_metric([42.0], batch_size=1, key_name="test")
+
+        assert result["test/mean"] == 42.0
+        assert result["test/max"] == 42.0
+        assert result["test/min"] == 42.0
+        assert result["test/median"] == 42.0
+        assert math.isnan(result["test/stddev"]), (
+            "stddev should be nan for single value"
+        )
+
+    def test_multiple_values_computes_stddev(self):
+        """Test that stddev is computed correctly for multiple values."""
+        result = _calculate_single_metric(
+            [1.0, 2.0, 3.0], batch_size=3, key_name="test"
+        )
+
+        assert result["test/mean"] == 2.0
+        assert result["test/max"] == 3.0
+        assert result["test/min"] == 1.0
+        assert result["test/median"] == 2.0
+        assert abs(result["test/stddev"] - 1.0) < 1e-9  # stdev of [1,2,3] is 1.0
+
+    def test_two_identical_values_returns_zero_stddev(self):
+        """Test that stddev is 0 when all values are identical."""
+        result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
+
+        assert result["test/stddev"] == 0.0
 
 
 @pytest.fixture(scope="function")
@@ -757,10 +797,21 @@ def test_run_async_nemo_gym_rollout(
     nemo_gym_sanity_test_data,  # noqa: F811
     nemo_gym_tokenizer,  # noqa: F811
 ):
+    # only keep the input part of the data for the test
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    # load the dataset and convert to compatible format for Nemo RL
+    nemo_gym_sanity_test_data = NemoGymDataset(data_path)
     nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_sanity_test_data["input"])
+        nemo_gym_data_processor(
+            nemo_gym_sanity_test_data.dataset[idx], None, None, None, idx
+        )
+        for idx in range(len(nemo_gym_sanity_test_data.dataset))
     ]
+
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
     actual_result = run_async_nemo_gym_rollout(
         policy_generation=nemo_gym_vllm_generation,

@@ -18,8 +18,11 @@ from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.data.multimodal_utils import PackedTensor
+
 # OpenAI-API-like message log, but every messsage may contain associated tensors (i.e. tokenized strings and logprobs) in addition to the original "content" string
 LLMMessageLogType = list[dict[str, Union[str, torch.Tensor]]]
+VLMMessageLogType = list[dict[str, Union[str, torch.Tensor, PackedTensor]]]
 
 # Flattened message log where all tensors and data are concatenated together for a conversation
 # Converts a conversation from list-of-turns format to key-value format with concatenated tensors
@@ -30,9 +33,9 @@ TokenizerType = PreTrainedTokenizerBase
 
 
 class DatumSpec(TypedDict):
-    message_log: LLMMessageLogType
+    message_log: LLMMessageLogType | VLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
-    extra_env_info: dict[str, Any]
+    extra_env_info: Optional[dict[str, Any]]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
     task_name: NotRequired[str]
@@ -40,7 +43,7 @@ class DatumSpec(TypedDict):
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 
-class DPODatumSpec(TypedDict):
+class PreferenceDatumSpec(TypedDict):
     message_log_chosen: LLMMessageLogType
     message_log_rejected: LLMMessageLogType
     length_chosen: int
@@ -98,3 +101,10 @@ class TaskDataProcessFnCallable(Protocol):
         idx: int,
     ) -> DatumSpec:
         raise NotImplementedError("Task data process not implemented")
+
+
+class TaskDataPreProcessFnCallable(Protocol):
+    """A callable that processes a loaded raw datum dictionary into a dictionary with required format for further processing."""
+
+    def __call__(self, datum_dict: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError("Task data preprocess not implemented")

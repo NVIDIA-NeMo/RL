@@ -12,10 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+import base64
+import inspect
+import logging
+import re
+from collections import defaultdict
+from io import BytesIO
+from typing import Any, Optional, Union
 
+import decord
+import requests
 import torch
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
+from transformers.audio_utils import load_audio
+from transformers.video_utils import load_video
+
+# List of allowed placeholder strings for different media types in the dataset string
+# e.g. "This is an example of <image>"
+MEDIA_TAGS = {
+    "image": "<image>",
+    "video": "<video>",
+    "audio": "<audio>",
+    "video-audio": "<video-audio>",
+}
+MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+
+DEFAULT_MEDIA_EXTENSIONS = {
+    "image": ["png", "jpeg", "jpg", "img"],
+    "video": ["mp4"],
+    "video-audio": ["mp4"],
+    "audio": ["wav", "flac", "mp3"],
+}
+
+
+# different media namings maybe used in the raw dataset,
+# in which case, they need to be mapped to the allowed ones
+# WARNING: values cannot be used as the keys in the same dict to avoid cyclic graph
+MEDIA_TAGS_TO_ALLOWED = {
+    "speech": "audio",
+    "speeches": "audio",
+    "sound": "audio",
+    "audios": "audio",
+    "images": "image",
+    "videos": "video",
+}
+
+
+# Build a pattern like: <image>|<video>|<audio>|<video-audio>
+MEDIA_TAG_PATTERN = re.compile(
+    r"(" + "|".join(re.escape(tag) for tag in MEDIA_TAGS.values()) + ")"
+)
+
+logger = logging.getLogger(__name__)
 
 
 class PackedTensor:
@@ -170,6 +219,51 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     return list(all_keys)
 
 
+def get_multimodal_default_settings_from_processor(
+    processor,
+) -> dict[str, dict[str, Any]]:
+    if isinstance(processor, PreTrainedTokenizerBase):
+        return {}
+
+    default_settings = {}
+    if hasattr(processor, "video_processor"):
+        video_settings_dict = processor.video_processor.to_dict()
+        if (
+            "fps" in video_settings_dict
+            and video_settings_dict["fps"] is None
+            and "num_frames" in video_settings_dict
+            and video_settings_dict["num_frames"] is None
+            and "max_frames" in video_settings_dict
+            and video_settings_dict["max_frames"] is not None
+        ):
+            video_settings_dict["num_frames"] = video_settings_dict["max_frames"]
+        if not hasattr(
+            get_multimodal_default_settings_from_processor, "load_video_kwargs"
+        ):
+            get_multimodal_default_settings_from_processor.load_video_kwargs = [
+                param for param in inspect.signature(load_video).parameters
+            ]
+        default_settings["video"] = {
+            arg: video_settings_dict[arg]
+            for arg in get_multimodal_default_settings_from_processor.load_video_kwargs
+            if arg in video_settings_dict
+        }
+    if hasattr(processor, "feature_extractor"):
+        if not hasattr(
+            get_multimodal_default_settings_from_processor, "load_audio_kwargs"
+        ):
+            get_multimodal_default_settings_from_processor.load_audio_kwargs = [
+                param for param in inspect.signature(load_audio).parameters
+            ]
+        audio_settings_dict = processor.feature_extractor.to_dict()
+        default_settings["audio"] = {
+            arg: audio_settings_dict[arg]
+            for arg in get_multimodal_default_settings_from_processor.load_audio_kwargs
+            if arg in audio_settings_dict
+        }
+    return default_settings
+
+
 def get_dim_to_pack_along(processor, key: str) -> int:
     """Special considerations for packing certain keys from certain processors.
 
@@ -179,3 +273,117 @@ def get_dim_to_pack_along(processor, key: str) -> int:
         return 1
     # return zero by default
     return 0
+
+
+def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
+    """Resolve the image path to a PIL.Image object.
+
+    image_path can be either:
+    - path to local file
+    - url to image
+    - base64 encoded image
+    """
+    if isinstance(image_path_or_image, Image.Image):
+        return image_path_or_image
+
+    if image_path_or_image.startswith(("http://", "https://")):
+        # Handle URL
+        response = requests.get(image_path_or_image)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    elif image_path_or_image.startswith("data:"):
+        # Handle base64 encoded image
+        # Format: data:image/jpeg;base64,/9j/4AAQSkZJRg...
+        header, encoded = image_path_or_image.split(",", 1)
+        image_data = base64.b64decode(encoded)
+        return Image.open(BytesIO(image_data)).convert("RGB")
+    else:
+        # Handle local file path
+        return Image.open(image_path_or_image).convert("RGB")
+
+
+def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
+    """Get all media from a message log item."""
+    # Handle None or missing content (e.g., assistant messages with only tool_calls)
+    if message.get("content") is None:
+        return {}
+    # Handle string content (no images)
+    if isinstance(message["content"], str):
+        return {}
+    # iterate over the content list
+    media = defaultdict(list)
+    for item in message["content"]:
+        tag = item["type"]
+        if tag in MEDIA_TAGS:
+            media[tag].extend(list(item[tag])) if isinstance(
+                item[tag], (list, tuple)
+            ) else media[tag].append(item[tag])
+    return media
+
+
+def load_media_from_message(
+    message: dict[str, Any],
+    processor=None,
+    multimodal_load_kwargs: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, list[Any]]:
+    loaded_media = defaultdict(list)
+    media_in_message = get_media_from_message(message)
+
+    if multimodal_load_kwargs is None:
+        multimodal_load_kwargs = {}
+
+    if not multimodal_load_kwargs and processor is not None:
+        multimodal_load_kwargs = get_multimodal_default_settings_from_processor(
+            processor
+        )
+
+    if "image" in media_in_message:
+        loaded_media["image"] += [
+            resolve_to_image(img) for img in media_in_message["image"]
+        ]
+    if "audio" in media_in_message:
+        for aud in media_in_message["audio"]:
+            if isinstance(aud, str):
+                if (
+                    "audio" not in multimodal_load_kwargs
+                    or "sampling_rate" not in multimodal_load_kwargs.get("audio", {})
+                ):
+                    raise ValueError(
+                        "multimodal_load_kwargs must include 'audio' with a 'sampling_rate' "
+                        "key to load audio from file path."
+                    )
+                try:
+                    loaded_media["audio"].append(
+                        load_audio(aud, **multimodal_load_kwargs["audio"])
+                    )
+                except (RuntimeError, FileNotFoundError, OSError) as e:
+                    logger.warning("Audio loading failed. Fall back to decord.")
+                    # use decord
+                    loaded_audio = decord.AudioReader(
+                        aud,
+                        sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
+                        mono=True,
+                    )
+                    loaded_media["audio"].append(
+                        loaded_audio[:].asnumpy()[
+                            get_dim_to_pack_along(processor, "audio")
+                        ]
+                    )
+            else:
+                loaded_media["audio"].append(aud)
+    if "video" in media_in_message:
+        for vid in media_in_message["video"]:
+            if isinstance(vid, str):
+                load_video_kwargs = (
+                    multimodal_load_kwargs["video"]
+                    if "video" in multimodal_load_kwargs
+                    else {}
+                )
+                # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
+                loaded_media["video"].append(
+                    load_video(vid, backend="decord", **load_video_kwargs)[0]
+                )
+            else:
+                loaded_media["video"].append(vid)
+
+    return loaded_media
