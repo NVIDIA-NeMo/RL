@@ -86,10 +86,13 @@ class Value(ValueInterface):
             )
 
         if megatron_enable:
-            raise NotImplementedError(
-                "Megatron backend is not yet implemented for Value models. "
-                "Please use DTensor backend (value.dtensor_cfg.enabled=true)."
-            )
+            worker_builder_cls = "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
+
+            tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
+            pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
+            cp_size = config["megatron_cfg"]["context_parallel_size"]
+
+            env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
             if not dtensor_enable:
                 raise ValueError(
@@ -423,30 +426,42 @@ class Value(ValueInterface):
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the value model."""
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+        megatron_enable = bool(
+            self.cfg.get("megatron_cfg", {}).get("enabled", False)
+        )
 
-        if use_v2:
+        if megatron_enable:
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
             )
         else:
-            if (
-                checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format", None) is not None
-            ):
-                raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorValueWorker (_v2=False)."
+            use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+
+            if use_v2:
+                futures = self.worker_group.run_all_workers_single_data(
+                    "save_checkpoint",
+                    weights_path=weights_path,
+                    optimizer_path=optimizer_path,
+                    tokenizer_path=tokenizer_path,
+                    checkpointing_cfg=checkpointing_cfg,
                 )
-            futures = self.worker_group.run_all_workers_single_data(
-                "save_checkpoint",
-                weights_path=weights_path,
-                optimizer_path=optimizer_path,
-                tokenizer_path=tokenizer_path,
-            )
+            else:
+                if (
+                    checkpointing_cfg is not None
+                    and checkpointing_cfg.get("model_save_format", None) is not None
+                ):
+                    raise ValueError(
+                        "model_save_format must be None or omitted if using DTensorValueWorker (_v2=False)."
+                    )
+                futures = self.worker_group.run_all_workers_single_data(
+                    "save_checkpoint",
+                    weights_path=weights_path,
+                    optimizer_path=optimizer_path,
+                    tokenizer_path=tokenizer_path,
+                )
         ray.get(futures)
 
     def shutdown(self) -> bool:

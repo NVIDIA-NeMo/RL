@@ -498,10 +498,17 @@ def setup(
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            ppo_config["max_num_steps"],
+            ppo_config.get("max_num_steps", 10**9),
             ppo_config["max_num_epochs"] * len(dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    if value_config is not None and value_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            ppo_config.get("max_num_steps", 10**9),
+            ppo_config["max_num_epochs"] * len(dataloader),
+        )
+        value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
     def init_policy():
@@ -1361,12 +1368,18 @@ def ppo_train(
 
             with timer.time("policy_and_reference_logprobs"):
                 print("▶ Computing policy and reference logprobs...", flush=True)
+                logprob_data = BatchedDataDict(
+                    {
+                        "input_ids": train_data["input_ids"],
+                        "input_lengths": train_data["input_lengths"],
+                    }
+                )
                 train_data["prev_logprobs"] = policy.get_logprobs(
-                    train_data, timer=timer
+                    logprob_data, timer=timer
                 )["logprobs"]
 
                 train_data["reference_policy_logprobs"] = (
-                    policy.get_reference_policy_logprobs(train_data, timer=timer)[
+                    policy.get_reference_policy_logprobs(logprob_data, timer=timer)[
                         "reference_logprobs"
                     ]
                 )
