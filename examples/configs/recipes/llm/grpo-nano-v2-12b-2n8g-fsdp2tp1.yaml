@@ -23,6 +23,8 @@ policy:
     max_new_tokens: 512
     vllm_cfg:
       max_model_len: 512
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32  # needed to avoid SSM state overflows in vllm 5.2.0
   scheduler:
     - name: "torch.optim.lr_scheduler.LinearLR"
       kwargs:
