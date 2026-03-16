@@ -19,6 +19,8 @@ from typing import Any, NamedTuple, Optional
 import torch
 from nemo_automodel.components._peft.lora import PeftConfig
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+
 
 class RuntimeConfig(NamedTuple):
     """Runtime configuration for model training and inference.
@@ -47,6 +49,9 @@ class RuntimeConfig(NamedTuple):
 
     # Generation configuration
     is_generation_colocated: Optional[bool]
+
+    # Sampling parameters
+    sampling_params: Optional[TrainingSamplingParams]
 
     # Reward model flag
     is_reward_model: bool

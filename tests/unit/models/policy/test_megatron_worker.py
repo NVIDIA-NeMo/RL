@@ -81,9 +81,9 @@ def create_megatron_test_config(
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,
-            "max_new_tokens": 32,  # Small number of tokens for testing
             "top_p": 1.0,
             "top_k": None,
+            "max_new_tokens": 32,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
@@ -135,7 +135,7 @@ def create_megatron_test_config(
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
             "moe_enable_deepep": False,
-            "moe_token_dispatcher_type": "allgather",
+            "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
@@ -178,6 +178,7 @@ def create_megatron_test_config(
                 "fp8_param": True,
             },
         },
+        "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
@@ -1747,6 +1748,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
     config_cp["sequence_packing"] = {
@@ -2004,6 +2006,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
     config_cp["sequence_packing"] = {
@@ -2198,6 +2201,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
     config_cp["train_global_batch_size"] = 2
 
     # Enable sequence packing
