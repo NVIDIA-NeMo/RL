@@ -195,8 +195,8 @@ policy:
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
     # See ray.sub for the full port layout.
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -304,10 +304,10 @@ env:
   should_log_nemo_gym_responses: true
   nemo_gym:
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
-    # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
-    # vLLM (20001+). See ray.sub for the full port layout.
-    port_range_low: 15001
-    port_range_high: 20000
+    # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
+    # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
+    port_range_low: 5000
+    port_range_high: 5999
     # Optional substrings/tags used to flag malformed assistant turns for advantage
     # penalties (see grpo.invalid_tool_call_advantage / malformed_thinking_advantage).
     # Omit to use the built-in defaults (DEFAULT_INVALID_TOOL_CALL_PATTERNS / DEFAULT_THINKING_TAGS).
@@ -363,5 +363,5 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 32
-  master_port_range_low: 25000
-  master_port_range_high: 28000
+  master_port_range_low: 1400
+  master_port_range_high: 1999
