@@ -94,20 +94,29 @@ policy:
     bias_activation_fusion: True
     moe_per_layer_logging: False
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
 
-    ## fp8 training currently not supported
-    #fp8_cfg:
-    #  enabled: true
-    #  fp8: hybrid
-    #  fp8_recipe: delayed
-    #  fp8_param: true # false gives the following error: "RuntimeError: /TransformerEngine/transformer_engine/common/gemm/cublaslt_gemm.cu:116 in function CanonicalizeGemmInput: Assertion failed: !is_fp8_dtype(ret.Atype). Input A is missing column-wise usage"
-    #  fp8_dot_product_attention: false #true
-    #  fp8_multi_head_attention: false #true
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 
   dynamic_batching:
     enabled: false

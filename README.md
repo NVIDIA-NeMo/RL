@@ -10,6 +10,11 @@
 </div>
 
 ## 📣 News
+* [03/12/2026] GDPO Support
+    * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
+    * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
+    * WIP: Support for Async RL training and Nemo-gym compatibility
+* [03/11/2026] [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/Nemotron-3-Super/) was post-trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) to reproduce the full RL training recipe.
 * [02/04/2026] LoRA Support
     * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
     * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).
@@ -82,14 +87,14 @@ For detailed information on backend selection, configuration, and examples, see 
 ✅ _Available now_ | 🔜 _Coming in v0.6_
 - 🔜 **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - 🔜 **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
-- 🔜 **SGLang Inference** - SGLang rollout suport for optimized inference.
+- 🔜 **SGLang Inference** - SGLang rollout support for optimized inference.
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **New Models** -  Qwen3-Next, Nemotron-Super.
 - 🔜 **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
 - 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
-- 🔜 **Speculaive Decoding** - Speculative Decoding support for rollout acceleration
+- 🔜 **Speculative Decoding** - Speculative Decoding support for rollout acceleration
 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
@@ -104,7 +109,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
-- ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
+- ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
 - ✅ **Nemo-Gym Integration** - RL Environment Integration.
 - ✅ **GB200** - container support for GB200.
 

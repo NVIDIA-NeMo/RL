@@ -28,27 +28,30 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
     set_seed,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -120,9 +123,9 @@ class AsyncGRPOConfig(TypedDict):
 
 
 class AdvEstimatorConfig(TypedDict):
-    """Configuration for advantage estimator (GRPO or Reinforce++)."""
+    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
 
-    name: str  # "grpo" or "reinforce_plus_plus"
+    name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
     normalize_rewards: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
@@ -162,6 +165,9 @@ class GRPOConfig(TypedDict):
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
+    # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
+    # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
+    seq_logprob_error_threshold: float | None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -211,14 +217,14 @@ class MasterConfig(TypedDict):
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset,
+    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
-    StatefulDataLoader,
+    StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
     Logger,
@@ -271,31 +277,78 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    # num_prompts_per_step and dataloader_batch_size will be different when using multiple dataloaders
+    num_prompts_per_step = grpo_config["num_prompts_per_step"]
+    if data_config["use_multiple_dataloader"]:
+        dataloader_batch_size = data_config["num_prompts_per_dataloader"]
+    else:
+        dataloader_batch_size = num_prompts_per_step
+
     # Validate batch_multiplier
     batch_multiplier = grpo_config["batch_multiplier"]
-    dataloader_batch_size = grpo_config["num_prompts_per_step"]
-    if not grpo_config["use_dynamic_sampling"]:
+    if grpo_config["use_dynamic_sampling"]:
+        num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
+        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
+    else:
         assert batch_multiplier == 1, (
             "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
         )
-    else:
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
 
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
-    if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+    # Validate number of prompts per step
+    if data_config["use_multiple_dataloader"]:
+        assert num_prompts_per_step % dataloader_batch_size == 0, (
+            "Expected num_prompts_per_step to be a multiple of num_prompts_per_dataloader, "
+            f"but got {num_prompts_per_step} and {dataloader_batch_size}. "
+            "Please check the configuration of num_prompts_per_step and num_prompts_per_dataloader. "
+            "If use_dynamic_sampling is enabled and batch_multiplier is used, please also check the configuration of batch_multiplier."
         )
-        dataloader.load_state_dict(dataloader_state_dict)
 
-    print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
+    # Load train dataset
+    def init_train_dataloader(dataset, suffix: str = ""):
+        dataloader = StatefulDataLoader(
+            dataset,
+            batch_size=dataloader_batch_size,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
+        if last_checkpoint_path is not None:
+            dataloader_state_dict = torch.load(
+                os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
+            )
+            dataloader.load_state_dict(dataloader_state_dict)
+        return dataloader
+
+    if data_config["use_multiple_dataloader"]:
+        # Initialize dataloaders
+        dataloaders = {}
+        for task_name, task_dataset in dataset.items():
+            dataloaders[task_name] = init_train_dataloader(
+                task_dataset, f"_{task_name}"
+            )
+            print(
+                f"  ✓ Training dataloader {task_name} loaded with {len(task_dataset)} samples",
+                flush=True,
+            )
+
+        train_sample_count = sum(
+            len(task_dataloader) for task_dataloader in dataloaders.values()
+        )
+
+        # Wrap dataloader
+        dataloader = MultipleDataloaderWrapper(
+            expected_num_prompts=num_prompts_per_step,
+            data_config=data_config,
+            dataloaders=dataloaders,
+        )
+    else:
+        dataloader = init_train_dataloader(dataset)
+        train_sample_count = len(dataloader)
+        print(
+            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
+            flush=True,
+        )
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -503,7 +556,7 @@ def setup(
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
             grpo_config["max_num_steps"],
-            grpo_config["max_num_epochs"] * len(dataloader),
+            grpo_config["max_num_epochs"] * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -915,11 +968,16 @@ def scale_rewards(
             )
 
         # Clamp and scale
-        rewards = torch.clamp(rewards, min=source_min, max=source_max)
-        scaled_rewards = target_min + (rewards - source_min) / (
-            source_max - source_min
-        ) * (target_max - target_min)
+        def _scale(reward_tensor: torch.Tensor) -> torch.Tensor:
+            r = torch.clamp(reward_tensor, min=source_min, max=source_max)
+            return target_min + (r - source_min) / (source_max - source_min) * (
+                target_max - target_min
+            )
+
+        scaled_rewards = _scale(rewards)
         repeated_batch["total_reward"] = scaled_rewards
+        for key in get_gdpo_reward_component_keys(repeated_batch):
+            repeated_batch[key] = _scale(repeated_batch[key])
 
     return repeated_batch
 
@@ -980,7 +1038,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPOAdvantageEstimator or ReinforcePlusPlusAdvantageEstimator).
+        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -1004,7 +1062,15 @@ def _create_advantage_estimator(master_config: MasterConfig):
     )
 
     adv_estimator_name = adv_estimator_config["name"]
-    if adv_estimator_name == "grpo":
+    if adv_estimator_name == "gdpo":
+        assert not _should_use_async_rollouts(master_config), (
+            "GDPO is not supported for async rollouts, "
+            "please set policy.generation.vllm_cfg.async_engine to false in your config. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2061 for more details."
+        )
+        adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using GDPO advantage estimator (multi-reward)")
+    elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "reinforce_plus_plus":
@@ -1161,6 +1227,89 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
+def compute_and_apply_seq_logprob_error_masking(
+    train_data: BatchedDataDict,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: Optional[float],
+) -> tuple[float, int, float]:
+    """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
+
+    This function computes the multiplicative probability error per sequence
+    (same calculation as token_mult_prob_error but aggregated per-sequence) and
+    optionally masks sequences that exceed the configured threshold.
+
+    Args:
+        train_data: Training data dict containing token_mask, sample_mask,
+                   prev_logprobs, and generation_logprobs. If masking is applied,
+                   sample_mask will be updated in-place.
+        rewards: Reward tensor for computing statistics on masked sequences.
+        seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
+                                    exceeding this threshold. If None, only compute metrics.
+
+    Returns:
+        Tuple of (max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct)
+    """
+    # Compute sequence-level logprob error metrics (always)
+    token_mask = train_data["token_mask"][:, 1:]
+    sample_mask = train_data["sample_mask"]
+    prev_logprobs = train_data["prev_logprobs"][:, 1:]
+    generation_logprobs = train_data["generation_logprobs"][:, 1:]
+    lp_error = torch.abs(generation_logprobs - prev_logprobs)
+
+    # Use combined mask exactly as in loss function
+    mask = token_mask * sample_mask.unsqueeze(-1)
+
+    # Calculate sequence-level multiplicative prob error
+    # EXACT same calculation as token_mult_prob_error but per-sequence
+    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(dim=-1) / mask.sum(
+        dim=-1
+    ).clamp(min=1)
+    max_seq_mult_prob_error = (
+        seq_mult_prob_error.max().item() if seq_mult_prob_error.numel() > 0 else 0.0
+    )
+
+    # Apply sequence-level masking if configured
+    num_masked_seqs = 0
+    masked_correct_pct = 0.0
+
+    if seq_logprob_error_threshold is not None:
+        print(
+            f"▶ Applying sequence-level logprob error masking (threshold={seq_logprob_error_threshold})...",
+            flush=True,
+        )
+
+        original_sample_mask = sample_mask.clone()
+
+        # Create mask for sequences below threshold
+        seq_error_mask = (
+            seq_mult_prob_error <= seq_logprob_error_threshold
+        ).float() * original_sample_mask
+
+        diff_mask = original_sample_mask - seq_error_mask
+        num_masked_seqs = int(diff_mask.sum().item())
+
+        if num_masked_seqs > 0:
+            diff_mask_bool = diff_mask.bool()
+            masked_correct_count = (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            masked_correct_pct = masked_correct_count / num_masked_seqs
+
+        # Update sample_mask in train_data
+        train_data["sample_mask"] = seq_error_mask
+
+        print(
+            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+            flush=True,
+        )
+        if num_masked_seqs > 0:
+            print(
+                f"  • {masked_correct_count}/{num_masked_seqs} masked sequences were correct (reward=1)"
+                f" → {masked_correct_pct:.2%}",
+                flush=True,
+            )
+
+    return max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1169,7 +1318,7 @@ def _log_mixed_rewards_and_advantages_information(
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    dataloader: StatefulDataLoader,
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
@@ -1257,6 +1406,13 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    if master_config["data"]["use_multiple_dataloader"]:
+        warnings.warn(
+            "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
+            "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used. "
+            "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
+        )
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1266,15 +1422,22 @@ def grpo_train(
         dynamic_sampling_num_gen_batches = 0
 
         # Run grpo/dapo training loop (single-turn)
-        for batch in dataloader:
+        for batch in wrapped_dataloader:
             # A central place to store logging data that won't be deleted until the loop ends
             metrics_logging_data = dict()
             metrics = dict()
 
-            print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
-                flush=True,
-            )
+            if master_config["data"]["use_multiple_dataloader"]:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(wrapped_dataloader), max_num_steps)} {'=' * 25}",
+                    flush=True,
+                )
+
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -1496,10 +1659,10 @@ def grpo_train(
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
+
                     gen_step_metrics = {}
                     if hasattr(policy_generation, "get_step_metrics"):
                         gen_step_metrics = policy_generation.get_step_metrics()
-                    advantages = (rewards - baseline).unsqueeze(-1)
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
@@ -1603,6 +1766,8 @@ def grpo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
                             **extra_multimodal_data,
                         }
                     )
@@ -1622,6 +1787,18 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
+                    (
+                        max_seq_mult_prob_error,
+                        num_masked_seqs,
+                        masked_correct_pct,
+                    ) = compute_and_apply_seq_logprob_error_masking(
+                        train_data=train_data,
+                        rewards=rewards,
+                        seq_logprob_error_threshold=master_config["grpo"][
+                            "seq_logprob_error_threshold"
+                        ],
+                    )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -1634,6 +1811,7 @@ def grpo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
@@ -1676,10 +1854,12 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = (total_steps + 1 >= max_num_steps) or (
-                    (current_epoch + 1 == max_num_epochs)
-                    and (current_step + 1 == len(dataloader))
-                )
+                is_last_step = total_steps + 1 >= max_num_steps
+                if not master_config["data"]["use_multiple_dataloader"]:
+                    is_last_step = is_last_step or (
+                        (current_epoch + 1 == max_num_epochs)
+                        and (current_step + 1 == len(wrapped_dataloader))
+                    )
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
@@ -1718,7 +1898,6 @@ def grpo_train(
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -1784,6 +1963,11 @@ def grpo_train(
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -1864,31 +2048,52 @@ def grpo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        if master_config["data"]["use_multiple_dataloader"]:
+                            for (
+                                task_name,
+                                task_dataloader,
+                            ) in wrapped_dataloader.dataloaders.items():
+                                torch.save(
+                                    task_dataloader.state_dict(),
+                                    os.path.join(
+                                        checkpoint_path,
+                                        f"train_dataloader_{task_name}.pt",
+                                    ),
+                                )
+                        else:
+                            torch.save(
+                                wrapped_dataloader.state_dict(),
+                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {"content": metrics_logging_data["content"]}
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
-
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
+
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
                 del log_data
+            del flat_messages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -2632,6 +2837,17 @@ def async_grpo_train(
                         )["reference_logprobs"]
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
+                    (
+                        max_seq_mult_prob_error,
+                        num_masked_seqs,
+                        masked_correct_pct,
+                    ) = compute_and_apply_seq_logprob_error_masking(
+                        train_data=train_data,
+                        rewards=rewards,
+                        seq_logprob_error_threshold=master_config["grpo"][
+                            "seq_logprob_error_threshold"
+                        ],
+                    )
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -2644,6 +2860,7 @@ def async_grpo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
@@ -2806,6 +3023,11 @@ def async_grpo_train(
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
+
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
                 timeout.mark_iteration()
@@ -2888,11 +3110,24 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
                     policy.offload_after_refit()
 
-            log_data = {"content": flat_messages_content}
+            # Logging
+            # Log training data (match sync GRPO logging payload for parity)
+            log_data = {}
+            if "agent_ref" in repeated_batch:
+                log_data["agent_ref"] = repeated_batch["agent_ref"]
+            log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
+            if master_config["grpo"]["use_dynamic_sampling"]:
+                # In dynamic sampling, `rewards` corresponds to filtered rewards
+                log_data["filtered_rewards"] = rewards.tolist()
+                log_data["rewards"] = repeated_batch["total_reward"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            log_data["token_ids"] = train_data["input_ids"].tolist()
+            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )

@@ -539,7 +539,14 @@ class BaseVllmGenerationWorker:
         """
         metrics: dict[str, float | list[float]] = {}
         if self.llm is not None:
-            for metric in self.llm.get_metrics():
+            if hasattr(self.llm, "get_metrics"):
+                vllm_prom_metrics = self.llm.get_metrics()
+            else:
+                # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
+                from vllm.v1.metrics.reader import get_metrics_snapshot
+
+                vllm_prom_metrics = get_metrics_snapshot()
+            for metric in vllm_prom_metrics:
                 if hasattr(metric, "values"):
                     metrics[metric.name] = metric.values
                 elif hasattr(metric, "value"):

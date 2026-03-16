@@ -369,20 +369,31 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
                 # res is conversation, [request_prompt], [engine_prompt]
-                res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt,
-                    continue_final_message,
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    add_special_tokens,
-                )
+                try:
+                    res = await super()._preprocess_chat(
+                        request,
+                        tokenizer,
+                        messages,
+                        chat_template,
+                        chat_template_content_format,
+                        add_generation_prompt,
+                        continue_final_message,
+                        tool_dicts,
+                        documents,
+                        chat_template_kwargs,
+                        tool_parser,
+                        add_special_tokens,
+                    )
+                except ValueError as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        # Print a clean one-liner warning that max model length has been exceeded
+                        # The exception is still raised, but later filtered out by the MaxContextLengthFilter
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
 
                 if request.required_prefix_token_ids is None:
                     return res
@@ -572,6 +583,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         vllm_async_llm_logger.addFilter(CleanLoggingFilter())
 
+        from logging import getLogger as _getLogger
+
+        _getLogger("vllm.entrypoints.openai.protocol").addFilter(CleanLoggingFilter())
+
+        # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
+        # This is expected during multi-turn rollouts; we log a clean one-line
+        # warning from _preprocess_chat instead.
+        class MaxContextLengthFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                if record.exc_info and record.exc_info[1]:
+                    if "maximum context length" in str(record.exc_info[1]):
+                        return False
+                return True
+
+        _getLogger("vllm.entrypoints.openai.serving_chat").addFilter(
+            MaxContextLengthFilter()
+        )
+
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
@@ -602,6 +631,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             app,
             host="0.0.0.0",
             port=free_port,
+            timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
         )
         server = uvicorn.Server(config=config)
 

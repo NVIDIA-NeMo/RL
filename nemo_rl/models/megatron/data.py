@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
 
@@ -24,7 +25,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -174,6 +175,7 @@ def get_microbatch_iterator(
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cfg["megatron_cfg"],
+            cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
         micro_batch_size = 1
@@ -211,7 +213,7 @@ def process_microbatch(
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     pack_sequences: bool = False,
-    straggler_timer: StragglerDetector = None,
+    straggler_timer: Optional[StragglerDetector] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -221,7 +223,8 @@ def process_microbatch(
     Optional[torch.Tensor],
 ]:
     """Process a microbatch for Megatron model forward pass."""
-    with straggler_timer(bdata=True):
+    ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
+    with ctx:
         input_ids = data_dict["input_ids"]
         attention_mask = None
         position_ids = None
@@ -294,15 +297,15 @@ def process_global_batch(
     *,
     batch_idx: int,
     batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> dict[str, Any]:
     """Process a global batch and compute normalization factors.
 
     Args:
-        data: Full dataset
+        data: Full dataset to extract a batch from
+        loss_fn: Loss function (used to check loss type for token-level validation)
+        dp_group: Data parallel process group for all-reduce
         batch_idx: Index of batch to extract
         batch_size: Size of batch to extract
-        loss_fn: Loss function (used to check loss type)
-        dp_mesh: Data parallel mesh
 
     Returns:
         Dictionary containing:
@@ -527,12 +530,14 @@ def _pack_sequences_for_megatron(
 
 def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
+    pad_individual_seqs_to_multiple_of: int,
     max_seq_len_in_batch: int,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
     Args:
         megatron_cfg: Megatron configuration
+        pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
         max_seq_len_in_batch: Maximum sequence length in batch
 
     Returns:
@@ -547,18 +552,28 @@ def _get_pack_sequence_parameters_for_megatron(
     cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
-    use_blockwise_fp8 = fp8_cfg.get("fp8_recipe", None) == "blockwise"
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    pad_individual_seqs_to_multiple_of = 1
+    minimum_pad_factor = 1
     if cp_size > 1:
-        pad_individual_seqs_to_multiple_of *= cp_size * 2
+        minimum_pad_factor *= cp_size * 2
     if tp_size > 1 and sp:
-        pad_individual_seqs_to_multiple_of *= tp_size
+        minimum_pad_factor *= tp_size
+    assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
+        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
+        f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+        f"    - If CP is enabled, the minimum pad factor is `cp_size * 2`.\n"
+        f"    - If TP+SP is enabled, the minimum pad factor is `tp_size`.\n"
+        f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+    )
 
     # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
     if use_fp8:
-        divisor = 128 if use_blockwise_fp8 else 16
+        divisor = 16
+        if fp8_cfg["fp8_recipe"] == "blockwise":
+            divisor = 128
+        elif fp8_cfg["fp8_recipe"] == "mxfp8":
+            divisor = 32
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2

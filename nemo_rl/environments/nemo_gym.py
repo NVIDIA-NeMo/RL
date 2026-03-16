@@ -82,6 +82,14 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            "rollout_max_attempts_to_avoid_lp_nan", 1
+        )
+
+        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
+        )
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -110,25 +118,47 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
-        nemo_gym_num_rows = len(nemo_gym_examples)
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
-
         timer.start("_run_rollouts_total")
-        nemo_rl_rowidxs = []
-        nemo_rl_results = []
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                nemo_gym_row, nemo_gym_result = await task
+        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
+        while trial < max_attempts:
+            nemo_gym_num_rows = len(nemo_gym_examples)
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples, head_server_config=self.head_server_config
+            )
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+            nemo_rl_rowidxs = []
+            nemo_rl_results = []
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    nemo_gym_row, nemo_gym_result = await task
+
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_result, tokenizer
+                    )
+
+                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
+                nemo_rl_results.append(nemo_rl_result)
+
+            # determine if generation_logprobs contain NaN; if not, break;
+            logprob_contains_nan = False
+            for nemo_rl_result in nemo_rl_results:
+                for message in nemo_rl_result["message_log"]:
+                    if (
+                        "generation_logprobs" in message
+                        and message["generation_logprobs"] is not None
+                    ):
+                        if torch.isnan(message["generation_logprobs"]).any():
+                            logprob_contains_nan = True
+                            break
+            if logprob_contains_nan:
+                trial += 1
+                print(
+                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
                 )
-
-            nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-            nemo_rl_results.append(nemo_rl_result)
+                continue
+            else:
+                break
 
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
@@ -201,6 +231,20 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict.pop("generation_token_ids")
             )
             output_item_dict.pop("generation_log_probs")
+
+        if not nemo_rl_message_log:
+            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            prompt_token_ids = tokenizer.apply_chat_template(
+                input_messages, tokenize=True
+            )
+            raise ValueError(
+                f"NeMo Gym returned a result with no generation data. "
+                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated.\n"
+                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
+                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"to a value larger than {len(prompt_token_ids)}."
+            )
 
         return {
             "message_log": nemo_rl_message_log,

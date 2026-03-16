@@ -20,17 +20,19 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     async_grpo_train,
+    compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
     validate,
 )
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -243,6 +245,14 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     # Mock print_performance_metrics to avoid needing real timing metrics
     stack.enter_context(
         patch("nemo_rl.algorithms.grpo.print_performance_metrics", return_value={})
+    )
+
+    # Mock compute_and_apply_seq_logprob_error_masking to avoid needing real logprob data
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=(0.0, 0, 0.0),
+        )
     )
 
     return stack
@@ -710,6 +720,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -746,7 +759,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -784,6 +802,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -820,7 +841,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -947,6 +973,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "dtensor_cfg": {"enabled": False},
             "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "sglang",
                 "colocated": {
                     "enabled": colocated_inference,
@@ -984,7 +1013,12 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "reward_shaping": {"enabled": False},
             "overlong_filtering": False,
         },
-        "data": {"shuffle": False, "num_workers": 0, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 0,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {"num_val_samples_to_print": 0},
         "checkpointing": {"enabled": False},
         "cluster": {"num_nodes": 1, "gpus_per_node": 4},
@@ -1132,6 +1166,11 @@ def test_grpo_train_collects_generation_logger_metrics(
     )
     monkeypatch.setattr(
         grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: (0.0, 0, 0.0),
     )
 
     master_config = mock_grpo_components["master_config"]
@@ -1296,6 +1335,7 @@ def mock_grpo_components():
                 "enabled": False,
                 "max_trajectory_age_steps": 1,
             },
+            "seq_logprob_error_threshold": None,
             "adv_estimator": {
                 "name": "grpo",
                 "use_leave_one_out_baseline": False,
@@ -1308,6 +1348,9 @@ def mock_grpo_components():
             "max_total_sequence_length": 2048,
             "make_sequence_length_divisible_by": 1,
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {"enabled": True},
                 "vllm_cfg": {"async_engine": True},  # Support async mode
@@ -1327,6 +1370,9 @@ def mock_grpo_components():
         },
         "logger": {
             "num_val_samples_to_print": 5,
+        },
+        "data": {
+            "use_multiple_dataloader": False,
         },
     }
 
@@ -1392,20 +1438,24 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
                 "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
             ):
-                train_func(
-                    mock_grpo_components["policy"],
-                    None,  # policy_generation
-                    mock_grpo_components["train_dataloader"],
-                    mock_grpo_components["val_dataloader"],
-                    mock_grpo_components["tokenizer"],
-                    mock_grpo_components["loss_fn"],
-                    mock_grpo_components["task_to_env"],
-                    mock_grpo_components["val_task_to_env"],
-                    mock_grpo_components["logger"],
-                    mock_grpo_components["checkpointer"],
-                    grpo_save_state,
-                    mock_grpo_components["master_config"],
-                )
+                with patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=(0.0, 0, 0.0),
+                ):
+                    train_func(
+                        mock_grpo_components["policy"],
+                        None,  # policy_generation
+                        mock_grpo_components["train_dataloader"],
+                        mock_grpo_components["val_dataloader"],
+                        mock_grpo_components["tokenizer"],
+                        mock_grpo_components["loss_fn"],
+                        mock_grpo_components["task_to_env"],
+                        mock_grpo_components["val_task_to_env"],
+                        mock_grpo_components["logger"],
+                        mock_grpo_components["checkpointer"],
+                        grpo_save_state,
+                        mock_grpo_components["master_config"],
+                    )
 
     # Verify we trained for exactly 12 steps
     assert mock_grpo_components["policy"].train.call_count == 12
@@ -1440,21 +1490,25 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
         ) as mock_async_rollout:
             mock_async_rollout.return_value = (mock_batch, mock_rollout_metrics)
 
-            # Run training
-            train_func(
-                mock_grpo_components["policy"],
-                None,  # policy_generation
-                mock_grpo_components["train_dataloader"],
-                mock_grpo_components["val_dataloader"],
-                mock_grpo_components["tokenizer"],
-                mock_grpo_components["loss_fn"],
-                mock_grpo_components["task_to_env"],
-                mock_grpo_components["val_task_to_env"],
-                mock_grpo_components["logger"],
-                mock_grpo_components["checkpointer"],
-                grpo_save_state,
-                mock_grpo_components["master_config"],
-            )
+            with patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=(0.0, 0, 0.0),
+            ):
+                # Run training
+                train_func(
+                    mock_grpo_components["policy"],
+                    None,  # policy_generation
+                    mock_grpo_components["train_dataloader"],
+                    mock_grpo_components["val_dataloader"],
+                    mock_grpo_components["tokenizer"],
+                    mock_grpo_components["loss_fn"],
+                    mock_grpo_components["task_to_env"],
+                    mock_grpo_components["val_task_to_env"],
+                    mock_grpo_components["logger"],
+                    mock_grpo_components["checkpointer"],
+                    grpo_save_state,
+                    mock_grpo_components["master_config"],
+                )
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
@@ -1515,20 +1569,24 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
                     "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
                     return_value=(mock_batch, mock_rollout_metrics),
                 ):
-                    train_func(
-                        mock_grpo_components["policy"],
-                        None,  # policy_generation
-                        mock_grpo_components["train_dataloader"],
-                        mock_grpo_components["val_dataloader"],
-                        mock_grpo_components["tokenizer"],
-                        mock_grpo_components["loss_fn"],
-                        mock_grpo_components["task_to_env"],
-                        mock_grpo_components["val_task_to_env"],
-                        mock_grpo_components["logger"],
-                        mock_grpo_components["checkpointer"],
-                        grpo_save_state,
-                        mock_grpo_components["master_config"],
-                    )
+                    with patch(
+                        "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                        return_value=(0.0, 0, 0.0),
+                    ):
+                        train_func(
+                            mock_grpo_components["policy"],
+                            None,  # policy_generation
+                            mock_grpo_components["train_dataloader"],
+                            mock_grpo_components["val_dataloader"],
+                            mock_grpo_components["tokenizer"],
+                            mock_grpo_components["loss_fn"],
+                            mock_grpo_components["task_to_env"],
+                            mock_grpo_components["val_task_to_env"],
+                            mock_grpo_components["logger"],
+                            mock_grpo_components["checkpointer"],
+                            grpo_save_state,
+                            mock_grpo_components["master_config"],
+                        )
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_grpo_components["policy"].train.call_count == 8
@@ -1598,7 +1656,11 @@ def test_grpo_advantage_estimator_zero_std():
     )  # prompt 0: std=0; prompt 1: std=sqrt(2)
     mask = torch.ones(4, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # prompt 0: std=0 -> skip normalization, advantage=0 (reward - mean = 0)
     # prompt 1: With Bessel correction for 2 samples, std = sqrt(2), normalized = ±1/sqrt(2) ≈ ±0.7071
@@ -1629,7 +1691,11 @@ def test_grpo_advantage_estimator_tensor_shapes():
     rewards = torch.tensor([1.0, 3.0])  # mean=2, std=sqrt(2) with Bessel
     mask = torch.ones(2, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
     assert result.shape == (2, 3)
 
     # Verify normalized values: (reward - mean) / std
@@ -1643,7 +1709,11 @@ def test_grpo_advantage_estimator_tensor_shapes():
     rewards = torch.arange(10, dtype=torch.float32)  # 0, 1, 2, ..., 9
     mask = torch.ones(10, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
     assert result.shape == (10, 5)
 
     # After normalization, mean should be ~0
@@ -1668,7 +1738,11 @@ def test_grpo_advantage_estimator_negative_advantages():
     rewards = torch.tensor([0.0, 2.0, 4.0])  # mean=2, deviations: -2, 0, +2
     mask = torch.ones(3, 4)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # Verify ordering: first should be negative, middle ~0, last positive
     assert result[0, 0] < 0  # below mean -> negative advantage
@@ -1698,7 +1772,11 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
     rewards = torch.tensor([5.0, 5.0, 5.0, 5.0])  # all same
     mask = torch.ones(4, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # All advantages should be exactly 0
     expected = torch.zeros(4, 3)
@@ -1724,7 +1802,11 @@ def test_grpo_advantage_estimator_small_nonzero_std():
     rewards = torch.tensor([1.0, 1.01])  # small but detectable difference
     mask = torch.ones(2, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # Even with small std, normalization should still happen
     # After normalization, the values should be ±1/sqrt(2) (for 2 samples with Bessel)
@@ -1734,6 +1816,51 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
     # Verify opposite signs
     assert result[0, 0] * result[1, 0] < 0
+
+
+# ============================================================================
+# Tests for ReinforcePlusPlusAdvantageEstimator class
+# ============================================================================
+
+
+def test_gdpo_advantage_estimator_multiple_rewards():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {
+        "reward1": torch.tensor([1.0, 1.0]),
+        "reward2": torch.tensor([1.0, -1.0]),
+        "reward3": torch.tensor([1.0, 0.0]),
+    }
+
+    result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+    assert result.shape == (2, 3)
+    assert torch.allclose(result[0, 0], torch.tensor(0.7071))
+    assert torch.allclose(result[1, 0], torch.tensor(-0.7071))
+
+
+def test_gdpo_advantage_estimator_single_reward():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+
+    with pytest.raises(ValueError):
+        estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
 # ============================================================================
@@ -1764,7 +1891,11 @@ def test_reinforce_plus_plus_global_normalization():
     rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])  # mean=1.5
     mask = torch.ones(4, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # After global normalization, mean should be ~0
     result_mean = (result * mask).sum() / mask.sum()
@@ -1857,6 +1988,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},
@@ -1950,6 +2084,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},
@@ -2008,3 +2145,329 @@ class TestValidateFunction:
 
         assert val_metrics == {}
         assert timing == {}
+
+
+# ============================================================================
+# Tests for compute_and_apply_seq_logprob_error_masking function
+# ============================================================================
+
+
+class TestComputeAndApplySeqLogprobErrorMasking:
+    """Tests for the compute_and_apply_seq_logprob_error_masking function."""
+
+    def _create_train_data(
+        self,
+        batch_size: int,
+        seq_length: int,
+        prev_logprobs: torch.Tensor,
+        generation_logprobs: torch.Tensor,
+        token_mask: torch.Tensor = None,
+        sample_mask: torch.Tensor = None,
+    ) -> BatchedDataDict:
+        """Helper to create mock train_data for testing."""
+        if token_mask is None:
+            token_mask = torch.ones(batch_size, seq_length)
+        if sample_mask is None:
+            sample_mask = torch.ones(batch_size)
+
+        return BatchedDataDict(
+            {
+                "token_mask": token_mask,
+                "sample_mask": sample_mask,
+                "prev_logprobs": prev_logprobs,
+                "generation_logprobs": generation_logprobs,
+            }
+        )
+
+    def test_no_threshold_only_computes_metrics(self):
+        """Test that when threshold is None, only metrics are computed (no masking)."""
+        batch_size, seq_length = 4, 10
+
+        # Create logprobs with varying errors
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Add small errors to sequences
+        generation_logprobs[0, 1:5] = 0.1  # Small error
+        generation_logprobs[1, 1:5] = 0.5  # Medium error
+        generation_logprobs[2, 1:5] = 1.0  # Large error
+        generation_logprobs[3, 1:5] = 2.0  # Very large error
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        original_sample_mask = train_data["sample_mask"].clone()
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=None
+        )
+
+        # Verify metrics are computed
+        assert max_error > 0.0, "Should compute max error"
+        assert num_masked == 0, "Should not mask any sequences when threshold is None"
+        assert masked_pct == 0.0, "Should have 0% masked"
+        # Verify sample_mask is unchanged
+        assert torch.equal(train_data["sample_mask"], original_sample_mask)
+
+    def test_masking_with_threshold(self):
+        """Test that sequences exceeding threshold are masked."""
+        batch_size, seq_length = 4, 10
+
+        # Create logprobs with specific errors
+        # Note: The metric is averaged over all tokens, so errors get diluted.
+        # Formula: seq_mult_prob_error = sum(exp(error) * mask) / sum(mask)
+        # With seq_length=10 and slicing [:, 1:], we have 9 tokens per sequence.
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Sequence 0: small error -> avg ≈ 1.047 (below threshold 1.2)
+        generation_logprobs[0, 1:5] = 0.1
+        # Sequence 1: small error -> avg ≈ 1.047 (below threshold 1.2)
+        generation_logprobs[1, 1:5] = 0.1
+        # Sequence 2: medium error -> avg ≈ 1.288 (above threshold 1.2)
+        # 4 tokens with exp(0.5)≈1.649, 5 tokens with exp(0)=1 -> (4*1.649+5)/9≈1.288
+        generation_logprobs[2, 1:5] = 0.5
+        # Sequence 3: large error -> avg ≈ 1.764 (above threshold 1.2)
+        # 4 tokens with exp(1.0)≈2.718, 5 tokens with exp(0)=1 -> (4*2.718+5)/9≈1.764
+        generation_logprobs[3, 1:5] = 1.0
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+        # Use threshold 1.2 which should mask sequences 2 and 3
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.2
+            )
+        )
+
+        # Verify masking occurred
+        assert num_masked == 2, "Should mask 2 sequences (indices 2 and 3)"
+        # Sequence 2 had reward=1, sequence 3 had reward=0, so 50% correct
+        assert masked_pct == 0.5, "50% of masked sequences should be correct"
+
+        # Verify sample_mask is updated correctly
+        expected_mask = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        assert torch.allclose(train_data["sample_mask"], expected_mask), (
+            "Should mask sequences 2 and 3"
+        )
+
+    def test_no_sequences_masked_when_all_below_threshold(self):
+        """Test that no sequences are masked when all are below threshold."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs with small errors (all below threshold)
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 0.05  # Very small error for all
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 1.0, 1.0])
+        original_sample_mask = train_data["sample_mask"].clone()
+
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=2.0
+            )
+        )
+
+        # Verify no masking occurred
+        assert num_masked == 0, "Should not mask any sequences"
+        assert masked_pct == 0.0
+        # All sequences should remain in sample_mask
+        assert torch.equal(train_data["sample_mask"], original_sample_mask)
+
+    def test_all_sequences_masked_when_all_above_threshold(self):
+        """Test that all sequences are masked when all exceed threshold."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs with large errors (all above threshold)
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 1.0  # Large error for all (exp(1) ~ 2.7)
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        rewards = torch.tensor([1.0, 0.0, 1.0])  # 2 correct, 1 incorrect
+
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.0
+            )
+        )
+
+        # Verify all sequences are masked
+        assert num_masked == 3, "Should mask all 3 sequences"
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of masked should be correct"
+        )
+        # All sequences should be zeroed in sample_mask
+        assert torch.equal(train_data["sample_mask"], torch.zeros(batch_size))
+
+    def test_respects_existing_sample_mask(self):
+        """Test that masking respects already-masked sequences in sample_mask."""
+        batch_size, seq_length = 4, 8
+
+        # Create logprobs with large errors
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[:, 1:4] = 1.0  # Large error for all
+
+        # Pre-mask sequence 1 (it's already excluded)
+        sample_mask = torch.tensor([1.0, 0.0, 1.0, 1.0])
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            sample_mask=sample_mask,
+        )
+        rewards = torch.tensor([1.0, 1.0, 0.0, 1.0])
+
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.0
+            )
+        )
+
+        # Only 3 sequences were originally unmasked, all should be masked now
+        assert num_masked == 3, "Should mask 3 sequences (indices 0, 2, 3)"
+        # Sequences 0 and 3 had reward=1, sequence 2 had reward=0
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of newly masked should be correct"
+        )
+        # All should be zeroed (including already-masked seq 1)
+        assert torch.equal(train_data["sample_mask"], torch.zeros(batch_size))
+
+    def test_masked_correct_pct_calculation(self):
+        """Test that masked_correct_pct is calculated correctly."""
+        batch_size, seq_length = 5, 8
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Make sequences 2, 3, 4 have high error (will be masked)
+        generation_logprobs[2:5, 1:4] = 1.5
+
+        train_data = self._create_train_data(
+            batch_size, seq_length, prev_logprobs, generation_logprobs
+        )
+        # Rewards: seq 2 correct, seq 3 incorrect, seq 4 correct
+        rewards = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0])
+
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=1.5
+            )
+        )
+
+        assert num_masked == 3, "Should mask 3 sequences"
+        # 2 out of 3 masked sequences were correct (reward=1)
+        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+            "2/3 of masked should be correct"
+        )
+
+    def test_token_mask_is_respected(self):
+        """Test that token_mask affects the error calculation correctly."""
+        batch_size, seq_length = 2, 8
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        # Add large error to both sequences at positions 1:6
+        generation_logprobs[:, 1:6] = 1.0
+
+        # But mask out tokens 3-5 for sequence 0 (reducing its effective error)
+        # After slicing [:, 1:], this affects positions 2-4 in the 7-token sequence
+        token_mask = torch.ones(batch_size, seq_length)
+        token_mask[0, 3:6] = 0.0  # Mask out high-error tokens for seq 0
+
+        # After slicing [:, 1:] and accounting for token_mask:
+        # Seq 0: 4 valid tokens (positions 0,1,5,6), 2 have error -> avg ≈ 1.859
+        # Seq 1: 7 valid tokens, 5 have error -> avg ≈ 2.227
+        # Use threshold 2.0 so seq 0 passes but seq 1 fails
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([1.0, 0.0])
+
+        # Sequence 0 should have lower error due to masked tokens
+        # Sequence 1 should have higher error
+        _max_error, num_masked, masked_pct = (
+            compute_and_apply_seq_logprob_error_masking(
+                train_data, rewards, seq_logprob_error_threshold=2.0
+            )
+        )
+
+        # Only sequence 1 should be masked (seq 0 has reduced error due to token_mask)
+        assert num_masked == 1, "Should mask only sequence 1"
+        assert masked_pct == 0.0, "Masked sequence had reward=0"
+        assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should remain unmasked"
+        assert train_data["sample_mask"][1] == 0.0, "Sequence 1 should be masked"
+
+    def test_empty_batch_returns_zero_metrics(self):
+        """Test handling of edge case with empty batch."""
+        # Create empty train_data
+        train_data = BatchedDataDict(
+            {
+                "token_mask": torch.zeros(0, 8),
+                "sample_mask": torch.zeros(0),
+                "prev_logprobs": torch.zeros(0, 8),
+                "generation_logprobs": torch.zeros(0, 8),
+            }
+        )
+        rewards = torch.zeros(0)
+
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
+        )
+
+        assert max_error == 0.0, "Empty batch should have max_error=0"
+        assert num_masked == 0, "Empty batch should have no masked sequences"
+        assert masked_pct == 0.0, "Empty batch should have 0% masked"
+
+    def test_threshold_boundary_values(self):
+        """Test behavior at exact threshold boundary."""
+        batch_size, seq_length = 3, 8
+
+        # Create logprobs where error is exactly at threshold
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+
+        # Set up specific errors: sequence-level mult_prob_error will be approximately:
+        # exp(error * 1) * 1 (for 1 token with error)
+        # So if error=0.4, mult_prob_error ~ exp(0.4) ~ 1.49
+        # If error=0.41, mult_prob_error ~ exp(0.41) ~ 1.51
+        generation_logprobs[0, 1] = 0.4  # Below threshold 1.5
+        generation_logprobs[1, 1] = 0.405  # Very close to threshold
+        generation_logprobs[2, 1] = 0.41  # Just above threshold 1.5
+
+        # Only consider position 1 as valid token
+        token_mask = torch.zeros(batch_size, seq_length)
+        token_mask[:, 1] = 1.0
+
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([1.0, 1.0, 1.0])
+
+        # Threshold of 1.5 should mask sequence 2 (exp(0.41) > 1.5)
+        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
+        )
+
+        # At least sequence 2 should be masked
+        assert num_masked >= 1, "At least one sequence should be masked"
+        assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"

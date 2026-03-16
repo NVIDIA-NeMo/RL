@@ -51,6 +51,7 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,6 +66,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
@@ -193,12 +195,20 @@ def validate_and_set_config(
     hf_model_name,
     pretrained_path,
     weights_path,
-    tokenizer,
 ):
-    # Handle generation colocation
+    # Handle generation configuration
     is_generation_colocated = None
+    sampling_params = None
     if "generation" in config and config["generation"] is not None:
-        is_generation_colocated = config["generation"]["colocated"]["enabled"]
+        generation_cfg = config["generation"]
+        # set generation colocated
+        is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg["top_k"],
+            top_p=generation_cfg["top_p"],
+            temperature=generation_cfg["temperature"],
+        )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -241,6 +251,7 @@ def validate_and_set_config(
         optimizer_cpu_offload,
         offload_optimizer_for_logprob,
         is_generation_colocated,
+        sampling_params,
         final_padded_vocab_size,
     )
 
@@ -663,12 +674,15 @@ def setup_model_and_optimizer(
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
     # Tokenizer
+    if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
+        megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
     build_tokenizer(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // megatron_cfg.model.tensor_model_parallel_size,
         tensor_model_parallel_size=megatron_cfg.model.tensor_model_parallel_size,
-        trust_remote_code=True,
     )
     assert megatron_cfg.model.vocab_size, "vocab size must be specified in model config"
 
@@ -680,10 +694,6 @@ def setup_model_and_optimizer(
 
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
-        if use_peft:
-            raise ValueError(
-                "Freezing the MOE router is not currently supported when using PEFT"
-            )
 
         def freeze_moe_router(megatron_model):
             if not isinstance(megatron_model, list):
@@ -704,6 +714,14 @@ def setup_model_and_optimizer(
 
     if use_peft:
         peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
+        if "dim" not in peft_cfg or peft_cfg["dim"] is None:
+            raise ValueError(
+                "If megtatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
+            )
+        if "alpha" not in peft_cfg or peft_cfg["alpha"] is None:
+            raise ValueError(
+                "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
+            )
         peft = LoRA(
             target_modules=peft_cfg["target_modules"],
             exclude_modules=peft_cfg["exclude_modules"],
@@ -718,6 +736,7 @@ def setup_model_and_optimizer(
         )
     else:
         peft = None
+
     megatron_cfg.peft = peft
 
     if megatron_cfg.peft is not None:
@@ -731,6 +750,8 @@ def setup_model_and_optimizer(
         pre_wrap_hook.extend([composed_peft_hook])
 
     # Model, optimizer, and learning rate.
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    setattr(megatron_cfg.model, "_pg_collection", pg_collection)
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
@@ -739,6 +760,7 @@ def setup_model_and_optimizer(
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -865,21 +887,68 @@ def setup_reference_model_state(
     if config["megatron_cfg"].get("freeze_moe_router", False):
         ref_mixed_precision_wrapper = MoEFloat16Module
 
+    ref_pre_wrap_hooks = []
+    use_peft = config["megatron_cfg"].get("peft", {}).get("enabled", False)
+
+    if use_peft:
+        peft_cfg = config["megatron_cfg"].get("peft", {})
+        if "dim" not in peft_cfg or peft_cfg["dim"] is None:
+            raise ValueError(
+                "If megtatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
+            )
+        if "alpha" not in peft_cfg or peft_cfg["alpha"] is None:
+            raise ValueError(
+                "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
+            )
+        peft = LoRA(
+            target_modules=peft_cfg["target_modules"],
+            exclude_modules=peft_cfg["exclude_modules"],
+            dim=peft_cfg["dim"],
+            alpha=peft_cfg["alpha"],
+            dropout=peft_cfg["dropout"],
+            dropout_position=peft_cfg["dropout_position"],
+            lora_A_init_method="zero",
+            lora_B_init_method="zero",
+            a2a_experimental=peft_cfg["a2a_experimental"],
+            lora_dtype=peft_cfg["lora_dtype"],
+        )
+    else:
+        peft = None
+
+    ref_megatron_cfg.peft = peft
+
+    if ref_megatron_cfg.peft is not None:
+        pre_peft_hook = _create_peft_pre_wrap_hook(ref_megatron_cfg, ref_state)
+        ref_megatron_cfg.model.register_pre_wrap_hook(pre_peft_hook)
+
+        def composed_peft_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+            model = pre_peft_hook(model)
+            return model
+
+        ref_pre_wrap_hooks.extend([composed_peft_hook])
+
     reference_model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        pre_wrap_hook=megatron_cfg.rng.data_parallel_random_init,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        pre_wrap_hook=ref_pre_wrap_hooks,
         mixed_precision_wrapper=ref_mixed_precision_wrapper,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+
+    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+    # so they only need to be loaded here if use_peft is False
+    should_load_checkpoint = (
+        not use_peft
+        and ref_checkpoint_config.pretrained_checkpoint is not None
+        and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
     )
 
     print("Loading the Reference Model")
-    reference_state_dict = {}
 
-    if ref_checkpoint_config.pretrained_checkpoint is not None and checkpoint_exists(
-        ref_checkpoint_config.pretrained_checkpoint
-    ):
+    if should_load_checkpoint:
         load_checkpoint(
             ref_state,
             reference_model,
@@ -888,9 +957,12 @@ def setup_reference_model_state(
             checkpointing_context=ref_ckpt_context,
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
+
+    reference_state_dict = {}
+
+    if should_load_checkpoint or use_peft:
         reference_model = reference_model[0]
         reference_model.eval()
-
         # Store reference state dict on CPU
         for name, item in reference_model.state_dict().items():
             if isinstance(item, torch.Tensor):
@@ -925,11 +997,16 @@ def finalize_megatron_setup(
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
         tokenizer_model=hf_model_name,
+        hf_tokenizer_kwargs={
+            "trust_remote_code": True,
+            "use_fast": True,
+        },
     )
 
     megatron_tokenizer = build_tokenizer(
@@ -937,7 +1014,6 @@ def finalize_megatron_setup(
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // config["megatron_cfg"]["tensor_model_parallel_size"],
         tensor_model_parallel_size=config["megatron_cfg"]["tensor_model_parallel_size"],
-        trust_remote_code=True,
     )
 
     dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
