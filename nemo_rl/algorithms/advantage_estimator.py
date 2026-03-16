@@ -266,7 +266,7 @@ class GeneralizedAdvantageEstimator:
                 r = rewards[i].item() if t == L - 1 else 0.0
 
                 delta = (
-                    rewards_expanded[i, t]
+                    rewards_expanded[i, t] + r
                     + self.gae_gamma * v_next
                     - values[i, t].item()
                 )
