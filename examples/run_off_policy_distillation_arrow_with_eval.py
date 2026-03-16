@@ -25,7 +25,15 @@ Usage:
 
 import argparse
 import os
+import sys
 import pprint
+
+# Force unbuffered stdout/stderr so logs appear immediately in SLURM output files
+os.environ["PYTHONUNBUFFERED"] = "1"
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
@@ -37,6 +45,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss_functions import (
+    CrossTokenizerDistillationLossFn,
     DistillationLossFn,
 )
 from nemo_rl.algorithms.off_policy_distillation import (
@@ -447,11 +456,44 @@ def main():
         f"  ✓ Cluster: {cluster_config['num_nodes']} nodes, max_colocated={max_colocated}"
     )
 
-    # ── Vocab check ──
-    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
-        check_vocab_equality(
-            tokenizer, policy_config["model_name"], teacher_config["model_name"]
+    # ── Cross-tokenizer setup ──
+    token_aligner_cfg = config.get("token_aligner", {})
+    cross_tokenizer_enabled = token_aligner_cfg.get("enabled", False)
+    token_aligner = None
+    teacher_tokenizer = None
+
+    if cross_tokenizer_enabled:
+        from nemo_rl.algorithms.x_token import TokenAligner
+
+        print("\n▶ Setting up cross-tokenizer distillation (TokenAligner)...")
+        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_config["model_name"])
+        if teacher_tokenizer.pad_token is None:
+            teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+        token_aligner = TokenAligner(
+            teacher_tokenizer_name=teacher_config["model_name"],
+            student_tokenizer_name=policy_config["model_name"],
+            max_comb_len=token_aligner_cfg.get("max_comb_len", 4),
+            projection_matrix_multiplier=token_aligner_cfg.get(
+                "projection_matrix_multiplier", 1.0
+            ),
         )
+        token_aligner._load_logits_projection_map(
+            file_path=token_aligner_cfg["projection_matrix_path"],
+            use_sparse_format=token_aligner_cfg.get("use_sparse_format", True),
+            learnable=token_aligner_cfg.get("learnable", False),
+            device="cpu",
+        )
+        if token_aligner_cfg.get("project_teacher_to_student", False):
+            token_aligner.create_reverse_projection_matrix(device="cpu")
+
+        print(f"  ✓ TokenAligner initialized ({policy_config['model_name']} → {teacher_config['model_name']})")
+    else:
+        # ── Vocab check (same-tokenizer mode only) ──
+        if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+            check_vocab_equality(
+                tokenizer, policy_config["model_name"], teacher_config["model_name"]
+            )
 
     # ── Teacher Policy ──
     print("\n▶ Setting up teacher policy...")
@@ -466,7 +508,7 @@ def main():
         name_prefix="teacher",
         cluster=cluster,
         config=teacher_config,
-        tokenizer=tokenizer,
+        tokenizer=teacher_tokenizer if cross_tokenizer_enabled else tokenizer,
         weights_path=None,
         optimizer_path=None,
         init_optimizer=False,
@@ -500,7 +542,10 @@ def main():
         init_reference_model=False,
     )
 
-    loss_fn = DistillationLossFn(config["loss_fn"])
+    if cross_tokenizer_enabled:
+        loss_fn = CrossTokenizerDistillationLossFn(config["loss_fn"], token_aligner)
+    else:
+        loss_fn = DistillationLossFn(config["loss_fn"])
 
     # ── vLLM Generation (colocated, for eval only) ──
     generation: Optional[GenerationInterface] = None
@@ -570,6 +615,8 @@ def main():
         eval_hook=eval_hook,
         eval_hook_period=eval_hook_period,
         eval_hook_at_start=eval_hook_at_start,
+        token_aligner=token_aligner,
+        teacher_tokenizer=teacher_tokenizer,
     )
 
 
