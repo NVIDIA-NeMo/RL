@@ -432,8 +432,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
                 collect_metrics=False,  # TODO(ahmadki): make configurable
-                min_bin_count=sequence_packing_args["min_bin_count"] or shards,
-                bin_count_multiple=sequence_packing_args["bin_count_multiple"]
+                min_bin_count=sequence_packing_args.get("min_bin_count") or shards,
+                bin_count_multiple=sequence_packing_args.get("bin_count_multiple")
                 or shards,
             )
 

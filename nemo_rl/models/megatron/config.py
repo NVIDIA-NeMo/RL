@@ -70,7 +70,7 @@ class ModelAndOptimizerState(NamedTuple):
     """
 
     state: GlobalState
-    model: MegatronModule
+    model: list[MegatronModule]
     optimizer: MegatronOptimizer
     scheduler: OptimizerParamScheduler
     checkpointing_context: dict[str, Any]
