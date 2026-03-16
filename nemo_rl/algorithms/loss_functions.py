@@ -1336,3 +1336,341 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+# =============================================================================
+# Cross-Tokenizer Distillation Loss (via TokenAligner)
+# =============================================================================
+
+
+class CrossTokenizerDistillationLossConfig(TypedDict):
+    """Configuration for cross-tokenizer distillation loss."""
+    loss_type: str                        # 'KL', 'cross_entropy', or 'chunked_ce'
+    temperature: float                    # Softmax temperature
+    vocab_topk: int                       # Reduce teacher vocab to top-k (0 = all)
+    exact_token_match_only: bool          # Only use 1:1 aligned positions
+    reverse_kl: bool                      # Reverse KL direction
+    project_teacher_to_student: NotRequired[bool]
+
+
+class CrossTokenizerDistillationLossDataDict(TypedDict):
+    """Data dict for cross-tokenizer distillation.
+
+    Only contains student-side tensors (same sequence dimension).
+    Teacher-side data (teacher_input_ids, aligned_pairs) is stored on the
+    loss function instance via set_cross_tokenizer_data() to avoid
+    sequence-length mismatches in the worker's shape validation.
+    """
+    input_ids: torch.Tensor               # Student token IDs (B, S_student)
+    input_lengths: torch.Tensor
+    token_mask: torch.Tensor              # (B, S_student)
+    sample_mask: torch.Tensor             # (B,)
+
+
+class CrossTokenizerDistillationLossFn(LossFunction):
+    """Cross-tokenizer distillation loss using TokenAligner's projection matrix.
+
+    Computes per-token KL divergence between projected student probabilities
+    (in teacher vocab space) and teacher probabilities, only at positions where
+    the two tokenizations have 1:1 aligned tokens. Uses NeMo RL's standard
+    masked_mean normalization so loss magnitude is comparable to same-tokenizer
+    distillation.
+
+    Teacher-specific data (teacher_input_ids, aligned_pairs) is stored on
+    this object via set_cross_tokenizer_data() before each training step,
+    rather than in the data dict, because teacher and student sequences
+    have different lengths and the worker validates that all tensors in
+    the data dict share the same sequence dimension.
+    """
+
+    def __init__(self, cfg: CrossTokenizerDistillationLossConfig, token_aligner):
+        from nemo_rl.algorithms.x_token import TokenAligner
+        assert isinstance(token_aligner, TokenAligner)
+        self.token_aligner = token_aligner
+        self.cfg = cfg
+        self.loss_type = LossType.TOKEN_LEVEL
+        self._teacher_input_ids = None
+        self._aligned_pairs = None
+
+    def set_cross_tokenizer_data(
+        self,
+        teacher_input_ids: torch.Tensor,
+        aligned_pairs: list,
+    ):
+        """Store teacher-side data before each training step.
+
+        Called from the training loop before student_policy.train().
+        The worker never sees these tensors in shape validation.
+        """
+        self._teacher_input_ids = teacher_input_ids
+        self._aligned_pairs = aligned_pairs
+
+    def _project_student_to_teacher(
+        self,
+        student_logits: torch.Tensor,
+        teacher_vocab_size: int,
+        temperature: float,
+        global_top_indices: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Project student logits into the reduced teacher vocabulary space.
+
+        Returns projected student probabilities of shape (B, S_student, K)
+        where K = len(global_top_indices).
+        """
+        student_probs = torch.softmax(student_logits / temperature, dim=-1)
+
+        has_sparse = (
+            hasattr(self.token_aligner, 'sparse_transformation_matrix')
+            and self.token_aligner.sparse_transformation_matrix is not None
+        )
+        if has_sparse:
+            projected_full = self.token_aligner.project_token_likelihoods_instance(
+                student_probs, None, None, None, device,
+                use_sparse_format=True,
+                sparse_matrix=self.token_aligner.sparse_transformation_matrix,
+            )
+            return projected_full[:, :, global_top_indices]
+
+        proj_values = self.token_aligner.likelihood_projection_matrix
+        if getattr(self.token_aligner, 'learnable', False):
+            proj_values = self.token_aligner.transform_learned_matrix_instance(proj_values)
+        return self.token_aligner.project_token_likelihoods_instance(
+            student_probs, self.token_aligner.likelihood_projection_indices,
+            proj_values, teacher_vocab_size, device,
+            use_sparse_format=False, global_top_indices=global_top_indices,
+        )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: CrossTokenizerDistillationLossDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        teacher_logits: Optional[torch.Tensor] = None,
+        mb_idx: Optional[int] = None,
+        mbs: Optional[int] = None,
+        teacher_topk_indices_ipc: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute cross-tokenizer distillation loss via chunk-averaged KL.
+
+        For each alignment chunk (1:1, 1:many, many:1, or many:many), the
+        projected student and teacher distributions are averaged over their
+        respective spans, renormalized, and compared via KL divergence.
+        The per-chunk KL is then distributed back to student positions
+        and normalized with the standard NeMo RL masked_mean.
+        """
+        input_ids_student = data["input_ids"]
+        batch_size = input_ids_student.shape[0]
+
+        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            student_logits = next_token_logits.full_tensor().to(torch.float32)
+        else:
+            student_logits = next_token_logits.to(torch.float32)
+
+        if teacher_logits is None:
+            raise ValueError(
+                "CrossTokenizerDistillationLossFn requires teacher_logits via IPC. "
+                "Set use_ipc=True in the distillation config."
+            )
+        if self._aligned_pairs is None or self._teacher_input_ids is None:
+            raise ValueError(
+                "Cross-tokenizer data not set. "
+                "Call loss_fn.set_cross_tokenizer_data() before training."
+            )
+
+        if isinstance(teacher_logits, torch.distributed.tensor.DTensor):
+            teacher_logits_f32 = teacher_logits.full_tensor().to(torch.float32)
+        else:
+            teacher_logits_f32 = teacher_logits.to(torch.float32)
+
+        if teacher_logits_f32.shape[-1] == 0:
+            raise ValueError(
+                f"Teacher logits have vocab dimension 0 (shape={teacher_logits_f32.shape}). "
+                "This typically means topk_logits=0 was passed instead of None "
+                "for the teacher forward pass. Cross-tokenizer distillation "
+                "requires full teacher logits (topk_logits=None)."
+            )
+
+        aligned_pairs = self._aligned_pairs
+        if mb_idx is not None and mbs is not None:
+            mb_start = mb_idx * mbs
+            mb_end = mb_start + batch_size
+            aligned_pairs = aligned_pairs[mb_start:mb_end]
+
+        self.token_aligner = self.token_aligner.to(student_logits.device)
+        device = student_logits.device
+
+        temperature = self.cfg.get("temperature", 1.0)
+        vocab_topk = self.cfg.get("vocab_topk", 8192)
+        reverse_kl = self.cfg.get("reverse_kl", False)
+        exact_match_only = self.cfg.get("exact_token_match_only", False)
+        student_seq_len = student_logits.shape[1]
+        teacher_seq_len = teacher_logits_f32.shape[1]
+        teacher_vocab_size = teacher_logits_f32.shape[-1]
+
+        # -- 1. Filter alignment pairs and count chunks --
+        filtered_pairs: list[list[tuple]] = []
+        total_chunks = 0
+        for batch_idx in range(batch_size):
+            batch_pairs = []
+            for pair in aligned_pairs[batch_idx]:
+                s1text, s2text, s1_start, s1_end, s2_start, s2_end = pair[:6]
+                # TODO: verify with TokenAligner author whether the correctness
+                # mask (pair[6]) should be used to filter chunks. Disabled for now
+                # to match original tokenalign.py behavior which uses all pairs.
+                # is_correct = pair[6] if len(pair) > 6 else (s1text == s2text)
+                # if not is_correct:
+                #     continue
+                if exact_match_only and (s1_end - s1_start != 1 or s2_end - s2_start != 1):
+                    continue
+                if s1_start == -1 or s2_start == -1:
+                    continue
+                if s1_end > student_seq_len or s2_end > teacher_seq_len:
+                    continue
+                batch_pairs.append(pair)
+            filtered_pairs.append(batch_pairs)
+            total_chunks = max(total_chunks, len(batch_pairs))
+
+        if total_chunks == 0:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return loss, {"loss": 0.0, "topk_accuracy": 0.0, "num_chunks": 0}
+
+        # -- 2. Build chunk masks (B, seq_len, num_chunks) --
+        proj_mask = torch.zeros(
+            batch_size, student_seq_len, total_chunks, dtype=torch.bool, device=device,
+        )
+        tgt_mask = torch.zeros(
+            batch_size, teacher_seq_len, total_chunks, dtype=torch.bool, device=device,
+        )
+        for batch_idx in range(batch_size):
+            for chunk_idx, pair in enumerate(filtered_pairs[batch_idx]):
+                _, _, s1_start, s1_end, s2_start, s2_end = pair[:6]
+                proj_mask[batch_idx, s1_start:s1_end, chunk_idx] = True
+                tgt_mask[batch_idx, s2_start:s2_end, chunk_idx] = True
+
+        # -- 3. Global vocabulary filtering (top-k teacher tokens) --
+        with torch.no_grad():
+            if vocab_topk == 0 or vocab_topk >= teacher_vocab_size:
+                global_top_indices = torch.arange(teacher_vocab_size, device=device)
+            else:
+                teacher_flat = teacher_logits_f32.view(-1, teacher_vocab_size)
+                importance = teacher_flat.max(dim=0)[0]
+                _, global_top_indices = torch.topk(
+                    importance, k=min(vocab_topk, teacher_vocab_size), dim=-1,
+                )
+                global_top_indices = global_top_indices.sort()[0]
+
+        # -- 4. Project student probs to teacher vocab --
+        projected_student = self._project_student_to_teacher(
+            student_logits, teacher_vocab_size, temperature, global_top_indices, device,
+        )
+
+        # -- 5. Teacher log-probs in reduced vocab --
+        teacher_logits_reduced = teacher_logits_f32[:, :, global_top_indices]
+        teacher_log_probs = torch.log_softmax(teacher_logits_reduced / temperature, dim=-1)
+        del teacher_logits_reduced
+
+        # -- 6. Chunk-averaged distributions --
+        # proj_mask: (B, S_student, C) -> transpose to (B, C, S_student)
+        # bmm with projected_student (B, S_student, K) -> (B, C, K)
+        proj_chunks = torch.bmm(
+            proj_mask.transpose(1, 2).to(projected_student.dtype), projected_student,
+        )
+        tgt_log_chunks = torch.bmm(
+            tgt_mask.transpose(1, 2).to(teacher_log_probs.dtype), teacher_log_probs,
+        )
+        del projected_student, teacher_log_probs
+
+        proj_sizes = proj_mask.sum(dim=1).unsqueeze(-1).to(proj_chunks.dtype)  # (B, C, 1)
+        tgt_sizes = tgt_mask.sum(dim=1).unsqueeze(-1).to(tgt_log_chunks.dtype)
+
+        proj_chunks = proj_chunks / (proj_sizes + 1e-10)
+        tgt_log_chunks = tgt_log_chunks / (tgt_sizes + 1e-10)
+
+        # Renormalize projected student so it sums to 1 after averaging
+        proj_chunks = proj_chunks / (proj_chunks.sum(dim=-1, keepdim=True) + 1e-10)
+        proj_log_chunks = torch.log(proj_chunks + 1e-10)
+
+        chunk_valid = (proj_sizes.squeeze(-1) > 0) & (tgt_sizes.squeeze(-1) > 0)  # (B, C)
+
+        # -- 7. KL divergence per chunk --
+        if reverse_kl:
+            kl_per_elem = torch.nn.functional.kl_div(
+                tgt_log_chunks, proj_log_chunks, reduction="none", log_target=True,
+            )
+        else:
+            kl_per_elem = torch.nn.functional.kl_div(
+                proj_log_chunks, tgt_log_chunks, reduction="none", log_target=True,
+            )
+        kl_per_chunk = kl_per_elem.sum(dim=-1) * (temperature ** 2)  # (B, C)
+        kl_per_chunk = kl_per_chunk * chunk_valid
+        del proj_chunks, tgt_log_chunks, proj_log_chunks, kl_per_elem
+
+        # -- 8. Scalar loss (same as original TokenAligner) --
+        # Mean KL over valid chunks, then scale for distributed microbatch contribution.
+        num_valid_chunks = chunk_valid.sum()
+        if num_valid_chunks > 0:
+            loss = kl_per_chunk.sum() / num_valid_chunks
+        else:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # One-time debug dump for sanity check comparison with standalone TokenAligner
+        if not getattr(self, '_debug_dumped', False):
+            self._debug_dumped = True
+            raw_loss = float(loss.item()) if loss.ndim == 0 else float(loss)
+            print(f"[CrossTokenKL DEBUG] raw_chunk_loss={raw_loss:.6f}, "
+                  f"num_valid_chunks={int(num_valid_chunks.item())}, "
+                  f"student_shape={student_logits.shape}, "
+                  f"teacher_shape={teacher_logits_f32.shape}, "
+                  f"total_filtered_pairs={sum(len(fp) for fp in filtered_pairs)}", flush=True)
+            try:
+                import os
+                dump_dir = os.environ.get("CROSS_TOK_DEBUG_DIR", "/tmp/cross_tok_debug")
+                os.makedirs(dump_dir, exist_ok=True)
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                teacher_ids = self._teacher_input_ids
+                if mb_idx is not None and mbs is not None:
+                    teacher_ids = teacher_ids[mb_idx * mbs : mb_idx * mbs + batch_size]
+                torch.save({
+                    "student_logits": student_logits.cpu(),
+                    "teacher_logits": teacher_logits_f32.cpu(),
+                    "input_ids_student": input_ids_student.cpu(),
+                    "input_ids_teacher": teacher_ids.cpu(),
+                    "aligned_pairs": aligned_pairs,
+                    "config": dict(self.cfg),
+                }, os.path.join(dump_dir, f"debug_rank{rank}.pt"))
+                print(f"[CrossTokenKL DEBUG] Saved debug tensors to {dump_dir}/debug_rank{rank}.pt", flush=True)
+            except Exception as e:
+                print(f"[CrossTokenKL DEBUG] Failed to save debug tensors: {e}", flush=True)
+
+        # Scale for NeMo RL distributed training: this microbatch's fraction
+        # of the global batch. masked_mean with a scalar does:
+        #   sum(loss * mask) / global_valid_toks
+        # We want: loss * (local_valid_toks / global_valid_toks)
+        # which ensures microbatch losses sum to the correct global mean.
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        max_len = min(token_mask.shape[1] - 1, student_seq_len)
+        local_mask = token_mask[:, 1 : max_len + 1] * sample_mask.unsqueeze(-1)
+        local_valid_toks = local_mask.sum()
+
+        if local_valid_toks > 0 and global_valid_toks > 0:
+            loss = loss * local_valid_toks / global_valid_toks
+        else:
+            loss = loss * 0.0
+
+        topk_accuracy = 0.0
+        num_valid = int(num_valid_chunks.item())
+        metrics = {
+            "loss": float(loss.item()) if loss.ndim == 0 else loss,
+            "topk_accuracy": topk_accuracy,
+            "num_valid_samples": int(batch_size),
+            "num_chunks": num_valid,
+            "alignment_density": num_valid / max(1, batch_size * student_seq_len),
+        }
+
+        return loss, metrics

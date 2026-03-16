@@ -38,6 +38,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss_functions import (
+    CrossTokenizerDistillationLossFn,
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
@@ -65,6 +66,26 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class TokenAlignerConfig(TypedDict, total=False):
+    """Configuration for cross-tokenizer distillation via TokenAligner.
+
+    When enabled, teacher and student may use different tokenizers/vocabularies.
+    A precomputed projection matrix maps between the two vocabulary spaces.
+    """
+    enabled: bool                          # Master switch for cross-tokenizer mode
+    projection_matrix_path: str            # Path to .pt projection matrix file
+    use_sparse_format: bool                # True = sparse COO format, False = dense indices/values
+    loss_type: str                         # 'KL', 'cross_entropy', or 'chunked_ce'
+    exact_token_match_only: bool           # Only use 1:1 aligned token positions for loss
+    temperature: float                     # Softmax temperature for KL computation
+    vocab_topk: int                        # Reduce teacher vocab to top-k for speed (0 = all)
+    reverse_kl: bool                       # If True, use reverse KL direction
+    projection_matrix_multiplier: float    # Scaling factor for projection matrix
+    max_comb_len: int                      # Max combination length for token alignment DP
+    learnable: bool                        # If True, projection matrix is trainable
+    project_teacher_to_student: bool       # If True, project teacher->student instead of student->teacher
 
 
 class OffPolicyDistillationConfig(TypedDict):
@@ -120,6 +141,7 @@ class OffPolicyMasterConfig(TypedDict):
     logger: LoggerConfig  # Logger configuration
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
+    token_aligner: NotRequired[TokenAlignerConfig]  # Cross-tokenizer config (optional)
 
 
 # ===============================================================================
@@ -291,14 +313,50 @@ def setup(
     )
 
     # ==========================
+    #      Cross-Tokenizer Setup
+    # ==========================
+    token_aligner_cfg = master_config.get("token_aligner", {})
+    cross_tokenizer_enabled = token_aligner_cfg.get("enabled", False)
+    token_aligner = None
+    teacher_tokenizer = None
+
+    if cross_tokenizer_enabled:
+        from nemo_rl.algorithms.x_token import TokenAligner
+
+        print("\n▶ Setting up cross-tokenizer distillation (TokenAligner)...", flush=True)
+        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_config["model_name"])
+        if teacher_tokenizer.pad_token is None:
+            teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+        token_aligner = TokenAligner(
+            teacher_tokenizer_name=teacher_config["model_name"],
+            student_tokenizer_name=policy_config["model_name"],
+            max_comb_len=token_aligner_cfg.get("max_comb_len", 4),
+            projection_matrix_multiplier=token_aligner_cfg.get(
+                "projection_matrix_multiplier", 1.0
+            ),
+        )
+        token_aligner._load_logits_projection_map(
+            file_path=token_aligner_cfg["projection_matrix_path"],
+            use_sparse_format=token_aligner_cfg.get("use_sparse_format", True),
+            learnable=token_aligner_cfg.get("learnable", False),
+            device="cpu",
+        )
+        if token_aligner_cfg.get("project_teacher_to_student", False):
+            token_aligner.create_reverse_projection_matrix(device="cpu")
+
+        print(f"  ✓ TokenAligner initialized ({policy_config['model_name']} → {teacher_config['model_name']})", flush=True)
+
+    # ==========================
     #      Teacher Policy
     # ==========================
     print("\n▶ Setting up teacher policy...", flush=True)
 
-    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
-        check_vocab_equality(
-            tokenizer, policy_config["model_name"], teacher_config["model_name"]
-        )
+    if not cross_tokenizer_enabled:
+        if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+            check_vocab_equality(
+                tokenizer, policy_config["model_name"], teacher_config["model_name"]
+            )
 
     if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
@@ -312,7 +370,7 @@ def setup(
         name_prefix="teacher",
         cluster=cluster,
         config=teacher_config,
-        tokenizer=tokenizer,
+        tokenizer=teacher_tokenizer if cross_tokenizer_enabled else tokenizer,
         weights_path=None,
         optimizer_path=None,
         init_optimizer=False,
@@ -352,7 +410,10 @@ def setup(
         init_reference_model=False,
     )
 
-    loss_fn = DistillationLossFn(loss_config)
+    if cross_tokenizer_enabled:
+        loss_fn = CrossTokenizerDistillationLossFn(loss_config, token_aligner)
+    else:
+        loss_fn = DistillationLossFn(loss_config)
 
     print("\n" + "=" * 60)
     print(" " * 12 + "OFF-POLICY DISTILLATION SETUP COMPLETE")
@@ -575,6 +636,8 @@ def off_policy_distillation_train(
     eval_hook: Optional[Callable] = None,
     eval_hook_period: int = 0,
     eval_hook_at_start: bool = False,
+    token_aligner=None,
+    teacher_tokenizer=None,
 ) -> None:
     """Run off-policy distillation training algorithm.
     
@@ -713,6 +776,60 @@ def off_policy_distillation_train(
                     )
                     train_data.to("cpu")
 
+                # ==== Cross-Tokenizer Data Processing ====
+                cross_tokenizer_enabled = token_aligner is not None and teacher_tokenizer is not None
+                teacher_data = None
+
+                if cross_tokenizer_enabled:
+                    with timer.time("cross_tokenizer_processing"):
+                        student_ids = train_data["input_ids"]
+                        batch_size_ct = student_ids.shape[0]
+
+                        texts = [
+                            tokenizer.decode(student_ids[i].tolist(), skip_special_tokens=True)
+                            for i in range(batch_size_ct)
+                        ]
+
+                        max_teacher_len = master_config["teacher"].get(
+                            "max_total_sequence_length",
+                            master_config["policy"]["max_total_sequence_length"],
+                        )
+                        teacher_encoded = teacher_tokenizer(
+                            texts,
+                            max_length=max_teacher_len,
+                            padding="max_length",
+                            truncation=True,
+                            return_tensors="pt",
+                        )
+                        teacher_input_ids = teacher_encoded["input_ids"]
+                        teacher_attention_mask = teacher_encoded["attention_mask"]
+                        teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
+
+                        aligned_pairs = token_aligner.align(
+                            student_ids, teacher_input_ids
+                        )
+
+                        loss_fn.set_cross_tokenizer_data(
+                            teacher_input_ids=teacher_input_ids,
+                            aligned_pairs=aligned_pairs,
+                        )
+
+                        teacher_token_mask = torch.zeros_like(
+                            teacher_input_ids, dtype=torch.float32
+                        )
+                        for i in range(batch_size_ct):
+                            teacher_token_mask[i, : teacher_input_lengths_ct[i]] = 1.0
+
+                        teacher_data = BatchedDataDict(
+                            {
+                                "input_ids": teacher_input_ids,
+                                "input_lengths": teacher_input_lengths_ct,
+                                "token_mask": teacher_token_mask,
+                                "sample_mask": batch["loss_multiplier"],
+                            }
+                        )
+                        teacher_data.to("cpu")
+
                 # ==== Teacher Logprob Inference ====
                 use_ipc = master_config["distillation"].get("use_ipc", True)
                 topk_k = master_config["distillation"]["topk_logits_k"]
@@ -722,19 +839,27 @@ def off_policy_distillation_train(
                     student_policy.offload_after_refit()
                     teacher_policy.prepare_for_lp_inference()
 
+                teacher_fwd_data = teacher_data if cross_tokenizer_enabled else train_data
+                teacher_topk_k = None if cross_tokenizer_enabled else topk_k
+
                 if use_ipc:
                     print("▶ Computing teacher logprobs (IPC)...", flush=True)
                     with timer.time("teacher_logprob_inference"):
                         teacher_logits = teacher_policy.train(
-                            train_data,
+                            teacher_fwd_data,
                             loss_fn,
                             eval_mode=True,
                             is_teacher=True,
-                            topk_logits=topk_k,
+                            topk_logits=teacher_topk_k,
                             gbs=master_config["policy"]["train_global_batch_size"],
                             mbs=master_config["policy"]["train_micro_batch_size"],
                         )
                 else:
+                    if cross_tokenizer_enabled:
+                        raise NotImplementedError(
+                            "Cross-tokenizer distillation requires use_ipc=True. "
+                            "Set distillation.use_ipc: true in the config."
+                        )
                     print("▶ Computing teacher logprobs (non-IPC, data dict)...", flush=True)
                     with timer.time("teacher_logprob_inference"):
                         teacher_topk = teacher_policy.get_topk_logits(train_data, k=topk_k)
