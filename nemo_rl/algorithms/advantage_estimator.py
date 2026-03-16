@@ -174,6 +174,8 @@ class GeneralizedAdvantageEstimator:
         self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
         self.normalize_advantages = estimator_config.get("normalize_advantages", True)
 
+        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.1)
+
     def _reward_whiten(
         self,
         rewards: torch.Tensor,
@@ -197,6 +199,7 @@ class GeneralizedAdvantageEstimator:
         lengths,
         values,
         reference_logprobs,
+        logprobs,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
@@ -214,27 +217,61 @@ class GeneralizedAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        rewards_expanded = torch.zeros_like(values)
-        advantages = torch.zeros_like(values)
-        values_next = torch.zeros_like(values)
-        values_next[:, :-1] = values[:, 1:]
-
-        for i, l in enumerate(lengths):
-            rewards_expanded[i, l - 1] = rewards[i]
-
-        deltas = rewards_expanded + self.gae_gamma * values_next - values
-
-        last_advantage = 0
-        for t in reversed(range(values.shape[1])):
-            advantages[:, t] = (
-                deltas[:, t] + self.gae_gamma * self.gae_lambda * last_advantage
-            )
-            last_advantage = advantages[:, t]
+        kl = calculate_kl(logprobs, reference_logprobs, "k1") * self.kl_coef
+        advantages, returns = self.compute_advantage_reference(
+            rewards, lengths, values, kl, mask=mask
+        )
 
         advantages = torch.masked_fill(
-            # self._reward_whiten(advantages, mask),
-            advantages,
+            self._reward_whiten(advantages, mask),
+            # advantages,
             ~(mask.bool()),
             0,
         )
-        return advantages
+        return advantages, returns
+
+    def compute_advantage_reference(
+        self,
+        rewards,
+        lengths,
+        values,
+        kl,
+        **kwargs,
+    ):
+        """Reference GAE implementation for correctness validation.
+
+        Fixes two issues in compute_advantage:
+        1. Terminal state: uses V=0 at t=L (not a padding token's value).
+        2. No cross-sequence contamination: accumulation resets per sequence.
+
+        Args:
+            rewards: Tensor of shape [batch_size].
+            lengths: Total sequence lengths of shape [batch_size].
+            values: Value predictions of shape [batch_size, seq_len].
+
+        Returns:
+            advantages: Tensor of shape [batch_size, seq_len].
+            returns: advantages + values, shape [batch_size, seq_len].
+        """
+        advantages = torch.zeros_like(values)
+        rewards_expanded = torch.zeros_like(values)
+
+        rewards_expanded -= kl
+
+        for i in range(values.shape[0]):
+            L = int(lengths[i])
+            last_adv = 0.0
+            for t in reversed(range(L)):
+                v_next = values[i, t + 1].item() if (t + 1) < L else 0.0
+                r = rewards[i].item() if t == L - 1 else 0.0
+
+                delta = (
+                    rewards_expanded[i, t]
+                    + self.gae_gamma * v_next
+                    - values[i, t].item()
+                )
+                last_adv = delta + self.gae_gamma * self.gae_lambda * last_adv
+                advantages[i, t] = last_adv
+
+        returns = advantages + values
+        return advantages, returns

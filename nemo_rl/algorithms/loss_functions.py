@@ -23,14 +23,10 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
-    ChunkedDistributedGatherLogprob,
-    _get_tokens_on_this_cp_rank,
-    allgather_cp_sharded_tensor,
-    from_parallel_logits_to_logprobs,
-    gather_logits_at_global_indices,
-    get_logprobs_from_vocab_parallel_logits,
-)
+    ChunkedDistributedEntropy, ChunkedDistributedGatherLogprob,
+    _get_tokens_on_this_cp_rank, allgather_cp_sharded_tensor,
+    from_parallel_logits_to_logprobs, gather_logits_at_global_indices,
+    get_logprobs_from_vocab_parallel_logits)
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -125,7 +121,7 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg["ratio_clip_min"]
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
+        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"] if not cfg["use_kl_in_reward"] else 0
         self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
         self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
         self.kl_output_clamp_value = cfg["kl_output_clamp_value"]

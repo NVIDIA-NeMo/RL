@@ -8,7 +8,7 @@ ppo:
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 32
-  steps_per_epoch: 1
+  steps_per_epoch: 4
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 1
@@ -48,7 +48,7 @@ ppo:
     target_max: 1.0
 
 loss_fn:
-  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_penalty: 0.1
   # Can be set to k1, k2, k3
   # For more details, see http://joschu.net/blog/kl-approx.html
   reference_policy_kl_type: "k3"
@@ -68,9 +68,9 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
-  use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  use_kl_in_reward: true  # Reinforce++: add KL penalty to reward instead of loss
 
-  value_loss_scale: 1.0
+  value_loss_scale: 0.4
 
 checkpointing:
   enabled: true
