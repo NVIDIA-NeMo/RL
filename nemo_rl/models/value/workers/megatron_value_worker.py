@@ -133,9 +133,10 @@ class _ValueOutputLayerBypass(torch.nn.Module):
 
     def forward(self, hidden_states, *args, **kwargs):
         self.captured_hidden["hidden_states"] = hidden_states
-        # Return a minimal tensor that preserves the autograd graph.
+        # Return (tensor, bias) tuple matching ColumnParallelLinear's signature,
+        # since GPTModel._postprocess does `logits, _ = self.output_layer(...)`.
         # Uses a slice view to avoid allocating new memory.
-        return hidden_states[..., :1]
+        return hidden_states[..., :1], None
 
 
 def forward_step_value(
