@@ -1942,7 +1942,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
         )
 
 
-def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int = 256) -> None:
+def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2063,7 +2063,7 @@ def _gpt_forward_with_linear_ce_fusion(
         inference_only=inference_context is not None and not self.training,
         tp_group=get_tensor_model_parallel_group(),
         cp_group=self.cp_group,
-        chunk_size=getattr(self, "_linear_ce_fusion_chunk_size", 256),
+        chunk_size=self._linear_ce_fusion_chunk_size,
     )
     return logprobs
 
