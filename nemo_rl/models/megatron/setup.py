@@ -472,10 +472,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
-        try:
+        if isinstance(attention_backend, str):
             model_cfg.attention_backend = AttnBackend[attention_backend]
-        except KeyError:
+        elif isinstance(attention_backend, int):
             model_cfg.attention_backend = AttnBackend(attention_backend)
+        else:
+            raise ValueError(f"Unsupported {type(attention_backend)=}, expected str or int")
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
