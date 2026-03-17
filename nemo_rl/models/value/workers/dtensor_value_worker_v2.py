@@ -509,6 +509,11 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
 
         torch.cuda.empty_cache()
 
+    def prepare_for_inference(self, *args, **kwargs) -> None:
+        """Prepare for inference by setting model to eval mode."""
+        self.model.eval()
+        torch.cuda.empty_cache()
+
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         """Move optimizer state to specified device."""
         from torch.distributed.tensor import DTensor

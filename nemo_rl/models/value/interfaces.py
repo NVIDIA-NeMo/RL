@@ -81,6 +81,11 @@ class ValueInterface(ABC):
         pass
 
     @abstractmethod
+    def prepare_for_inference(self, *args: Any, **kwargs: Any) -> None:
+        """Prepare the value model for inference (e.g., offload gradients)."""
+        pass
+
+    @abstractmethod
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         """Clean up after training."""
         pass
