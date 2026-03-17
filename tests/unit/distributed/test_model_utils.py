@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import os
 
 import pytest
@@ -241,6 +242,194 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
 
     finally:
         cluster.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# distributed_test_runner-based packed-sequences tests (coverage-friendly)
+# ---------------------------------------------------------------------------
+
+
+def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_size):
+    """Test from_parallel_logits_to_logprobs_packed_sequences with coverage.
+
+    Uses _pack_input_ids to build packed targets and compares:
+      1. target_is_pre_rolled=False against the unpacked baseline (CP=1 only)
+      2. target_is_pre_rolled=True against target_is_pre_rolled=False
+    with variable-length sequences.
+    """
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    # Build 2-D process groups: inner=TP, outer=CP
+    tp_groups = []
+    cp_groups = []
+    for cp_r in range(cp_size):
+        ranks = [cp_r * tp_size + tp_r for tp_r in range(tp_size)]
+        tp_groups.append(torch.distributed.new_group(ranks=ranks))
+    for tp_r in range(tp_size):
+        ranks = [cp_r * tp_size + tp_r for cp_r in range(cp_size)]
+        cp_groups.append(torch.distributed.new_group(ranks=ranks))
+
+    my_tp_rank = rank % tp_size
+    my_cp_rank = rank // tp_size
+    tp_group = tp_groups[my_cp_rank]
+    cp_group = cp_groups[my_tp_rank] if cp_size > 1 else None
+    my_cp_rank_val = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+
+    batch_size = 4
+    vocab_size = 1024
+    vocab_part_size = vocab_size // tp_size
+    vocab_start_index = my_tp_rank * vocab_part_size
+    vocab_end_index = (my_tp_rank + 1) * vocab_part_size
+
+    # Variable-length sequences
+    raw_seq_lengths = [24, 48, 16, 40]
+    max_seq_len = max(raw_seq_lengths)
+
+    if cp_size > 1 and max_seq_len % (2 * cp_size) != 0:
+        max_seq_len = (max_seq_len // (2 * cp_size) + 1) * (2 * cp_size)
+        raw_seq_lengths = [min(l, max_seq_len) for l in raw_seq_lengths]
+
+    pad_to = 2 * cp_size if cp_size > 1 else 1
+    padded_seq_lengths = [
+        ((l + pad_to - 1) // pad_to) * pad_to for l in raw_seq_lengths
+    ]
+
+    # Build cu_seqlens / cu_seqlens_padded
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    for i in range(batch_size):
+        cu_seqlens[i + 1] = cu_seqlens[i] + raw_seq_lengths[i]
+        cu_seqlens_padded[i + 1] = cu_seqlens_padded[i] + padded_seq_lengths[i]
+
+    total_padded = int(cu_seqlens_padded[-1].item())
+
+    torch.manual_seed(42)
+    unpacked_logits_full = torch.randn(
+        batch_size, max_seq_len, vocab_size, device="cuda"
+    )
+    input_ids = torch.randint(0, vocab_size, (batch_size, max_seq_len), device="cuda")
+
+    unpacked_logits_local = unpacked_logits_full[
+        :, :, vocab_start_index:vocab_end_index
+    ]
+
+    # --- Pack logits: [B, S, V_local] -> [1, T_padded // CP, V_local] ---
+    # Each sequence is individually padded and CP-sharded (matching production).
+    packed_logits = torch.zeros(
+        1, total_padded // cp_size, vocab_part_size, device="cuda"
+    )
+    for i in range(batch_size):
+        sl = raw_seq_lengths[i]
+        psl = padded_seq_lengths[i]
+        padded_seq = torch.zeros(1, psl, vocab_part_size, device="cuda")
+        padded_seq[:, :sl, :] = unpacked_logits_local[i : i + 1, :sl, :]
+        offset = int(cu_seqlens_padded[i].item())
+        if cp_size > 1:
+            sharded = _get_tokens_on_this_cp_rank(padded_seq, my_cp_rank_val, cp_size)
+            packed_logits[:, offset // cp_size : (offset + psl) // cp_size, :] = sharded
+        else:
+            packed_logits[:, offset : offset + psl, :] = padded_seq
+
+    # --- Path 1: target_is_pre_rolled=False ---
+    # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
+    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+
+    logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
+        packed_logits,
+        packed_target_raw,
+        cu_seqlens_padded,
+        max_seq_len,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        cp_group=cp_group,
+        chunk_size=chunk_size,
+        target_is_pre_rolled=False,
+    )
+
+    # --- Path 2: target_is_pre_rolled=True ---
+    packed_target_pre_rolled = _pack_input_ids(
+        input_ids,
+        cu_seqlens,
+        cu_seqlens_padded,
+        cp_rank=my_cp_rank_val,
+        cp_size=cp_size,
+        roll_shift=-1,
+    )
+
+    logprobs_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
+        packed_logits,
+        packed_target_pre_rolled,
+        cu_seqlens_padded,
+        max_seq_len,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        cp_group=cp_group,
+        chunk_size=chunk_size,
+        target_is_pre_rolled=True,
+    )
+
+    # Both paths must produce identical results
+    for i in range(batch_size):
+        valid_len = raw_seq_lengths[i] - 1
+        torch.testing.assert_close(
+            logprobs_pre_rolled[i, :valid_len],
+            logprobs_not_pre_rolled[i, :valid_len],
+            rtol=1e-5,
+            atol=1e-5,
+            msg=f"pre_rolled vs not_pre_rolled mismatch on rank {rank}, seq {i}",
+        )
+
+    # --- Also compare against the unpacked baseline ---
+    # The unpacked function CP-shards each row from max_seq_len, which matches
+    # the packed per-sequence CP-sharding only when CP=1.
+    if cp_size == 1:
+        baseline_logprobs = from_parallel_logits_to_logprobs(
+            unpacked_logits_local,
+            input_ids,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=cp_group,
+        )
+        for i in range(batch_size):
+            valid_len = raw_seq_lengths[i] - 1
+            torch.testing.assert_close(
+                logprobs_not_pre_rolled[i, :valid_len],
+                baseline_logprobs[i, :valid_len],
+                rtol=1e-5,
+                atol=1e-5,
+                msg=f"packed vs unpacked mismatch on rank {rank}, seq {i}",
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, cp_size, chunk_size",
+    [
+        (2, 1, None),
+        (1, 2, None),
+        (2, 1, 8),
+        (1, 2, 8),
+    ],
+    ids=lambda v: str(v),
+)
+def test_packed_sequences_with_distributed_runner(
+    distributed_test_runner, tp_size, cp_size, chunk_size
+):
+    """Test from_parallel_logits_to_logprobs_packed_sequences using distributed_test_runner.
+
+    Covers both target_is_pre_rolled paths, variable-length sequences, and chunk_size,
+    with proper code coverage tracking (unlike Ray-based tests).
+    """
+    world_size = tp_size * cp_size
+    test_fn = functools.partial(
+        _run_packed_sequences_equivalence,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        chunk_size=chunk_size,
+    )
+    distributed_test_runner(test_fn, world_size=world_size)
 
 
 @ray.remote(num_gpus=1)
