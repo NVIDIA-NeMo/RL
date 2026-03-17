@@ -1281,8 +1281,9 @@ class MseValueLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute Mean Squared Error value loss."""
 
-        if values.shape[-1] != 1:
-            values = values[..., 0]
+        # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
+        if values.ndim > 2 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
 
 
         token_mask = data["token_mask"]
