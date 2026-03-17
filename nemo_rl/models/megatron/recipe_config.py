@@ -29,9 +29,13 @@ YAML config under ``policy.megatron_recipe``. For example:
 The import path is resolved at runtime using ``load_recipe()``.
 """
 
-import importlib
+from __future__ import annotations
 
-from megatron.bridge.training.config import ConfigContainer
+import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from megatron.bridge.training.config import ConfigContainer
 
 
 def load_recipe(recipe_path: str) -> ConfigContainer:
