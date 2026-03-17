@@ -12,10 +12,6 @@ NUM_MINUTES=30
 
 exit_if_max_steps_reached
 
-# Disable torch.compile — MoE experts.py uses @torch.compile which triggers
-# inductor GuardOnDataDependentSymNode errors with dynamic MoE shapes in torch 2.10.
-export TORCH_COMPILE_DISABLE=1
-
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_sft.py \
