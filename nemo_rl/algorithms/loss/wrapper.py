@@ -152,6 +152,68 @@ class SequencePackingLossWrapper:
         return loss_accum, metrics_accum
 
 
+class SequencePackingFusionLossWrapper:
+    """Fused sequence packing loss wrapper that processes all sequences in one forward pass.
+
+    Unlike SequencePackingLossWrapper which iterates over sequences one at a time,
+    this wrapper calls prepare_fn once on the packed logits to compute log
+    probabilities in a single shot, then calls the loss function once with the
+    pre-computed result.
+
+    This avoids per-sequence kernel launches and TP/CP communication overhead while
+    producing numerically identical results.
+
+    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
+    which currently only supports LossInputType.LOGPROB.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        prepare_fn: Callable[..., Any],
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Compute loss for all packed sequences in one forward pass."""
+        loss_input, prepared_data = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.loss_fn,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_q_padded=self.cu_seqlens_q_padded,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        )
+
+        return self.loss_fn(
+            data=prepared_data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
+
+
 def wrap_loss_fn_with_input_preparation(
     next_token_logits: Tensor,
     data: BatchedDataDict[Any],
