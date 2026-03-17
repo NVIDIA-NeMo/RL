@@ -119,6 +119,25 @@ def _unwrap_model(model):
     return m
 
 
+class _ValueOutputLayerBypass(torch.nn.Module):
+    """Replaces the output_layer during value model forward to skip the expensive
+    logits computation (hidden_size -> vocab_size).
+
+    Instead of computing [S, B, vocab_size] logits, captures the hidden states
+    and returns a minimal [S, B, 1] tensor, saving both memory and FLOPS.
+    """
+
+    def __init__(self, captured_hidden: dict):
+        super().__init__()
+        self.captured_hidden = captured_hidden
+
+    def forward(self, hidden_states, *args, **kwargs):
+        self.captured_hidden["hidden_states"] = hidden_states
+        # Return a minimal tensor that preserves the autograd graph.
+        # Uses a slice view to avoid allocating new memory.
+        return hidden_states[..., :1]
+
+
 def forward_step_value(
     state,
     global_valid_seqs,
@@ -160,39 +179,35 @@ def forward_step_value(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
-    # Register a hook to capture hidden states before the output_layer
+    # Bypass the output_layer to avoid computing expensive logits [S, B, vocab_size].
+    # Instead, capture hidden_states and route them through the value head.
     captured_hidden = {}
-
     base_model = _unwrap_model(model)
-    hook_handle = None
+    original_output_layer = None
+
     if hasattr(base_model, "output_layer"):
+        original_output_layer = base_model.output_layer
+        base_model.output_layer = _ValueOutputLayerBypass(captured_hidden)
 
-        def _capture_hook(module, args):
-            # args[0] is the hidden_states input to output_layer
-            captured_hidden["hidden_states"] = args[0]
-
-        hook_handle = base_model.output_layer.register_forward_pre_hook(_capture_hook)
-
-    with straggler_timer:
-        # Run the normal model forward (this computes logits we'll discard)
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-        )
-
-    # Remove hook
-    if hook_handle is not None:
-        hook_handle.remove()
+    try:
+        with straggler_timer:
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **additional_kwargs,
+            )
+    finally:
+        # Always restore the original output_layer
+        if original_output_layer is not None:
+            base_model.output_layer = original_output_layer
 
     # Compute values from captured hidden states
     if "hidden_states" in captured_hidden:
         hidden_states = captured_hidden["hidden_states"]
-        # Megatron-Core uses [S, B, H] internally; transpose to [B, S, H]
-        if hidden_states.shape[0] != data_dict["input_ids"].shape[0]:
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-        values = value_head(hidden_states)  # [batch, seq, 1]
+        # Megatron-Core always uses [S, B, H] layout internally; transpose to [B, S, H]
+        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        values = value_head(hidden_states).squeeze(-1)  # [batch, seq]
         # Replace output_tensor with values for loss computation
         output_tensor = values
     else:
@@ -590,8 +605,18 @@ class MegatronValueWorker(AbstractPolicyWorker):
                         self.optimizer.step()
                     )
 
-                    # Step value head optimizer separately
+                    # Step value head optimizer separately.
+                    # The value head is NOT wrapped in DDP, so we must manually
+                    # allreduce its gradients across DP ranks to keep weights in sync.
                     if hasattr(self, "value_head_optimizer"):
+                        dp_group = parallel_state.get_data_parallel_group()
+                        for param in self.value_head.parameters():
+                            if param.grad is not None:
+                                torch.distributed.all_reduce(
+                                    param.grad,
+                                    op=torch.distributed.ReduceOp.AVG,
+                                    group=dp_group,
+                                )
                         # Clip value head gradients
                         max_grad_norm = self.cfg.get("max_grad_norm", 1.0)
                         if max_grad_norm is not None and max_grad_norm > 0:
@@ -745,37 +770,33 @@ class MegatronValueWorker(AbstractPolicyWorker):
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
 
-            # Register hook to capture hidden states
+            # Bypass output_layer to avoid computing expensive logits
             captured_hidden = {}
             base_model = _unwrap_model(model)
-            hook_handle = None
+            original_output_layer = None
+
             if hasattr(base_model, "output_layer"):
+                original_output_layer = base_model.output_layer
+                base_model.output_layer = _ValueOutputLayerBypass(captured_hidden)
 
-                def _capture_hook(module, args):
-                    captured_hidden["hidden_states"] = args[0]
-
-                hook_handle = base_model.output_layer.register_forward_pre_hook(
-                    _capture_hook
+            try:
+                output_tensor = model(
+                    input_ids=input_ids_cp_sharded,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    **additional_kwargs,
                 )
-
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                **additional_kwargs,
-            )
-
-            if hook_handle is not None:
-                hook_handle.remove()
+            finally:
+                if original_output_layer is not None:
+                    base_model.output_layer = original_output_layer
 
             def collection_fn(output_tensor):
                 # Compute values from hidden states
                 if "hidden_states" in captured_hidden:
                     hidden_states = captured_hidden["hidden_states"]
-                    # Megatron-Core uses [S, B, H] internally; transpose to [B, S, H]
-                    if hidden_states.shape[0] != data_dict["input_ids"].shape[0]:
-                        hidden_states = hidden_states.transpose(0, 1).contiguous()
-                    values = self.value_head(hidden_states)  # [B, S, 1]
+                    # Megatron-Core always uses [S, B, H] layout; transpose to [B, S, H]
+                    hidden_states = hidden_states.transpose(0, 1).contiguous()
+                    values = self.value_head(hidden_states).squeeze(-1)  # [B, S]
                 else:
                     # Non-last PP stage: return dummy
                     values = torch.zeros(1, device=output_tensor.device)
@@ -827,9 +848,9 @@ class MegatronValueWorker(AbstractPolicyWorker):
             for val in all_values:
                 padding_needed = seq_length - val.shape[1]
                 if padding_needed > 0:
-                    # For [B, S, 1] tensors, pad along seq dim (dim 1)
+                    # For [B, S] tensors, pad along seq dim (dim 1)
                     val = torch.nn.functional.pad(
-                        val, (0, 0, 0, padding_needed), mode="constant", value=0.0
+                        val, (0, padding_needed), mode="constant", value=0.0
                     )
                 all_values_padded.append(val)
 

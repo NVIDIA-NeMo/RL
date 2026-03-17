@@ -1354,8 +1354,9 @@ def ppo_train(
                     }
                 )
 
+                value_model.prepare_for_inference()
                 values = value_model.get_values(train_data)
-                train_data["values"] = values["values"][..., 0]
+                train_data["values"] = values["values"].squeeze(-1)
 
                 print(
                     f"  • Average batch reward: {train_data['rewards'].mean().numpy():.4f}\n"
