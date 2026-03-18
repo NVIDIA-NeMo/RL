@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.models.draft.eagle import EagleModel
-from nemo_rl.models.draft.hidden_capture import (
+from nemo_rl.models.megatron.draft.eagle import EagleModel
+from nemo_rl.models.megatron.draft.hidden_capture import (
     CapturedStates,
     HiddenStateCapture,
     get_capture_context,
     get_eagle3_aux_hidden_state_layers,
 )
-from nemo_rl.models.draft.utils import (
+from nemo_rl.models.megatron.draft.utils import (
     export_eagle_weights_to_hf,
     load_hf_weights_to_eagle,
 )

@@ -12,15 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict, TypeVar
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+
+class DraftCrossEntropyLossFn:
+    """Compute the auxiliary soft-target cross-entropy used for draft-model training."""
+
+    def __init__(
+        self,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.vocab_parallel_group = vocab_parallel_group
+
+    def __call__(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+        mask: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce the masked per-token draft loss to a scalar."""
+        if self.vocab_parallel_group is not None:
+            # Soft cross entropy matches the forward-KL student gradient.
+            per_token_loss = DistributedCrossEntropy.apply(
+                student_logits,
+                teacher_logits,
+                self.vocab_parallel_group,
+                False,
+            )
+        else:
+            teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
+            student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
+            per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
+
+        return masked_mean(
+            per_token_loss,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
 
 
 class ClippedPGLossConfig(TypedDict):

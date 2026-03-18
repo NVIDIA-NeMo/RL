@@ -249,16 +249,19 @@ class MegatronConfig(TypedDict):
 
 
 class DraftConfigDisabled(TypedDict):
+    """Configuration shape for the disabled draft-model training path."""
+
     enabled: Literal[False]
 
 
 class DraftConfig(TypedDict):
+    """Configuration for Eagle draft-model training alongside the policy model."""
+
     enabled: Literal[True]
     model_name: str
     loss_weight: NotRequired[float]
-    topk: NotRequired[int | None]
     num_layers: NotRequired[int]
-    aux_layer_indices: NotRequired[list[int]]
+    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):

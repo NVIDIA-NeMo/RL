@@ -26,6 +26,7 @@ from torch import Tensor, nn
 
 
 def get_eagle3_aux_hidden_state_layers(num_layers: int) -> tuple[int, ...]:
+    """Pick the default auxiliary policy layers whose activations feed Eagle training."""
     candidate_indices = (
         1,
         max(0, num_layers // 2 - 1),
@@ -312,7 +313,7 @@ def get_capture_context(
     draft_config: Optional[Dict] = None,
     aux_layer_indices: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[ContextManager, Optional[HiddenStateCapture]]:
-    """Return a capture context and capture object when draft is enabled."""
+    """Return a no-op context unless draft training needs hidden-state capture for this step."""
     if not isinstance(draft_config, dict) or not draft_config.get("enabled", False):
         return nullcontext(), None
     capture = HiddenStateCapture(

@@ -661,7 +661,7 @@ def build_unwrapped_draft_model(
 
     from transformers import AutoConfig
 
-    from nemo_rl.models.draft import (
+    from nemo_rl.models.megatron.draft import (
         EagleModel,
         get_eagle3_aux_hidden_state_layers,
         load_hf_weights_to_eagle,
@@ -925,8 +925,8 @@ def setup_model_and_optimizer(
     )
     preload_policy_from_pretrained_for_draft = (
         draft_enabled
-        and not use_peft
-        and not resume_checkpoint_exists
+        and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
+        and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
         and pretrained_checkpoint_exists
     )
 
