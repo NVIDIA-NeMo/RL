@@ -44,7 +44,7 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -84,7 +84,7 @@ policy:
       async_engine: false
       precision: "bfloat16"
       kv_cache_dtype: "auto"
-      tensor_parallel_size: 4
+      tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.6
@@ -120,7 +120,7 @@ teacher:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -171,6 +171,13 @@ eval:
     mmlu:
       dataset_name: "mmlu"
       prompt_file: "examples/prompts/mmlu.txt"
+      env:
+        num_workers: 8
+        verifier_type: "multilingual_multichoice"
+    mmlu_5shot:
+      dataset_name: "mmlu"
+      prompt_file: "examples/prompts/mmlu.txt"
+      num_few_shot: 5
       env:
         num_workers: 8
         verifier_type: "multilingual_multichoice"

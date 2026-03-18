@@ -14,7 +14,12 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+else:
+    from typing import Any, Optional, TypedDict, TypeVar, cast
+    from typing_extensions import NotRequired
 
 import numpy as np
 import ray

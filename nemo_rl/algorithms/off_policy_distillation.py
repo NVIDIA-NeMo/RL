@@ -29,7 +29,12 @@ Key difference from on-policy distillation (in distillation.py):
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+else:
+    from typing import Any, Callable, Optional, TypedDict, TypeVar, cast
+    from typing_extensions import NotRequired
 
 import numpy as np
 import torch
