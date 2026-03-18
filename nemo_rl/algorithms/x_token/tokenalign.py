@@ -108,8 +108,16 @@ class TokenAligner(nn.Module):
             student_vocab_size = len(self.student_tokenizer) if self.student_tokenizer else 128256  # fallback
             if 1:
                 # get vocab sizes from autoconfig
-                teacher_vocab_size = AutoConfig.from_pretrained(self.teacher_tokenizer_name).vocab_size
-                student_vocab_size = AutoConfig.from_pretrained(self.student_tokenizer_name).vocab_size
+                if "gemma" not in self.teacher_tokenizer_name.lower() and "qwen3.5" not in self.teacher_tokenizer_name.lower():
+                    teacher_vocab_size = AutoConfig.from_pretrained(self.teacher_tokenizer_name).vocab_size
+                else:
+                    teacher_vocab_size = AutoConfig.from_pretrained(self.teacher_tokenizer_name).text_config.vocab_size
+                if "gemma" not in self.student_tokenizer_name.lower() and "qwen3.5" not in self.student_tokenizer_name.lower():
+                    student_vocab_size = AutoConfig.from_pretrained(self.student_tokenizer_name).vocab_size
+                else:
+                    student_vocab_size = AutoConfig.from_pretrained(self.student_tokenizer_name).text_config.vocab_size
+                # teacher_vocab_size = AutoConfig.from_pretrained(self.teacher_tokenizer_name).vocab_size
+                # student_vocab_size = AutoConfig.from_pretrained(self.student_tokenizer_name).vocab_size
 
             
             # Debug vocab sizes
@@ -602,18 +610,33 @@ class TokenAligner(nn.Module):
                     global_top_indices=global_top_indices,
                 )
 
-            scale_trick_enabled = self.enable_scale_trick if self.enable_scale_trick is not None else False
-            return TokenAligner.project_token_likelihoods_dense(
-                input_likelihoods,
-                projection_map_indices,
-                projection_map_values * self.projection_matrix_multiplier,
-                target_vocab_size,
-                device,
-                use_vectorized=True,
-                gpu_optimized_scatter=gpu_optimized_scatter,
-                enable_scale_trick=scale_trick_enabled,
-                global_top_indices=global_top_indices,
-            )
+            # Otherwise, use stateless CSR matmul (no caching) for memory efficiency
+            vs = projection_map_indices.shape[0]
+            top_k = projection_map_indices.shape[1]
+            # Ensure device/dtype for indices/values
+            idx = projection_map_indices.to(device)
+            val = (projection_map_values * self.projection_matrix_multiplier).to(device)
+            if val.dtype != input_likelihoods.dtype:
+                val = val.to(input_likelihoods.dtype)
+            # Build CSR once per call outside autograd to keep checkpoint recomputation identical
+            with torch.no_grad():
+                crow_indices = torch.arange(0, (vs + 1) * top_k, top_k, device=device, dtype=torch.long)
+                col_indices = idx.reshape(-1)
+                values = val.reshape(-1)
+                proj_csr = torch.sparse_csr_tensor(
+                    crow_indices, col_indices, values, size=(vs, target_vocab_size), device=device
+                )
+            # Matmul: [B, S, Vs] -> [B*S, Vs] @ [Vs, Vt] -> [B*S, Vt] -> [B, S, Vt]
+            bsz, seqlen, vs_in = input_likelihoods.shape
+            if vs_in != vs:
+                # In case logits have extra vocab tail, slice to match
+                x = input_likelihoods[:, :, :vs]
+            else:
+                x = input_likelihoods
+            x2d = x.reshape(bsz * seqlen, vs)
+            out2d = torch.matmul(x2d.to(torch.float32), proj_csr.to(torch.float32))
+            out = out2d.reshape(bsz, seqlen, target_vocab_size).to(input_likelihoods.dtype)
+            return out
     
     @staticmethod
     def project_token_likelihoods_dense(input_likelihoods, projection_map_indices, projection_map_values, target_vocab_size, device, use_vectorized=True, gpu_optimized_scatter=True, enable_scale_trick=None, global_top_indices=None):
@@ -2354,7 +2377,9 @@ class TokenAligner(nn.Module):
         if hasattr(self, 'conflict_contexts'):
             self.conflict_contexts.clear()
 
-    def compute_loss(self, aligned_pairs, student_logits, teacher_logits, input_ids_student, input_ids_teacher, loss_type = 'chunked_ce', exact_token_match_only = False, temperature=1.0, loss_on_non_zero_only=False, debug_verbose=False, kd_topk: int = 0, vocab_topk: int = 8192, reverse_kl: bool = False, project_teacher_logits_to_student: bool = False, log_softmax: str = "together", token_weights=None) -> float:
+    def compute_loss(self, aligned_pairs, student_logits, teacher_logits, input_ids_student, input_ids_teacher, loss_type = 'chunked_ce', exact_token_match_only = False, temperature=1.0, 
+    loss_on_non_zero_only=False, debug_verbose=False, kd_topk: int = 0, vocab_topk: int = 8192, reverse_kl: bool = False, project_teacher_logits_to_student: bool = False, 
+    log_softmax: str = "together", token_weights=None, gold_loss: bool = False, xtoken_loss: bool = False) -> float:
         '''
         Compute the loss between two sequences of tokens.
         
@@ -2458,7 +2483,7 @@ class TokenAligner(nn.Module):
             else:
                 loss, topk_accuracy = self.compute_KL_loss_optimized(
                     aligned_pairs, student_logits, teacher_logits, input_ids_student, input_ids_teacher, tokenids_with_exact_match,
-                    exact_token_match_only, temperature=temperature, loss_on_non_zero_only=loss_on_non_zero_only, debug_verbose=debug_verbose, kd_topk=kd_topk, vocab_topk=vocab_topk, reverse_kl=reverse_kl, project_teacher_logits_to_student=project_teacher_logits_to_student, log_softmax=log_softmax, token_weights=token_weights
+                    exact_token_match_only, temperature=temperature, loss_on_non_zero_only=loss_on_non_zero_only, debug_verbose=debug_verbose, kd_topk=kd_topk, vocab_topk=vocab_topk, reverse_kl=reverse_kl, project_teacher_logits_to_student=project_teacher_logits_to_student, log_softmax=log_softmax, token_weights=token_weights, gold_loss=gold_loss, xtoken_loss=xtoken_loss,
                 )
         else:
             raise ValueError(f"Loss type {loss_type} not supported")
@@ -3423,7 +3448,8 @@ class TokenAligner(nn.Module):
 
         return loss_kl * (temperature ** 2), top1_accuracy
 
-    def compute_KL_loss_optimized(self, aligned_pairs, student_logits, teacher_logits, input_ids_student, input_ids_teacher, tokenids_with_exact_match=None, exact_token_match_only=False, temperature=1.0, loss_on_non_zero_only=False, debug_verbose=False, kd_topk: int = 0, vocab_topk: int = 8192, reverse_kl: bool = False, project_teacher_logits_to_student: bool = False, log_softmax: str = "together", token_weights=None):
+    def compute_KL_loss_optimized(self, aligned_pairs, student_logits, teacher_logits, input_ids_student, input_ids_teacher, tokenids_with_exact_match=None, exact_token_match_only=False, temperature=1.0, loss_on_non_zero_only=False, debug_verbose=False,
+     kd_topk: int = 0, vocab_topk: int = 8192, reverse_kl: bool = False, project_teacher_logits_to_student: bool = False, log_softmax: str = "together", token_weights=None, gold_loss: bool = False, xtoken_loss: bool = False):
         """
         Heavily optimized KL loss computation for large vocabularies.
         
@@ -3436,6 +3462,7 @@ class TokenAligner(nn.Module):
         Args:
             vocab_topk: Reduce effective vocabulary size to this many tokens based on teacher logits
             project_teacher_logits_to_student: If True, project teacher logits to student space (instead of student to teacher)
+            gold_loss: If True, use gold loss computation (no vocab transformation for chunks, direct logit averaging)
             Other args same as compute_KL_loss
         """
         if not aligned_pairs or not any(aligned_pairs):
@@ -3452,6 +3479,344 @@ class TokenAligner(nn.Module):
         device = student_logits.device
         batch_size, student_seq_len, student_vocab_size = student_logits.shape
         teacher_seq_len, teacher_vocab_size = teacher_logits.shape[1], teacher_logits.shape[2]
+        
+        # Gold loss path: split into exact-mapped (common) and non-exact (uncommon) vocab
+        if gold_loss:
+            # Step 1: Create exact token map from projection matrix
+            # Only include student tokens that have exactly one strong mapping to a teacher token
+            if not hasattr(self, 'likelihood_projection_indices') or self.likelihood_projection_indices is None:
+                raise ValueError("gold_loss requires likelihood_projection_indices to be loaded")
+            
+            projection_indices = self.likelihood_projection_indices  # (student_vocab, top_k)
+            projection_matrix = self.transform_learned_matrix_instance(self.likelihood_projection_matrix) if getattr(self, 'learnable', False) else self.likelihood_projection_matrix
+            
+            # Find student tokens with exactly one strong mapping
+            # Sort projection weights for each student token to find strongest mappings
+            sorted_values, sorted_indices_in_topk = torch.sort(projection_matrix, dim=-1, descending=True)
+            
+            # A student token has exact mapping if:
+            # - First value is high (>0.9) indicating strong mapping
+            # - Second value is low (<0.1) indicating no other strong mappings
+            
+            if xtoken_loss:
+                #remove multitoken projections
+                #consider ones with top1 proj > 0.6 prob in the transformation matrix as exact mappings; with GOLD, anything that has <1.0 prob is considered non exact mapping for ULD loss
+                #avoid collisions, it's makes KL loss shoot up
+                has_exact_map = (sorted_values[:, 0] >= 0.6)
+            else:
+                has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)# & (sorted_values[:, 1] < 0.1)
+
+            # import pdb
+            # pdb.set_trace()
+            
+            # Get the actual teacher token indices for exact mappings
+            # projection_indices[student_idx, k] gives the teacher token for the k-th strongest mapping
+            student_indices_with_exact_map = torch.where(has_exact_map)[0]
+            teacher_indices_for_exact_map = projection_indices[student_indices_with_exact_map, sorted_indices_in_topk[student_indices_with_exact_map, 0]]
+            
+            # Create mapping dictionaries for quick lookup
+            student_to_teacher_exact_map = {}
+            teacher_to_student_exact_map = {}
+            teacher_collision_count = 0
+            teacher_collisions = []  # Track which teacher tokens have multiple student mappings
+            
+            # for s_idx, t_idx in zip(student_indices_with_exact_map.tolist(), teacher_indices_for_exact_map.tolist()):
+            #     # Only keep if teacher index is valid
+            #     if 0 <= t_idx < teacher_vocab_size:
+            #         if t_idx not in teacher_to_student_exact_map:# or xtoken_loss:
+            #             # New mapping
+            #             student_to_teacher_exact_map[s_idx] = t_idx
+            #             teacher_to_student_exact_map[t_idx] = s_idx
+            #         else:
+            #             # Collision: teacher token already mapped to different student token
+            #             teacher_collision_count += 1
+            #             existing_s_idx = teacher_to_student_exact_map[t_idx]
+                        # teacher_collisions.append((t_idx, existing_s_idx, s_idx))
+
+            for s_idx, t_idx in zip(student_indices_with_exact_map.tolist(), teacher_indices_for_exact_map.tolist()):
+                # Only keep if teacher index is valid
+                if 0 <= t_idx < teacher_vocab_size:
+                    if t_idx not in teacher_to_student_exact_map or xtoken_loss:
+                        # New mapping
+
+                        if t_idx in teacher_to_student_exact_map:
+                            prev_student_token = teacher_to_student_exact_map[t_idx]
+                            prev_prob = sorted_values[prev_student_token, 0]
+
+                            if prev_prob >= sorted_values[s_idx, 0]:
+                                # print(f"Skipping: prev_prob={prev_prob} > new_prob={sorted_values[s_idx, 0]}")
+                                continue
+                            else:
+                                del student_to_teacher_exact_map[prev_student_token]
+                                # print(f"replacing student token {prev_student_token} {prev_prob} with {s_idx} {sorted_values[s_idx, 0]}")
+
+                        student_to_teacher_exact_map[s_idx] = t_idx
+                        teacher_to_student_exact_map[t_idx] = s_idx
+                    else:
+                        # Collision: teacher token already mapped to different student token
+                        teacher_collision_count += 1
+                        existing_s_idx = teacher_to_student_exact_map[t_idx]
+                        teacher_collisions.append((t_idx, existing_s_idx, s_idx))
+            
+            # # Print collision diagnostics
+            # if teacher_collision_count > 0:
+            #     print(f"⚠️  Teacher token collision warning: {teacher_collision_count} student tokens tried to map to already-mapped teacher tokens")
+            #     if len(teacher_collisions) <= 10:
+            #         # Print all collisions if there are few
+            #         for t_idx, existing_s, new_s in teacher_collisions:
+            #             print(f"   Teacher token {t_idx} already mapped to student {existing_s}, skipping student {new_s}")
+            #     else:
+            #         # Print first 5 and last 5 if there are many
+            #         print(f"   Showing first 5 and last 5 collisions:")
+            #         for t_idx, existing_s, new_s in teacher_collisions[:5]:
+            #             print(f"   Teacher token {t_idx} already mapped to student {existing_s}, skipping student {new_s}")
+            #         print(f"   ... ({len(teacher_collisions) - 10} more collisions) ...")
+            #         for t_idx, existing_s, new_s in teacher_collisions[-5:]:
+            #             print(f"   Teacher token {t_idx} already mapped to student {existing_s}, skipping student {new_s}")
+            
+            # Step 2: Split indices into common (exact match) and uncommon (no exact match)
+            common_student_indices = sorted(student_to_teacher_exact_map.keys())
+            common_teacher_indices = [student_to_teacher_exact_map[s] for s in common_student_indices]
+            
+            all_student_indices = set(range(student_vocab_size))
+            all_teacher_indices = set(range(teacher_vocab_size))
+            uncommon_student_indices = sorted(all_student_indices - set(common_student_indices))
+            uncommon_teacher_indices = sorted(all_teacher_indices - set(common_teacher_indices))
+            
+            # print(f"Gold loss: {len(common_student_indices)} exact token mappings, "
+                #   f"{len(uncommon_student_indices)} uncommon student tokens, "
+                #   f"{len(uncommon_teacher_indices)} uncommon teacher tokens")
+            
+            # Step 3: Compute loss using chunk-based masking
+            # Build chunk masks for all alignments (not just exact 1-to-1)
+            max_n_chunks = min(student_seq_len, teacher_seq_len)
+            
+            student_chunk_mask = torch.zeros((batch_size, student_seq_len, max_n_chunks), 
+                                            dtype=torch.bool, device=device)
+            teacher_chunk_mask = torch.zeros((batch_size, teacher_seq_len, max_n_chunks), 
+                                            dtype=torch.bool, device=device)
+            
+            # Fill chunk masks from alignment pairs
+            for batch_idx in range(batch_size):
+                for chunk_idx, alignment_pair in enumerate(aligned_pairs[batch_idx][:max_n_chunks]):
+                    s1text, s2text, start1, end1, start2, end2 = alignment_pair[:6]
+                    if start1 != -1 and start2 != -1:
+                        student_chunk_mask[batch_idx, start1:end1, chunk_idx] = True
+                        teacher_chunk_mask[batch_idx, start2:end2, chunk_idx] = True
+            
+            # Compute log_softmax on original logits BEFORE averaging
+            student_log_probs = torch.log_softmax(student_logits / temperature, dim=-1)
+            teacher_log_probs = torch.log_softmax(teacher_logits / temperature, dim=-1)
+            
+            # Average log probabilities within chunks for FULL vocabularies
+            student_chunk_log_probs_full = torch.bmm(
+                student_chunk_mask.transpose(1, 2).to(student_log_probs.dtype),
+                student_log_probs
+            )  # (batch, max_n_chunks, student_vocab_size)
+            
+            teacher_chunk_log_probs_full = torch.bmm(
+                teacher_chunk_mask.transpose(1, 2).to(teacher_log_probs.dtype),
+                teacher_log_probs
+            )  # (batch, max_n_chunks, teacher_vocab_size)
+            
+            # Normalize by chunk sizes
+            student_chunk_sizes = student_chunk_mask.sum(dim=1, keepdim=True).float().transpose(1, 2)  # (batch, max_n_chunks, 1)
+            teacher_chunk_sizes = teacher_chunk_mask.sum(dim=1, keepdim=True).float().transpose(1, 2)  # (batch, max_n_chunks, 1)
+            
+            student_chunk_log_probs_full = student_chunk_log_probs_full / (student_chunk_sizes + 1e-10)
+            teacher_chunk_log_probs_full = teacher_chunk_log_probs_full / (teacher_chunk_sizes + 1e-10)
+            
+            # Valid chunk mask
+            chunk_mask = (student_chunk_sizes.squeeze(-1) > 0) & (teacher_chunk_sizes.squeeze(-1) > 0)
+            
+            if not chunk_mask.any():
+                return torch.tensor(0.0, device=device, requires_grad=True), 0.0
+            
+            # Now split chunk-averaged log probs into common and uncommon vocab
+            # Extract common and uncommon from chunk-averaged log probs
+            if len(common_student_indices) > 0:
+                common_student_indices_tensor = torch.tensor(common_student_indices, device=device)
+                common_teacher_indices_tensor = torch.tensor(common_teacher_indices, device=device)
+                
+                student_chunk_common_log_probs = student_chunk_log_probs_full[:, :, common_student_indices_tensor]  # (B, chunks, num_common)
+                teacher_chunk_common_log_probs = teacher_chunk_log_probs_full[:, :, common_teacher_indices_tensor]  # (B, chunks, num_common)
+            else:
+                student_chunk_common_log_probs = torch.empty(batch_size, max_n_chunks, 0, device=device)
+                teacher_chunk_common_log_probs = torch.empty(batch_size, max_n_chunks, 0, device=device)
+            
+            if len(uncommon_student_indices) > 0:
+                uncommon_student_indices_tensor = torch.tensor(uncommon_student_indices, device=device)
+                student_chunk_uncommon_log_probs = student_chunk_log_probs_full[:, :, uncommon_student_indices_tensor]  # (B, chunks, num_uncommon_s)
+            else:
+                student_chunk_uncommon_log_probs = torch.empty(batch_size, max_n_chunks, 0, device=device)
+            
+            if len(uncommon_teacher_indices) > 0:
+                uncommon_teacher_indices_tensor = torch.tensor(uncommon_teacher_indices, device=device)
+                teacher_chunk_uncommon_log_probs = teacher_chunk_log_probs_full[:, :, uncommon_teacher_indices_tensor]  # (B, chunks, num_uncommon_t)
+            else:
+                teacher_chunk_uncommon_log_probs = torch.empty(batch_size, max_n_chunks, 0, device=device)
+            
+            # Part 1: KL loss on common (aligned) vocab - using pre-computed log probs
+            loss_kl_common = torch.tensor(0.0, device=device, requires_grad=True)
+            if student_chunk_common_log_probs.shape[-1] > 0:
+                # Compute KL divergence per chunk using pre-computed log probs
+                if not reverse_kl:
+                    loss_kl_per_elem = torch.nn.functional.kl_div(
+                        student_chunk_common_log_probs, teacher_chunk_common_log_probs,
+                        reduction="none", log_target=True
+                    )
+                else:
+                    loss_kl_per_elem = torch.nn.functional.kl_div(
+                        teacher_chunk_common_log_probs, student_chunk_common_log_probs,
+                        reduction="none", log_target=True
+                    )
+                
+                # Sum across vocab dimension
+                # print(f"student {student_chunk_common_log_probs} teahcer {teacher_chunk_common_log_probs}")
+                # import pdb
+                # pdb.set_trace()
+                loss_kl_per_chunk = loss_kl_per_elem.sum(dim=-1)  # (batch, max_n_chunks)
+                
+                # Mask invalid chunks
+                loss_kl_per_chunk = loss_kl_per_chunk * chunk_mask
+                
+                if chunk_mask.sum() > 0:
+                    if token_weights is not None:
+                        # Map chunk losses to teacher token positions
+                        loss_kl_per_teacher_token = torch.bmm(
+                            teacher_chunk_mask.to(loss_kl_per_chunk.dtype),
+                            loss_kl_per_chunk.unsqueeze(-1)
+                        ).squeeze(-1)
+                        
+                        weighted_loss_per_token = loss_kl_per_teacher_token * token_weights
+                        
+                        valid_teacher_sizes = teacher_chunk_sizes.squeeze(-1) * chunk_mask
+                        total_teacher_token_participations = valid_teacher_sizes.sum()
+                        if total_teacher_token_participations > 0:
+                            loss_kl_common = weighted_loss_per_token.sum() / total_teacher_token_participations
+                    else:
+                        loss_kl_common = loss_kl_per_chunk.sum() / chunk_mask.sum()
+                        # pdb.set_trace()
+            
+            # Part 2: L1 loss on uncommon (unaligned) vocab - sort chunk-averaged probabilities
+            loss_l1_uncommon = torch.tensor(0.0, device=device, requires_grad=True)
+            # import pdb
+            # pdb.set_trace()
+            if student_chunk_uncommon_log_probs.shape[-1] > 0 or teacher_chunk_uncommon_log_probs.shape[-1] > 0:
+                # import pdb
+                # pdb.set_trace()
+                # Get valid chunks only
+                student_uncommon_valid = student_chunk_uncommon_log_probs[chunk_mask]  # (num_valid_chunks, num_uncommon_s)
+                teacher_uncommon_valid = teacher_chunk_uncommon_log_probs[chunk_mask]  # (num_valid_chunks, num_uncommon_t)
+                
+                if student_uncommon_valid.shape[0] > 0:
+                    # Convert log probabilities to probabilities using exp - use in-place operations where possible
+                    with torch.no_grad():
+                        # Use topk instead of full sort to reduce memory - only need sorted values, not indices
+                        # Limit the vocab size for uncommon distributions to prevent OOM
+                        max_uncommon_vocab = min(
+                            student_uncommon_valid.shape[-1], 
+                            teacher_uncommon_valid.shape[-1],
+                            8192  # Cap at reasonable size to prevent OOM
+                        )
+                    
+                    if max_uncommon_vocab > 0:
+                        student_uncommon_probs = torch.exp(student_uncommon_valid)
+                        teacher_uncommon_probs = torch.exp(teacher_uncommon_valid)
+                        
+                        # Use topk for memory efficiency - we only need the top probabilities
+                        # topk is much more memory efficient than full sort
+                        if student_uncommon_probs.shape[-1] > max_uncommon_vocab:
+                            student_uncommon_sorted, _ = torch.topk(student_uncommon_probs, k=max_uncommon_vocab, dim=-1, largest=True)
+                        else:
+                            student_uncommon_sorted = torch.sort(student_uncommon_probs, dim=-1, descending=True)[0]
+                        
+                        if teacher_uncommon_probs.shape[-1] > max_uncommon_vocab:
+                            teacher_uncommon_sorted, _ = torch.topk(teacher_uncommon_probs, k=max_uncommon_vocab, dim=-1, largest=True)
+                        else:
+                            teacher_uncommon_sorted = torch.sort(teacher_uncommon_probs, dim=-1, descending=True)[0]
+                        
+                        # Free intermediate tensors immediately
+                        del student_uncommon_probs, teacher_uncommon_probs
+                        
+                        # Take minimum length for comparison
+                        min_uncommon_len = min(student_uncommon_sorted.shape[-1], teacher_uncommon_sorted.shape[-1])
+                        if min_uncommon_len > 0:
+                            student_uncommon_sorted = student_uncommon_sorted[:, :min_uncommon_len]
+                            teacher_uncommon_sorted = teacher_uncommon_sorted[:, :min_uncommon_len]
+                            
+                            # Compute L1 loss on sorted uncommon probabilities
+                            # print(f"ULD student {student_uncommon_sorted} teacher {teacher_uncommon_sorted}")
+                            loss_l1_per_chunk = torch.nn.functional.l1_loss(
+                                student_uncommon_sorted, teacher_uncommon_sorted, reduction='none'
+                            ).sum(dim=-1)  # Sum over vocab dimension
+                            
+                            # Free sorted tensors immediately after computing loss
+                            del student_uncommon_sorted, teacher_uncommon_sorted
+                            
+                            # Apply token weights if provided
+                            if token_weights is not None:
+                                # Expand chunk mask to get chunk indices
+                                chunk_indices = torch.nonzero(chunk_mask, as_tuple=False)  # (num_valid_chunks, 2) - [batch_idx, chunk_idx]
+                                
+                                # Map chunks back to teacher tokens for weighting
+                                weighted_l1_per_chunk = torch.zeros_like(loss_l1_per_chunk)
+                                for valid_idx, (batch_idx, chunk_idx) in enumerate(chunk_indices):
+                                    # Get teacher tokens participating in this chunk
+                                    teacher_tokens_in_chunk = teacher_chunk_mask[batch_idx, :, chunk_idx]
+                                    if teacher_tokens_in_chunk.any():
+                                        # Average token weights for tokens in this chunk
+                                        chunk_weight = token_weights[batch_idx, teacher_tokens_in_chunk].mean()
+                                        weighted_l1_per_chunk[valid_idx] = loss_l1_per_chunk[valid_idx] * chunk_weight
+                                
+                                loss_l1_uncommon = weighted_l1_per_chunk.mean()
+                                del weighted_l1_per_chunk, chunk_indices
+                            else:
+                                loss_l1_uncommon = loss_l1_per_chunk.mean()
+                                # pdb.set_trace()
+                            
+                            del loss_l1_per_chunk
+            
+            # Combine losses
+            loss_total = loss_kl_common + loss_l1_uncommon
+            # print(f"loss_kl_common: {loss_kl_common}, loss_l1_uncommon: {loss_l1_uncommon}")
+            
+            # Free large tensors before accuracy computation to ensure memory is available
+            # These are no longer needed for the loss computation
+            del student_chunk_log_probs_full, teacher_chunk_log_probs_full
+            del student_chunk_mask, teacher_chunk_mask
+            if len(uncommon_student_indices) > 0:
+                del student_chunk_uncommon_log_probs
+            if len(uncommon_teacher_indices) > 0:
+                del teacher_chunk_uncommon_log_probs
+            
+            # Accuracy computation on common vocab - using pre-computed log probs
+            # MEMORY OPTIMIZED: argmax works directly on log probs without needing exp()
+            with torch.no_grad():
+                if student_chunk_common_log_probs.shape[-1] > 0 and chunk_mask.any():
+                    # Get predictions for valid chunks BEFORE exp to save memory
+                    # argmax is invariant to monotonic transformations, so argmax(log_probs) == argmax(probs)
+                    student_chunk_log_probs_valid = student_chunk_common_log_probs[chunk_mask]
+                    teacher_chunk_log_probs_valid = teacher_chunk_common_log_probs[chunk_mask]
+                    
+                    # Compute argmax directly on log probabilities (saves massive memory)
+                    student_top1 = student_chunk_log_probs_valid.argmax(dim=-1)
+                    teacher_top1 = teacher_chunk_log_probs_valid.argmax(dim=-1)
+                    matches = (student_top1 == teacher_top1).sum().item()
+                    top1_accuracy = matches / chunk_mask.sum().item()
+                    
+                    # Clean up accuracy computation tensors
+                    del student_chunk_log_probs_valid, teacher_chunk_log_probs_valid
+                    del student_top1, teacher_top1
+                else:
+                    top1_accuracy = 0.0
+            
+            # Clean up remaining tensors
+            del chunk_mask
+            if len(common_student_indices) > 0:
+                del student_chunk_common_log_probs, teacher_chunk_common_log_probs
+            
+            return loss_total * (temperature ** 2), top1_accuracy
         
         if project_teacher_logits_to_student:
             # REVERSE PROJECTION: Teacher → Student
@@ -3551,17 +3916,15 @@ class TokenAligner(nn.Module):
                 projected_probs = projected_probs_full[:, :, global_top_indices]  # (B, S, vocab_topk)
             
             else:
-                # print(f"Using dense matrix projection for student_probs")
-                # print(f"matrix used is learnable: {getattr(self, 'learnable', False)} {self.transform_learned_matrix_instance(self.likelihood_projection_matrix) if getattr(self, 'learnable', False) else self.likelihood_projection_matrix}")
-                projected_probs = self.project_token_likelihoods_instance(
+                projected_probs_full = self.project_token_likelihoods_instance(
                     student_probs,
                     self.likelihood_projection_indices,
                     self.transform_learned_matrix_instance(self.likelihood_projection_matrix) if getattr(self, 'learnable', False) else self.likelihood_projection_matrix,
                     teacher_vocab_size, device, use_sparse_format=False,
-                    global_top_indices=global_top_indices
                 )
+                projected_probs = projected_probs_full[:, :, global_top_indices]  # (B, S, vocab_topk)
             
-            # Step 3: Slice to reduced vocabulary - now handled inside projection functions
+            # Step 3: Slice to reduced vocabulary
             teacher_logits_reduced = teacher_logits[:, :, global_top_indices]   # (B, T, vocab_topk)
             
             # Step 4: Efficient target log-probabilities (fused softmax+log)
@@ -3630,12 +3993,9 @@ class TokenAligner(nn.Module):
             
             # Fast accuracy computation
             with torch.no_grad():
-                if projected_probs_masked.numel() > 0 and projected_probs_masked.shape[-1] > 0:
-                    matches = (projected_probs_masked.argmax(dim=-1) == 
-                              torch.exp(target_log_probs_masked).argmax(dim=-1)).sum().item()
-                    top1_accuracy = matches / projected_probs_masked.shape[0]
-                else:
-                    top1_accuracy = 0.0
+                matches = (projected_probs_masked.argmax(dim=-1) == 
+                          torch.exp(target_log_probs_masked).argmax(dim=-1)).sum().item()
+                top1_accuracy = matches / projected_probs_masked.shape[0]
                 
         else:
             # Chunk-based with reduced vocabulary - similar to original but on smaller vocab

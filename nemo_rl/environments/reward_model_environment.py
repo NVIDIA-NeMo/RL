@@ -13,7 +13,12 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
+else:
+    from typing import Any, Dict, List, Optional, Tuple, TypedDict
+    from typing_extensions import NotRequired
 
 import ray
 import torch

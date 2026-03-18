@@ -26,10 +26,12 @@ def load_eval_dataset(data_config):
 
     # mmlu
     if dataset_name.startswith("mmlu") and dataset_name != "mmlu_pro":
+        num_few_shot = data_config.get("num_few_shot", 0)
         if dataset_name == "mmlu":
             base_dataset = MMLUDataset(
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
+                num_few_shot=num_few_shot,
             )
         else:
             language = dataset_name.split("_")[1]
@@ -37,6 +39,7 @@ def load_eval_dataset(data_config):
                 language=language,
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
+                num_few_shot=num_few_shot,
             )
     elif dataset_name == "mmlu_pro":
         base_dataset = MMLUProDataset(

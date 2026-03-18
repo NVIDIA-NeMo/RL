@@ -22,7 +22,12 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+else:
+    from typing import Any, Callable, Mapping, Optional, TypedDict
+    from typing_extensions import NotRequired
 
 import mlflow
 import numpy as np

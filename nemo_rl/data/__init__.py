@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Literal, NotRequired, TypedDict
+else:
+    from typing import Literal, TypedDict
+    from typing_extensions import NotRequired
 
 
 class ResponseDatasetConfig(TypedDict):

@@ -189,6 +189,7 @@ def setup_eval_data(
             "dataset_name": dataset_name,
             "prompt_file": prompt_file,
             "system_prompt_file": system_prompt_file,
+            "num_few_shot": bench_cfg.get("num_few_shot", 0),
         }
         base_dataset = load_eval_dataset(data_cfg)
 
