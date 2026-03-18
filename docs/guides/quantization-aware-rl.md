@@ -36,7 +36,7 @@ policy:
 ```bash
 uv run examples/run_grpo.py \
   --config examples/modelopt/qa_grpo_math_megatron.yaml \
-  policy.model_name=Qwen/Qwen3-1.7B-Base
+  policy.model_name=Qwen/Qwen3-1.7B
 ```
 
 **Via Slurm:**
@@ -44,7 +44,7 @@ uv run examples/run_grpo.py \
 ```bash
 COMMAND="uv run examples/run_grpo.py \
   --config examples/modelopt/qa_grpo_math_megatron.yaml \
-  policy.model_name=Qwen/Qwen3-1.7B-Base \
+  policy.model_name=Qwen/Qwen3-1.7B \
   checkpointing.checkpoint_dir=results/qa_grpo" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
@@ -84,8 +84,8 @@ policy:
 ```bash
 uv run examples/run_distillation.py \
   --config examples/modelopt/qa_distillation_math_megatron.yaml \
-  policy.model_name=Qwen/Qwen3-1.7B-Base \
-  teacher.model_name=Qwen/Qwen3-4B
+  policy.model_name=Qwen/Qwen3-1.7B \
+  teacher.model_name=Qwen/Qwen3-1.7B
 ```
 
 ## Quantization Parameters
