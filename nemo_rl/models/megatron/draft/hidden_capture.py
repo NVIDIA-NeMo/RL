@@ -310,11 +310,11 @@ class HiddenStateCapture:
 
 def get_capture_context(
     model: nn.Module,
-    draft_config: Optional[Dict] = None,
+    enabled: bool = False,
     aux_layer_indices: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[ContextManager, Optional[HiddenStateCapture]]:
     """Return a no-op context unless draft training needs hidden-state capture for this step."""
-    if not isinstance(draft_config, dict) or not draft_config.get("enabled", False):
+    if not enabled:
         return nullcontext(), None
     capture = HiddenStateCapture(
         model=model,
