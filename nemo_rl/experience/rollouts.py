@@ -961,6 +961,31 @@ def run_async_multi_turn_rollout(
             }
         )
 
+        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
+        # Collect all reward component keys from any sample state (samples may come from different envs).
+        reward_component_keys = sorted(
+            set(
+                k
+                for state in final_sample_states
+                for k in state
+                if isinstance(k, str)
+                and k.startswith("reward")
+                and len(k) > 6
+                and k[6:].isdigit()
+            ),
+            key=lambda k: int(k[6:]),
+        )
+        for key in reward_component_keys:
+            # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
+            final_batch[key] = torch.stack(
+                [
+                    state[key]
+                    if key in state
+                    else torch.tensor(0.0, dtype=torch.float32)
+                    for state in final_sample_states
+                ]
+            )
+
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():
             if key not in final_batch:
