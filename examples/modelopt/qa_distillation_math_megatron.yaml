@@ -2,8 +2,8 @@
 #
 # Example usage (1 node, 8 GPUs):
 #   uv run examples/run_distillation.py --config examples/modelopt/qa_distillation_math_megatron.yaml \
-#     policy.model_name=Qwen/Qwen3-1.7B-Base \
-#     teacher.model_name=Qwen/Qwen3-4B
+#     policy.model_name=Qwen/Qwen3-1.7B \
+#     teacher.model_name=Qwen/Qwen3-1.7B
 #
 defaults: "../configs/distillation_math_megatron.yaml"
 

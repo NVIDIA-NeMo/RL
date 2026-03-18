@@ -94,7 +94,7 @@ These parameters are added under the `policy` section:
 
 | Parameter | Description |
 |---|---|
-| `quant_cfg` | ModelOpt quantization config name (e.g. `"NVFP4_DEFAULT_CFG"`) |
+| `quant_cfg` | ModelOpt quantization config name (e.g. `"NVFP4_DEFAULT_CFG"`) or a path to a custom config file with variable name (e.g. `"path/to/config.py:MY_CONFIG"`). See `examples/modelopt/quant_configs/` for examples. |
 | `quant_calib_data` | Dataset name used for calibration. See the [ModelOpt PTQ examples](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq) for supported datasets. |
 | `quant_calib_size` | Number of samples for the calibration pass |
 | `quant_batch_size` | Batch size during calibration |
@@ -115,3 +115,4 @@ QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via Transf
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
 - **Quantization format**: Only per-tensor quantization formats are currently supported. Static block-wise quantization formats are not yet available.
+- **Model support**: MoE (Mixture of Experts) and Mamba models are currently not supported.

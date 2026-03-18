@@ -2,7 +2,8 @@
 #
 # Example usage (1 node, 8 GPUs):
 #   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_math_megatron.yaml \
-#     policy.model_name=Qwen/Qwen3-1.7B-Base
+#     policy.model_name=Qwen/Qwen3-1.7B
+#     teacher.model_name=Qwen/Qwen3-1.7B
 #
 defaults: "../configs/grpo_math_1B_megatron.yaml"
 
