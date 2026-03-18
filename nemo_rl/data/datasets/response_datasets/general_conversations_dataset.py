@@ -186,8 +186,6 @@ class GeneralConversationsJsonlDataset(RawDataset):
         }
     """
 
-    task_name = "general-conversation-jsonl"
-
     def __init__(
         self,
         data_path: str,
@@ -197,6 +195,12 @@ class GeneralConversationsJsonlDataset(RawDataset):
         **kwargs,
     ):
         self.media_data_dir = media_data_dir
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        default_task_name = self.extract_task_name_from_path(data_path)
+        self.common_init(default_task_name=default_task_name, **kwargs)
+
+        # load from huggingface
         self.dataset = load_dataset_from_path(data_path)
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)
@@ -235,7 +239,7 @@ class GeneralConversationsJsonlDataset(RawDataset):
         """Convert the json structure into an OpenAI-API-like message log."""
         processed_example = {
             "messages": [],
-            "task_name": cls.task_name,
+            "task_name": example["task_name"],
         }
 
         if "conversations" in example:
