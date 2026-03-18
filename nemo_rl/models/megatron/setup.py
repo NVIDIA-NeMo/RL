@@ -477,7 +477,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         elif isinstance(attention_backend, int):
             model_cfg.attention_backend = AttnBackend(attention_backend)
         else:
-            raise ValueError(f"Unsupported {type(attention_backend)=}, expected str or int")
+            raise ValueError(
+                f"Unsupported {type(attention_backend)=}, expected str or int"
+            )
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)

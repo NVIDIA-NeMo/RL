@@ -64,10 +64,7 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.LOGPROB:
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if (
-            hasattr(loss_fn, "use_linear_ce_fusion")
-            and loss_fn.use_linear_ce_fusion
-        ):
+        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
