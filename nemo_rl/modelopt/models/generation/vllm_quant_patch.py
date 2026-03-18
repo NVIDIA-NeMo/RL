@@ -22,6 +22,8 @@ import torch
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from vllm.v1.worker.gpu_worker import Worker as BaseWorker
 
+from nemo_rl.modelopt.utils import resolve_quant_cfg
+
 
 @contextmanager
 def disable_compilation(model):
@@ -48,7 +50,7 @@ def _fakequant_run_prolog_worker(self) -> None:
     def calibrate_loop(model: Any = None) -> None:
         self.model_runner._dummy_run(1, skip_eplb=True, remove_lora=False)
 
-    quant_cfg = getattr(mtq, os.environ.get("VLLM_QUANT_CFG", None))
+    quant_cfg = resolve_quant_cfg(os.environ["VLLM_QUANT_CFG"])
     print(f"quant_cfg: {quant_cfg}")
 
     model = self.model_runner.model
