@@ -413,8 +413,8 @@ jobs:
         include:
           - script: L1_Functional_Tests_GPU
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
-    needs: [pre-flight, build-container, org-member-pre-flight]
-    if: ${{ needs.pre-flight.outputs.test_level == 'Lfast' }}
+    needs: [pre-flight, org-member-pre-flight]
+    if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
     name: fast_${{ matrix.script }}
     environment: nemo-ci
