@@ -26,12 +26,14 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.async_grpo.enabled=true \
     grpo.async_grpo.max_trajectory_age_steps=1 \
     grpo.async_grpo.in_flight_weight_updates=false \
+    loss_fn.use_importance_sampling_correction=true \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
     cluster.num_nodes=1 \
+    policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.colocated.resources.num_nodes=1 \
     grpo.max_num_steps=2 \
