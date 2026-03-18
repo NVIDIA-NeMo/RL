@@ -236,6 +236,7 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
         self.placement_group_strategy = placement_group_strategy
+        self._allocated_master_ports: set[int] = set()
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False
@@ -417,6 +418,11 @@ class RayVirtualCluster:
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
 
+        Each call returns a unique port that has not been returned by previous
+        calls on this cluster instance.  This prevents NCCL process-group
+        collisions when multiple worker groups (e.g. policy and value) share the
+        same cluster and node.
+
         Returns:
             Tuple of (address, port)
         """
@@ -424,14 +430,22 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # If sorted bundle indices are available, get the address and port for the first bundle index
         if self._sorted_bundle_indices is not None:
-            return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
-            )
+            pg_idx, bundle_idx = 0, self._sorted_bundle_indices[0]
+        else:
+            pg_idx, bundle_idx = 0, 0
 
-        # Otherwise, get the address and port for bundle index 0
-        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+        max_retries = 10
+        for _ in range(max_retries):
+            addr, port = self.get_available_address_and_port(pg_idx, bundle_idx)
+            if port not in self._allocated_master_ports:
+                self._allocated_master_ports.add(port)
+                return addr, port
+
+        raise RuntimeError(
+            f"Failed to find a unique master port after {max_retries} retries. "
+            f"Already allocated ports: {self._allocated_master_ports}"
+        )
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
         """Gets the sorted bundle indices for the placement groups."""

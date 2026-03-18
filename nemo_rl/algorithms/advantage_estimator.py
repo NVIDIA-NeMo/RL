@@ -236,42 +236,50 @@ class GeneralizedAdvantageEstimator:
         lengths,
         values,
         kl,
+        mask=None,
         **kwargs,
     ):
-        """Reference GAE implementation for correctness validation.
+        """GAE implementation with proper masking.
 
-        Fixes two issues in compute_advantage:
-        1. Terminal state: uses V=0 at t=L (not a padding token's value).
-        2. No cross-sequence contamination: accumulation resets per sequence.
+        Masks values and per-token rewards so that prompt/padding positions
+        contribute zero to the TD errors. Vectorized across the batch dimension.
 
         Args:
-            rewards: Tensor of shape [batch_size].
+            rewards: Tensor of shape [batch_size], terminal reward per sample.
             lengths: Total sequence lengths of shape [batch_size].
             values: Value predictions of shape [batch_size, seq_len].
+            kl: Per-token KL penalty of shape [batch_size, seq_len].
+            mask: Token mask of shape [batch_size, seq_len], 1 for response tokens.
 
         Returns:
             advantages: Tensor of shape [batch_size, seq_len].
             returns: advantages + values, shape [batch_size, seq_len].
         """
-        advantages = torch.zeros_like(values)
-        rewards_expanded = torch.zeros_like(values)
-
-        rewards_expanded -= kl
-
-        for i in range(values.shape[0]):
+        # Build per-token rewards: -KL everywhere, plus terminal reward at last valid token
+        per_token_rewards = -kl.clone()
+        for i in range(rewards.shape[0]):
             L = int(lengths[i])
-            last_adv = 0.0
-            for t in reversed(range(L)):
-                v_next = values[i, t + 1].item() if (t + 1) < L else 0.0
-                r = rewards[i].item() if t == L - 1 else 0.0
+            if L > 0:
+                per_token_rewards[i, L - 1] += rewards[i]
 
-                delta = (
-                    rewards_expanded[i, t] + r
-                    + self.gae_gamma * v_next
-                    - values[i, t].item()
-                )
-                last_adv = delta + self.gae_gamma * self.gae_lambda * last_adv
-                advantages[i, t] = last_adv
+        # Zero out prompt/padding positions so they don't pollute TD errors
+        if mask is not None:
+            values = values * mask
+            per_token_rewards = per_token_rewards * mask
+
+        # Vectorized GAE (across batch dimension)
+        last_gae_lam = torch.zeros(values.shape[0], device=values.device, dtype=values.dtype)
+        advantages = torch.zeros_like(values)
+        max_seq_len = values.size(-1)
+
+        for t in reversed(range(max_seq_len)):
+            if t == max_seq_len - 1:
+                next_values = torch.zeros_like(last_gae_lam)
+            else:
+                next_values = values[:, t + 1]
+            delta = per_token_rewards[:, t] + self.gae_gamma * next_values - values[:, t]
+            last_gae_lam = delta + self.gae_gamma * self.gae_lambda * last_gae_lam
+            advantages[:, t] = last_gae_lam
 
         returns = advantages + values
         return advantages, returns
