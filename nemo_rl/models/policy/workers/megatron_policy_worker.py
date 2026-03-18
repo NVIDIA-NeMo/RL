@@ -340,9 +340,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         global_valid_toks=global_valid_toks,
                         sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
-                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"][
-                            "use_linear_ce_fusion_loss"
-                        ],
+                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                            "use_linear_ce_fusion_loss", False
+                        ),
                     )
 
                 # Empty unused memory.

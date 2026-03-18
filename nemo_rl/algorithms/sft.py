@@ -210,7 +210,7 @@ def setup(
 
     loss_fn = NLLLossFn(
         use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+        and policy_config["megatron_cfg"].get("use_linear_ce_fusion_loss", False)
     )
     print("  ✓ Model initialized")
 
