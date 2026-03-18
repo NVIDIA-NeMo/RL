@@ -770,7 +770,7 @@ def setup_model_and_optimizer(
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
-    if policy_cfg["megatron_cfg"]["use_linear_ce_fusion_loss"]:
+    if policy_cfg["megatron_cfg"].get("use_linear_ce_fusion_loss", False):
         patch_gpt_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
         )
