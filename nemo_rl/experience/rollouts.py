@@ -979,7 +979,9 @@ def run_async_multi_turn_rollout(
             # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
             final_batch[key] = torch.stack(
                 [
-                    state[key] if key in state else torch.tensor(0.0, dtype=torch.float32)
+                    state[key]
+                    if key in state
+                    else torch.tensor(0.0, dtype=torch.float32)
                     for state in final_sample_states
                 ]
             )
