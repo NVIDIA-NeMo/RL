@@ -226,6 +226,9 @@ env:
           judge_base_url: null
           judge_api_key: dummy_key
           judge_model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
+          judge_temperature: 0.7
+          judge_top_p: 0.8
+          judge_max_tokens: 10000
 
     turing_vif_simple_agent:
       responses_api_agents:

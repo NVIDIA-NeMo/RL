@@ -78,6 +78,49 @@ Added `aggregation_mode: all` to the base server config so the field is explicit
 
 Updated to document the new `aggregation_mode` config field with a table of available modes and an example experiment YAML override.
 
+### 7. `resources_servers/turing_vif/vif_validators/data_loader.py` + `app.py` — Judge Prompt Improvements
+
+**Problem:** The `LLM_JUDGE_QUESTION_PROMPT` template had two issues causing noisy and systematically deflated reward signals for `llm_judge`-based evaluation (used by MultiChallenge):
+
+1. **Fragile JSON output format.** The template asked the judge to return a JSON object `{"verdict": "YES" or "NO", "reasoning": "..."}`. The extraction code parsed this with `json.loads` + Pydantic validation, and any parse failure silently scored the sample as `False`. With a stochastic judge (temperature > 0), malformed JSON was common — extra text around the JSON, lowercase `"yes"`, trailing commas, missing quotes — all producing guaranteed false negatives on potentially correct evaluations.
+
+2. **Suboptimal content ordering.** The model's response appeared *before* the conversation context in the prompt. The judge read the response to evaluate before understanding what the conversation was about or what criterion to check. This is an unnatural evaluation order that can reduce judge accuracy on context-dependent criteria (e.g., "Did the model remember the user's seafood allergy?").
+
+**Fix (template — `data_loader.py`):** Restructured `LLM_JUDGE_QUESTION_PROMPT` to:
+- Place `{question}` (which contains the conversation context and evaluation criterion) **before** `{model_response}`, so the judge reads context first.
+- Replace the JSON output instruction with a simple `[[YES]]` / `[[NO]]` bracket-marker instruction: *"Analyze carefully, then respond with exactly [[YES]] or [[NO]] on the last line."*
+
+**Fix (extraction — `app.py`):** Replaced `_validate_custom_llm_judge_async`'s JSON parsing with robust three-tier verdict extraction:
+1. **Primary:** Search for the last occurrence of `[[YES]]` and `[[NO]]` in the response (last-occurrence-wins, matching the reference implementation's semantics).
+2. **Fallback:** Check the last line for plain `YES` or `NO` (case-insensitive).
+3. **Default:** Score as `NO` if neither marker is found.
+
+This eliminates the entire class of JSON parse failures. The judge can produce arbitrarily long reasoning, markdown formatting, or chain-of-thought — as long as `[[YES]]` or `[[NO]]` appears anywhere, the verdict is extracted correctly.
+
+**Backwards compatibility:** Fully backwards-compatible. The `JUDGE_SYSTEM_PROMPT` (used for `instructions`-based stylistic/linguistic validation) is unchanged and still uses JSON output. Only the `llm_judge` code path is affected. The `JudgeResponse` Pydantic model is retained for the instruction-based path.
+
+### 8. `resources_servers/turing_vif/app.py` + configs — Configurable Judge Sampling Parameters
+
+**Problem:** The judge's sampling parameters (`temperature`, `top_p`, `max_tokens`) were hardcoded in the `_judge_llm_api_async` method signature. The previous defaults (`temperature=1.0`, no `top_p`) produced high-variance judge verdicts, contributing to a noisy reward signal during RL training.
+
+**Fix:** Added three new config fields to `TuringVIFResourcesServerConfig`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `judge_temperature` | `0.7` | Sampling temperature for judge LLM calls |
+| `judge_top_p` | `0.8` | Top-p (nucleus) sampling for judge LLM calls |
+| `judge_max_tokens` | `10000` | Max output tokens for judge LLM calls |
+
+The `_judge_llm_api_async` method now reads these from config, with optional per-call overrides. The `top_p` parameter is threaded through `_judge_llm_api_call_async` to the underlying `create_chat_completion` call.
+
+Updated all config files to declare the new fields explicitly:
+- `resources_servers/turing_vif/configs/turing_vif.yaml` (Gym base config)
+- `experiments/turing_vif_multichallenge/grpo_turing_vif_multichallenge.yaml`
+- `experiments/turing_vif_inverse_if/grpo_turing_vif_inverse_if.yaml`
+- `experiments/dummy_turing_vif/grpo_dummy_turing_vif.yaml`
+
+**Backwards compatibility:** Fully backwards-compatible. The config fields have sensible defaults and can be overridden per-experiment via YAML or CLI (`++env.nemo_gym.turing_vif.resources_servers.turing_vif.judge_temperature=0.5`).
+
 ## Experiment Configs (NeMo-RL side, not in Gym)
 
 The following changes were made in the NeMo-RL experiment configs to work with the corrected Gym code:

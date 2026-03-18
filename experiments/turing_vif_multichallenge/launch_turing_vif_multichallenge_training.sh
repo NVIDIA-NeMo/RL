@@ -151,7 +151,7 @@ JUDGE_TP="${JUDGE_TP:-8}"                    # TP=8 for 235B (full node)
 JUDGE_ROUTER_DP_SIZE="${JUDGE_ROUTER_DP_SIZE:-4}"  # 4 replicas (matches reference: GENRM_ROUTER_DP_SIZE=4)
 JUDGE_NUM_NODES="${JUDGE_NUM_NODES:-4}"      # 4 nodes (32 GPUs) for 235B (matches reference: NUM_GENRM_NODES=4)
 JUDGE_GPU_UTIL="${JUDGE_GPU_UTIL:-0.9}"      # Higher util with FP8
-JUDGE_MAX_LEN="${JUDGE_MAX_LEN:-32768}"      # 32K context for evaluations
+JUDGE_MAX_LEN="${JUDGE_MAX_LEN:-65536}"      # 64K context for evaluations (long conversations)
 JUDGE_MAX_NUM_SEQS="${JUDGE_MAX_NUM_SEQS:-256}"  # Limit concurrent seqs to avoid OOM during sampler warmup
 JUDGE_ENFORCE_EAGER="${JUDGE_ENFORCE_EAGER:-true}"  # Disable CUDA graphs to save ~3 GiB for forward pass activations
 JUDGE_ENABLE_EP="${JUDGE_ENABLE_EP:-true}"   # Expert parallelism for MoE
@@ -345,7 +345,6 @@ uv run python examples/nemo_gym/run_grpo_nemo_gym.py \\
     ++logger.wandb.project=${WANDB_PROJECT} \\
     ++logger.log_dir=${LOG_BASE_DIR}/\${SLURM_JOB_ID}-logs \\
     ++checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \\
-    ++loss_fn.force_on_policy_ratio=true \\
     ${JUDGE_ARGS} \\
     \$@
 EOF
