@@ -378,7 +378,7 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore"
         )
-        assert not config["megatron_cfg"]["use_linear_ce_fusion_loss"], (
+        assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
         )
 
