@@ -18,28 +18,6 @@ policy:
   max_total_sequence_length: 4096
   dtensor_cfg:
     tensor_parallel_size: 4
-<<<<<<< sfawzy_megatron_recipes
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
-  megatron_recipe: megatron.bridge.recipes.llama.llama31_8b_pretrain_config
-  megatron_cfg:
-    enabled: false
-
-  dynamic_batching:
-    enabled: false
-
-  sequence_packing:
-    enabled: false
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-
-  # makes the training sequence length divisible by the tensor parallel size
-  # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
-=======
->>>>>>> main
   max_grad_norm: null
   optimizer:
     kwargs:
