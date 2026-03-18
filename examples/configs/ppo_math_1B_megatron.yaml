@@ -1,10 +1,10 @@
-# PPO with Megatron-Core Backend
-# Extends ppo_math_1B.yaml with Megatron policy + Megatron value model
-defaults: "ppo_math_1B.yaml"
+# PPO with Megatron-Core Backend (Standalone)
+# Megatron policy + Megatron value model
 
 ppo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
+  max_rollout_turns: 1
   max_num_epochs: 32
   steps_per_epoch: 4
   normalize_rewards: true
@@ -12,17 +12,53 @@ ppo:
   val_period: 1
   val_at_start: true
   val_at_end: false
+  overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+
+  adv_estimator:
+    name: "gae"
+    gae_lambda: 0.95
+    gae_gamma: 0.99
+    normalize_advantages: true
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
 
 loss_fn:
   reference_policy_kl_penalty: 0.1
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
   ratio_clip_max: 0.2
+  ratio_clip_c: null
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
   token_level_loss: true
-  ratio_clip_c: null
+  force_on_policy_ratio: false
+  use_kl_in_reward: true
+  value_loss_scale: 0.4
 
 checkpointing:
   enabled: false
@@ -32,38 +68,44 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null
+  hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 64
   logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 1024
   precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
 
   dtensor_cfg:
+    _v2: true
     enabled: false
-
-  dynamic_batching:
-    enabled: False
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    sequence_length_round: 64
-
-  sequence_packing:
-    enabled: True
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-
-  max_grad_norm: 1.0
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
-  optimizer: null
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    lora_cfg:
+      enabled: False
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
 
   megatron_cfg:
     enabled: true
@@ -129,6 +171,25 @@ policy:
     fp8_cfg: null
     env_vars: null
 
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+  scheduler: null
+
   generation:
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
@@ -185,12 +246,29 @@ value:
   reward_model_cfg:
     enabled: false
     reward_model_type: "regression"
+    only_head_unfreeze: true
 
-  # Disable DTensor for value model
   dtensor_cfg:
+    _v2: true
     enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
 
-  # Enable Megatron-Core for value model
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
@@ -267,6 +345,21 @@ value:
   max_grad_norm: 1.0
   optimizer: null
   scheduler: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05
+    seed: ${ppo.seed}
+  validation: null
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
 
 env:
   math:
