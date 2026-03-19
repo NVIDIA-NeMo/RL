@@ -62,15 +62,22 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
-        logprobs = get_next_token_logprobs_from_logits(
-            input_ids=data["input_ids"],
-            next_token_logits=logits,
-            seq_index=data.get("seq_index", None),
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
-            sampling_params=sampling_params,
-        )
+        # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
+        # Keep normal path unchanged for standard logits (3D tensor).
+        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
+            logprobs = logits
+            logprobs = logprobs.to(torch.float32)
+            logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
+        else:
+            logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=sampling_params,
+            )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
