@@ -64,6 +64,8 @@ RL training for Nemotron 3 Super consists of 3 main stages:
 
 The RLVR stage consists of 3 sub-stages with different data blends and the SWE RL stage consists of 2 sub-stages, for 6 total stages.
 
+**Note:** vLLM versions prior to 0.17.0 have a bug that causes logprob values to diverge between vLLM and Megatron for certain sequences, which can lead to training instability. To work around this, the recipes below set `seq_logprob_error_threshold: 2` to mask out sequences where the logprob mismatch exceeds the threshold. This bug is fixed in vLLM 0.17.0 and will be incorporated in the Nemotron 3 Ultra release.
+
 ### Build sandbox container
 
 Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during training rely on a sandbox container for code execution, including [NeMo-Skills tools](https://github.com/NVIDIA-NeMo/Gym/tree/main/resources_servers/ns_tools) (stateful Python execution with math verification) and [Lean4 formal proof verification](https://github.com/NVIDIA-NeMo/Gym/tree/main/resources_servers/math_formal_lean). To build the sandbox container, use the [NeMo-Skills Dockerfile](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox):
