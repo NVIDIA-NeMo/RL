@@ -1,5 +1,6 @@
-# PPO with Megatron-Core Backend (Standalone)
-# Megatron policy + Megatron value model
+# PPO-DAPO with Megatron-Core Backend
+# DAPO-style PPO: no KL penalty, asymmetric clipping, dual-clip, reward scaling
+# Dynamic sampling is disabled (standard PPO batching).
 
 ppo:
   num_prompts_per_step: 32
@@ -10,7 +11,7 @@ ppo:
   steps_per_epoch: 4
   policy_training_start_epoch: 0
   normalize_rewards: true
-  use_leave_one_out_baseline: true
+  use_leave_one_out_baseline: false  # DAPO: no leave-one-out
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -18,39 +19,42 @@ ppo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
-  use_dynamic_sampling: false
+  use_dynamic_sampling: false  # DAPO dynamic sampling OFF
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+
   reward_shaping:
-    enabled: false
-    overlong_buffer_length: 128
+    enabled: true
+    overlong_buffer_length: 2048
     overlong_buffer_penalty: 1
-    max_response_length: ${policy.max_total_sequence_length}
+    max_response_length: 14336
     stop_properly_penalty_coef: null
 
   adv_estimator:
     name: "gae"
     gae_lambda: 0.95
-    gae_gamma: 0.99
+    gae_gamma: 1
     normalize_advantages: true
     normalize_rewards: true
     use_leave_one_out_baseline: false
     minus_baseline: true
+
   reward_scaling:
-    enabled: false
+    enabled: true
     source_min: 0.0
     source_max: 1.0
-    target_min: 0.0
+    target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
 
 loss_fn:
-  reference_policy_kl_penalty: 0.1
+  reference_policy_kl_penalty: 0.0  # DAPO: no KL penalty
   reference_policy_kl_type: "k3"
   kl_input_clamp_value: 20.0
   kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
-  ratio_clip_c: null
+  ratio_clip_max: 0.28  # DAPO: asymmetric clipping (wider upper bound)
+  ratio_clip_c: 10  # DAPO: dual-clip with c=10
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
   truncated_importance_sampling_ratio: null
@@ -59,16 +63,16 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
-  use_kl_in_reward: true
+  use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   value_loss_scale: 0.4
   value_cliprange: 0.2
 
 checkpointing:
-  enabled: false
-  checkpoint_dir: "results/ppo_megatron"
+  enabled: true
+  checkpoint_dir: "results/ppo_dapo_megatron"
   metric_name: "val:accuracy"
   higher_is_better: true
-  keep_top_k: 3
+  keep_top_k: 5
   save_period: 10
   checkpoint_must_save_by: null
   model_save_format: "safetensors"
@@ -139,9 +143,9 @@ policy:
 
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
-      weight_decay: 0.01
+      lr: 1.0e-6  # DAPO: lower LR
+      min_lr: 1.0e-7
+      weight_decay: 0.1  # DAPO: higher weight decay
       bf16: true
       fp16: false
       params_dtype: "float32"
@@ -161,8 +165,8 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: 1000
-      lr_warmup_iters: 13
-      lr_warmup_init: 5.0e-7
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -300,9 +304,9 @@ value:
 
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
-      weight_decay: 0.01
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+      weight_decay: 0.1
       bf16: true
       fp16: false
       params_dtype: "float32"
@@ -317,13 +321,13 @@ value:
       optimizer_offload_fraction: 0.0
 
     scheduler:
-      start_weight_decay: 0.01
-      end_weight_decay: 0.01
+      start_weight_decay: 0.1
+      end_weight_decay: 0.1
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: 1000
-      lr_warmup_iters: 13
-      lr_warmup_init: 5.0e-7
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -377,15 +381,15 @@ logger:
   swanlab_enabled: false
   monitor_gpus: false
   wandb:
-    project: "ppo-megatron-dev"
-    name: "ppo_megatron_1B"
+    project: "ppo-dapo-megatron-dev"
+    name: "ppo_dapo_megatron_1B"
   swanlab:
-    project: "ppo-megatron-dev"
-    name: "ppo_megatron_1B"
+    project: "ppo-dapo-megatron-dev"
+    name: "ppo_dapo_megatron_1B"
   tensorboard: {}
   mlflow:
-    experiment_name: "ppo-megatron-dev"
-    run_name: "ppo_megatron_1B"
+    experiment_name: "ppo-dapo-megatron-dev"
+    run_name: "ppo_dapo_megatron_1B"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

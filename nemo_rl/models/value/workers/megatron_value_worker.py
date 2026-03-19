@@ -209,6 +209,12 @@ def forward_step_value(
         # Megatron-Core always uses [S, B, H] layout internally; transpose to [B, S, H]
         hidden_states = hidden_states.transpose(0, 1).contiguous()
         values = value_head(hidden_states).squeeze(-1)  # [batch, seq]
+        # Shift right by 1 to align with inference: values[t] = V(state before token t).
+        # This must match the shift in get_values_impl so that the training targets
+        # (returns, old_values) computed from inference values are aligned.
+        values = torch.cat(
+            [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
+        )
         # Replace output_tensor with values for loss computation
         output_tensor = values
     else:

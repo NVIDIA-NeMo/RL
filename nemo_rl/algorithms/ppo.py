@@ -30,6 +30,9 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator, GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator)
+from nemo_rl.algorithms.grpo import (
+    _should_use_async_rollouts, _should_use_nemo_gym,
+    _should_log_nemo_gym_responses)
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (ClippedPGLossConfig,
                                                ClippedPGLossDataDict,
@@ -171,7 +174,7 @@ class GRPOSaveState(TypedDict):
     ]  # Optional field - may not be present during training
 
 
-def _default_grpo_save_state() -> GRPOSaveState:
+def _default_ppo_save_state() -> GRPOSaveState:
     return {
         "consumed_samples": 0,
         "current_step": 0,
@@ -222,7 +225,7 @@ def setup(
     GRPOSaveState,
     MasterConfig,
 ]:
-    """Main entry point for running GRPO algorithm.
+    """Main entry point for running PPO algorithm.
 
     Returns:
         tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
@@ -242,7 +245,7 @@ def setup(
     cluster_config = master_config["cluster"]
 
     assert generation_config is not None, (
-        "A generation config in the PolicyConfig is required for GRPO"
+        "A generation config in the PolicyConfig is required for PPO"
     )
 
     # Set seed for all random number generators
@@ -259,11 +262,11 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = cast(
+    ppo_save_state: Optional[GRPOSaveState] = cast(
         Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
-    if grpo_save_state is None:
-        grpo_save_state = _default_grpo_save_state()
+    if ppo_save_state is None:
+        ppo_save_state = _default_ppo_save_state()
 
     # ==========================
     #           Data
@@ -794,7 +797,7 @@ def setup(
         value_loss_fn,
         logger,
         checkpointer,
-        grpo_save_state,
+        ppo_save_state,
         master_config,
     )
 
@@ -815,7 +818,7 @@ def dynamic_sampling(
     we store it in the batch_cache to be used in later iterations.
     If the current batch has more number of prompts with non-zero standard deviation than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
     the batch is sliced to ensure batch size is num_prompts_per_step * num_generations_per_prompt.
-    is_batch_complete is set to False to indicate that the current batch is not enough to meet the required batch size. This is used as a signal in the GRPO training loop
+    is_batch_complete is set to False to indicate that the current batch is not enough to meet the required batch size. This is used as a signal in the training loop
     to continue sampling or proceed to training.
     This approach is based on the dynamic sampling algorithm from the DAPO paper:
     https://arxiv.org/pdf/2503.14476.
@@ -825,7 +828,7 @@ def dynamic_sampling(
         std (torch.Tensor): Tensor representing the standard deviation for each prompt group.
         baseline (torch.Tensor): Baseline values for each prompt group.
         dynamic_sampling_num_gen_batches (int): Number of generation batches processed at the current step.
-        master_config (MasterConfig): Configuration containing GRPO and policy settings.
+        master_config (MasterConfig): Configuration containing PPO and policy settings.
         batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
 
     Returns:
@@ -839,8 +842,8 @@ def dynamic_sampling(
 
     # Required batch size for training
     train_prompts_size = (
-        master_config["grpo"]["num_prompts_per_step"]
-        * master_config["grpo"]["num_generations_per_prompt"]
+        master_config["ppo"]["num_prompts_per_step"]
+        * master_config["ppo"]["num_generations_per_prompt"]
     )
     # Store the baseline, std and total_reward for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
@@ -851,7 +854,7 @@ def dynamic_sampling(
     # Dynamic sampling algorithm (used in DAPO algorithm)
     # This block implements dynamic sampling by selecting prompt groups with non-zero std.
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
-    if master_config["grpo"]["use_dynamic_sampling"]:
+    if master_config["ppo"]["use_dynamic_sampling"]:
         with timer.time("dynamic_sampling"):
             # Get the prompt indices with non-zero std
             non_zero_std_mask = std != 0.0
@@ -894,11 +897,11 @@ def dynamic_sampling(
 
             # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
             if filtered_prompts_size < train_prompts_size:
-                dynamic_sampling_max_gen_batches = master_config["grpo"][
+                dynamic_sampling_max_gen_batches = master_config["ppo"][
                     "dynamic_sampling_max_gen_batches"
                 ]
                 assert dynamic_sampling_max_gen_batches > 0, (
-                    "When using grpo.use_dynamic_sampling, grpo.dynamic_sampling_max_gen_batches must be > 0"
+                    "When using ppo.use_dynamic_sampling, ppo.dynamic_sampling_max_gen_batches must be > 0"
                 )
                 if dynamic_sampling_num_gen_batches <= dynamic_sampling_max_gen_batches:
                     print(
@@ -922,7 +925,7 @@ def dynamic_sampling(
 
     batch_to_return = (
         filtered_repeated_batch
-        if master_config["grpo"]["use_dynamic_sampling"]
+        if master_config["ppo"]["use_dynamic_sampling"]
         else repeated_batch
     )
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
@@ -985,7 +988,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
     loss_config = master_config["loss_fn"]
 
     # Provide backward-compatible defaults when adv_estimator is not in config.
-    # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
+    # Fall back to top-level ppo.normalize_rewards / ppo.use_leave_one_out_baseline
     # which older configs still use.
     adv_estimator_config = ppo_config.get(
         "adv_estimator",
@@ -1180,10 +1183,17 @@ def ppo_train(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
     checkpointer: CheckpointManager,
-    grpo_save_state: GRPOSaveState,
+    ppo_save_state: GRPOSaveState,
     master_config: MasterConfig,
 ) -> None:
-    """Run PPO training algorithm."""
+    """Run PPO training algorithm.
+
+    Based on the grpo_train loop with PPO-specific modifications:
+    - Value model inference and training (actor-critic)
+    - GAE advantage estimation with value bootstrap
+    - Multiple training steps per rollout (steps_per_epoch)
+    - Configurable policy training start epoch
+    """
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
@@ -1205,30 +1215,22 @@ def ppo_train(
     if master_config["ppo"].get("skip_reference_policy_logprobs_calculation"):
         assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
         print(
-            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+            "Reference policy logprob calculation will be skipped since `ppo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
 
     # Check if we need to sync KV cache scales
-    # When fallback to policy as the policy_generation, we use getattr to check.
     sync_kv_scales = getattr(policy_generation, "requires_kv_scale_sync", False)
 
-    # common config/state times
-    current_step = grpo_save_state["current_step"]  # current step within an epoch
-    total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
-    current_epoch = grpo_save_state["current_epoch"]  # current epoch
-    max_num_epochs = master_config["ppo"][
-        "max_num_epochs"
-    ]  # max number of epochs to train for
+    # common config/state
+    current_step = ppo_save_state["current_step"]
+    total_steps = ppo_save_state["total_steps"]
+    max_num_steps = master_config["ppo"]["max_num_steps"]
+    current_epoch = ppo_save_state["current_epoch"]
+    max_num_epochs = master_config["ppo"]["max_num_epochs"]
     steps_per_epoch = master_config["ppo"]["steps_per_epoch"]
     policy_training_start_epoch = master_config["ppo"].get("policy_training_start_epoch", 0)
-    max_num_steps = master_config["ppo"]["max_num_steps"]
-
-    consumed_samples = grpo_save_state[
-        "consumed_samples"
-    ]  # total samples consumed across all epochs
-    total_valid_tokens = grpo_save_state.get(
-        "total_valid_tokens", 0
-    )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
+    consumed_samples = ppo_save_state["consumed_samples"]
+    total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
     val_at_start = master_config["ppo"]["val_at_start"]
     val_at_end = master_config["ppo"]["val_at_end"]
     val_period = master_config["ppo"]["val_period"]
@@ -1238,7 +1240,6 @@ def ppo_train(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
-    # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
@@ -1261,212 +1262,359 @@ def ppo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
-    # Run PPO training loop
-    train_loader_iter = iter(dataloader)
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
-        epoch = current_epoch
-        metrics_logging_data = dict()
-        print(f"\n{'=' * 25} Epoch {epoch + 1}/{max_num_epochs} {'=' * 25}")
+        memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
+        print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
-        with timer.time("total_epoch_time"):
-            print("▶ Preparing batch...", flush=True)
-            with timer.time("data_processing"):
-                batch = next(train_loader_iter)
-                repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
-                    master_config["ppo"]["num_generations_per_prompt"]
-                )
-                # Convert LLMMessageLogType to FlatMessagesType for generation
-                batched_flat, input_lengths = batched_message_log_to_flat_message(
-                    repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                )
-                input_ids = batched_flat["token_ids"]
+        for batch in dataloader:
+            metrics_logging_data = dict()
+            metrics = dict()
+
             print(
-                f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
             )
-            with timer.time("prepare_for_generation/total"):
-                if NEED_REFIT and POLICY_GENERATION_STALE:
-                    refit_policy_generation(
-                        policy, policy_generation, colocated_inference
+            maybe_gpu_profile_step(policy, total_steps + 1)
+            if policy != policy_generation:
+                maybe_gpu_profile_step(policy_generation, total_steps + 1)
+            val_metrics, validation_timings = None, None
+
+            with timer.time("total_step_time"):
+                # Prepare batch
+                print("▶ Preparing batch...", flush=True)
+                with timer.time("data_processing"):
+                    repeated_batch: BatchedDataDict[DatumSpec] = (
+                        batch.repeat_interleave(
+                            master_config["ppo"]["num_generations_per_prompt"]
+                        )
                     )
-                    POLICY_GENERATION_STALE = False
-                else:
-                    if colocated_inference:
-                        policy.offload_after_refit()
-                    policy_generation.prepare_for_generation()
+                    batched_flat, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    input_ids = batched_flat["token_ids"]
 
-            with timer.time("generation"):
-                print("▶ Generating responses...", flush=True)
-                # Clear logger metrics for each generation step
-                if policy_generation is not None:
-                    policy_generation.clear_logger_metrics()
-                # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
-                repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
-                    greedy=False,
+                # Generate responses
+                memory_tracker.snapshot_start_of_stage("Generation", dir())
+                print(
+                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                    flush=True,
                 )
-
-                policy_generation.finish_generation()
-                # Collect generation logger metrics for performance reporting after each generation step
-                # inflight batch sizes and num pending samples are collected from each worker
-                if policy_generation is not None:
-                    generation_logger_metrics = policy_generation.get_logger_metrics()
-                metrics_logging_data["mean_gen_tokens_per_sample"] = rollout_metrics[
-                    "mean_gen_tokens_per_sample"
-                ]
-                logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
-
-            repeated_batch = scale_rewards(
-                repeated_batch, master_config["ppo"]["reward_scaling"]
-            )
-
-            with timer.time("reward_calculation"):
-                print("▶ Calculating rewards and values...", flush=True)
-
-                for message_log in repeated_batch["message_log"]:
-                    for _, message in enumerate(message_log):
-                        if message["role"] == "assistant":
-                            message["token_loss_mask"] = torch.ones_like(
-                                message["token_ids"]
+                with timer.time("prepare_for_generation/total"):
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        if sync_kv_scales and kv_scales_cache is None:
+                            print("▶ Computing KV cache scales...", flush=True)
+                            policy.prepare_for_lp_inference()
+                            calib_flat, calib_input_lengths = (
+                                batched_message_log_to_flat_message(
+                                    repeated_batch["message_log"],
+                                    pad_value_dict={
+                                        "token_ids": tokenizer.pad_token_id
+                                    },
+                                    make_sequence_length_divisible_by=master_config[
+                                        "policy"
+                                    ]["make_sequence_length_divisible_by"],
+                                )
                             )
-                        else:
-                            message["token_loss_mask"] = torch.zeros_like(
-                                message["token_ids"]
+                            calibration_data = BatchedDataDict[ClippedPGLossDataDict](
+                                {
+                                    "input_ids": calib_flat["token_ids"],
+                                    "input_lengths": calib_input_lengths,
+                                }
                             )
-                        if "generation_logprobs" not in message:
-                            message["generation_logprobs"] = torch.zeros_like(
-                                message["token_ids"], dtype=torch.float32
-                            )
+                            calibration_data.to("cpu")
+                            kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+                                calibration_data, include_q=True
+                            )["layers"]
 
-                messages, input_lengths = batched_message_log_to_flat_message(
-                    repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    make_sequence_length_divisible_by=master_config["policy"][
-                        "make_sequence_length_divisible_by"
-                    ],
+                        refit_policy_generation(
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            timer=timer,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        if colocated_inference:
+                            policy.offload_after_refit()
+                        policy_generation.prepare_for_generation()
+
+                with timer.time("generation"):
+                    if policy_generation is not None:
+                        policy_generation.clear_logger_metrics()
+
+                    if _should_use_nemo_gym(master_config):
+                        generation_config = master_config["policy"]["generation"]
+                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                            policy_generation=policy_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=None,
+                            generation_config=generation_config,
+                            max_rollout_turns=None,
+                            greedy=False,
+                        )
+                        input_ids = nemo_gym_rollout_result.input_ids
+                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                        del nemo_gym_rollout_result
+
+                        if not _should_log_nemo_gym_responses(master_config):
+                            for key in list(rollout_metrics):
+                                if "full_result" in key:
+                                    rollout_metrics.pop(key)
+
+                    elif _should_use_async_rollouts(master_config):
+                        (
+                            repeated_batch,
+                            rollout_metrics,
+                        ) = run_async_multi_turn_rollout(
+                            policy_generation=policy_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                            max_rollout_turns=master_config["ppo"][
+                                "max_rollout_turns"
+                            ],
+                            greedy=False,
+                        )
+                    else:
+                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                            policy_generation=policy_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                            max_rollout_turns=master_config["ppo"][
+                                "max_rollout_turns"
+                            ],
+                            greedy=False,
+                        )
+                    policy_generation.finish_generation()
+                    if policy_generation is not None:
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
+                        )
+
+                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
+                        rollout_metrics["mean_gen_tokens_per_sample"]
+                    )
+                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+
+                repeated_batch = scale_rewards(
+                    repeated_batch, master_config["ppo"]["reward_scaling"]
                 )
+                if master_config["ppo"]["reward_shaping"]["enabled"]:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config["ppo"]["reward_shaping"]
+                    )
 
-                train_data = BatchedDataDict[ClippedPGLossDataDict](
-                    {
-                        "input_ids": messages["token_ids"],
-                        "input_lengths": input_lengths,
-                        "generation_logprobs": messages["generation_logprobs"],
-                        "rewards": repeated_batch["total_reward"],
-                        "sample_mask": repeated_batch["loss_multiplier"],
-                        "token_mask": messages["token_loss_mask"],
-                    }
-                )
+                # Process rewards and build training data
+                memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
+                print("▶ Processing rewards...", flush=True)
+                with timer.time("reward_calculation"):
+                    rewards = repeated_batch["total_reward"]
 
-                value_model.prepare_for_inference()
-                values = value_model.get_values(train_data)
-                train_data["values"] = values["values"].squeeze(-1)
+                with timer.time("data_processing"):
+                    use_overlong_filtering = master_config["ppo"].get("overlong_filtering", False)
+                    if use_overlong_filtering:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        truncated = repeated_batch["truncated"]
+                        if isinstance(truncated, list):
+                            truncated = torch.tensor(truncated, dtype=torch.bool)
+                        loss_multiplier[truncated] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    for i, message_log in enumerate(repeated_batch["message_log"]):
+                        for j, message in enumerate(message_log):
+                            if message["role"] == "assistant":
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
+                            else:
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            if "generation_logprobs" not in message:
+                                message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
+
+                    flat_messages, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config["policy"][
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
+
+                    train_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": flat_messages["token_ids"],
+                            "input_lengths": input_lengths,
+                            "generation_logprobs": flat_messages["generation_logprobs"],
+                            "rewards": repeated_batch["total_reward"],
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
+                        }
+                    )
+                    extra_multimodal_data = flat_messages.get_multimodal_dict(
+                        as_tensors=False
+                    )
+                    train_data.update(extra_multimodal_data)
+                    train_data.to("cpu")
+
+                    metrics_logging_data["content"] = flat_messages["content"]
+
+                # PPO: Value model inference
+                memory_tracker.snapshot_start_of_stage("Value inference", dir())
+                print("▶ Computing values...", flush=True)
+                with timer.time("value_inference"):
+                    value_model.prepare_for_inference()
+                    values = value_model.get_values(train_data)
+                    train_data["values"] = values["values"].squeeze(-1)
 
                 print(
-                    f"  • Average batch reward: {train_data['rewards'].mean().numpy():.4f}\n"
+                    f"  • Average batch reward: {rewards.mean().numpy():.4f}\n"
                     f"  • Average batch response length: {input_lengths.sum() / input_lengths.shape[0]:.4f}"
                 )
 
-            with timer.time("logprob_inference_prep"):
+                # Compute logprobs
+                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 print("▶ Preparing for logprob inference...", flush=True)
-                policy.prepare_for_lp_inference()
+                with timer.time("logprob_inference_prep"):
+                    policy.prepare_for_lp_inference()
 
-            with timer.time("policy_and_reference_logprobs"):
-                print("▶ Computing policy and reference logprobs...", flush=True)
-                logprob_data = BatchedDataDict(
-                    {
-                        "input_ids": train_data["input_ids"],
-                        "input_lengths": train_data["input_lengths"],
-                    }
-                )
-                train_data["prev_logprobs"] = policy.get_logprobs(
-                    logprob_data, timer=timer
-                )["logprobs"]
-
-                train_data["reference_policy_logprobs"] = (
-                    policy.get_reference_policy_logprobs(logprob_data, timer=timer)[
-                        "reference_logprobs"
-                    ]
-                )
-
-            with timer.time("compute_advantages"):
-                print("▶ Computing advantages...", flush=True)
-                advantages, returns = adv_estimator.compute_advantage(
-                    prompt_ids=torch.arange(messages["token_ids"].shape[0]),
-                    rewards=train_data["rewards"],
-                    mask=train_data["token_mask"],
-                    values=train_data["values"],
-                    lengths=input_lengths,
-                    reference_logprobs=train_data["reference_policy_logprobs"],
-                    logprobs=train_data["prev_logprobs"],
-                )
-
-                train_data["advantages"] = advantages
-                train_data["returns"] = returns
-
-            for step in range(steps_per_epoch):
-                print(
-                    f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch}...",
-                    flush=True,
-                )
-
-                # Train value model first so the critic is updated before the actor,
-                # matching veRL's update ordering.
-                with timer.time("value_training_prep"):
-                    value_model.prepare_for_training()
-
-                with timer.time("value_training"):
-                    print("▶ Training value...", flush=True)
-                    value_results = value_model.train(
-                        train_data,
-                        value_loss_fn,
-                        timer=timer,
+                print("▶ Computing logprobs...", flush=True)
+                with timer.time("policy_and_reference_logprobs"):
+                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": train_data["input_ids"],
+                            "input_lengths": train_data["input_lengths"],
+                            **extra_multimodal_data,
+                        }
                     )
-                    value_model.finish_training()
+                    train_data["prev_logprobs"] = policy.get_logprobs(
+                        logprob_data, timer=timer
+                    )["logprobs"]
 
-                train_results = None
-                if epoch >= policy_training_start_epoch:
-                    with timer.time("policy_training_prep"):
-                        policy.prepare_for_training()
+                    if not master_config["ppo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        train_data["reference_policy_logprobs"] = (
+                            policy.get_reference_policy_logprobs(
+                                logprob_data,
+                                timer=timer,
+                            )["reference_logprobs"]
+                        )
 
-                    with timer.time("policy_training"):
-                        print("▶ Training policy...", flush=True)
-                        train_results = policy.train(
+                    del logprob_data
+                    del extra_multimodal_data
+
+                # Build prompt IDs for advantage estimation (groups responses from same prompt)
+                with timer.time("advantage_calculation"):
+                    print("▶ Computing advantages...", flush=True)
+                    prompt_only_message_logs = _extract_prompt_only_messages(
+                        repeated_batch["message_log"]
+                    )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        prompt_only_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    del prompt_only_message_logs
+                    del prompt_batched_flat
+
+                    advantages, returns = adv_estimator.compute_advantage(
+                        prompt_ids=prompt_ids_for_adv,
+                        rewards=train_data["rewards"],
+                        mask=train_data["token_mask"],
+                        values=train_data["values"],
+                        lengths=input_lengths,
+                        reference_logprobs=train_data.get("reference_policy_logprobs"),
+                        logprobs=train_data["prev_logprobs"],
+                    )
+                    del prompt_ids_for_adv
+
+                    train_data["advantages"] = advantages
+                    train_data["returns"] = returns
+
+                # PPO: Multiple training steps per rollout
+                memory_tracker.snapshot_start_of_stage("Policy train", dir())
+                for step in range(steps_per_epoch):
+                    print(
+                        f"▶ Step {step + 1}/{steps_per_epoch}...",
+                        flush=True,
+                    )
+
+                    # Train value model first (critic before actor, matching veRL)
+                    with timer.time("value_training_prep"):
+                        value_model.prepare_for_training()
+
+                    with timer.time("value_training"):
+                        print("▶ Training value...", flush=True)
+                        value_results = value_model.train(
                             train_data,
-                            loss_fn,
+                            value_loss_fn,
                             timer=timer,
                         )
-                        policy.finish_training()
+                        value_model.finish_training()
+
+                    train_results = None
+                    if current_epoch >= policy_training_start_epoch:
+                        print("▶ Preparing for training...", flush=True)
+                        with timer.time("training_prep"):
+                            policy.prepare_for_training()
+                            POLICY_GENERATION_STALE = True
+
+                        print("▶ Training policy...", flush=True)
+                        with timer.time("policy_training"):
+                            train_results = policy.train(
+                                train_data,
+                                loss_fn,
+                                timer=timer,
+                            )
+                            policy.finish_training()
+
+                    if train_results is not None:
+                        print(f"    • Policy loss: {train_results['loss'].item():.4f}")
+                    print(f"    • Value loss: {value_results['loss'].item():.4f}")
+
+                # Recompute KV scales after policy training if needed
+                if sync_kv_scales:
+                    with timer.time("recompute_kv_scales"):
+                        print(
+                            "▶ Recomputing KV cache scales after policy update...",
+                            flush=True,
+                        )
+                        kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+                            train_data, include_q=True
+                        )["layers"]
                         POLICY_GENERATION_STALE = True
 
-                print(
-                    f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch} training results:"
+                is_last_step = (total_steps + 1 >= max_num_steps) or (
+                    (current_epoch + 1 == max_num_epochs)
+                    and (current_step + 1 == len(dataloader))
                 )
 
-                if train_results is not None:
-                    print(f"    • Policy loss: {train_results['loss'].item():.4f}")
-                print(f"    • Value loss: {value_results['loss'].item():.4f}")
-
-            total_steps += 1
-
-            is_last_step = (total_steps >= max_num_steps) or (
-                (current_epoch + 1 == max_num_epochs)
-            )
-
-            if (val_period > 0 and (epoch + 1) % val_period == 0) or (
-                val_at_end and is_last_step
-            ):
-                with timer.time("validation"):
-                    print("▶ Validating...", flush=True)
-
+                # Validation
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
+                    memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1478,22 +1626,261 @@ def ppo_train(
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        step=total_steps,
+                        step=total_steps + 1,
                         master_config=master_config,
                         logger=logger,
                     )
                     policy_generation.finish_generation()
-
                     logger.log_metrics(
-                        validation_timings,
-                        total_steps,
-                        prefix="timing/validation",
+                        validation_timings, total_steps + 1, prefix="timing/validation"
                     )
                     logger.log_metrics(
-                        val_metrics, total_steps, prefix="validation"
+                        val_metrics, total_steps + 1, prefix="validation"
                     )
 
+                # Metrics
+                flat_advantages = train_data["advantages"]
+                flat_token_mask = flat_messages["token_loss_mask"]
+                del flat_messages
+
+                response_advantages = torch.masked_select(
+                    flat_advantages, flat_token_mask.bool()
+                )
+
+                memory_tracker.snapshot_start_of_stage("Metrics", dir())
+                if train_results is not None:
+                    metrics = {
+                        **metrics,
+                        "loss": train_results["loss"].numpy(),
+                        "grad_norm": train_results["grad_norm"].numpy(),
+                    }
+                    metrics.update(train_results["all_mb_metrics"])
+                    if "moe_metrics" in train_results:
+                        metrics.update(
+                            {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                        )
+
+                metrics.update({
+                    "reward": rewards.numpy(),
+                    "value_loss": value_results["loss"].item(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                    "advantages/mean": torch.mean(response_advantages).detach().item()
+                    if response_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/max": torch.max(response_advantages).detach().item()
+                    if response_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/min": torch.min(response_advantages).detach().item()
+                    if response_advantages.numel() > 0
+                    else 0.0,
+                })
+
+                gen_step_metrics = {}
+                if hasattr(policy_generation, "get_step_metrics"):
+                    gen_step_metrics = policy_generation.get_step_metrics()
+                metrics.update(gen_step_metrics)
+
+                for k, v in metrics.items():
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.min(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = (
+                            np.max(valid_values).item() if valid_values else -1.0
+                        )
+                    elif k in {
+                        "lr",
+                        "wd",
+                        "reward",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    elif isinstance(v, (np.ndarray, list)):
+                        metrics[k] = np.sum(v).item()
+
+                metrics.update(rollout_metrics)
+                metrics["generation_logger_metrics"] = generation_logger_metrics
+                if "global_valid_toks" in metrics:
+                    total_valid_tokens += metrics["global_valid_toks"]
+
+                ## Checkpointing
+                consumed_samples += master_config["ppo"]["num_prompts_per_step"]
+                timeout.mark_iteration()
+
+                should_save_by_step = (
+                    is_last_step
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    == 0
+                )
+                should_save_by_timeout = timeout.check_save()
+
+                memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    policy.prepare_for_training()
+
+                    ppo_save_state["current_step"] = current_step + 1
+                    ppo_save_state["total_steps"] = total_steps + 1
+                    ppo_save_state["current_epoch"] = current_epoch
+                    ppo_save_state["total_valid_tokens"] = total_valid_tokens
+                    if val_metrics is not None:
+                        ppo_save_state["val_reward"] = val_metrics["accuracy"]
+                    elif "val_reward" in ppo_save_state:
+                        del ppo_save_state["val_reward"]
+                    ppo_save_state["consumed_samples"] = consumed_samples
+
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
+                            )
+                            if full_metric_name in ppo_save_state:
+                                del ppo_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            ppo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
+
+                    with timer.time("checkpointing"):
+                        print(
+                            f"Saving checkpoint for step {total_steps + 1}...",
+                            flush=True,
+                        )
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            total_steps + 1, ppo_save_state, master_config
+                        )
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "policy", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config["checkpointing"],
+                        )
+                        value_model.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "value", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "value", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "value", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config["checkpointing"],
+                        )
+                        torch.save(
+                            dataloader.state_dict(),
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        checkpointer.finalize_checkpoint(checkpoint_path)
+
+            # Logging
+            memory_tracker.snapshot_start_of_stage("Logging", dir())
+
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
+
+            del train_data
+
+            print("\n📊 Training Results:")
+            if train_results is not None:
+                print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
+            print(f"  • Value Loss: {value_results['loss'].item():.4f}")
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(
+                f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
+                flush=True,
+            )
+
+            print("\n⏱️  Timing:", flush=True)
+            total_time = timing_metrics.get("total_step_time", 0)
+
+            number_of_samples_per_step = (
+                master_config["ppo"]["num_prompts_per_step"]
+                * master_config["ppo"]["num_generations_per_prompt"]
+            )
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+
+            print(f"  • Total step time: {total_time:.2f}s", flush=True)
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k != "total_step_time":
+                    percent = (v / total_time * 100) if total_time > 0 else 0
+                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
+
+            if "global_valid_toks" in metrics:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics["global_valid_toks"] / total_time / total_num_gpus
+                    if total_time > 0
+                    else 0
+                )
+            performance_metrics = print_performance_metrics(
+                train_results if train_results is not None else value_results,
+                metrics,
+                timing_metrics,
+                master_config,
+            )
+
+            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                performance_metrics, total_steps + 1, prefix="performance"
+            )
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
+
+            # Clear mem
+            memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
+            del repeated_batch
+            del rewards
+            del metrics
+            if "val_metrics" in dir():
+                del val_metrics
+
+            timer.reset()
+            current_step += 1
+            total_steps += 1
+            if should_save_by_timeout:
+                memory_tracker.snapshot_start_of_stage("", dir())
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
             if total_steps >= max_num_steps:
+                memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -1501,6 +1888,7 @@ def ppo_train(
                 return
 
         current_epoch += 1
+        current_step = 0
 
 
 def validate(
@@ -1514,8 +1902,8 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert val_dataloader is not None or master_config["ppo"]["val_period"] == 0, (
+            "val_dataloader is None, so ppo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
