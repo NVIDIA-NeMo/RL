@@ -8,7 +8,9 @@ ppo:
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 32
+  max_num_steps: 100000
   steps_per_epoch: 4
+  policy_training_start_epoch: 0  # Skip policy training for epochs < this value (value model still trains)
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 1
@@ -71,6 +73,7 @@ loss_fn:
   use_kl_in_reward: true  # Reinforce++: add KL penalty to reward instead of loss
 
   value_loss_scale: 0.4
+  value_cliprange: 0.2  # Clip value predictions to [old ± clip] like PPO. null to disable.
 
 checkpointing:
   enabled: true
@@ -379,13 +382,12 @@ data:
 
   # dataset
   train:
-    dataset_name: OpenMathInstruct-2
-    split_validation_size: 0.05 # use 5% of the training data as validation data
-    seed: ${ppo.seed} # seed for train/validation split when split_validation_size > 0
-  validation: null
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
   # default settings for all datasets
   default:
-    prompt_file: "examples/prompts/cot.txt"
+    prompt_file: null
     system_prompt_file: null
     processor: "math_hf_data_processor"
     env_name: "math"
@@ -415,7 +417,7 @@ data:
 env:
   math:
     num_workers: 8
-    math_verify_impl: "hf_math_verify"
+    math_verify_impl: "dapo_math_verify"
 
 logger:
   log_dir: "logs"  # Base directory for all logs

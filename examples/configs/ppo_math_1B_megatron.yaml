@@ -5,11 +5,13 @@ ppo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 1
-  max_num_epochs: 32
+  max_num_epochs: 100000
+  max_num_steps: 100000
   steps_per_epoch: 4
+  policy_training_start_epoch: 0
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 1
+  val_period: 20
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
@@ -59,6 +61,7 @@ loss_fn:
   force_on_policy_ratio: false
   use_kl_in_reward: true
   value_loss_scale: 0.4
+  value_cliprange: 0.2
 
 checkpointing:
   enabled: false
@@ -81,7 +84,7 @@ policy:
   train_micro_batch_size: 4
   generation_batch_size: 64
   logprob_batch_size: ${policy.train_micro_batch_size}
-  max_total_sequence_length: 1024
+  max_total_sequence_length: 16384
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
@@ -347,16 +350,15 @@ value:
   scheduler: null
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
+  max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
   train:
-    dataset_name: OpenMathInstruct-2
-    split_validation_size: 0.05
-    seed: ${ppo.seed}
-  validation: null
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
   default:
-    prompt_file: "examples/prompts/cot.txt"
+    prompt_file: null
     system_prompt_file: null
     processor: "math_hf_data_processor"
     env_name: "math"
@@ -364,7 +366,7 @@ data:
 env:
   math:
     num_workers: 8
-    math_verify_impl: "hf_math_verify"
+    math_verify_impl: "dapo_math_verify"
 
 logger:
   log_dir: "logs"
