@@ -155,6 +155,9 @@ class GRPOConfig(TypedDict):
     calculate_advantages_on_gpu: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
+    # Epoch at which policy training begins. Value model trains from epoch 0;
+    # policy training is skipped for epochs < this value. Default 0 (train from start).
+    policy_training_start_epoch: NotRequired[int]
 
 
 class GRPOSaveState(TypedDict):
@@ -318,7 +321,10 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(loss_config["value_loss_scale"])
+    value_loss_fn = MseValueLossFn(
+        scale=loss_config["value_loss_scale"],
+        cliprange=loss_config.get("value_cliprange", None),
+    )
 
     # Validate force_on_policy_ratio
     if loss_config.get("force_on_policy_ratio", False):
@@ -1214,6 +1220,8 @@ def ppo_train(
         "max_num_epochs"
     ]  # max number of epochs to train for
     steps_per_epoch = master_config["ppo"]["steps_per_epoch"]
+    policy_training_start_epoch = master_config["ppo"].get("policy_training_start_epoch", 0)
+    max_num_steps = master_config["ppo"]["max_num_steps"]
 
     consumed_samples = grpo_save_state[
         "consumed_samples"
@@ -1255,7 +1263,8 @@ def ppo_train(
 
     # Run PPO training loop
     train_loader_iter = iter(dataloader)
-    for epoch in range(current_epoch, max_num_epochs):
+    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+        epoch = current_epoch
         metrics_logging_data = dict()
         print(f"\n{'=' * 25} Epoch {epoch + 1}/{max_num_epochs} {'=' * 25}")
 
@@ -1406,7 +1415,22 @@ def ppo_train(
                     flush=True,
                 )
 
-                if epoch > 12:
+                # Train value model first so the critic is updated before the actor,
+                # matching veRL's update ordering.
+                with timer.time("value_training_prep"):
+                    value_model.prepare_for_training()
+
+                with timer.time("value_training"):
+                    print("▶ Training value...", flush=True)
+                    value_results = value_model.train(
+                        train_data,
+                        value_loss_fn,
+                        timer=timer,
+                    )
+                    value_model.finish_training()
+
+                train_results = None
+                if epoch >= policy_training_start_epoch:
                     with timer.time("policy_training_prep"):
                         policy.prepare_for_training()
 
@@ -1420,27 +1444,23 @@ def ppo_train(
                         policy.finish_training()
                         POLICY_GENERATION_STALE = True
 
-                with timer.time("value_training_prep"):
-                    value_model.prepare_for_training()
-
-                with timer.time("value_training"):
-                    print("▶ Training value...", flush=True)
-                    value_results = value_model.train(
-                        train_data,
-                        value_loss_fn,
-                        timer=timer,
-                    )
-                    value_model.finish_training()
-
                 print(
                     f"▶ Epoch {epoch + 1}/{max_num_epochs}, Step {step + 1}/{steps_per_epoch} training results:"
                 )
 
-                if epoch > 12:
+                if train_results is not None:
                     print(f"    • Policy loss: {train_results['loss'].item():.4f}")
                 print(f"    • Value loss: {value_results['loss'].item():.4f}")
 
-            if (epoch + 1) % val_period == 0:
+            total_steps += 1
+
+            is_last_step = (total_steps >= max_num_steps) or (
+                (current_epoch + 1 == max_num_epochs)
+            )
+
+            if (val_period > 0 and (epoch + 1) % val_period == 0) or (
+                val_at_end and is_last_step
+            ):
                 with timer.time("validation"):
                     print("▶ Validating...", flush=True)
 
@@ -1458,7 +1478,7 @@ def ppo_train(
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        step=epoch + 1,
+                        step=total_steps,
                         master_config=master_config,
                         logger=logger,
                     )
@@ -1466,12 +1486,21 @@ def ppo_train(
 
                     logger.log_metrics(
                         validation_timings,
-                        current_epoch + 1,
+                        total_steps,
                         prefix="timing/validation",
                     )
                     logger.log_metrics(
-                        val_metrics, current_epoch + 1, prefix="validation"
+                        val_metrics, total_steps, prefix="validation"
                     )
+
+            if total_steps >= max_num_steps:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
+
+        current_epoch += 1
 
 
 def validate(

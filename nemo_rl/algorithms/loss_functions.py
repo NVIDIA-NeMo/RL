@@ -61,6 +61,10 @@ class ClippedPGLossConfig(TypedDict):
     force_on_policy_ratio: NotRequired[bool]
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: NotRequired[bool]
+    # Clip range for value function loss. If set, value predictions are clipped
+    # to [old_values - clip, old_values + clip] and the loss is max(unclipped, clipped).
+    # Set to None or 0 to disable (plain MSE). Typical value: 0.2.
+    value_cliprange: NotRequired[float | None]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -1266,10 +1270,18 @@ class DistillationLossFn(LossFunction):
 
 
 class MseValueLossFn(LossFunction):
-    """Mean Squared Error value loss function."""
+    """Mean Squared Error value loss function with optional clipping (PPO-style).
 
-    def __init__(self, scale: float = 1.0):
+    When ``cliprange`` is set, value predictions are clipped to
+    ``[old_values - cliprange, old_values + cliprange]`` and the loss is
+    ``0.5 * max(mse(vpred, returns), mse(vpred_clipped, returns))``.
+    This prevents the value function from changing too drastically in a
+    single update, mirroring the policy ratio clipping in PPO.
+    """
+
+    def __init__(self, scale: float = 1.0, cliprange: float | None = None):
         self.scale = scale
+        self.cliprange = cliprange
         self.loss_type = LossType.TOKEN_LEVEL
 
     def __call__(
@@ -1279,28 +1291,43 @@ class MseValueLossFn(LossFunction):
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute Mean Squared Error value loss."""
+        """Compute Mean Squared Error value loss, optionally with clipping."""
 
         # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
         if values.ndim > 2 and values.shape[-1] == 1:
             values = values.squeeze(-1)
 
-
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
-
         returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
 
-        loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
-
-        loss = self.scale * masked_mean(
-            loss,
-            token_mask * sample_mask.unsqueeze(-1),
-            global_normalization_factor=global_valid_toks,
-        )
+        if self.cliprange and self.cliprange > 0:
+            old_values = data["values"]
+            vpred_clipped = torch.clamp(
+                values,
+                old_values - self.cliprange,
+                old_values + self.cliprange,
+            )
+            vf_losses_unclipped = (values - returns) ** 2
+            vf_losses_clipped = (vpred_clipped - returns) ** 2
+            vf_losses = torch.max(vf_losses_unclipped, vf_losses_clipped)
+            loss = 0.5 * self.scale * masked_mean(
+                vf_losses, mask, global_normalization_factor=global_valid_toks,
+            )
+            vf_clipfrac = masked_mean(
+                (vf_losses_clipped > vf_losses_unclipped).float(), mask,
+            ).item()
+        else:
+            loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
+            loss = self.scale * masked_mean(
+                loss, mask, global_normalization_factor=global_valid_toks,
+            )
+            vf_clipfrac = 0.0
 
         metrics = {
             "loss": float(loss.item()),
+            "vf_clipfrac": vf_clipfrac,
             "num_valid_samples": int(values.shape[0]),
         }
 
