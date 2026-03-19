@@ -24,6 +24,7 @@ policy:
         rms_norm: te
         enable_deepep: true
         fake_balanced_gate: false
+        rope_fusion: false
         enable_hf_state_dict_adapter: true
         enable_fsdp_optimizations: false
         gate_precision: float64
