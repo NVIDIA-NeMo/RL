@@ -669,6 +669,7 @@ def build_unwrapped_draft_model(
 
     model_name = draft_config.get("model_name")
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    draft_num_layers = draft_config.get("num_layers")
     config = TransformerConfig(
         normalization="RMSNorm",
         activation_func=torch.nn.functional.silu,
@@ -684,7 +685,11 @@ def build_unwrapped_draft_model(
         bf16=model_provider.bf16,
         params_dtype=model_provider.params_dtype,
         pipeline_dtype=model_provider.pipeline_dtype,
-        num_layers=hf_config.get("num_hidden_layers", 1),
+        num_layers=(
+            hf_config.get("num_hidden_layers", 1)
+            if model_name is not None
+            else draft_num_layers or 1
+        ),
         ffn_hidden_size=hf_config.get(
             "intermediate_size", model_provider.ffn_hidden_size
         ),
@@ -732,9 +737,14 @@ def build_unwrapped_draft_model(
     )
     config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
     config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
-    config.eagle_aux_hidden_state_layer_ids = hf_config.get(
-        "eagle_aux_hidden_state_layer_ids", []
-    )
+    if model_name is not None:
+        config.eagle_aux_hidden_state_layer_ids = hf_config.get(
+            "eagle_aux_hidden_state_layer_ids", []
+        )
+    else:
+        config.eagle_aux_hidden_state_layer_ids = (
+            draft_config.get("aux_layer_indices") or []
+        )
     if (
         config.use_aux_hidden_state
         and len(config.eagle_aux_hidden_state_layer_ids) == 0
@@ -800,10 +810,10 @@ def _create_draft_pre_wrap_hook(
     *,
     preload_policy_from_pretrained: bool,
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
-    draft_cfg = policy_cfg.get("draft", {}) or {}
+    draft_cfg = policy_cfg["draft"]
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
-        if not draft_cfg.get("enabled", False):
+        if not draft_cfg["enabled"]:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -913,7 +923,7 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
-    draft_cfg = policy_cfg.get["draft"]
+    draft_cfg = policy_cfg["draft"]
     draft_enabled = draft_cfg["enabled"]
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None

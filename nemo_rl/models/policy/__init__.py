@@ -258,9 +258,9 @@ class DraftConfig(TypedDict):
     """Configuration for Eagle draft-model training alongside the policy model."""
 
     enabled: Literal[True]
-    model_name: str
+    model_name: NotRequired[str | None]
     loss_weight: NotRequired[float]
-    num_layers: NotRequired[int]
+    num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
 
 
