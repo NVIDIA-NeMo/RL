@@ -15,9 +15,7 @@
 import types
 from contextlib import ExitStack, contextmanager
 
-import modelopt.torch.quantization as mtq
 import torch
-import torch.nn as nn
 import vllm  # noqa: F401
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
@@ -27,42 +25,29 @@ from nemo_rl.models.generation.vllm.vllm_backend import VllmInternalWorkerExtens
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
-        """Temporarily patches model.named_parameters() to also yield named_buffers().
+        """Temporarily patches model.named_parameters() to also yield input_quantizer buffers.
 
-        This allows vLLM's load_weights (which typically iterates named_parameters)
-        to discover and load into buffers (like amax) as if they were parameters.
-        Also attaches a default weight_loader to buffers so they can be loaded.
+        Weights arrive pre-folded from the Megatron side, so only input_quantizer
+        amax buffers need to be loaded. Weight quantizer buffers are skipped.
         """
-        print("patching named parameters to include buffers")
         original_named_parameters = model.named_parameters
         buffers_with_loader = []
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
             param.copy_(torch.max(param, loaded_weight))
 
-        def weight_amax_loader(param, loaded_weight, *args, **kwargs):
-            if param.numel() == 1:
-                param.copy_(torch.max(param, loaded_weight))
-            else:
-                raise ValueError("Now only tensor-wise quantization is supported.")
-
         def new_named_parameters(self, *args, **kwargs):
             yield from original_named_parameters(*args, **kwargs)
             for name, buf in self.named_buffers(*args, **kwargs):
-                if "_quantizer" not in name:
+                if "input_quantizer" not in name:
                     continue
                 if not hasattr(buf, "weight_loader"):
-                    if "input_quantizer" in name:
-                        buf.weight_loader = input_amax_loader
-                    elif "weight_quantizer" in name:
-                        buf.weight_loader = weight_amax_loader
-                    # print("buf", name, buf.shape)
+                    buf.weight_loader = input_amax_loader
                     buffers_with_loader.append(buf)
                 yield name, buf
 
         model.named_parameters = types.MethodType(new_named_parameters, model)
         try:
-            # print("calling patch named parameters to include buffers")
             yield
         finally:
             model.named_parameters = original_named_parameters
@@ -70,33 +55,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 if hasattr(buf, "weight_loader"):
                     del buf.weight_loader
 
-    @contextmanager
-    def _fold_weight(self, model: nn.Module):
-        """Enable quantizers and fold weight after loading weights."""
-        print("folding weight context")
-        if hasattr(model, "unwrap"):
-            model = model.unwrap()
-
-        try:
-            for _, module in model.named_modules():
-                if (
-                    isinstance(module, TensorQuantizer)
-                    and hasattr(module, "_is_active")
-                    and module._is_active
-                ):
-                    # print(f"enabling quantizer: {module}")
-                    module.enable()
-            yield
-        finally:
-            mtq.fold_weight(model, keep_attrs=True)
-
     def _load_weights(self, weights):
-        """Load weights and fold weight after loading weights."""
+        """Load pre-folded weights and input_quantizer amax buffers.
+
+        Weights arrive already folded from the Megatron side (weight_quantizer
+        applied during export), so no fold_weight step is needed here.
+        """
         with ExitStack() as contexts:
-            contexts.enter_context(self._fold_weight(self.model_runner.model))
-            # we need to patch the children of the root model
-            # For LLM: model.model
-            # For VLM: model.language_model, model.vision_model, etc.
             for _, child in self.model_runner.model.named_children():
                 contexts.enter_context(
                     self._patch_named_parameters_to_include_buffers(child)

@@ -20,6 +20,7 @@ from typing import Generator
 
 import modelopt.torch.quantization as mtq
 import ray
+import torch
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
@@ -342,3 +343,68 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """Save the checkpoint."""
         with self.without_model_config():
             return super().save_checkpoint(*args, **kwargs)
+
+    @torch.no_grad()
+    def prepare_refit_info(self):
+        """Prepare refit info, excluding weight_quantizer amax.
+
+        Weight quantizer amax is consumed on the Megatron side via pre-folding,
+        so only input_quantizer amax needs to be transferred to vLLM.
+        Uses the parent's iterator (without folding) since metadata is shape/dtype only.
+        """
+        self.refit_param_info_mcore = self._calculate_refit_param_info()
+
+        refit_param_info_hf = {}
+        for name, tensor in super()._iter_params_with_optional_kv_scales():
+            if "weight_quantizer" in name:
+                continue
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+        return refit_param_info_hf
+
+    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+        """Pre-fold weights on-the-fly via lazy proxy tasks.
+
+        Wraps each conversion task so that reading task.param_weight returns
+        weight_quantizer(weight) instead of the raw weight. The folded tensor
+        is computed lazily when export_hf_weights accesses it, so only one
+        extra weight-sized tensor exists at a time — O(1) extra memory.
+        """
+
+        class _FoldedTask:
+            """Proxy that applies weight_quantizer(param_weight) on access."""
+
+            def __init__(self, task, wq):
+                self._task = task
+                self._wq = wq
+
+            @property
+            def param_weight(self):
+                w = self._task.param_weight
+                if w is None:
+                    return None
+                return self._wq(w.float()).to(w.dtype)
+
+            def __getattr__(self, name):
+                return getattr(self._task, name)
+
+        folded_tasks = []
+        for task in self.refit_conversion_tasks:
+            wq = getattr(task.megatron_module, "weight_quantizer", None)
+            if (
+                isinstance(wq, TensorQuantizer)
+                and wq.is_enabled
+                and task.param_weight is not None
+            ):
+                folded_tasks.append(_FoldedTask(task, wq))
+            else:
+                folded_tasks.append(task)
+
+        original_tasks = self.refit_conversion_tasks
+        self.refit_conversion_tasks = folded_tasks
+        try:
+            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+                if "weight_quantizer" in name:
+                    continue
+                yield name, tensor
+        finally:
+            self.refit_conversion_tasks = original_tasks

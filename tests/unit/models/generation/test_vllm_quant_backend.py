@@ -88,6 +88,8 @@ def _make_megatron_config(vllm_config):
     cfg["quant_cfg"] = _QUANT_CFG
     cfg["quant_calib_size"] = 1
     cfg["quant_calib_data"] = "random"
+    cfg["quant_batch_size"] = 1
+    cfg["quant_sequence_length"] = 128
     cfg["generation"] = vllm_config
     return cfg
 
@@ -109,11 +111,12 @@ def cluster():
 @requires_quant
 @pytest.mark.parametrize("async_engine", [False, True], ids=["sync", "async"])
 def test_vllm_quant_refit(cluster, async_engine):
-    """Integration test: quantized Megatron -> vLLM refit should load amax and fold weights.
+    """Integration test: quantized Megatron -> vLLM refit should transfer pre-folded weights.
 
     Uses is_eval=True so vLLM loads real HF weights at init, allowing us
-    to verify that fold_weight introduces FP8 quantization error (the only
-    source of weight change when both sides load from the same checkpoint).
+    to verify that pre-folded weights (with FP8 quantization applied on
+    the Megatron side) differ from the original HF weights by a small
+    quantization error.
     """
     tokenizer = get_tokenizer({"name": _MODEL_NAME})
     vllm_config = _make_vllm_config(tokenizer, async_engine=async_engine)
@@ -155,7 +158,7 @@ def test_vllm_quant_refit(cluster, async_engine):
                 f"Megatron rank {rank}: {stats['with_amax'] - stats['positive_amax']} quantizers have non-positive amax"
             )
 
-        # Refit: transfer weights + amax from Megatron to vLLM, then fold_weight applies FP8
+        # Refit: transfer pre-folded weights + input_quantizer amax from Megatron to vLLM
         state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
         refit_policy_generation(
@@ -171,19 +174,19 @@ def test_vllm_quant_refit(cluster, async_engine):
                 f"vLLM rank {rank}: expected positive amax after refit, got {stats['positive_amax']}"
             )
 
-        # Verify fold_weight changed the weights (FP8 quantization error)
+        # Verify pre-folded weights differ from original HF weights (FP8 quantization error)
         futures = vllm_policy.worker_group.run_all_workers_single_data(
             "get_weight_snapshot", name=_PROBE_WEIGHT
         )
         weight_after = ray.get(futures)[0]
 
         assert not torch.equal(weight_before, weight_after), (
-            "Weights are bit-identical before and after refit -- fold_weight had no effect"
+            "Weights are bit-identical before and after refit -- pre-folding had no effect"
         )
         max_diff = (weight_before - weight_after).abs().max().item()
-        print(f"fold_weight max abs diff: {max_diff:.6e}")
+        print(f"refit weight max abs diff: {max_diff:.6e}")
         assert torch.allclose(weight_before, weight_after, atol=0.1, rtol=0.0), (
-            f"Weights diverged too much after fold (max diff={max_diff:.6e}), "
+            f"Weights diverged too much after refit (max diff={max_diff:.6e}), "
             "expected small FP8 quantization error"
         )
     finally:
