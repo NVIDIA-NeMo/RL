@@ -783,6 +783,7 @@ def build_unwrapped_draft_model(
 
 
 def _find_draft_owner_chunk(model: list[MegatronModule]) -> MegatronModule | None:
+    """Return the post-process chunk that should own the nested draft model."""
     for model_chunk in reversed(model):
         if getattr(model_chunk, "post_process", False):
             return model_chunk
@@ -795,6 +796,7 @@ def _find_draft_owner_chunk(model: list[MegatronModule]) -> MegatronModule | Non
 
 
 def _get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | None:
+    """Find an already attached draft model after Megatron wrapping has been applied."""
     for model_chunk in reversed(model):
         unwrapped_chunk = unwrap_model(model_chunk)
         draft_model = getattr(unwrapped_chunk, "draft_model", None)
@@ -810,9 +812,11 @@ def _create_draft_pre_wrap_hook(
     *,
     preload_policy_from_pretrained: bool,
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
     draft_cfg = policy_cfg["draft"]
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        """Optionally preload the base policy, then attach the draft module to the owner chunk."""
         if not draft_cfg["enabled"]:
             return model
 

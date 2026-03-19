@@ -30,6 +30,7 @@ from torch import Tensor
 
 
 def build_default_causal_attention_mask(seq_len: int, device: torch.device) -> Tensor:
+    """Build a standard causal mask in Megatron's `[batch, heads, q, k]` layout."""
     return torch.triu(
         torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device=device),
         diagonal=1,
