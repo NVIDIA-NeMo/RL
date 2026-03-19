@@ -75,7 +75,7 @@ class HeadNodeHCPScheduler:
         # Fallback calculation if not provided (for standalone usage)
         if hcp_config.max_seqlen_per_dp_cp_rank is None:
             self.max_seqlen_per_dp_cp_rank = max_seq_len // cp_size
-            logger.warning(
+            print(
                 f"HCP: max_seqlen_per_dp_cp_rank not provided in config. "
                 f"Calculated as {self.max_seqlen_per_dp_cp_rank} "
                 f"(max_seq_len={max_seq_len} // cp_size={cp_size}). "
@@ -92,7 +92,7 @@ class HeadNodeHCPScheduler:
             dp_cp_group=mock_dp_cp_group,
         )
 
-        logger.info(
+        print(
             f"HCP Scheduler initialized: dp_size={dp_size}, cp_size={cp_size}, "
             f"hdp_size={self.hdp_size}, max_seqlen_per_dp_cp_rank={self.max_seqlen_per_dp_cp_rank}"
         )
@@ -137,16 +137,22 @@ class HeadNodeHCPScheduler:
         # Create (sample_id, seq_len) tuples
         sample_id_seqlens = [(i, seq_len) for i, seq_len in enumerate(seq_lengths)]
 
-        logger.info(
-            f"HCP: Scheduling {len(seq_lengths)} samples across {self.hdp_size} DP×CP ranks"
-        )
+        # print(
+        #     f"HCP: Scheduling {len(seq_lengths)} samples across {self.hdp_size} DP×CP ranks"
+        # )
 
         # Run the scheduler
         groups, sample_id_groups = self.scheduler.get_groups_and_subsamples(
             sample_id_seqlens, self.hcp_config
         )
 
-        logger.info(f"HCP: Created {len(groups)} microbatch groups")
+        # print(f"HCP: Created {len(groups)} microbatch groups")
+
+        # Print sample_id_groups structure for debugging distribution
+        # print(f"HCP: sample_id_groups structure (num_rounds={len(sample_id_groups)}, hdp_size={self.hdp_size}):")
+        # for round_idx, round_assignments in enumerate(sample_id_groups):
+        #     samples_per_rank = [len(sample_ids) for sample_ids in round_assignments]
+        #     print(f"  Round {round_idx}: samples per rank = {samples_per_rank}, total = {sum(samples_per_rank)}")
 
         return groups, sample_id_groups
 
@@ -197,7 +203,7 @@ class HeadNodeHCPScheduler:
                 f"Missing sample IDs: {list(missing)[:10]}..."
             )
 
-        logger.info(
+        print(
             f"HCP: Assigned {num_samples} samples to {self.hdp_size} DP×CP ranks. "
             f"CP sizes range: {min(sample_local_cp_size)}-{max(sample_local_cp_size)}"
         )
@@ -223,6 +229,17 @@ class HeadNodeHCPScheduler:
             We don't attach local_cp_size per sample here since Megatron-LM's
             hybrid_context_parallel_forward_backward calculates it from sample_id_groups.
         """
+        # Log input data info
+        # print(f"HCP: Sharding data - total samples: {data.size}")
+        if "input_lengths" in data:
+            input_lengths = data["input_lengths"]
+            # if torch.is_tensor(input_lengths):
+            #     print(f"HCP: Input sequence lengths: {input_lengths.tolist()}")
+            # else:
+            #     print(f"HCP: Input sequence lengths: {list(input_lengths)}")
+        # if "input_ids" in data:
+        #     print(f"HCP: Input input_ids shape: {data['input_ids'].shape}")
+
         # Create shards - one per DP×CP rank
         # Each shard will contain all samples assigned to that rank across all rounds
         sharded_data: List[List[BatchedDataDict]] = [[] for _ in range(self.hdp_size)]
@@ -244,6 +261,8 @@ class HeadNodeHCPScheduler:
                 # This rank has no samples - create empty shard
                 shard = SlicedDataDict()
                 shard["sample_id_groups"] = sample_id_groups
+                shard["shard_sample_ids"] = []  # Empty list for empty shard
+                # print(f"HCP: Shard {hdp_rank} (hdp_rank) has 0 samples")
             else:
                 shard = SlicedDataDict.from_batches(sharded_data[hdp_rank])
 
@@ -253,11 +272,28 @@ class HeadNodeHCPScheduler:
                 # 2. Coordinate barriers between groups
                 shard["sample_id_groups"] = sample_id_groups
 
-            aggregated_shards.append(shard)
+                # Add the list of global sample IDs in this shard
+                # This is needed by HCPDataIterator to create a dict with sample IDs as keys
+                shard["shard_sample_ids"] = shard_sample_ids[hdp_rank]
 
-            logger.debug(
-                f"HCP: Shard {hdp_rank} has {len(shard_sample_ids[hdp_rank])} samples"
-            )
+                # Log shard details
+                shard_input_lengths = shard.get("input_lengths", None)
+                if shard_input_lengths is not None:
+                    if torch.is_tensor(shard_input_lengths):
+                        lengths_list = shard_input_lengths.tolist()
+                    else:
+                        lengths_list = list(shard_input_lengths)
+                    # print(
+                    #     f"HCP: Shard {hdp_rank} (hdp_rank) has {len(shard_sample_ids[hdp_rank])} samples: "
+                    #     f"global_ids={shard_sample_ids[hdp_rank]}, seq_lengths={lengths_list}"
+                    # )
+                else:
+                    print(
+                        f"HCP: Shard {hdp_rank} (hdp_rank) has {len(shard_sample_ids[hdp_rank])} samples: "
+                        f"global_ids={shard_sample_ids[hdp_rank]}"
+                    )
+
+            aggregated_shards.append(shard)
 
         return aggregated_shards
 
@@ -277,6 +313,37 @@ class HeadNodeHCPScheduler:
         Returns:
             List of SlicedDataDict, one per DP×CP rank, with HCP metadata
         """
+        # Step 0: Validate batch size consistency across all keys
+        batch_sizes = set()
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                batch_sizes.add(v.shape[0])
+            elif isinstance(v, list):
+                batch_sizes.add(len(v))
+
+        if len(batch_sizes) > 1:
+            # Get detailed information about which keys have which sizes
+            size_info = {}
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    size = v.shape[0]
+                elif isinstance(v, list):
+                    size = len(v)
+                else:
+                    continue
+                if size not in size_info:
+                    size_info[size] = []
+                size_info[size].append(k)
+
+            error_msg = "HCP: Inconsistent batch sizes detected in input data:\n"
+            for size, keys in sorted(size_info.items()):
+                error_msg += f"  Size {size}: {keys}\n"
+            error_msg += (
+                "\nThis likely indicates a data preparation mismatch. "
+                "Ensure all data tensors have the same batch size before calling HCP scheduler."
+            )
+            raise ValueError(error_msg)
+
         # Step 1: Extract sequence lengths
         seq_lengths = self.extract_sequence_lengths(data, seq_length_key)
 

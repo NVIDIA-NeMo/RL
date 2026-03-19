@@ -192,6 +192,7 @@ class MegatronConfig(TypedDict):
     # Use 'flex' when using DeepEP
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
+    attention_backend: NotRequired[str]
     moe_shared_expert_overlap: bool
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig

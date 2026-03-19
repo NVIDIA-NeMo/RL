@@ -42,6 +42,7 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.policy.hcp_data_iterator import HCPGroupedSamples
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +116,6 @@ def log_sequence_length_distribution(
         f"[SeqPacking] {worker_info} | "
         f"Sequence length distribution (total={total_seqs}): {dist_str}"
     )
-
-    print(f"[SeqPacking] {worker_info} | cu_seqlens_padded: {cu_seqlens_padded.cpu().tolist()} | "
-        f"Sequence length distribution (total={total_seqs}): {dist_str}")
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -342,34 +340,36 @@ def _pad_sample_for_cp(
     if sequence_parallel:
         pad_factor *= tp_size
 
-    # Calculate padded length
+    # Calculate required length based on the actual (unpadded) sequence length.
     padded_length = ((seq_length + pad_factor - 1) // pad_factor) * pad_factor
 
-    if padded_length == seq_length:
-        # No padding needed
-        return input_ids
-
-    # Apply padding
+    # The input tensor may already be batch-padded to a different length.
+    # Always return a tensor of exactly padded_length, truncating batch padding
+    # when it overshoots and appending pad tokens when it undershoots.
     if input_ids.dim() == 1:
-        # Shape: [seqlen] -> [padded_length]
-        padding_size = padded_length - seq_length
-        padded_input_ids = torch.nn.functional.pad(
-            input_ids,
-            (0, padding_size),
-            mode='constant',
-            value=pad_token_id
-        )
+        current_len = input_ids.shape[0]
+        if current_len == padded_length:
+            return input_ids
+        elif current_len > padded_length:
+            # Batch-padding pushed the tensor past the CP-aligned boundary; trim it.
+            return input_ids[:padded_length]
+        else:
+            padding_size = padded_length - current_len
+            return torch.nn.functional.pad(
+                input_ids, (0, padding_size), mode='constant', value=pad_token_id
+            )
     else:
         # Shape: [1, seqlen] -> [1, padded_length]
-        padding_size = padded_length - input_ids.shape[1]
-        padded_input_ids = torch.nn.functional.pad(
-            input_ids,
-            (0, padding_size),
-            mode='constant',
-            value=pad_token_id
-        )
-
-    return padded_input_ids
+        current_len = input_ids.shape[1]
+        if current_len == padded_length:
+            return input_ids
+        elif current_len > padded_length:
+            return input_ids[:, :padded_length]
+        else:
+            padding_size = padded_length - current_len
+            return torch.nn.functional.pad(
+                input_ids, (0, padding_size), mode='constant', value=pad_token_id
+            )
 
 
 def _get_pack_sequence_parameters_for_megatron(
@@ -518,6 +518,7 @@ def forward_step_arbitrary_loss(
     defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
+    step_counter: Optional[list] = None,
 ):
     """Forward training step with support for packed sequences and context parallelism.
 
@@ -546,102 +547,107 @@ def forward_step_arbitrary_loss(
     straggler_timer = state.straggler_timer
 
     with straggler_timer(bdata=True):
-        data_dict = next(data_iterator).to("cuda")
-        input_ids = data_dict["input_ids"]
+        raw_data = next(data_iterator)
+
         attention_mask = None
         position_ids = None
         packed_seq_params = None
-
-        original_batch_size = input_ids.shape[0]
-        original_seq_length = input_ids.shape[1]
-        seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
-        cp_size_for_normalization = None  # Track CP size for loss normalization
+        cp_size_for_normalization = None
+        hcp_cp_group = None  # Per-sample CP group in HCP mode; None means use global CP group
 
-        if pack_sequences:
-            # For packed sequences with padded input, we need sequence lengths
+        if isinstance(raw_data, HCPGroupedSamples):
+            # HCP mode: pack all samples in the group into a single forward pass.
+            # raw_data.samples is a list of BatchedDataDict (one per sample in the group).
+            # raw_data.local_cp_size is the CP size assigned to this group by the HCP scheduler.
+            from megatron.core.utils import get_batch_on_this_hybrid_cp_rank
+            from megatron.core import parallel_state as mcore_parallel_state
+
+            assert pack_sequences, (
+                "HCP mode requires pack_sequences=True"
+            )
             assert seq_length_key is not None, (
-                "seq_length_key must be provided for packed sequences"
-            )
-            assert seq_length_key in data_dict, (
-                f"{seq_length_key} not found in data_dict"
+                "seq_length_key must be provided for HCP packing"
             )
 
-            # Get sequence lengths and context parallel size
-            seq_lengths = data_dict[seq_length_key]
+            samples = [s.to("cuda") for s in raw_data.samples]
+            local_cp_size = raw_data.local_cp_size
 
-            # Check if Hybrid Context Parallelism is enabled
-            # In HCP mode, Megatron's _get_new_data_iterator attaches local_cp_size to each sample
-            local_cp_size_tensor = data_dict.get("local_cp_size", None)
+            # Stack all per-sample BatchedDataDicts along the batch dimension.
+            # This gives data_dict["input_ids"] shape [num_samples, max_seq_len] which
+            # SequencePackingLossWrapper then slices per-sequence for loss computation.
+            data_dict = BatchedDataDict.from_batches(samples)
 
-            if local_cp_size_tensor is not None:
-                # HCP mode: Pad sample based on its local_cp_size, then use get_batch_on_this_hybrid_cp_rank
-                from megatron.core.utils import get_batch_on_this_hybrid_cp_rank
-                from megatron.core import parallel_state
+            input_ids = data_dict["input_ids"]   # [num_samples, max_seq_len]
+            seq_lengths = data_dict[seq_length_key]  # [num_samples]
+            original_batch_size = input_ids.shape[0]
+            original_seq_length = input_ids.shape[1]
 
-                local_cp_size = int(local_cp_size_tensor.item())
+            # Each sample's tokens must be padded to a multiple of (local_cp_size * 2)
+            # so that get_batch_on_this_hybrid_cp_rank can shard evenly across CP ranks.
+            # Additionally account for sequence-parallel (SP) requirements if enabled.
+            tp_size = get_tensor_model_parallel_world_size()
+            sequence_parallel = get_context_parallel_world_size() > 1
+            pad_individual_seqs_hcp = local_cp_size * 2
+            if sequence_parallel:
+                pad_individual_seqs_hcp *= tp_size
 
-                # Get actual sequence length for this sample
-                if seq_lengths.dim() == 0:
-                    # Scalar tensor
-                    actual_seq_len = int(seq_lengths.item())
-                elif seq_lengths.dim() == 1 and seq_lengths.shape[0] == 1:
-                    # Single element tensor
-                    actual_seq_len = int(seq_lengths[0].item())
-                else:
-                    # Assume first element if batch
-                    actual_seq_len = int(seq_lengths[0].item())
+            # Pack all samples into a single [1, T] tensor using _pack_sequences_for_megatron
+            # with cp_size=1 (no CP sharding here — that is done by get_batch_on_this_hybrid_cp_rank).
+            (
+                all_input_ids,       # [1, T] — packed tokens (per-seq CP-padded, not sharded)
+                _,                   # same as all_input_ids since cp_size=1
+                _,                   # packed_seq_params placeholder (rebuilt below)
+                cu_seqlens,
+                cu_seqlens_padded,
+            ) = _pack_sequences_for_megatron(
+                input_ids,
+                seq_lengths,
+                pad_individual_seqs_to_multiple_of=pad_individual_seqs_hcp,
+                pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                pad_packed_seq_to=pad_full_seq_to,
+                cp_rank=0,
+                cp_size=1,
+            )
 
-                # Pad the sample based on local_cp_size
-                tp_size = get_tensor_model_parallel_world_size()
-                sequence_parallel = get_context_parallel_world_size() > 1
+            max_seqlen = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().to(dtype=torch.int32)
 
-                # Ensure input_ids is in correct format for padding
-                if input_ids.dim() == 2 and input_ids.shape[0] == 1:
-                    # [1, seqlen] format - squeeze to [seqlen]
-                    tokens = input_ids.squeeze(0)
-                else:
-                    tokens = input_ids
+            # get_batch_on_this_hybrid_cp_rank expects tokens as 1D [T];
+            # it stacks to [1, T] internally before calling get_thd_batch_on_this_cp_rank.
+            cp_group = mcore_parallel_state.get_hybrid_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
+            batch_for_this_rank, packed_seq_params = get_batch_on_this_hybrid_cp_rank(
+                batch={"tokens": all_input_ids.squeeze(0)},
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens_padded,
+                max_seqlen=max_seqlen,
+                local_cp_size=local_cp_size,
+                cp_group=cp_group,
+            )
 
-                # Pad the tokens
-                padded_tokens = _pad_sample_for_cp(
-                    tokens,
-                    actual_seq_len,
-                    local_cp_size,
-                    tp_size,
-                    sequence_parallel,
-                    pad_token_id=0,
+            hcp_cp_group = packed_seq_params.cp_group
+            input_ids_cp_sharded = batch_for_this_rank["tokens"]  # [1, T // local_cp_size]
+            cp_size_for_normalization = local_cp_size
+
+        else:
+            # Standard path: raw_data is a BatchedDataDict
+            data_dict = raw_data.to("cuda")
+            input_ids = data_dict["input_ids"]
+            original_batch_size = input_ids.shape[0]
+            original_seq_length = input_ids.shape[1]
+
+            if pack_sequences:
+                assert seq_length_key is not None, (
+                    "seq_length_key must be provided for packed sequences"
+                )
+                assert seq_length_key in data_dict, (
+                    f"{seq_length_key} not found in data_dict"
                 )
 
-                # Prepare batch dict for get_batch_on_this_hybrid_cp_rank
-                batch_dict = {"tokens": padded_tokens}
+                seq_lengths = data_dict[seq_length_key]
 
-                # Get the HCP process group for this CP size
-                cp_group = None
-                if local_cp_size > 1:
-                    cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
-                        group_size=local_cp_size
-                    )
-
-                # Call get_batch_on_this_hybrid_cp_rank - returns (batch, packed_seq_params)
-                batch_for_this_rank, packed_seq_params = get_batch_on_this_hybrid_cp_rank(
-                    batch=batch_dict,
-                    local_cp_size=local_cp_size,
-                    cp_group=cp_group,
-                )
-
-                # Extract the CP-sharded tokens
-                input_ids_cp_sharded = batch_for_this_rank["tokens"]
-
-                # Store local_cp_size for loss normalization
-                cp_size_for_normalization = local_cp_size
-
-                # Extract cu_seqlens_padded from packed_seq_params for logging
-                if packed_seq_params is not None:
-                    cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
-            else:
-                # Use standard sequence packing without HCP
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -657,38 +663,20 @@ def forward_step_arbitrary_loss(
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
-
-                # Use global CP size for loss normalization
                 cp_size_for_normalization = get_context_parallel_world_size()
 
-            # Log sequence packing information
-            # if int(get_context_parallel_rank()) == 0 and int(get_tensor_model_parallel_rank()) == 0:
-            #     max_seq_len = pad_full_seq_to if pad_full_seq_to is not None else original_seq_length
-            #     print(f"Forward step: Trying to log")
-            #     log_sequence_length_distribution(
-            #         cu_seqlens_padded,
-            #         max_seq_len=max_seq_len,
-            #         num_bins=5,
-            #     )
-
-            # For packed sequences, position_ids and attention_mask are typically None
-            # The PackedSeqParams handles all necessary sequence information
-            position_ids = None
-            attention_mask = None
-        else:
-            # Non-packed sequences
-            input_ids_cp_sharded = input_ids
-            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
-                eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
-                reset_position_ids=False,
-                reset_attention_mask=False,
-                eod_mask_loss=False,
-                pad_mask_loss=False,
-            )
-            # Use global CP size for normalization in non-packed mode
-            if cp_size_for_normalization is None:
+            else:
+                # Non-packed sequences
+                input_ids_cp_sharded = input_ids
+                attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+                    data=input_ids,
+                    eod_token=0,  # used for loss_mask, which we don't use
+                    pad_token=0,  # used for loss_mask, which we don't use
+                    reset_position_ids=False,
+                    reset_attention_mask=False,
+                    eod_mask_loss=False,
+                    pad_mask_loss=False,
+                )
                 cp_size_for_normalization = get_context_parallel_world_size()
 
     multimodal_data = data_dict.get_multimodal_dict(
@@ -705,7 +693,11 @@ def forward_step_arbitrary_loss(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
+    if step_counter is not None:
+        step_counter[0] += 1
+
     with straggler_timer:
+        torch.cuda.nvtx.range_push("forward_step/model_forward")
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
@@ -713,6 +705,7 @@ def forward_step_arbitrary_loss(
             **additional_kwargs,
             **multimodal_data,
         )
+        torch.cuda.nvtx.range_pop()
 
         # Apply temperature scaling to logits for training
         # This matches the dtensor worker's _apply_temperature_scaling in the train method
@@ -741,7 +734,10 @@ def forward_step_arbitrary_loss(
         global_valid_toks=global_valid_toks,
         vocab_parallel_rank=get_tensor_model_parallel_rank(),
         vocab_parallel_group=get_tensor_model_parallel_group(),
-        context_parallel_group=get_context_parallel_group(),
+        # In HCP mode use the per-sample cp_group (sized local_cp_size) so that
+        # from_parallel_logits_to_logprobs gathers across the right ranks and
+        # SequencePackingLossWrapper slices the logit tensor correctly.
+        context_parallel_group=hcp_cp_group if hcp_cp_group is not None else get_context_parallel_group(),
     )
 
     if cp_normalize:

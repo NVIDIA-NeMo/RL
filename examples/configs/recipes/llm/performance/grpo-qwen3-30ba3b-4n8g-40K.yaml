@@ -1,7 +1,7 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 32
-  num_generations_per_prompt: 16
+  num_generations_per_prompt: 32
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g
@@ -18,7 +18,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
     sequence_parallel: true
@@ -36,8 +36,8 @@ policy:
     moe_token_dispatcher_type: flex
     moe_shared_expert_overlap: false
   hybrid_cp:
-    enabled: true
-    max_seqlen_per_dp_cp_rank: 5120
+    enabled: false
+    max_seqlen_per_dp_cp_rank: 7168
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
