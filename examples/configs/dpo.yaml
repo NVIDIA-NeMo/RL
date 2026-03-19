@@ -147,7 +147,7 @@ policy:
       lora_A_init_method: "xavier"
       lora_B_init_method: "zero"
       a2a_experimental: false
-      lora_dtype: None
+      lora_dtype: null
 
     optimizer:
       optimizer: "adam"
