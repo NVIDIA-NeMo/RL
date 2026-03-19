@@ -96,6 +96,7 @@ class ValueHead(torch.nn.Module):
 
     def __init__(self, hidden_size: int, dtype: torch.dtype):
         super().__init__()
+        self.dtype = dtype
         self.linear = torch.nn.Linear(hidden_size, 1, bias=False)
         self.linear.to(dtype=dtype)
 
@@ -108,7 +109,8 @@ class ValueHead(torch.nn.Module):
         Returns:
             values: [batch, seq, 1]
         """
-        return self.linear(hidden_states)
+        with torch.autocast(device_type=hidden_states.device.type, dtype=torch.float32):
+            return self.linear(hidden_states.float())
 
 
 def _unwrap_model(model):
@@ -614,8 +616,24 @@ class MegatronValueWorker(AbstractPolicyWorker):
 
                     # Step value head optimizer separately.
                     # The value head is NOT wrapped in DDP, so we must manually
-                    # allreduce its gradients across DP ranks to keep weights in sync.
+                    # allreduce its gradients to keep weights in sync.
                     if hasattr(self, "value_head_optimizer"):
+                        # When sequence parallelism is on, each TP rank processes
+                        # a different shard of the sequence, so the value head
+                        # receives different gradients on each TP rank. We must
+                        # allreduce across TP first to get the correct full-sequence
+                        # gradient before syncing across DP.
+                        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                        if tp_size > 1 and self.megatron_cfg.model.sequence_parallel:
+                            tp_group = parallel_state.get_tensor_model_parallel_group()
+                            for param in self.value_head.parameters():
+                                if param.grad is not None:
+                                    torch.distributed.all_reduce(
+                                        param.grad,
+                                        op=torch.distributed.ReduceOp.AVG,
+                                        group=tp_group,
+                                    )
+
                         dp_group = parallel_state.get_data_parallel_group()
                         for param in self.value_head.parameters():
                             if param.grad is not None:
