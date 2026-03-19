@@ -1,18 +1,21 @@
-defaults: ../../sft.yaml
-sft:
+defaults: ../../dpo.yaml
+dpo:
+  val_period: 50
   max_num_steps: 100
-checkpointing:
-  enabled: false
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
-  max_total_sequence_length: 2048
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
   optimizer:
     kwargs:
-      lr: 1.5e-05
+      lr: 5.5e-05
   hf_config_overrides:
     router_aux_loss_coef: 0
   dtensor_cfg:
+    _v2: true
     expert_parallel_size: 8
     automodel_kwargs:
       backend:
@@ -24,13 +27,16 @@ policy:
         enable_deepep: true
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+  offload_optimizer_for_logprob: true
 logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: sft-nanov3-30BA3B-2n8g-fsdp2
+    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
   tensorboard:
-    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-fsdp2
+    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
   mlflow:
-    run_name: sft-nanov3-30BA3B-2n8g-fsdp2
+    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
 cluster:
   gpus_per_node: 8

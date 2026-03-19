@@ -1,6 +1,0 @@
-defaults: ./dpo-nanov3-30B3AB-2n8g-fsdp2-cpuoffload.yaml
-logger:
-  wandb:
-    name: dpo-nanov3-30B3AB-2n4g-fsdp2-cpuoffload
-cluster:
-  gpus_per_node: 4
