@@ -61,6 +61,8 @@ class ClippedPGLossConfig(TypedDict):
     force_on_policy_ratio: NotRequired[bool]
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: NotRequired[bool]
+    # Scale factor for the value loss (PPO). Default 1.0.
+    value_loss_scale: NotRequired[float]
     # Clip range for value function loss. If set, value predictions are clipped
     # to [old_values - clip, old_values + clip] and the loss is max(unclipped, clipped).
     # Set to None or 0 to disable (plain MSE). Typical value: 0.2.

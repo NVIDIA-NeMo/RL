@@ -240,11 +240,13 @@ class GeneralizedAdvantageEstimator:
             kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
-        # Place terminal reward at last valid token for each sample
-        for i in range(rewards.shape[0]):
-            L = int(lengths[i])
-            if L > 0:
-                token_level_rewards[i, L - 1] += rewards[i]
+        # Place terminal reward at last response token (last mask=1 position)
+        # for each sample. Using mask instead of lengths ensures the reward
+        # lands on an assistant token even in multi-turn scenarios where the
+        # sequence may end with a non-assistant message.
+        last_response_idx = mask.shape[1] - 1 - mask.fliplr().argmax(dim=1)
+        has_response = mask.any(dim=1)
+        token_level_rewards[has_response, last_response_idx[has_response]] += rewards[has_response]
 
         # Zero out prompt/padding positions
         token_level_rewards = token_level_rewards * mask
