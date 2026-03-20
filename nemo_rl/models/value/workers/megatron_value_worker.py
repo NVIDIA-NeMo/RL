@@ -138,7 +138,8 @@ class _ValueOutputLayerBypass(torch.nn.Module):
         # Return (tensor, bias) tuple matching ColumnParallelLinear's signature,
         # since GPTModel._postprocess does `logits, _ = self.output_layer(...)`.
         # Uses a slice view to avoid allocating new memory.
-        return hidden_states[..., :1], None
+        dummy = hidden_states[..., :1]
+        return dummy, None
 
 
 def forward_step_value(
@@ -217,7 +218,14 @@ def forward_step_value(
         values = torch.cat(
             [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
         )
-        # Replace output_tensor with values for loss computation
+        # Replace output_tensor with values for loss computation.
+        # Include the original output_layer weight with a zero contribution so
+        # that it receives a gradient during backward. Megatron DDP with
+        # overlap_grad_reduce=True requires every registered parameter to
+        # produce a gradient for bucket sync; without this the output_layer
+        # weight has no grad and finish_grad_sync() raises an AssertionError.
+        if original_output_layer is not None:
+            values = values + 0.0 * original_output_layer.weight.view(-1)[0]
         output_tensor = values
     else:
         # On non-last PP stages, output_layer doesn't exist.
@@ -353,8 +361,23 @@ class MegatronValueWorker(AbstractPolicyWorker):
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
+        # Freeze the output_layer (LM head) before DDP wrapping so it is not
+        # registered in any DDP gradient bucket.  The value model never uses the
+        # LM head — it bypasses it and routes hidden states through a value head
+        # instead — so its weights should not participate in gradient sync.
+        def _freeze_output_layer(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                if hasattr(model_module, "module"):
+                    model_module = model_module.module
+                if hasattr(model_module, "output_layer"):
+                    for param in model_module.output_layer.parameters():
+                        param.requires_grad_(False)
+
         model_and_optimizer_state = setup_model_and_optimizer(
-            policy_like_cfg, self.megatron_cfg, init_optimizer
+            policy_like_cfg, self.megatron_cfg, init_optimizer,
+            additional_pre_wrap_hooks=[_freeze_output_layer],
         )
 
         self.mcore_state = model_and_optimizer_state.state
@@ -370,6 +393,31 @@ class MegatronValueWorker(AbstractPolicyWorker):
         # Step 5: Create value head
         hidden_size = self.megatron_cfg.model.hidden_size
         self.value_head = ValueHead(hidden_size, self.dtype).cuda()
+
+        # Load value head from HF checkpoint if configured
+        if config.get("load_value_head_from_model", False):
+            from nemo_rl.models.megatron.community_import import (
+                extract_value_head_from_hf_checkpoint,
+            )
+
+            score_weights = extract_value_head_from_hf_checkpoint(
+                config["model_name"]
+            )
+            if "score.weight" in score_weights:
+                self.value_head.linear.weight.data.copy_(score_weights["score.weight"])
+                print(f"Loaded value head score.weight from {config['model_name']}")
+            if "score.bias" in score_weights:
+                # Add bias to the linear layer if the checkpoint has one
+                if self.value_head.linear.bias is None:
+                    self.value_head.linear.bias = torch.nn.Parameter(
+                        torch.zeros(
+                            self.value_head.linear.out_features,
+                            dtype=self.value_head.dtype,
+                            device=self.value_head.linear.weight.device,
+                        )
+                    )
+                self.value_head.linear.bias.data.copy_(score_weights["score.bias"])
+                print(f"Loaded value head score.bias from {config['model_name']}")
 
         # If loading a value checkpoint that includes the value head weights,
         # we'd load them here. For initial training from a pretrained LM,

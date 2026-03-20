@@ -631,6 +631,10 @@ def setup(
             worker_init_timing_metrics[init_time_key] = generation_time
 
             policy, policy_time = init_policy()
+            # Block until the policy worker's __init__ completes and offload
+            # to CPU, freeing GPU for value model initialization.
+            # Policy will be reloaded before the vLLM refit step below.
+            policy.finish_training()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
             worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
@@ -638,6 +642,11 @@ def setup(
             if value_config is not None:
                 print("  ⚙️  Initializing value model for GAE...", flush=True)
                 value_model, value_time = init_value()
+                # Block until the value worker's __init__ completes and offload
+                # model + optimizer to CPU. Without this, __init__ runs
+                # asynchronously in the Ray actor and may overlap with vLLM
+                # generation, causing GPU OOM.
+                value_model.finish_training()
                 worker_init_timing_metrics["value_init_time_s"] = value_time
                 print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
             else:
@@ -747,6 +756,10 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+
+    # Reload policy weights to GPU before refit (they may have been offloaded
+    # during setup to free GPU for value model initialization).
+    policy.prepare_for_training()
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
