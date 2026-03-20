@@ -1079,6 +1079,14 @@ class MegatronValueWorker(AbstractPolicyWorker):
             "Loading checkpoints outside of init is not yet implemented for MegatronValueWorker."
         )
 
+    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+        """Offload model params to CPU after inference."""
+        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=False)
+        self.value_head.cpu()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
         self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=True)
