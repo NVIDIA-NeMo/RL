@@ -420,8 +420,9 @@ class Value(ValueInterface):
         ray.get(futures)
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        """Clean up after training."""
-        pass
+        """Offload value model to CPU after training."""
+        futures = self.worker_group.run_all_workers_single_data("finish_training")
+        ray.get(futures)
 
     def save_checkpoint(
         self,
