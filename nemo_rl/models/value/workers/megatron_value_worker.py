@@ -1080,5 +1080,17 @@ class MegatronValueWorker(AbstractPolicyWorker):
         )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        """Clean up after training."""
-        pass
+        """Offload model, gradients, and optimizer to CPU after training."""
+        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=True)
+        self.model.eval()
+        self.value_head.cpu().eval()
+
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()

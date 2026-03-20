@@ -1558,6 +1558,11 @@ def ppo_train(
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
 
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    _total_gb = _total / (1024**3)
+                    print(f"[GPU mem] after value prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+
                     with timer.time("value_training"):
                         print("▶ Training value...", flush=True)
                         value_results = value_model.train(
@@ -1565,7 +1570,16 @@ def ppo_train(
                             value_loss_fn,
                             timer=timer,
                         )
+
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        print(f"[GPU mem] after value train (before finish): {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+
                         value_model.finish_training()
+
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        print(f"[GPU mem] after value finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                     train_results = None
                     if current_epoch >= policy_training_start_epoch:
@@ -1573,6 +1587,10 @@ def ppo_train(
                         with timer.time("training_prep"):
                             policy.prepare_for_training()
                             POLICY_GENERATION_STALE = True
+
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        print(f"[GPU mem] after policy prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                         print("▶ Training policy...", flush=True)
                         with timer.time("policy_training"):
@@ -1582,6 +1600,10 @@ def ppo_train(
                                 timer=timer,
                             )
                             policy.finish_training()
+
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        print(f"[GPU mem] after policy finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                     if train_results is not None:
                         print(f"    • Policy loss: {train_results['loss'].item():.4f}")
