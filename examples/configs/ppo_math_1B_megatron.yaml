@@ -243,6 +243,7 @@ value:
     name: ${value.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
+  load_value_head_from_model: false
 
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}

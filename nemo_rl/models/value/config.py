@@ -74,6 +74,9 @@ class ValueConfig(TypedDict):
     # Checkpoint loading
     dequantize_base_checkpoint: NotRequired[bool]
 
+    # Load value head weights from the HF checkpoint specified by model_name
+    load_value_head_from_model: NotRequired[bool]
+
     # Optimizer and scheduler
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
