@@ -1534,6 +1534,12 @@ def ppo_train(
                     del logprob_data
                     del extra_multimodal_data
 
+                    policy.finish_inference()
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    _total_gb = _total / (1024**3)
+                    print(f"[GPU mem] after policy finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+
                 # Build prompt IDs for advantage estimation (groups responses from same prompt)
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
