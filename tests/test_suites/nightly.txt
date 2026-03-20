@@ -118,6 +118,9 @@ tests/test_suites/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.sh
 tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2.sh
 tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
 
+# Long sequence + Yarn
+tests/test_suites/llm/sft-qwen3-0.6B-2n8g-megatron-yarn-128k.sh
+
 #######
 # DPO #
 #######

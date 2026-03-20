@@ -1,0 +1,63 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 80
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 8
+  max_total_sequence_length: 131072  # 128K
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    context_parallel_size: 8
+    sequence_parallel: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      use_distributed_optimizer: false
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-11
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: 32
+  hf_config_overrides:
+    rope_scaling:
+      rope_type: yarn
+      factor: 3.2
+      original_max_position_embeddings: 40960
+      truncate: true
+      beta_fast: 32
+      beta_slow: 1
+      mscale: 1
+      mscale_all_dim: 0
+data:
+  add_generation_prompt: true
+  num_workers: 8
+  train:
+    dataset_name: Nemotron-Math-v2
+    split: high_part02
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
+logger:
+  wandb:
+    project: nemo-rl
+    name: sft-qwen3-0.6B-2n8g-megatron-yarn-128k
+  tensorboard:
+    log_dir: tb_logs-sft-qwen3-0.6B-2n8g-megatron-yarn-128k
+  mlflow:
+    run_name: sft-qwen3-0.6B-2n8g-megatron-yarn-128k
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
