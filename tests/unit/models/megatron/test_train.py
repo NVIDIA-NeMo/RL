@@ -30,7 +30,6 @@ import torch
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
-
 pytestmark = pytest.mark.mcore
 
 

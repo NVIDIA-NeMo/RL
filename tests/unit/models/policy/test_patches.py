@@ -445,5 +445,3 @@ def permutation_kernel(x):
                 assert captured.out.count("Successfully patched") == 1
         finally:
             os.unlink(tmp_path)
-
-

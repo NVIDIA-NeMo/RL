@@ -104,5 +104,3 @@ def apply_transformer_engine_patch():
 
     except Exception as e:
         print(f"Error checking/patching transformer_engine: {e}")
-
-

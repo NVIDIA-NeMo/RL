@@ -173,9 +173,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     DeprecationWarning,
                     stacklevel=1,
                 )
-            llm_kwargs["compilation_config"] = CompilationConfig(
-                **compilation_config
-            )
+            llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
@@ -596,7 +594,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from logging import getLogger as _getLogger
 
-        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(CleanLoggingFilter())
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(
+            CleanLoggingFilter()
+        )
 
         # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
         # This is expected during multi-turn rollouts; we log a clean one-line
