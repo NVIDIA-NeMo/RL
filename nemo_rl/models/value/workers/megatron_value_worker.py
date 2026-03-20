@@ -394,8 +394,19 @@ class MegatronValueWorker(AbstractPolicyWorker):
         hidden_size = self.megatron_cfg.model.hidden_size
         self.value_head = ValueHead(hidden_size, self.dtype).cuda()
 
-        # Load value head from HF checkpoint if configured
-        if config.get("load_value_head_from_model", False):
+        # Load value head weights: prefer training checkpoint, fall back to HF model
+        value_head_loaded = False
+        if weights_path is not None:
+            value_head_path = os.path.join(weights_path, "value_head.pt")
+            if os.path.exists(value_head_path):
+                value_head_state = torch.load(
+                    value_head_path, map_location="cuda", weights_only=True
+                )
+                self.value_head.load_state_dict(value_head_state)
+                print(f"Loaded value head weights from {value_head_path}")
+                value_head_loaded = True
+
+        if not value_head_loaded and config.get("load_value_head_from_model", False):
             from nemo_rl.models.megatron.community_import import (
                 extract_value_head_from_hf_checkpoint,
             )
@@ -418,18 +429,6 @@ class MegatronValueWorker(AbstractPolicyWorker):
                     )
                 self.value_head.linear.bias.data.copy_(score_weights["score.bias"])
                 print(f"Loaded value head score.bias from {config['model_name']}")
-
-        # If loading a value checkpoint that includes the value head weights,
-        # we'd load them here. For initial training from a pretrained LM,
-        # the value head starts with random initialization.
-        if weights_path is not None:
-            value_head_path = os.path.join(weights_path, "value_head.pt")
-            if os.path.exists(value_head_path):
-                value_head_state = torch.load(
-                    value_head_path, map_location="cuda", weights_only=True
-                )
-                self.value_head.load_state_dict(value_head_state)
-                print(f"Loaded value head weights from {value_head_path}")
 
         # Add value head parameters to the optimizer
         if init_optimizer and self.optimizer is not None:
