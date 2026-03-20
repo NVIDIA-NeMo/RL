@@ -264,14 +264,9 @@ class BaseVllmGenerationWorker:
                 logger.info("Hermes tool parser thread-safety patch already applied.")
                 return
 
-            old_import = (
-                "import json\n"
-                "from collections.abc import Sequence"
-            )
+            old_import = "import json\nfrom collections.abc import Sequence"
             new_import = (
-                "import json\n"
-                "import threading\n"
-                "from collections.abc import Sequence"
+                "import json\nimport threading\nfrom collections.abc import Sequence"
             )
 
             old_class_line = "class Hermes2ProToolParser(ToolParser):"

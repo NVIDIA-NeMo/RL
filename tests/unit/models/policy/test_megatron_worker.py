@@ -1981,7 +1981,9 @@ def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.skip(reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)")
+@pytest.mark.skip(
+    reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)"
+)
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):

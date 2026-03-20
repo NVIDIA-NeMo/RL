@@ -79,7 +79,10 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     # If the architecture doesn't have a custom model implementation,
     # HF model will be used regardless — no adapter involved.
     architectures = getattr(model_config, "architectures", None) or []
-    if not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls:
+    if (
+        not architectures
+        or architectures[0] not in ModelRegistry.model_arch_name_to_cls
+    ):
         return
 
     arch = architectures[0]
@@ -106,7 +109,9 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     if adapter_ok:
         return
 
-    force_hf_explicitly_false = "force_hf" in automodel_kwargs and automodel_kwargs["force_hf"] is False
+    force_hf_explicitly_false = (
+        "force_hf" in automodel_kwargs and automodel_kwargs["force_hf"] is False
+    )
     if force_hf_explicitly_false:
         raise RuntimeError(
             f"force_hf=False but the custom model for {arch} uses an adapter that "

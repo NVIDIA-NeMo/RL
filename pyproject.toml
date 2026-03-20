@@ -85,7 +85,7 @@ vllm = [
 ]
 sglang = [
   "sglang",
-  "sgl-kernel",  # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
+  "sgl-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)

@@ -2100,7 +2100,11 @@ class TestMaybeSetForceHf:
 
         # Find a model whose adapter has convert_single_tensor_to_hf
         # (e.g. Qwen3Moe, NemotronH, DeepseekV3)
-        compatible_archs = ["Qwen3MoeForCausalLM", "NemotronHForCausalLM", "DeepseekV3ForCausalLM"]
+        compatible_archs = [
+            "Qwen3MoeForCausalLM",
+            "NemotronHForCausalLM",
+            "DeepseekV3ForCausalLM",
+        ]
         arch = None
         for a in compatible_archs:
             if a in ModelRegistry.model_arch_name_to_cls:
