@@ -245,7 +245,7 @@ value:
   hf_config_overrides: {}
 
   train_global_batch_size: ${policy.train_global_batch_size}
-  train_micro_batch_size: 8
+  train_micro_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: ${policy.max_total_sequence_length}
   make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
   precision: "bfloat16"
